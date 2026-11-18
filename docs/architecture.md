@@ -285,27 +285,45 @@ contract v2 from `hermes_like_agent` and vorflux:
 
 ```python
 class RuntimeKind(StrEnum):
-    CLAUDE_AGENT_SDK = "claude_agent_sdk"   # default
+    CLAUDE_AGENT_SDK = "claude_agent_sdk"  # default
     OPENAI_AGENTS_SDK = "openai_agents_sdk"
-    FAKE = "fake"                            # scripted, for tests
+    FAKE = "fake"  # scripted, for tests
+
 
 class AgentRuntime(Protocol):
     kind: RuntimeKind
-    def capabilities(self) -> Capabilities: ...       # native_subagents, native_compaction, native_skills, ...
+
+    def capabilities(
+        self,
+    ) -> Capabilities: ...  # native_subagents, native_compaction, native_skills, ...
     def run(self, req: RunRequest) -> AsyncIterator[RunEvent]: ...
-    def resume(self, req: ResumeRequest) -> AsyncIterator[RunEvent]: ...   # after an approval decision
+    def resume(
+        self, req: ResumeRequest
+    ) -> AsyncIterator[RunEvent]: ...  # after an approval decision
     async def cancel(self, run_id: str) -> None: ...
 
-RunEvent = (TextDelta | ToolCallStarted | ToolCallFinished | ApprovalRequired
-            | Compacted | SubagentEvent | RunCompleted | RunFailed)
+
+RunEvent = (
+    TextDelta
+    | ToolCallStarted
+    | ToolCallFinished
+    | ApprovalRequired
+    | Compacted
+    | SubagentEvent
+    | RunCompleted
+    | RunFailed
+)
 ```
 
-- `RunRequest` holds the `RunScope` (org, workspace, user, session, run), the user input, and
-  the frozen `RunConfig`.
+- `RunRequest` holds the `RunScope` (org, workspace, session, run, audience, and the user for
+  a private session), the user input, the frozen `RunConfig`, the run `Budget`, and the
+  runtime state from the previous run. `ResumeRequest` holds the approval id, the decision
+  (`approve` or `reject`), and the runtime state from `ApprovalRequired`.
 - `RunConfig` is frozen per session. It holds only what the model sees and what the cache
   needs: runtime, model, SOUL, context files, memory snapshot, skill index, tool schemas, and
-  MCP server configs. It has `fingerprint()` and `render_prefix()`. Remote MCP configs hide
-  their bearer token in `repr`.
+  MCP server configs. It has `fingerprint()` (SHA-256 of canonical JSON, the same in every
+  process) and `render_prefix()` (the tiers of Section 6.1). Remote MCP configs hide their
+  bearer token in `repr`. The token changes per run, so it is not in the fingerprint.
 - **Authority is not frozen.** The control plane checks membership, connection access,
   approval policy, budgets, and revocations again at every tool call, model call, and
   approval resume. A newer `deny` or a lower budget applies at once, also to long-lived
@@ -1180,6 +1198,10 @@ The owner answered these questions on 2026-11-18. The answers are binding for M1
 | Q4 | Which region? | Supabase in `ap-south-1` (Mumbai), the same as vorflux. Fly.io in the region nearest to it. |
 | Q5 | Who may approve changes to workspace memory, workspace skills, and SOUL? | Workspace `admin` and org `owner`. Org-scope changes need the org `owner`. |
 | Q6 | When do we build the web app? | A minimal web chat and approvals page in M1. Web app v1 for the team in M3. The customer-ready web app in M6. |
+| Q7 | How do we start M1? | Foundations first. The first pull request has M1.1 (repo foundations) and M1.3 (runtime contract and fake runtime). Then one pull request per item or per small group. |
+| Q8 | Which Supabase project does claw use? | A new Supabase project for claw in `ap-south-1`. Claw tables do not share a project with other apps. |
+| Q9 | Which service keys does claw use? | The existing E2B, Anthropic, OpenAI, and Langfuse keys. Keys for the Telegram bot and for connectors are added later, when those items are ready. |
+| Q10 | Where does claw deploy? | Fly.io. The owner adds `FLY_API_TOKEN` at M1.15. |
 
 No questions are open now.
 

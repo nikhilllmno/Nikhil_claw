@@ -39,6 +39,9 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
+Done: M1.1 and M1.3 (contract in `src/claw/runtime/contract.py`, fake runtime in
+`src/claw/runtime/fake.py`).
+
 | # | Item | Acceptance criteria |
 |---|---|---|
 | M1.1 | Repo foundations | `pyproject.toml` (Python 3.12, uv), Ruff, mypy strict, pytest, pre-commit. GitHub Actions runs lint, types, and tests on every pull request. Dependency groups `runtime-claude` and `runtime-openai`. |
