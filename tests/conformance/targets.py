@@ -15,7 +15,6 @@ from __future__ import annotations
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
@@ -43,7 +42,6 @@ from tests.conformance.tool_server import LOOKUP, SEND_NOTE, SERVER_NAME, ToolSe
 
 CANCEL_LIMIT_S = 10.0
 LIVE_MODEL = "claude-haiku-4-5"
-LIVE_MAX_COST_USD = Decimal("0.50")
 
 
 class Scenario(StrEnum):

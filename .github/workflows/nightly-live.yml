@@ -1,8 +1,12 @@
 name: Nightly live
 
 # Runs the runtime conformance suite and the Claude adapter live tests against the real
-# Claude API (docs/architecture.md, Section 5.5). Each run has a cost limit of USD 0.50.
-# It needs the repository secret ANTHROPIC_API_KEY.
+# Claude API (docs/architecture.md, Section 5.5). It needs the repository secret
+# ANTHROPIC_API_KEY.
+#
+# Cost: all live tests share one cap (tests/live_budget.py). Each run gets the rest of the cap
+# as max_budget_usd, and a test fails before it calls the model when the cap is used up. The
+# CLI checks the budget after each model turn, so the total can pass the cap by one turn.
 
 on:
   schedule:
@@ -46,6 +50,7 @@ jobs:
       - name: Live conformance suite and adapter tests
         env:
           SAMA_LIVE_TESTS: "1"
+          SAMA_LIVE_MAX_COST_USD: "0.50"
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         # -rs lists skipped tests. A live test that skips here means a missing setting.
         run: uv run pytest -m live tests/conformance tests/runtime -rs

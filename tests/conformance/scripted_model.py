@@ -227,26 +227,27 @@ async def _stream(
     yield event({"type": "message_stop"})
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @contextmanager
 def serve(app: ASGIApp) -> Iterator[str]:
-    """Serves ``app`` on a free local port in a thread. Yields the base URL."""
-    port = free_port()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
+    """Serves ``app`` on a free local port in a thread. Yields the base URL.
+
+    The socket stays bound from the port choice to the server start, so no other process can
+    take the port in between.
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = int(sock.getsockname()[1])
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 10
-    while not server.started:
-        if time.monotonic() > deadline or not thread.is_alive():
-            raise RuntimeError("the local test server did not start")
-        time.sleep(0.02)
     try:
+        deadline = time.monotonic() + 10
+        while not server.started:
+            if time.monotonic() > deadline or not thread.is_alive():
+                raise RuntimeError("the local test server did not start")
+            time.sleep(0.02)
         yield f"http://127.0.0.1:{port}"
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+        sock.close()

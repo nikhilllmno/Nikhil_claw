@@ -486,6 +486,11 @@ The suite is `tests/conformance/`. Each test runs once per **target**:
   (M1.7), skills (M2.2), and egress (M1.6). Each item adds its test to this suite.
 - **Clean CLI config.** Each Claude target uses a new `CLAUDE_CONFIG_DIR`, so skills, memory,
   and settings of the host do not reach the run.
+- **Live cost cap.** All live tests in one pytest process share one cap
+  (`tests/live_budget.py`, `SAMA_LIVE_MAX_COST_USD`, default USD 0.50). Each live run gets the
+  rest of the cap as its budget, and a test fails before it calls the model when the cap is
+  used up. The CLI checks the budget after each model turn, so the total can pass the cap by
+  one turn.
 - **New adapters.** A new runtime adds a target (for example `openai-scripted` in M3.6) and
   must pass the suite.
 

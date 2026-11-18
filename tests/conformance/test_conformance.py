@@ -8,8 +8,11 @@ a real model.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
+from collections.abc import AsyncGenerator
+from typing import cast
 
 import pytest
 
@@ -28,11 +31,11 @@ from sama.runtime import (
     TextDelta,
     ToolCallFinished,
     ToolCallStarted,
+    Usage,
     validate_event_stream,
 )
 from tests.conformance.targets import (
     CANCEL_LIMIT_S,
-    LIVE_MAX_COST_USD,
     NOTE_FILE,
     WRITE_TOOL,
     Scenario,
@@ -40,9 +43,29 @@ from tests.conformance.targets import (
     new_word,
 )
 from tests.conformance.tool_server import LOOKUP, SEND_NOTE, tool_id
+from tests.live_budget import LIVE_SPEND
 from tests.support import collect, make_scope
 
-BUDGET = Budget(max_cost_usd=LIVE_MAX_COST_USD, max_wall_time_s=120)
+LIVE_TARGET = "claude-live"
+SCRIPTED_WALL_TIME_S = 30.0
+"""A scripted run takes under a second. A hang fails the test after this time."""
+
+
+def budget_for(
+    target: Target, *, max_turns: int | None = None, already_spent: Usage | None = None
+) -> Budget:
+    """The run budget. A live target gets the rest of the shared cost cap (tests/live_budget.py).
+    The scripted model is free, so other targets get only the limits of the test."""
+    if target.name == LIVE_TARGET:
+        return LIVE_SPEND.budget(max_turns=max_turns, already_spent=already_spent)
+    return Budget(max_turns=max_turns, max_wall_time_s=SCRIPTED_WALL_TIME_S)
+
+
+def record_spend(
+    target: Target, events: list[RunEvent], *, already_spent: Usage | None = None
+) -> None:
+    if target.name == LIVE_TARGET:
+        LIVE_SPEND.record(events, already_spent=already_spent)
 
 
 def scope() -> RunScope:
@@ -55,13 +78,13 @@ def request(
     *,
     run_scope: RunScope | None = None,
     state: bytes | None = None,
-    budget: Budget = BUDGET,
+    max_turns: int | None = None,
 ) -> RunRequest:
     return RunRequest(
         scope=run_scope or scope(),
         input=text,
         config=target.config,
-        budget=budget,
+        budget=budget_for(target, max_turns=max_turns),
         runtime_state=state,
     )
 
@@ -72,11 +95,11 @@ async def run(
     *,
     run_scope: RunScope | None = None,
     state: bytes | None = None,
-    budget: Budget = BUDGET,
+    max_turns: int | None = None,
 ) -> list[RunEvent]:
-    events = await collect(
-        target.runtime.run(request(target, text, run_scope=run_scope, state=state, budget=budget))
-    )
+    run_request = request(target, text, run_scope=run_scope, state=state, max_turns=max_turns)
+    events = await collect(target.runtime.run(run_request))
+    record_spend(target, events)
     validate_event_stream(events)
     return events
 
@@ -90,7 +113,7 @@ def resume_request(
         approval_id=paused.approval_id,
         decision=decision,
         reason="The note is not needed." if decision is ApprovalDecision.REJECT else None,
-        budget=BUDGET,
+        budget=budget_for(target, already_spent=paused.usage),
         runtime_state=paused.runtime_state,
     )
 
@@ -100,6 +123,7 @@ async def resume(
 ) -> list[RunEvent]:
     request_ = resume_request(target, paused, run_scope, decision)
     events = await collect(target.runtime.resume(request_))
+    record_spend(target, events, already_spent=paused.usage)
     validate_event_stream(events, start=paused.usage)
     return events
 
@@ -200,31 +224,51 @@ async def test_reject_does_not_run_the_gated_call(target: Target, scenario: Scen
         assert SEND_NOTE not in target.tools.calls
 
 
-async def test_an_approval_resumes_only_once(target: Target) -> None:
-    paused, run_scope = await _pause(target, Scenario.NOTE, new_word())
+@GATED
+async def test_an_approval_resumes_only_once(target: Target, scenario: Scenario) -> None:
+    word = new_word()
+    paused, run_scope = await _pause(target, scenario, word)
     completed(await resume(target, paused, run_scope, ApprovalDecision.APPROVE))
+    if target.calls_mcp:
+        assert _done(target, scenario) == [word]
+    done_before, calls_before = _done(target, scenario), list(target.tools.calls)
+    if target.workdir is not None and scenario is Scenario.WRITE:
+        (target.workdir / NOTE_FILE).unlink()  # A second run of the call would write it again.
     # A refused request reports no usage, so it is not checked against the paused usage.
     request_ = resume_request(target, paused, run_scope, ApprovalDecision.APPROVE)
     again = await collect(target.runtime.resume(request_))
     validate_event_stream(again)
     assert isinstance(again[-1], RunFailed)
     assert again[-1].code is FailureCode.INVALID_REQUEST
+    # The replay ran nothing.
+    assert not any(isinstance(e, ToolCallStarted | ToolCallFinished) for e in again)
+    assert target.tools.calls == calls_before
+    if scenario is Scenario.NOTE:
+        assert _done(target, scenario) == done_before
+    else:
+        assert _done(target, scenario) == []
 
 
 async def test_cancel_ends_the_run_within_ten_seconds(target: Target) -> None:
     run_scope = scope()
-    stream = target.runtime.run(request(target, target.prompt(Scenario.SLOW), run_scope=run_scope))
+    run_request = request(target, target.prompt(Scenario.SLOW), run_scope=run_scope)
+    # Every adapter returns an async generator. aclosing() stops it if the test fails.
+    stream = cast(AsyncGenerator[RunEvent], target.runtime.run(run_request))
     events: list[RunEvent] = []
-    async with asyncio.timeout(60):
-        async for event in stream:
-            events.append(event)
-            if isinstance(event, TextDelta):
-                break
-    started = time.monotonic()
-    await target.runtime.cancel(run_scope.run_id)
-    async with asyncio.timeout(CANCEL_LIMIT_S):
-        events.extend([event async for event in stream])
-    assert time.monotonic() - started < CANCEL_LIMIT_S
+    async with contextlib.aclosing(stream):
+        async with asyncio.timeout(60):
+            async for event in stream:
+                events.append(event)
+                if isinstance(event, TextDelta):
+                    break
+        started = time.monotonic()
+        # One limit for the cancel call and the rest of the stream (contract: 10 seconds).
+        async with asyncio.timeout(CANCEL_LIMIT_S):
+            await target.runtime.cancel(run_scope.run_id)
+            events.extend([event async for event in stream])
+        elapsed = time.monotonic() - started
+    assert elapsed < CANCEL_LIMIT_S
+    record_spend(target, events)
     validate_event_stream(events)
     last = events[-1]
     assert isinstance(last, RunFailed), last
@@ -233,7 +277,7 @@ async def test_cancel_ends_the_run_within_ten_seconds(target: Target) -> None:
 
 async def test_budget_stops_the_run(target: Target) -> None:
     # The tool call uses the only turn, so the model cannot answer with the result.
-    events = await run(target, target.prompt(Scenario.BUDGET), budget=Budget(max_turns=1))
+    events = await run(target, target.prompt(Scenario.BUDGET), max_turns=1)
     last = events[-1]
     assert isinstance(last, RunFailed), last
     assert last.code is FailureCode.BUDGET_EXCEEDED
