@@ -2,7 +2,7 @@
 
 ## Hermes Agent
 
-Nikhil_claw takes design ideas, default limits, and feature names from Hermes Agent
+Sama takes design ideas, default limits, and feature names from Hermes Agent
 (https://github.com/NousResearch/hermes-agent, reviewed at commit `0e8e4216`). This
 repository does not contain Hermes code. If we copy Hermes text or code later, we list it
 here.

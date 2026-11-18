@@ -1,7 +1,7 @@
 """The runtime contract that every agent runtime adapter implements.
 
 Each adapter (Claude Agent SDK, OpenAI Agents SDK, fake) maps this contract to the API of its
-SDK. Claw features (tenancy, approvals, memory, skills, audit) sit above this seam, so they
+SDK. Sama features (tenancy, approvals, memory, skills, audit) sit above this seam, so they
 work the same for every runtime. See docs/architecture.md, Section 5.
 
 Two rules from the design shape this module:
@@ -17,12 +17,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, Protocol, Self, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    SecretStr,
+    TypeAdapter,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------------------------
 # Base model
@@ -30,9 +40,48 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, model
 
 
 class _Frozen(BaseModel):
-    """Immutable value object. Unknown fields are an error, so typos fail early."""
+    """Immutable value object. Unknown fields are an error, so typos fail early.
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    Bytes (the opaque ``runtime_state``) are base64 in JSON, so any byte value can be stored
+    and sent.
+    """
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"
+    )
+
+
+def _freeze_json(value: Any) -> Any:
+    """Makes a JSON value read-only: objects become read-only mappings, arrays become tuples.
+
+    The result is a new value, so a later change to the input does not change the model.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(k): _freeze_json(v) for k, v in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(v) for v in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    """The reverse of ``_freeze_json``, for serialisation. Returns plain dicts and lists."""
+    if isinstance(value, Mapping):
+        return {k: _thaw_json(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(v) for v in value]
+    return value
+
+
+FrozenJsonObject = Annotated[
+    Mapping[str, Any],
+    AfterValidator(_freeze_json),
+    PlainSerializer(_thaw_json, return_type=dict[str, Any]),
+]
+"""A JSON object that cannot change after validation, also in nested values.
+
+``frozen=True`` stops field assignment only. This type also stops changes inside the object,
+so a frozen ``RunConfig`` keeps the same fingerprint for the life of a session.
+"""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -47,7 +96,7 @@ class RuntimeKind(StrEnum):
 
 
 class Capabilities(_Frozen):
-    """What a runtime does natively. Claw fills each gap itself."""
+    """What a runtime does natively. Sama fills each gap itself."""
 
     streaming: bool
     native_subagents: bool
@@ -114,11 +163,11 @@ class SkillIndexEntry(_Frozen):
 class ToolSchema(_Frozen):
     name: str = Field(min_length=1, max_length=64)
     description: str
-    input_schema: dict[str, Any] = Field(default_factory=dict)
+    input_schema: FrozenJsonObject = Field(default_factory=dict)
 
 
 class McpServerConfig(_Frozen):
-    """A remote MCP server that the runtime connects to, normally the claw MCP tool server.
+    """A remote MCP server that the runtime connects to, normally the sama MCP tool server.
 
     The bearer token is a run token. It changes per run, so it is not part of the
     fingerprint, and ``repr`` hides it.
@@ -153,7 +202,7 @@ class RunConfig(_Frozen):
         """A stable SHA-256 hex digest of the config.
 
         The same config gives the same digest in every process and on every machine. Secrets
-        (run tokens) are not part of it. Claw uses the digest to check that a session's
+        (run tokens) are not part of it. Sama uses the digest to check that a session's
         prefix did not change.
         """
         payload = self.model_dump(mode="json")
@@ -295,7 +344,7 @@ class ToolCallStarted(_Event):
     type: Literal["tool_call_started"] = "tool_call_started"
     call_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments: FrozenJsonObject = Field(default_factory=dict)
 
 
 class ToolCallFinished(_Event):
@@ -326,7 +375,7 @@ class ApprovalRequired(_Event):
     approval_id: str = Field(min_length=1)
     call_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
-    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments: FrozenJsonObject = Field(default_factory=dict)
     reason: str = ""
     runtime_state: bytes | None = None
 
@@ -376,11 +425,13 @@ class ContractViolation(Exception):
     """A runtime broke the event stream rules of the contract."""
 
 
-def validate_event_stream(events: Sequence[RunEvent]) -> TerminalEvent:
+def validate_event_stream(events: Sequence[RunEvent], start: Usage | None = None) -> TerminalEvent:
     """Checks the stream rules and returns the terminal event.
 
     Rules: the stream is not empty, it ends with exactly one terminal event, and token counts
-    and cost in ``usage`` never go down.
+    and cost in ``usage`` never go down. For a resumed run, ``start`` is the usage of the
+    ``ApprovalRequired`` event that paused it: usage is for the whole run, so the resumed
+    stream must not report less.
     """
     if not events:
         raise ContractViolation("the stream has no events")
@@ -390,7 +441,7 @@ def validate_event_stream(events: Sequence[RunEvent]) -> TerminalEvent:
             f"the stream must end with exactly one terminal event; terminal positions: "
             f"{terminals}, length: {len(events)}"
         )
-    previous = Usage()
+    previous = start if start is not None else Usage()
     for index, event in enumerate(events):
         if not _usage_not_lower(event.usage, previous):
             raise ContractViolation(f"usage went down at event {index}")
@@ -432,7 +483,11 @@ class AgentRuntime(Protocol):
         ...
 
     async def cancel(self, run_id: str) -> None:
-        """Stops a run. Its stream ends with ``RunFailed(code=CANCELLED)``."""
+        """Stops a run. Its stream ends with ``RunFailed(code=CANCELLED)``.
+
+        A run that is paused on ``ApprovalRequired`` stops too: its approvals become invalid,
+        and a later ``resume`` fails with ``INVALID_REQUEST``.
+        """
         ...
 
 

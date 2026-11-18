@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from claw.runtime import (
+from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
     ContractViolation,
@@ -40,7 +40,7 @@ def _approval_script(delay_s: float = 0.0) -> FakeScript:
             ),
         ],
         on_approve=[
-            ToolCallFinished(call_id="c1"),
+            ToolCallFinished(call_id="c1", usage=Usage(input_tokens=5)),
             RunCompleted(output="sent", usage=Usage(input_tokens=5, output_tokens=1)),
         ],
         on_reject=[RunCompleted(output="not sent", usage=Usage(input_tokens=5, output_tokens=2))],
@@ -232,3 +232,72 @@ async def test_the_same_run_cannot_stream_twice_at_once() -> None:
     assert second[-1].code is FailureCode.INVALID_REQUEST
     rest = [first_event, *[e async for e in first]]
     assert isinstance(validate_event_stream(rest), RunCompleted)
+
+
+# --- lifecycle edge cases ----------------------------------------------------------------------
+
+
+async def test_resume_works_before_the_paused_stream_is_closed() -> None:
+    runtime = FakeRuntime(scripts=[_approval_script()])
+    paused = runtime.run(make_request())
+    events = [await anext(paused), await anext(paused)]
+    assert isinstance(events[-1], ApprovalRequired)
+    # The caller resumes at once and does not advance or close the paused stream first.
+    resumed = await collect(runtime.resume(_resume(ApprovalDecision.APPROVE)))
+    assert isinstance(validate_event_stream(resumed, start=events[-1].usage), RunCompleted)
+    assert [e async for e in paused] == []  # the paused stream ends cleanly
+
+
+async def test_a_rejected_duplicate_run_does_not_use_a_script() -> None:
+    slow = FakeScript(events=[TextDelta(text="a"), RunCompleted(output="a")], delay_s=0.05)
+    nxt = FakeScript(events=[RunCompleted(output="next")])
+    runtime = FakeRuntime(scripts=[slow, nxt])
+    first = runtime.run(make_request())
+    await anext(first)
+    duplicate = await collect(runtime.run(make_request()))
+    assert isinstance(duplicate[-1], RunFailed)
+    assert isinstance([e async for e in first][-1], RunCompleted)
+    assert await collect(runtime.run(make_request(run_id="r2"))) == [RunCompleted(output="next")]
+
+
+async def test_usage_does_not_go_down_across_a_resume() -> None:
+    runtime = FakeRuntime(scripts=[_approval_script()])
+    paused = await collect(runtime.run(make_request()))
+    resumed = await collect(runtime.resume(_resume(ApprovalDecision.APPROVE)))
+    validate_event_stream(resumed, start=paused[-1].usage)
+
+
+def test_a_branch_with_lower_usage_than_the_pause_is_rejected() -> None:
+    pause = ApprovalRequired(
+        approval_id="a", call_id="c", tool_name="t", usage=Usage(input_tokens=5)
+    )
+    with pytest.raises(ContractViolation, match="usage went down"):
+        FakeScript(
+            events=[pause],
+            on_approve=[RunCompleted(output="y")],
+            on_reject=[RunCompleted(output="n", usage=Usage(input_tokens=5))],
+        )
+
+
+async def test_cancel_during_a_resume_reports_the_usage_so_far() -> None:
+    runtime = FakeRuntime(scripts=[_approval_script(delay_s=0.01)])
+    request = make_request()
+    paused = await collect(runtime.run(request))
+    resume_task = asyncio.create_task(collect(runtime.resume(_resume(ApprovalDecision.APPROVE))))
+    await asyncio.sleep(0)  # let the resume start, then cancel before its first event
+    await runtime.cancel(request.scope.run_id)
+    resumed = await asyncio.wait_for(resume_task, timeout=10)
+    terminal = validate_event_stream(resumed, start=paused[-1].usage)
+    assert isinstance(terminal, RunFailed)
+    assert terminal.code is FailureCode.CANCELLED
+    assert terminal.usage == paused[-1].usage
+
+
+async def test_cancel_of_a_paused_run_makes_its_approval_invalid() -> None:
+    runtime = FakeRuntime(scripts=[_approval_script()])
+    await collect(runtime.run(make_request()))
+    await runtime.cancel("run-1")
+    events = await collect(runtime.resume(_resume(ApprovalDecision.APPROVE)))
+    assert len(events) == 1
+    assert isinstance(events[0], RunFailed)
+    assert events[0].code is FailureCode.INVALID_REQUEST

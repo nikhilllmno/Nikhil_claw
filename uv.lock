@@ -214,43 +214,6 @@ wheels = [
 ]
 
 [[package]]
-name = "claw"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "pydantic" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pre-commit" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-runtime-claude = [
-    { name = "claude-agent-sdk" },
-]
-runtime-openai = [
-    { name = "openai-agents" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.14.3,<3" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=2.4.1,<3" },
-    { name = "pre-commit", specifier = ">=4.7.0,<5" },
-    { name = "pytest", specifier = ">=9.2.0,<10" },
-    { name = "pytest-asyncio", specifier = ">=1.5.0,<2" },
-    { name = "ruff", specifier = ">=0.17.5,<0.18" },
-]
-runtime-claude = [{ name = "claude-agent-sdk", specifier = "==0.2.184" }]
-runtime-openai = [{ name = "openai-agents", specifier = "==0.25.0" }]
-
-[[package]]
 name = "click"
 version = "8.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1007,6 +970,43 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/8c/e4db9ae1e0ee233c04df007ab6d0d42f799ae9abd95d352b6092ee7bc4bf/ruff-0.17.5-py3-none-win_amd64.whl", hash = "sha256:aa415d57c244299279901d776607fee3df7831c2a7435433fbfacde8632c6550", size = 10275454, upload-time = "2026-11-12T17:54:49.401Z" },
     { url = "https://files.pythonhosted.org/packages/e6/65/a1648bc1550e7683bf7bf1e2ce2485c9f8535cbca6cca9ec7b73cc12fb8e/ruff-0.17.5-py3-none-win_arm64.whl", hash = "sha256:64a6fd668a336df959c522991de33e9e3c8be463afc0c9ac8f029f9d19ef756e", size = 9849020, upload-time = "2026-11-12T17:54:52.055Z" },
 ]
+
+[[package]]
+name = "sama"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+runtime-claude = [
+    { name = "claude-agent-sdk" },
+]
+runtime-openai = [
+    { name = "openai-agents" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.14.3,<3" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=2.4.1,<3" },
+    { name = "pre-commit", specifier = ">=4.7.0,<5" },
+    { name = "pytest", specifier = ">=9.2.0,<10" },
+    { name = "pytest-asyncio", specifier = ">=1.5.0,<2" },
+    { name = "ruff", specifier = ">=0.17.5,<0.18" },
+]
+runtime-claude = [{ name = "claude-agent-sdk", specifier = "==0.2.184" }]
+runtime-openai = [{ name = "openai-agents", specifier = "==0.25.0" }]
 
 [[package]]
 name = "sniffio"

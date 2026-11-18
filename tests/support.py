@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 
 from pydantic import SecretStr
 
-from claw.runtime import (
+from sama.runtime import (
     Audience,
     ContextFile,
     McpServerConfig,
@@ -58,7 +58,7 @@ def make_config(
         ),
         mcp_servers=(
             McpServerConfig(
-                name="claw", url="https://mcp.claw.test/mcp", bearer_token=SecretStr(token)
+                name="sama", url="https://mcp.sama.test/mcp", bearer_token=SecretStr(token)
             ),
         ),
     )

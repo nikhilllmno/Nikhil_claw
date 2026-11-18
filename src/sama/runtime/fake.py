@@ -14,7 +14,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 
-from claw.runtime.contract import (
+from sama.runtime.contract import (
     ApprovalDecision,
     ApprovalRequired,
     Capabilities,
@@ -27,6 +27,7 @@ from claw.runtime.contract import (
     RuntimeKind,
     TextDelta,
     Usage,
+    is_terminal,
     validate_event_stream,
 )
 
@@ -37,7 +38,9 @@ class FakeScript:
 
     If ``events`` ends with ``ApprovalRequired``, ``on_approve`` and ``on_reject`` are the
     events that ``resume`` streams for each decision. They must end with ``RunCompleted`` or
-    ``RunFailed``. ``delay_s`` is the pause before each event, to test streaming and cancel.
+    ``RunFailed``, and their usage must not be lower than the usage at the pause, because
+    usage is for the whole run. ``delay_s`` is the pause before each event, to test streaming
+    and cancel.
     """
 
     events: Sequence[RunEvent]
@@ -51,7 +54,9 @@ class FakeScript:
         terminal = validate_event_stream(self.events)
         if isinstance(terminal, ApprovalRequired):
             for name, branch in (("on_approve", self.on_approve), ("on_reject", self.on_reject)):
-                if isinstance(validate_event_stream(branch), ApprovalRequired):
+                if isinstance(
+                    validate_event_stream(branch, start=terminal.usage), ApprovalRequired
+                ):
                     raise ValueError(f"{name} must end with RunCompleted or RunFailed")
         elif self.on_approve or self.on_reject:
             raise ValueError("on_approve and on_reject need events that end with ApprovalRequired")
@@ -61,11 +66,21 @@ class FakeScript:
 class _Pending:
     run_id: str
     script: FakeScript
+    usage: Usage
+    """The usage at the pause. The resumed stream continues from it."""
 
 
 @dataclass(slots=True)
 class FakeRuntime:
-    """Replays scripts. Records every request in ``requests`` for assertions in tests."""
+    """Replays scripts. Records every request in ``requests`` for assertions in tests.
+
+    Rules, the same as for a real adapter:
+
+    - One stream at a time per run id. A run gives up its run id before it yields its
+      terminal event, so the caller can resume at once after ``ApprovalRequired``.
+    - Each approval resumes once, and only for the run that paused.
+    - ``cancel`` stops an active stream and makes the approvals of a paused run invalid.
+    """
 
     scripts: Iterable[FakeScript] = ()
     requests: list[RunRequest | ResumeRequest] = field(default_factory=list)
@@ -96,57 +111,75 @@ class FakeRuntime:
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
+        run_id = request.scope.run_id
         if request.config.runtime is not RuntimeKind.FAKE:
             yield _invalid(f"config is for runtime {request.config.runtime}, not fake")
             return
+        if run_id in self._active or any(p.run_id == run_id for p in self._pending.values()):
+            yield _invalid(f"run {run_id} is already active")
+            return
         script = self._queue.popleft() if self._queue else _echo_script(request)
-        async for event in self._stream(request.scope.run_id, script.events, script.delay_s):
+        async for event in self._stream(run_id, script.events, script.delay_s, Usage()):
             if isinstance(event, ApprovalRequired):
-                self._pending[event.approval_id] = _Pending(request.scope.run_id, script)
+                self._pending[event.approval_id] = _Pending(run_id, script, event.usage)
             yield event
 
     async def resume(self, request: ResumeRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
+        run_id = request.scope.run_id
         pending = self._pending.get(request.approval_id)
         if pending is None:
             yield _invalid(f"unknown approval: {request.approval_id}")
             return
-        if pending.run_id != request.scope.run_id:
+        if pending.run_id != run_id:
             yield _invalid(f"approval {request.approval_id} belongs to another run")
+            return
+        if run_id in self._active:
+            yield _invalid(f"run {run_id} is already active")
             return
         del self._pending[request.approval_id]
         script = pending.script
         branch = (
             script.on_approve if request.decision is ApprovalDecision.APPROVE else script.on_reject
         )
-        async for event in self._stream(request.scope.run_id, branch, script.delay_s):
+        async for event in self._stream(run_id, branch, script.delay_s, pending.usage):
             yield event
 
     async def cancel(self, run_id: str) -> None:
         cancelled = self._active.get(run_id)
         if cancelled is not None:
             cancelled.set()
+        for approval_id in [a for a, p in self._pending.items() if p.run_id == run_id]:
+            del self._pending[approval_id]
 
     async def _stream(
-        self, run_id: str, events: Sequence[RunEvent], delay_s: float
+        self, run_id: str, events: Sequence[RunEvent], delay_s: float, usage: Usage
     ) -> AsyncIterator[RunEvent]:
-        if run_id in self._active:
-            yield _invalid(f"run {run_id} is already active")
-            return
+        """Streams ``events`` for ``run_id``. The caller checks that the run id is free.
+
+        ``usage`` is the usage so far. A cancel before the first event reports it.
+        """
         cancelled = asyncio.Event()
         self._active[run_id] = cancelled
-        usage = Usage()
         try:
             for event in events:
                 if delay_s:
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(cancelled.wait(), timeout=delay_s)
                 if cancelled.is_set():
+                    self._release(run_id, cancelled)
                     yield RunFailed(code=FailureCode.CANCELLED, message="cancelled", usage=usage)
                     return
                 usage = event.usage
+                if is_terminal(event):
+                    self._release(run_id, cancelled)
                 yield event
         finally:
+            self._release(run_id, cancelled)
+
+    def _release(self, run_id: str, owner: asyncio.Event) -> None:
+        """Frees the run id, but only if this stream still owns it."""
+        if self._active.get(run_id) is owner:
             del self._active[run_id]
 
 

@@ -1,6 +1,6 @@
 """Runtime adapter layer (docs/architecture.md, Section 5)."""
 
-from claw.runtime.contract import (
+from sama.runtime.contract import (
     AgentRuntime,
     ApprovalDecision,
     ApprovalRequired,
@@ -34,7 +34,7 @@ from claw.runtime.contract import (
     run_event_adapter,
     validate_event_stream,
 )
-from claw.runtime.fake import FakeRuntime, FakeScript
+from sama.runtime.fake import FakeRuntime, FakeScript
 
 __all__ = [
     "AgentRuntime",

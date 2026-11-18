@@ -1,5 +1,5 @@
 [project]
-name = "claw"
+name = "sama"
 version = "0.1.0"
 description = "Cloud, multi-user assistant engine on the Claude Agent SDK and the OpenAI Agents SDK."
 readme = "README.md"

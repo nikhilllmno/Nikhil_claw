@@ -1,4 +1,4 @@
-# Nikhil_claw
+# Sama
 
 A cloud agent engine with Hermes-level features, built on the Claude Agent SDK and the OpenAI Agents SDK.
 
@@ -9,7 +9,7 @@ Status: M1 (core engine) in progress. The runtime contract and the fake runtime 
 You need [uv](https://docs.astral.sh/uv/). uv installs Python 3.12.
 
 ```bash
-uv sync                      # install claw and the dev tools
+uv sync                      # install sama and the dev tools
 uv run pytest                # tests
 uv run ruff check .          # lint
 uv run ruff format .         # format
@@ -25,8 +25,8 @@ uv sync --group runtime-claude   # claude-agent-sdk
 uv sync --group runtime-openai   # openai-agents
 ```
 
-Code layout: `src/claw/runtime/contract.py` is the runtime contract (architecture Section 5.1).
-`src/claw/runtime/fake.py` is the scripted runtime for tests.
+Code layout: `src/sama/runtime/contract.py` is the runtime contract (architecture Section 5.1).
+`src/sama/runtime/fake.py` is the scripted runtime for tests.
 
 ## Docs
 

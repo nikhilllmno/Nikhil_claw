@@ -4,11 +4,12 @@ import subprocess
 import sys
 import textwrap
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from claw.runtime import (
+from sama.runtime import (
     ApprovalRequired,
     Audience,
     ContextFile,
@@ -20,6 +21,7 @@ from claw.runtime import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunRequest,
     RunScope,
     RuntimeKind,
     RuntimeRegistry,
@@ -33,8 +35,8 @@ from claw.runtime import (
     run_event_adapter,
     validate_event_stream,
 )
-from claw.runtime.contract import CONTEXT_FILE_MAX_CHARS, AgentRuntime
-from tests.support import make_config, make_scope
+from sama.runtime.contract import CONTEXT_FILE_MAX_CHARS, AgentRuntime
+from tests.support import make_config, make_request, make_scope
 
 # --- RunScope ---------------------------------------------------------------------------------
 
@@ -134,7 +136,7 @@ def test_duplicate_names_are_rejected() -> None:
     tool = ToolSchema(name="t", description="")
     with pytest.raises(ValidationError, match="duplicate tool name: t"):
         RunConfig(runtime=RuntimeKind.FAKE, model="m", tool_schemas=(tool, tool))
-    server = McpServerConfig(name="claw", url="https://x")
+    server = McpServerConfig(name="sama", url="https://x")
     with pytest.raises(ValidationError, match="duplicate MCP server name"):
         RunConfig(runtime=RuntimeKind.FAKE, model="m", mcp_servers=(server, server))
 
@@ -249,3 +251,43 @@ def test_registry() -> None:
         registry.register(FakeRuntime())
     with pytest.raises(UnknownRuntimeError):
         registry.get(RuntimeKind.CLAUDE_AGENT_SDK)
+
+
+# --- immutability of JSON fields and bytes in JSON ----------------------------------------------
+
+
+def test_tool_schema_cannot_change_after_validation() -> None:
+    source: dict[str, Any] = {"type": "object", "properties": {"q": {"type": "string"}}}
+    tool = ToolSchema(name="t", description="d", input_schema=source)
+    config = RunConfig(runtime=RuntimeKind.FAKE, model="m", tool_schemas=(tool,))
+    before = config.fingerprint()
+    # A change to the input after validation does not reach the model.
+    source["properties"]["q"]["type"] = "integer"
+    # A change through the model fails, also in nested values.
+    with pytest.raises(TypeError):
+        config.tool_schemas[0].input_schema["type"] = "array"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        config.tool_schemas[0].input_schema["properties"]["q"]["type"] = "integer"
+    assert config.fingerprint() == before
+    assert config.tool_schemas[0].model_dump()["input_schema"] == {
+        "type": "object",
+        "properties": {"q": {"type": "string"}},
+    }
+
+
+def test_tool_call_arguments_cannot_change() -> None:
+    event = ToolCallStarted(call_id="c1", name="n", arguments={"items": [{"a": 1}]})
+    with pytest.raises(TypeError):
+        event.arguments["items"][0]["a"] = 2
+    assert run_event_adapter.validate_json(run_event_adapter.dump_json(event)) == event
+
+
+def test_any_runtime_state_bytes_round_trip_through_json() -> None:
+    state = bytes(range(256))
+    event = RunCompleted(output="x", runtime_state=state)
+    parsed = run_event_adapter.validate_json(run_event_adapter.dump_json(event))
+    assert isinstance(parsed, RunCompleted)
+    assert parsed.runtime_state == state
+    request = make_request(runtime_state=b"\xff\x00")
+    parsed_request = RunRequest.model_validate_json(request.model_dump_json())
+    assert parsed_request.runtime_state == b"\xff\x00"
