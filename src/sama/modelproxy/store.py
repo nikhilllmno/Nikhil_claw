@@ -13,7 +13,8 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import ColumnElement, func, insert, select
+from sqlalchemy import ColumnElement, func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import ModelCall, Org
@@ -26,6 +27,8 @@ class CallRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    call_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    """One id per provider call. A second write of the same record does nothing."""
     org_id: str
     workspace_id: str
     session_id: str
@@ -79,7 +82,8 @@ class MemoryUsageStore:
         self.limits = limits if limits is not None else {}
 
     async def record(self, call: CallRecord) -> None:
-        self.calls.append(call)
+        if all(c.call_id != call.call_id for c in self.calls):
+            self.calls.append(call)
 
     async def run_spend(self, org_id: str, run_id: str) -> Spend:
         calls = [c for c in self.calls if c.org_id == org_id and c.run_id == run_id]
@@ -121,6 +125,7 @@ class PostgresUsageStore:
 
     async def record(self, call: CallRecord) -> None:
         values: dict[str, Any] = {
+            "call_id": call.call_id,
             "org_id": uuid.UUID(call.org_id),
             "workspace_id": uuid.UUID(call.workspace_id),
             "session_id": uuid.UUID(call.session_id),
@@ -142,7 +147,11 @@ class PostgresUsageStore:
             "created_at": call.created_at,
         }
         async with self._engine.begin() as connection:
-            await connection.execute(insert(ModelCall).values(**values))
+            await connection.execute(
+                insert(ModelCall)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[ModelCall.call_id])
+            )
 
     async def run_spend(self, org_id: str, run_id: str) -> Spend:
         query = select(

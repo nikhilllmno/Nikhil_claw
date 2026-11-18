@@ -109,6 +109,8 @@ class _SseLines:
         events: list[bytes] = []
         line_start = 0
         while (end := self._buffer.find(b"\n", max(start, line_start))) >= 0:
+            if end - line_start > self._limit:
+                return self._overflow(events)
             line = bytes(self._buffer[line_start:end]).rstrip(b"\r")
             line_start = end + 1
             if not line:
@@ -116,13 +118,20 @@ class _SseLines:
                     events.append(b"\n".join(self._data))
                     self._data, self._data_bytes = [], 0
             elif line.startswith(b"data:"):
-                self._data.append(line[5:].lstrip(b" "))
                 self._data_bytes += len(line)
+                if self._data_bytes > self._limit:
+                    return self._overflow(events)
+                self._data.append(line[5:].lstrip(b" "))
         del self._buffer[:line_start]
-        if len(self._buffer) > self._limit or self._data_bytes > self._limit:
-            self.overflow = True
-            self._buffer.clear()
-            self._data.clear()
+        if len(self._buffer) > self._limit:
+            return self._overflow(events)
+        return events
+
+    def _overflow(self, events: list[bytes]) -> list[bytes]:
+        """Stops the parser. The complete events before the large one stay."""
+        self.overflow = True
+        self._buffer.clear()
+        self._data.clear()
         return events
 
 

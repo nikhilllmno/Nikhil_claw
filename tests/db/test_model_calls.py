@@ -87,3 +87,16 @@ async def test_a_negative_cost_is_refused(engine: AsyncEngine, world: World) -> 
                 text("UPDATE model_calls SET cost_usd = -1 WHERE org_id = :org"),
                 {"org": world.ids["org-a"]},
             )
+
+
+async def test_a_second_write_of_the_same_record_does_nothing(
+    engine: AsyncEngine, world: World
+) -> None:
+    store = PostgresUsageStore(engine)
+    org_b, run = str(world.ids["org-b"]), str(world.ids["run:b1-bob"])
+    before = await store.run_spend(org_b, run)
+    record = call(world, "b1-bob", cost="0.5")
+    await store.record(record)
+    await store.record(record)
+    after = await store.run_spend(org_b, run)
+    assert after.cost_usd - before.cost_usd == Decimal("0.5")

@@ -187,3 +187,18 @@ def test_an_estimate_is_high_and_keeps_the_seen_counts() -> None:
     estimate = estimate_counts(1000, {"max_output_tokens": 500}, seen)
     assert estimate == TokenCounts(input=496, cache_read=4, output=900)
     assert estimate_counts(10, {}, TokenCounts()).output == DEFAULT_OUTPUT_ESTIMATE
+
+
+def test_a_large_event_that_ends_in_the_same_chunk_stops_the_reader() -> None:
+    lines = _SseLines(limit=100)
+    assert lines.feed(b"data: " + b"x" * 200 + b"\n\n") == []
+    assert lines.overflow
+    many = _SseLines(limit=100)
+    assert many.feed(b"data: " + b"y" * 60 + b"\ndata: " + b"z" * 60 + b"\n\n") == []
+    assert many.overflow
+
+
+def test_the_events_before_a_large_one_stay() -> None:
+    lines = _SseLines(limit=100)
+    assert lines.feed(b"data: ok\n\ndata: " + b"x" * 200 + b"\n\n") == [b"ok"]
+    assert lines.overflow

@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -25,6 +26,8 @@ from sama.modelproxy import (
     ProxySettings,
     TokenCounts,
 )
+from sama.modelproxy import app as app_module
+from sama.modelproxy.app import QUEUE_CHUNKS, UpstreamStreamError
 from sama.modelproxy.prices import Provider
 from sama.modelproxy.store import CallRecord
 from sama.modelproxy.usage import Endpoint
@@ -577,3 +580,185 @@ async def test_openai_calls_use_the_standard_tier(harness: Harness) -> None:
         )
         assert response.status_code == 200
         assert harness.upstream.body()["service_tier"] == "default"
+
+
+async def test_a_broken_provider_stream_is_an_error_for_the_client() -> None:
+    async def stream() -> AsyncIterator[bytes]:
+        yield anthropic_stream().split(b"\n\n")[0] + b"\n\n"
+        raise httpx.ReadError("the connection broke")
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer)
+    transport = httpx.ASGITransport(app=proxy.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://p") as client:
+        with pytest.raises(UpstreamStreamError):
+            await client.post(
+                "/anthropic/v1/messages",
+                json={"model": MODEL, "stream": True, "max_tokens": 100, "messages": []},
+                headers={"x-api-key": signer.issue(make_scope("run-1"), ttl_s=60)},
+            )
+    await proxy.aclose()
+    [call] = store.calls
+    assert call.usage_estimated
+    assert call.counts.output == 100
+
+
+async def test_a_slow_client_holds_only_a_few_chunks() -> None:
+    """The ASGI app is driven directly, with a client that does not read for a while."""
+    sent = 0
+
+    async def stream() -> AsyncIterator[bytes]:
+        nonlocal sent
+        for _ in range(QUEUE_CHUNKS * 4):
+            sent += 1
+            yield b": keep-alive\n\n"
+        yield anthropic_stream()
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer)
+    app = proxy.app()
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    body = json.dumps({"model": MODEL, "stream": True, "messages": []}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/anthropic/v1/messages",
+        "raw_path": b"/anthropic/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", token.encode()), (b"content-type", b"application/json")],
+        "server": ("proxy", 80),
+        "client": ("test", 1),
+    }
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    reading = asyncio.Event()
+    received: list[bytes] = []
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        await asyncio.Event().wait()  # no disconnect
+        return {}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.body":
+            await reading.wait()
+            received.append(message.get("body", b""))
+
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.sleep(0.2)  # the client does not read; the pump must wait
+    assert sent <= QUEUE_CHUNKS + 3
+    reading.set()
+    async with asyncio.timeout(5):
+        await task
+    await proxy.aclose()
+    assert sent == QUEUE_CHUNKS * 4
+    assert b"".join(received).endswith(anthropic_stream())
+    assert store.calls[0].counts == TokenCounts(input=50, output=7)
+
+
+async def test_a_retried_record_is_counted_once() -> None:
+    class CommitThenFail(MemoryUsageStore):
+        """The first write commits, but the answer is lost."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes = 0
+
+        async def record(self, call: CallRecord) -> None:
+            self.writes += 1
+            await super().record(call)
+            if self.writes == 1:
+                raise ConnectionError("the answer was lost")
+
+    upstream, store, signer = Upstream(), CommitThenFail(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, record_retry_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+        response = await client.post(
+            "/anthropic/v1/messages",
+            json={"model": MODEL, "messages": []},
+            headers={"x-api-key": signer.issue(make_scope("run-1"), ttl_s=60)},
+        )
+    await proxy.aclose()
+    assert response.status_code == 200
+    assert store.writes == 2
+    assert len(store.calls) == 1
+
+
+async def test_the_fence_holds_while_a_flush_writes() -> None:
+    """A record stays in the fence until its write succeeds, also during the write."""
+    gate = asyncio.Event()
+
+    class SlowStore(FailingStore):
+        async def record(self, call: CallRecord) -> None:
+            if not self.broken:
+                await gate.wait()
+            await super().record(call)
+
+    upstream, store, signer = Upstream(), SlowStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, record_retry_s=0.0)
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    payload = {"model": MODEL, "messages": []}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+
+        async def call() -> httpx.Response:
+            return await client.post(
+                "/anthropic/v1/messages", json=payload, headers={"x-api-key": token}
+            )
+
+        assert (await call()).status_code == 200
+        assert len(proxy.unrecorded) == 1
+        store.broken = False
+        first = asyncio.create_task(call())  # starts a flush that waits on the gate
+        await asyncio.sleep(0.05)
+        assert len(proxy.unrecorded) == 1
+        second = asyncio.create_task(call())
+        await asyncio.sleep(0.05)
+        assert not second.done()  # it waits for the flush; it does not pass the fence
+        gate.set()
+        assert (await first).status_code == 200
+        assert (await second).status_code == 200
+    await proxy.aclose()
+    assert len(upstream.requests) == 3
+
+
+async def test_close_stops_open_streams_and_records_them() -> None:
+    async def stream() -> AsyncIterator[bytes]:
+        yield anthropic_stream().split(b"\n\n")[0] + b"\n\n"
+        await asyncio.sleep(60)
+        yield b""
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer)
+    transport = httpx.ASGITransport(app=proxy.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://p") as client:
+
+        async def read() -> None:
+            async with client.stream(
+                "POST",
+                "/anthropic/v1/messages",
+                json={"model": MODEL, "stream": True, "max_tokens": 300, "messages": []},
+                headers={"x-api-key": signer.issue(make_scope("run-1"), ttl_s=60)},
+            ) as response:
+                async for _ in response.aiter_raw():
+                    pass
+
+        reader = asyncio.create_task(read())
+        await asyncio.sleep(0.1)
+        with patch.object(app_module, "CLOSE_WAIT_S", 0.1):
+            async with asyncio.timeout(5):
+                await proxy.aclose()
+        with pytest.raises(UpstreamStreamError):
+            await reader
+    [call] = store.calls
+    assert call.usage_estimated
+    assert call.counts.output == 300

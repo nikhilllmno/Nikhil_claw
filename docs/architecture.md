@@ -1299,16 +1299,24 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
    computes the cost and writes one row to `model_calls` before the response ends.
 
 **Missing usage is never free.** A pump task reads the provider response, separately from
-the client. If the client stops reading, the pump reads on for at most 10 minutes
-(`drain_s`) to get the final usage. If the final usage still is not known (the stream
+the client. It holds at most 16 chunks for a slow client, then it waits, so a slow client
+does not make the proxy keep the whole response. If the client stops reading, the pump drops
+the held chunks and reads on for at most 10 minutes (`drain_s`) to get the final usage. If
+the provider stream breaks, the client stream ends with an error, not with a clean end. If the final usage still is not known (the stream
 stopped, or a stream event is larger than 16 MB), the proxy records a high estimate and sets
 `usage_estimated`: one input token for each 2 bytes of the request, and the output limit of
 the request (64,000 tokens if the request has none). The seen counts stay if they are higher.
 
-**A lost record blocks the org.** The proxy tries a record write 3 times. If all fail, it
-keeps the record in memory and refuses new calls of that org with `503`. Each new call tries
-the write again. A restart of the proxy loses these records. M1.10 moves them to a durable
-queue.
+**A lost record blocks the org.** Each record has a `call_id`, and a second write of the
+same record does nothing, so a retry cannot count a call twice. The proxy tries a record
+write 3 times. If all fail, it keeps the record in memory and refuses new calls of that org
+with `503`. The next call of any org tries the write again, under a lock. The record stays
+in the block list until its write succeeds.
+
+**Stop.** When the proxy stops, open streams get 5 seconds to end. Then each pump stops
+reading and writes its record, with an estimate if the usage is not final. A record that
+still is not written goes to the log as JSON, for a manual fix. M1.10 moves records that
+wait to a durable queue.
 
 **Price table.** `src/sama/modelproxy/prices.toml` has USD per million tokens for input,
 output, cache reads, short cache writes (Anthropic 5 minutes, OpenAI 30 minutes), and long
@@ -1324,7 +1332,7 @@ The `Usage` in the run events is what the adapter sees. The `model_calls` record
 of truth for cost (D15). The conformance suite checks that the tokens of a run match the
 proxy record.
 
-**`model_calls`** (migration `0002`): `org_id`, `workspace_id`, `session_id`, `run_id`,
+**`model_calls`** (migration `0002`): `call_id` (unique), `org_id`, `workspace_id`, `session_id`, `run_id`,
 `user_id`, `provider`, `model`, `endpoint`, `status_code`, the five token counts,
 `web_search_requests`, `usage_estimated`, `cost_usd`, `duration_ms`, and `created_at`. The row points to its run
 with `(org_id, session_id, run_id)`. RLS follows the session, as for `run_events`. Until the

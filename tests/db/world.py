@@ -173,6 +173,7 @@ def plan(
         )
         add(
             ModelCall,
+            call_id=uuid.uuid4(),
             org_id=org_id,
             workspace_id=ids[workspace],
             session_id=ids[session],

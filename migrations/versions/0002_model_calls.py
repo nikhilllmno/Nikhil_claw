@@ -20,6 +20,7 @@ def upgrade() -> None:
     op.create_table(
         "model_calls",
         sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("call_id", sa.UUID(), nullable=False),
         sa.Column("org_id", sa.UUID(), nullable=False),
         sa.Column("workspace_id", sa.UUID(), nullable=False),
         sa.Column("session_id", sa.UUID(), nullable=False),
@@ -78,6 +79,7 @@ def upgrade() -> None:
             ["org_id"], ["orgs.id"], name=op.f("fk_model_calls_org_id_orgs"), ondelete="CASCADE"
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_model_calls")),
+        sa.UniqueConstraint("call_id", name=op.f("uq_model_calls_call_id")),
     )
     for columns in (
         ["org_id", "created_at"],
