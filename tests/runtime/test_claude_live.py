@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +32,11 @@ from sama.runtime import (
     RuntimeKind,
     TextDelta,
     ToolCallStarted,
+    Usage,
     validate_event_stream,
 )
 from sama.runtime.claude import ClaudeRuntime, ClaudeSettings, GateDecision
+from tests.live_budget import LIVE_SPEND
 from tests.support import collect, make_scope
 
 pytestmark = [
@@ -72,16 +74,29 @@ def _runtime(cwd: Path) -> ClaudeRuntime:
 
 
 def _request(text: str, run_id: str, state: bytes | None = None) -> RunRequest:
-    return RunRequest(scope=make_scope(run_id), input=text, config=_config(), runtime_state=state)
+    return RunRequest(
+        scope=make_scope(run_id),
+        input=text,
+        config=_config(),
+        runtime_state=state,
+        budget=LIVE_SPEND.budget(),
+    )
+
+
+async def _collect(stream: AsyncIterator[RunEvent], start: Usage | None = None) -> list[RunEvent]:
+    """Collects a stream and adds its cost to the shared live cap (tests/live_budget.py)."""
+    events = await collect(stream)
+    LIVE_SPEND.record(events, already_spent=start)
+    return events
 
 
 async def test_streams_text_and_resumes_the_session(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    first = await collect(runtime.run(_request("Remember the word 'tamarind'. Reply OK.", "r1")))
+    first = await _collect(runtime.run(_request("Remember the word 'tamarind'. Reply OK.", "r1")))
     done = validate_event_stream(first)
     assert isinstance(done, RunCompleted), done
     assert any(isinstance(e, TextDelta) for e in first)
-    second = await collect(
+    second = await _collect(
         runtime.run(_request("Which word did I ask you to remember?", "r2", done.runtime_state))
     )
     answer = validate_event_stream(second)
@@ -95,7 +110,7 @@ def _exists(path: Path) -> bool:
 
 async def _pause(runtime: ClaudeRuntime, marker: Path) -> ApprovalRequired:
     prompt = f"Run this exact shell command with the Bash tool: touch {marker}"
-    events = await collect(runtime.run(_request(prompt, "r-approval")))
+    events = await _collect(runtime.run(_request(prompt, "r-approval")))
     paused = validate_event_stream(events)
     assert isinstance(paused, ApprovalRequired), paused
     assert paused.tool_name == "Bash"
@@ -112,6 +127,7 @@ def _resume(paused: ApprovalRequired, decision: ApprovalDecision) -> ResumeReque
         decision=decision,
         reason="not now" if decision is ApprovalDecision.REJECT else None,
         runtime_state=paused.runtime_state,
+        budget=LIVE_SPEND.budget(already_spent=paused.usage),
     )
 
 
@@ -119,7 +135,7 @@ async def test_approve_runs_the_deferred_call(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     marker = tmp_path / "approved.txt"
     paused = await _pause(runtime, marker)
-    events = await collect(runtime.resume(_resume(paused, ApprovalDecision.APPROVE)))
+    events = await _collect(runtime.resume(_resume(paused, ApprovalDecision.APPROVE)), paused.usage)
     assert isinstance(validate_event_stream(events, start=paused.usage), RunCompleted)
     assert _exists(marker)
 
@@ -128,7 +144,7 @@ async def test_reject_does_not_run_the_deferred_call(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     marker = tmp_path / "rejected.txt"
     paused = await _pause(runtime, marker)
-    events = await collect(runtime.resume(_resume(paused, ApprovalDecision.REJECT)))
+    events = await _collect(runtime.resume(_resume(paused, ApprovalDecision.REJECT)), paused.usage)
     terminal = validate_event_stream(events, start=paused.usage)
     assert isinstance(terminal, (RunCompleted, ApprovalRequired)), terminal
     assert not _exists(marker)
@@ -148,6 +164,7 @@ async def test_cancel_ends_the_run_within_ten_seconds(tmp_path: Path) -> None:
     events.extend([e async for e in stream])
     await cancel
     elapsed = time.monotonic() - started
+    LIVE_SPEND.record(events)
     terminal = validate_event_stream(events)
     assert isinstance(terminal, RunFailed), terminal
     assert terminal.code is FailureCode.CANCELLED
