@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete, insert, text
@@ -24,6 +25,7 @@ from sama.db.models import (
     AuditEntry,
     Membership,
     Message,
+    ModelCall,
     Org,
     Run,
     RunEvent,
@@ -168,6 +170,22 @@ def plan(
             session_id=ids[session],
             channel="web",
             external_key=f"web:{ids[session]}",
+        )
+        add(
+            ModelCall,
+            org_id=org_id,
+            workspace_id=ids[workspace],
+            session_id=ids[session],
+            run_id=run_id,
+            user_id=ids[owner] if owner else None,
+            provider="anthropic",
+            model="claude-sonnet-5-5",
+            endpoint="messages",
+            status_code=200,
+            input_tokens=10,
+            output_tokens=5,
+            cost_usd=Decimal("0.00007"),
+            duration_ms=12,
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")

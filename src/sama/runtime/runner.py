@@ -141,8 +141,13 @@ def claude_cli_env(token: str, model_url: str | None) -> dict[str, str]:
         "ANTHROPIC_API_KEY": token,
     }
     if model_url:
-        env["ANTHROPIC_BASE_URL"] = model_url
+        env["ANTHROPIC_BASE_URL"] = anthropic_base_url(model_url)
     return env
+
+
+def anthropic_base_url(model_url: str) -> str:
+    """The Anthropic route of the model proxy (docs/architecture.md, Section 16.6)."""
+    return model_url.rstrip("/") + "/anthropic"
 
 
 def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:

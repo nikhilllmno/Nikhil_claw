@@ -3,8 +3,8 @@
 A cloud agent engine with Hermes-level features, built on the Claude Agent SDK and the OpenAI Agents SDK.
 
 Status: M1 (core engine) in progress. The runtime contract, the fake runtime, the Claude
-Agent SDK adapter, the conformance suite, the database with row-level security, and the
-sandbox providers with the runner are done.
+Agent SDK adapter, the conformance suite, the database with row-level security, the
+sandbox providers with the runner, and the model proxy are done.
 
 ## Development
 
@@ -55,6 +55,26 @@ uv run python -m sama.sandbox.template
 SAMA_LIVE_TESTS=1 uv run pytest -m live tests/sandbox
 ```
 
+### Model proxy
+
+The model proxy is the only path from a sandbox to a model provider (architecture Section
+16.6). It holds the provider keys, accepts only run tokens, enforces budgets, and records the
+cost of each call. Start it on the control plane:
+
+```bash
+export SAMA_RUN_TOKEN_KEY=...   # the run token key of the orchestrator, 32 bytes or more
+export ANTHROPIC_API_KEY=...    # and OPENAI_API_KEY for OpenAI models
+uv run python -m sama.modelproxy --port 8787
+```
+
+Set `SandboxSettings.model_url` to the proxy URL. The runner then gives the Claude CLI
+`<url>/anthropic` and the run token as its key. Prices are in
+`src/sama/modelproxy/prices.toml`. A live test runs a real Claude call through the proxy:
+
+```bash
+SAMA_LIVE_TESTS=1 uv run pytest -m live tests/modelproxy
+```
+
 ### Database
 
 Sama uses Supabase Postgres (architecture Section 17.1). The database tests need a Postgres
@@ -92,6 +112,9 @@ SAMA_LIVE_TESTS=1 uv run pytest tests/db/test_supabase_live.py
 - `src/sama/runtime/fake.py`: the scripted runtime for tests.
 - `src/sama/runtime/claude.py`: the Claude Agent SDK adapter (architecture Section 5.3).
 - `src/sama/db/`: SQLAlchemy models and engine helpers. `migrations/`: Alembic migrations.
+- `src/sama/sandbox/`, `src/sama/orchestrator/`, `src/sama/runtime/runner.py`: the sandbox
+  providers, the orchestrator, and the runner (architecture Section 16.2).
+- `src/sama/modelproxy/`: the model proxy (architecture Section 16.6).
 
 ## Docs
 

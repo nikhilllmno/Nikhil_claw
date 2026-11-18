@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import jwt
 import pytest
 
+from sama.runtime import Budget
 from sama.tenancy import RUN_TOKEN_MAX_TTL_S, InvalidRunTokenError, RunTokenSigner
 from tests.support import make_scope
 
@@ -155,3 +158,31 @@ def test_errors_and_repr_do_not_show_the_token_or_the_key() -> None:
 def test_garbage_is_refused() -> None:
     with pytest.raises(InvalidRunTokenError):
         RunTokenSigner(KEY).verify("not-a-jwt")
+
+
+def test_the_token_carries_the_model_limits_of_the_budget() -> None:
+    signer = RunTokenSigner(KEY)
+    budget = Budget(max_tokens=5000, max_cost_usd=Decimal("0.25"), max_turns=3)
+    claims = signer.verify(signer.issue(make_scope(), ttl_s=60, budget=budget))
+    assert claims.max_tokens == 5000
+    assert claims.max_cost_usd == Decimal("0.25")
+    unlimited = signer.verify(signer.issue(make_scope(), ttl_s=60))
+    assert (unlimited.max_tokens, unlimited.max_cost_usd) == (None, None)
+
+
+def test_a_changed_budget_breaks_the_signature() -> None:
+    signer = RunTokenSigner(KEY)
+    token = signer.issue(make_scope(), ttl_s=60, budget=Budget(max_cost_usd=Decimal("0.25")))
+    raw = jwt.decode(token, options={"verify_signature": False})
+    raw["bmc"] = "1000"
+    forged = jwt.encode(raw, b"x" * 32, algorithm="HS256")
+    with pytest.raises(InvalidRunTokenError):
+        signer.verify(forged)
+
+
+def test_a_bad_budget_claim_is_refused() -> None:
+    raw = {"iss": "sama", "aud": "sama-run", "sub": "run-1", "iat": 0, "exp": 60, "jti": "j"}
+    raw |= {"org": "o", "wsp": "w", "ses": "s", "bmc": "lots"}
+    token = jwt.encode(raw, KEY, algorithm="HS256")
+    with pytest.raises(InvalidRunTokenError):
+        RunTokenSigner(KEY, clock=lambda: 10.0).verify(token)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Final
 
 from sqlalchemy import (
@@ -23,6 +24,7 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    Numeric,
     Text,
     UniqueConstraint,
     func,
@@ -50,6 +52,8 @@ TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
 CHANNELS: Final = ("web", "slack", "telegram", "extension")
 ACTOR_KINDS: Final = ("user", "agent", "system")
+PROVIDERS: Final = ("anthropic", "openai")
+MODEL_ENDPOINTS: Final = ("messages", "count_tokens", "responses", "chat_completions")
 
 
 def _one_of(column: str, values: tuple[str, ...]) -> str:
@@ -375,4 +379,57 @@ class AuditEntry(Base):
     target_id: Mapped[str | None] = mapped_column(Text)
     run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     details: Mapped[dict[str, Any]] = _json()
+    created_at: Mapped[datetime] = _created_at()
+
+
+class ModelCall(Base):
+    """One call through the model proxy (docs/architecture.md, Section 16.6)."""
+
+    __tablename__ = "model_calls"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id", "session_id"],
+            ["sessions.org_id", "sessions.workspace_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("provider", PROVIDERS), name="provider"),
+        CheckConstraint(_one_of("endpoint", MODEL_ENDPOINTS), name="endpoint"),
+        CheckConstraint(
+            "input_tokens >= 0 AND output_tokens >= 0 AND cache_read_tokens >= 0"
+            " AND cache_write_tokens >= 0 AND cache_write_long_tokens >= 0"
+            " AND web_search_requests >= 0 AND cost_usd >= 0 AND duration_ms >= 0",
+            name="counts",
+        ),
+        Index(None, "org_id", "run_id"),
+        Index(None, "org_id", "created_at"),
+        Index(None, "org_id", "user_id", "created_at"),
+        Index(None, "org_id", "session_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cache_write_long_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    web_search_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = _created_at()

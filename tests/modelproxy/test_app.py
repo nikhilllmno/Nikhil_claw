@@ -1,0 +1,461 @@
+"""The model proxy service (docs/architecture.md, Section 16.6).
+
+The upstream provider is an ``httpx.MockTransport``. The tests call the proxy app in process.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+
+import httpx
+import pytest
+from pydantic import SecretStr
+
+from sama.modelproxy import (
+    MemoryUsageStore,
+    ModelProxy,
+    OrgLimits,
+    PriceTable,
+    ProxySettings,
+    TokenCounts,
+)
+from sama.modelproxy.prices import Provider
+from sama.modelproxy.store import CallRecord
+from sama.modelproxy.usage import Endpoint
+from sama.runtime import Budget
+from sama.tenancy.run_token import RunTokenSigner
+from tests.conformance.scripted_model import serve
+from tests.support import make_scope
+
+KEY = b"k" * 32
+ANTHROPIC_KEY = "sk-ant-upstream"
+OPENAI_KEY = "sk-openai-upstream"
+NOW = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
+MODEL = "claude-sonnet-5-5"
+
+
+def anthropic_message(output_tokens: int = 10) -> dict[str, Any]:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "hi"}],
+        "usage": {"input_tokens": 100, "output_tokens": output_tokens},
+    }
+
+
+def anthropic_stream() -> bytes:
+    events: list[dict[str, Any]] = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 50, "output_tokens": 1}}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+        {"type": "message_delta", "usage": {"output_tokens": 7}},
+        {"type": "message_stop"},
+    ]
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+
+
+class Body(httpx.AsyncByteStream):
+    """A response body that is not read yet, like a real network response."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._data
+
+
+def reply(
+    status: int = 200,
+    *,
+    json_body: Any = None,
+    content: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    data = json.dumps(json_body).encode() if json_body is not None else content
+    sent = {"content-type": "application/json"} if json_body is not None else {}
+    return httpx.Response(status, headers=sent | (headers or {}), stream=Body(data))
+
+
+@dataclass
+class Upstream:
+    """The fake provider. ``reply`` makes the response for a request."""
+
+    requests: list[httpx.Request] = field(default_factory=list)
+    reply: Callable[[httpx.Request], httpx.Response] = field(
+        default=lambda _: reply(json_body=anthropic_message())
+    )
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self.reply(request)
+
+    def body(self, index: int = -1) -> dict[str, Any]:
+        data: dict[str, Any] = json.loads(self.requests[index].content)
+        return data
+
+
+@dataclass
+class Harness:
+    upstream: Upstream
+    store: MemoryUsageStore
+    signer: RunTokenSigner
+    client: httpx.AsyncClient
+    proxy: ModelProxy
+
+    def token(self, budget: Budget | None = None, *, shared: bool = False) -> str:
+        """A token for a private session of ``user-1``, or for a shared session."""
+        return self.signer.issue(make_scope("run-1", shared=shared), ttl_s=600, budget=budget)
+
+    async def messages(
+        self,
+        token: str | None = None,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        sent = {"x-api-key": token if token is not None else self.token(), **(headers or {})}
+        payload = body if body is not None else {"model": MODEL, "max_tokens": 10, "messages": []}
+        return await self.client.post("/anthropic/v1/messages", json=payload, headers=sent)
+
+
+def make_proxy(
+    upstream: Upstream, store: MemoryUsageStore, signer: RunTokenSigner, **settings: Any
+) -> ModelProxy:
+    defaults: dict[str, Any] = {
+        "anthropic_url": "https://anthropic.test",
+        "openai_url": "https://openai.test",
+        "anthropic_key": SecretStr(ANTHROPIC_KEY),
+        "openai_key": SecretStr(OPENAI_KEY),
+    }
+    return ModelProxy(
+        signer=signer,
+        store=store,
+        prices=PriceTable.load(),
+        settings=ProxySettings(**(defaults | settings)),
+        clock=lambda: NOW,
+        transport=httpx.MockTransport(upstream.handler),
+    )
+
+
+@pytest.fixture
+async def harness() -> AsyncIterator[Harness]:
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer)
+    transport = httpx.ASGITransport(app=proxy.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as client:
+        yield Harness(upstream, store, signer, client, proxy)
+    await proxy.aclose()
+
+
+def record(cost: str, *, user_id: str | None = None, at: datetime = NOW) -> CallRecord:
+    return CallRecord(
+        org_id="org-1",
+        workspace_id="ws-1",
+        session_id="sess-1",
+        run_id="other-run",
+        user_id=user_id,
+        provider=Provider.ANTHROPIC,
+        model=MODEL,
+        endpoint=Endpoint.MESSAGES,
+        status_code=200,
+        counts=TokenCounts(),
+        cost_usd=Decimal(cost),
+        duration_ms=1,
+        created_at=at,
+    )
+
+
+# Authentication -------------------------------------------------------------------------------
+
+
+async def test_a_call_without_a_token_is_refused(harness: Harness) -> None:
+    response = await harness.messages(token="")
+    assert response.status_code == 401
+    assert response.json()["error"]["type"] == "authentication_error"
+    assert harness.upstream.requests == []
+
+
+async def test_a_token_from_another_key_is_refused(harness: Harness) -> None:
+    other = RunTokenSigner(b"x" * 32).issue(make_scope("run-1"), ttl_s=600)
+    response = await harness.messages(token=other)
+    assert response.status_code == 401
+    assert harness.upstream.requests == []
+
+
+async def test_openai_errors_use_the_openai_format(harness: Harness) -> None:
+    response = await harness.client.post(
+        "/openai/v1/responses", json={"model": "gpt-6-luna", "input": "hi"}
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "authentication_error"
+
+
+async def test_a_bearer_token_is_accepted(harness: Harness) -> None:
+    harness.upstream.reply = lambda _: reply(
+        json_body={"usage": {"input_tokens": 5, "output_tokens": 1}}
+    )
+    response = await harness.client.post(
+        "/openai/v1/responses",
+        json={"model": "gpt-6-luna", "input": "hi"},
+        headers={"authorization": f"Bearer {harness.token()}"},
+    )
+    assert response.status_code == 200
+    assert harness.upstream.requests[0].headers["authorization"] == f"Bearer {OPENAI_KEY}"
+
+
+# Request checks -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"max_tokens": 1}, "no model"),
+        ({"model": "claude-unknown-9"}, "not allowed"),
+        ({"model": MODEL, "speed": "fast"}, "speed"),
+        ({"model": MODEL, "inference_geo": "us"}, "inference_geo"),
+    ],
+)
+async def test_a_request_that_cannot_be_priced_is_refused(
+    harness: Harness, body: dict[str, Any], message: str
+) -> None:
+    response = await harness.messages(body=body)
+    assert response.status_code == 400
+    assert message in response.json()["error"]["message"]
+    assert harness.upstream.requests == []
+
+
+@pytest.mark.parametrize("extra", [{"background": True}, {"service_tier": "flex"}])
+async def test_openai_options_with_other_prices_are_refused(
+    harness: Harness, extra: dict[str, Any]
+) -> None:
+    response = await harness.client.post(
+        "/openai/v1/responses",
+        json={"model": "gpt-6-luna", "input": "hi", **extra},
+        headers={"authorization": f"Bearer {harness.token()}"},
+    )
+    assert response.status_code == 400
+
+
+async def test_a_body_that_is_not_json_is_refused(harness: Harness) -> None:
+    response = await harness.client.post(
+        "/anthropic/v1/messages", content=b"[1, 2", headers={"x-api-key": harness.token()}
+    )
+    assert response.status_code == 400
+
+
+async def test_a_large_body_is_refused() -> None:
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, max_request_bytes=100)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/anthropic/v1/messages",
+            json={"model": MODEL, "messages": [{"role": "user", "content": "x" * 200}]},
+            headers={"x-api-key": signer.issue(make_scope("run-1"), ttl_s=60)},
+        )
+    await proxy.aclose()
+    assert response.status_code == 413
+    assert upstream.requests == []
+
+
+async def test_other_paths_are_not_found(harness: Harness) -> None:
+    response = await harness.client.post(
+        "/anthropic/v1/files", json={}, headers={"x-api-key": harness.token()}
+    )
+    assert response.status_code == 404
+    assert (await harness.client.get("/healthz")).json() == {"status": "ok"}
+
+
+# Forwarding -----------------------------------------------------------------------------------
+
+
+async def test_the_call_uses_the_provider_key_and_not_the_run_token(harness: Harness) -> None:
+    token = harness.token()
+    response = await harness.messages(
+        token=token,
+        headers={"anthropic-version": "2023-06-01", "anthropic-beta": "b1", "cookie": "c=1"},
+    )
+    assert response.status_code == 200
+    assert response.json() == anthropic_message()
+    sent = harness.upstream.requests[0]
+    assert str(sent.url) == "https://anthropic.test/v1/messages"
+    assert sent.headers["x-api-key"] == ANTHROPIC_KEY
+    assert sent.headers["anthropic-version"] == "2023-06-01"
+    assert sent.headers["anthropic-beta"] == "b1"
+    assert "cookie" not in sent.headers
+    assert token not in str(sent.headers)
+    assert token.encode() not in sent.content
+
+
+async def test_the_call_is_recorded_with_its_cost(harness: Harness) -> None:
+    await harness.messages()
+    [call] = harness.store.calls
+    assert (call.org_id, call.run_id, call.model) == ("org-1", "run-1", MODEL)
+    assert call.counts == TokenCounts(input=100, output=10)
+    # 100 input at 2 USD and 10 output at 10 USD per million tokens.
+    assert call.cost_usd == Decimal("0.0003")
+    assert call.status_code == 200
+
+
+async def test_a_stream_passes_through_unchanged_and_is_recorded(harness: Harness) -> None:
+    data = anthropic_stream()
+    harness.upstream.reply = lambda _: reply(
+        content=data, headers={"content-type": "text/event-stream"}
+    )
+    response = await harness.messages(body={"model": MODEL, "stream": True, "messages": []})
+    assert response.content == data
+    assert response.headers["content-type"] == "text/event-stream"
+    [call] = harness.store.calls
+    assert call.counts == TokenCounts(input=50, output=7)
+
+
+async def test_a_chat_completions_stream_asks_for_the_usage(harness: Harness) -> None:
+    harness.upstream.reply = lambda _: reply(
+        content=b'data: {"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 2}}\n\n'
+        b"data: [DONE]\n\n",
+    )
+    response = await harness.client.post(
+        "/openai/v1/chat/completions",
+        json={"model": "gpt-6-luna", "stream": True, "stream_options": {"x": 1}, "messages": []},
+        headers={"authorization": f"Bearer {harness.token()}"},
+    )
+    assert response.status_code == 200
+    assert harness.upstream.body()["stream_options"] == {"x": 1, "include_usage": True}
+    assert harness.store.calls[0].counts == TokenCounts(input=4, output=2)
+
+
+async def test_an_upstream_error_passes_through_and_is_recorded(harness: Harness) -> None:
+    error = {"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}
+    harness.upstream.reply = lambda _: reply(
+        429, json_body=error, headers={"retry-after": "3", "set-cookie": "a=b"}
+    )
+    response = await harness.messages()
+    assert response.status_code == 429
+    assert response.json() == error
+    assert response.headers["retry-after"] == "3"
+    assert "set-cookie" not in response.headers
+    [call] = harness.store.calls
+    assert (call.status_code, call.cost_usd) == (429, Decimal(0))
+
+
+async def test_an_unreachable_provider_gives_502(harness: Harness) -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route", request=request)
+
+    harness.upstream.reply = fail
+    response = await harness.messages()
+    assert response.status_code == 502
+    assert harness.store.calls == []
+
+
+async def test_a_provider_without_a_key_gives_503() -> None:
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, openai_key=None)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/openai/v1/responses",
+            json={"model": "gpt-6-luna", "input": "hi"},
+            headers={"authorization": f"Bearer {signer.issue(make_scope('r'), ttl_s=60)}"},
+        )
+    await proxy.aclose()
+    assert response.status_code == 503
+    assert upstream.requests == []
+
+
+async def test_count_tokens_is_not_recorded(harness: Harness) -> None:
+    harness.upstream.reply = lambda _: reply(json_body={"input_tokens": 12})
+    harness.store.limits["org-1"] = OrgLimits(model_usd_per_month=Decimal(0))
+    response = await harness.client.post(
+        "/anthropic/v1/messages/count_tokens",
+        json={"model": MODEL, "messages": []},
+        headers={"x-api-key": harness.token()},
+    )
+    assert response.json() == {"input_tokens": 12}
+    assert harness.store.calls == []
+
+
+# Budgets --------------------------------------------------------------------------------------
+
+
+async def test_the_run_cost_budget_refuses_the_next_call(harness: Harness) -> None:
+    token = harness.token(Budget(max_cost_usd=Decimal("0.0005")))
+    assert (await harness.messages(token=token)).status_code == 200  # 0.0003 USD
+    assert (await harness.messages(token=token)).status_code == 200  # 0.0006 USD in total
+    refused = await harness.messages(token=token)
+    assert refused.status_code == 402
+    assert refused.json()["error"] == {
+        "type": "budget_exceeded",
+        "message": "the run reached max_cost_usd",
+    }
+    assert len(harness.upstream.requests) == 2
+
+
+async def test_the_run_token_budget_refuses_the_next_call(harness: Harness) -> None:
+    token = harness.token(Budget(max_tokens=110))
+    assert (await harness.messages(token=token)).status_code == 200  # 110 tokens
+    refused = await harness.messages(token=token)
+    assert refused.status_code == 402
+    assert "max_tokens" in refused.json()["error"]["message"]
+
+
+async def test_the_org_monthly_limit(harness: Harness) -> None:
+    harness.store.limits["org-1"] = OrgLimits(model_usd_per_month=Decimal("1"))
+    harness.store.calls.append(record("0.6", at=NOW - timedelta(days=30)))  # last month
+    harness.store.calls.append(record("0.6"))
+    assert (await harness.messages()).status_code == 200
+    harness.store.calls.append(record("0.4"))
+    assert (await harness.messages()).status_code == 402
+
+
+async def test_the_user_daily_limit_applies_only_to_that_user(harness: Harness) -> None:
+    harness.store.limits["org-1"] = OrgLimits(model_usd_per_user_day=Decimal("1"))
+    harness.store.calls.append(record("1", user_id="user-1"))
+    harness.store.calls.append(record("5", user_id="user-1", at=NOW - timedelta(days=1)))
+    refused = await harness.messages(token=harness.token())
+    assert refused.status_code == 402
+    assert "daily" in refused.json()["error"]["message"]
+    # A shared session has no user in its token.
+    assert (await harness.messages(token=harness.token(shared=True))).status_code == 200
+
+
+# Client disconnect ----------------------------------------------------------------------------
+
+
+async def test_the_call_is_recorded_when_the_client_stops_reading() -> None:
+    """The real server, so the client can close the connection in the middle of the stream."""
+
+    async def slow_stream() -> AsyncIterator[bytes]:
+        yield anthropic_stream().split(b"\n\n")[0] + b"\n\n"  # message_start only
+        await asyncio.sleep(30)
+        yield b""
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=slow_stream())
+    proxy = make_proxy(upstream, store, signer)
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    with serve(proxy.app()) as url:
+        async with (
+            httpx.AsyncClient(base_url=url) as client,
+            client.stream(
+                "POST",
+                "/anthropic/v1/messages",
+                json={"model": MODEL, "stream": True, "messages": []},
+                headers={"x-api-key": token},
+            ) as response,
+        ):
+            async for chunk in response.aiter_bytes():
+                assert b"message_start" in chunk
+                break
+        async with asyncio.timeout(5):
+            while not store.calls:  # noqa: ASYNC110 - the server thread writes the record
+                await asyncio.sleep(0.05)
+    await proxy.aclose()
+    assert store.calls[0].counts == TokenCounts(input=50, output=1)

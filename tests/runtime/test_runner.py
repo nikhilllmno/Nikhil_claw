@@ -218,9 +218,9 @@ def test_the_run_token_is_the_bearer_of_every_mcp_server() -> None:
 
 
 def test_the_cli_uses_the_run_token_as_the_model_key() -> None:
-    env = claude_cli_env("tok", "https://proxy.example/v1")
+    env = claude_cli_env("tok", "https://proxy.example/")
     assert env["ANTHROPIC_API_KEY"] == "tok"
-    assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example/v1"
+    assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example/anthropic"
     assert "ANTHROPIC_BASE_URL" not in claude_cli_env("tok", None)
 
 

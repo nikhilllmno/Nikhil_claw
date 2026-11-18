@@ -26,6 +26,7 @@ from typing import Protocol
 
 from pydantic import SecretStr
 
+from sama.modelproxy import MemoryUsageStore
 from sama.orchestrator.sandboxed import SandboxedRuntime
 from sama.runtime import (
     AgentRuntime,
@@ -64,7 +65,8 @@ class Scenario(StrEnum):
 
 
 class Target(Protocol):
-    """``calls_mcp`` is true if the runtime really calls the MCP tool server."""
+    """``calls_mcp`` is true if the runtime really calls the MCP tool server. ``model_calls``
+    is the record store of the model proxy, for targets whose model calls go through it."""
 
     def prompt(self, scenario: Scenario, word: str = "") -> str: ...
 
@@ -78,6 +80,8 @@ class Target(Protocol):
     def tools(self) -> ToolServer: ...
     @property
     def calls_mcp(self) -> bool: ...
+    @property
+    def model_calls(self) -> MemoryUsageStore | None: ...
 
     async def read_note(self, scope: RunScope) -> str | None:
         """The text of the note file that a native shell call wrote, or None."""
@@ -201,6 +205,7 @@ class ClaudeTarget:
     prompts: Mapping[Scenario, str]
     files: NoteFiles
     calls_mcp: bool = True
+    model_calls: MemoryUsageStore | None = None
 
     def prompt(self, scenario: Scenario, word: str = "") -> str:
         return self.prompts[scenario].format(word=word, path=self.files.note_path)
@@ -248,6 +253,7 @@ class FakeTarget:
     tools: ToolServer
     name: str = "fake"
     calls_mcp: bool = False
+    model_calls: MemoryUsageStore | None = None
     runtime: FakeRuntime = field(default_factory=FakeRuntime)
     config: RunConfig = field(
         default_factory=lambda: RunConfig(runtime=RuntimeKind.FAKE, model="fake")

@@ -424,7 +424,7 @@ class SandboxedRuntime:
                 env = {
                     WORKDIR_ENV: sandbox.workdir,
                     **self._settings.extra_env,
-                    RUN_TOKEN_ENV: self._signer.issue(scope, ttl_s=ttl),
+                    RUN_TOKEN_ENV: self._signer.issue(scope, ttl_s=ttl, budget=budget),
                 }
                 if self._settings.model_url:
                     env[MODEL_URL_ENV] = self._settings.model_url

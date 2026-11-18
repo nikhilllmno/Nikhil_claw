@@ -86,6 +86,8 @@ DROP_DEFERRED_ENV: Final = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL"
 
 _ABORTED: Final = frozenset({"aborted_streaming", "aborted_tools"})
 _BUDGET_SUBTYPES: Final = frozenset({"error_max_turns", "error_max_budget_usd"})
+_PROXY_BUDGET_STATUS: Final = 402
+"""The model proxy refuses a call over a budget with HTTP 402 (Section 16.6)."""
 _RETRYABLE_STATUS: Final = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _KNOWN_SUBTYPES: Final = frozenset(
     {"error_during_execution", "error_max_structured_output_retries"}
@@ -395,6 +397,12 @@ class _Translator:
             limit = "max_turns" if result.subtype == "error_max_turns" else "max_cost_usd"
             return RunFailed(
                 code=FailureCode.BUDGET_EXCEEDED, message=f"the run reached {limit}", usage=usage
+            )
+        if result.is_error and result.api_error_status == _PROXY_BUDGET_STATUS:
+            return RunFailed(
+                code=FailureCode.BUDGET_EXCEEDED,
+                message="the model proxy refused the call: a budget is used up",
+                usage=usage,
             )
         if result.is_error or result.subtype != "success":
             status = result.api_error_status

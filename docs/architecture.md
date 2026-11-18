@@ -482,8 +482,12 @@ The suite is `tests/conformance/`. Each test runs once per **target**:
   `runtime_state`, an MCP tool call, approve and reject for an MCP tool and a native tool, an
   approval used once, cancel within 10 seconds, the `max_turns` budget stop, and a
   `Compacted` event.
-- **Later items:** sandbox pause and resume (M1.6), usage against the model proxy record
-  (M1.7), skills (M2.2), and egress (M1.6). Each item adds its test to this suite.
+- **Model proxy.** The `claude-runner` and `claude-docker` targets send their model calls
+  through the model proxy (Section 16.6) to the scripted model. Two tests use the proxy
+  record: the tokens of a run match the record, and the proxy stops a run at `max_tokens`
+  with `402`, so the run ends with `budget_exceeded`.
+- **Later items:** sandbox pause and resume (M1.6), skills (M2.2), and egress (M1.6). Each
+  item adds its test to this suite.
 - **Clean CLI config.** Each Claude target uses a new `CLAUDE_CONFIG_DIR`, so skills, memory,
   and settings of the host do not reach the run.
 - **Live cost cap.** All live tests in one pytest process share one cap
@@ -1163,7 +1167,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 - stdin, later lines: `{"op": "cancel"}` cancels the run. The end of stdin also cancels it, so
   a runner never outlives its orchestrator.
 - stdout: one `RunEvent` per line. The last line is the terminal event. stderr: logs only.
-- The environment has `SAMA_RUN_TOKEN`, `SAMA_MODEL_URL` (the model proxy, M1.7), and
+- The environment has `SAMA_RUN_TOKEN`, `SAMA_MODEL_URL` (the model proxy, Section 16.6), and
   `SAMA_WORKDIR`. The runner uses the run token as the bearer of every MCP server and as the
   model key for the proxy. It refuses to start if a provider key, a database URL, or another
   long-lived secret is in its environment.
@@ -1242,6 +1246,82 @@ policy for all of them:
 - A run triggered by untrusted input uses a narrow toolset by default.
 - Context files and skills are scanned for prompt-injection patterns before use.
 
+### 16.6 Model proxy (M1.7)
+
+The model proxy is the only path from a sandbox to a model provider (D6). It holds the
+Anthropic and OpenAI keys, accepts only a run token, checks the model and the budgets,
+forwards the call, and records the usage and the cost of each call. The code is in
+`src/sama/modelproxy/`. `python -m sama.modelproxy` starts it.
+
+| Route | Upstream | Recorded |
+|---|---|---|
+| `POST /anthropic/v1/messages` | Anthropic Messages API, streaming or not | yes |
+| `POST /anthropic/v1/messages/count_tokens` | Anthropic token count (free) | no |
+| `POST /openai/v1/responses` | OpenAI Responses API, streaming or not | yes |
+| `POST /openai/v1/chat/completions` | OpenAI Chat Completions, streaming or not | yes |
+| `GET /healthz` | none | no |
+
+Other routes get `404`. `SAMA_MODEL_URL` in the sandbox is the root URL of the proxy. The
+runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run token as
+`ANTHROPIC_API_KEY`. The OpenAI adapter (M3.6) uses `<root>/openai/v1` as `base_url`.
+
+**One call.**
+
+1. **Token.** The proxy reads the run token from `x-api-key` or `Authorization: Bearer`. A
+   token that is not valid gets `401`. The tenant scope comes from the token only.
+2. **Request.** The body is JSON of at most 32 MB. The `model` must be in the price table, so
+   a model with no known price gets `400`. A dated id (`claude-haiku-4-5-20251001`,
+   `gpt-6-luna-2026-05-01`) uses the price of its base id. Options with a cost that the
+   table does not have also get `400`: Anthropic `speed` other than `standard`,
+   Anthropic `inference_geo` other than `global`, OpenAI `background`, and an OpenAI
+   `service_tier` other than `auto` or `default`.
+3. **Budget.** The proxy adds the recorded calls and refuses the call if one limit is used up:
+   - the run: `max_tokens` and `max_cost_usd` of the run `Budget`. The orchestrator puts them
+     in the run token, so the sandbox cannot change them;
+   - the org: `model_usd_per_month` in `orgs.limits` (calendar month, UTC);
+   - the user: `model_usd_per_user_day` in `orgs.limits` (calendar day, UTC), for runs whose
+     token names a user (private sessions).
+
+   A refused call gets `402` with the error type `budget_exceeded`, in the error format of
+   the provider. The SDKs do not retry `402`. The Claude adapter maps it to
+   `RunFailed(budget_exceeded)`. A call that is in progress always ends, so the total can pass
+   a limit by the calls that were in progress at the same time.
+4. **Forward.** The proxy sends the body unchanged with the provider key and an allowlist of
+   headers (`anthropic-version`, `anthropic-beta`, `openai-beta`, `content-type`). It never
+   forwards the run token. For a streaming Chat Completions call it sets
+   `stream_options.include_usage`, so the last chunk has the usage. The response goes back
+   unchanged, also as a stream. Upstream errors go back with their status. If the provider
+   cannot be reached, the call gets `502`.
+5. **Record.** The proxy reads the usage from the response or from the stream events
+   (`message_start` and `message_delta`, `response.completed`, or the last chunk). It
+   computes the cost and writes one row to `model_calls`. It also writes the row if the client
+   stops reading, with the usage that it saw.
+
+**Price table.** `src/sama/modelproxy/prices.toml` has USD per million tokens for input,
+output, cache reads, short cache writes (Anthropic 5 minutes, OpenAI 30 minutes), and long
+cache writes (Anthropic 1 hour, OpenAI 12 hours), and USD per 1,000 Anthropic web searches. A
+model can have a long-context tier: a call whose prompt (input, cache reads, and cache writes)
+is more than the threshold uses the second set of prices (Claude Haiku 5.5 above 100,000
+tokens, OpenAI above 272,000 tokens). The table names its source pages and the date of the
+prices. A price change is a pull request.
+
+**Usage and cost.** Anthropic `input_tokens` does not include the cache. OpenAI
+`input_tokens` includes the cached tokens and the cache writes, so the proxy subtracts them.
+The `Usage` in the run events is what the adapter sees. The `model_calls` record is the source
+of truth for cost (D15). The conformance suite checks that the tokens of a run match the
+proxy record.
+
+**`model_calls`** (migration `0002`): `org_id`, `workspace_id`, `session_id`, `run_id`,
+`user_id`, `provider`, `model`, `endpoint`, `status_code`, the five token counts,
+`web_search_requests`, `cost_usd`, `duration_ms`, and `created_at`. The row points to its run
+with `(org_id, session_id, run_id)`. RLS follows the session, as for `run_events`. Until the
+run queue writes `runs` rows (M1.10), local runs and tests use the in-memory store.
+
+**Not in M1.7.** The keys come from the environment of the proxy process. The vault replaces
+this in M1.17. Langfuse traces come in M1.14. The live checks of membership and revocations
+come in M1.18. The proxy prices only the costs that the table lists. For example, OpenAI
+hosted tools are not priced yet.
+
 ---
 
 ## 17. Users, teams, and tenants
@@ -1284,6 +1364,7 @@ migrated schema.
 | `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
 | `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |
 | `audit_log` | `org_id`, `workspace_id`, `actor_kind`, `actor_user_id`, `action`, `target_type`, `target_id`, `run_id`, `details` |
+| `model_calls` | One row per model proxy call (migration `0002`, Section 16.6) |
 
 Rules:
 
@@ -1347,7 +1428,8 @@ Row-level security:
 - **Usage**: the model proxy records input, output, and cache tokens and the cost per call.
   Runs, sessions, users, and orgs roll this up.
 - **Budgets**: hard limits per run, per user per day, and per org per month. The proxy
-  rejects calls over the limit, and the run ends with `RunFailed(budget_exceeded)`.
+  rejects calls over the limit, and the run ends with `RunFailed(budget_exceeded)`
+  (Section 16.6).
 - **Audit log**: append-only rows for tool calls with side effects, approvals, configuration
   changes, logins, and admin actions.
 - **Health**: structured logs, metrics (queue depth, run latency, sandbox start time, error
