@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.1, 2026-11-18 |
+| Status | Draft v0.2, 2026-11-18 |
 | Source | Hermes Agent, commit `0e8e4216` (MIT, Copyright (c) 2025 Nous Research) |
 | Design | [`architecture.md`](architecture.md) (sections are linked as §N) |
 | Plan | [`roadmap.md`](roadmap.md) (milestones M1 to M6) |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.1, 2026-11-18 |
+| Status | Draft v0.2, 2026-11-18 |
 | Design | [`architecture.md`](architecture.md) |
 | Feature map | [`feature-map.md`](feature-map.md) |
 
@@ -53,7 +53,7 @@ M2 and M3 can run in parallel after M1.
 | M1.10 | Run orchestrator and queue | Postgres queue with `FOR UPDATE SKIP LOCKED` and leases. A crashed worker's run is marked failed or resumed. One active run per session; new messages queue. |
 | M1.11 | Prompt assembly | SOUL per profile, context files (20,000-char cap, injection scan), frozen prefix per session. Prompt changes apply from the next session. |
 | M1.12 | HTTP API and minimal web chat | `POST /sessions/{id}/messages`, server-sent events for run events, approve and deny endpoints. Supabase Auth login. A minimal web page for chat and approvals. |
-| M1.13 | Telegram channel | Webhook adapter, pairing codes from the web page, streaming edits, inline-keyboard approvals, voice notes transcribed, `/new`, `/stop`, `/model` (starts a child session). DMs are private sessions. Groups are shared sessions without `user` memory or personal connections (architecture §11.3). |
+| M1.13 | Telegram channel | One shared claw bot for the team. Webhook adapter, pairing codes from the web page, streaming edits, inline-keyboard approvals, voice notes transcribed, `/new`, `/stop`, `/model` (starts a child session). DMs are private sessions. Groups are shared sessions without `user` memory or personal connections (architecture §11.3). |
 | M1.14 | Observability | Langfuse traces per run for the Claude adapter. Structured logs. Alerts to a Slack channel on error rate. |
 | M1.15 | Deploy | Fly.io apps for `api`, `gateway`, `worker`. CI deploys `main` to staging. A manual promote step deploys to production. |
 | M1.16 | Code editing in the sandbox | The agent clones a public repo, edits files, and runs tests in the sandbox with native tools. No push yet. |
@@ -78,7 +78,7 @@ M2 and M3 can run in parallel after M1.
 | # | Item | Acceptance criteria |
 |---|---|---|
 | M3.1 | Slack channel | Slack app with OAuth install, DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. |
-| M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
+| M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
 | M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. |
 | M3.4 | Composio connections | Composio entity per user and per workspace. `connections_list`, `connection_request`. Composio tools behind `tool_search`. Read actions `allow`, write actions `ask`. |
 | M3.5 | Remote MCP servers | Add a remote MCP server with OAuth per workspace. Tools proxied by the claw MCP server as `mcp_<server>_<tool>`. |
@@ -124,7 +124,7 @@ M2 and M3 can run in parallel after M1.
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. |
 | M6.5 | Customer sign-up | Self-serve sign-up, org creation, invites, roles. |
 | M6.6 | Billing and quotas | Stripe plans and usage billing from proxy cost. Quotas per plan. |
-| M6.7 | Org keys and regions | An org can bring its own Anthropic and OpenAI keys. Region per org. |
+| M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys and its own Telegram bot. Region per org. |
 | M6.8 | Data controls | Export and delete per user and per org. Retention per plan. |
 | M6.9 | Customer-ready web app | Onboarding, billing pages, admin views, and docs. |
 
@@ -134,7 +134,7 @@ M2 and M3 can run in parallel after M1.
 
 - More channels: email, WhatsApp, Discord, Microsoft Teams.
 - Mem0 as a memory provider.
-- Fly Machines as a second sandbox provider (Q1).
+- Fly Machines as a second sandbox provider, only if a product needs it (architecture Q1).
 - Desktop control beyond the browser.
 - ACP adapter for editors.
 - An OpenAI-compatible chat endpoint.

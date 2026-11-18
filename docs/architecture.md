@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.1 for owner review. No code yet. |
+| Status | Draft v0.2. The owner answered all open questions (Section 22). No code yet. |
 | Date | 2026-11-18 |
 | Owner | Nikhil Mandhani |
 | Companion docs | [`feature-map.md`](feature-map.md) (every Hermes feature and our plan for it), [`roadmap.md`](roadmap.md) (milestones and backlog) |
@@ -30,7 +30,7 @@
 19. [Technology stack and repository layout](#19-technology-stack-and-repository-layout)
 20. [Milestones](#20-milestones)
 21. [Risks](#21-risks)
-22. [Open questions](#22-open-questions)
+22. [Resolved questions](#22-resolved-questions)
 23. [References](#23-references)
 
 ---
@@ -158,7 +158,7 @@ Five rules shape the design:
 | D2 | One runtime contract (`AgentRuntime`) with two adapters: `claude_agent_sdk` (default) and `openai_agents_sdk`. A `fake` runtime exists for tests. | The owner uses only Anthropic and OpenAI models. One contract keeps every claw feature runtime-neutral and makes a third runtime cheap. |
 | D3 | Claw tools reach both runtimes through **one MCP server per run** (streamable HTTP), scoped by a run token. | Both SDKs are MCP clients. One implementation serves both. Tenant scope, approvals, and audit happen in one place. |
 | D4 | The runner (adapter plus SDK) runs **inside the sandbox**, not in the API process. | The Claude Agent SDK starts the Claude Code CLI as a subprocess, and its native tools run where the CLI runs. The OpenAI `SandboxAgent` needs a sandbox too. The OS boundary is the only real boundary against a model that misbehaves (Hermes security policy). |
-| D5 | **E2B** is the sandbox provider, behind a `SandboxProvider` interface. One sandbox per session. E2B pause and resume keep the workspace between runs. Docker is for local development and CI. | Owner chose cloud sandboxes with E2B. The OpenAI Agents SDK has an E2B sandbox client. The interface keeps a path to Fly Machines, which vorflux chose (Q1). |
+| D5 | **E2B** is the sandbox provider, behind a `SandboxProvider` interface. One sandbox per session. E2B pause and resume keep the workspace between runs. Docker is for local development and CI. | Owner chose cloud sandboxes with E2B. The OpenAI Agents SDK has an E2B sandbox client. The interface keeps a path to Fly Machines, which vorflux chose. Owner decision: E2B now, Fly Machines later only if needed (Q1). |
 | D6 | **No long-lived secrets in the sandbox.** Model calls go to the claw **model proxy** (`ANTHROPIC_BASE_URL` / OpenAI `base_url`) with a run token. Integration calls go through claw tools on the control plane. | A prompt-injected agent cannot leak a key that it cannot read. The proxy also meters cost, enforces budgets, and sends traces. |
 | D7 | **Supabase** is the system of record: Postgres with RLS, Auth, Storage, and pgvector. | Already in the owner's stack. RLS is a second tenant guard under the API. pgvector covers session search and memory recall. |
 | D8 | **Postgres is the job queue** (`FOR UPDATE SKIP LOCKED` with leases) for runs, cron fires, workflow steps, and deliveries. No separate workflow engine in v1. | Fewer moving parts. vorflux made the same choice. The queue sits behind an interface. |
@@ -523,7 +523,8 @@ flowchart LR
    skill or memory be saved or updated?"). It has only `memory` and `skill_manage`, and its
    own nudges are off, so it cannot recurse.
 3. **Apply.** Writes to `user` scope apply at once, and the user sees a short note. Writes
-   to `workspace` and `org` scope, and SOUL changes, need an approval.
+   to `workspace` scope and SOUL changes need an approval from a workspace `admin` or the
+   org `owner`. Writes to `org` scope need the org `owner` (Q5).
 4. **Curate.** A weekly curator job tracks skill usage (views, uses, patches). It marks
    unused agent-written skills `stale`, then `archived`. It merges near-duplicates with an
    approval. It never deletes. Pinned skills and skills that jobs or workflows use are exempt.
@@ -612,7 +613,7 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 |---|---|---|
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
 | Slack | Slack Bolt for Python, Events API over HTTP, interactive components | One Slack app per org install (OAuth). DMs and mentions. A thread is a session. Approval buttons through Block Kit. |
-| Telegram | Bot API webhook | One bot per org (token in the vault), or one shared claw bot. DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
+| Telegram | Bot API webhook | One shared claw bot for our team now. One bot per org for customers later, with its token in the org vault (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
 | Chrome extension | WebSocket from the extension to the gateway | Side panel chat bound to the current tab. Also the `my_chrome` browser target (Section 14). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
 
@@ -985,16 +986,21 @@ docs/
 
 ---
 
-## 22. Open questions
+## 22. Resolved questions
 
-| # | Question | Recommendation |
+The owner answered these questions on 2026-11-18. The answers are binding for M1. Section
+3.1 lists the earlier owner answers.
+
+| # | Question | Decision |
 |---|---|---|
-| Q1 | vorflux chose Fly Machines for sandboxes. Claw chose E2B (owner answer). Should vorflux move to E2B through claw, or should claw support both? | Claw uses E2B behind `SandboxProvider`. vorflux decides when it adopts claw. A Fly Machines provider is possible later. |
-| Q2 | Python package and service name: `claw`? | Yes: package `claw`, services `claw-api`, `claw-gateway`, `claw-worker`, `claw-scheduler`. |
-| Q3 | Telegram: one shared claw bot for everyone, or one bot per org? | One shared bot for our team now. One bot per org for customers later. |
-| Q4 | Which region for Supabase and Fly? | `ap-south-1` (Mumbai) for Supabase, same as vorflux. Fly region nearest to it. |
-| Q5 | Who in our team may approve workspace-scope memory, skills, and SOUL changes? | Workspace `admin` and org `owner`. |
-| Q6 | When do we build the web app? | A minimal web chat and approvals page in M1, web app v1 for the team in M3, and the customer-ready web app in M6. |
+| Q1 | vorflux chose Fly Machines for sandboxes. Claw uses E2B. Should claw support both? | Claw uses E2B now, behind the `SandboxProvider` interface (D5). Claw adds a Fly Machines provider later only if a product needs it. vorflux decides when it adopts claw. |
+| Q2 | Python package and service name? | Package `claw`. Services `claw-api`, `claw-gateway`, `claw-worker`, and `claw-scheduler`. |
+| Q3 | Telegram: one shared bot or one bot per org? | One shared claw bot for our team now. One bot per org for customers later (M6), with its token in the org vault. |
+| Q4 | Which region? | Supabase in `ap-south-1` (Mumbai), the same as vorflux. Fly.io in the region nearest to it. |
+| Q5 | Who may approve changes to workspace memory, workspace skills, and SOUL? | Workspace `admin` and org `owner`. Org-scope changes need the org `owner`. |
+| Q6 | When do we build the web app? | A minimal web chat and approvals page in M1. Web app v1 for the team in M3. The customer-ready web app in M6. |
+
+No questions are open now.
 
 ---
 
