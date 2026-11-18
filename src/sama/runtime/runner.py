@@ -30,7 +30,7 @@ import sys
 from collections.abc import AsyncIterator, Mapping
 from typing import IO, Any, Final, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
 from sama.runtime.contract import (
     AgentRuntime,
@@ -79,10 +79,9 @@ itself, from the run token."""
 
 
 class GatePolicy(BaseModel):
-    """A static tool gate for the runner. ``ask`` and ``deny`` hold exact tool names.
-
-    Other tools are allowed. The real gate (M1.9) asks the control plane for each call and
-    replaces this.
+    """A static tool gate for tests and local development. ``ask`` and ``deny`` hold exact
+    tool names. Other tools are allowed. A real run sets ``RunnerJob.gate_url`` instead: then
+    the runner asks the control plane for each call (``RemoteGate``).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -100,6 +99,9 @@ class RunnerJob(BaseModel):
     run: RunRequest | None = None
     resume: ResumeRequest | None = None
     gate: GatePolicy = GatePolicy()
+    gate_url: str | None = Field(default=None, min_length=1)
+    """The gate endpoint of the control plane (``POST /gate``). When set, ``gate`` must be
+    empty."""
     fake_scripts: tuple[FakeScript, ...] = ()
     """Scripts for the fake runtime. Only for tests."""
 
@@ -109,6 +111,8 @@ class RunnerJob(BaseModel):
             self.resume is not None
         ):
             raise ValueError("set run for op=run, or resume for op=resume, not both")
+        if self.gate_url is not None and (self.gate.ask or self.gate.deny):
+            raise ValueError("set gate_url or a static gate, not both")
         return self
 
     @property
@@ -153,18 +157,6 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
     if kind is RuntimeKind.CLAUDE_AGENT_SDK:
         from sama.runtime.claude import ClaudeRuntime, ClaudeSettings, GateDecision
 
-        policy = job.gate
-
-        class StaticGate:
-            async def check(
-                self, scope: RunScope, tool_name: str, arguments: Mapping[str, Any]
-            ) -> GateDecision:
-                if tool_name in policy.deny:
-                    return GateDecision("deny", "the tool policy denies this tool")
-                if tool_name in policy.ask:
-                    return GateDecision("ask", "the tool policy asks for approval")
-                return GateDecision("allow")
-
         workdir = env.get(WORKDIR_ENV) or WORKDIR
         os.makedirs(workdir, exist_ok=True)
         settings = ClaudeSettings(
@@ -172,6 +164,30 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
             env=claude_cli_env(env[RUN_TOKEN_ENV], env.get(MODEL_URL_ENV)),
             cancel_grace_s=CANCEL_GRACE_S,
         )
+        if job.gate_url is not None:
+            from sama.runtime.remote_gate import RemoteGate
+
+            return ClaudeRuntime(
+                gate=RemoteGate(job.gate_url, env[RUN_TOKEN_ENV]), settings=settings
+            )
+
+        policy = job.gate
+
+        class StaticGate:
+            async def check(
+                self,
+                scope: RunScope,
+                tool_name: str,
+                arguments: Mapping[str, Any],
+                *,
+                call_id: str,
+            ) -> GateDecision:
+                if tool_name in policy.deny:
+                    return GateDecision("deny", "the tool policy denies this tool")
+                if tool_name in policy.ask:
+                    return GateDecision("ask", "the tool policy asks for approval")
+                return GateDecision("allow")
+
         return ClaudeRuntime(gate=StaticGate(), settings=settings)
     raise ValueError(f"the runner does not support runtime {kind}")
 

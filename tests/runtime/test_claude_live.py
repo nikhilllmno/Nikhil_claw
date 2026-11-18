@@ -54,7 +54,12 @@ class AskForBash:
     """Asks for every Bash call. Allows the other tools."""
 
     async def check(
-        self, scope: RunScope, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        scope: RunScope,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        call_id: str,
     ) -> GateDecision:
         if tool_name == "Bash":
             return GateDecision("ask", "shell commands need approval")

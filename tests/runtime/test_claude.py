@@ -203,7 +203,12 @@ class ScriptedGate:
         self.calls: list[tuple[str, Mapping[str, Any]]] = []
 
     async def check(
-        self, scope: RunScope, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        scope: RunScope,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        call_id: str,
     ) -> GateDecision:
         self.calls.append((tool_name, arguments))
         if isinstance(self.decision, Exception):
