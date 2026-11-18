@@ -374,6 +374,50 @@ RunEvent = (
 | Tracing | Langfuse integration plus proxy usage | Agents SDK tracing processor to Langfuse plus proxy usage |
 | Main risks | CLI subprocess and Node in the image. Fast option changes. Claude models only. | Fast-moving API surface (`SandboxAgent` is new). OpenAI models only. |
 
+#### Claude adapter notes (M1.4)
+
+The adapter is `src/sama/runtime/claude.py`. These rules come from live tests with
+`claude-agent-sdk==0.2.184`:
+
+- **Options.** `setting_sources=[]`, so no file settings from the sandbox apply.
+  `strict_mcp_config=True`. Remote MCP servers are `http` servers with the run token in an
+  `Authorization` header. `include_partial_messages=True` gives text deltas. The preset prompt
+  uses `exclude_dynamic_sections=True`, so the prefix stays the same for the prompt cache.
+- **Tool gate.** The `PreToolUse` hook calls the `ToolGate`. `allow` and `deny` go to the CLI.
+  `ask` becomes `defer`. A sub-agent cannot pause the run, so `ask` inside a sub-agent becomes
+  `deny`. If the gate fails, the call gets `deny`.
+- **Pause.** On `defer`, the CLI ends the turn with `stop_reason` `tool_deferred` and
+  `deferred_tool_use`. The adapter yields `ApprovalRequired`. The approval id is the tool use
+  id. `runtime_state` holds the SDK session id, the run id, the usage, and the pending call.
+- **Permission callback.** The adapter also sets `can_use_tool`. It allows only the tool use
+  ids that the hook allowed or that a human approved. It denies all other calls. Without it,
+  the CLI uses its own permission rules, and these can block a call that sama allowed.
+- **Approve.** The adapter resumes the SDK session with no prompt. On resume the CLI checks
+  the deferred call again. For most calls it asks `can_use_tool`. For some read-only calls it
+  runs the `PreToolUse` hook again. Both allow the approved tool use id without a new gate
+  check, so the orchestrator checks authority before it calls `resume` (Section 5.1). Then the
+  CLI runs the call and the model continues.
+- **Reject.** A deny from `can_use_tool` or the hook on resume is not a reliable reject: some
+  read-only calls skip `can_use_tool`, and the model can try the call again. So the adapter
+  first resumes with the tool in `disallowed_tools` and
+  `CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL=1`. The CLI drops the call
+  (`stop_reason` `tool_deferred_unavailable`). Then the adapter resumes again with all tools
+  and tells the model that the user rejected the call. If the CLI does not drop the call, the
+  run fails with `internal`.
+- **New message while paused.** A new run on a session with an unanswered approval drops the
+  deferred call first, in the same way.
+- **One deferred call per turn.** The CLI defers only one tool call per turn.
+- **Usage.** Token counts come from each `ResultMessage`. The CLI reports cost for the whole
+  SDK session, also after a resume, so the adapter adds only the difference. The model proxy
+  record is the source of truth for billing (M1.7).
+- **Cancel.** `cancel` calls `interrupt()`. If the CLI does not stop within
+  `cancel_grace_s` (5 seconds by default), the adapter ends the stream and stops the CLI.
+  The stream ends with `RunFailed(cancelled)` within 10 seconds.
+- **Limits.** `max_turns` and `max_cost_usd` map to `max_turns` and `max_budget_usd`.
+  `max_wall_time_s` is a timer in the adapter. `max_tokens` is enforced by the model proxy.
+- **Sub-agents.** Messages with a `parent_tool_use_id` become `SubagentEvent`s.
+  `compact_boundary` system messages become `Compacted`.
+
 Versions at the time of writing: `claude-agent-sdk==0.2.184` and `openai-agents==0.25.0`.
 Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
 `runtime-openai`). Exact option names are checked again when each adapter is built.
