@@ -45,7 +45,6 @@ from sama.runtime import (
     Usage,
 )
 from sama.runtime.fake import FakeRuntime, FakeScript
-from sama.sandbox import Sandbox
 from tests.conformance.tool_server import LOOKUP, SEND_NOTE, SERVER_NAME, ToolServer, tool_id
 
 CANCEL_LIMIT_S = 10.0
@@ -178,25 +177,19 @@ class SandboxFiles:
     runtime: SandboxedRuntime
     note_path: str = NOTE_FILE
 
-    async def _path(self, scope: RunScope) -> tuple[Sandbox, str] | None:
-        sandbox = await self.runtime.session_sandbox(scope.org_id, scope.session_id)
-        return None if sandbox is None else (sandbox, f"{sandbox.workdir}/{NOTE_FILE}")
-
     async def read(self, scope: RunScope) -> str | None:
-        found = await self._path(scope)
-        if found is None:
+        sandbox = await self.runtime.session_sandbox(scope.org_id, scope.session_id)
+        if sandbox is None:
             return None
-        sandbox, path = found
         try:
-            return (await sandbox.read_file(path)).decode().strip()
+            return (await sandbox.read_file(f"{sandbox.workdir}/{NOTE_FILE}")).decode().strip()
         except FileNotFoundError:
             return None
 
     async def remove(self, scope: RunScope) -> None:
-        found = await self._path(scope)
-        if found is not None:
-            sandbox, path = found
-            await sandbox.remove_file(path)
+        sandbox = await self.runtime.session_sandbox(scope.org_id, scope.session_id)
+        if sandbox is not None:
+            await sandbox.remove_file(f"{sandbox.workdir}/{NOTE_FILE}")
 
 
 @dataclass

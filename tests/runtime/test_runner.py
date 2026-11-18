@@ -25,10 +25,10 @@ from sama.runtime import (
     run_event_adapter,
     validate_event_stream,
 )
+from sama.runtime.fake import FakeScript
 from sama.runtime.runner import (
     FORBIDDEN_ENV,
     RUN_TOKEN_ENV,
-    FakeScriptSpec,
     GatePolicy,
     Output,
     RunnerJob,
@@ -43,14 +43,14 @@ from tests.support import make_config, make_scope
 ENV = {RUN_TOKEN_ENV: "token-1"}
 
 
-def _job(*scripts: FakeScriptSpec, run_id: str = "run-1") -> RunnerJob:
+def _job(*scripts: FakeScript, run_id: str = "run-1") -> RunnerJob:
     request = RunRequest(scope=make_scope(run_id), input="hi", config=make_config())
     return RunnerJob(op="run", run=request, fake_scripts=scripts)
 
 
-def _reply(text: str) -> FakeScriptSpec:
+def _reply(text: str) -> FakeScript:
     usage = Usage(input_tokens=3, output_tokens=1)
-    return FakeScriptSpec(
+    return FakeScript(
         events=(
             TextDelta(text=text, usage=usage),
             RunCompleted(output=text, usage=usage, runtime_state=b"\x00\xff"),
@@ -58,10 +58,10 @@ def _reply(text: str) -> FakeScriptSpec:
     )
 
 
-def _slow() -> FakeScriptSpec:
+def _slow() -> FakeScript:
     words = [TextDelta(text=f"w{i} ", usage=Usage(output_tokens=i)) for i in range(1, 51)]
     done = RunCompleted(output="done", usage=Usage(output_tokens=50))
-    return FakeScriptSpec(events=(*words, done), delay_s=0.05)
+    return FakeScript(events=(*words, done), delay_s=0.05)
 
 
 async def _lines(items: Sequence[str], *, hold: asyncio.Event | None = None) -> AsyncIterator[str]:
@@ -95,7 +95,7 @@ async def test_a_pause_ends_the_stream_with_the_approval() -> None:
         approval_id="a1", call_id="c1", tool_name="send", usage=usage, runtime_state=b"{}"
     )
     after = (RunCompleted(output="ok", usage=usage),)
-    script = FakeScriptSpec(events=(paused,), on_approve=after, on_reject=after)
+    script = FakeScript(events=(paused,), on_approve=after, on_reject=after)
     lines = _lines([_job(script).model_dump_json()], hold=asyncio.Event())
     code, events = await _serve(lines)
     assert code == 0
@@ -154,9 +154,9 @@ async def test_no_job_is_an_invalid_request() -> None:
 
 
 async def test_a_bad_fake_script_is_an_invalid_request() -> None:
-    usage = Usage(output_tokens=1)
-    script = FakeScriptSpec(events=(TextDelta(text="no end", usage=usage),))
-    code, events = await _serve(_lines([_job(script).model_dump_json()]))
+    job = _job(_reply("ok")).model_dump(mode="json")
+    job["fake_scripts"][0]["events"] = job["fake_scripts"][0]["events"][:1]  # no terminal event
+    code, events = await _serve(_lines([json.dumps(job)]))
     assert code == 2
     assert isinstance(events[0], RunFailed)
     assert events[0].code is FailureCode.INVALID_REQUEST

@@ -3,8 +3,9 @@
 One E2B sandbox per session, from the sama template (``python -m sama.sandbox.template``).
 E2B pauses an idle sandbox by itself (``lifecycle.on_timeout = "pause"``), and ``resume``
 connects to it again. Files and memory stay. ``SandboxSpec.allow_out`` becomes the E2B
-egress allowlist: all other outbound traffic is blocked. E2B filters host names on ports 80
-and 443 only, so other ports are blocked unless an IP range is allowed.
+egress allowlist: all other outbound traffic is blocked, also when the list is empty. Only
+``SandboxSpec.open_egress`` turns the block off. E2B filters host names on ports 80 and 443
+only, so other ports are blocked unless an IP range is allowed.
 
 CPU and memory come from the template build. ``SandboxSpec.cpu_count`` and ``memory_mb``
 document what the template must give.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import shlex
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -30,15 +32,15 @@ from e2b import (
 from e2b.exceptions import FileNotFoundException
 
 from sama.sandbox.base import (
+    SANDBOX_USER,
+    STDERR_TAIL_LINES,
     WORKDIR,
     ExecResult,
     SandboxError,
     SandboxNotFoundError,
     SandboxProcess,
     SandboxSpec,
-    SandboxStart,
-    StartKind,
-    Stopwatch,
+    log_start,
 )
 
 if TYPE_CHECKING:
@@ -46,8 +48,6 @@ if TYPE_CHECKING:
 
 DEFAULT_TEMPLATE: Final = "sama-runner"
 ALL_TRAFFIC: Final = "0.0.0.0/0"
-_USER: Final = "user"
-_STDERR_TAIL_LINES: Final = 50
 
 
 @dataclass
@@ -56,7 +56,7 @@ class _Output:
 
     queue: asyncio.Queue[str | None] = field(default_factory=asyncio.Queue)
     buffer: str = ""
-    stderr: deque[str] = field(default_factory=lambda: deque(maxlen=_STDERR_TAIL_LINES))
+    stderr: deque[str] = field(default_factory=lambda: deque(maxlen=STDERR_TAIL_LINES))
 
     def on_stdout(self, chunk: str) -> None:
         self.buffer += chunk
@@ -103,7 +103,7 @@ class E2BProcess:
             stdin=True,
             envs=dict(env or {}),
             cwd=cwd,
-            user=_USER,
+            user=SANDBOX_USER,
             on_stdout=output.on_stdout,
             on_stderr=output.on_stderr,
             timeout=0,
@@ -150,10 +150,6 @@ class E2BSandbox:
         return str(self.sandbox.sandbox_id)
 
     @property
-    def provider(self) -> str:
-        return "e2b"
-
-    @property
     def workdir(self) -> str:
         return WORKDIR
 
@@ -170,7 +166,7 @@ class E2BSandbox:
                 shlex.join(argv),
                 envs=dict(env or {}),
                 cwd=cwd or WORKDIR,
-                user=_USER,
+                user=SANDBOX_USER,
                 timeout=timeout_s,
             )
         except CommandExitException as exit_:
@@ -189,13 +185,13 @@ class E2BSandbox:
 
     async def write_file(self, path: str, data: bytes) -> None:
         try:
-            await self.sandbox.files.write(path, data, user=_USER)
+            await self.sandbox.files.write(path, data, user=SANDBOX_USER)
         except SandboxException as error:
             raise SandboxError(f"write_file failed: {type(error).__name__}") from None
 
     async def read_file(self, path: str) -> bytes:
         try:
-            data = await self.sandbox.files.read(path, format="bytes", user=_USER)
+            data = await self.sandbox.files.read(path, format="bytes", user=SANDBOX_USER)
         except (FileNotFoundException, NotFoundException):
             raise FileNotFoundError(path) from None
         except SandboxException as error:
@@ -204,10 +200,13 @@ class E2BSandbox:
 
     async def remove_file(self, path: str) -> None:
         with contextlib.suppress(FileNotFoundException, NotFoundException):
-            await self.sandbox.files.remove(path, user=_USER)
+            await self.sandbox.files.remove(path, user=SANDBOX_USER)
 
     async def keep_alive(self, seconds: int) -> None:
-        await self.sandbox.set_timeout(seconds)
+        try:
+            await self.sandbox.set_timeout(seconds)
+        except SandboxException as error:
+            raise SandboxError(f"keep_alive failed: {type(error).__name__}") from None
 
     async def pause(self) -> None:
         try:
@@ -220,11 +219,17 @@ class E2BSandbox:
             await self.sandbox.kill()
 
 
-def network_options(allow_out: Sequence[str]) -> dict[str, Any] | None:
-    """The E2B network options: allow the listed hosts and block all other egress."""
-    if not allow_out:
+def network_options(spec: SandboxSpec) -> dict[str, Any] | None:
+    """The E2B network options: allow the listed hosts and block all other egress.
+
+    An empty allowlist blocks all egress. ``None`` (no filter) only with ``open_egress``.
+    """
+    if spec.open_egress:
         return None
-    return {"allow_out": list(allow_out), "deny_out": [ALL_TRAFFIC]}
+    options: dict[str, Any] = {"deny_out": [ALL_TRAFFIC]}
+    if spec.allow_out:
+        options["allow_out"] = list(spec.allow_out)
+    return options
 
 
 @dataclass
@@ -241,24 +246,24 @@ class E2BProvider:
         return {"api_key": self.api_key} if self.api_key else {}
 
     async def create(self, spec: SandboxSpec) -> E2BSandbox:
-        watch = Stopwatch()
+        started = time.monotonic()
         try:
             sandbox = await AsyncSandbox.create(
                 template=spec.template,
                 timeout=spec.idle_timeout_s,
                 metadata=spec.labels(),
-                network=network_options(spec.allow_out),  # type: ignore[arg-type]
+                network=network_options(spec),  # type: ignore[arg-type]
                 lifecycle={"on_timeout": "pause", "auto_resume": False},
                 **self._opts(),
             )
         except SandboxException as error:
             raise SandboxError(f"create failed: {type(error).__name__}: {error}") from None
         result = E2BSandbox(sandbox)
-        SandboxStart(self.name, result.id, spec.session_id, StartKind.CREATE, watch.elapsed()).log()
+        log_start(self.name, "create", result.id, spec.session_id, started)
         return result
 
     async def resume(self, sandbox_id: str, spec: SandboxSpec) -> E2BSandbox:
-        watch = Stopwatch()
+        started = time.monotonic()
         try:
             sandbox = await AsyncSandbox.connect(
                 sandbox_id, timeout=spec.idle_timeout_s, **self._opts()
@@ -268,12 +273,8 @@ class E2BProvider:
             raise SandboxNotFoundError(sandbox_id) from None
         except SandboxException as error:
             raise SandboxError(f"resume failed: {type(error).__name__}") from None
-        metadata = info.metadata or {}
-        if (metadata.get("sama.org_id"), metadata.get("sama.session_id")) != (
-            spec.org_id,
-            spec.session_id,
-        ):
+        if not spec.owns(info.metadata or {}):
             raise SandboxError("the sandbox belongs to another session")
         result = E2BSandbox(sandbox)
-        SandboxStart(self.name, result.id, spec.session_id, StartKind.RESUME, watch.elapsed()).log()
+        log_start(self.name, "resume", result.id, spec.session_id, started)
         return result

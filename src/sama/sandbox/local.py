@@ -8,11 +8,10 @@ process goes in, so a test can prove that the runner gets no provider key.
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import os
 import shutil
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,11 +24,9 @@ from sama.sandbox.base import (
     SandboxNotFoundError,
     SandboxProcess,
     SandboxSpec,
-    SandboxStart,
-    StartKind,
-    Stopwatch,
+    log_start,
 )
-from sama.sandbox.process import SubprocessProcess
+from sama.sandbox.process import SubprocessProcess, run_command
 
 _LABELS: Final = "labels.json"
 
@@ -41,10 +38,6 @@ class LocalSandbox:
     @property
     def id(self) -> str:
         return self.root.name
-
-    @property
-    def provider(self) -> str:
-        return "local"
 
     @property
     def workdir(self) -> str:
@@ -69,22 +62,10 @@ class LocalSandbox:
         cwd: str | None = None,
         timeout_s: float = 60,
     ) -> ExecResult:
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._env(env),
-            cwd=cwd or self.workdir,
+        code, out, err = await run_command(
+            argv, env=self._env(env), cwd=cwd or self.workdir, timeout_s=timeout_s
         )
-        try:
-            out, err = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            await process.wait()
-            raise SandboxError(f"the command timed out after {timeout_s} s") from None
-        return ExecResult(process.returncode or 0, out.decode(errors="replace"), err.decode())
+        return ExecResult(code, out.decode(errors="replace"), err.decode(errors="replace"))
 
     async def start(
         self, argv: Sequence[str], *, env: Mapping[str, str] | None = None, cwd: str | None = None
@@ -126,29 +107,21 @@ class LocalProvider:
         return "local"
 
     async def create(self, spec: SandboxSpec) -> LocalSandbox:
-        watch = Stopwatch()
+        started = time.monotonic()
         root = self.root / f"local-{uuid.uuid4().hex[:12]}"
         (root / "work").mkdir(parents=True)
         (root / "home").mkdir()
         (root / _LABELS).write_text(json.dumps(spec.labels()))
         sandbox = LocalSandbox(root)
-        SandboxStart(
-            self.name, sandbox.id, spec.session_id, StartKind.CREATE, watch.elapsed()
-        ).log()
+        log_start(self.name, "create", sandbox.id, spec.session_id, started)
         return sandbox
 
     async def resume(self, sandbox_id: str, spec: SandboxSpec) -> LocalSandbox:
-        watch = Stopwatch()
+        started = time.monotonic()
         root = self.root / sandbox_id
         if root.parent != self.root or not (root / _LABELS).is_file():
             raise SandboxNotFoundError(sandbox_id)
-        labels = json.loads((root / _LABELS).read_text())
-        if [labels.get("sama.org_id"), labels.get("sama.session_id")] != [
-            spec.org_id,
-            spec.session_id,
-        ]:
+        if not spec.owns(json.loads((root / _LABELS).read_text())):
             raise SandboxError("the sandbox belongs to another session")
-        SandboxStart(
-            self.name, sandbox_id, spec.session_id, StartKind.RESUME, watch.elapsed()
-        ).log()
+        log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return LocalSandbox(root)

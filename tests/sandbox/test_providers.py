@@ -15,12 +15,13 @@ import sys
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Final, cast
 
 import pytest
 
 from sama.orchestrator.sandboxed import RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.runtime import RunCompleted, RunConfig, RunRequest, RuntimeKind, Usage
-from sama.runtime.runner import FakeScriptSpec
+from sama.runtime.fake import FakeScript
 from sama.sandbox import Sandbox, SandboxError, SandboxNotFoundError, SandboxProvider, SandboxSpec
 from sama.tenancy import RunTokenSigner
 from tests.support import collect, make_scope
@@ -59,12 +60,15 @@ class Harness:
         self.runner = runner
         self.created: list[Sandbox] = []
 
-    def spec(self, session_id: str = "", allow_out: tuple[str, ...] = ()) -> SandboxSpec:
+    def spec(
+        self, session_id: str = "", allow_out: tuple[str, ...] = (), *, open_egress: bool = False
+    ) -> SandboxSpec:
         return SandboxSpec(
             org_id="org-test",
             session_id=session_id or f"sess-{uuid.uuid4().hex[:8]}",
             template=E2B_TEMPLATE if self.name == "e2b" else "sama",
             allow_out=allow_out,
+            open_egress=open_egress,
         )
 
     async def create(self, spec: SandboxSpec) -> Sandbox:
@@ -156,11 +160,22 @@ async def test_a_process_streams_lines_and_reads_stdin(harness: Harness) -> None
     assert "err" in process.stderr_tail()
 
 
-async def test_kill_stops_a_process(harness: Harness) -> None:
+_ALIVE: Final = (
+    'pid=$(cat "$0") && [ -d "/proc/$pid" ] && [ "$(cut -d" " -f3 "/proc/$pid/stat")" != Z ]'
+)
+
+
+async def test_kill_stops_the_process_in_the_sandbox(harness: Harness) -> None:
+    """The kill stops the command in the sandbox, not only the client on the host."""
     sandbox = await harness.create(harness.spec())
-    process = await sandbox.start(["sleep", "300"])
+    pid_file = f"{sandbox.workdir}/sleep.pid"
+    process = await sandbox.start(["sh", "-c", 'echo $$ > "$0"; exec sleep 300', pid_file])
+    wait = 'for _ in $(seq 50); do [ -s "$0" ] && exit 0; sleep 0.1; done; exit 1'
+    assert (await sandbox.exec(["sh", "-c", wait, pid_file])).exit_code == 0
+    assert (await sandbox.exec(["sh", "-c", _ALIVE, pid_file])).exit_code == 0
     await process.kill()
     assert await process.wait() != 0
+    assert (await sandbox.exec(["sh", "-c", _ALIVE, pid_file])).exit_code != 0
 
 
 async def test_the_runner_runs_in_the_sandbox(harness: Harness) -> None:
@@ -172,7 +187,7 @@ async def test_the_runner_runs_in_the_sandbox(harness: Harness) -> None:
         signer=RunTokenSigner(b"t" * 32),
         settings=SandboxSettings(template=harness.spec().template, runner_argv=harness.runner),
     )
-    runtime.fake_scripts.append(FakeScriptSpec(events=(RunCompleted(output="hi", usage=usage),)))
+    runtime.fake_scripts.append(FakeScript(events=(RunCompleted(output="hi", usage=usage),)))
     scope = make_scope(f"run-{uuid.uuid4().hex[:8]}").model_copy(
         update={"session_id": f"sess-{uuid.uuid4().hex[:8]}"}
     )
@@ -185,6 +200,10 @@ async def test_the_runner_runs_in_the_sandbox(harness: Harness) -> None:
     assert events[-1].output == "hi"
 
 
+_CURL: Final = ("curl", "-sS", "-I", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10")
+"""A HEAD request: the test needs the status, not the body."""
+
+
 @pytest.mark.live
 @pytest.mark.skipif(not LIVE_E2B, reason="set SAMA_LIVE_TESTS=1 and E2B_API_KEY")
 async def test_e2b_blocks_hosts_that_are_not_allowed(tmp_path: Path) -> None:
@@ -193,11 +212,37 @@ async def test_e2b_blocks_hosts_that_are_not_allowed(tmp_path: Path) -> None:
     harness = Harness("e2b", E2BProvider(api_key=E2B_KEY), RUNNER_ARGV)
     sandbox = await harness.create(harness.spec(allow_out=("pypi.org",)))
     try:
-        curl = ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10"]
-        allowed = await sandbox.exec([*curl, "https://pypi.org/simple/"], timeout_s=30)
-        blocked = await sandbox.exec([*curl, "https://example.com/"], timeout_s=30)
+        allowed = await sandbox.exec([*_CURL, "https://pypi.org/simple/pip/"], timeout_s=30)
+        blocked = await sandbox.exec([*_CURL, "https://example.com/"], timeout_s=30)
     finally:
         await sandbox.kill()
     assert allowed.exit_code == 0, allowed.stderr
     assert allowed.stdout == "200"
     assert blocked.exit_code != 0
+
+
+@pytest.mark.live
+@pytest.mark.skipif(not LIVE_E2B, reason="set SAMA_LIVE_TESTS=1 and E2B_API_KEY")
+async def test_e2b_with_no_allowlist_blocks_all_egress() -> None:
+    from sama.sandbox.e2b import E2BProvider
+
+    harness = Harness("e2b", E2BProvider(api_key=E2B_KEY), RUNNER_ARGV)
+    sandbox = await harness.create(harness.spec())
+    try:
+        blocked = await sandbox.exec([*_CURL, "https://pypi.org/simple/pip/"], timeout_s=30)
+    finally:
+        await sandbox.kill()
+    assert blocked.exit_code != 0
+
+
+def test_e2b_network_options() -> None:
+    pytest.importorskip("e2b")
+    from sama.sandbox.e2b import ALL_TRAFFIC, network_options
+
+    harness = Harness("e2b", cast(SandboxProvider, None), RUNNER_ARGV)
+    assert network_options(harness.spec()) == {"deny_out": [ALL_TRAFFIC]}
+    assert network_options(harness.spec(allow_out=("pypi.org",))) == {
+        "deny_out": [ALL_TRAFFIC],
+        "allow_out": ["pypi.org"],
+    }
+    assert network_options(harness.spec(allow_out=("pypi.org",), open_egress=True)) is None

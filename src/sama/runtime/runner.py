@@ -30,7 +30,7 @@ import sys
 from collections.abc import AsyncIterator, Mapping
 from typing import IO, Any, Final, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, model_validator
 
 from sama.runtime.contract import (
     AgentRuntime,
@@ -48,13 +48,13 @@ from sama.runtime.contract import (
     run_event_adapter,
 )
 from sama.runtime.fake import FakeRuntime, FakeScript
+from sama.sandbox.base import WORKDIR
 
 log: Final = logging.getLogger("sama.runner")
 
 RUN_TOKEN_ENV: Final = "SAMA_RUN_TOKEN"  # noqa: S105 -- a variable name
 MODEL_URL_ENV: Final = "SAMA_MODEL_URL"
 WORKDIR_ENV: Final = "SAMA_WORKDIR"
-DEFAULT_WORKDIR: Final = "/home/user/work"
 CANCEL_GRACE_S: Final = 4.0
 """The Claude adapter waits this long for the CLI after a cancel. The orchestrator waits
 longer before it kills the runner, and both fit in the 10-second cancel limit."""
@@ -91,25 +91,6 @@ class GatePolicy(BaseModel):
     deny: tuple[str, ...] = ()
 
 
-class FakeScriptSpec(BaseModel):
-    """A ``FakeScript`` for the fake runtime, in JSON. Only for tests."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    events: tuple[RunEvent, ...]
-    on_approve: tuple[RunEvent, ...] = ()
-    on_reject: tuple[RunEvent, ...] = ()
-    delay_s: float = Field(default=0.0, ge=0)
-
-    def script(self) -> FakeScript:
-        return FakeScript(
-            events=self.events,
-            on_approve=self.on_approve,
-            on_reject=self.on_reject,
-            delay_s=self.delay_s,
-        )
-
-
 class RunnerJob(BaseModel):
     """The first line on stdin. Exactly one of ``run`` and ``resume`` is set."""
 
@@ -119,7 +100,8 @@ class RunnerJob(BaseModel):
     run: RunRequest | None = None
     resume: ResumeRequest | None = None
     gate: GatePolicy = GatePolicy()
-    fake_scripts: tuple[FakeScriptSpec, ...] = ()
+    fake_scripts: tuple[FakeScript, ...] = ()
+    """Scripts for the fake runtime. Only for tests."""
 
     @model_validator(mode="after")
     def _one_request(self) -> Self:
@@ -130,18 +112,10 @@ class RunnerJob(BaseModel):
         return self
 
     @property
-    def scope(self) -> RunScope:
+    def request(self) -> RunRequest | ResumeRequest:
         request = self.run or self.resume
-        if request is None:  # pragma: no cover -- the validator checks it
-            raise ValueError("the job has no request")
-        return request.scope
-
-    @property
-    def config(self) -> RunConfig:
-        request = self.run or self.resume
-        if request is None:  # pragma: no cover -- the validator checks it
-            raise ValueError("the job has no request")
-        return request.config
+        assert request is not None  # noqa: S101 -- the validator checks it
+        return request
 
 
 def forbidden_env(env: Mapping[str, str]) -> list[str]:
@@ -172,9 +146,9 @@ def claude_cli_env(token: str, model_url: str | None) -> dict[str, str]:
 
 
 def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
-    kind = job.config.runtime
+    kind = job.request.config.runtime
     if kind is RuntimeKind.FAKE:
-        return FakeRuntime(scripts=[s.script() for s in job.fake_scripts])
+        return FakeRuntime(scripts=job.fake_scripts)
     if kind is RuntimeKind.CLAUDE_AGENT_SDK:
         from sama.runtime.claude import ClaudeRuntime, ClaudeSettings, GateDecision
 
@@ -190,7 +164,7 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
                     return GateDecision("ask", "the tool policy asks for approval")
                 return GateDecision("allow")
 
-        workdir = env.get(WORKDIR_ENV) or DEFAULT_WORKDIR
+        workdir = env.get(WORKDIR_ENV) or WORKDIR
         os.makedirs(workdir, exist_ok=True)
         settings = ClaudeSettings(
             cwd=workdir,
@@ -260,6 +234,9 @@ async def serve(lines: AsyncIterator[str], out: Output, env: Mapping[str, str]) 
         problems = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in error.errors())
         out.event(_failed(FailureCode.INVALID_REQUEST, f"the job is not valid: {problems}"))
         return 2
+    except ContractViolation as error:  # a fake script that breaks the stream rules
+        out.event(_failed(FailureCode.INVALID_REQUEST, f"the job is not valid: {error}"))
+        return 2
     leaked = forbidden_env(env)
     if leaked:
         message = f"the sandbox has forbidden variables: {', '.join(leaked)}"
@@ -275,7 +252,7 @@ async def serve(lines: AsyncIterator[str], out: Output, env: Mapping[str, str]) 
         out.event(_failed(FailureCode.INVALID_REQUEST, str(error)))
         return 2
 
-    config = with_run_token(job.config, token)
+    config = with_run_token(job.request.config, token)
     stream: AsyncIterator[RunEvent]
     if job.run is not None:
         stream = runtime.run(job.run.model_copy(update={"config": config}))
@@ -283,22 +260,19 @@ async def serve(lines: AsyncIterator[str], out: Output, env: Mapping[str, str]) 
         assert job.resume is not None  # noqa: S101 -- the validator checks it
         stream = runtime.resume(job.resume.model_copy(update={"config": config}))
 
-    run_id = job.scope.run_id
+    run_id = job.request.scope.run_id
     done = asyncio.Event()
     requested = asyncio.Event()
     control = asyncio.create_task(_watch_control(lines, runtime, run_id, done, requested))
     usage = Usage()
     ended = False
-    repeated = False
     try:
         async for event in stream:
-            if requested.is_set() and not repeated and not is_terminal(event):
-                repeated = True
+            if requested.is_set() and not is_terminal(event):
+                requested.clear()  # The control task sets it once, so this repeats it once.
                 await runtime.cancel(run_id)
             usage = event.usage
-            if is_terminal(event):
-                done.set()
-                ended = True
+            ended = is_terminal(event)
             out.event(event)
             if ended:
                 break

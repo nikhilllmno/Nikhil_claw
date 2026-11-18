@@ -11,9 +11,8 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from sama.sandbox.base import SandboxError
+from sama.sandbox.base import STDERR_TAIL_LINES, SandboxError
 
-_STDERR_TAIL_LINES: Final = 50
 _STREAM_LIMIT: Final = 16 * 1024 * 1024
 """The longest stdout line. An event with a large tool output is one line."""
 
@@ -40,9 +39,13 @@ class SubprocessProcess:
             limit=_STREAM_LIMIT,
             start_new_session=True,
         )
-        tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+        tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
         task = asyncio.create_task(_drain(process, tail))
         return cls(process, tail, task)
+
+    @property
+    def returncode(self) -> int | None:
+        return self._process.returncode
 
     async def write(self, data: str) -> None:
         stdin = self._process.stdin
@@ -96,3 +99,34 @@ async def _drain(process: asyncio.subprocess.Process, tail: deque[str]) -> None:
         return
     async for raw in process.stderr:
         tail.append(raw.decode(errors="replace").rstrip("\n"))
+
+
+async def run_command(
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+    stdin: bytes | None = None,
+    timeout_s: float = 60,
+) -> tuple[int, bytes, bytes]:
+    """Runs a program to the end. Returns the exit code, stdout, and stderr.
+
+    ``env=None`` gives the program the environment of this process. Raises ``SandboxError``
+    if the program does not end in ``timeout_s``.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=None if env is None else dict(env),
+        cwd=cwd,
+    )
+    try:
+        out, err = await asyncio.wait_for(process.communicate(stdin), timeout=timeout_s)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise SandboxError(f"the command timed out after {timeout_s} s") from None
+    return process.returncode or 0, out, err

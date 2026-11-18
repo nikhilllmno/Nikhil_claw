@@ -41,7 +41,7 @@ async def build(root: Path, alias: str, api_key: str) -> str:
         on_build_logs=lambda entry: log.info("%s", entry),
         api_key=api_key,
     )
-    return str(getattr(info, "template_id", info))
+    return info.template_id
 
 
 def main(argv: list[str] | None = None) -> int:

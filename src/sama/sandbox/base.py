@@ -13,8 +13,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
-from typing import Final, Protocol, runtime_checkable
+from typing import Final, Protocol
 
 log: Final = logging.getLogger("sama.sandbox")
 
@@ -26,6 +25,9 @@ DEFAULT_IDLE_TIMEOUT_S: Final = 15 * 60
 WORKDIR: Final = "/home/user/work"
 """The work folder of the agent in the sama image. It stays the same for the life of a
 session, because the Claude CLI keys its session files by the folder."""
+SANDBOX_USER: Final = "user"
+"""The user that runs commands in the sama image."""
+STDERR_TAIL_LINES: Final = 50
 
 
 class SandboxError(Exception):
@@ -36,17 +38,13 @@ class SandboxNotFoundError(SandboxError):
     """The provider has no sandbox with this id. The caller creates a new sandbox."""
 
 
-class StartKind(StrEnum):
-    CREATE = "create"
-    RESUME = "resume"
-
-
 @dataclass(frozen=True, slots=True)
 class SandboxSpec:
     """What the orchestrator asks for. ``allow_out`` is the egress allowlist (host names).
 
-    An empty ``allow_out`` means the provider default. E2B then blocks no host. The sama
-    deployment always sets it (Section 16.2).
+    E2B blocks all other outbound traffic, so an empty ``allow_out`` blocks all of it.
+    ``open_egress`` turns the block off. Use it only for development. Docker and the local
+    provider do not block egress (Section 16.2).
     """
 
     org_id: str
@@ -56,6 +54,7 @@ class SandboxSpec:
     memory_mb: int = DEFAULT_MEMORY_MB
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
     allow_out: tuple[str, ...] = ()
+    open_egress: bool = False
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -68,6 +67,13 @@ class SandboxSpec:
         """Provider labels. Sama keys win over ``metadata``, so a caller cannot change them."""
         return {**self.metadata, "sama.org_id": self.org_id, "sama.session_id": self.session_id}
 
+    def owns(self, labels: Mapping[str, str]) -> bool:
+        """True if a sandbox with these labels belongs to the org and session of this spec."""
+        return (
+            labels.get("sama.org_id") == self.org_id
+            and labels.get("sama.session_id") == self.session_id
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ExecResult:
@@ -76,37 +82,18 @@ class ExecResult:
     stderr: str
 
 
-@dataclass(frozen=True, slots=True)
-class SandboxStart:
-    """One measured sandbox start. The orchestrator logs it (roadmap M1.6)."""
-
-    provider: str
-    sandbox_id: str
-    session_id: str
-    kind: StartKind
-    duration_s: float
-
-    def log(self) -> None:
-        log.info(
-            "sandbox start provider=%s kind=%s sandbox=%s session=%s duration_s=%.3f",
-            self.provider,
-            self.kind,
-            self.sandbox_id,
-            self.session_id,
-            self.duration_s,
-            extra={"sama_sandbox_start": self},
-        )
+def log_start(provider: str, kind: str, sandbox_id: str, session_id: str, started: float) -> None:
+    """Logs one sandbox start (roadmap M1.6). ``started`` is a ``time.monotonic()`` value."""
+    log.info(
+        "sandbox start provider=%s kind=%s sandbox=%s session=%s duration_s=%.3f",
+        provider,
+        kind,
+        sandbox_id,
+        session_id,
+        time.monotonic() - started,
+    )
 
 
-class Stopwatch:
-    def __init__(self) -> None:
-        self._started = time.monotonic()
-
-    def elapsed(self) -> float:
-        return time.monotonic() - self._started
-
-
-@runtime_checkable
 class SandboxProcess(Protocol):
     """A process in the sandbox with a stdin pipe and a stdout line stream."""
 
@@ -133,13 +120,9 @@ class SandboxProcess(Protocol):
         ...
 
 
-@runtime_checkable
 class Sandbox(Protocol):
     @property
     def id(self) -> str: ...
-
-    @property
-    def provider(self) -> str: ...
 
     @property
     def workdir(self) -> str:
@@ -172,8 +155,9 @@ class Sandbox(Protocol):
         ...
 
     async def keep_alive(self, seconds: int) -> None:
-        """Keeps the sandbox running for at least ``seconds`` from now. The orchestrator calls
-        it before a run, so the idle timeout does not pause the sandbox during the run."""
+        """Sets the idle timeout: the sandbox pauses ``seconds`` from now. The orchestrator
+        makes it long before a run, so the sandbox does not pause during the run, and sets it
+        back to ``SandboxSpec.idle_timeout_s`` after the last run of the session."""
         ...
 
     async def pause(self) -> None:
@@ -185,7 +169,6 @@ class Sandbox(Protocol):
         ...
 
 
-@runtime_checkable
 class SandboxProvider(Protocol):
     @property
     def name(self) -> str: ...

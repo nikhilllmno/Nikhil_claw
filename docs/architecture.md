@@ -1137,8 +1137,9 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 - Default limits: 2 vCPU, 4 GB RAM, 1 hour per run, 15 minutes of idle before E2B pauses the
   sandbox. Later, 24 hours of pause before the workspace is archived to Supabase Storage.
 - Egress: the sama API endpoints, package registries, GitHub, and a per-org allowlist. E2B
-  blocks every other host (`deny_out` is all traffic, `allow_out` is the list). The Docker
-  provider does not block egress. We track this as a risk (R4).
+  blocks every other host (`deny_out` is all traffic, `allow_out` is the list). An empty
+  list blocks all egress. Only `SandboxSpec.open_egress` turns the block off, and only for
+  development. The Docker provider does not block egress. We track this as a risk (R4).
 - The sandbox has no database credentials, no provider keys, and no integration tokens. It
   has only the run token. Git goes through the sama git proxy (Section 15.1).
 
@@ -1148,7 +1149,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 |---|---|---|
 | Interface | `src/sama/sandbox/base.py` | `SandboxProvider` (`create`, `resume`), `Sandbox` (`exec`, `start`, files, `keep_alive`, `pause`, `kill`), `SandboxProcess` (stdin, stdout lines, exit code). `SandboxSpec` holds the org, the session, the template, the limits, and `allow_out`. |
 | E2B | `src/sama/sandbox/e2b.py` | `lifecycle.on_timeout = "pause"`. Metadata `sama.org_id` and `sama.session_id`. `resume` connects and checks the metadata. |
-| Docker | `src/sama/sandbox/docker.py` | For local development and CI. One container per session. `pause` stops the container and `resume` starts it. |
+| Docker | `src/sama/sandbox/docker.py` | For local development and CI. One container per session. `pause` stops the container and `resume` starts it. A process runs under `setsid` in its own process group, and `kill` kills that group in the container, then the `docker exec` client on the host. |
 | Local | `src/sama/sandbox/local.py` | A folder on the host, for tests only. No isolation, only a clean environment. |
 | Image | `sandbox/Dockerfile` | Python 3.12, git, ripgrep, the runner, and the Claude runtime (the SDK bundles the Claude CLI). Docker uses it, and `python -m sama.sandbox.template` builds the E2B template from it. |
 | Run token | `src/sama/tenancy/run_token.py` | HS256 JWT, issuer `sama`, audience `sama-run`. Claims: run, org, workspace, session, and user (private runs only). Lifetime at most 2 hours. |
@@ -1174,12 +1175,23 @@ adapter (for Claude, the session id and the transcript) goes back to the caller 
 terminal event, as in Section 5.1, so the next runner continues the session. For now the
 session-to-sandbox map and these rules are in memory. M1.10 moves them to Postgres.
 
-**Cancel.** The orchestrator writes a cancel line. The runner gives the Claude CLI 4 seconds.
-After 7 seconds the orchestrator kills the runner. The stream then ends with `RunFailed`
-(`cancelled`). Both limits fit in the 10-second cancel limit of the contract.
+If a resume fails before the runner gets the job (for example, the sandbox does not start),
+the approval is not used. The run waits for approval again, and the caller can retry.
 
-**Failures.** If the sandbox does not start, or the runner ends with no terminal event, the
-stream ends with `RunFailed` (`sandbox_error`, `retryable`). If the provider lost the session
+**Idle timeout.** Before a run, the orchestrator sets the idle timeout of the sandbox to the
+wall time of the run plus 10 minutes. After the last run of the session, it sets the timeout
+back to the idle limit (15 minutes), so an idle sandbox pauses on time.
+
+**Cancel.** The orchestrator writes a cancel line. The runner gives the Claude CLI 4 seconds.
+After 7 seconds the orchestrator kills the runner. The stream ends with `RunFailed`
+(`cancelled`) within 9 seconds of the cancel, also if the runner does not answer. This fits in
+the 10-second cancel limit of the contract. A cancel while the sandbox or the runner starts
+ends the stream at once. The start continues in the background, and the orchestrator then
+stops the late runner and sets the idle timeout back. A cancel also wins over an
+`ApprovalRequired` that the runner wrote before the cancel.
+
+**Failures.** If the sandbox does not start, the connection to the runner fails, or the runner
+ends with no terminal event, the stream ends with `RunFailed` (`sandbox_error`, `retryable`). If the provider lost the session
 sandbox, the orchestrator creates a new one. The files of the old one are then lost.
 
 **Start time.** Each `create` and `resume` logs its duration (`sama.sandbox`), and the

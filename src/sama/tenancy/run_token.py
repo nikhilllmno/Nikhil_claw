@@ -122,7 +122,5 @@ class RunTokenSigner:
                 token_id=raw["jti"],
                 expires_at=expires_at,
             )
-        except InvalidRunTokenError:
-            raise
         except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise InvalidRunTokenError("the run token is not valid") from None

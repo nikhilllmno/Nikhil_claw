@@ -4,53 +4,59 @@ It drives the ``docker`` CLI, so it needs no Python Docker client. One container
 runs ``sleep infinity`` from the sama image (``sandbox/Dockerfile``). ``pause`` stops the
 container and ``resume`` starts it again; the files stay. Docker has no egress allowlist, so
 ``SandboxSpec.allow_out`` is not enforced here. Use E2B where egress matters.
+
+A process started with ``start`` runs in its own process group in the container, and the
+group id goes to a file in ``/tmp``. ``kill`` stops that group in the container. Killing only
+the host ``docker exec`` client would leave the command running.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
+import json
 import os
 import shlex
-from collections.abc import Mapping, Sequence
+import time
+import uuid
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
 from sama.sandbox.base import (
+    SANDBOX_USER,
     WORKDIR,
     ExecResult,
     SandboxError,
     SandboxNotFoundError,
     SandboxProcess,
     SandboxSpec,
-    SandboxStart,
-    StartKind,
-    Stopwatch,
+    log_start,
 )
-from sama.sandbox.process import SubprocessProcess
+from sama.sandbox.process import SubprocessProcess, run_command
 
 DEFAULT_IMAGE: Final = "sama-runner:dev"
-_USER: Final = "user"
+_GROUP_SCRIPT: Final = 'echo $$ > "$0"; "$@"; code=$?; rm -f "$0"; exit $code'
+"""Runs the command as a child of this shell. ``setsid`` makes the shell the leader of a new
+process group, so the group id is ``$$``."""
+_KILL_SCRIPT: Final = (
+    'for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$0" ] && break; sleep 0.1; done; '
+    'pid=$(cat "$0" 2>/dev/null) && kill -s KILL -- "-$pid" 2>/dev/null; rm -f "$0"'
+)
+"""Waits up to 1 second for the group file, then kills the group. The dash ``kill`` needs
+``-s KILL --`` for a group. It refuses ``-KILL -- -pid``."""
 
 
 async def _docker(
-    *args: str, stdin: bytes | None = None, timeout_s: float = 120
+    *args: str,
+    stdin: bytes | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float = 120,
 ) -> tuple[int, bytes, bytes]:
-    process = await asyncio.create_subprocess_exec(
-        "docker",
-        *args,
-        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(process.communicate(stdin), timeout=timeout_s)
-    except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        await process.wait()
-        raise SandboxError(f"docker {args[0]} timed out after {timeout_s} s") from None
-    return process.returncode or 0, out, err
+    return await run_command(["docker", *args], env=env, stdin=stdin, timeout_s=timeout_s)
+
+
+def _failed(what: str, err: bytes) -> SandboxError:
+    return SandboxError(f"{what} failed: {err.decode(errors='replace').strip()}")
 
 
 def _env_args(env: Mapping[str, str] | None) -> tuple[list[str], dict[str, str]]:
@@ -67,6 +73,48 @@ def _env_args(env: Mapping[str, str] | None) -> tuple[list[str], dict[str, str]]
 
 
 @dataclass
+class DockerProcess:
+    """A process in a container. The host side is the ``docker exec`` client."""
+
+    _client: SubprocessProcess
+    _container: str
+    _group_file: str
+
+    async def write(self, data: str) -> None:
+        await self._client.write(data)
+
+    async def close_stdin(self) -> None:
+        await self._client.close_stdin()
+
+    def lines(self) -> AsyncIterator[str]:
+        return self._client.lines()
+
+    async def wait(self) -> int:
+        return await self._client.wait()
+
+    async def kill(self) -> None:
+        """Kills the process group in the container, then the client on the host."""
+        if self._client.returncode is None:
+            # If this fails, the client kill below still ends the stream.
+            with contextlib.suppress(SandboxError):
+                await _docker(
+                    "exec",
+                    "--user",
+                    SANDBOX_USER,
+                    self._container,
+                    "sh",
+                    "-c",
+                    _KILL_SCRIPT,
+                    self._group_file,
+                    timeout_s=10,
+                )
+        await self._client.kill()
+
+    def stderr_tail(self) -> str:
+        return self._client.stderr_tail()
+
+
+@dataclass
 class DockerSandbox:
     container: str
 
@@ -75,12 +123,16 @@ class DockerSandbox:
         return self.container
 
     @property
-    def provider(self) -> str:
-        return "docker"
-
-    @property
     def workdir(self) -> str:
         return WORKDIR
+
+    def _exec_args(
+        self, env: Mapping[str, str] | None, cwd: str | None, *, stdin: bool = False
+    ) -> tuple[list[str], dict[str, str]]:
+        env_args, cli_env = _env_args(env)
+        flags = ["-i"] if stdin else []
+        args = ["exec", *flags, "--user", SANDBOX_USER, "--workdir", cwd or WORKDIR, *env_args]
+        return [*args, self.container], cli_env
 
     async def exec(
         self,
@@ -90,59 +142,47 @@ class DockerSandbox:
         cwd: str | None = None,
         timeout_s: float = 60,
     ) -> ExecResult:
-        env_args, cli_env = _env_args(env)
-        process = await asyncio.create_subprocess_exec(
-            "docker",
-            "exec",
-            "--user",
-            _USER,
-            "--workdir",
-            cwd or WORKDIR,
-            *env_args,
-            self.container,
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=cli_env,
-        )
-        try:
-            out, err = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            await process.wait()
-            raise SandboxError(f"the command timed out after {timeout_s} s") from None
-        return ExecResult(process.returncode or 0, out.decode(errors="replace"), err.decode())
+        args, cli_env = self._exec_args(env, cwd)
+        code, out, err = await _docker(*args, *argv, env=cli_env, timeout_s=timeout_s)
+        return ExecResult(code, out.decode(errors="replace"), err.decode(errors="replace"))
 
     async def start(
         self, argv: Sequence[str], *, env: Mapping[str, str] | None = None, cwd: str | None = None
     ) -> SandboxProcess:
-        env_args, cli_env = _env_args(env)
-        args = ["exec", "-i", "--user", _USER, "--workdir", cwd or WORKDIR, *env_args]
-        return await SubprocessProcess.start(["docker", *args, self.container, *argv], cli_env)
+        args, cli_env = self._exec_args(env, cwd, stdin=True)
+        group_file = f"/tmp/sama-process-{uuid.uuid4().hex}.pgid"  # noqa: S108 -- in the container
+        wrapped = ["setsid", "-w", "sh", "-c", _GROUP_SCRIPT, group_file, *argv]
+        try:
+            client = await SubprocessProcess.start(["docker", *args, *wrapped], cli_env)
+        except OSError as error:
+            raise SandboxError(f"the process did not start: {error}") from None
+        return DockerProcess(client, self.container, group_file)
 
     async def write_file(self, path: str, data: bytes) -> None:
         script = f'mkdir -p -- "$(dirname -- {shlex.quote(path)})" && cat > {shlex.quote(path)}'
         code, _, err = await _docker(
-            "exec", "-i", "--user", _USER, self.container, "sh", "-c", script, stdin=data
+            "exec", "-i", "--user", SANDBOX_USER, self.container, "sh", "-c", script, stdin=data
         )
         if code != 0:
-            raise SandboxError(f"write_file failed: {err.decode(errors='replace').strip()}")
+            raise _failed("write_file", err)
 
     async def read_file(self, path: str) -> bytes:
         script = f"test -f {shlex.quote(path)} || exit 44; cat -- {shlex.quote(path)}"
-        code, out, err = await _docker("exec", "--user", _USER, self.container, "sh", "-c", script)
+        code, out, err = await _docker(
+            "exec", "--user", SANDBOX_USER, self.container, "sh", "-c", script
+        )
         if code == 44:
             raise FileNotFoundError(path)
         if code != 0:
-            raise SandboxError(f"read_file failed: {err.decode(errors='replace').strip()}")
+            raise _failed("read_file", err)
         return out
 
     async def remove_file(self, path: str) -> None:
-        code, _, err = await _docker("exec", "--user", _USER, self.container, "rm", "-f", path)
+        code, _, err = await _docker(
+            "exec", "--user", SANDBOX_USER, self.container, "rm", "-f", path
+        )
         if code != 0:
-            raise SandboxError(f"remove_file failed: {err.decode(errors='replace').strip()}")
+            raise _failed("remove_file", err)
 
     async def keep_alive(self, seconds: int) -> None:
         """Docker has no idle timeout, so the container runs until ``pause``."""
@@ -150,7 +190,7 @@ class DockerSandbox:
     async def pause(self) -> None:
         code, _, err = await _docker("stop", "--time", "2", self.container)
         if code != 0:
-            raise SandboxError(f"pause failed: {err.decode(errors='replace').strip()}")
+            raise _failed("pause", err)
 
     async def kill(self) -> None:
         await _docker("rm", "--force", self.container)
@@ -168,7 +208,7 @@ class DockerProvider:
         return "docker"
 
     async def create(self, spec: SandboxSpec) -> DockerSandbox:
-        watch = Stopwatch()
+        started = time.monotonic()
         args = [
             "run",
             "--detach",
@@ -183,25 +223,20 @@ class DockerProvider:
         args += [self.image, "sleep", "infinity"]
         code, out, err = await _docker(*args)
         if code != 0:
-            raise SandboxError(f"docker run failed: {err.decode(errors='replace').strip()}")
+            raise _failed("docker run", err)
         sandbox = DockerSandbox(out.decode().strip())
-        SandboxStart(
-            self.name, sandbox.id, spec.session_id, StartKind.CREATE, watch.elapsed()
-        ).log()
+        log_start(self.name, "create", sandbox.id, spec.session_id, started)
         return sandbox
 
     async def resume(self, sandbox_id: str, spec: SandboxSpec) -> DockerSandbox:
-        watch = Stopwatch()
-        owner = '{{index .Config.Labels "sama.org_id"}} {{index .Config.Labels "sama.session_id"}}'
-        code, out, _ = await _docker("inspect", "--format", owner, sandbox_id)
+        started = time.monotonic()
+        code, out, _ = await _docker("inspect", "--format", "{{json .Config.Labels}}", sandbox_id)
         if code != 0:
             raise SandboxNotFoundError(sandbox_id)
-        if out.decode().split() != [spec.org_id, spec.session_id]:
+        if not spec.owns(json.loads(out) or {}):
             raise SandboxError("the sandbox belongs to another session")
         code, _, err = await _docker("start", sandbox_id)
         if code != 0:
-            raise SandboxError(f"docker start failed: {err.decode(errors='replace').strip()}")
-        SandboxStart(
-            self.name, sandbox_id, spec.session_id, StartKind.RESUME, watch.elapsed()
-        ).log()
+            raise _failed("docker start", err)
+        log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return DockerSandbox(sandbox_id)
