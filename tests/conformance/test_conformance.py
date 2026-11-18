@@ -36,7 +36,6 @@ from sama.runtime import (
 )
 from tests.conformance.targets import (
     CANCEL_LIMIT_S,
-    NOTE_FILE,
     WRITE_TOOL,
     Scenario,
     Target,
@@ -173,14 +172,12 @@ async def test_calls_an_mcp_tool_and_uses_the_result(target: Target) -> None:
 GATED = pytest.mark.parametrize("scenario", [Scenario.NOTE, Scenario.WRITE], ids=["mcp", "native"])
 
 
-def _done(target: Target, scenario: Scenario) -> list[str]:
+async def _done(target: Target, scenario: Scenario, run_scope: RunScope) -> list[str]:
     """What the gated call left behind: sent notes, or the content of the written file."""
     if scenario is Scenario.NOTE:
         return list(target.tools.notes)
-    if target.workdir is None:
-        return []
-    path = target.workdir / NOTE_FILE
-    return [path.read_text().strip()] if path.exists() else []
+    note = await target.read_note(run_scope)
+    return [] if note is None else [note]
 
 
 async def _pause(
@@ -196,7 +193,7 @@ async def _pause(
     else:
         assert paused.tool_name == WRITE_TOOL
         assert word in str(paused.arguments.get("command"))
-    assert _done(target, scenario) == []
+    assert await _done(target, scenario, run_scope) == []
     return paused, run_scope
 
 
@@ -210,7 +207,7 @@ async def test_approve_runs_the_gated_call(target: Target, scenario: Scenario) -
     assert [e.call_id for e in finished] == [paused.call_id]
     assert not finished[0].is_error
     if target.calls_mcp:
-        assert _done(target, scenario) == [word]
+        assert await _done(target, scenario, run_scope) == [word]
 
 
 @GATED
@@ -219,7 +216,7 @@ async def test_reject_does_not_run_the_gated_call(target: Target, scenario: Scen
     paused, run_scope = await _pause(target, scenario, word)
     events = await resume(target, paused, run_scope, ApprovalDecision.REJECT)
     completed(events)
-    assert _done(target, scenario) == []
+    assert await _done(target, scenario, run_scope) == []
     if target.calls_mcp:
         assert SEND_NOTE not in target.tools.calls
 
@@ -230,10 +227,10 @@ async def test_an_approval_resumes_only_once(target: Target, scenario: Scenario)
     paused, run_scope = await _pause(target, scenario, word)
     completed(await resume(target, paused, run_scope, ApprovalDecision.APPROVE))
     if target.calls_mcp:
-        assert _done(target, scenario) == [word]
-    done_before, calls_before = _done(target, scenario), list(target.tools.calls)
-    if target.workdir is not None and scenario is Scenario.WRITE:
-        (target.workdir / NOTE_FILE).unlink()  # A second run of the call would write it again.
+        assert await _done(target, scenario, run_scope) == [word]
+    done_before, calls_before = await _done(target, scenario, run_scope), list(target.tools.calls)
+    if scenario is Scenario.WRITE:
+        await target.remove_note(run_scope)  # A second run of the call would write it again.
     # A refused request reports no usage, so it is not checked against the paused usage.
     request_ = resume_request(target, paused, run_scope, ApprovalDecision.APPROVE)
     again = await collect(target.runtime.resume(request_))
@@ -244,9 +241,9 @@ async def test_an_approval_resumes_only_once(target: Target, scenario: Scenario)
     assert not any(isinstance(e, ToolCallStarted | ToolCallFinished) for e in again)
     assert target.tools.calls == calls_before
     if scenario is Scenario.NOTE:
-        assert _done(target, scenario) == done_before
+        assert await _done(target, scenario, run_scope) == done_before
     else:
-        assert _done(target, scenario) == []
+        assert await _done(target, scenario, run_scope) == []
 
 
 async def test_cancel_ends_the_run_within_ten_seconds(target: Target) -> None:

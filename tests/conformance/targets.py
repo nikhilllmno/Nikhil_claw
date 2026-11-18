@@ -8,6 +8,11 @@ tests run on every target.
 - ``claude-scripted``: ``ClaudeRuntime`` and the real Claude CLI, with the scripted model as
   the Messages API and a real MCP tool server. CI runs it.
 - ``claude-live``: the same with a real Claude model. The nightly job runs it.
+- ``claude-runner``: ``SandboxedRuntime`` with the local provider. The orchestrator starts the
+  runner in a folder with a clean environment, and the runner starts ``ClaudeRuntime``. It
+  uses the scripted model and a run token. CI runs it.
+- ``claude-docker``: the same in the sama image with the Docker provider. It runs when the
+  image is built (``SAMA_DOCKER_IMAGE``).
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from typing import Protocol
 
 from pydantic import SecretStr
 
+from sama.orchestrator.sandboxed import SandboxedRuntime
 from sama.runtime import (
     AgentRuntime,
     ApprovalRequired,
@@ -31,6 +37,7 @@ from sama.runtime import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunScope,
     RuntimeKind,
     TextDelta,
     ToolCallFinished,
@@ -38,6 +45,7 @@ from sama.runtime import (
     Usage,
 )
 from sama.runtime.fake import FakeRuntime, FakeScript
+from sama.sandbox import Sandbox
 from tests.conformance.tool_server import LOOKUP, SEND_NOTE, SERVER_NAME, ToolServer, tool_id
 
 CANCEL_LIMIT_S = 10.0
@@ -71,10 +79,12 @@ class Target(Protocol):
     def tools(self) -> ToolServer: ...
     @property
     def calls_mcp(self) -> bool: ...
-    @property
-    def workdir(self) -> Path | None:
-        """The folder of native file tools, or None if the runtime has no native tools."""
+
+    async def read_note(self, scope: RunScope) -> str | None:
+        """The text of the note file that a native shell call wrote, or None."""
         ...
+
+    async def remove_note(self, scope: RunScope) -> None: ...
 
 
 GATED_TOOLS = (SEND_NOTE,)
@@ -84,11 +94,13 @@ WRITE_TOOL = "Bash"
 NOTE_FILE = "note.txt"
 
 
+GATED_TOOL_NAMES = (WRITE_TOOL, *GATED_TOOLS, *(tool_id(name) for name in GATED_TOOLS))
+"""Every name of a gated tool, for the static gate of the runner."""
+
+
 def is_gated(tool_name: str) -> bool:
     """The tool gate of the suite: it asks for every gated tool and allows the others."""
-    if tool_name == WRITE_TOOL:
-        return True
-    return any(tool_name in {name, tool_id(name)} for name in GATED_TOOLS)
+    return tool_name in GATED_TOOL_NAMES
 
 
 def mcp_config(tools: ToolServer, url: str) -> tuple[McpServerConfig, ...]:
@@ -131,6 +143,62 @@ LIVE_PROMPTS: Mapping[Scenario, str] = {
 }
 
 
+class NoteFiles(Protocol):
+    """Where the native tools of a target write files."""
+
+    @property
+    def note_path(self) -> str: ...
+    async def read(self, scope: RunScope) -> str | None: ...
+    async def remove(self, scope: RunScope) -> None: ...
+
+
+@dataclass
+class HostFiles:
+    """The runtime runs in the test process, in ``workdir``."""
+
+    workdir: Path
+
+    @property
+    def note_path(self) -> str:
+        return str(self.workdir / NOTE_FILE)
+
+    async def read(self, scope: RunScope) -> str | None:
+        path = self.workdir / NOTE_FILE
+        return path.read_text().strip() if path.exists() else None
+
+    async def remove(self, scope: RunScope) -> None:
+        (self.workdir / NOTE_FILE).unlink(missing_ok=True)
+
+
+@dataclass
+class SandboxFiles:
+    """The runtime runs in the session sandbox. The prompt uses a relative path, because the
+    work folder of the sandbox is not known before the first run."""
+
+    runtime: SandboxedRuntime
+    note_path: str = NOTE_FILE
+
+    async def _path(self, scope: RunScope) -> tuple[Sandbox, str] | None:
+        sandbox = await self.runtime.session_sandbox(scope.org_id, scope.session_id)
+        return None if sandbox is None else (sandbox, f"{sandbox.workdir}/{NOTE_FILE}")
+
+    async def read(self, scope: RunScope) -> str | None:
+        found = await self._path(scope)
+        if found is None:
+            return None
+        sandbox, path = found
+        try:
+            return (await sandbox.read_file(path)).decode().strip()
+        except FileNotFoundError:
+            return None
+
+    async def remove(self, scope: RunScope) -> None:
+        found = await self._path(scope)
+        if found is not None:
+            sandbox, path = found
+            await sandbox.remove_file(path)
+
+
 @dataclass
 class ClaudeTarget:
     name: str
@@ -138,12 +206,17 @@ class ClaudeTarget:
     config: RunConfig
     tools: ToolServer
     prompts: Mapping[Scenario, str]
-    workdir: Path | None
+    files: NoteFiles
     calls_mcp: bool = True
 
     def prompt(self, scenario: Scenario, word: str = "") -> str:
-        path = self.workdir / NOTE_FILE if self.workdir else NOTE_FILE
-        return self.prompts[scenario].format(word=word, path=path)
+        return self.prompts[scenario].format(word=word, path=self.files.note_path)
+
+    async def read_note(self, scope: RunScope) -> str | None:
+        return await self.files.read(scope)
+
+    async def remove_note(self, scope: RunScope) -> None:
+        await self.files.remove(scope)
 
 
 def claude_env(config_dir: Path, model_url: str | None) -> dict[str, str]:
@@ -182,7 +255,6 @@ class FakeTarget:
     tools: ToolServer
     name: str = "fake"
     calls_mcp: bool = False
-    workdir: Path | None = None
     runtime: FakeRuntime = field(default_factory=FakeRuntime)
     config: RunConfig = field(
         default_factory=lambda: RunConfig(runtime=RuntimeKind.FAKE, model="fake")
@@ -192,6 +264,12 @@ class FakeTarget:
     def prompt(self, scenario: Scenario, word: str = "") -> str:
         self.runtime.add_script(self._script(scenario, word))
         return f"{scenario}:{word}"
+
+    async def read_note(self, scope: RunScope) -> str | None:
+        return None  # The fake has no native tools.
+
+    async def remove_note(self, scope: RunScope) -> None:
+        return None
 
     def _script(self, scenario: Scenario, word: str) -> FakeScript:
         if scenario is Scenario.TEXT:

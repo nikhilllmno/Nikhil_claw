@@ -2,6 +2,9 @@
 
 - ``fake`` and ``claude-scripted`` run in CI. ``claude-scripted`` needs the Claude SDK and
   its bundled CLI (the default ``runtime-claude`` group).
+- ``claude-runner`` runs in CI. It starts the runner in a local sandbox folder.
+- ``claude-docker`` runs only with ``SAMA_DOCKER_IMAGE``, the tag of the sama image
+  (``sandbox/Dockerfile``). The container uses the host network to reach the test servers.
 - ``claude-live`` runs only with ``SAMA_LIVE_TESTS=1`` and ``ANTHROPIC_API_KEY``. It has the
   ``live`` marker, so ``pytest -m live`` selects it.
 """
@@ -10,20 +13,29 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from collections.abc import AsyncIterator, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from sama.orchestrator.sandboxed import RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.runtime import RunConfig, RunScope, RuntimeKind
+from sama.runtime.runner import GatePolicy
+from sama.sandbox import SandboxProvider
+from sama.sandbox.docker import DockerProvider
+from sama.sandbox.local import LocalProvider
 from tests.conformance.scripted_model import ScriptedModel, serve
 from tests.conformance.targets import (
+    GATED_TOOL_NAMES,
     LIVE_MODEL,
     LIVE_PROMPTS,
     SCRIPTED_PROMPTS,
     ClaudeTarget,
     FakeTarget,
+    HostFiles,
+    SandboxFiles,
     Target,
     claude_env,
     is_gated,
@@ -35,6 +47,7 @@ if TYPE_CHECKING:
     from sama.runtime.claude import ToolGate
 
 HAS_CLAUDE_SDK = importlib.util.find_spec("claude_agent_sdk") is not None
+DOCKER_IMAGE = os.environ.get("SAMA_DOCKER_IMAGE", "")
 LIVE = os.environ.get("SAMA_LIVE_TESTS") == "1" and bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 TARGETS = [
@@ -43,6 +56,16 @@ TARGETS = [
         "claude-scripted",
         id="claude-scripted",
         marks=pytest.mark.skipif(not HAS_CLAUDE_SDK, reason="claude-agent-sdk is not installed"),
+    ),
+    pytest.param(
+        "claude-runner",
+        id="claude-runner",
+        marks=pytest.mark.skipif(not HAS_CLAUDE_SDK, reason="claude-agent-sdk is not installed"),
+    ),
+    pytest.param(
+        "claude-docker",
+        id="claude-docker",
+        marks=pytest.mark.skipif(not DOCKER_IMAGE, reason="set SAMA_DOCKER_IMAGE"),
     ),
     pytest.param(
         "claude-live",
@@ -99,6 +122,20 @@ async def target(
         yield FakeTarget(tools=tools)
         return
 
+    if request.param in {"claude-runner", "claude-docker"}:
+        _, model_url = request.getfixturevalue("scripted_model")
+        sandboxed = _sandboxed_runtime(request.param, tools, model_url, tmp_path)
+        yield ClaudeTarget(
+            name=request.param,
+            runtime=sandboxed,
+            config=_scripted_config(tools, tools_url, "claude-sonnet-4-5"),
+            tools=tools,
+            prompts=SCRIPTED_PROMPTS,
+            files=SandboxFiles(sandboxed),
+        )
+        await sandboxed.close_sandboxes(kill=True)
+        return
+
     from sama.runtime.claude import ClaudeRuntime, ClaudeSettings
 
     live = request.param == "claude-live"
@@ -109,18 +146,41 @@ async def target(
     workdir.mkdir()
     settings = ClaudeSettings(cwd=str(workdir), env=claude_env(tmp_path / "claude", model_url))
     runtime = ClaudeRuntime(gate=_suite_gate(), settings=settings)
-    config = RunConfig(
-        runtime=RuntimeKind.CLAUDE_AGENT_SDK,
-        model=LIVE_MODEL if live else "claude-sonnet-4-5",
-        soul="You are a test agent. Follow the user's instructions exactly.",
-        mcp_servers=mcp_config(tools, tools_url),
-    )
     yield ClaudeTarget(
         name=request.param,
         runtime=runtime,
-        config=config,
+        config=_scripted_config(tools, tools_url, LIVE_MODEL if live else "claude-sonnet-4-5"),
         tools=tools,
         prompts=LIVE_PROMPTS if live else SCRIPTED_PROMPTS,
-        workdir=workdir,
+        files=HostFiles(workdir),
     )
     await runtime.aclose()
+
+
+def _scripted_config(tools: ToolServer, tools_url: str, model: str) -> RunConfig:
+    return RunConfig(
+        runtime=RuntimeKind.CLAUDE_AGENT_SDK,
+        model=model,
+        soul="You are a test agent. Follow the user's instructions exactly.",
+        mcp_servers=mcp_config(tools, tools_url),
+    )
+
+
+def _sandboxed_runtime(
+    name: str, tools: ToolServer, model_url: str, tmp_path: Path
+) -> SandboxedRuntime:
+    """The orchestrator side. The runner gets only the run token and the model URL."""
+    provider: SandboxProvider
+    if name == "claude-docker":
+        provider = DockerProvider(image=DOCKER_IMAGE, network="host")
+        argv = RUNNER_ARGV
+    else:
+        provider = LocalProvider(tmp_path / "sandboxes")
+        argv = (sys.executable, "-m", "sama.runtime.runner")
+    return SandboxedRuntime(
+        kind=RuntimeKind.CLAUDE_AGENT_SDK,
+        provider=provider,
+        signer=tools.run_tokens,
+        settings=SandboxSettings(template=name, model_url=model_url, runner_argv=argv),
+        gate=GatePolicy(ask=GATED_TOOL_NAMES),
+    )

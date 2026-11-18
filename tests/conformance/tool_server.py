@@ -7,11 +7,13 @@ It has two tools:
   can check that a rejected call did not run.
 
 The server checks the bearer token, like the run token of the real sama MCP server.
+It accepts a static test token and the run tokens that it signed.
 """
 
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from mcp.server.mcpserver import MCPServer
@@ -19,6 +21,8 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from sama.tenancy import InvalidRunTokenError, RunTokenSigner
 
 SERVER_NAME = "sama"
 LOOKUP = "lookup"
@@ -32,7 +36,13 @@ def tool_id(name: str) -> str:
 
 @dataclass
 class ToolServer:
+    """``token`` is a static bearer for runtimes in the test process. ``run_tokens`` also
+    accepts the run tokens that it signed, for runners in a sandbox."""
+
     token: str = field(default_factory=lambda: secrets.token_urlsafe(16))
+    run_tokens: RunTokenSigner = field(
+        default_factory=lambda: RunTokenSigner(secrets.token_bytes(32))
+    )
     secret: str = field(default_factory=lambda: f"amber-{secrets.token_hex(4)}")
     notes: list[str] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
@@ -52,18 +62,29 @@ class ToolServer:
             return "sent"
 
         inner = server.streamable_http_app(stateless_http=True, json_response=True)
-        return _BearerAuth(inner, self.token)
+        return _BearerAuth(inner, self.accepts)
+
+    def accepts(self, bearer: str) -> bool:
+        if secrets.compare_digest(bearer, self.token):
+            return True
+        try:
+            self.run_tokens.verify(bearer)
+        except InvalidRunTokenError:
+            return False
+        return True
 
 
 @dataclass
 class _BearerAuth:
     app: Starlette
-    token: str
+    accepts: Callable[[str], bool]
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
             request = Request(scope)
-            if request.headers.get("authorization") != f"Bearer {self.token}":
+            header = request.headers.get("authorization", "")
+            bearer = header.removeprefix("Bearer ")
+            if bearer == header or not self.accepts(bearer):
                 response = JSONResponse({"error": "bad run token"}, status_code=401)
                 await response(scope, receive, send)
                 return

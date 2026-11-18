@@ -1130,17 +1130,67 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
 the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
 
-### 16.2 Sandbox
+### 16.2 Sandbox and runner (M1.6)
 
-- One E2B sandbox per session, from a sama template (Python, Node for the Claude Code CLI,
-  git, ripgrep, Playwright client). It pauses when idle and resumes on the next run.
-- Default limits: 2 vCPU, 4 GB RAM, 1 hour per run, 24 hours of idle before the workspace is
-  archived to Supabase Storage.
-- Egress: the sama API endpoints, package registries, GitHub, and a per-org allowlist. Other
-  hosts are blocked where E2B network controls allow it. Otherwise the runner logs every
-  connection, and we track this as a risk (R4).
+- One E2B sandbox per session, from the sama template `sama-runner`. It pauses when idle and
+  resumes on the next run, and the files stay.
+- Default limits: 2 vCPU, 4 GB RAM, 1 hour per run, 15 minutes of idle before E2B pauses the
+  sandbox. Later, 24 hours of pause before the workspace is archived to Supabase Storage.
+- Egress: the sama API endpoints, package registries, GitHub, and a per-org allowlist. E2B
+  blocks every other host (`deny_out` is all traffic, `allow_out` is the list). The Docker
+  provider does not block egress. We track this as a risk (R4).
 - The sandbox has no database credentials, no provider keys, and no integration tokens. It
   has only the run token. Git goes through the sama git proxy (Section 15.1).
+
+**Code.**
+
+| Part | Where | What it does |
+|---|---|---|
+| Interface | `src/sama/sandbox/base.py` | `SandboxProvider` (`create`, `resume`), `Sandbox` (`exec`, `start`, files, `keep_alive`, `pause`, `kill`), `SandboxProcess` (stdin, stdout lines, exit code). `SandboxSpec` holds the org, the session, the template, the limits, and `allow_out`. |
+| E2B | `src/sama/sandbox/e2b.py` | `lifecycle.on_timeout = "pause"`. Metadata `sama.org_id` and `sama.session_id`. `resume` connects and checks the metadata. |
+| Docker | `src/sama/sandbox/docker.py` | For local development and CI. One container per session. `pause` stops the container and `resume` starts it. |
+| Local | `src/sama/sandbox/local.py` | A folder on the host, for tests only. No isolation, only a clean environment. |
+| Image | `sandbox/Dockerfile` | Python 3.12, git, ripgrep, the runner, and the Claude runtime (the SDK bundles the Claude CLI). Docker uses it, and `python -m sama.sandbox.template` builds the E2B template from it. |
+| Run token | `src/sama/tenancy/run_token.py` | HS256 JWT, issuer `sama`, audience `sama-run`. Claims: run, org, workspace, session, and user (private runs only). Lifetime at most 2 hours. |
+| Runner | `src/sama/runtime/runner.py` | `python -m sama.runtime.runner` in the sandbox. One process per run or resume. |
+| Orchestrator | `src/sama/orchestrator/sandboxed.py` | `SandboxedRuntime` implements `AgentRuntime`. It gets the session sandbox, issues the run token, starts the runner, and streams its events. |
+
+**Runner protocol.** One JSON object per line.
+
+- stdin, line 1: a `RunnerJob` with a `RunRequest` or a `ResumeRequest` and a static tool
+  policy (`ask`, `deny`). M1.9 replaces the static policy with a call to the control plane.
+- stdin, later lines: `{"op": "cancel"}` cancels the run. The end of stdin also cancels it, so
+  a runner never outlives its orchestrator.
+- stdout: one `RunEvent` per line. The last line is the terminal event. stderr: logs only.
+- The environment has `SAMA_RUN_TOKEN`, `SAMA_MODEL_URL` (the model proxy, M1.7), and
+  `SAMA_WORKDIR`. The runner uses the run token as the bearer of every MCP server and as the
+  model key for the proxy. It refuses to start if a provider key, a database URL, or another
+  long-lived secret is in its environment.
+
+**Rules in the control plane.** The runner is a new process for each invocation, so
+`SandboxedRuntime` enforces the contract rules that span invocations: one stream per run id,
+each approval resumes once, and a cancelled run cannot resume. The runtime state of the
+adapter (for Claude, the session id and the transcript) goes back to the caller in the
+terminal event, as in Section 5.1, so the next runner continues the session. For now the
+session-to-sandbox map and these rules are in memory. M1.10 moves them to Postgres.
+
+**Cancel.** The orchestrator writes a cancel line. The runner gives the Claude CLI 4 seconds.
+After 7 seconds the orchestrator kills the runner. The stream then ends with `RunFailed`
+(`cancelled`). Both limits fit in the 10-second cancel limit of the contract.
+
+**Failures.** If the sandbox does not start, or the runner ends with no terminal event, the
+stream ends with `RunFailed` (`sandbox_error`, `retryable`). If the provider lost the session
+sandbox, the orchestrator creates a new one. The files of the old one are then lost.
+
+**Start time.** Each `create` and `resume` logs its duration (`sama.sandbox`), and the
+orchestrator logs the time to the first runner event (`sama.orchestrator`). On E2B we measured
+0.34 s for a create, 0.2 s for a pause, and 0.24 s for a resume (2026-11, `ap-south-1` client).
+
+**Tests.** `tests/sandbox/` runs the same provider tests on `local`, `docker` (with
+`SAMA_DOCKER_IMAGE`), and `e2b` (live). The conformance suite has two more targets:
+`claude-runner` (local provider) and `claude-docker` (sama image). The tool server of the
+suite accepts only run tokens that it signed. CI builds the image and runs the Docker tests.
+The nightly job builds the E2B template from `main` and runs the E2B tests.
 
 ### 16.3 Secrets
 
@@ -1311,15 +1361,16 @@ Repository layout (planned):
 src/sama/
   api/            # FastAPI routers
   gateway/        # channel adapters: web, slack, telegram, extension
-  orchestrator/   # run queue, sandbox lifecycle, events
+  orchestrator/   # run queue, sandbox lifecycle, events (M1.6: sandboxed.py)
+  sandbox/        # sandbox providers: base, e2b, docker, local, template build
   runtime/        # contract, claude adapter, openai adapter, fake, runner entry point
   tools/          # sama MCP server and tool packs
   memory/  skills/  sessions/  scheduler/  workflows/  browser/  approvals/
-  modelproxy/  vault/  tenancy/  observability/
+  modelproxy/  vault/  tenancy/ (run tokens)  observability/
 skills/           # builtin skills (SKILL.md folders)
 extension/        # Chrome extension (TypeScript)
 web/              # Next.js app
-sandbox/          # E2B template definition
+sandbox/          # Dockerfile of the sama image (Docker and the E2B template)
 migrations/       # Alembic
 tests/            # unit, conformance, integration
 docs/

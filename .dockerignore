@@ -1,0 +1,18 @@
+# Keep the build context small, and keep local files and secrets out of the image.
+# A deny list, not `**` with exceptions: the E2B template build reads this file too, and it
+# does not apply exceptions after `**`.
+.git
+.github
+.venv
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+docs
+migrations
+tests
+extension
+web
