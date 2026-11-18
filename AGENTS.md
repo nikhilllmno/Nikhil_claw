@@ -6,7 +6,7 @@ Products such as vorflux build on top of it.
 
 ## Read first
 
-- `docs/architecture.md`: the design and decisions D1 to D16. Follow the decisions. Change a
+- `docs/architecture.md`: the design and decisions D1 to D17. Follow the decisions. Change a
   decision only in a pull request that updates the doc.
 - `docs/roadmap.md`: milestones and backlog items with acceptance criteria.
 - `docs/feature-map.md`: every Hermes feature and the claw plan for it.

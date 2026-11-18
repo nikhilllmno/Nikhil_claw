@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.2, 2026-11-18 |
+| Status | Draft v0.3, 2026-11-18 |
 | Design | [`architecture.md`](architecture.md) |
 | Feature map | [`feature-map.md`](feature-map.md) |
 
@@ -16,7 +16,7 @@ An item is done when its acceptance criteria pass in CI or in a recorded demo.
 | M0 | Design | This pull request: architecture, feature map, roadmap. |
 | M1 | Core engine | Chat from Telegram and a web page. The agent runs code in an E2B sandbox on the Claude Agent SDK, asks for approval, and keeps the session. |
 | M2 | Learning loop | The agent remembers facts, writes and improves skills, and finds old sessions. |
-| M3 | Reach | Slack, Composio and MCP connections, the OpenAI Agents SDK runtime, GitHub pull requests, web app v1. |
+| M3 | Reach | Slack, connections (Composio, remote MCP, PostgreSQL), the OpenAI Agents SDK runtime, GitHub pull requests, web app v1. |
 | M4 | Automation | Cron jobs, triggers, workflows, `delegate_task`, task board. |
 | M5 | Browser | Cloud browser tools and the Chrome extension with click, type, and cursor. |
 | M6 | Self-change and customers | `change_propose`, `claw_pr`, curator, checkpoints, customer sign-up and billing. |
@@ -80,13 +80,14 @@ M2 and M3 can run in parallel after M1.
 | M3.1 | Slack channel | Slack app with OAuth install, DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. |
 | M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
 | M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. |
-| M3.4 | Composio connections | Composio entity per user and per workspace. `connections_list`, `connection_request`. Composio tools behind `tool_search`. Read actions `allow`, write actions `ask`. |
-| M3.5 | Remote MCP servers | Add a remote MCP server with OAuth per workspace. Tools proxied by the claw MCP server as `mcp_<server>_<tool>`. |
+| M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. |
+| M3.5 | Remote MCP connections | Add a remote MCP server from the catalog or by URL, with OAuth 2.1 (dynamic client registration and PKCE), a bearer token, or a header. Tools proxied by the claw MCP server as `mcp_<connection>_<tool>`. Include and exclude filters, a tool schema cache, and a health check. New tools are usable without a new session. All calls use the outbound URL policy (architecture §16.4). |
 | M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the local sandbox client inside the E2B sandbox (no E2B key in the runner), a claw `Session` over the control-plane API (no database credentials in the runner), `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. |
 | M3.7 | GitHub App, git proxy, and pull requests | Claw GitHub App. Claw git proxy holds the tokens; the sandbox has none. `repo_clone`, `pr_create`, `pr_comment`. Allowlist of repos per org. The proxy rejects pushes to non-`claw/*` refs, force-pushes, and ref deletes, and needs an approval for protected paths. Setup docs require a default-branch ruleset with no bypass for the App. Tests cover each rejected push. |
 | M3.8 | Web app v1 | Next.js app: chat, approvals, memory editor, skill editor, connections, sessions with search and export (Markdown and JSON), run traces, settings. |
 | M3.9 | Busy controls and handoff | Queue, `/stop`, `/steer` while a run is busy. `/handoff` between channels. |
 | M3.10 | Worker bots | An agent profile bound to a Slack channel with a daily budget. |
+| M3.11 | PostgreSQL connections | Database gateway with PostgreSQL (also Supabase and Neon) (architecture §10.4). Tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`. Tests show that: `query` runs in a read-only transaction; a write or a second statement in `query` is rejected; DDL is denied by default; a query stops after 30 seconds; the model gets at most 1,000 rows and 50 KB, and the rest spills to a file; hidden columns do not appear in any result; `execute` needs an approval that shows the SQL. Static egress IP addresses are documented for allowlists. |
 
 ## M4 — Automation
 
@@ -102,6 +103,9 @@ M2 and M3 can run in parallel after M1.
 | M4.8 | Code execution | `execute_code` with a stub that calls claw tools over MCP. Only stdout returns to the model. |
 | M4.9 | More media and references | `image_generate`, `text_to_speech` (Telegram voice note), `@file`, `@url`, `@session`. |
 | M4.10 | Skills import and `/learn` | Import a skill from a Git URL with scan and approval. `/learn` creates a draft skill from sources. |
+| M4.11 | Hosted stdio MCP connections | Connector host per connection in its own E2B sandbox (architecture §10.5). Pinned package from the manifest, egress allowlist, start on first call, pause when idle, restart on memory limit. The agent cannot run commands in the host. A custom command needs the org `owner`. A test shows that the agent sandbox cannot read the host's secrets. |
+| M4.12 | HTTP API connections | Import an OpenAPI document or a list of endpoints. One tool per operation as `api_<connection>_<tool>`. Auth by API key, bearer, basic, or OAuth 2 client credentials. `GET` tools `allow`, other methods `ask`. |
+| M4.13 | More databases and SSH tunnels | MySQL and MariaDB, Microsoft SQL Server, BigQuery (with maximum bytes billed), Snowflake, ClickHouse, and MongoDB (read with `find` and `aggregate`) in the database gateway, with the M3.11 tests for each engine. SSH tunnel route per connection (architecture §10.6). A test shows that a tunnel route cannot be used by another connection or by `web_extract`. |
 
 ## M5 — Browser
 
@@ -137,4 +141,6 @@ M2 and M3 can run in parallel after M1.
 - Fly Machines as a second sandbox provider, only if a product needs it (architecture Q1).
 - Desktop control beyond the browser.
 - ACP adapter for editors.
+- A private network relay that customers run inside their network (architecture §10.6).
+- Claw as an MCP server for other agents (architecture §10.7).
 - An OpenAI-compatible chat endpoint.

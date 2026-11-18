@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.2, 2026-11-18 |
+| Status | Draft v0.3, 2026-11-18 |
 | Source | Hermes Agent, commit `0e8e4216` (MIT, Copyright (c) 2025 Nous Research) |
 | Design | [`architecture.md`](architecture.md) (sections are linked as §N) |
 | Plan | [`roadmap.md`](roadmap.md) (milestones M1 to M6) |
@@ -60,7 +60,7 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | `clarify` | `tools/clarify_tool.py` | Claw tool, rendered as buttons per channel. Denied in unattended runs. | Adapt | M1 |
 | `execute_code` (RPC to tools) | `tools/code_execution_tool.py` | Claw `code_exec`: Python in the sandbox with a stub that calls claw tools over MCP. | Adapt | M4 |
 | `computer_use` (desktop control) | `tools/computer_use_tool.py` | Browser vision mode (§14) covers web apps. Full desktop control is not planned. | Defer | — |
-| `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` with Composio OAuth links (§10.3). | Adapt | M3 |
+| `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` (link or web form), `connection_test`. Add, change, and remove happen in the web app or through `/connect`, so secrets never enter chat (§10.3). | Adapt | M3 |
 | Discord and Feishu tools | `tools/discord_tool.py`, `tools/feishu_*.py` | Through Composio toolkits when needed. | Defer | — |
 | Desktop-only tools (`desktop_ui`, `project`, `catalog`) | `tools/project_tools.py` and others | No desktop app. | Skip | — |
 | No agent-callable `send_message` | `toolsets.py` | Same rule: replies go to the trigger's channel (§10.1). | Adapt | M1 |
@@ -195,9 +195,19 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Claw design | Decision | Milestone |
 |---|---|---|---|---|
-| MCP client (stdio, HTTP, OAuth) | `tools/mcp_tool*.py` | Remote MCP servers only (no stdio in the cloud), proxied by the claw MCP server with OAuth tokens in the vault (§10.3). | Adapt | M3 |
-| MCP tool naming `mcp_<server>_<tool>` | `tools/mcp_tool.py` | Same naming, behind `tool_search`. | Adapt | M3 |
+| MCP client, HTTP and OAuth | `tools/mcp_tool*.py`, `tools/connectors/mcp_oauth.py` | `mcp_remote` connections: streamable HTTP, OAuth 2.1 with dynamic client registration and PKCE, bearer, or header. Proxied by the claw MCP server, tokens in the vault (§10.3). | Adapt | M3 |
+| MCP client, stdio servers | `tools/mcp_tool_transport.py`, `tools/connectors/mcp_launch.py` | `mcp_hosted` connections run in a connector host (a separate E2B sandbox per connection), not in the agent sandbox (§10.5). | Adapt | M4 |
+| MCP tool naming `mcp_<server>_<tool>` | `tools/mcp_tool.py` | Same naming as `mcp_<connection>_<tool>`, plus `db_` and `api_` prefixes, behind `tool_search` (§10.3). | Adapt | M3 |
+| Per-server tool filters, schema cache, health checks | `tools/mcp_tool_registration.py`, `tools/mcp_schema_cache.py`, `tools/mcp_tool_health.py` | Include and exclude filters, `tool_cache`, and health checks per connection (§10.3). | Adapt | M3 |
+| `/reload-mcp` | `tui_gateway/methods_tools.py` | Not needed. New connector tools are reachable through `tool_search`, so the prompt prefix does not change (§10.3). | Skip | — |
+| `${ENV_VAR}` in MCP config | `tools/mcp_tool_config.py` | Secrets come from the vault reference of the connection, not from environment variables (§10.3). | Adapt | M3 |
+| MCP catalog (`optional-mcps/`, 66 manifests) | `optional-mcps/` | Connector catalog of YAML manifests in `connectors/catalog/`, added by reviewed pull requests (§10.3). We write our own manifests. | Adapt | M3 |
+| Connection state contract | `tools/connectors/contract.py` | Same idea: only the backend sets `connected`; a clock expires `initiated` (§10.3). | Adapt | M3 |
 | Managed connectors (Nous tool gateway) | `tools/connectors/` | Composio with entities per user and per workspace (§10.3). | Adapt | M3 |
+| Database access | Through MCP servers (for example Supabase, Neon) | Native database connections with a claw database gateway: read-only by default, one statement per call, timeouts, row limits, hidden columns, approval for writes (§10.4). Vendor MCP servers also work. | New | M3 (PostgreSQL), M4 (others) |
+| HTTP API connectors | none | `http_api` connections from an OpenAPI document (§10.3). | New | M4 |
+| Private networks | none | Static egress IPs and SSH tunnels per connection; a relay later (§10.6). | New | M4 |
+| Hermes as an MCP server (`hermes mcp serve`) | moved out of core (`hermes_cli/left_core_migration.py`) | Claw as an MCP server later (§10.7). | Defer | — |
 | Plugin system | `plugins/`, `hermes_cli/plugins*` | Extension points for products (tools, skills, toolsets, channels, policies) (D16). | Adapt | M1 |
 | ACP adapter for editors | `acp_adapter/` | Not planned. | Defer | — |
 

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.2. The owner answered all open questions (Section 22). No code yet. |
+| Status | Draft v0.3. The owner answered all open questions (Section 22). Connectors and databases added (Sections 10.3 to 10.7). No code yet. |
 | Date | 2026-11-18 |
 | Owner | Nikhil Mandhani |
 | Companion docs | [`feature-map.md`](feature-map.md) (every Hermes feature and our plan for it), [`roadmap.md`](roadmap.md) (milestones and backlog) |
@@ -127,7 +127,8 @@ Five rules shape the design:
 | Toolset | A named group of tools. An agent profile enables toolsets. |
 | Claw tools | Tools that claw implements once for both runtimes (memory, skills, cron, delegation, browser, connectors). They reach the runtime through the claw MCP tool server. |
 | Native tools | Tools that a runtime ships (for example Claude `Read`, `Edit`, `Bash`). They run inside the sandbox. |
-| Integration | An external app that the agent can use as tools: a Composio toolkit or a remote MCP server. |
+| Connector | A kind of external system that the agent can use as tools: a Composio toolkit, an MCP server, a database, an HTTP API, or a plugin (Section 10.3). |
+| Connection | One configured account or endpoint of a connector, owned by a user or a workspace, with its credentials in the claw vault. |
 | Channel | A surface where users talk to the agent: web, Slack, Telegram, Chrome side panel. |
 | Skill | A versioned folder with a `SKILL.md` (agentskills.io format) that tells the agent how to do a task. |
 | Memory | Small, curated notes that claw puts in every new session (Section 8). |
@@ -163,13 +164,14 @@ Five rules shape the design:
 | D7 | **Supabase** is the system of record: Postgres with RLS, Auth, Storage, and pgvector. | Already in the owner's stack. RLS is a second tenant guard under the API. pgvector covers session search and memory recall. |
 | D8 | **Postgres is the job queue** (`FOR UPDATE SKIP LOCKED` with leases) for runs, cron fires, workflow steps, and deliveries. No separate workflow engine in v1. | Fewer moving parts. vorflux made the same choice. The queue sits behind an interface. |
 | D9 | The **prompt prefix is frozen per session**: SOUL, context files, tool list, memory snapshot, skill index. New memory and skills apply from the next session. A short note on the next user message tells the agent about new skills. | Hermes rule. It keeps prompt caching valid on both SDKs and makes runs reproducible (`RunConfig.fingerprint()`). |
-| D10 | **Integrations come from Composio and remote MCP servers.** Connections are per user or per workspace, with OAuth tokens in the claw vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
+| D10 | **Connectors use one model for all kinds**: Composio toolkits, remote MCP servers, hosted stdio MCP servers, databases, HTTP APIs, and plugins. Connections are per user or per workspace, with credentials in the claw vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
 | D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Bolt, Events API), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
 | D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless a human approved a pre-approval for that tool in that job version. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
 | D14 | **Self-improvement writes are versioned data.** Memory, skills, cron jobs, workflows, and SOUL changes are rows with history and provenance. Changes to claw's own code are pull requests that a human merges. | The agent can learn and change its stack, but every change can be reviewed and reverted. |
 | D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. | One trace view for both SDKs. Both SDKs have Langfuse integrations. The proxy is the source of truth for cost. |
 | D16 | **Claw is a library plus services.** Products import `claw` and register extra tools, skills, toolsets, channels, and policies through extension points. They do not patch claw code. | vorflux and later products build on the engine without a fork (Hermes rule: plugins never touch core). |
+| D17 | **Databases use a claw database gateway, and stdio MCP servers run in connector hosts.** The gateway enforces read-only transactions, one statement per call, timeouts, row limits, and hidden columns at the driver. A connector host is a separate sandbox per connection that holds only that connection's secrets. | A prompt cannot remove a limit that the driver enforces. Many SQL MCP servers give full rights through one tool. Running stdio servers outside the agent sandbox keeps credentials out of the sandbox (D6) and still supports the Hermes MCP ecosystem. |
 
 ---
 
@@ -564,8 +566,8 @@ flowchart LR
 | `workflows` | `workflow_manage`, `workflow_run` | Claw MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Claw MCP to Browserbase or the extension |
 | `media` | `vision_analyze`, `image_generate`, `text_to_speech`, `transcribe` | Claw MCP |
-| `connections` | `connections_list`, `connection_request` (sends the user an OAuth link) | Claw MCP |
-| `integrations` | Composio toolkit tools and remote MCP server tools, behind `tool_search` | Claw MCP (Composio and MCP proxy) |
+| `connections` | `connections_list`, `connection_request` (sends the user a link or a form), `connection_test` | Claw MCP |
+| `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Claw MCP (Composio, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment` through the claw GitHub App | Claw MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `claw_pr` (code change to claw, Section 15) | Claw MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` | Claw MCP |
@@ -574,20 +576,197 @@ Agent profiles combine toolsets. Built-in presets: `assistant` (everything excep
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, vision,
 clarify; for webhook triggers), and `cron` (like `assistant` but no `cron` and no `clarify`).
 
-### 10.3 Integrations: Composio and MCP
+### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
-- **Composio** gives toolkits for hundreds of apps (Gmail, Google Calendar, GitHub, Linear,
-  Notion, HubSpot, and more), managed OAuth, and triggers. Claw uses one Composio entity per
-  claw user (personal accounts) and one per workspace (shared accounts).
-- **Remote MCP servers**: an org admin adds a server URL from a curated catalog or by hand.
-  OAuth or bearer tokens go to the claw vault. Claw proxies the calls, so the sandbox never
-  sees the token.
-- **Exposure**: integration tools are deferred behind `tool_search` by default. An agent
-  profile can pin a few integrations so that their tools are always visible.
-- **Approval defaults**: read actions `allow`, write actions `ask`, destructive actions
-  `ask` with a stronger warning. Admins can change this per tool.
-- **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks
-  can start runs or workflows (Section 12).
+A **connector** is a kind of external system that claw can reach. A **connection** is one
+configured account or endpoint of a connector, with its credentials in the claw vault.
+Hermes has the same idea (`tools/connectors/`, the `optional-mcps/` catalog, and
+`mcp_servers` in its config). Claw keeps the idea and moves it to a multi-user cloud.
+
+**Connector kinds**
+
+| Kind | What it connects | Examples | Where the calls run |
+|---|---|---|---|
+| `composio` | Managed app toolkits with managed OAuth and triggers | Gmail, Google Calendar, Drive, Sheets, GitHub, Linear, Notion, HubSpot, Slack | Control plane, through the Composio API |
+| `mcp_remote` | A remote MCP server over streamable HTTP. Auth: OAuth 2.1 (with dynamic client registration and PKCE), a bearer token, or a custom header | Supabase, Neon, Sentry, Stripe, Atlassian, Notion, Linear, any vendor MCP | Control plane, through the claw MCP proxy |
+| `mcp_hosted` | A stdio MCP server (`command` and `args`, for example an `npx` or `uvx` package) that claw runs for the user | Community MCP servers with no hosted version | A **connector host** (see below) |
+| `database` | A database with a native claw driver | PostgreSQL (also Supabase, Neon, RDS), MySQL and MariaDB, Microsoft SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB | Control plane, through the claw database gateway (Section 10.4) |
+| `http_api` | A REST API from an OpenAPI document or from a list of endpoints. Auth: API key, bearer, basic, or OAuth 2 client credentials | Internal company APIs, a PMS, a CRM without a Composio toolkit | Control plane, through the claw HTTP client |
+| `plugin` | Python code that a product registers through the extension points (D16) | vorflux: Beds24 PMS, hotel channel managers | Control plane, in the product's tool pack |
+
+**Rules for every kind**
+
+- **No credentials in the agent sandbox.** Every call runs on the control plane or in a
+  connector host. The agent sandbox sees only tool results (D6).
+- **One tool path.** Every connector tool goes through the claw MCP server and the tool gate
+  (Section 16.1). Approvals, audit, budgets, and redaction work the same for all kinds.
+- **The outbound URL policy applies** (Section 16.4). A connection to a private network
+  needs an explicit network route (Section 10.6).
+- **Results are untrusted content** (Section 16.5). A database row or an API response can
+  contain a prompt injection.
+
+**Connector catalog**
+
+The catalog is a folder of YAML manifests in the claw repo, `connectors/catalog/<name>.yaml`,
+one file per connector, like Hermes `optional-mcps/`. A manifest is added through a reviewed
+pull request. A manifest holds:
+
+- `name`, `kind`, `description`, `icon`, and `docs_url`.
+- The transport: a URL (`mcp_remote`), a pinned package and command (`mcp_hosted`), a driver
+  (`database`), or an OpenAPI URL (`http_api`).
+- The auth type and the setup form fields. Secret fields are marked `secret: true`.
+- Default tool policies (`allow`, `ask`, `deny` per tool or per pattern) and default tool
+  filters (include and exclude lists).
+- Keywords for suggestions, for example "the user mentioned Supabase".
+
+An org admin can also add a custom connection that is not in the catalog (a URL, an OpenAPI
+document, a database, or a stdio command). A custom `mcp_hosted` connection needs the org
+`owner`.
+
+**Connection record**
+
+| Field | Meaning |
+|---|---|
+| `org_id`, `workspace_id` | Tenant scope (RLS) |
+| `scope` | `personal` (one user) or `workspace` (shared) |
+| `owner_user_id` | The user for a `personal` connection |
+| `connector`, `kind` | Catalog entry or `custom` |
+| `config` | Non-secret settings: URL, host, database name, schemas, read-only flag, tool filters |
+| `secret_ref` | Reference to the vault entry. Never the secret value. |
+| `state` | `pending`, `initiated`, `connected`, `failed`, `expired`, `disabled` |
+| `tool_cache` | Tool names and schemas from the last discovery, with a hash |
+| `policy_overrides` | Admin changes to the default tool policies |
+| `last_health_at`, `last_error` | Health check result |
+
+The state model follows Hermes `tools/connectors/contract.py`: only the backend can set
+`connected` (an OAuth callback, a successful health check, or a successful discovery). The
+model and the user's chat text cannot set it. A clock moves `initiated` to `expired`, and a
+failed health check or a refused token moves `connected` to `expired` or `failed`. The owner
+gets one notice per change.
+
+**How a user connects something**
+
+1. The user opens the Connections page in the web app, or types `/connect supabase` in any
+   channel, or the agent calls `connection_request` when it needs a connector.
+2. Claw shows a card with a link. OAuth connectors open the provider's consent page. Form
+   connectors (databases, API keys, stdio servers) open a form in the web app. **Secrets are
+   never typed in chat**, so they never enter a transcript.
+3. Claw stores the secret in the vault, tests the connection, discovers the tools, and sets
+   `connected`.
+4. The tools are available at once in new and running sessions through `tool_search`, so the
+   frozen prompt prefix does not change (D9). Hermes needs `/reload-mcp`, which breaks the
+   prompt cache. Claw does not.
+
+**Agent tools for connections** (toolset `connections`)
+
+| Tool | Purpose |
+|---|---|
+| `connections_list` | Lists the connections that this session can use, with state and a short description |
+| `connection_request` | Asks the user to connect a connector. Sends a card with the link or form. The agent cannot supply credentials. |
+| `connection_test` | Runs the health check for one connection and returns the state |
+
+**Tool naming and exposure**
+
+- Connector tools have a prefix for the kind and the connection name, as in Hermes:
+  `mcp_<connection>_<tool>` for MCP, `db_<connection>_<tool>` for databases, and
+  `api_<connection>_<tool>` for HTTP APIs. Composio tools keep the Composio slug (for
+  example `GMAIL_SEND_EMAIL`). If a name is longer than 64 characters, claw shortens it and
+  adds a short hash. Each connection is also a toolset `conn-<connection>`.
+- Connector tools are deferred behind `tool_search` by default. An agent profile can pin a
+  connection so that its tools are always visible.
+- Admins can include or exclude tools per connection, as in Hermes per-server filters.
+
+**Who can use a connection**
+
+- A `personal` connection runs as its owner. It is usable only in that user's private
+  sessions (Section 11.3), and in that user's jobs and workflows.
+- A `workspace` connection is usable by all workspace members and in shared sessions. Only a
+  workspace `admin` or the org `owner` can create, change, or remove it.
+- Default policies: read tools `allow`, write tools `ask`, destructive tools `ask` with a
+  stronger warning. Admins can change this per tool. Unattended runs follow Section 12.1.
+
+**Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
+start runs or workflows (Section 12).
+
+### 10.4 Database connections
+
+Claw has its own database connector because many SQL MCP servers give the model one
+`execute_sql` tool with full rights. The **claw database gateway** is a module of the claw MCP
+tool server. It holds the drivers and the connection pools, and it enforces the limits below
+at the driver, so a prompt cannot remove them.
+
+**Tools** (for each database connection)
+
+| Tool | What it does | Default policy |
+|---|---|---|
+| `db_<conn>_schema` | Lists schemas, tables, columns, types, keys, indexes, and comments. Filters by schema or table. Results are cached for 10 minutes. | `allow` |
+| `db_<conn>_sample` | Returns up to 20 rows of one table | `allow` |
+| `db_<conn>_query` | Runs one read statement (`SELECT`, `WITH`, `EXPLAIN`, or the equivalent for the engine) with bound parameters | `allow` |
+| `db_<conn>_export` | Runs one read statement and writes the full result as CSV or Parquet to a file in the agent sandbox, for analysis with code | `allow` |
+| `db_<conn>_execute` | Runs one write statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`). Only on connections with writes turned on. | `ask`, with the SQL and the estimated row count in the approval card |
+
+**Limits**
+
+- **Read-only by default.** Claw asks for a read-only database user in the setup form.
+  Claw also opens every `query` and `export` in a read-only transaction (for example
+  PostgreSQL `SET TRANSACTION READ ONLY`, MySQL `START TRANSACTION READ ONLY`).
+- **One statement per call.** Claw parses the SQL (with `sqlglot`) and rejects more than one
+  statement. A `query` call that contains a write is rejected. DDL (`CREATE`, `ALTER`, `DROP`,
+  `TRUNCATE`, `GRANT`) is `deny` by default. An admin can allow it for one connection, and
+  each DDL call is then `ask`.
+- **Limits per call**: a 30-second statement timeout, at most 1,000 rows and 50 KB returned
+  to the model (the rest spills to a file, as in Section 6.2), and a cost limit where the
+  engine reports one (for example BigQuery maximum bytes billed).
+- **Allowed schemas and tables**: an admin can limit a connection to some schemas or tables,
+  and can hide columns (for example `email` or `phone`). Claw applies the hidden columns to
+  `schema`, `sample`, `query`, and `export` results.
+- **Pools**: a small connection pool per connection, with a limit per org, so that the agent
+  cannot overload a production database.
+
+**Other ways to reach a database**
+
+- A vendor MCP server (for example Supabase or Neon) through `mcp_remote`. This is good for
+  admin tasks such as branches or migrations. Its tools follow the tool gate.
+- The agent can also use a database through code in its sandbox only if the user gives a
+  connection string for a scratch database. Claw does not put production credentials in the
+  sandbox.
+
+### 10.5 Connector hosts for stdio MCP servers
+
+Hermes starts stdio MCP servers as local processes. In the cloud, claw runs each
+`mcp_hosted` connection in a **connector host**: a small, separate E2B sandbox (or Fly
+Machine later) that the control plane owns.
+
+- One connector host per connection. It holds only that connection's secrets, as
+  environment variables. It is not the agent sandbox, and the agent cannot run commands in
+  it.
+- The host runs the pinned package from the manifest. Claw speaks MCP to it over a stdio
+  bridge, and proxies its tools like a remote MCP server.
+- The host has its own egress allowlist from the manifest (for example only `api.vendor.com`).
+- The host starts on the first call, pauses when idle, and restarts if it uses too much
+  memory (Hermes recycles stdio servers in the same way).
+- Custom stdio commands that are not in the catalog need the org `owner` to approve them.
+
+### 10.6 Private networks
+
+Many databases and internal APIs are not on the public internet. Claw supports these routes,
+per connection:
+
+| Route | How |
+|---|---|
+| IP allowlist | The claw services that call connectors use static egress IP addresses (Fly.io). The customer allows these addresses in the database firewall. |
+| SSH tunnel | Claw opens an SSH tunnel through the customer's bastion host. The SSH key is in the vault. |
+| Private network agent (later) | A small claw relay that the customer runs inside the network. It connects out to claw over TLS, so no inbound port is open. |
+
+The outbound URL policy (Section 16.4) blocks private addresses for normal requests. A
+connection that uses a tunnel or a relay is the only way to reach a private address, and only
+for that connection.
+
+### 10.7 Claw as an MCP server (later)
+
+Hermes can expose its own tools as an MCP server. Claw can expose an agent profile as a
+remote MCP server later, so that other agents (for example Claude Code or Cursor) can call
+claw tools and skills with an org token. This is not planned for M1 to M6.
 
 ---
 
@@ -859,8 +1038,8 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 
 ### 16.4 Outbound requests from the control plane
 
-Some requests start on the control plane, not in the sandbox: `web_extract`, remote MCP
-discovery and calls, OAuth flows, skill imports, webhook deliveries, and browser
+Some requests start on the control plane, not in the sandbox: `web_extract`, connector
+discovery and calls (MCP, HTTP API, database), OAuth flows, skill imports, webhook deliveries, and browser
 navigation. Sandbox egress rules do not cover them. One outbound HTTP client enforces a URL
 policy for all of them:
 
@@ -870,6 +1049,8 @@ policy for all of them:
   link-local, and cloud metadata addresses.
 - Claw checks every redirect hop again, with a limit on the number of hops.
 - Org allowlists and block lists apply. Response size and time limits apply.
+- A connection that has a private network route (SSH tunnel or relay, Section 10.6) may reach
+  the private addresses of that route only. No other request can use the route.
 
 ### 16.5 Untrusted content
 
@@ -889,7 +1070,7 @@ policy for all of them:
 | `users`, `memberships` | Users and their role per org and workspace (`owner`, `admin`, `member`) |
 | `agent_profiles` | SOUL, runtime, model, toolsets, skills, policy, budgets |
 | `channel_identities`, `session_bindings` | Paired Slack and Telegram identities, chat-to-session bindings |
-| `vault_secrets`, `connections` | Encrypted secrets, Composio and MCP connections |
+| `vault_secrets`, `connections`, `connector_hosts` | Encrypted secrets, connections of all kinds (Section 10.3), connector host state (Section 10.5) |
 
 - Every table has `org_id`, and most have `workspace_id`. RLS policies check membership from
   the Supabase JWT. The API also checks scope in code (two guards).
@@ -927,7 +1108,7 @@ policy for all of them:
 | Hosting | Fly.io: `api`, `gateway`, `worker`, `scheduler` process groups |
 | Sandboxes | E2B (custom template), Docker for local development |
 | Browser | Browserbase plus Playwright; Chrome extension (TypeScript, MV3) |
-| Integrations | Composio, remote MCP servers |
+| Connectors | Composio, remote MCP servers, hosted stdio MCP servers (E2B), database drivers (`asyncpg`, `aiomysql`, and others) with `sqlglot`, OpenAPI |
 | Channels | Slack Bolt for Python, Telegram Bot API |
 | Web UI | Next.js on Vercel |
 | Observability | Langfuse, OpenTelemetry |
@@ -963,8 +1144,8 @@ docs/
 | M0 | This design (doc only). |
 | M1 Core engine | Repo foundations and CI. Runtime contract, Claude adapter, fake runtime, conformance suite. E2B sandbox and runner. Model proxy. Sessions in Postgres. SOUL and context files. Vault and redaction. Claw MCP tool server with output caps and spill. Outbound URL policy. Tool gate with approvals in the web chat and Telegram. HTTP chat API and a minimal web chat page. Telegram. Langfuse. Code editing in the sandbox (no pull requests yet). |
 | M2 Learning loop | Memory, skills library and tools, session search, background review, context management (tool search, pins). |
-| M3 Reach | Slack with shared-session rules. Approver rules per role. Composio and MCP connections. OpenAI Agents SDK adapter passes the conformance suite. GitHub pull request flow. Web app v1 for the team. |
-| M4 Automation | Cron jobs and delivery, event triggers, workflows, `delegate_task`, task board, `@` references. |
+| M3 Reach | Slack with shared-session rules. Approver rules per role. Connections: connection framework, Composio, remote MCP, and PostgreSQL. OpenAI Agents SDK adapter passes the conformance suite. GitHub pull request flow. Web app v1 for the team. |
+| M4 Automation | Cron jobs and delivery, event triggers, workflows, `delegate_task`, task board, `@` references. Hosted stdio MCP, HTTP API connections, more databases, and SSH tunnels. |
 | M5 Browser | Cloud browser tools, vision mode, browser vault, Chrome extension. |
 | M6 Self-change and customers | `change_propose` and `claw_pr`, curator, checkpoints, customer sign-up, billing, quotas, org keys, regions, customer-ready web app. |
 
