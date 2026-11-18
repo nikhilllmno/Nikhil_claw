@@ -412,9 +412,19 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   record is the source of truth for billing (M1.7).
 - **Cancel.** `cancel` calls `interrupt()`. If the CLI does not stop within
   `cancel_grace_s` (5 seconds by default), the adapter ends the stream and stops the CLI.
-  The stream ends with `RunFailed(cancelled)` within 10 seconds.
-- **Limits.** `max_turns` and `max_cost_usd` map to `max_turns` and `max_budget_usd`.
-  `max_wall_time_s` is a timer in the adapter. `max_tokens` is enforced by the model proxy.
+  The stream ends with `RunFailed(cancelled)` within 10 seconds. If the pump already queued
+  `ApprovalRequired`, the stream gives `RunFailed(cancelled)` in its place.
+- **CLI stop.** The SDK stops the CLI in steps (close stdin, terminate, kill). This can take
+  about 20 seconds, and a cancel of that work can leave the CLI running. So the adapter runs
+  `disconnect()` in a task of its own and never cancels it. The stream does not wait for it
+  longer than `cancel_grace_s`. `ClaudeRuntime.aclose()` waits until all CLI processes stopped.
+- **Limits.** `max_turns` and `max_cost_usd` map to `max_turns` and `max_budget_usd`. The CLI
+  counts these limits per process, not per SDK session. So `runtime_state` keeps the turns
+  and the wall time that the run used, and each resume gets only the rest of each limit. If a
+  limit is used up, the run fails before the CLI starts. `max_wall_time_s` is a timer in the
+  adapter. `max_tokens` is enforced by the model proxy.
+- **Errors.** Failure messages are fixed text. CLI error strings and the text of SDK
+  exceptions can hold raw tool data, so they do not go into `RunFailed`.
 - **Sub-agents.** Messages with a `parent_tool_use_id` become `SubagentEvent`s.
   `compact_boundary` system messages become `Compacted`.
 

@@ -9,13 +9,14 @@ hook decision ``defer``: the CLI ends the turn with ``stop_reason == "tool_defer
 adapter yields ``ApprovalRequired``. The live behaviour of the CLI, checked with
 ``claude-agent-sdk==0.2.184``:
 
-- Approve: resume the SDK session with no prompt. The CLI runs the deferred call and the
-  model continues. The hook does not fire again for that call.
-- Reject: a resume with no prompt also runs the deferred call, so it is not safe. The adapter
-  first resumes with the tool in ``disallowed_tools`` and
-  ``CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL=1``. The CLI then drops the call
-  (``stop_reason == "tool_deferred_unavailable"``). Then the adapter resumes again with all
-  tools and tells the model that the user rejected the call.
+- Approve: resume the SDK session with no prompt. The CLI checks the deferred call again,
+  through ``can_use_tool`` or (for some read-only calls) the hook. Both allow only the
+  approved tool use id. Then the CLI runs the call and the model continues.
+- Reject: a deny on resume is not reliable, because some calls skip ``can_use_tool`` and the
+  model can try the call again. So the adapter first resumes with the tool in
+  ``disallowed_tools`` and ``CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL=1``. The CLI then
+  drops the call (``stop_reason == "tool_deferred_unavailable"``). Then the adapter resumes
+  again with all tools and tells the model that the user rejected the call.
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ from claude_agent_sdk.types import (
     SystemPromptPreset,
     ToolPermissionContext,
 )
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sama.runtime.contract import (
     ApprovalDecision,
@@ -86,6 +87,9 @@ DROP_DEFERRED_ENV: Final = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL"
 _ABORTED: Final = frozenset({"aborted_streaming", "aborted_tools"})
 _BUDGET_SUBTYPES: Final = frozenset({"error_max_turns", "error_max_budget_usd"})
 _RETRYABLE_STATUS: Final = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+_KNOWN_SUBTYPES: Final = frozenset(
+    {"error_during_execution", "error_max_structured_output_retries"}
+)
 _SUBAGENT_TOOLS: Final = frozenset({"Task", "Agent"})
 _PREVIEW_CHARS: Final = 2_000
 _MEMORY_SIZE: Final = 10_000
@@ -178,7 +182,9 @@ class _PendingCall(BaseModel):
 class _State(BaseModel):
     """The JSON in ``runtime_state``. ``sdk_cost_usd`` is the last cost that the CLI reported
     for the SDK session. The CLI reports cost for the whole SDK session, also after a resume,
-    so the adapter adds only the difference to the cost of the run."""
+    so the adapter adds only the difference to the cost of the run. ``turns`` and
+    ``elapsed_s`` are what the run used before it paused. The CLI counts its limits per
+    process, so a resume gets only the rest of the budget."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -187,6 +193,8 @@ class _State(BaseModel):
     run_id: str
     usage: Usage = Usage()
     sdk_cost_usd: Decimal = Decimal(0)
+    turns: int = Field(default=0, ge=0)
+    elapsed_s: float = Field(default=0.0, ge=0)
     pending: _PendingCall | None = None
 
     def dump(self) -> bytes:
@@ -241,6 +249,10 @@ class _Translator:
     usage: Usage
     sdk_cost_usd: Decimal
     session_id: str | None = None
+    turns: int = 0
+    elapsed_before_s: float = 0.0
+    """Wall time that the run used in earlier streams (before a pause)."""
+    started_at: float | None = None
     ask_reasons: dict[str, str] = field(default_factory=dict)
     allowed_calls: set[str] = field(default_factory=set)
     """Tool use ids that the gate or a human allowed. ``can_use_tool`` allows only these."""
@@ -339,7 +351,13 @@ class _Translator:
             cost = reported - self.sdk_cost_usd if reported >= self.sdk_cost_usd else reported
             self.sdk_cost_usd = reported
         self.usage = self.usage + tokens.model_copy(update={"cost_usd": cost})
+        self.turns += _non_negative_int(result.num_turns)
         self.session_id = result.session_id or self.session_id
+
+    def elapsed_s(self) -> float:
+        if self.started_at is None:
+            return self.elapsed_before_s
+        return self.elapsed_before_s + max(0.0, asyncio.get_running_loop().time() - self.started_at)
 
     def state(self, pending: _PendingCall | None = None) -> bytes | None:
         if self.session_id is None:
@@ -349,6 +367,8 @@ class _Translator:
             run_id=self.run_id,
             usage=self.usage,
             sdk_cost_usd=self.sdk_cost_usd,
+            turns=self.turns,
+            elapsed_s=self.elapsed_s(),
             pending=pending,
         ).dump()
 
@@ -372,8 +392,9 @@ class _Translator:
                 usage=usage,
             )
         if result.subtype in _BUDGET_SUBTYPES:
+            limit = "max_turns" if result.subtype == "error_max_turns" else "max_cost_usd"
             return RunFailed(
-                code=FailureCode.BUDGET_EXCEEDED, message=_error_text(result), usage=usage
+                code=FailureCode.BUDGET_EXCEEDED, message=f"the run reached {limit}", usage=usage
             )
         if result.is_error or result.subtype != "success":
             status = result.api_error_status
@@ -405,10 +426,11 @@ def _preview(content: Any) -> str:
 
 
 def _error_text(result: ResultMessage) -> str:
-    if result.errors:
-        return "; ".join(result.errors)[:_PREVIEW_CHARS]
-    reason = result.terminal_reason or result.stop_reason or "unknown"
-    return f"the run ended with {result.subtype} ({reason})"
+    """A fixed public message. The CLI error strings can hold tool data, so they stay out."""
+    status = result.api_error_status
+    detail = f", HTTP status {status}" if isinstance(status, int) else ""
+    subtype = result.subtype if result.subtype in _KNOWN_SUBTYPES else "error"
+    return f"the model call failed ({subtype}{detail})"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -490,6 +512,8 @@ class ClaudeRuntime:
         self._paused = _BoundedSet()
         self._used_approvals = _BoundedSet()
         self._cancelled_runs = _BoundedSet()
+        self._pumps: set[asyncio.Task[None]] = set()
+        self._cleanups: set[asyncio.Task[None]] = set()
 
     @property
     def kind(self) -> RuntimeKind:
@@ -567,6 +591,8 @@ class ClaudeRuntime:
             usage=state.usage,
             sdk_cost_usd=state.sdk_cost_usd,
             session_id=state.session_id,
+            turns=state.turns,
+            elapsed_before_s=state.elapsed_s,
         )
         stream = self._stream(request.scope, request.config, request.budget, phases, translator)
         async with contextlib.aclosing(stream):
@@ -635,6 +661,8 @@ class ClaudeRuntime:
         self._active[run_id] = active
         pump = asyncio.create_task(self._pump(scope, config, budget, phases, translator, active))
         active.pump = pump
+        self._pumps.add(pump)
+        pump.add_done_callback(self._pumps.discard)
         try:
             while True:
                 item = await active.queue.get()
@@ -649,8 +677,13 @@ class ClaudeRuntime:
                     return
                 if is_terminal(item):
                     self._release(run_id, active)
-                    if isinstance(item, ApprovalRequired) and not active.cancelled.is_set():
-                        self._paused.add(run_id)
+                    if isinstance(item, ApprovalRequired):
+                        if active.cancelled.is_set():
+                            # cancel() came after the pump queued the approval. A cancelled
+                            # run cannot pause.
+                            item = _cancelled(item.usage)
+                        else:
+                            self._paused.add(run_id)
                     yield item
                     return
                 yield item
@@ -676,10 +709,26 @@ class ClaudeRuntime:
     ) -> None:
         """Owns the SDK clients. Every SDK call happens in this task."""
         send = active.send
+        translator.started_at = asyncio.get_running_loop().time()
+        wall_time: float | None = None
+        if budget.max_wall_time_s is not None:
+            wall_time = max(0.0, budget.max_wall_time_s - translator.elapsed_before_s)
         try:
-            async with asyncio.timeout(budget.max_wall_time_s):
+            async with asyncio.timeout(wall_time):
                 for phase in phases:
                     if active.cancelled.is_set():
+                        break
+                    if wall_time == 0.0:
+                        raise TimeoutError
+                    exhausted = _exhausted(budget, translator)
+                    if exhausted is not None:
+                        send(
+                            RunFailed(
+                                code=FailureCode.BUDGET_EXCEEDED,
+                                message=f"the run reached {exhausted}",
+                                usage=translator.usage,
+                            )
+                        )
                         break
                     terminal = await self._run_phase(
                         scope, config, budget, phase, translator, active
@@ -706,7 +755,8 @@ class ClaudeRuntime:
             send(
                 RunFailed(
                     code=FailureCode.INTERNAL,
-                    message=f"claude agent sdk error: {type(exc).__name__}: {exc}"[:500],
+                    # The text of an SDK error can hold raw CLI output. Only the type goes out.
+                    message=f"claude agent sdk error: {type(exc).__name__}",
                     usage=translator.usage,
                 )
             )
@@ -734,6 +784,7 @@ class ClaudeRuntime:
         options = self._options(scope, config, budget, phase, translator)
         client = self._client_factory(options)
         active.client = client
+        final: ResultMessage | None = None
         try:
             await client.connect()
             if phase.prompt is not None:
@@ -741,23 +792,54 @@ class ClaudeRuntime:
             async for message in client.receive_messages():
                 if isinstance(message, ResultMessage):
                     translator.add_result_usage(message)
-                    if phase.drop_tool is None:
-                        return translator.terminal(message, active.cancelled.is_set())
-                    if active.cancelled.is_set() or message.terminal_reason in _ABORTED:
-                        return _cancelled(translator.usage)
-                    if message.stop_reason != "tool_deferred_unavailable":
-                        raise _UnexpectedResult(
-                            "the CLI did not drop the rejected tool call "
-                            f"(stop_reason: {message.stop_reason})"
-                        )
-                    return None
+                    final = message
+                    break
                 for event in translator.feed(message):
                     active.send(event)
-            raise _UnexpectedResult("the CLI stopped before it sent a result")
         finally:
             active.client = None
+            await self._disconnect(client)
+        # Map the result only after the CLI stopped, so the wall time in runtime_state also
+        # counts the time to stop the CLI.
+        if final is None:
+            raise _UnexpectedResult("the CLI stopped before it sent a result")
+        if phase.drop_tool is None:
+            return translator.terminal(final, active.cancelled.is_set())
+        if active.cancelled.is_set() or final.terminal_reason in _ABORTED:
+            return _cancelled(translator.usage)
+        if final.stop_reason != "tool_deferred_unavailable":
+            raise _UnexpectedResult(
+                f"the CLI did not drop the rejected tool call (stop_reason: {final.stop_reason})"
+            )
+        return None
+
+    async def _disconnect(self, client: ClaudeClient) -> None:
+        """Stops the CLI process in a task of its own.
+
+        The SDK stops the CLI in steps (close stdin, terminate, kill), and this can take about
+        20 seconds. A cancel of that work can leave the CLI running, so the adapter never
+        cancels it. It waits up to ``cancel_grace_s`` and lets the task finish after. The
+        runtime keeps a reference to the task until it ends. ``aclose`` waits for all of them.
+        """
+
+        async def stop() -> None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.disconnect(), timeout=self._settings.cancel_grace_s)
+                await client.disconnect()
+
+        task = asyncio.create_task(stop())
+        self._cleanups.add(task)
+        task.add_done_callback(self._cleanups.discard)
+        # asyncio.wait does not cancel the task on a timeout or when this task is cancelled.
+        await asyncio.wait({task}, timeout=self._settings.cancel_grace_s)
+
+    async def aclose(self) -> None:
+        """Waits until every CLI process that the adapter started has stopped.
+
+        It waits for the pumps first, because a pump that ``cancel`` stopped starts its
+        ``disconnect`` task only when it unwinds.
+        """
+        while self._pumps or self._cleanups:
+            await asyncio.wait(self._pumps | self._cleanups)
 
     # -- options ---------------------------------------------------------------------------
 
@@ -794,8 +876,8 @@ class ClaudeRuntime:
             setting_sources=[],
             disallowed_tools=disallowed,
             resume=translator.session_id,
-            max_turns=budget.max_turns,
-            max_budget_usd=float(budget.max_cost_usd) if budget.max_cost_usd else None,
+            max_turns=_remaining_turns(budget, translator),
+            max_budget_usd=_remaining_cost(budget, translator),
             include_partial_messages=True,
             hooks={"PreToolUse": [HookMatcher(hooks=[self._hook(scope, phase, translator)])]},
             can_use_tool=_can_use_tool(translator),
@@ -874,6 +956,30 @@ def _mcp_servers(config: RunConfig) -> dict[str, Any]:
             entry["headers"] = {"Authorization": f"Bearer {server.bearer_token.get_secret_value()}"}
         servers[server.name] = entry
     return servers
+
+
+def _remaining_turns(budget: Budget, translator: _Translator) -> int | None:
+    if budget.max_turns is None:
+        return None
+    return budget.max_turns - translator.turns
+
+
+def _remaining_cost(budget: Budget, translator: _Translator) -> float | None:
+    """The CLI counts ``max_budget_usd`` per process, so each process gets only the rest."""
+    if budget.max_cost_usd is None:
+        return None
+    return float(budget.max_cost_usd - translator.usage.cost_usd)
+
+
+def _exhausted(budget: Budget, translator: _Translator) -> str | None:
+    """The name of a budget limit that the run already used up, or None."""
+    remaining_turns = _remaining_turns(budget, translator)
+    if remaining_turns is not None and remaining_turns <= 0:
+        return "max_turns"
+    remaining_cost = _remaining_cost(budget, translator)
+    if remaining_cost is not None and remaining_cost <= 0:
+        return "max_cost_usd"
+    return None
 
 
 def _invalid(message: str) -> RunFailed:

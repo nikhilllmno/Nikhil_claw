@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     CLIConnectionError,
+    CLIJSONDecodeError,
     HookInput,
     ResultMessage,
     StreamEvent,
@@ -81,13 +82,14 @@ def result(
     terminal_reason: str | None = "completed",
     errors: list[str] | None = None,
     api_error_status: int | None = None,
+    num_turns: int = 1,
 ) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
         duration_ms=1,
         duration_api_ms=1,
         is_error=is_error,
-        num_turns=1,
+        num_turns=num_turns,
         session_id=SESSION,
         stop_reason=stop_reason,
         total_cost_usd=cost,
@@ -139,8 +141,10 @@ class FakeClient:
         block: bool = False,
         honour_interrupt: bool = True,
         connect_error: Exception | None = None,
+        disconnect_s: float = 0.0,
     ) -> None:
         self.options = options
+        self.disconnect_s = disconnect_s
         self.steps = list(steps)
         self.block = block
         self.honour_interrupt = honour_interrupt
@@ -174,6 +178,7 @@ class FakeClient:
         self.interrupted.set()
 
     async def disconnect(self) -> None:
+        await asyncio.sleep(self.disconnect_s)
         self.disconnected = True
 
 
@@ -272,6 +277,7 @@ def resume_request(
     run_id: str = "run-1",
     approval_id: str | None = None,
     reason: str | None = None,
+    budget: Budget | None = None,
 ) -> ResumeRequest:
     return ResumeRequest(
         scope=make_scope(run_id),
@@ -279,6 +285,7 @@ def resume_request(
         approval_id=approval_id or paused.approval_id,
         decision=decision,
         reason=reason,
+        budget=budget or Budget(),
         runtime_state=paused.runtime_state,
     )
 
@@ -489,7 +496,25 @@ async def test_model_error_is_retryable_for_overload() -> None:
     assert isinstance(failed, RunFailed)
     assert failed.code is FailureCode.MODEL_ERROR
     assert failed.retryable
-    assert failed.message == "overloaded"
+    assert "overloaded" not in failed.message
+    assert "529" in failed.message
+
+
+async def test_cli_error_strings_do_not_leak() -> None:
+    factory = Factory(
+        [result(subtype="error_during_execution", is_error=True, errors=["token sk-123 bad"])]
+    )
+    events = await collect(ClaudeRuntime(client_factory=factory).run(request()))
+    assert isinstance(events[-1], RunFailed)
+    assert "sk-123" not in events[-1].message
+
+
+async def test_sdk_error_text_does_not_leak() -> None:
+    error = CLIJSONDecodeError('{"tool_input": "sk-123"', ValueError("bad json"))
+    factory = Factory([], connect_error=error)
+    events = await collect(ClaudeRuntime(client_factory=factory).run(request()))
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].message == "claude agent sdk error: CLIJSONDecodeError"
 
 
 async def test_sdk_error_fails_the_run() -> None:
@@ -638,6 +663,56 @@ async def test_can_use_tool_allows_only_calls_the_gate_allowed() -> None:
     assert isinstance(unknown, PermissionResultDeny)
 
 
+async def pause_with_usage(*, cost: float, turns: int) -> tuple[ClaudeRuntime, ApprovalRequired]:
+    phase = deferred_phase()
+    final = phase[-1]
+    assert isinstance(final, ResultMessage)
+    final.total_cost_usd = cost
+    final.num_turns = turns
+    runtime = ClaudeRuntime(
+        gate=ScriptedGate(GateDecision("ask", "write")), client_factory=Factory(phase)
+    )
+    events = await collect(runtime.run(request()))
+    assert isinstance(events[-1], ApprovalRequired)
+    return runtime, events[-1]
+
+
+async def test_resume_gets_only_the_rest_of_the_budget() -> None:
+    # The CLI counts max_turns and max_budget_usd per process. A resume must not get them again.
+    runtime, paused = await pause_with_usage(cost=0.08, turns=3)
+    factory = Factory([result(cost=0.09)])
+    runtime._client_factory = factory
+    budget = Budget(max_turns=5, max_cost_usd=Decimal("0.10"))
+    request_ = resume_request(paused, ApprovalDecision.APPROVE, budget=budget)
+    events = await collect(runtime.resume(request_))
+    assert isinstance(events[-1], RunCompleted)
+    options = factory.clients[0].options
+    assert options.max_turns == 2
+    assert options.max_budget_usd == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize(
+    ("budget", "code"),
+    [
+        (Budget(max_cost_usd=Decimal("0.05")), FailureCode.BUDGET_EXCEEDED),
+        (Budget(max_turns=3), FailureCode.BUDGET_EXCEEDED),
+        (Budget(max_wall_time_s=0.000001), FailureCode.TIMEOUT),
+    ],
+)
+async def test_resume_with_a_used_up_budget_fails_before_the_cli_starts(
+    budget: Budget, code: FailureCode
+) -> None:
+    runtime, paused = await pause_with_usage(cost=0.08, turns=3)
+    factory = Factory()
+    runtime._client_factory = factory
+    events = await collect(
+        runtime.resume(resume_request(paused, ApprovalDecision.APPROVE, budget=budget))
+    )
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].code is code
+    assert factory.clients == []
+
+
 async def test_reject_drops_the_call_then_tells_the_model() -> None:
     runtime, paused = await pause()
     factory = Factory(
@@ -707,7 +782,7 @@ async def test_new_message_after_an_unanswered_approval_drops_the_call_first() -
         ({"run_id": "run-9"}, "another run"),
     ],
 )
-async def test_resume_rejects_a_wrong_approval(change: dict[str, str], message: str) -> None:
+async def test_resume_rejects_a_wrong_approval(change: dict[str, Any], message: str) -> None:
     runtime, paused = await pause()
     events = await collect(
         runtime.resume(resume_request(paused, ApprovalDecision.APPROVE, **change))
@@ -786,6 +861,58 @@ async def test_cancel_stops_the_stream_when_the_cli_hangs() -> None:
     assert isinstance(events[-1], RunFailed)
     assert events[-1].code is FailureCode.CANCELLED
     assert elapsed < 2
+
+
+async def test_cancel_after_a_queued_approval_cancels_the_run() -> None:
+    phase = [delta("Hi"), *deferred_phase()]
+    runtime = ClaudeRuntime(
+        gate=ScriptedGate(GateDecision("ask", "write")), client_factory=Factory(phase)
+    )
+    stream = runtime.run(request())
+    assert isinstance(await anext(stream), TextDelta)
+    pump = runtime._active["run-1"].pump
+    assert pump is not None
+    await asyncio.wait({pump})  # The pump queued ApprovalRequired. The consumer did not read it.
+    await runtime.cancel("run-1")
+    rest = [e async for e in stream]
+    assert isinstance(rest[-1], RunFailed)
+    assert rest[-1].code is FailureCode.CANCELLED
+    assert "run-1" not in runtime._paused
+
+
+async def test_slow_disconnect_is_not_cancelled() -> None:
+    factory = Factory([delta("Hi")], block=True, honour_interrupt=False, disconnect_s=0.5)
+    runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=0.1), client_factory=factory)
+    events, elapsed = await _cancel_while_streaming(runtime)
+    assert isinstance(events[-1], RunFailed)
+    assert elapsed < 0.5
+    client = factory.clients[0]
+    assert not client.disconnected
+    await runtime.aclose()
+    assert client.disconnected
+
+
+async def test_aclose_right_after_cancel_waits_for_the_cli_to_stop() -> None:
+    factory = Factory([delta("Hi")], block=True, honour_interrupt=False, disconnect_s=0.3)
+    runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=0.1), client_factory=factory)
+    stream = runtime.run(request())
+    await anext(stream)
+    await runtime.cancel("run-1")
+    await runtime.aclose()  # The stream is not drained yet.
+    assert factory.clients[0].disconnected
+
+
+async def test_approval_state_counts_the_time_to_stop_the_cli() -> None:
+    runtime = ClaudeRuntime(
+        gate=ScriptedGate(GateDecision("ask", "write")),
+        settings=ClaudeSettings(cancel_grace_s=1.0),
+        client_factory=Factory(deferred_phase(), disconnect_s=0.3),
+    )
+    events = await collect(runtime.run(request()))
+    paused = events[-1]
+    assert isinstance(paused, ApprovalRequired)
+    assert paused.runtime_state is not None
+    assert json.loads(paused.runtime_state)["elapsed_s"] >= 0.3
 
 
 async def test_cancel_of_an_unknown_run_does_nothing() -> None:
