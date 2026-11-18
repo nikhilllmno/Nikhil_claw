@@ -83,6 +83,9 @@ def client(handler: Handler, policy: UrlPolicy | None = None) -> OutboundClient:
         ("ff02::1", False),
         ("::ffff:127.0.0.1", False),
         ("::ffff:8.8.8.8", True),
+        ("4000::1", False),  # reserved, but is_global is true
+        ("64:ff9b::a00:1", False),  # NAT64 of 10.0.0.1
+        ("64:ff9b::a9fe:a9fe", False),  # NAT64 of 169.254.169.254
         ("2002:0a00:0001::1", False),  # 6to4 of 10.0.0.1
         ("2001:0:4136:e378:8000:63bf:f5ff:fffe", False),  # Teredo of 10.0.0.1
     ],
@@ -304,8 +307,20 @@ async def test_the_size_limit_counts_the_bytes_on_the_wire() -> None:
     assert result.truncated
 
 
-@pytest.mark.parametrize("entry", ["bücher.de", "xn--bcher-kva.de", "XN--BCHER-KVA.DE."])
-@pytest.mark.parametrize("url", ["https://bücher.de/", "https://xn--bcher-kva.de/"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "bücher.de",
+        "xn--bcher-kva.de",
+        "XN--BCHER-KVA.DE.",
+        "bücher.de\u3002",
+        "bücher.de\uff0e",
+        "bücher.de\uff61",
+    ],
+)
+@pytest.mark.parametrize(
+    "url", ["https://bücher.de/", "https://xn--bcher-kva.de/", "https://bücher.de\u3002/"]
+)
 async def test_host_lists_match_unicode_and_punycode_names(entry: str, url: str) -> None:
     with pytest.raises(BlockedUrlError, match="block list"):
         await client(page(), UrlPolicy(block_hosts=(entry,))).get(url)

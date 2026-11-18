@@ -79,8 +79,9 @@ class FetchResult:
 def address_problem(address: IPAddress) -> str | None:
     """Why the address is not allowed, or ``None`` for a public unicast address.
 
-    ``is_global`` is false also for unspecified and reserved addresses. Multicast needs its
-    own check, because some multicast ranges are global."""
+    Multicast and reserved addresses need their own checks: some multicast ranges are global,
+    and for IPv6 ``is_global`` is true for some reserved ranges (for example the NAT64 prefix
+    ``64:ff9b::/96``, which can carry a private IPv4 address)."""
     candidates: list[IPAddress] = [address]
     if isinstance(address, ipaddress.IPv6Address):
         for embedded in (address.ipv4_mapped, address.sixtofour):
@@ -91,7 +92,7 @@ def address_problem(address: IPAddress) -> str | None:
     if any(candidate in METADATA_ADDRESSES for candidate in candidates):
         return f"{address} is a cloud metadata address"
     for candidate in candidates:
-        if not candidate.is_global or candidate.is_multicast:
+        if not candidate.is_global or candidate.is_multicast or candidate.is_reserved:
             return f"{address} is not a public address"
     return None
 
@@ -99,10 +100,11 @@ def address_problem(address: IPAddress) -> str | None:
 def ascii_host(host: str) -> str:
     """The lower-case IDNA (punycode) form of a host name, without a final dot."""
     try:
-        raw = httpx.URL(f"https://{host.strip().rstrip('.')}/").raw_host
+        raw = httpx.URL(f"https://{host.strip()}/").raw_host
     except httpx.InvalidURL:
         raise ValueError(f"{host!r} is not a valid host name") from None
-    return raw.decode("ascii").lower()
+    # Strip the dot after the IDNA step, which also maps the Unicode dots (U+3002 and others).
+    return raw.decode("ascii").lower().rstrip(".")
 
 
 def _host_matches(host: str, patterns: Sequence[str]) -> bool:
