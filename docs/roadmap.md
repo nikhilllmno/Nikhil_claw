@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.9.
+Done: M1.1 to M1.10.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -63,13 +63,18 @@ Done: M1.1 to M1.9.
   run in E2B needs a proxy URL that the sandbox can reach, so it waits for the deploy (M1.15).
 - M1.8: the sama MCP tool server in `src/sama/tools/` (architecture Section 16.7), with the
   outbound URL policy (Section 16.4) and the `session_todos` table (migration `0003`).
-  `web_search` uses the Brave Search API. The clarify broker is in memory until M1.10. The
+  `web_search` uses the Brave Search API. The clarify broker is in memory (see Later). The
   Claude `TodoWrite` mapping to `todo` comes later.
 - M1.9: the tool gate in `src/sama/gate/` (architecture Section 16.1), with the `approvals`
   and `tool_policies` tables and `runs.unattended` (migration `0004`). The runner asks the
   control plane for each call (`POST /gate`). The API and the channels call
   `GateService.decide_approval` (M1.12, M1.13). The worker calls `GateService.expire()`
   (M1.10). Job pre-approvals come with jobs (M3).
+- M1.10: the run queue and the worker in `src/sama/orchestrator/queue.py` and
+  `src/sama/orchestrator/worker.py` (architecture Section 4.3), with the queue columns of
+  `runs` and `sessions.sandbox_id` (migration `0005`). `PostgresSandboxDirectory` stores the
+  sandbox of each session. Per-org concurrency and rate limits come with the API (M1.12). The
+  deploy (M1.15) applies migrations `0004` and `0005` to Supabase.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
@@ -176,3 +181,6 @@ Done: M1.1 to M1.9.
 - A private network relay that customers run inside their network (architecture §10.6).
 - Sama as an MCP server for other agents (architecture §10.7).
 - An OpenAI-compatible chat endpoint.
+- Clarify questions in Postgres, so the API, the tool server, and the workers can run in
+  separate processes (architecture §16.7).
+- A durable queue for model proxy records that wait for a write (architecture §16.6).
