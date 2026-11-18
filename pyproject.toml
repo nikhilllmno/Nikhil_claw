@@ -21,7 +21,8 @@ dev = [
     "ruff>=0.17.5,<0.18",
 ]
 # Each runtime adapter pins its SDK (docs/architecture.md, Section 5.3).
-# Install with `uv sync --group runtime-claude` or `uv sync --group runtime-openai`.
+# `runtime-claude` is a default group because Claude is the default runtime.
+# Install the other one with `uv sync --group runtime-openai`.
 runtime-claude = [
     "claude-agent-sdk==0.2.184",
 ]
@@ -30,7 +31,7 @@ runtime-openai = [
 ]
 
 [tool.uv]
-default-groups = ["dev"]
+default-groups = ["dev", "runtime-claude"]
 
 [tool.ruff]
 line-length = 100
@@ -60,3 +61,6 @@ testpaths = ["tests"]
 addopts = "-q --strict-markers"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: calls a real model API. Runs only with SAMA_LIVE_TESTS=1.",
+]

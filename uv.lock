@@ -975,6 +975,7 @@ wheels = [
 name = "sama"
 version = "0.1.0"
 source = { editable = "." }
+default-groups = ["dev", "runtime-claude"]
 dependencies = [
     { name = "pydantic" },
 ]

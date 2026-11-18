@@ -40,7 +40,9 @@ M2 and M3 can run in parallel after M1.
 ## M1 — Core engine
 
 Done: M1.1 and M1.3 (contract in `src/sama/runtime/contract.py`, fake runtime in
-`src/sama/runtime/fake.py`).
+`src/sama/runtime/fake.py`), and M1.4 (Claude adapter in `src/sama/runtime/claude.py`, see
+architecture Section 5.3). Live tests of the adapter run with
+`SAMA_LIVE_TESTS=1 uv run --all-groups pytest -m live`.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
