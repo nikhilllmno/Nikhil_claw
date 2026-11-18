@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.7.
+Done: M1.1 to M1.8.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -61,6 +61,10 @@ Done: M1.1 to M1.7.
   table `prices.toml` and the `model_calls` table (migration `0002`). The `claude-runner` and
   `claude-docker` conformance targets send their model calls through the proxy. A live Claude
   run in E2B needs a proxy URL that the sandbox can reach, so it waits for the deploy (M1.15).
+- M1.8: the sama MCP tool server in `src/sama/tools/` (architecture Section 16.7), with the
+  outbound URL policy (Section 16.4) and the `session_todos` table (migration `0003`).
+  `web_search` uses the Brave Search API. The clarify broker is in memory until M1.10. The
+  Claude `TodoWrite` mapping to `todo` comes later.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
