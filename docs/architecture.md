@@ -71,7 +71,8 @@ Five rules shape the design:
    security is on from the first table, so customers later need no data migration.
 4. **The prompt prefix is frozen per session** (a Hermes rule). The system prompt, tool list,
    memory snapshot, and skill index do not change during a session. This keeps prompt caching
-   cheap. Changes apply from the next session. Compaction is the only exception.
+   cheap. Prompt changes apply from the next session. Compaction is the only exception.
+   Authority is not frozen: a revoked permission or a lower budget applies at once.
 5. **Self-improvement is bounded and reversible.** The agent can write memory, skills, cron
    jobs, and workflows. Each write is versioned. Changes to claw's own code go through a pull
    request that a human merges. The agent never changes the running service directly.
@@ -165,7 +166,7 @@ Five rules shape the design:
 | D10 | **Integrations come from Composio and remote MCP servers.** Connections are per user or per workspace, with OAuth tokens in the claw vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
 | D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Bolt, Events API), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
-| D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless the job has a pre-approval for that tool. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
+| D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless a human approved a pre-approval for that tool in that job version. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
 | D14 | **Self-improvement writes are versioned data.** Memory, skills, cron jobs, workflows, and SOUL changes are rows with history and provenance. Changes to claw's own code are pull requests that a human merges. | The agent can learn and change its stack, but every change can be reviewed and reverted. |
 | D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. | One trace view for both SDKs. Both SDKs have Langfuse integrations. The proxy is the source of truth for cost. |
 | D16 | **Claw is a library plus services.** Products import `claw` and register extra tools, skills, toolsets, channels, and policies through extension points. They do not patch claw code. | vorflux and later products build on the engine without a fork (Hermes rule: plugins never touch core). |
@@ -262,8 +263,9 @@ flowchart LR
 6. **Execute.** The runner starts the adapter. The SDK calls the model through the model
    proxy and calls claw tools through the MCP server. Here the agent calls
    `cronjob_manage(action="create", ...)`.
-7. **Gate.** The tool gate checks the policy. Creating a job is `allow` for the owner of the
-   chat, so the call runs. A risky call (send an email to a customer, push code) gets `ask`:
+7. **Gate.** The tool gate checks the policy. Creating a job without pre-approved tools is
+   `allow` for the owner of the chat, so the call runs. If the job asks for pre-approved
+   tools, those tools stay off until the user approves them (Section 12.1). A risky call (send an email to a customer, push code) gets `ask`:
    the run pauses with `ApprovalRequired`, and an approval card goes to Telegram.
 8. **Finish.** The run ends with `RunCompleted` or `RunFailed`. The sandbox pauses.
 9. **Learn.** A background review may propose memory or skill updates (Section 9.4).
@@ -298,9 +300,15 @@ RunEvent = (TextDelta | ToolCallStarted | ToolCallFinished | ApprovalRequired
 
 - `RunRequest` holds the `RunScope` (org, workspace, user, session, run), the user input, and
   the frozen `RunConfig`.
-- `RunConfig` is frozen per session. It holds runtime, model, SOUL, context files, memory
-  snapshot, skill index, toolsets, MCP server configs, approval policy, and limits. It has
-  `fingerprint()` and `render_prefix()`. Remote MCP configs hide their bearer token in `repr`.
+- `RunConfig` is frozen per session. It holds only what the model sees and what the cache
+  needs: runtime, model, SOUL, context files, memory snapshot, skill index, tool schemas, and
+  MCP server configs. It has `fingerprint()` and `render_prefix()`. Remote MCP configs hide
+  their bearer token in `repr`.
+- **Authority is not frozen.** The control plane checks membership, connection access,
+  approval policy, budgets, and revocations again at every tool call, model call, and
+  approval resume. A newer `deny` or a lower budget applies at once, also to long-lived
+  sessions. A tool that is still in the frozen schema but is no longer allowed gets `deny`
+  from the tool gate.
 - Every event carries running `Usage`. The stream ends with exactly one of
   `ApprovalRequired`, `RunCompleted`, or `RunFailed` (with a `FailureCode`).
 - The adapter saves the runtime's own resumable state as an opaque blob. The orchestrator
@@ -329,11 +337,11 @@ RunEvent = (TextDelta | ToolCallStarted | ToolCallFinished | ApprovalRequired
 | System prompt | `system_prompt` preset `claude_code` with the claw prefix appended, or a full custom prompt for non-coding profiles | `Agent.instructions` |
 | Claw tools | `mcp_servers` with the claw MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the claw tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
-| Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to claw. | Serialised `RunState` plus a Postgres-backed `Session` (`SQLAlchemySession`). |
+| Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to claw. | Serialised `RunState` plus a claw `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
 | Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers) | Agents as tools and handoffs |
 | Skills | Native: claw writes the session's skills to `.claude/skills/` and sets the `skills` option. | `SandboxAgent` `Skills` capability with a claw skill source, or the claw `skill_view` tool. |
 | Compaction | Native auto-compaction. The `PreCompact` hook lets claw archive the full transcript first. | `Compaction` capability or `OpenAIResponsesCompactionSession`. |
-| Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`) on the session sandbox |
+| Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
 | Limits | `max_turns`, `max_budget_usd`, `task_budget` | `max_turns`; claw budget in the model proxy |
 | Checkpoints | `enable_file_checkpointing` and `rewind_files()` | Claw git snapshot of the workspace (Section 15.3) |
 | Tracing | Langfuse integration plus proxy usage | Agents SDK tracing processor to Langfuse plus proxy usage |
@@ -507,8 +515,10 @@ flowchart LR
   G["Curator<br/>(weekly)"] --> H["Mark stale,<br/>archive, merge"]
 ```
 
-1. **Nudge.** After every 10 user turns or 10 tool iterations (Hermes defaults), or when a
-   run ends, claw queues a **background review**.
+1. **Nudge.** Claw counts user turns and tool iterations per session. When a run ends, claw
+   checks the counters. If either counter reached 10 since the last review (Hermes defaults),
+   claw queues one **background review** and resets both counters. A session has at most
+   one review running and one queued.
 2. **Review.** A forked run reads the transcript with the Hermes review prompts ("should a
    skill or memory be saved or updated?"). It has only `memory` and `skill_manage`, and its
    own nudges are off, so it cannot recurse.
@@ -540,7 +550,8 @@ flowchart LR
 
 | Toolset | Tools | Where they run |
 |---|---|---|
-| `core` (native) | Shell, read, write, edit, search files, web fetch, todo | Runtime, in the sandbox |
+| `core` (native) | Shell, read, write, edit, search files, web fetch | Runtime, in the sandbox |
+| `todo` | `todo` (read and write the session task list). On Claude, the adapter also maps native `TodoWrite` calls to the same list with a `PostToolUse` hook. | Claw MCP |
 | `web` | `web_search`, `web_extract` | Claw MCP (search provider key on the control plane) |
 | `memory` | `memory` | Claw MCP |
 | `skills` | `skills_list`, `skill_view`, `skill_manage` | Claw MCP |
@@ -615,6 +626,15 @@ One gateway service hosts all channel adapters. Each adapter does five things:
   paired members can start runs there.
 - Group messages are untrusted input. In groups the agent uses the profile's group toolset
   (default: no shell, no code edits, no outbound writes).
+- **Audience and principal.** Each session has an audience: `private` (one user, for
+  example a DM) or `shared` (a Slack channel or thread, a Telegram group). A private session
+  runs as its user. A shared session runs as the workspace and uses only shared context:
+  SOUL, `agent` and `workspace` memory, workspace skills, and workspace connections. It does
+  not load `user` memory, user skills, or personal connections. A user who wants personal
+  data uses a private session, or shares one item on purpose with an approval.
+- The same audience rule applies to `session_search`, `session_read`, resume, and delivery.
+  A user finds only sessions whose audience includes the user. A job delivers to a shared
+  target only output from a shared-audience run.
 
 ---
 
@@ -629,7 +649,7 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 | `agent_profile`, `model` | Pins. The default is the profile default when the job fires. |
 | `deliver` | `origin` (the chat that created it), a channel target (`slack:#ops`, `telegram:<chat>`, `email:<address>`), or `none`. Plus `failure_deliver`. |
 | `mode` | `agent` (an LLM run) or `script` (run a script in the sandbox and deliver its output, no LLM). |
-| `preapproved_tools` | Tools that may run without a human in this job. Everything else that needs `ask` is denied. |
+| `preapproved_tools` | Tools that may run without a human in this job, each bound to a connection and optional argument limits (for example "Slack post to `#eng` only"). Everything else that needs `ask` is denied. Adding or widening a pre-approval needs a human approval, which is bound to that job version. A change to the job's prompt, schedule, or target creates a new version, and write pre-approvals then need approval again. |
 | `attach_to_session` | Run inside one long-lived session (heartbeat) instead of a fresh session. |
 
 Execution:
@@ -675,8 +695,14 @@ steps:
 - Step types: `tool` (one tool call, no LLM), `agent` (a run with a prompt and skills),
   `approval`, `branch` (a condition), `parallel` (fan out), `wait` (time or event), and
   `workflow` (a sub-workflow).
-- The workflow engine runs each step as a queue item and stores its output. A failed step
-  retries with backoff. A crash resumes from the last finished step.
+- The workflow engine runs each step as a queue item and stores its output. A crash
+  resumes from the last finished step.
+- Each step has a stable operation id. Claw passes it as an idempotency key where the
+  provider supports one, and writes a receipt before and after the external call.
+- A step that failed for sure (for example a 4xx response) retries with backoff. A
+  non-idempotent write with an unknown result (for example a crash after the call) is not
+  retried. Claw tries to check the result (reconcile). If it cannot, the instance waits for
+  a human.
 - The agent can write workflows with `workflow_manage`. "Turn this session into a workflow"
   is a built-in skill. New or changed workflows that write to external systems need an
   approval before their first run.
@@ -753,14 +779,19 @@ Tools:
 
 ### 15.1 Editing code
 
-- The agent clones allowed repositories into the session sandbox with `repo_clone`. The
-  claw GitHub App issues a short-lived token for that clone only. The org allowlist decides
-  which repos.
-- The agent edits with native tools (Claude `Edit`, OpenAI `apply_patch`), runs tests in the
-  sandbox, commits to a `claw/<slug>` branch, pushes, and opens a pull request with
-  `pr_create`.
-- The agent never pushes to the default branch, never merges, and never force-pushes. The
-  GitHub App has no merge permission.
+- The sandbox has no GitHub token. Git traffic goes through the **claw git proxy** on the
+  control plane, which holds the GitHub App installation tokens. The sandbox authenticates
+  to the proxy with the run token. The org allowlist decides which repos.
+- The agent clones with `repo_clone`, edits with native tools (Claude `Edit`, OpenAI
+  `apply_patch`), runs tests in the sandbox, commits to a `claw/<slug>` branch, pushes
+  through the proxy, and opens a pull request with `pr_create`.
+- The proxy checks every push: the target repo is on the allowlist, every ref is a
+  `claw/*` branch, there is no force-push and no ref delete, and changed protected paths
+  (for example `.github/workflows`) have an approval.
+- The agent never merges. Claw has no merge tool, and no GitHub token reaches the sandbox.
+  A GitHub App with `contents: write` can merge through the API, so the permission alone
+  does not stop a merge. Repos also need branch rules (rulesets) on the default branch that
+  require a reviewed pull request and give the claw App no bypass.
 - Repo `AGENTS.md` and `CLAUDE.md` load as context files for that session.
 
 ### 15.2 Changing its own stack
@@ -769,7 +800,7 @@ Tools:
 
 | Level | What | How it applies |
 |---|---|---|
-| Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through claw tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. All apply from the next session. Every change can be reverted from the history view. |
+| Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through claw tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. Prompt content (SOUL, memory, skills) applies from the next session. Restrictions (deny rules, removed tools, revoked connections, lower budgets) apply at once (Section 5.1). Every change can be reverted from the history view. |
 | Code | Claw itself (and later products such as vorflux) | The agent uses `claw_pr`: it clones the claw repo in its sandbox, makes the change, runs the tests, and opens a pull request. A human reviews and merges. CI deploys. Changes to protected paths (auth, tenancy, approvals, model proxy, sandbox, CI) need the owner's review. |
 
 The agent never edits the running service, its database schema, or its secrets directly.
@@ -796,8 +827,9 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
    mode. The default for unknown tools is `ask`.
-5. **Context**: in unattended runs, `ask` becomes `deny` unless the job pre-approved the
-   tool.
+5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
+   pre-approval for this tool in this job version, and the call fits its connection and
+   argument limits (Section 12.1).
 
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
 the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
@@ -812,8 +844,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
   hosts are blocked where E2B network controls allow it. Otherwise the runner logs every
   connection, and we track this as a risk (R4).
 - The sandbox has no database credentials, no provider keys, and no integration tokens. It
-  has only the run token and short-lived tokens for single operations (for example one git
-  clone).
+  has only the run token. Git goes through the claw git proxy (Section 15.1).
 
 ### 16.3 Secrets
 
@@ -825,7 +856,21 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 - Each org can bring its own Anthropic and OpenAI keys later. Our keys are the default for
   our team.
 
-### 16.4 Untrusted content
+### 16.4 Outbound requests from the control plane
+
+Some requests start on the control plane, not in the sandbox: `web_extract`, remote MCP
+discovery and calls, OAuth flows, skill imports, webhook deliveries, and browser
+navigation. Sandbox egress rules do not cover them. One outbound HTTP client enforces a URL
+policy for all of them:
+
+- Only `https` (and `http` where the org allows it) to public addresses.
+- Claw resolves the host, checks every resolved address, and connects to the checked
+  address, so DNS rebinding cannot change the target. It blocks private, loopback,
+  link-local, and cloud metadata addresses.
+- Claw checks every redirect hop again, with a limit on the number of hops.
+- Org allowlists and block lists apply. Response size and time limits apply.
+
+### 16.5 Untrusted content
 
 - Content from the web, email, webhooks, other people in groups, and files is untrusted.
   Claw marks it as untrusted in tool results.
@@ -915,9 +960,9 @@ docs/
 | Milestone | Outcome |
 |---|---|
 | M0 | This design (doc only). |
-| M1 Core engine | Repo foundations and CI. Runtime contract, Claude adapter, fake runtime, conformance suite. E2B sandbox and runner. Model proxy. Sessions in Postgres. SOUL and context files. Tool gate with approvals in the web chat. HTTP chat API and a minimal web chat page. Telegram. Langfuse. Code editing in the sandbox (no pull requests yet). |
-| M2 Learning loop | Memory, skills library and tools, session search, background review, context management (spill, tool search, pins). |
-| M3 Reach | Slack. Approvals over chat. Composio and MCP connections. OpenAI Agents SDK adapter passes the conformance suite. GitHub pull request flow. Web app v1 for the team. |
+| M1 Core engine | Repo foundations and CI. Runtime contract, Claude adapter, fake runtime, conformance suite. E2B sandbox and runner. Model proxy. Sessions in Postgres. SOUL and context files. Vault and redaction. Claw MCP tool server with output caps and spill. Outbound URL policy. Tool gate with approvals in the web chat and Telegram. HTTP chat API and a minimal web chat page. Telegram. Langfuse. Code editing in the sandbox (no pull requests yet). |
+| M2 Learning loop | Memory, skills library and tools, session search, background review, context management (tool search, pins). |
+| M3 Reach | Slack with shared-session rules. Approver rules per role. Composio and MCP connections. OpenAI Agents SDK adapter passes the conformance suite. GitHub pull request flow. Web app v1 for the team. |
 | M4 Automation | Cron jobs and delivery, event triggers, workflows, `delegate_task`, task board, `@` references. |
 | M5 Browser | Cloud browser tools, vision mode, browser vault, Chrome extension. |
 | M6 Self-change and customers | `change_propose` and `claw_pr`, curator, checkpoints, customer sign-up, billing, quotas, org keys, regions, customer-ready web app. |
