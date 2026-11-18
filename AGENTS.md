@@ -1,15 +1,16 @@
-# AGENTS.md — Nikhil_claw
+# AGENTS.md — Sama
 
-Nikhil_claw ("claw") is a cloud-only, multi-user assistant engine in the style of Hermes Agent.
+Sama is a cloud-only, multi-user assistant engine in the style of Hermes Agent.
 It uses the Claude Agent SDK (default runtime) and the OpenAI Agents SDK (second runtime).
-Products such as vorflux build on top of it.
+Products such as vorflux build on top of it. The GitHub repository is still named
+`Nikhil_claw`. The product, the Python package, and the services are named `sama`.
 
 ## Read first
 
 - `docs/architecture.md`: the design and decisions D1 to D17. Follow the decisions. Change a
   decision only in a pull request that updates the doc.
 - `docs/roadmap.md`: milestones and backlog items with acceptance criteria.
-- `docs/feature-map.md`: every Hermes feature and the claw plan for it.
+- `docs/feature-map.md`: every Hermes feature and the sama plan for it.
 
 ## Conventions
 
@@ -17,7 +18,7 @@ Products such as vorflux build on top of it.
   the same pull request.
 - **Stack.** Python 3.12, uv, FastAPI, Pydantic v2, SQLAlchemy 2 (async), Alembic, pytest,
   Ruff, mypy strict. TypeScript only for `extension/` (Chrome extension) and `web/` (web app).
-- **Runtime neutrality.** Claw features are claw tools (MCP) or control-plane code. Do not put
+- **Runtime neutrality.** Sama features are sama tools (MCP) or control-plane code. Do not put
   a feature only in one runtime adapter, unless the capability flags say so.
 - **Tenancy.** Every table has `org_id`. Every query is scoped. Add an RLS policy for every
   new table.

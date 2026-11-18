@@ -1,0 +1,6 @@
+# gitleaks configuration. CI runs it on every pull request (.github/workflows/ci.yml).
+# Run it locally with: gitleaks git --config .gitleaks.toml .
+title = "sama"
+
+[extend]
+useDefault = true
