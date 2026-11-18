@@ -6,8 +6,9 @@ The upstream provider is an ``httpx.MockTransport``. The tests call the proxy ap
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-from collections.abc import AsyncIterator, Callable, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -604,6 +605,35 @@ async def test_a_broken_provider_stream_is_an_error_for_the_client() -> None:
     assert call.counts.output == 100
 
 
+def asgi_call(
+    signer: RunTokenSigner, payload: dict[str, Any]
+) -> tuple[dict[str, Any], Callable[[], Awaitable[dict[str, Any]]]]:
+    """An ASGI scope and a receive function for one Anthropic call with no disconnect."""
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/anthropic/v1/messages",
+        "raw_path": b"/anthropic/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", token.encode()), (b"content-type", b"application/json")],
+        "server": ("proxy", 80),
+        "client": ("test", 1),
+    }
+    messages = [{"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        await asyncio.Event().wait()
+        return {}
+
+    return scope, receive
+
+
 async def test_a_slow_client_holds_only_a_few_chunks() -> None:
     """The ASGI app is driven directly, with a client that does not read for a while."""
     sent = 0
@@ -619,30 +649,9 @@ async def test_a_slow_client_holds_only_a_few_chunks() -> None:
     upstream.reply = lambda _: httpx.Response(200, content=stream())
     proxy = make_proxy(upstream, store, signer)
     app = proxy.app()
-    token = signer.issue(make_scope("run-1"), ttl_s=60)
-    body = json.dumps({"model": MODEL, "stream": True, "messages": []}).encode()
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": "/anthropic/v1/messages",
-        "raw_path": b"/anthropic/v1/messages",
-        "query_string": b"",
-        "headers": [(b"x-api-key", token.encode()), (b"content-type", b"application/json")],
-        "server": ("proxy", 80),
-        "client": ("test", 1),
-    }
-    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    scope, receive = asgi_call(signer, {"model": MODEL, "stream": True, "messages": []})
     reading = asyncio.Event()
     received: list[bytes] = []
-
-    async def receive() -> dict[str, Any]:
-        if messages:
-            return messages.pop(0)
-        await asyncio.Event().wait()  # no disconnect
-        return {}
 
     async def send(message: MutableMapping[str, Any]) -> None:
         if message["type"] == "http.response.body":
@@ -762,3 +771,72 @@ async def test_close_stops_open_streams_and_records_them() -> None:
     [call] = store.calls
     assert call.usage_estimated
     assert call.counts.output == 300
+
+
+async def test_a_client_that_goes_before_the_body_still_pays() -> None:
+    """The client goes while the proxy sends the headers. The pump still records the call."""
+    first, last = events(
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+        {"type": "message_delta", "usage": {"output_tokens": 70}},
+    )
+
+    async def stream() -> AsyncIterator[bytes]:
+        for _ in range(QUEUE_CHUNKS * 2):
+            yield first
+        yield last
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer)
+    scope, receive = asgi_call(signer, {"model": MODEL, "stream": True, "messages": []})
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        raise OSError("the client is gone")
+
+    with contextlib.suppress(Exception):
+        await proxy.app()(scope, receive, send)
+    async with asyncio.timeout(5):
+        while not store.calls:  # noqa: ASYNC110 - the pump task writes the record
+            await asyncio.sleep(0.02)
+    await proxy.aclose()
+    [call] = store.calls
+    assert not call.usage_estimated
+    assert call.counts.output == 70
+
+
+async def test_close_ends_with_a_full_queue_and_a_stuck_store() -> None:
+    """The client does not read, the store hangs. Close still ends, and the record waits in
+    the fence and in the log."""
+    hang = asyncio.Event()
+
+    class StuckStore(MemoryUsageStore):
+        async def record(self, call: CallRecord) -> None:
+            await hang.wait()
+
+    async def stream() -> AsyncIterator[bytes]:
+        for _ in range(QUEUE_CHUNKS * 3):
+            yield b": keep-alive\n\n"
+        await asyncio.sleep(60)
+        yield b""
+
+    upstream, store, signer = Upstream(), StuckStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer)
+    scope, receive = asgi_call(signer, {"model": MODEL, "stream": True, "messages": []})
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.body":
+            await asyncio.Event().wait()  # the client never reads
+
+    server = asyncio.create_task(proxy.app()(scope, receive, send))
+    await asyncio.sleep(0.2)
+    with (
+        patch.object(app_module, "CLOSE_WAIT_S", 0.1),
+        patch.object(app_module, "STOP_WAIT_S", 0.3),
+    ):
+        async with asyncio.timeout(5):
+            await proxy.aclose()
+    server.cancel()
+    await asyncio.gather(server, return_exceptions=True)
+    [call] = proxy.unrecorded
+    assert call.usage_estimated

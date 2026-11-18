@@ -1300,8 +1300,9 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
 
 **Missing usage is never free.** A pump task reads the provider response, separately from
 the client. It holds at most 16 chunks for a slow client, then it waits, so a slow client
-does not make the proxy keep the whole response. If the client stops reading, the pump drops
-the held chunks and reads on for at most 10 minutes (`drain_s`) to get the final usage. If
+does not make the proxy keep the whole response. If the client stops reading, also before
+the body starts, the pump drops the held chunks and reads on for at most 10 minutes
+(`drain_s`) to get the final usage. If
 the provider stream breaks, the client stream ends with an error, not with a clean end. If the final usage still is not known (the stream
 stopped, or a stream event is larger than 16 MB), the proxy records a high estimate and sets
 `usage_estimated`: one input token for each 2 bytes of the request, and the output limit of
@@ -1314,7 +1315,9 @@ with `503`. The next call of any org tries the write again, under a lock. The re
 in the block list until its write succeeds.
 
 **Stop.** When the proxy stops, open streams get 5 seconds to end. Then each pump stops
-reading and writes its record, with an estimate if the usage is not final. A record that
+reading and writes its record, with an estimate if the usage is not final. The proxy builds
+each record before it closes the provider stream, so a cancel during the cleanup or the
+write keeps the record in the block list. The last writes have 10 seconds. A record that
 still is not written goes to the log as JSON, for a manual fix. M1.10 moves records that
 wait to a durable queue.
 

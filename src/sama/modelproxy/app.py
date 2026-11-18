@@ -8,6 +8,7 @@ response through unchanged, and records the usage and the cost of the call.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -23,6 +24,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, SecretStr
+from starlette.types import Receive, Scope, Send
 
 from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
 from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
@@ -121,9 +123,10 @@ class _Pump:
     upstream: httpx.Response
     reader: UsageReader
     drain_s: float
-    queue: asyncio.Queue[bytes | _End] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=QUEUE_CHUNKS)
-    )
+    queue: asyncio.Queue[bytes | _End] = field(default_factory=asyncio.Queue)
+    """Chunks for the client, then one ``_End``. ``space`` bounds the chunks, so the end
+    marker never waits."""
+    space: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(QUEUE_CHUNKS))
     gone: bool = False
     stopped: bool = False
     reading: bool = False
@@ -137,6 +140,7 @@ class _Pump:
         self.gone = True
         while not self.queue.empty():
             self.queue.get_nowait()
+        self.space.release()  # wakes a pump that waits for space
         self.limit(self.drain_s)
 
     def stop(self) -> None:
@@ -152,6 +156,21 @@ class _Pump:
         current = self.deadline.when()
         if current is None or when < current:
             self.deadline.reschedule(when)
+
+
+class _PumpResponse(StreamingResponse):
+    """A stream response that tells the pump when the client is gone, also when the client
+    goes before the body starts."""
+
+    def __init__(self, pump: _Pump, content: AsyncIterator[bytes], **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._pump = pump
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._pump.client_gone()
 
 
 class ProxyError(Exception):
@@ -225,7 +244,11 @@ class ModelProxy:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-        await self._flush()
+        try:
+            async with asyncio.timeout(STOP_WAIT_S):
+                await self._flush()
+        except TimeoutError:
+            log.error("the last record writes did not end in time")
         for call in self.unrecorded:
             log.error("the proxy stops with an unwritten call record: %s", call.model_dump_json())
         await self._client.aclose()
@@ -301,6 +324,7 @@ class ModelProxy:
                         return
                     if item is _End.FAILED:
                         raise UpstreamStreamError("the provider stream broke")
+                    pump.space.release()
                     yield item
             finally:
                 pump.client_gone()
@@ -310,7 +334,7 @@ class ModelProxy:
             for name, value in upstream.headers.items()
             if name in _RESPONSE_HEADERS or name.startswith(_RESPONSE_PREFIXES)
         }
-        return StreamingResponse(relay(), status_code=upstream.status_code, headers=headers)
+        return _PumpResponse(pump, relay(), status_code=upstream.status_code, headers=headers)
 
     def _verify(self, request: Request) -> RunTokenClaims:
         token = _token(request)
@@ -343,8 +367,10 @@ class ModelProxy:
                 async for chunk in pump.upstream.aiter_raw():
                     reader.feed(chunk)
                     if not pump.gone:
-                        # Waits while the queue is full. client_gone empties the queue.
-                        await pump.queue.put(chunk)
+                        # Waits while the client holds QUEUE_CHUNKS chunks. client_gone wakes it.
+                        await pump.space.acquire()
+                    if not pump.gone:
+                        pump.queue.put_nowait(chunk)
                     elif not wanted or reader.final:
                         break
         except TimeoutError:
@@ -358,18 +384,26 @@ class ModelProxy:
                 await self._finish(pump)
             finally:
                 self._pumps.discard(pump)
-                if not pump.gone:
-                    await pump.queue.put(end)
+                pump.queue.put_nowait(end)  # never waits, also after a cancel
 
     async def _finish(self, pump: _Pump) -> None:
+        """Builds the record first. A cancel during the cleanup or the write fences it."""
         call, reader = pump.call, pump.reader
-        await pump.upstream.aclose()
-        if not call.route.recorded:
-            return
-        counts, estimated = reader.counts(), False
-        if pump.upstream.is_success and not reader.final:
-            counts, estimated = estimate_counts(call.request_bytes, call.body, counts), True
-        await self._record(call, pump.upstream, counts, estimated)
+        record: CallRecord | None = None
+        if call.route.recorded:
+            counts, estimated = reader.counts(), False
+            if pump.upstream.is_success and not reader.final:
+                counts, estimated = estimate_counts(call.request_bytes, call.body, counts), True
+            record = self._record_for(call, pump.upstream.status_code, counts, estimated)
+        try:
+            with contextlib.suppress(httpx.HTTPError):
+                await pump.upstream.aclose()
+            if record is not None and not await self._save(record):
+                self._fence(record)
+        except asyncio.CancelledError:
+            if record is not None:
+                self._fence(record)
+            raise
 
     async def _body(self, request: Request) -> tuple[dict[str, Any], int]:
         limit = self._settings.max_request_bytes
@@ -470,12 +504,21 @@ class ModelProxy:
             log.warning("the provider did not answer provider=%s error=%s", route.provider, exc)
             raise ProxyError(502, "api_error", "the provider did not answer") from None
 
-    async def _record(
-        self, request: _Call, upstream: httpx.Response, counts: TokenCounts, estimated: bool
-    ) -> None:
+    def _record_for(
+        self, request: _Call, status_code: int, counts: TokenCounts, estimated: bool
+    ) -> CallRecord:
         claims, route, model = request.claims, request.route, request.model
         cost = self._prices.cost(route.provider, model, counts)
-        call = CallRecord(
+        log.info(
+            "model call run=%s model=%s status=%s tokens=%s cost_usd=%s estimated=%s",
+            claims.run_id,
+            model,
+            status_code,
+            counts.total_tokens,
+            cost,
+            estimated,
+        )
+        return CallRecord(
             org_id=claims.org_id,
             workspace_id=claims.workspace_id,
             session_id=claims.session_id,
@@ -484,27 +527,12 @@ class ModelProxy:
             provider=route.provider,
             model=model,
             endpoint=route.endpoint,
-            status_code=upstream.status_code,
+            status_code=status_code,
             counts=counts,
             usage_estimated=estimated,
             cost_usd=cost,
             duration_ms=int((time.monotonic() - request.started) * 1000),
             created_at=self._clock(),
-        )
-        try:
-            saved = await self._save(call)
-        except asyncio.CancelledError:
-            self._fence(call)
-            raise
-        if not saved:
-            self._fence(call)
-        log.info(
-            "model call run=%s model=%s status=%s tokens=%s cost_usd=%s",
-            claims.run_id,
-            model,
-            upstream.status_code,
-            counts.total_tokens,
-            cost,
         )
 
     async def _save(self, call: CallRecord) -> bool:
@@ -520,6 +548,8 @@ class ModelProxy:
         return False
 
     def _fence(self, call: CallRecord) -> None:
+        if call in self.unrecorded:
+            return
         self.unrecorded.append(call)
         log.error("the call record was not written; the org is blocked run=%s", call.run_id)
 
