@@ -91,3 +91,26 @@ jobs:
       - name: Import the pinned SDKs
         run: uv run python -c "import claude_agent_sdk, agents; print(claude_agent_sdk.__version__, agents.__version__)"
       - run: uv run mypy
+
+  sandbox-image:
+    name: Sandbox image (Docker provider and runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SAMA_DOCKER_IMAGE: sama-runner:ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Build the sama image
+        run: docker build -f sandbox/Dockerfile -t "$SAMA_DOCKER_IMAGE" .
+      - run: uv sync --locked
+      # The provider tests and the claude-docker conformance target run the runner in the image.
+      - name: Docker provider and claude-docker conformance target
+        run: uv run pytest tests/sandbox tests/conformance -k docker -rs

@@ -3,7 +3,8 @@
 A cloud agent engine with Hermes-level features, built on the Claude Agent SDK and the OpenAI Agents SDK.
 
 Status: M1 (core engine) in progress. The runtime contract, the fake runtime, the Claude
-Agent SDK adapter, the conformance suite, and the database with row-level security are done.
+Agent SDK adapter, the conformance suite, the database with row-level security, and the
+sandbox providers with the runner are done.
 
 ## Development
 
@@ -35,6 +36,24 @@ SAMA_LIVE_TESTS=1 uv run pytest -m live   # needs ANTHROPIC_API_KEY and the SAMA
 The runtime conformance suite (architecture Section 5.5) is in `tests/conformance/`. `uv run
 pytest` runs it on the fake runtime and on the Claude CLI with a scripted model, at no cost.
 `-m live` adds a real Claude model. A GitHub Actions job runs the live suite every night.
+
+### Sandbox
+
+The agent runs in a sandbox, one per session (architecture Section 16.2). E2B is the cloud
+provider. Docker is for local development and CI. Build the sama image and run the Docker
+tests:
+
+```bash
+docker build -f sandbox/Dockerfile -t sama-runner:dev .
+SAMA_DOCKER_IMAGE=sama-runner:dev uv run pytest tests/sandbox tests/conformance -k docker
+```
+
+Build the E2B template `sama-runner` and run the E2B tests (needs `E2B_API_KEY`):
+
+```bash
+uv run python -m sama.sandbox.template
+SAMA_LIVE_TESTS=1 uv run pytest -m live tests/sandbox
+```
 
 ### Database
 
