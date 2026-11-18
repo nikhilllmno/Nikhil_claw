@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.1, 2026-11-18 |
+| Status | Draft v0.3, 2026-11-18 |
 | Source | Hermes Agent, commit `0e8e4216` (MIT, Copyright (c) 2025 Nous Research) |
 | Design | [`architecture.md`](architecture.md) (sections are linked as §N) |
 | Plan | [`roadmap.md`](roadmap.md) (milestones M1 to M6) |
@@ -35,7 +35,7 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). | Adapt | M1 |
 | Context files (`AGENTS.md`, `CLAUDE.md`, `.hermes.md`) | `agent/context_files*.py` | Loaded from the repo in the sandbox and from workspace settings, 20,000-char cap, injection scan (§6). | Adapt | M1 |
 | Personalities (`/personality`) | `hermes_cli` | Agent profiles cover this. | Adapt | M3 |
-| Model switch per session (`/model`) | `hermes_cli/commands.py` | `/model` sets the model for the next run. Prefix fingerprint changes, so a new prefix is built. | Adapt | M1 |
+| Model switch per session (`/model`) | `hermes_cli/commands.py` | `/model` starts a child session (lineage) with the new model and a new prefix. The old session keeps its frozen prefix. | Adapt | M1 |
 | Fallback model and credential pools | `agent/credential_pool*.py` | The model proxy retries on a second key or model of the same provider. | Adapt | M3 |
 | Prompt caching | `agent/prompt_caching*.py` | SDK caching plus the frozen prefix. Proxy records cache tokens. | SDK | M1 |
 | Reasoning effort settings | config `agent.reasoning_effort` | Profile setting passed to the SDK (`thinking` for Claude, `reasoning` for OpenAI). | SDK | M1 |
@@ -56,11 +56,11 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | `image_generate` | `tools/image_generation_tool.py` | Claw `media` tool with the OpenAI image model, behind `tool_search`. | Adapt | M4 |
 | `text_to_speech` | `tools/tts_tool.py` | Claw `media` tool. Telegram sends a voice note. | Adapt | M4 |
 | Speech to text for voice memos | `tools/transcription_tools.py` | Gateway transcribes inbound voice with the OpenAI transcription model before the run (§11). | Adapt | M1 |
-| `todo_list` | `tools/todo_tool.py` | Native todo tools of the SDK (Claude `TodoWrite`). Claw shows the list in the web app. | SDK | M1 |
+| `todo_list` | `tools/todo_tool.py` | Claw `todo` tool for both runtimes. On Claude, native `TodoWrite` calls map to the same list. The web app shows it (§10.2). | Adapt | M1 |
 | `clarify` | `tools/clarify_tool.py` | Claw tool, rendered as buttons per channel. Denied in unattended runs. | Adapt | M1 |
 | `execute_code` (RPC to tools) | `tools/code_execution_tool.py` | Claw `code_exec`: Python in the sandbox with a stub that calls claw tools over MCP. | Adapt | M4 |
 | `computer_use` (desktop control) | `tools/computer_use_tool.py` | Browser vision mode (§14) covers web apps. Full desktop control is not planned. | Defer | — |
-| `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` with Composio OAuth links (§10.3). | Adapt | M3 |
+| `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` (link or web form), `connection_test`. Add, change, and remove happen in the web app or through `/connect`, so secrets never enter chat (§10.3). | Adapt | M3 |
 | Discord and Feishu tools | `tools/discord_tool.py`, `tools/feishu_*.py` | Through Composio toolkits when needed. | Defer | — |
 | Desktop-only tools (`desktop_ui`, `project`, `catalog`) | `tools/project_tools.py` and others | No desktop app. | Skip | — |
 | No agent-callable `send_message` | `toolsets.py` | Same rule: replies go to the trigger's channel (§10.1). | Adapt | M1 |
@@ -105,14 +105,14 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | Queue, interrupt, steer while busy | `gateway/session_*.py` | New message while a run is busy: queue by default, `/stop` cancels, `/steer` adds a note to the running turn. | Adapt | M3 |
 | Cross-platform handoff (`/handoff`) | `gateway/` | A session can bind to more than one channel. `/handoff telegram` moves replies. | Adapt | M3 |
 | Retention and housekeeping | `session_retention.py` | Retention per org plan. Export and delete per user. | Adapt | M6 |
-| Export and import | `/export`, `/import` | Export to Markdown and JSON from the web app. | Adapt | M3 |
+| Export and import | `/export`, `/import` | Session export to Markdown and JSON from the web app (M3). Full account export with data controls (M6). | Adapt | M3, M6 |
 
 ## 6. Context management
 
 | Hermes feature | Hermes location | Claw design | Decision | Milestone |
 |---|---|---|---|---|
 | Compression at 50% of the window, protect last 20 | `agent/context_compressor.py` | Native compaction in both SDKs. Claw archives the transcript before and records a `Compacted` event (§6.2). | SDK | M2 |
-| Tool output cap (50,000 bytes) and spill to file | `tools/tool_result_storage*.py` | Claw tools cap at 50 KB and spill to a sandbox file with a preview and path. | Adapt | M2 |
+| Tool output cap (50,000 bytes) and spill to file | `tools/tool_result_storage*.py` | Claw tools cap at 50 KB and spill to a sandbox file with a preview and path. | Adapt | M1 |
 | Tool search (`tool_search`, `tool_describe`, `tool_call`) | `tools/tool_search*.py` | Same three tools for deferred tools and integrations. Claude native tool search is an option. | Adapt | M2 |
 | Token accounting | `agent/usage*.py` | Model proxy records tokens and cost per call (§18). | Adapt | M1 |
 | `@file`, `@url` references | `agent/context_references.py` | `@file`, `@url`, `@session` in a message. | Adapt | M4 |
@@ -142,7 +142,7 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | Delivery to any channel with receipts | `cron/delivery*.py` | Delivery targets and receipts. An unknown delivery result is not retried (§12.1). | Adapt | M4 |
 | No cron recursion | `toolsets.py` (`hermes-cron`) | A job run cannot create jobs. | Adapt | M4 |
 | Per-job model and script-only jobs | `cron/` | `model` pin and `mode: script`. | Adapt | M4 |
-| Unattended approvals deny | `tools/approval*.py` | `ask` becomes `deny` unless the job pre-approved the tool (D13). | Adapt | M1 |
+| Unattended approvals deny | `tools/approval*.py` | `ask` becomes `deny` unless a human approved a pre-approval for that tool in that job version (D13, §12.1). | Adapt | M1 |
 | Webhooks (restricted toolset) | `gateway/platforms/webhook*.py` | Signed webhook triggers with the `safe` toolset (§12.2). | Adapt | M4 |
 | Heartbeat, goals, loops | `gateway/run_goals.py` | A job with `attach_to_session` runs inside one session (heartbeat). | Adapt | M4 |
 | Automation blueprints | `cron/blueprint_catalog.py` | Workflow templates (§12.3). | Adapt | M4 |
@@ -157,9 +157,9 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | Slack adapter | `plugins/platforms/slack/` | Slack Bolt, Events API, Block Kit approvals, thread = session (§11.2). | Adapt | M3 |
 | 24 other platforms (Discord, WhatsApp, Signal, Email, Teams, ...) | `plugins/platforms/` | Same adapter shape. Email and WhatsApp first, on request. | Defer | — |
 | API server (OpenAI-compatible) | `gateway/platforms/api_server*.py` | Claw HTTP API with streaming events (§4.1). OpenAI-compatible endpoint later. | Adapt | M1 |
-| Authorization ladder, default deny | `gateway/authz_mixin.py` | Paired identities only. Group policy per binding (§11.3). | Adapt | M1 |
+| Authorization ladder, default deny | `gateway/authz_mixin.py` | Paired identities only. Group policy per binding. Private and shared session audiences (§11.3). | Adapt | M1 |
 | DM pairing codes with rate limits and lockout | `gateway/pairing.py` | Codes from the web app, 10-minute expiry, lockout (§11.3). | Adapt | M1 |
-| Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1). | Adapt | M3 |
+| Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. | Adapt | M1, M3 |
 | Streaming edits to messages | `gateway/stream_consumer*.py` | Edit one message as text arrives, with rate limits per channel. | Adapt | M1 |
 | Slash command registry | `hermes_cli/commands.py` | One command registry for all channels (§11.1). | Adapt | M1 |
 | Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, jobs, workflows, connections, traces (§11.2). | Adapt | M1 (minimal), M3, M6 |
@@ -195,9 +195,19 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Claw design | Decision | Milestone |
 |---|---|---|---|---|
-| MCP client (stdio, HTTP, OAuth) | `tools/mcp_tool*.py` | Remote MCP servers only (no stdio in the cloud), proxied by the claw MCP server with OAuth tokens in the vault (§10.3). | Adapt | M3 |
-| MCP tool naming `mcp_<server>_<tool>` | `tools/mcp_tool.py` | Same naming, behind `tool_search`. | Adapt | M3 |
+| MCP client, HTTP and OAuth | `tools/mcp_tool*.py`, `tools/connectors/mcp_oauth.py` | `mcp_remote` connections: streamable HTTP, OAuth 2.1 with dynamic client registration and PKCE, bearer, or header. Proxied by the claw MCP server, tokens in the vault (§10.3). | Adapt | M3 |
+| MCP client, stdio servers | `tools/mcp_tool_transport.py`, `tools/connectors/mcp_launch.py` | `mcp_hosted` connections run in a connector host (a separate E2B sandbox per connection), not in the agent sandbox (§10.5). | Adapt | M4 |
+| MCP tool naming `mcp_<server>_<tool>` | `tools/mcp_tool.py` | Same naming as `mcp_<connection>_<tool>`, plus `db_` and `api_` prefixes, behind `tool_search` (§10.3). | Adapt | M3 |
+| Per-server tool filters, schema cache, health checks | `tools/mcp_tool_registration.py`, `tools/mcp_schema_cache.py`, `tools/mcp_tool_health.py` | Include and exclude filters, `tool_cache`, and health checks per connection (§10.3). | Adapt | M3 |
+| `/reload-mcp` | `tui_gateway/methods_tools.py` | Not needed. New connector tools are reachable through `tool_search`, so the prompt prefix does not change (§10.3). | Skip | — |
+| `${ENV_VAR}` in MCP config | `tools/mcp_tool_config.py` | Secrets come from the vault reference of the connection, not from environment variables (§10.3). | Adapt | M3 |
+| MCP catalog (`optional-mcps/`, 66 manifests) | `optional-mcps/` | Connector catalog of YAML manifests in `connectors/catalog/`, added by reviewed pull requests (§10.3). We write our own manifests. | Adapt | M3 |
+| Connection state contract | `tools/connectors/contract.py` | Same idea: only the backend sets `connected`; a clock expires `initiated` (§10.3). | Adapt | M3 |
 | Managed connectors (Nous tool gateway) | `tools/connectors/` | Composio with entities per user and per workspace (§10.3). | Adapt | M3 |
+| Database access | Through MCP servers (for example Supabase, Neon) | Native database connections with a claw database gateway: read-only by default, one statement per call, timeouts, row limits, hidden columns, approval for writes (§10.4). Vendor MCP servers also work. | New | M3 (PostgreSQL), M4 (others) |
+| HTTP API connectors | none | `http_api` connections from an OpenAPI document (§10.3). | New | M4 |
+| Private networks | none | Static egress IPs and SSH tunnels per connection; a relay later (§10.6). | New | M4 |
+| Hermes as an MCP server (`hermes mcp serve`) | moved out of core (`hermes_cli/left_core_migration.py`) | Claw as an MCP server later (§10.7). | Defer | — |
 | Plugin system | `plugins/`, `hermes_cli/plugins*` | Extension points for products (tools, skills, toolsets, channels, policies) (D16). | Adapt | M1 |
 | ACP adapter for editors | `acp_adapter/` | Not planned. | Defer | — |
 
@@ -210,8 +220,8 @@ claw implements it as a claw tool or in the control plane (architecture §5.3).
 | Protected paths and write guards | `tools/file_tools_write_guards.py` | Sandbox isolation plus protected paths in repos (for example `.github/workflows`) need `ask`. | Adapt | M3 |
 | Secret redaction | `agent/redact*.py` | Redaction of tool output, logs, and traces (§16.3). | Adapt | M1 |
 | Secrets in `.env` and vault backends | `agent/secret_sources/` | Claw vault in Postgres. No secrets in the sandbox (D6). | Adapt | M1 |
-| SSRF and web access policy | `tools/website_policy.py` | Egress allowlist and URL policy (§16.2). | Adapt | M1 |
-| Prompt-injection scans for context and skills | `agent/prompt_injection*.py` | Scans for context files, skills, and imported content (§16.4). | Adapt | M2 |
+| SSRF and web access policy | `tools/website_policy.py` | Sandbox egress allowlist (§16.2) and control-plane outbound URL policy against SSRF and DNS rebinding (§16.4). | Adapt | M1 |
+| Prompt-injection scans for context and skills | `agent/prompt_injection*.py` | Scans for context files (M1), skills and imported content (M2) (§16.5). | Adapt | M1, M2 |
 | Container sandbox backends | `tools/environments/` | E2B for every run (D4, D5). | Adapt | M1 |
 | Multi-user roles and tenant isolation | none | Orgs, workspaces, roles, RLS (§17). | New | M1 |
 | Budgets per run, user, org | `agent/budget_config.py` (bot mode) | Proxy budgets at every level (§18). | Adapt | M1 |

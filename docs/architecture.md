@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.1 for owner review. No code yet. |
+| Status | Draft v0.3. The owner answered all open questions (Section 22). Connectors and databases added (Sections 10.3 to 10.7). No code yet. |
 | Date | 2026-11-18 |
 | Owner | Nikhil Mandhani |
 | Companion docs | [`feature-map.md`](feature-map.md) (every Hermes feature and our plan for it), [`roadmap.md`](roadmap.md) (milestones and backlog) |
@@ -30,7 +30,7 @@
 19. [Technology stack and repository layout](#19-technology-stack-and-repository-layout)
 20. [Milestones](#20-milestones)
 21. [Risks](#21-risks)
-22. [Open questions](#22-open-questions)
+22. [Resolved questions](#22-resolved-questions)
 23. [References](#23-references)
 
 ---
@@ -71,7 +71,8 @@ Five rules shape the design:
    security is on from the first table, so customers later need no data migration.
 4. **The prompt prefix is frozen per session** (a Hermes rule). The system prompt, tool list,
    memory snapshot, and skill index do not change during a session. This keeps prompt caching
-   cheap. Changes apply from the next session. Compaction is the only exception.
+   cheap. Prompt changes apply from the next session. Compaction is the only exception.
+   Authority is not frozen: a revoked permission or a lower budget applies at once.
 5. **Self-improvement is bounded and reversible.** The agent can write memory, skills, cron
    jobs, and workflows. Each write is versioned. Changes to claw's own code go through a pull
    request that a human merges. The agent never changes the running service directly.
@@ -126,7 +127,8 @@ Five rules shape the design:
 | Toolset | A named group of tools. An agent profile enables toolsets. |
 | Claw tools | Tools that claw implements once for both runtimes (memory, skills, cron, delegation, browser, connectors). They reach the runtime through the claw MCP tool server. |
 | Native tools | Tools that a runtime ships (for example Claude `Read`, `Edit`, `Bash`). They run inside the sandbox. |
-| Integration | An external app that the agent can use as tools: a Composio toolkit or a remote MCP server. |
+| Connector | A kind of external system that the agent can use as tools: a Composio toolkit, an MCP server, a database, an HTTP API, or a plugin (Section 10.3). |
+| Connection | One configured account or endpoint of a connector, owned by a user or a workspace, with its credentials in the claw vault. |
 | Channel | A surface where users talk to the agent: web, Slack, Telegram, Chrome side panel. |
 | Skill | A versioned folder with a `SKILL.md` (agentskills.io format) that tells the agent how to do a task. |
 | Memory | Small, curated notes that claw puts in every new session (Section 8). |
@@ -157,18 +159,19 @@ Five rules shape the design:
 | D2 | One runtime contract (`AgentRuntime`) with two adapters: `claude_agent_sdk` (default) and `openai_agents_sdk`. A `fake` runtime exists for tests. | The owner uses only Anthropic and OpenAI models. One contract keeps every claw feature runtime-neutral and makes a third runtime cheap. |
 | D3 | Claw tools reach both runtimes through **one MCP server per run** (streamable HTTP), scoped by a run token. | Both SDKs are MCP clients. One implementation serves both. Tenant scope, approvals, and audit happen in one place. |
 | D4 | The runner (adapter plus SDK) runs **inside the sandbox**, not in the API process. | The Claude Agent SDK starts the Claude Code CLI as a subprocess, and its native tools run where the CLI runs. The OpenAI `SandboxAgent` needs a sandbox too. The OS boundary is the only real boundary against a model that misbehaves (Hermes security policy). |
-| D5 | **E2B** is the sandbox provider, behind a `SandboxProvider` interface. One sandbox per session. E2B pause and resume keep the workspace between runs. Docker is for local development and CI. | Owner chose cloud sandboxes with E2B. The OpenAI Agents SDK has an E2B sandbox client. The interface keeps a path to Fly Machines, which vorflux chose (Q1). |
+| D5 | **E2B** is the sandbox provider, behind a `SandboxProvider` interface. One sandbox per session. E2B pause and resume keep the workspace between runs. Docker is for local development and CI. | Owner chose cloud sandboxes with E2B. The OpenAI Agents SDK has an E2B sandbox client. The interface keeps a path to Fly Machines, which vorflux chose. Owner decision: E2B now, Fly Machines later only if needed (Q1). |
 | D6 | **No long-lived secrets in the sandbox.** Model calls go to the claw **model proxy** (`ANTHROPIC_BASE_URL` / OpenAI `base_url`) with a run token. Integration calls go through claw tools on the control plane. | A prompt-injected agent cannot leak a key that it cannot read. The proxy also meters cost, enforces budgets, and sends traces. |
 | D7 | **Supabase** is the system of record: Postgres with RLS, Auth, Storage, and pgvector. | Already in the owner's stack. RLS is a second tenant guard under the API. pgvector covers session search and memory recall. |
 | D8 | **Postgres is the job queue** (`FOR UPDATE SKIP LOCKED` with leases) for runs, cron fires, workflow steps, and deliveries. No separate workflow engine in v1. | Fewer moving parts. vorflux made the same choice. The queue sits behind an interface. |
 | D9 | The **prompt prefix is frozen per session**: SOUL, context files, tool list, memory snapshot, skill index. New memory and skills apply from the next session. A short note on the next user message tells the agent about new skills. | Hermes rule. It keeps prompt caching valid on both SDKs and makes runs reproducible (`RunConfig.fingerprint()`). |
-| D10 | **Integrations come from Composio and remote MCP servers.** Connections are per user or per workspace, with OAuth tokens in the claw vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
+| D10 | **Connectors use one model for all kinds**: Composio toolkits, remote MCP servers, hosted stdio MCP servers, databases, HTTP APIs, and plugins. Connections are per user or per workspace, with credentials in the claw vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
 | D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Bolt, Events API), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
-| D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless the job has a pre-approval for that tool. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
+| D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless a human approved a pre-approval for that tool in that job version. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
 | D14 | **Self-improvement writes are versioned data.** Memory, skills, cron jobs, workflows, and SOUL changes are rows with history and provenance. Changes to claw's own code are pull requests that a human merges. | The agent can learn and change its stack, but every change can be reviewed and reverted. |
 | D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. | One trace view for both SDKs. Both SDKs have Langfuse integrations. The proxy is the source of truth for cost. |
 | D16 | **Claw is a library plus services.** Products import `claw` and register extra tools, skills, toolsets, channels, and policies through extension points. They do not patch claw code. | vorflux and later products build on the engine without a fork (Hermes rule: plugins never touch core). |
+| D17 | **Databases use a claw database gateway, and stdio MCP servers run in connector hosts.** The gateway enforces read-only transactions, one statement per call, timeouts, row limits, and hidden columns at the driver. A connector host is a separate sandbox per connection that holds only that connection's secrets. | A prompt cannot remove a limit that the driver enforces. Many SQL MCP servers give full rights through one tool. Running stdio servers outside the agent sandbox keeps credentials out of the sandbox (D6) and still supports the Hermes MCP ecosystem. |
 
 ---
 
@@ -262,8 +265,9 @@ flowchart LR
 6. **Execute.** The runner starts the adapter. The SDK calls the model through the model
    proxy and calls claw tools through the MCP server. Here the agent calls
    `cronjob_manage(action="create", ...)`.
-7. **Gate.** The tool gate checks the policy. Creating a job is `allow` for the owner of the
-   chat, so the call runs. A risky call (send an email to a customer, push code) gets `ask`:
+7. **Gate.** The tool gate checks the policy. Creating a job without pre-approved tools is
+   `allow` for the owner of the chat, so the call runs. If the job asks for pre-approved
+   tools, those tools stay off until the user approves them (Section 12.1). A risky call (send an email to a customer, push code) gets `ask`:
    the run pauses with `ApprovalRequired`, and an approval card goes to Telegram.
 8. **Finish.** The run ends with `RunCompleted` or `RunFailed`. The sandbox pauses.
 9. **Learn.** A background review may propose memory or skill updates (Section 9.4).
@@ -298,9 +302,15 @@ RunEvent = (TextDelta | ToolCallStarted | ToolCallFinished | ApprovalRequired
 
 - `RunRequest` holds the `RunScope` (org, workspace, user, session, run), the user input, and
   the frozen `RunConfig`.
-- `RunConfig` is frozen per session. It holds runtime, model, SOUL, context files, memory
-  snapshot, skill index, toolsets, MCP server configs, approval policy, and limits. It has
-  `fingerprint()` and `render_prefix()`. Remote MCP configs hide their bearer token in `repr`.
+- `RunConfig` is frozen per session. It holds only what the model sees and what the cache
+  needs: runtime, model, SOUL, context files, memory snapshot, skill index, tool schemas, and
+  MCP server configs. It has `fingerprint()` and `render_prefix()`. Remote MCP configs hide
+  their bearer token in `repr`.
+- **Authority is not frozen.** The control plane checks membership, connection access,
+  approval policy, budgets, and revocations again at every tool call, model call, and
+  approval resume. A newer `deny` or a lower budget applies at once, also to long-lived
+  sessions. A tool that is still in the frozen schema but is no longer allowed gets `deny`
+  from the tool gate.
 - Every event carries running `Usage`. The stream ends with exactly one of
   `ApprovalRequired`, `RunCompleted`, or `RunFailed` (with a `FailureCode`).
 - The adapter saves the runtime's own resumable state as an opaque blob. The orchestrator
@@ -329,11 +339,11 @@ RunEvent = (TextDelta | ToolCallStarted | ToolCallFinished | ApprovalRequired
 | System prompt | `system_prompt` preset `claude_code` with the claw prefix appended, or a full custom prompt for non-coding profiles | `Agent.instructions` |
 | Claw tools | `mcp_servers` with the claw MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the claw tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
-| Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to claw. | Serialised `RunState` plus a Postgres-backed `Session` (`SQLAlchemySession`). |
+| Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to claw. | Serialised `RunState` plus a claw `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
 | Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers) | Agents as tools and handoffs |
 | Skills | Native: claw writes the session's skills to `.claude/skills/` and sets the `skills` option. | `SandboxAgent` `Skills` capability with a claw skill source, or the claw `skill_view` tool. |
 | Compaction | Native auto-compaction. The `PreCompact` hook lets claw archive the full transcript first. | `Compaction` capability or `OpenAIResponsesCompactionSession`. |
-| Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`) on the session sandbox |
+| Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
 | Limits | `max_turns`, `max_budget_usd`, `task_budget` | `max_turns`; claw budget in the model proxy |
 | Checkpoints | `enable_file_checkpointing` and `rewind_files()` | Claw git snapshot of the workspace (Section 15.3) |
 | Tracing | Langfuse integration plus proxy usage | Agents SDK tracing processor to Langfuse plus proxy usage |
@@ -507,13 +517,16 @@ flowchart LR
   G["Curator<br/>(weekly)"] --> H["Mark stale,<br/>archive, merge"]
 ```
 
-1. **Nudge.** After every 10 user turns or 10 tool iterations (Hermes defaults), or when a
-   run ends, claw queues a **background review**.
+1. **Nudge.** Claw counts user turns and tool iterations per session. When a run ends, claw
+   checks the counters. If either counter reached 10 since the last review (Hermes defaults),
+   claw queues one **background review** and resets both counters. A session has at most
+   one review running and one queued.
 2. **Review.** A forked run reads the transcript with the Hermes review prompts ("should a
    skill or memory be saved or updated?"). It has only `memory` and `skill_manage`, and its
    own nudges are off, so it cannot recurse.
 3. **Apply.** Writes to `user` scope apply at once, and the user sees a short note. Writes
-   to `workspace` and `org` scope, and SOUL changes, need an approval.
+   to `workspace` scope and SOUL changes need an approval from a workspace `admin` or the
+   org `owner`. Writes to `org` scope need the org `owner` (Q5).
 4. **Curate.** A weekly curator job tracks skill usage (views, uses, patches). It marks
    unused agent-written skills `stale`, then `archived`. It merges near-duplicates with an
    approval. It never deletes. Pinned skills and skills that jobs or workflows use are exempt.
@@ -540,7 +553,8 @@ flowchart LR
 
 | Toolset | Tools | Where they run |
 |---|---|---|
-| `core` (native) | Shell, read, write, edit, search files, web fetch, todo | Runtime, in the sandbox |
+| `core` (native) | Shell, read, write, edit, search files, web fetch | Runtime, in the sandbox |
+| `todo` | `todo` (read and write the session task list). On Claude, the adapter also maps native `TodoWrite` calls to the same list with a `PostToolUse` hook. | Claw MCP |
 | `web` | `web_search`, `web_extract` | Claw MCP (search provider key on the control plane) |
 | `memory` | `memory` | Claw MCP |
 | `skills` | `skills_list`, `skill_view`, `skill_manage` | Claw MCP |
@@ -552,8 +566,8 @@ flowchart LR
 | `workflows` | `workflow_manage`, `workflow_run` | Claw MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Claw MCP to Browserbase or the extension |
 | `media` | `vision_analyze`, `image_generate`, `text_to_speech`, `transcribe` | Claw MCP |
-| `connections` | `connections_list`, `connection_request` (sends the user an OAuth link) | Claw MCP |
-| `integrations` | Composio toolkit tools and remote MCP server tools, behind `tool_search` | Claw MCP (Composio and MCP proxy) |
+| `connections` | `connections_list`, `connection_request` (sends the user a link or a form), `connection_test` | Claw MCP |
+| `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Claw MCP (Composio, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment` through the claw GitHub App | Claw MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `claw_pr` (code change to claw, Section 15) | Claw MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` | Claw MCP |
@@ -562,20 +576,197 @@ Agent profiles combine toolsets. Built-in presets: `assistant` (everything excep
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, vision,
 clarify; for webhook triggers), and `cron` (like `assistant` but no `cron` and no `clarify`).
 
-### 10.3 Integrations: Composio and MCP
+### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
-- **Composio** gives toolkits for hundreds of apps (Gmail, Google Calendar, GitHub, Linear,
-  Notion, HubSpot, and more), managed OAuth, and triggers. Claw uses one Composio entity per
-  claw user (personal accounts) and one per workspace (shared accounts).
-- **Remote MCP servers**: an org admin adds a server URL from a curated catalog or by hand.
-  OAuth or bearer tokens go to the claw vault. Claw proxies the calls, so the sandbox never
-  sees the token.
-- **Exposure**: integration tools are deferred behind `tool_search` by default. An agent
-  profile can pin a few integrations so that their tools are always visible.
-- **Approval defaults**: read actions `allow`, write actions `ask`, destructive actions
-  `ask` with a stronger warning. Admins can change this per tool.
-- **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks
-  can start runs or workflows (Section 12).
+A **connector** is a kind of external system that claw can reach. A **connection** is one
+configured account or endpoint of a connector, with its credentials in the claw vault.
+Hermes has the same idea (`tools/connectors/`, the `optional-mcps/` catalog, and
+`mcp_servers` in its config). Claw keeps the idea and moves it to a multi-user cloud.
+
+**Connector kinds**
+
+| Kind | What it connects | Examples | Where the calls run |
+|---|---|---|---|
+| `composio` | Managed app toolkits with managed OAuth and triggers | Gmail, Google Calendar, Drive, Sheets, GitHub, Linear, Notion, HubSpot, Slack | Control plane, through the Composio API |
+| `mcp_remote` | A remote MCP server over streamable HTTP. Auth: OAuth 2.1 (with dynamic client registration and PKCE), a bearer token, or a custom header | Supabase, Neon, Sentry, Stripe, Atlassian, Notion, Linear, any vendor MCP | Control plane, through the claw MCP proxy |
+| `mcp_hosted` | A stdio MCP server (`command` and `args`, for example an `npx` or `uvx` package) that claw runs for the user | Community MCP servers with no hosted version | A **connector host** (see below) |
+| `database` | A database with a native claw driver | PostgreSQL (also Supabase, Neon, RDS), MySQL and MariaDB, Microsoft SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB | Control plane, through the claw database gateway (Section 10.4) |
+| `http_api` | A REST API from an OpenAPI document or from a list of endpoints. Auth: API key, bearer, basic, or OAuth 2 client credentials | Internal company APIs, a PMS, a CRM without a Composio toolkit | Control plane, through the claw HTTP client |
+| `plugin` | Python code that a product registers through the extension points (D16) | vorflux: Beds24 PMS, hotel channel managers | Control plane, in the product's tool pack |
+
+**Rules for every kind**
+
+- **No credentials in the agent sandbox.** Every call runs on the control plane or in a
+  connector host. The agent sandbox sees only tool results (D6).
+- **One tool path.** Every connector tool goes through the claw MCP server and the tool gate
+  (Section 16.1). Approvals, audit, budgets, and redaction work the same for all kinds.
+- **The outbound URL policy applies** (Section 16.4). A connection to a private network
+  needs an explicit network route (Section 10.6).
+- **Results are untrusted content** (Section 16.5). A database row or an API response can
+  contain a prompt injection.
+
+**Connector catalog**
+
+The catalog is a folder of YAML manifests in the claw repo, `connectors/catalog/<name>.yaml`,
+one file per connector, like Hermes `optional-mcps/`. A manifest is added through a reviewed
+pull request. A manifest holds:
+
+- `name`, `kind`, `description`, `icon`, and `docs_url`.
+- The transport: a URL (`mcp_remote`), a pinned package and command (`mcp_hosted`), a driver
+  (`database`), or an OpenAPI URL (`http_api`).
+- The auth type and the setup form fields. Secret fields are marked `secret: true`.
+- Default tool policies (`allow`, `ask`, `deny` per tool or per pattern) and default tool
+  filters (include and exclude lists).
+- Keywords for suggestions, for example "the user mentioned Supabase".
+
+An org admin can also add a custom connection that is not in the catalog (a URL, an OpenAPI
+document, a database, or a stdio command). A custom `mcp_hosted` connection needs the org
+`owner`.
+
+**Connection record**
+
+| Field | Meaning |
+|---|---|
+| `org_id`, `workspace_id` | Tenant scope (RLS) |
+| `scope` | `personal` (one user) or `workspace` (shared) |
+| `owner_user_id` | The user for a `personal` connection |
+| `connector`, `kind` | Catalog entry or `custom` |
+| `config` | Non-secret settings: URL, host, database name, schemas, read-only flag, tool filters |
+| `secret_ref` | Reference to the vault entry. Never the secret value. |
+| `state` | `pending`, `initiated`, `connected`, `failed`, `expired`, `disabled` |
+| `tool_cache` | Tool names and schemas from the last discovery, with a hash |
+| `policy_overrides` | Admin changes to the default tool policies |
+| `last_health_at`, `last_error` | Health check result |
+
+The state model follows Hermes `tools/connectors/contract.py`: only the backend can set
+`connected` (an OAuth callback, a successful health check, or a successful discovery). The
+model and the user's chat text cannot set it. A clock moves `initiated` to `expired`, and a
+failed health check or a refused token moves `connected` to `expired` or `failed`. The owner
+gets one notice per change.
+
+**How a user connects something**
+
+1. The user opens the Connections page in the web app, or types `/connect supabase` in any
+   channel, or the agent calls `connection_request` when it needs a connector.
+2. Claw shows a card with a link. OAuth connectors open the provider's consent page. Form
+   connectors (databases, API keys, stdio servers) open a form in the web app. **Secrets are
+   never typed in chat**, so they never enter a transcript.
+3. Claw stores the secret in the vault, tests the connection, discovers the tools, and sets
+   `connected`.
+4. The tools are available at once in new and running sessions through `tool_search`, so the
+   frozen prompt prefix does not change (D9). Hermes needs `/reload-mcp`, which breaks the
+   prompt cache. Claw does not.
+
+**Agent tools for connections** (toolset `connections`)
+
+| Tool | Purpose |
+|---|---|
+| `connections_list` | Lists the connections that this session can use, with state and a short description |
+| `connection_request` | Asks the user to connect a connector. Sends a card with the link or form. The agent cannot supply credentials. |
+| `connection_test` | Runs the health check for one connection and returns the state |
+
+**Tool naming and exposure**
+
+- Connector tools have a prefix for the kind and the connection name, as in Hermes:
+  `mcp_<connection>_<tool>` for MCP, `db_<connection>_<tool>` for databases, and
+  `api_<connection>_<tool>` for HTTP APIs. Composio tools keep the Composio slug (for
+  example `GMAIL_SEND_EMAIL`). If a name is longer than 64 characters, claw shortens it and
+  adds a short hash. Each connection is also a toolset `conn-<connection>`.
+- Connector tools are deferred behind `tool_search` by default. An agent profile can pin a
+  connection so that its tools are always visible.
+- Admins can include or exclude tools per connection, as in Hermes per-server filters.
+
+**Who can use a connection**
+
+- A `personal` connection runs as its owner. It is usable only in that user's private
+  sessions (Section 11.3), and in that user's jobs and workflows.
+- A `workspace` connection is usable by all workspace members and in shared sessions. Only a
+  workspace `admin` or the org `owner` can create, change, or remove it.
+- Default policies: read tools `allow`, write tools `ask`, destructive tools `ask` with a
+  stronger warning. Admins can change this per tool. Unattended runs follow Section 12.1.
+
+**Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
+start runs or workflows (Section 12).
+
+### 10.4 Database connections
+
+Claw has its own database connector because many SQL MCP servers give the model one
+`execute_sql` tool with full rights. The **claw database gateway** is a module of the claw MCP
+tool server. It holds the drivers and the connection pools, and it enforces the limits below
+at the driver, so a prompt cannot remove them.
+
+**Tools** (for each database connection)
+
+| Tool | What it does | Default policy |
+|---|---|---|
+| `db_<conn>_schema` | Lists schemas, tables, columns, types, keys, indexes, and comments. Filters by schema or table. Results are cached for 10 minutes. | `allow` |
+| `db_<conn>_sample` | Returns up to 20 rows of one table | `allow` |
+| `db_<conn>_query` | Runs one read statement (`SELECT`, `WITH`, `EXPLAIN`, or the equivalent for the engine) with bound parameters | `allow` |
+| `db_<conn>_export` | Runs one read statement and writes the full result as CSV or Parquet to a file in the agent sandbox, for analysis with code | `allow` |
+| `db_<conn>_execute` | Runs one write statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`). Only on connections with writes turned on. | `ask`, with the SQL and the estimated row count in the approval card |
+
+**Limits**
+
+- **Read-only by default.** Claw asks for a read-only database user in the setup form.
+  Claw also opens every `query` and `export` in a read-only transaction (for example
+  PostgreSQL `SET TRANSACTION READ ONLY`, MySQL `START TRANSACTION READ ONLY`).
+- **One statement per call.** Claw parses the SQL (with `sqlglot`) and rejects more than one
+  statement. A `query` call that contains a write is rejected. DDL (`CREATE`, `ALTER`, `DROP`,
+  `TRUNCATE`, `GRANT`) is `deny` by default. An admin can allow it for one connection, and
+  each DDL call is then `ask`.
+- **Limits per call**: a 30-second statement timeout, at most 1,000 rows and 50 KB returned
+  to the model (the rest spills to a file, as in Section 6.2), and a cost limit where the
+  engine reports one (for example BigQuery maximum bytes billed).
+- **Allowed schemas and tables**: an admin can limit a connection to some schemas or tables,
+  and can hide columns (for example `email` or `phone`). Claw applies the hidden columns to
+  `schema`, `sample`, `query`, and `export` results.
+- **Pools**: a small connection pool per connection, with a limit per org, so that the agent
+  cannot overload a production database.
+
+**Other ways to reach a database**
+
+- A vendor MCP server (for example Supabase or Neon) through `mcp_remote`. This is good for
+  admin tasks such as branches or migrations. Its tools follow the tool gate.
+- The agent can also use a database through code in its sandbox only if the user gives a
+  connection string for a scratch database. Claw does not put production credentials in the
+  sandbox.
+
+### 10.5 Connector hosts for stdio MCP servers
+
+Hermes starts stdio MCP servers as local processes. In the cloud, claw runs each
+`mcp_hosted` connection in a **connector host**: a small, separate E2B sandbox (or Fly
+Machine later) that the control plane owns.
+
+- One connector host per connection. It holds only that connection's secrets, as
+  environment variables. It is not the agent sandbox, and the agent cannot run commands in
+  it.
+- The host runs the pinned package from the manifest. Claw speaks MCP to it over a stdio
+  bridge, and proxies its tools like a remote MCP server.
+- The host has its own egress allowlist from the manifest (for example only `api.vendor.com`).
+- The host starts on the first call, pauses when idle, and restarts if it uses too much
+  memory (Hermes recycles stdio servers in the same way).
+- Custom stdio commands that are not in the catalog need the org `owner` to approve them.
+
+### 10.6 Private networks
+
+Many databases and internal APIs are not on the public internet. Claw supports these routes,
+per connection:
+
+| Route | How |
+|---|---|
+| IP allowlist | The claw services that call connectors use static egress IP addresses (Fly.io). The customer allows these addresses in the database firewall. |
+| SSH tunnel | Claw opens an SSH tunnel through the customer's bastion host. The SSH key is in the vault. |
+| Private network agent (later) | A small claw relay that the customer runs inside the network. It connects out to claw over TLS, so no inbound port is open. |
+
+The outbound URL policy (Section 16.4) blocks private addresses for normal requests. A
+connection that uses a tunnel or a relay is the only way to reach a private address, and only
+for that connection.
+
+### 10.7 Claw as an MCP server (later)
+
+Hermes can expose its own tools as an MCP server. Claw can expose an agent profile as a
+remote MCP server later, so that other agents (for example Claude Code or Cursor) can call
+claw tools and skills with an org token. This is not planned for M1 to M6.
 
 ---
 
@@ -601,7 +792,7 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 |---|---|---|
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
 | Slack | Slack Bolt for Python, Events API over HTTP, interactive components | One Slack app per org install (OAuth). DMs and mentions. A thread is a session. Approval buttons through Block Kit. |
-| Telegram | Bot API webhook | One bot per org (token in the vault), or one shared claw bot. DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
+| Telegram | Bot API webhook | One shared claw bot for our team now. One bot per org for customers later, with its token in the org vault (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
 | Chrome extension | WebSocket from the extension to the gateway | Side panel chat bound to the current tab. Also the `my_chrome` browser target (Section 14). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
 
@@ -615,6 +806,15 @@ One gateway service hosts all channel adapters. Each adapter does five things:
   paired members can start runs there.
 - Group messages are untrusted input. In groups the agent uses the profile's group toolset
   (default: no shell, no code edits, no outbound writes).
+- **Audience and principal.** Each session has an audience: `private` (one user, for
+  example a DM) or `shared` (a Slack channel or thread, a Telegram group). A private session
+  runs as its user. A shared session runs as the workspace and uses only shared context:
+  SOUL, `agent` and `workspace` memory, workspace skills, and workspace connections. It does
+  not load `user` memory, user skills, or personal connections. A user who wants personal
+  data uses a private session, or shares one item on purpose with an approval.
+- The same audience rule applies to `session_search`, `session_read`, resume, and delivery.
+  A user finds only sessions whose audience includes the user. A job delivers to a shared
+  target only output from a shared-audience run.
 
 ---
 
@@ -629,7 +829,7 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 | `agent_profile`, `model` | Pins. The default is the profile default when the job fires. |
 | `deliver` | `origin` (the chat that created it), a channel target (`slack:#ops`, `telegram:<chat>`, `email:<address>`), or `none`. Plus `failure_deliver`. |
 | `mode` | `agent` (an LLM run) or `script` (run a script in the sandbox and deliver its output, no LLM). |
-| `preapproved_tools` | Tools that may run without a human in this job. Everything else that needs `ask` is denied. |
+| `preapproved_tools` | Tools that may run without a human in this job, each bound to a connection and optional argument limits (for example "Slack post to `#eng` only"). Everything else that needs `ask` is denied. Adding or widening a pre-approval needs a human approval, which is bound to that job version. A change to the job's prompt, schedule, or target creates a new version, and write pre-approvals then need approval again. |
 | `attach_to_session` | Run inside one long-lived session (heartbeat) instead of a fresh session. |
 
 Execution:
@@ -675,8 +875,14 @@ steps:
 - Step types: `tool` (one tool call, no LLM), `agent` (a run with a prompt and skills),
   `approval`, `branch` (a condition), `parallel` (fan out), `wait` (time or event), and
   `workflow` (a sub-workflow).
-- The workflow engine runs each step as a queue item and stores its output. A failed step
-  retries with backoff. A crash resumes from the last finished step.
+- The workflow engine runs each step as a queue item and stores its output. A crash
+  resumes from the last finished step.
+- Each step has a stable operation id. Claw passes it as an idempotency key where the
+  provider supports one, and writes a receipt before and after the external call.
+- A step that failed for sure (for example a 4xx response) retries with backoff. A
+  non-idempotent write with an unknown result (for example a crash after the call) is not
+  retried. Claw tries to check the result (reconcile). If it cannot, the instance waits for
+  a human.
 - The agent can write workflows with `workflow_manage`. "Turn this session into a workflow"
   is a built-in skill. New or changed workflows that write to external systems need an
   approval before their first run.
@@ -753,14 +959,19 @@ Tools:
 
 ### 15.1 Editing code
 
-- The agent clones allowed repositories into the session sandbox with `repo_clone`. The
-  claw GitHub App issues a short-lived token for that clone only. The org allowlist decides
-  which repos.
-- The agent edits with native tools (Claude `Edit`, OpenAI `apply_patch`), runs tests in the
-  sandbox, commits to a `claw/<slug>` branch, pushes, and opens a pull request with
-  `pr_create`.
-- The agent never pushes to the default branch, never merges, and never force-pushes. The
-  GitHub App has no merge permission.
+- The sandbox has no GitHub token. Git traffic goes through the **claw git proxy** on the
+  control plane, which holds the GitHub App installation tokens. The sandbox authenticates
+  to the proxy with the run token. The org allowlist decides which repos.
+- The agent clones with `repo_clone`, edits with native tools (Claude `Edit`, OpenAI
+  `apply_patch`), runs tests in the sandbox, commits to a `claw/<slug>` branch, pushes
+  through the proxy, and opens a pull request with `pr_create`.
+- The proxy checks every push: the target repo is on the allowlist, every ref is a
+  `claw/*` branch, there is no force-push and no ref delete, and changed protected paths
+  (for example `.github/workflows`) have an approval.
+- The agent never merges. Claw has no merge tool, and no GitHub token reaches the sandbox.
+  A GitHub App with `contents: write` can merge through the API, so the permission alone
+  does not stop a merge. Repos also need branch rules (rulesets) on the default branch that
+  require a reviewed pull request and give the claw App no bypass.
 - Repo `AGENTS.md` and `CLAUDE.md` load as context files for that session.
 
 ### 15.2 Changing its own stack
@@ -769,7 +980,7 @@ Tools:
 
 | Level | What | How it applies |
 |---|---|---|
-| Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through claw tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. All apply from the next session. Every change can be reverted from the history view. |
+| Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through claw tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. Prompt content (SOUL, memory, skills) applies from the next session. Restrictions (deny rules, removed tools, revoked connections, lower budgets) apply at once (Section 5.1). Every change can be reverted from the history view. |
 | Code | Claw itself (and later products such as vorflux) | The agent uses `claw_pr`: it clones the claw repo in its sandbox, makes the change, runs the tests, and opens a pull request. A human reviews and merges. CI deploys. Changes to protected paths (auth, tenancy, approvals, model proxy, sandbox, CI) need the owner's review. |
 
 The agent never edits the running service, its database schema, or its secrets directly.
@@ -796,8 +1007,9 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
    mode. The default for unknown tools is `ask`.
-5. **Context**: in unattended runs, `ask` becomes `deny` unless the job pre-approved the
-   tool.
+5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
+   pre-approval for this tool in this job version, and the call fits its connection and
+   argument limits (Section 12.1).
 
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
 the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
@@ -812,8 +1024,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
   hosts are blocked where E2B network controls allow it. Otherwise the runner logs every
   connection, and we track this as a risk (R4).
 - The sandbox has no database credentials, no provider keys, and no integration tokens. It
-  has only the run token and short-lived tokens for single operations (for example one git
-  clone).
+  has only the run token. Git goes through the claw git proxy (Section 15.1).
 
 ### 16.3 Secrets
 
@@ -825,7 +1036,23 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 - Each org can bring its own Anthropic and OpenAI keys later. Our keys are the default for
   our team.
 
-### 16.4 Untrusted content
+### 16.4 Outbound requests from the control plane
+
+Some requests start on the control plane, not in the sandbox: `web_extract`, connector
+discovery and calls (MCP, HTTP API, database), OAuth flows, skill imports, webhook deliveries, and browser
+navigation. Sandbox egress rules do not cover them. One outbound HTTP client enforces a URL
+policy for all of them:
+
+- Only `https` (and `http` where the org allows it) to public addresses.
+- Claw resolves the host, checks every resolved address, and connects to the checked
+  address, so DNS rebinding cannot change the target. It blocks private, loopback,
+  link-local, and cloud metadata addresses.
+- Claw checks every redirect hop again, with a limit on the number of hops.
+- Org allowlists and block lists apply. Response size and time limits apply.
+- A connection that has a private network route (SSH tunnel or relay, Section 10.6) may reach
+  the private addresses of that route only. No other request can use the route.
+
+### 16.5 Untrusted content
 
 - Content from the web, email, webhooks, other people in groups, and files is untrusted.
   Claw marks it as untrusted in tool results.
@@ -843,7 +1070,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 | `users`, `memberships` | Users and their role per org and workspace (`owner`, `admin`, `member`) |
 | `agent_profiles` | SOUL, runtime, model, toolsets, skills, policy, budgets |
 | `channel_identities`, `session_bindings` | Paired Slack and Telegram identities, chat-to-session bindings |
-| `vault_secrets`, `connections` | Encrypted secrets, Composio and MCP connections |
+| `vault_secrets`, `connections`, `connector_hosts` | Encrypted secrets, connections of all kinds (Section 10.3), connector host state (Section 10.5) |
 
 - Every table has `org_id`, and most have `workspace_id`. RLS policies check membership from
   the Supabase JWT. The API also checks scope in code (two guards).
@@ -881,7 +1108,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 | Hosting | Fly.io: `api`, `gateway`, `worker`, `scheduler` process groups |
 | Sandboxes | E2B (custom template), Docker for local development |
 | Browser | Browserbase plus Playwright; Chrome extension (TypeScript, MV3) |
-| Integrations | Composio, remote MCP servers |
+| Connectors | Composio, remote MCP servers, hosted stdio MCP servers (E2B), database drivers (`asyncpg`, `aiomysql`, and others) with `sqlglot`, OpenAPI |
 | Channels | Slack Bolt for Python, Telegram Bot API |
 | Web UI | Next.js on Vercel |
 | Observability | Langfuse, OpenTelemetry |
@@ -915,10 +1142,10 @@ docs/
 | Milestone | Outcome |
 |---|---|
 | M0 | This design (doc only). |
-| M1 Core engine | Repo foundations and CI. Runtime contract, Claude adapter, fake runtime, conformance suite. E2B sandbox and runner. Model proxy. Sessions in Postgres. SOUL and context files. Tool gate with approvals in the web chat. HTTP chat API and a minimal web chat page. Telegram. Langfuse. Code editing in the sandbox (no pull requests yet). |
-| M2 Learning loop | Memory, skills library and tools, session search, background review, context management (spill, tool search, pins). |
-| M3 Reach | Slack. Approvals over chat. Composio and MCP connections. OpenAI Agents SDK adapter passes the conformance suite. GitHub pull request flow. Web app v1 for the team. |
-| M4 Automation | Cron jobs and delivery, event triggers, workflows, `delegate_task`, task board, `@` references. |
+| M1 Core engine | Repo foundations and CI. Runtime contract, Claude adapter, fake runtime, conformance suite. E2B sandbox and runner. Model proxy. Sessions in Postgres. SOUL and context files. Vault and redaction. Claw MCP tool server with output caps and spill. Outbound URL policy. Tool gate with approvals in the web chat and Telegram. HTTP chat API and a minimal web chat page. Telegram. Langfuse. Code editing in the sandbox (no pull requests yet). |
+| M2 Learning loop | Memory, skills library and tools, session search, background review, context management (tool search, pins). |
+| M3 Reach | Slack with shared-session rules. Approver rules per role. Connections: connection framework, Composio, remote MCP, and PostgreSQL. OpenAI Agents SDK adapter passes the conformance suite. GitHub pull request flow. Web app v1 for the team. |
+| M4 Automation | Cron jobs and delivery, event triggers, workflows, `delegate_task`, task board, `@` references. Hosted stdio MCP, HTTP API connections, more databases, and SSH tunnels. |
 | M5 Browser | Cloud browser tools, vision mode, browser vault, Chrome extension. |
 | M6 Self-change and customers | `change_propose` and `claw_pr`, curator, checkpoints, customer sign-up, billing, quotas, org keys, regions, customer-ready web app. |
 
@@ -940,16 +1167,21 @@ docs/
 
 ---
 
-## 22. Open questions
+## 22. Resolved questions
 
-| # | Question | Recommendation |
+The owner answered these questions on 2026-11-18. The answers are binding for M1. Section
+3.1 lists the earlier owner answers.
+
+| # | Question | Decision |
 |---|---|---|
-| Q1 | vorflux chose Fly Machines for sandboxes. Claw chose E2B (owner answer). Should vorflux move to E2B through claw, or should claw support both? | Claw uses E2B behind `SandboxProvider`. vorflux decides when it adopts claw. A Fly Machines provider is possible later. |
-| Q2 | Python package and service name: `claw`? | Yes: package `claw`, services `claw-api`, `claw-gateway`, `claw-worker`, `claw-scheduler`. |
-| Q3 | Telegram: one shared claw bot for everyone, or one bot per org? | One shared bot for our team now. One bot per org for customers later. |
-| Q4 | Which region for Supabase and Fly? | `ap-south-1` (Mumbai) for Supabase, same as vorflux. Fly region nearest to it. |
-| Q5 | Who in our team may approve workspace-scope memory, skills, and SOUL changes? | Workspace `admin` and org `owner`. |
-| Q6 | When do we build the web app? | A minimal web chat and approvals page in M1, web app v1 for the team in M3, and the customer-ready web app in M6. |
+| Q1 | vorflux chose Fly Machines for sandboxes. Claw uses E2B. Should claw support both? | Claw uses E2B now, behind the `SandboxProvider` interface (D5). Claw adds a Fly Machines provider later only if a product needs it. vorflux decides when it adopts claw. |
+| Q2 | Python package and service name? | Package `claw`. Services `claw-api`, `claw-gateway`, `claw-worker`, and `claw-scheduler`. |
+| Q3 | Telegram: one shared bot or one bot per org? | One shared claw bot for our team now. One bot per org for customers later (M6), with its token in the org vault. |
+| Q4 | Which region? | Supabase in `ap-south-1` (Mumbai), the same as vorflux. Fly.io in the region nearest to it. |
+| Q5 | Who may approve changes to workspace memory, workspace skills, and SOUL? | Workspace `admin` and org `owner`. Org-scope changes need the org `owner`. |
+| Q6 | When do we build the web app? | A minimal web chat and approvals page in M1. Web app v1 for the team in M3. The customer-ready web app in M6. |
+
+No questions are open now.
 
 ---
 

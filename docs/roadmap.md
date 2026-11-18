@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.1, 2026-11-18 |
+| Status | Draft v0.3, 2026-11-18 |
 | Design | [`architecture.md`](architecture.md) |
 | Feature map | [`feature-map.md`](feature-map.md) |
 
@@ -16,7 +16,7 @@ An item is done when its acceptance criteria pass in CI or in a recorded demo.
 | M0 | Design | This pull request: architecture, feature map, roadmap. |
 | M1 | Core engine | Chat from Telegram and a web page. The agent runs code in an E2B sandbox on the Claude Agent SDK, asks for approval, and keeps the session. |
 | M2 | Learning loop | The agent remembers facts, writes and improves skills, and finds old sessions. |
-| M3 | Reach | Slack, Composio and MCP connections, the OpenAI Agents SDK runtime, GitHub pull requests, web app v1. |
+| M3 | Reach | Slack, connections (Composio, remote MCP, PostgreSQL), the OpenAI Agents SDK runtime, GitHub pull requests, web app v1. |
 | M4 | Automation | Cron jobs, triggers, workflows, `delegate_task`, task board. |
 | M5 | Browser | Cloud browser tools and the Chrome extension with click, type, and cursor. |
 | M6 | Self-change and customers | `change_propose`, `claw_pr`, curator, checkpoints, customer sign-up and billing. |
@@ -48,15 +48,17 @@ M2 and M3 can run in parallel after M1.
 | M1.5 | Conformance suite | Shared tests for every runtime: streaming, tool call through MCP, approval pause and resume, cancel, budget stop, compaction event. The fake and Claude adapters pass. A nightly job runs it against the live Claude API. |
 | M1.6 | Sandbox provider and runner | `SandboxProvider` with E2B and Docker. A claw E2B template. One sandbox per session with pause and resume. The runner starts inside the sandbox and talks to the control plane only with a run token. Start time is measured and logged. |
 | M1.7 | Model proxy | Anthropic and OpenAI pass-through with run tokens. Records tokens and cost per call. Rejects calls over budget. No provider key exists in the sandbox (a test checks the sandbox environment). |
-| M1.8 | Claw MCP tool server | Streamable HTTP MCP server per run, scoped by the run token. Tools: `web_search`, `web_extract`, `clarify`. Output cap of 50 KB with spill. |
+| M1.8 | Claw MCP tool server | Streamable HTTP MCP server per run, scoped by the run token. Tools: `web_search`, `web_extract`, `clarify`, `todo`. Output cap of 50 KB with spill. `web_extract` uses the outbound URL policy (architecture §16.4): a test shows that private, metadata, and redirect-to-private URLs are blocked. |
 | M1.9 | Tool gate and approvals | Order of §16.1: toolset, hardline, recorded decision, policy, context. `ask` pauses the run and creates an approval. Unattended runs turn `ask` into `deny`. Every decision is in the audit log. Tests cover each step. |
 | M1.10 | Run orchestrator and queue | Postgres queue with `FOR UPDATE SKIP LOCKED` and leases. A crashed worker's run is marked failed or resumed. One active run per session; new messages queue. |
-| M1.11 | Prompt assembly | SOUL per profile, context files (20,000-char cap, injection scan), frozen prefix per session. Changes apply from the next session. |
+| M1.11 | Prompt assembly | SOUL per profile, context files (20,000-char cap, injection scan), frozen prefix per session. Prompt changes apply from the next session. |
 | M1.12 | HTTP API and minimal web chat | `POST /sessions/{id}/messages`, server-sent events for run events, approve and deny endpoints. Supabase Auth login. A minimal web page for chat and approvals. |
-| M1.13 | Telegram channel | Webhook adapter, pairing codes from the web page, streaming edits, inline-keyboard approvals, voice notes transcribed, `/new`, `/stop`, `/model`. |
+| M1.13 | Telegram channel | One shared claw bot for the team. Webhook adapter, pairing codes from the web page, streaming edits, inline-keyboard approvals, voice notes transcribed, `/new`, `/stop`, `/model` (starts a child session). DMs are private sessions. Groups are shared sessions without `user` memory or personal connections (architecture §11.3). |
 | M1.14 | Observability | Langfuse traces per run for the Claude adapter. Structured logs. Alerts to a Slack channel on error rate. |
 | M1.15 | Deploy | Fly.io apps for `api`, `gateway`, `worker`. CI deploys `main` to staging. A manual promote step deploys to production. |
 | M1.16 | Code editing in the sandbox | The agent clones a public repo, edits files, and runs tests in the sandbox with native tools. No push yet. |
+| M1.17 | Vault and redaction | Encrypted secrets per org for provider, search, and bot keys. Redaction of known secrets in tool output, logs, and traces. A test checks that a planted secret does not appear in a transcript or trace. |
+| M1.18 | Live authority checks | The control plane checks membership, policy, budgets, and revocations at every tool call, model call, and approval resume. A test revokes a tool during a session and the next call gets `deny`. |
 
 ## M2 — Learning loop
 
@@ -65,7 +67,7 @@ M2 and M3 can run in parallel after M1.
 | M2.1 | Memory | `memory` tool with targets `agent`, `user`, `workspace` and actions add, patch, remove. Char caps. Over-limit writes fail and return current entries. `memory_revisions` and revert. Snapshot in the frozen prefix. |
 | M2.2 | Skills storage and tools | Skills as versioned rows plus files. Scopes builtin, org, workspace, user. `skills_list`, `skill_view`, `skill_manage`. Skill index (60-char descriptions) in the prefix. Skills sync into the sandbox. Lint and injection scan on every write. |
 | M2.3 | Builtin skills | At least 10 builtin skills of our own (for example research, writing, code review, spreadsheet, PDF, meeting notes). `/<skill-name>` works in Telegram and web. |
-| M2.4 | Background review | After a run, every 10 user turns or 10 tool iterations, a review run with a cheap model may write memory and skills. Recursion is off. User-scope writes apply. Workspace and org writes create an approval. |
+| M2.4 | Background review | When a run ends and 10 user turns or 10 tool iterations passed since the last review, claw queues one review and resets the counters. At most one review runs and one waits per session. The review run with a cheap model may write memory and skills. Recursion is off. User-scope writes apply. Workspace and org writes create an approval. |
 | M2.5 | Session search | Full-text plus pgvector index on messages. `session_search` and `session_read`. No LLM call in the tool. |
 | M2.6 | Context management | Compaction events from the Claude SDK, transcript archive, session lineage. `tool_search`, `tool_describe`, `tool_call` for deferred tools. Context pins. `/compact`. |
 | M2.7 | Native sub-agents | Claude `agents` option configured from the agent profile. Sub-agent events appear in traces. |
@@ -76,30 +78,34 @@ M2 and M3 can run in parallel after M1.
 | # | Item | Acceptance criteria |
 |---|---|---|
 | M3.1 | Slack channel | Slack app with OAuth install, DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. |
-| M3.2 | Approvals over chat | Approval cards in Telegram and Slack. Approver rules per workspace role. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
-| M3.3 | Vault | Encrypted secrets per org. Redaction of known secrets in tool output, logs, and traces. |
-| M3.4 | Composio connections | Composio entity per user and per workspace. `connections_list`, `connection_request`. Composio tools behind `tool_search`. Read actions `allow`, write actions `ask`. |
-| M3.5 | Remote MCP servers | Add a remote MCP server with OAuth per workspace. Tools proxied by the claw MCP server as `mcp_<server>_<tool>`. |
-| M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the E2B sandbox client, `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. |
-| M3.7 | GitHub App and pull requests | Claw GitHub App. `repo_clone`, `pr_create`, `pr_comment`. Allowlist of repos per org. The App has no merge permission. Protected paths need `ask`. |
-| M3.8 | Web app v1 | Next.js app: chat, approvals, memory editor, skill editor, connections, sessions with search, run traces, settings. |
+| M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
+| M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. |
+| M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. |
+| M3.5 | Remote MCP connections | Add a remote MCP server from the catalog or by URL, with OAuth 2.1 (dynamic client registration and PKCE), a bearer token, or a header. Tools proxied by the claw MCP server as `mcp_<connection>_<tool>`. Include and exclude filters, a tool schema cache, and a health check. New tools are usable without a new session. All calls use the outbound URL policy (architecture §16.4). |
+| M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the local sandbox client inside the E2B sandbox (no E2B key in the runner), a claw `Session` over the control-plane API (no database credentials in the runner), `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. |
+| M3.7 | GitHub App, git proxy, and pull requests | Claw GitHub App. Claw git proxy holds the tokens; the sandbox has none. `repo_clone`, `pr_create`, `pr_comment`. Allowlist of repos per org. The proxy rejects pushes to non-`claw/*` refs, force-pushes, and ref deletes, and needs an approval for protected paths. Setup docs require a default-branch ruleset with no bypass for the App. Tests cover each rejected push. |
+| M3.8 | Web app v1 | Next.js app: chat, approvals, memory editor, skill editor, connections, sessions with search and export (Markdown and JSON), run traces, settings. |
 | M3.9 | Busy controls and handoff | Queue, `/stop`, `/steer` while a run is busy. `/handoff` between channels. |
 | M3.10 | Worker bots | An agent profile bound to a Slack channel with a daily budget. |
+| M3.11 | PostgreSQL connections | Database gateway with PostgreSQL (also Supabase and Neon) (architecture §10.4). Tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`. Tests show that: `query` runs in a read-only transaction; a write or a second statement in `query` is rejected; DDL is denied by default; a query stops after 30 seconds; the model gets at most 1,000 rows and 50 KB, and the rest spills to a file; hidden columns do not appear in any result; `execute` needs an approval that shows the SQL. Static egress IP addresses are documented for allowlists. |
 
 ## M4 — Automation
 
 | # | Item | Acceptance criteria |
 |---|---|---|
 | M4.1 | Scheduler | `scheduler` service with a 60-second tick and leader lease. A fire runs once, also when two schedulers run. |
-| M4.2 | Cron jobs | `jobs` table, `cronjob_manage`, `/cron`, and a web page. Natural language to cron with validation and the next 3 fire times. Model pin, `mode: script`, `preapproved_tools`, `attach_to_session`. A job run cannot create jobs. |
+| M4.2 | Cron jobs | `jobs` table, `cronjob_manage`, `/cron`, and a web page. Natural language to cron with validation and the next 3 fire times. Model pin, `mode: script`, `preapproved_tools`, `attach_to_session`. A job run cannot create jobs. Adding or widening a pre-approval needs a human approval bound to the job version, connection, and argument limits. A test shows that a job created by the agent cannot run a write tool without that approval. |
 | M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. |
 | M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. |
-| M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with retry and resume after a crash. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
+| M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
 | M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. |
 | M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. |
 | M4.8 | Code execution | `execute_code` with a stub that calls claw tools over MCP. Only stdout returns to the model. |
 | M4.9 | More media and references | `image_generate`, `text_to_speech` (Telegram voice note), `@file`, `@url`, `@session`. |
 | M4.10 | Skills import and `/learn` | Import a skill from a Git URL with scan and approval. `/learn` creates a draft skill from sources. |
+| M4.11 | Hosted stdio MCP connections | Connector host per connection in its own E2B sandbox (architecture §10.5). Pinned package from the manifest, egress allowlist, start on first call, pause when idle, restart on memory limit. The agent cannot run commands in the host. A custom command needs the org `owner`. A test shows that the agent sandbox cannot read the host's secrets. |
+| M4.12 | HTTP API connections | Import an OpenAPI document or a list of endpoints. One tool per operation as `api_<connection>_<tool>`. Auth by API key, bearer, basic, or OAuth 2 client credentials. `GET` tools `allow`, other methods `ask`. |
+| M4.13 | More databases and SSH tunnels | MySQL and MariaDB, Microsoft SQL Server, BigQuery (with maximum bytes billed), Snowflake, ClickHouse, and MongoDB (read with `find` and `aggregate`) in the database gateway, with the M3.11 tests for each engine. SSH tunnel route per connection (architecture §10.6). A test shows that a tunnel route cannot be used by another connection or by `web_extract`. |
 
 ## M5 — Browser
 
@@ -122,7 +128,7 @@ M2 and M3 can run in parallel after M1.
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. |
 | M6.5 | Customer sign-up | Self-serve sign-up, org creation, invites, roles. |
 | M6.6 | Billing and quotas | Stripe plans and usage billing from proxy cost. Quotas per plan. |
-| M6.7 | Org keys and regions | An org can bring its own Anthropic and OpenAI keys. Region per org. |
+| M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys and its own Telegram bot. Region per org. |
 | M6.8 | Data controls | Export and delete per user and per org. Retention per plan. |
 | M6.9 | Customer-ready web app | Onboarding, billing pages, admin views, and docs. |
 
@@ -132,7 +138,9 @@ M2 and M3 can run in parallel after M1.
 
 - More channels: email, WhatsApp, Discord, Microsoft Teams.
 - Mem0 as a memory provider.
-- Fly Machines as a second sandbox provider (Q1).
+- Fly Machines as a second sandbox provider, only if a product needs it (architecture Q1).
 - Desktop control beyond the browser.
 - ACP adapter for editors.
+- A private network relay that customers run inside their network (architecture §10.6).
+- Claw as an MCP server for other agents (architecture §10.7).
 - An OpenAI-compatible chat endpoint.
