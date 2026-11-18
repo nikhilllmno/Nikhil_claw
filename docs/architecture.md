@@ -1227,6 +1227,9 @@ Row-level security:
 - `sama.db.as_user()` runs a transaction as `authenticated` with the claims of one user.
   The API uses it for user reads, so RLS is the second guard under the code check. The role
   and the claims are `LOCAL` to the transaction, so a pooled connection does not keep them.
+- **Migrations are append-only after merge.** Do not edit a merged migration. A schema change
+  gets a new revision that upgrades the existing schema and its data. Before the merge of this
+  PR, `0001` was edited and the `sama` project was rebuilt with it (it had no data).
 - Tests: `tests/db/` runs the migration and the RLS tests on a local Postgres with a small
   Supabase Auth shim (`tests/db/supabase_shim.sql`). CI runs them with a Postgres service.
   A live test (`-m live`) checks isolation on the Supabase project through the Data API and
