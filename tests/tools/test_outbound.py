@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import gzip
 import ipaddress
 from collections.abc import Callable, Sequence
 
@@ -16,6 +18,7 @@ from sama.tools.outbound import (
     UrlPolicy,
     address_problem,
 )
+from tests.support import wire_transport
 
 PUBLIC = "93.184.215.14"
 
@@ -28,6 +31,9 @@ DNS: dict[str, list[str]] = {
     "meta.example.com": ["169.254.169.254"],
     "mapped.example.com": ["::ffff:10.0.0.1"],
     "v6.example.com": ["2606:2800:21f:cb07:6820:80da:af6b:8b2c"],
+    "first.example": [PUBLIC],
+    "other.example": [PUBLIC],
+    "xn--bcher-kva.de": [PUBLIC],
 }
 
 
@@ -48,7 +54,7 @@ def page(text: str = "<title>Hi</title><p>Hello</p>") -> Handler:
 
 
 def client(handler: Handler, policy: UrlPolicy | None = None) -> OutboundClient:
-    return OutboundClient(policy, resolver=resolver, transport=httpx.MockTransport(handler))
+    return OutboundClient(policy, resolver=resolver, transport=wire_transport(handler))
 
 
 @pytest.mark.parametrize(
@@ -242,14 +248,71 @@ async def test_a_transport_error_is_a_fetch_error() -> None:
 
 
 async def test_the_total_time_limit() -> None:
-    import asyncio
-
     async def slow(host: str, port: int) -> Sequence[IPAddress]:
         await asyncio.sleep(5)
         return [ipaddress.ip_address(PUBLIC)]
 
     outbound = OutboundClient(
-        UrlPolicy(total_timeout_s=0.05), resolver=slow, transport=httpx.MockTransport(page())
+        UrlPolicy(total_timeout_s=0.05), resolver=slow, transport=wire_transport(page())
     )
     with pytest.raises(FetchError, match="too long"):
         await outbound.get("https://example.com/")
+
+
+async def test_cookies_are_never_kept_or_sent() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "set-cookie": "sid=secret; Path=/"},
+            text="ok",
+        )
+
+    outbound = client(handler)
+    await outbound.get("https://first.example/")
+    await outbound.get("https://first.example/again")
+    # The other host has the same address. A kept cookie would go to it too.
+    await outbound.get("https://other.example/")
+    assert seen == [None, None, None]
+
+
+async def test_a_compressed_body_is_refused() -> None:
+    bomb = gzip.compress(b"\0" * 1_000_000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(
+            200, headers={"content-type": "text/plain", "content-encoding": "gzip"}, content=bomb
+        )
+
+    with pytest.raises(FetchError, match="compressed"):
+        await client(handler).get("https://example.com/")
+
+
+async def test_the_size_limit_counts_the_bytes_on_the_wire() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "content-encoding": "identity"},
+            text="x" * 500,
+        )
+
+    result = await client(handler, UrlPolicy(max_bytes=100)).get("https://example.com/")
+    assert len(result.content) == 100
+    assert result.truncated
+
+
+@pytest.mark.parametrize("entry", ["bücher.de", "xn--bcher-kva.de", "XN--BCHER-KVA.DE."])
+@pytest.mark.parametrize("url", ["https://bücher.de/", "https://xn--bcher-kva.de/"])
+async def test_host_lists_match_unicode_and_punycode_names(entry: str, url: str) -> None:
+    with pytest.raises(BlockedUrlError, match="block list"):
+        await client(page(), UrlPolicy(block_hosts=(entry,))).get(url)
+    allowed = client(page(), UrlPolicy(allow_hosts=(entry,)))
+    assert (await allowed.get(url)).status_code == 200
+
+
+def test_a_host_list_entry_that_is_not_a_host_name_is_refused() -> None:
+    with pytest.raises(ValueError, match="not a valid host name"):
+        OutboundClient(UrlPolicy(block_hosts=("ü" * 70,)), resolver=resolver)

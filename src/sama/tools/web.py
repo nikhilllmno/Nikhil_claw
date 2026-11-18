@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -13,6 +14,8 @@ from pydantic import SecretStr
 from sama.tools.outbound import BlockedUrlError, FetchError, OutboundClient
 from sama.tools.output import untrusted
 from sama.tools.text import UnsupportedContentError, page_text
+
+log = logging.getLogger("sama.tools")
 
 MAX_SEARCH_RESULTS: Final = 10
 MAX_EXTRACT_URLS: Final = 5
@@ -97,14 +100,14 @@ async def extract_one(client: OutboundClient, url: str) -> str:
     """The text of one page, marked as untrusted, or an error line."""
     try:
         result = await client.get(url)
-    except (BlockedUrlError, FetchError) as error:
-        return f"[{url}] error: {error}"
-    if result.status_code >= 400:
-        return f"[{url}] error: the server returned status {result.status_code}"
-    try:
+        if result.status_code >= 400:
+            raise FetchError(f"the server returned status {result.status_code}")
         title, text = page_text(result.content, result.content_type)
-    except UnsupportedContentError as error:
+    except (BlockedUrlError, FetchError, UnsupportedContentError) as error:
         return f"[{url}] error: {error}"
+    except Exception as error:  # one bad page must not fail the other pages of the call
+        log.warning("web_extract failed: error=%s", type(error).__name__)
+        return f"[{url}] error: the page could not be read"
     header = f"Title: {title}\n\n" if title else ""
     note = "\n\n[The page was larger than the size limit. The text ends early.]"
     body = header + text + (note if result.truncated else "")

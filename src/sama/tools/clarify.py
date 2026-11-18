@@ -86,12 +86,10 @@ class ClarifyBroker:
         """Waits for the answers. Returns ``None`` if nobody answers in time or the run is
         cancelled."""
         check_questions(questions)
-        same_session = [
-            o
-            for o in self._open.values()
-            if (o.request.org_id, o.request.session_id) == (claims.org_id, claims.session_id)
-        ]
-        if len(same_session) >= MAX_OPEN_PER_SESSION:
+        # A run waits on one clarify call at a time. A new call means that the client gave up
+        # on the old one (for example after a disconnect), so the old one ends.
+        self.cancel_run(claims.org_id, claims.run_id)
+        if len(self.pending(claims.org_id, claims.session_id)) >= MAX_OPEN_PER_SESSION:
             raise ClarifyError("the session has too many open questions. Wait for the answers.")
         request = ClarifyRequest(
             id=str(uuid.uuid4()),
@@ -114,10 +112,13 @@ class ClarifyBroker:
             self._open.pop(request.id, None)
 
     def pending(self, org_id: str, session_id: str) -> list[ClarifyRequest]:
+        """The requests of the session that still wait for an answer."""
         return [
             o.request
             for o in self._open.values()
-            if o.request.org_id == org_id and o.request.session_id == session_id
+            if o.request.org_id == org_id
+            and o.request.session_id == session_id
+            and not o.answers.done()
         ]
 
     def answer(self, org_id: str, request_id: str, answers: Sequence[str]) -> None:

@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-from sama.tenancy import RunTokenClaims
 from sama.tools.todo import (
     MAX_ITEMS,
     MemoryTodoStore,
@@ -17,17 +16,7 @@ from sama.tools.todo import (
     apply,
     render,
 )
-
-
-def claims(session: str = "sess-1") -> RunTokenClaims:
-    return RunTokenClaims(
-        org_id="org-1",
-        workspace_id="ws-1",
-        session_id=session,
-        run_id="run-1",
-        token_id="t-1",
-        expires_at=2_000_000_000,
-    )
+from tests.support import make_claims
 
 
 def item(id: str, content: str, status: TodoStatus = TodoStatus.PENDING) -> TodoItem:
@@ -100,28 +89,28 @@ def test_render() -> None:
 
 async def test_memory_store_is_scoped_by_session() -> None:
     store = MemoryTodoStore()
-    await store.change(claims(), lambda items: [*items, item("1", "a")])
-    assert await store.read(claims()) == [item("1", "a")]
-    assert await store.read(claims("sess-2")) == []
+    await store.change(make_claims(), lambda items: [*items, item("1", "a")])
+    assert await store.read(make_claims()) == [item("1", "a")]
+    assert await store.read(make_claims(session="sess-2")) == []
 
 
 async def test_memory_store_changes_are_atomic() -> None:
     store = MemoryTodoStore()
 
     async def add(n: int) -> None:
-        await store.change(claims(), lambda items: [*items, item(str(n), "x")])
+        await store.change(make_claims(), lambda items: [*items, item(str(n), "x")])
 
     await asyncio.gather(*(add(n) for n in range(20)))
-    assert len(await store.read(claims())) == 20
+    assert len(await store.read(make_claims())) == 20
 
 
 async def test_a_failed_change_keeps_the_list() -> None:
     store = MemoryTodoStore()
-    await store.change(claims(), lambda items: [item("1", "a")])
+    await store.change(make_claims(), lambda items: [item("1", "a")])
 
     def bad(items: list[TodoItem]) -> list[TodoItem]:
         raise TodoError("no")
 
     with pytest.raises(TodoError):
-        await store.change(claims(), bad)
-    assert await store.read(claims()) == [item("1", "a")]
+        await store.change(make_claims(), bad)
+    assert await store.read(make_claims()) == [item("1", "a")]

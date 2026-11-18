@@ -7,12 +7,16 @@ deliveries) go through ``OutboundClient``. It enforces one URL policy:
 - Every resolved address of the host must be a public unicast address. The client then
   connects to the checked address, so DNS rebinding cannot change the target.
 - Redirects are checked hop by hop, at most ``max_redirects`` hops.
-- Size and time limits apply.
+- Size and time limits apply. The body is read as raw bytes, and a compressed body is refused,
+  so a small response cannot expand past the size limit.
+- No cookies are kept or sent, and no connections are kept, so one request cannot leak state
+  to the next host or tenant.
 """
 
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import ipaddress
 import socket
 from collections.abc import Awaitable, Callable, Sequence
@@ -73,7 +77,10 @@ class FetchResult:
 
 
 def address_problem(address: IPAddress) -> str | None:
-    """Why the address is not allowed, or ``None`` for a public unicast address."""
+    """Why the address is not allowed, or ``None`` for a public unicast address.
+
+    ``is_global`` is false also for unspecified and reserved addresses. Multicast needs its
+    own check, because some multicast ranges are global."""
     candidates: list[IPAddress] = [address]
     if isinstance(address, ipaddress.IPv6Address):
         for embedded in (address.ipv4_mapped, address.sixtofour):
@@ -84,31 +91,38 @@ def address_problem(address: IPAddress) -> str | None:
     if any(candidate in METADATA_ADDRESSES for candidate in candidates):
         return f"{address} is a cloud metadata address"
     for candidate in candidates:
-        if (
-            not candidate.is_global
-            or candidate.is_multicast
-            or candidate.is_unspecified
-            or candidate.is_reserved
-        ):
+        if not candidate.is_global or candidate.is_multicast:
             return f"{address} is not a public address"
     return None
 
 
+def ascii_host(host: str) -> str:
+    """The lower-case IDNA (punycode) form of a host name, without a final dot."""
+    try:
+        raw = httpx.URL(f"https://{host.strip().rstrip('.')}/").raw_host
+    except httpx.InvalidURL:
+        raise ValueError(f"{host!r} is not a valid host name") from None
+    return raw.decode("ascii").lower()
+
+
 def _host_matches(host: str, patterns: Sequence[str]) -> bool:
-    return any(
-        host == p or host.endswith("." + p) for p in (p.lower().strip(".") for p in patterns)
-    )
+    return any(host == p or host.endswith("." + p) for p in patterns)
+
+
+class _NoCookies(http.cookiejar.DefaultCookiePolicy):
+    def set_ok(self, cookie: http.cookiejar.Cookie, request: object) -> bool:
+        return False
+
+    def return_ok(self, cookie: http.cookiejar.Cookie, request: object) -> bool:
+        return False
 
 
 async def system_resolver(host: str, port: int) -> Sequence[IPAddress]:
     infos = await asyncio.get_running_loop().getaddrinfo(
         host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
     )
-    seen: dict[IPAddress, None] = {}
-    for _family, _type, _proto, _name, sockaddr in infos:
-        # An IPv6 address can carry a zone ("fe80::1%eth0"). The zone is never public.
-        seen[ipaddress.ip_address(str(sockaddr[0]).split("%", 1)[0])] = None
-    return list(seen)
+    # An IPv6 address can carry a zone ("fe80::1%eth0"). The zone is never public.
+    return list(dict.fromkeys(ipaddress.ip_address(str(i[4][0]).split("%", 1)[0]) for i in infos))
 
 
 class OutboundClient:
@@ -122,11 +136,17 @@ class OutboundClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.policy = policy or UrlPolicy()
+        self._allow = tuple(ascii_host(h) for h in self.policy.allow_hosts)
+        self._block = tuple(ascii_host(h) for h in self.policy.block_hosts)
         self._resolve = resolver
         self._client = httpx.AsyncClient(
             transport=transport,
             follow_redirects=False,
             trust_env=False,
+            # The client sends requests to IP addresses, so a kept cookie would go to every
+            # host on that address, also for another tenant. Give the jar itself: httpx copies a
+            # ``Cookies`` object into a new jar without the policy.
+            cookies=http.cookiejar.CookieJar(policy=_NoCookies()),
             timeout=httpx.Timeout(self.policy.hop_timeout_s),
             # No kept connections: two hosts on one address must not share a TLS session.
             limits=httpx.Limits(max_keepalive_connections=0),
@@ -146,16 +166,17 @@ class OutboundClient:
             raise BlockedUrlError(f"the scheme must be {' or '.join(schemes)}")
         if parsed.userinfo:
             raise BlockedUrlError("a URL with a user name or a password is not allowed")
-        host = parsed.host.lower().rstrip(".")
+        # The IDNA form, so "bücher.de" and "xn--bcher-kva.de" match the same list entry.
+        host = parsed.raw_host.decode("ascii").lower().rstrip(".")
         if not host:
             raise BlockedUrlError("the URL has no host")
         if host in METADATA_HOSTS:
             raise BlockedUrlError(f"{host} is a cloud metadata host")
         if host == "localhost" or host.endswith(".localhost"):
             raise BlockedUrlError(f"{host} is not a public host")
-        if self.policy.allow_hosts and not _host_matches(host, self.policy.allow_hosts):
+        if self._allow and not _host_matches(host, self._allow):
             raise BlockedUrlError(f"{host} is not in the allow list of the org")
-        if _host_matches(host, self.policy.block_hosts):
+        if _host_matches(host, self._block):
             raise BlockedUrlError(f"{host} is in the block list of the org")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         try:
@@ -195,7 +216,7 @@ class OutboundClient:
     async def _send(self, parsed: httpx.URL, address: IPAddress) -> FetchResult | str:
         """Sends one request to the checked address. Returns the result, or the next URL of a
         redirect."""
-        host = parsed.host
+        host = parsed.raw_host.decode("ascii")
         target = parsed.copy_with(host=str(address))
         headers = {
             "host": parsed.netloc.decode("ascii"),
@@ -215,10 +236,14 @@ class OutboundClient:
                 if not location:
                     raise FetchError(f"{host} sent a redirect without a location")
                 return str(parsed.join(location))
+            encoding = response.headers.get("content-encoding", "identity").strip().lower()
+            if encoding not in ("", "identity"):
+                # The client asks for identity. A compressed body could expand past the limit.
+                raise FetchError(f"{host} sent a compressed body ({encoding})")
             body = bytearray()
             truncated = False
             try:
-                async for chunk in response.aiter_bytes():
+                async for chunk in response.aiter_raw():
                     room = self.policy.max_bytes - len(body)
                     if len(chunk) > room:
                         body += chunk[:room]

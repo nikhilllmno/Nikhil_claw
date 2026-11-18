@@ -61,33 +61,23 @@ def apply(
     ids = [c.id for c in changes]
     if len(ids) != len(set(ids)):
         raise TodoError("each id can be in the list one time only")
-    if not merge:
-        items: list[TodoItem] = []
-        for change in changes:
+    # Without merge, the new list replaces the old list, so every item is new.
+    by_id = {item.id: item for item in current} if merge else {}
+    for change in changes:
+        old = by_id.get(change.id)
+        if old is None:
             if change.content is None:
-                raise TodoError(f"item {change.id} needs content when merge is false")
-            items.append(
-                TodoItem(
-                    id=change.id, content=change.content, status=change.status or TodoStatus.PENDING
-                )
+                raise TodoError(f"item {change.id} is new, so it needs content")
+            by_id[change.id] = TodoItem(
+                id=change.id, content=change.content, status=change.status or TodoStatus.PENDING
             )
-    else:
-        by_id = {item.id: item for item in current}
-        for change in changes:
-            old = by_id.get(change.id)
-            if old is None:
-                if change.content is None:
-                    raise TodoError(f"item {change.id} is new, so it needs content")
-                by_id[change.id] = TodoItem(
-                    id=change.id, content=change.content, status=change.status or TodoStatus.PENDING
-                )
-            else:
-                by_id[change.id] = TodoItem(
-                    id=old.id,
-                    content=change.content if change.content is not None else old.content,
-                    status=change.status or old.status,
-                )
-        items = list(by_id.values())
+        else:
+            by_id[change.id] = TodoItem(
+                id=old.id,
+                content=change.content if change.content is not None else old.content,
+                status=change.status or old.status,
+            )
+    items = list(by_id.values())
     if len(items) > MAX_ITEMS:
         raise TodoError(f"the list can have at most {MAX_ITEMS} items")
     return items

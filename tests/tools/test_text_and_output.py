@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from typing import cast
 
 import pytest
 
-from sama.tenancy import RunTokenClaims
-from sama.tools.output import HEAD_BYTES, MAX_OUTPUT_BYTES, TAIL_BYTES, cap, untrusted
-from sama.tools.text import UnsupportedContentError, charset_of, html_to_text, page_text
-
-CLAIMS = RunTokenClaims(
-    org_id="org-1",
-    workspace_id="ws-1",
-    session_id="sess-1",
-    run_id="run-1",
-    token_id="t-1",
-    expires_at=2_000_000_000,
+from sama.sandbox.base import Sandbox
+from sama.tools.output import (
+    HEAD_BYTES,
+    MAX_OUTPUT_BYTES,
+    TAIL_BYTES,
+    SandboxSpill,
+    cap,
+    untrusted,
 )
+from sama.tools.text import UnsupportedContentError, charset_of, html_to_text, page_text
+from tests.support import RecordingSpill, make_claims
+
+CLAIMS = make_claims()
 
 
 def test_html_to_text_keeps_visible_text_only() -> None:
@@ -64,19 +65,6 @@ def test_untrusted_escapes_the_closing_tag() -> None:
     assert "<\\/ UNTRUSTED_CONTENT>" in wrapped
 
 
-@dataclass
-class RecordingSpill:
-    files: dict[str, bytes] = field(default_factory=dict)
-    fail: bool = False
-
-    async def save(self, claims: RunTokenClaims, name: str, data: bytes) -> str | None:
-        if self.fail:
-            raise OSError("disk full")
-        path = f"/work/.sama/spill/{name}"
-        self.files[path] = data
-        return path
-
-
 async def test_a_small_output_is_not_changed() -> None:
     spill = RecordingSpill()
     text = "x" * MAX_OUTPUT_BYTES
@@ -109,3 +97,35 @@ async def test_the_cut_does_not_split_a_character() -> None:
     capped = await cap("a" + text, tool="t", claims=CLAIMS, spill=None)
     capped.encode("utf-8")
     assert "\ufffd" not in capped
+
+
+def test_a_page_without_a_head_end_tag_keeps_its_body() -> None:
+    # HTML5 lets a page leave out </head>.
+    assert html_to_text("<html><head><title>T</title><body><p>Hello</p>") == ("T", "Hello")
+
+
+class FakeSandbox:
+    workdir = "/work/"
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        self.files[path] = data
+
+
+async def test_the_sandbox_spill_writes_to_the_session_sandbox() -> None:
+    sandbox = FakeSandbox()
+    asked: list[tuple[str, str]] = []
+
+    async def session_sandbox(org_id: str, session_id: str) -> Sandbox | None:
+        asked.append((org_id, session_id))
+        return cast(Sandbox, sandbox) if session_id == "sess-1" else None
+
+    spill = SandboxSpill(session_sandbox)
+    path = await spill.save(CLAIMS, "t-1.txt", b"data")
+    assert path == "/work/.sama/spill/t-1.txt"
+    assert sandbox.files == {path: b"data"}
+    assert asked == [("org-1", "sess-1")]
+    no_sandbox = make_claims(session="sess-2")
+    assert await spill.save(no_sandbox, "t-2.txt", b"data") is None

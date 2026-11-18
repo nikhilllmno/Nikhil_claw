@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-from sama.tenancy import RunTokenClaims
 from sama.tools.clarify import (
     MAX_ANSWER_CHARS,
     MAX_OPEN_PER_SESSION,
@@ -16,20 +15,12 @@ from sama.tools.clarify import (
     ClarifyRequest,
     render_answers,
 )
+from tests.support import make_claims
 
 QUESTION = ClarifyQuestion(question="Which color?", choices=("Red", "Blue"))
 
 
-def claims(run: str = "run-1", org: str = "org-1") -> RunTokenClaims:
-    return RunTokenClaims(
-        org_id=org,
-        workspace_id="ws-1",
-        session_id="sess-1",
-        run_id=run,
-        user_id="user-1",
-        token_id="t-1",
-        expires_at=2_000_000_000,
-    )
+claims = make_claims
 
 
 async def open_request(broker: ClarifyBroker, org: str = "org-1") -> ClarifyRequest:
@@ -129,3 +120,23 @@ def test_render_answers() -> None:
         "The user answered:\n1. Which color?\n   Answer: Blue"
     )
     assert render_answers([QUESTION], None).startswith("The user did not answer.")
+
+
+async def test_a_new_call_of_the_same_run_ends_the_old_call() -> None:
+    broker = ClarifyBroker(wait_s=5)
+    first = asyncio.create_task(broker.ask(claims("run-1"), [QUESTION]))
+    old = await open_request(broker)
+    other_run = asyncio.create_task(broker.ask(claims("run-2"), [QUESTION]))
+    second = asyncio.create_task(broker.ask(claims("run-1"), [QUESTION]))
+    assert await first is None
+    for _ in range(100):
+        if len(broker.pending("org-1", "sess-1")) == 2:
+            break
+        await asyncio.sleep(0)
+    pending = broker.pending("org-1", "sess-1")
+    assert old.id not in {p.id for p in pending}
+    assert sorted(p.run_id for p in pending) == ["run-1", "run-2"]
+    broker.cancel_run("org-1", "run-1")
+    broker.cancel_run("org-1", "run-2")
+    assert await second is None
+    assert await other_run is None

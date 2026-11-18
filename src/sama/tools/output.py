@@ -76,16 +76,12 @@ async def cap(text: str, *, tool: str, claims: RunTokenClaims, spill: Spill | No
     # A cut can split a character. "ignore" drops only the partial character at the cut.
     head = data[:HEAD_BYTES].decode("utf-8", errors="ignore")
     tail = data[-TAIL_BYTES:].decode("utf-8", errors="ignore")
-    if path is not None:
-        note = (
-            f"[The output has {len(data):,} bytes. Only the start and the end are here. "
-            f"The full output is in the file {path}. Read that file to see the rest.]"
-        )
-    else:
-        note = (
-            f"[The output has {len(data):,} bytes. Only the start and the end are here. "
-            "The full output was not kept.]"
-        )
+    rest = (
+        f"The full output is in the file {path}. Read that file to see the rest."
+        if path is not None
+        else "The full output was not kept."
+    )
+    note = f"[The output has {len(data):,} bytes. Only the start and the end are here. {rest}]"
     return f"{head}\n\n{note}\n\n{tail}"
 
 

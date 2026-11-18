@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from typing import cast
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import Table, delete, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -16,6 +18,20 @@ from sama.tools.todo import PostgresTodoStore, TodoError, TodoItem, TodoStatus
 from tests.db.world import World
 
 pytestmark = pytest.mark.usefixtures("world")
+
+
+@pytest.fixture(autouse=True)
+async def keep_the_seeded_todos(engine: AsyncEngine) -> AsyncIterator[None]:
+    """The tests change rows of the shared seed. Other test files (for example the RLS tests)
+    expect the seeded rows, so each test puts them back."""
+    table = cast(Table, SessionTodo.__table__)
+    async with engine.connect() as connection:
+        rows = [dict(r) for r in (await connection.execute(select(table))).mappings()]
+    yield
+    async with engine.begin() as connection:
+        await connection.execute(delete(table))
+        if rows:
+            await connection.execute(insert(table), rows)
 
 
 def claims(world: World, session: str, run: str | None = None) -> RunTokenClaims:
@@ -89,3 +105,12 @@ async def test_a_session_of_another_workspace_is_refused(engine: AsyncEngine, wo
         )
     with pytest.raises(IntegrityError):
         await store.change(wrong, lambda items: [])
+
+
+async def test_the_seeded_rows_are_back(engine: AsyncEngine, world: World) -> None:
+    """Runs after the tests that change the seed (pytest keeps the file order)."""
+    async with engine.connect() as connection:
+        sessions = {
+            str(r.session_id) for r in await connection.execute(select(SessionTodo.session_id))
+        }
+    assert str(world.ids["a2-shared"]) in sessions

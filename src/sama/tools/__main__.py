@@ -23,7 +23,7 @@ from pydantic import SecretStr
 from starlette.applications import Starlette
 
 from sama.tenancy.run_token import RunTokenSigner
-from sama.tools.server import ToolServer
+from sama.tools.server import ToolServer, quiet_dependency_logs
 from sama.tools.todo import MemoryTodoStore, PostgresTodoStore, TodoStore
 from sama.tools.web import BraveSearch
 
@@ -46,8 +46,10 @@ def build_app(store_kind: str) -> Starlette:
         log.warning("the task lists are in memory only")
         todos = MemoryTodoStore()
     brave_key = os.environ.get("BRAVE_API_KEY", "")
-    search = BraveSearch(SecretStr(brave_key)) if brave_key else None
-    if search is None:
+    search = None
+    if brave_key:
+        search = BraveSearch(SecretStr(brave_key))
+    else:
         log.warning("BRAVE_API_KEY is not set, so web_search is hidden")
     server = ToolServer(signer=RunTokenSigner(key.encode()), todos=todos, search=search)
     return server.app()
@@ -60,6 +62,7 @@ def main() -> None:
     parser.add_argument("--store", choices=("memory", "postgres"), default="memory")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
+    quiet_dependency_logs()
     uvicorn.run(build_app(args.store), host=args.host, port=args.port)
 
 

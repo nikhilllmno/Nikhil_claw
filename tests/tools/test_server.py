@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import secrets
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
@@ -20,8 +21,9 @@ from sama.tenancy import RunTokenSigner
 from sama.tools import ClarifyBroker, MemoryTodoStore, OutboundClient, SearchHit, ToolServer
 from sama.tools.outbound import IPAddress
 from sama.tools.output import MAX_OUTPUT_BYTES
+from sama.tools.server import MAX_ERROR_CHARS, quiet_dependency_logs
 from tests.conformance.scripted_model import serve
-from tests.support import make_scope
+from tests.support import RecordingSpill, make_scope, wire_transport
 
 
 @dataclass
@@ -35,23 +37,13 @@ class FakeSearch:
 
 
 @dataclass
-class FakeSpill:
-    files: dict[str, bytes] = field(default_factory=dict)
-
-    async def save(self, claims: object, name: str, data: bytes) -> str | None:
-        path = f"/work/.sama/spill/{name}"
-        self.files[path] = data
-        return path
-
-
-@dataclass
 class World:
     url: str
     signer: RunTokenSigner
     todos: MemoryTodoStore
     search: FakeSearch
     broker: ClarifyBroker
-    spill: FakeSpill
+    spill: RecordingSpill
 
     def token(self, run_id: str = "run-1", *, session: str = "sess-1") -> str:
         scope = make_scope(run_id).model_copy(update={"session_id": session})
@@ -62,7 +54,7 @@ def _no_network() -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, headers={"content-type": "text/plain"}, text="x" * 70_000)
 
-    return httpx.MockTransport(handler)
+    return wire_transport(handler)
 
 
 async def _public(host: str, port: int) -> Sequence[IPAddress]:
@@ -75,7 +67,7 @@ def world() -> Iterator[World]:
     todos = MemoryTodoStore()
     search = FakeSearch([SearchHit(title="Sama", url="https://sama.example", snippet="An agent")])
     broker = ClarifyBroker(wait_s=5)
-    spill = FakeSpill()
+    spill = RecordingSpill()
     server = ToolServer(
         signer=signer,
         todos=todos,
@@ -238,3 +230,73 @@ async def test_clarify_refuses_a_single_choice(world: World) -> None:
         )
     assert result.is_error
     assert "2 or more choices" in text_of(result)
+
+
+async def test_a_long_argument_error_is_cut(world: World) -> None:
+    bad = [{"id": "x" * 500, "content": "y" * 500, "status": "nope"}] * 100
+    async with connect(world.url, world.token()) as client:
+        result = await client.call_tool("todo", {"todos": bad})
+    assert result.is_error
+    text = text_of(result)
+    assert len(text) <= MAX_ERROR_CHARS + len(" [cut]")
+    assert text.endswith(" [cut]")
+
+
+async def test_a_disconnect_ends_a_waiting_clarify_call(world: World) -> None:
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "clarify",
+            "arguments": {"questions": [{"question": "Which?", "choices": ["A", "B"]}]},
+        },
+    }
+    headers = {
+        "authorization": f"Bearer {world.token()}",
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+    }
+
+    async def post() -> None:
+        async with httpx.AsyncClient(timeout=30) as http:
+            await http.post(world.url, headers=headers, json=call)
+
+    posting = asyncio.create_task(post())
+    for _ in range(200):
+        if world.broker.pending("org-1", "sess-1"):
+            break
+        await asyncio.sleep(0.02)
+    assert world.broker.pending("org-1", "sess-1")
+    posting.cancel()
+    for _ in range(200):
+        if not world.broker.pending("org-1", "sess-1"):
+            break
+        await asyncio.sleep(0.02)
+    assert world.broker.pending("org-1", "sess-1") == []
+
+
+def test_dependency_logs_keep_only_warnings() -> None:
+    names = ("httpx", "httpcore", "mcp")
+    before = {n: logging.getLogger(n).level for n in names}
+    try:
+        quiet_dependency_logs()
+        for name in names:
+            assert not logging.getLogger(name).isEnabledFor(logging.INFO)
+            assert logging.getLogger(name + ".child").getEffectiveLevel() == logging.WARNING
+    finally:
+        for name, level in before.items():
+            logging.getLogger(name).setLevel(level)
+
+
+async def test_the_tool_log_has_no_arguments(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="sama.tools")
+    async with connect(world.url, world.token()) as client:
+        await client.call_tool("web_search", {"query": "private words", "limit": 2})
+        await client.call_tool("todo", {"todos": [{"id": "secret-id"}]})
+    lines = [r.getMessage() for r in caplog.records if r.name == "sama.tools"]
+    assert any("tool=web_search" in line and "ok=True" in line for line in lines)
+    assert any("tool=todo" in line and "ok=False" in line for line in lines)
+    assert not any("private words" in line or "secret-id" in line for line in lines)

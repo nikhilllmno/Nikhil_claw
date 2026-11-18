@@ -1254,9 +1254,15 @@ policy for all of them:
 - Redirects are not followed by the HTTP library. The client checks each `Location` as a new
   URL, at most 5 hops.
 - Limits: 5 MB of response body, 10 seconds for each hop, and 20 seconds for all hops. The
-  client asks for no compression and ignores proxy variables of the environment.
+  client asks for no compression and ignores proxy variables of the environment. It reads the
+  body as raw bytes and refuses a body with a `Content-Encoding` other than `identity`, so a
+  small compressed body cannot expand past the size limit.
+- The client keeps no cookies and sends no cookies. It sends requests to IP addresses, so a
+  kept cookie could go to another host on the same address, also for another tenant.
 - `allow_hosts` (only these hosts and their subdomains) and `block_hosts` are the org lists.
-  They apply to every hop. The org settings that fill them come with the vault (M1.17).
+  They apply to every hop. The client compares host names in their IDNA (punycode) form, in
+  lower case, without a final dot. So `bücher.de` and `xn--bcher-kva.de` match the same entry.
+  The org settings that fill the lists come with the vault (M1.17).
 
 ### 16.5 Untrusted content
 
@@ -1376,7 +1382,8 @@ without a valid run token gets `401` before MCP reads it. Each tool call takes t
 scope (org, workspace, session, run, user) from the token, never from its arguments. So the
 server acts as one server per run: the token selects the run. The token is the only guard,
 so the MCP check of the `Host` header (DNS rebinding) is off: a browser cannot add the token.
-`GET /healthz` returns `ok`.
+`GET /healthz` returns `ok`. If the client disconnects before the answer, the server cancels
+the tool call. So a `clarify` call that nobody waits for ends.
 
 **Tools in M1.8.**
 
@@ -1396,11 +1403,16 @@ goes to a file in the session sandbox, `.sama/spill/<tool>-<id>.txt` under the w
 tool returns the first 30,000 bytes, a note with the size and the path, and the last 10,000
 bytes. The agent reads the file with its native file tools. If the session has no sandbox or
 the write fails, the note says that the full output was not kept. The spill uses
-`SandboxedRuntime.session_sandbox`.
+`SandboxedRuntime.session_sandbox`. Error results do not spill. The MCP SDK makes some errors
+itself, for example for arguments that are not valid. The server cuts each error text to
+2,000 characters.
 
 **Clarify broker.** `ClarifyBroker` keeps the open questions in memory. The API (M1.12) and the
 channels (M1.13) list them with `pending(org_id, session_id)` and answer them with
-`answer(request_id, answers)`. A cancel of the run or a timeout ends the wait. The broker is in
+`answer(request_id, answers)`. A cancel of the run or a timeout ends the wait. A run waits on
+one `clarify` call at a time: a new call of the same run ends the open call of that run, and
+the old call returns "no answer". When a run ends, the orchestrator calls
+`cancel_run(org_id, run_id)` (M1.10). At most 5 questions of one session can be open. The broker is in
 the process of the tool server, so the API must run in the same process until the run queue
 (M1.10) moves the questions to Postgres. In unattended runs the tool gate (M1.9) denies
 `clarify`.
@@ -1413,7 +1425,9 @@ item. RLS follows the session, as for `model_calls`. Until the run queue writes 
 
 **Audit.** The server logs each tool call with the org, session, run, tool, result size, and
 time (`sama.tools`). Arguments and results are not in the log, because they can contain
-personal data. The audit log rows come with the tool gate (M1.9).
+personal data. An unexpected error in `web_extract` logs only the error type. The HTTPX and
+MCP SDK loggers log full URLs and error texts at `INFO`, so `python -m sama.tools` keeps only
+their warnings. The audit log rows come with the tool gate (M1.9).
 
 **Not in M1.8.** The tool gate checks toolsets and policy in M1.9. Until then the server lists
 every tool that it can serve. The Claude adapter does not yet map the native `TodoWrite` tool

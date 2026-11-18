@@ -11,6 +11,7 @@ from pydantic import SecretStr
 
 from sama.tools.outbound import IPAddress, OutboundClient
 from sama.tools.web import BRAVE_URL, BraveSearch, SearchError, SearchHit, extract, format_hits
+from tests.support import wire_transport
 
 
 def brave(handler: Callable[[httpx.Request], httpx.Response]) -> BraveSearch:
@@ -97,24 +98,56 @@ async def test_extract_reports_each_url() -> None:
                 )
             case "missing.test":
                 return httpx.Response(404)
+            case "idna.test":
+                # "idna" is a codec, but not a text charset. It raises UnicodeError.
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/plain; charset=idna"},
+                    content=b"caf\xc3\xa9",
+                )
             case _:
                 return httpx.Response(200, headers={"content-type": "image/png"}, content=b"\x89")
 
-    client = OutboundClient(resolver=_resolve, transport=httpx.MockTransport(handler))
+    client = OutboundClient(resolver=_resolve, transport=wire_transport(handler))
     text = await extract(
         client,
         [
             "https://page.test/",
+            "https://idna.test/",
             "https://missing.test/",
             "https://image.test/",
             "https://private.test/",
         ],
     )
-    parts = text.split("\n\n[")
-    assert parts[0] == (
+    assert text.startswith(
         '<untrusted_content source="web_extract" url="https://page.test/">\n'
-        "Title: T\n\nBody\n</untrusted_content>"
+        "Title: T\n\nBody\n</untrusted_content>\n\n"
+        '<untrusted_content source="web_extract" url="https://idna.test/">\ncafé\n'
+        "</untrusted_content>\n\n"
     )
     assert "[https://missing.test/] error: the server returned status 404" in text
     assert "[https://image.test/] error: the content type image/png is not supported" in text
     assert "[https://private.test/] error: private.test resolves to 10.0.0.1" in text
+
+
+async def test_an_unexpected_error_fails_only_its_own_url(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def page_text(content: bytes, content_type: str) -> tuple[str, str]:
+        if content == b"bad":
+            raise RuntimeError("secret detail")
+        return "", content.decode()
+
+    monkeypatch.setattr("sama.tools.web.page_text", page_text)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b"bad" if request.headers["host"] == "bad.test" else b"good"
+        return httpx.Response(200, headers={"content-type": "text/plain"}, content=body)
+
+    client = OutboundClient(resolver=_resolve, transport=wire_transport(handler))
+    text = await extract(client, ["https://good.test/", "https://bad.test/"])
+    assert "\ngood\n" in text
+    assert "[https://bad.test/] error: the page could not be read" in text
+    assert "secret detail" not in text
+    assert "secret detail" not in caplog.text
+    assert "error=RuntimeError" in caplog.text

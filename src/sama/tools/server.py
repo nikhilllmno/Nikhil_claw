@@ -2,7 +2,8 @@
 
 One streamable HTTP endpoint, ``/mcp``, for every run. The run token in the ``Authorization``
 header selects the run: each tool call takes the tenant scope from the token, never from its
-arguments. A request without a valid run token gets ``401`` before MCP reads it.
+arguments. A request without a valid run token gets ``401`` before MCP reads it. If the client
+goes away before the answer, the tool call is cancelled.
 """
 
 from __future__ import annotations
@@ -10,25 +11,33 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Annotated, Any, Final
 
+import anyio
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp_types import ToolAnnotations
+from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
-from sama.tools.clarify import ClarifyBroker, ClarifyError, ClarifyQuestion, render_answers
+from sama.tools.clarify import (
+    MAX_QUESTIONS,
+    ClarifyBroker,
+    ClarifyError,
+    ClarifyQuestion,
+    render_answers,
+)
 from sama.tools.outbound import OutboundClient
 from sama.tools.output import Spill, cap
-from sama.tools.todo import TodoChange, TodoError, TodoStore, apply, render
+from sama.tools.todo import MAX_ITEMS, TodoChange, TodoError, TodoStore, apply, render
 from sama.tools.web import (
     MAX_EXTRACT_URLS,
     MAX_SEARCH_RESULTS,
@@ -48,16 +57,55 @@ WEB_EXTRACT: Final = "web_extract"
 CLARIFY: Final = "clarify"
 TODO: Final = "todo"
 
+MAX_ERROR_CHARS: Final = 2_000
+"""An error result is cut to this length. Argument errors of the SDK can be long."""
+
 _EXPECTED = (ClarifyError, SearchError, TodoError)
+_NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
 
 
-def bearer_of(headers: Any) -> str | None:
+def bearer_of(headers: Mapping[str, str] | None) -> str | None:
     """The bearer token of an ``Authorization`` header, or ``None``."""
-    header = str(headers.get("authorization", "")) if headers is not None else ""
-    scheme, _, token = header.partition(" ")
+    scheme, _, token = (headers or {}).get("authorization", "").partition(" ")
     if scheme.lower() != "bearer":
         return None
     return token.strip() or None
+
+
+def verify_bearer(signer: RunTokenSigner, headers: Mapping[str, str] | None) -> RunTokenClaims:
+    """The claims of the bearer run token. Raises ``InvalidRunTokenError``."""
+    token = bearer_of(headers)
+    if token is None:
+        raise InvalidRunTokenError("the request has no run token")
+    return signer.verify(token)
+
+
+def quiet_dependency_logs() -> None:
+    """HTTPX logs full URLs (search queries and page URLs), and the MCP SDK logs tool error
+    messages. Both can hold user data, so the server keeps only their warnings."""
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+async def _cap_errors(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
+    """Cuts long error results, which ``cap`` does not see, for example argument errors."""
+    result = await call_next(ctx)
+    if ctx.method != "tools/call":
+        return result
+    # The SDK gives the result in the wire form (a dict). The model form is cut too.
+    if isinstance(result, CallToolResult) and result.is_error:
+        for item in result.content:
+            if isinstance(item, TextContent):
+                item.text = _cut(item.text)
+    elif isinstance(result, dict) and result.get("isError") is True:
+        for item in result.get("content") or ():
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                item["text"] = _cut(item["text"])
+    return result
+
+
+def _cut(text: str) -> str:
+    return text if len(text) <= MAX_ERROR_CHARS else text[:MAX_ERROR_CHARS] + " [cut]"
 
 
 class ToolServer:
@@ -95,11 +143,8 @@ class ToolServer:
     # -- tools ------------------------------------------------------------------------------
 
     def claims(self, ctx: Context) -> RunTokenClaims:
-        token = bearer_of(ctx.headers)
-        if token is None:
-            raise ToolError("the request has no run token")
         try:
-            return self.signer.verify(token)
+            return verify_bearer(self.signer, ctx.headers)
         except InvalidRunTokenError as error:
             raise ToolError(str(error)) from None
 
@@ -130,7 +175,7 @@ class ToolServer:
             )
 
     def mcp(self) -> MCPServer:
-        server: MCPServer = MCPServer(SERVER_NAME)
+        server: MCPServer = MCPServer(SERVER_NAME, middleware=[_cap_errors])
         web = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 
         if self.search is not None:
@@ -190,7 +235,9 @@ class ToolServer:
                 structured_output=False,
             )
             async def clarify(
-                questions: Annotated[list[ClarifyQuestion], Field(min_length=1, max_length=5)],
+                questions: Annotated[
+                    list[ClarifyQuestion], Field(min_length=1, max_length=MAX_QUESTIONS)
+                ],
                 ctx: Context,
             ) -> str:
                 async def body(claims: RunTokenClaims) -> str:
@@ -212,16 +259,17 @@ class ToolServer:
         )
         async def todo(
             ctx: Context,
-            todos: Annotated[list[TodoChange] | None, Field(max_length=100)] = None,
+            todos: Annotated[list[TodoChange] | None, Field(max_length=MAX_ITEMS)] = None,
             merge: bool = False,
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
                 if todos is None:
                     return render(await self.todos.read(claims))
-                items = await self.todos.change(
-                    claims, lambda current: apply(current, todos, merge=merge)
+                return render(
+                    await self.todos.change(
+                        claims, lambda current: apply(current, todos, merge=merge)
+                    )
                 )
-                return render(items)
 
             return await self._call(ctx, TODO, body)
 
@@ -260,27 +308,57 @@ class ToolServer:
 
 
 class _RunTokenGate:
-    """Refuses HTTP requests without a valid run token, before MCP reads them."""
+    """Refuses HTTP requests without a valid run token, before MCP reads them. Cancels the
+    request when the client disconnects, so a waiting tool call (for example ``clarify``)
+    ends."""
 
     def __init__(self, app: ASGIApp, signer: RunTokenSigner) -> None:
         self.app = app
         self.signer = signer
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            token = bearer_of(Request(scope).headers)
-            problem = "the request has no run token" if token is None else None
-            if token is not None:
-                try:
-                    self.signer.verify(token)
-                except InvalidRunTokenError as error:
-                    problem = str(error)
-            if problem is not None:
-                response = JSONResponse(
-                    {"error": problem},
-                    status_code=401,
-                    headers={"www-authenticate": 'Bearer realm="sama"'},
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            verify_bearer(self.signer, Request(scope).headers)
+        except InvalidRunTokenError as error:
+            response = JSONResponse(
+                {"error": str(error)},
+                status_code=401,
+                headers={"www-authenticate": 'Bearer realm="sama"'},
+            )
+            await response(scope, receive, send)
+            return
+        await _cancel_on_disconnect(self.app, scope, receive, send)
+
+
+async def _cancel_on_disconnect(app: ASGIApp, scope: Scope, receive: Receive, send: Send) -> None:
+    """Runs ``app``. After the app has read the request body, a watcher reads ``receive`` and
+    cancels the app when the client disconnects."""
+    body_read = anyio.Event()
+    disconnected = anyio.Event()
+
+    async def app_receive() -> Message:
+        if body_read.is_set():
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            disconnected.set()
+        elif not message.get("more_body", False):
+            body_read.set()
+        return message
+
+    async with anyio.create_task_group() as tasks:
+
+        async def watch() -> None:
+            await body_read.wait()
+            while (await receive())["type"] != "http.disconnect":
+                pass
+            disconnected.set()
+            tasks.cancel_scope.cancel()
+
+        tasks.start_soon(watch)
+        await app(scope, app_receive, send)
+        tasks.cancel_scope.cancel()
