@@ -334,6 +334,8 @@ class ToolCall(Base):
     call_id: Mapped[str] = mapped_column(Text, nullable=False)
     tool_name: Mapped[str] = mapped_column(Text, nullable=False)
     arguments: Mapped[dict[str, Any]] = _json()
+    # The digest of the full arguments. The gate binds a call id to one tool and one digest.
+    arguments_digest: Mapped[str | None] = mapped_column(Text)
     decision: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="started")
     result_preview: Mapped[str | None] = mapped_column(Text)

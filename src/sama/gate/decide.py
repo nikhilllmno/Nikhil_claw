@@ -16,7 +16,6 @@ from typing import Any, Final, Literal
 from sama.gate.hardline import hardline_problem
 
 Action = Literal["allow", "ask", "deny"]
-ACTIONS: Final = ("allow", "ask", "deny")
 
 SAMA_MCP_PREFIX: Final = "mcp__sama__"
 """The Claude CLI names a tool of the sama MCP server ``mcp__sama__<tool>``."""

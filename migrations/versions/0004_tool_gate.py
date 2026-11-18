@@ -33,6 +33,7 @@ def upgrade() -> None:
         "runs",
         sa.Column("unattended", sa.Boolean(), server_default=sa.false(), nullable=False),
     )
+    op.add_column("tool_calls", sa.Column("arguments_digest", sa.Text(), nullable=True))
     op.create_table(
         "approvals",
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
@@ -159,4 +160,5 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("tool_policies")
     op.drop_table("approvals")
+    op.drop_column("tool_calls", "arguments_digest")
     op.drop_column("runs", "unattended")

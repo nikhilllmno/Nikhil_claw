@@ -6,6 +6,7 @@ the shared seed of the RLS tests reads.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -335,6 +336,55 @@ def test_large_arguments_are_cut() -> None:
     cut = stored_arguments({"text": "x" * (MAX_STORED_ARGUMENT_CHARS + 10)})
     assert cut["_cut"] is True
     assert len(cut["preview"]) <= MAX_STORED_ARGUMENT_CHARS
+
+
+async def call_row(engine: AsyncEngine, org: Org1, call_id: str) -> Any:
+    async with engine.connect() as connection:
+        return (
+            await connection.execute(
+                select(ToolCall).where(
+                    ToolCall.run_id == org.ids["run"], ToolCall.call_id == call_id
+                )
+            )
+        ).one()
+
+
+async def test_a_call_id_is_bound_to_one_call(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    first = await gate.check(org.claims(), "c1", "Read", {"file_path": "a.txt"})
+    again = await gate.check(org.claims(), "c1", "Read", {"file_path": "a.txt"})
+    assert first.action == again.action == "allow"
+    other = await gate.check(org.claims(), "c1", "Read", {"file_path": "b.txt"})
+    assert (other.action, other.step) == ("deny", GateStep.RECORDED)
+    tool = await gate.check(org.claims(), "c1", "Glob", {"file_path": "a.txt"})
+    assert tool.action == "deny"
+    row = await call_row(engine, org, "c1")
+    assert (row.tool_name, row.arguments, row.decision, row.status) == (
+        "Read",
+        {"file_path": "a.txt"},
+        "allow",
+        "started",
+    )
+    assert row.arguments_digest == arguments_digest({"file_path": "a.txt"})
+    actions = [details["action"] for _, _, details in await audit(engine, org)]
+    assert actions == ["allow", "allow", "deny", "deny"]
+
+
+async def test_concurrent_first_checks_of_one_call_id_are_in_a_sequence(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    deploy = {"command": "make deploy"}
+    verdicts = await asyncio.gather(
+        *(gate.check(org.claims(), "c1", "Bash", ARGS if i % 2 else deploy) for i in range(6))
+    )
+    assert sorted(v.action for v in verdicts).count("ask") == 3
+    assert sorted(v.action for v in verdicts).count("deny") == 3
+    row = await approval(engine, org, "c1")
+    winner = ARGS if row.arguments_digest == arguments_digest(ARGS) else deploy
+    for i, verdict in enumerate(verdicts):
+        expected = "ask" if (ARGS if i % 2 else deploy) == winner else "deny"
+        assert verdict.action == expected
 
 
 # -- approvals --------------------------------------------------------------------------------

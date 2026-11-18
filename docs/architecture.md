@@ -1150,8 +1150,10 @@ Flow:
 
 1. The `PreToolUse` hook of the runner calls `RemoteGate.check` with the tool use id.
 2. The tool server checks the run token and calls `GateService.check`.
-3. `GateService` loads the run, its profile, the policy rules, and the approval of this call
-   id in one transaction. It records the verdict and returns it.
+3. `GateService` loads the run, its profile, the policy rules, the tool call row, and the
+   approval of this call id in one transaction. It records the verdict and returns it. A
+   transaction-level advisory lock on the run and the call id puts concurrent checks of one
+   call id in a sequence, so only one of them creates the approval.
 4. On `ask`, the adapter pauses the run (Section 5.3). The approval row already exists.
 
 If the control plane does not answer, or `GateService` fails, the call gets `deny`. Without
@@ -1170,10 +1172,17 @@ Rules of the steps:
 - **Hardline.** Recursive deletes of `/`, `~`, `$HOME`, or a top-level system folder;
   `--no-preserve-root`; fork bombs; `mkfs`, `wipefs`, `blkdiscard`; `dd`, `shred`, or `>` to
   a disk device; a remote script piped to a root shell; and recursive `chmod`, `chown`, or
-  `chgrp` of `/`. The list is a guard against accidents, not a sandbox. The sandbox is the
-  real boundary (Section 16.2).
-- **Recorded decision.** An approval holds the tool name and a SHA-256 digest of the
-  arguments (canonical JSON). If the call does not match, it gets `deny`. `approved` gives
+  `chgrp` of `/`. A delete target is normalized first, so `/etc/../usr` is `/usr`. A
+  command longer than 32,000 characters is on the list too. Each pattern has bounded gaps, so
+  the check takes linear time: it runs in the event loop of the tool server for all orgs. The
+  list is a guard against accidents, not a sandbox. The sandbox is the real boundary
+  (Section 16.2).
+- **Call identity.** The first check of a call id binds the id to the tool name and the
+  SHA-256 digest of the arguments (canonical JSON) in `tool_calls`. A later check of the
+  same id with another tool or other arguments gets `deny` and does not change the row. A
+  retry of the same call gets a verdict again.
+- **Recorded decision.** An approval holds the tool name and the digest of the arguments.
+  If the call does not match, it gets `deny`. `approved` gives
   `allow`. `rejected` and `expired` give `deny`. `pending` gives `ask`.
 - **Policy.** `tool_policies` rows have a level: org (no profile, no user), profile, or user.
   The user is the user who started the run, else the user of the run token. A rule matches an
@@ -1188,7 +1197,8 @@ Rules of the steps:
 
 Records, all in the transaction of the verdict:
 
-- `tool_calls`: one row per call id, with `decision` and `status` (`started` or `denied`).
+- `tool_calls`: one row per call id, with the tool name, the arguments, `arguments_digest`
+  (migration `0004`), `decision`, and `status` (`started` or `denied`).
 - `approvals` (migration `0004`): one row per `ask`, keyed by `(run_id, call_id)`. The
   approval id is the tool use id. Columns: the tool name, the arguments (cut at 8,000
   characters), the digest, the reason, the status, `expires_at`, and the decider. RLS follows

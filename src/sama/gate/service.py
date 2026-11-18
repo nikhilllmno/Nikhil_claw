@@ -3,6 +3,11 @@
 ``GateService`` loads the gate context of a run from Postgres, calls ``decide``, and records
 each verdict: a ``tool_calls`` row, an ``audit_log`` row, and for ``ask`` an ``approvals`` row.
 It also records human decisions and times out open approvals.
+
+A call id is bound to one tool name and one arguments digest: the first check writes them to
+the ``tool_calls`` row. A later check of the same call id with another tool or other arguments
+gets ``deny`` and does not change the row. A transaction-level advisory lock on the run and the
+call id puts concurrent checks of one call id in a sequence.
 """
 
 from __future__ import annotations
@@ -71,11 +76,18 @@ class _Ref:
 
 
 @dataclass(frozen=True, slots=True)
+class _Call:
+    """The identity of a recorded tool call."""
+
+    tool_name: str
+    arguments_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _Run:
     ref: _Ref
-    profile_id: uuid.UUID
-    user_id: uuid.UUID | None
     context: GateContext
+    call: _Call | None = None
 
 
 def _utcnow() -> datetime:
@@ -120,13 +132,20 @@ class GateService:
         if not call_id:
             return Verdict("deny", GateStep.TOOLSET, "the tool call has no id")
         name = canonical_name(tool_name)
+        digest = arguments_digest(arguments)
         async with self._engine.begin() as connection:
-            run = await self._load(connection, claims, name, call_id)
+            run = await self._load(connection, claims, call_id)
             if run is None:
                 log.warning("gate: unknown run org=%s run=%s", claims.org_id, claims.run_id)
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown")
-            verdict = decide(run.context, name, arguments)
-            await self._record(connection, run, call_id, name, arguments, verdict)
+            if run.call is not None and run.call != _Call(name, digest):
+                verdict = Verdict("deny", GateStep.RECORDED, "the call id belongs to another call")
+                await self._audit(
+                    connection, run.ref, "tool_gate.verdict", call_id, _details(name, verdict)
+                )
+            else:
+                verdict = decide(run.context, name, arguments)
+                await self._record(connection, run, call_id, name, arguments, digest, verdict)
         log.info(
             "gate org=%s run=%s call=%s tool=%s action=%s step=%s",
             claims.org_id,
@@ -145,7 +164,7 @@ class GateService:
         ``deny``. A ``deny`` is in the audit log."""
         name = canonical_name(tool_name)
         async with self._engine.begin() as connection:
-            run = await self._load(connection, claims, name, None)
+            run = await self._load(connection, claims, None)
             if run is None:
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown")
             verdict = decide(run.context, name, arguments)
@@ -159,7 +178,6 @@ class GateService:
         self,
         connection: AsyncConnection,
         claims: RunTokenClaims,
-        name: str,
         call_id: str | None,
     ) -> _Run | None:
         try:
@@ -171,6 +189,11 @@ class GateService:
             )
         except ValueError:
             return None
+        if call_id:
+            key = f"sama.gate:{run_id}:{call_id}"
+            await connection.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(key, 0)))
+            )
         row = (
             await connection.execute(
                 select(
@@ -200,18 +223,27 @@ class GateService:
         if user_id is None and claims.user_id:
             user_id = uuid.UUID(claims.user_id)
         toolsets = row.toolsets if isinstance(row.toolsets, list) else []
+        ref = _Ref(org_id, workspace_id, session_id, run_id)
         context = GateContext(
             toolsets=frozenset(str(item) for item in toolsets),
             rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
             unattended=bool(row.unattended),
-            recorded=(
-                await self._recorded(connection, org_id, workspace_id, run_id, call_id)
-                if call_id
-                else None
-            ),
+            recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
         )
-        ref = _Ref(org_id, workspace_id, session_id, run_id)
-        return _Run(ref, row.agent_profile_id, user_id, context)
+        call = None
+        if call_id:
+            found = (
+                await connection.execute(
+                    select(ToolCall.tool_name, ToolCall.arguments_digest).where(
+                        ToolCall.org_id == org_id,
+                        ToolCall.run_id == run_id,
+                        ToolCall.call_id == call_id,
+                    )
+                )
+            ).one_or_none()
+            if found is not None:
+                call = _Call(found.tool_name, found.arguments_digest)
+        return _Run(ref, context, call)
 
     async def _rules(
         self,
@@ -249,24 +281,21 @@ class GateService:
     async def _recorded(
         self,
         connection: AsyncConnection,
-        org_id: uuid.UUID,
-        workspace_id: uuid.UUID,
-        run_id: uuid.UUID,
+        ref: _Ref,
         call_id: str,
     ) -> Recorded | None:
         row = (
             await connection.execute(
                 select(
                     Approval.id,
-                    Approval.session_id,
                     Approval.status,
                     Approval.tool_name,
                     Approval.arguments_digest,
                     Approval.expires_at,
                 )
                 .where(
-                    Approval.org_id == org_id,
-                    Approval.run_id == run_id,
+                    Approval.org_id == ref.org_id,
+                    Approval.run_id == ref.run_id,
                     Approval.call_id == call_id,
                 )
                 .with_for_update()
@@ -277,7 +306,7 @@ class GateService:
         status = row.status
         if status == "pending" and row.expires_at <= self._clock():
             status = "expired"
-            await self._expire_one(connection, row.id, org_id, workspace_id, run_id, call_id)
+            await self._expire_one(connection, row.id, ref, call_id)
         return Recorded(
             status=cast(Literal["pending", "approved", "rejected", "expired"], status),
             tool_name=row.tool_name,
@@ -291,6 +320,7 @@ class GateService:
         call_id: str,
         name: str,
         arguments: Mapping[str, Any],
+        digest: str,
         verdict: Verdict,
     ) -> None:
         ref = run.ref
@@ -303,6 +333,7 @@ class GateService:
             call_id=call_id,
             tool_name=name,
             arguments=stored,
+            arguments_digest=digest,
             decision=verdict.action,
             status=status,
         )
@@ -324,7 +355,7 @@ class GateService:
                     call_id=call_id,
                     tool_name=name,
                     arguments=stored,
-                    arguments_digest=arguments_digest(arguments),
+                    arguments_digest=digest,
                     reason=verdict.reason,
                     created_at=now,
                     expires_at=now + self._ttl,
@@ -398,9 +429,7 @@ class GateService:
             now = self._clock()
             run = _Ref(org_id, row.workspace_id, row.session_id, run_id)
             if row.expires_at <= now:
-                await self._expire_one(
-                    connection, row.id, org_id, row.workspace_id, run_id, call_id
-                )
+                await self._expire_one(connection, row.id, run, call_id)
             else:
                 status = "approved" if approve else "rejected"
                 await connection.execute(
@@ -499,21 +528,22 @@ class GateService:
             rows = (
                 await connection.execute(
                     update(Approval)
-                    .where(Approval.id.in_(due))
+                    .where(
+                        Approval.id.in_(due),
+                        Session.org_id == Approval.org_id,
+                        Session.id == Approval.session_id,
+                    )
                     .values(status="expired", decided_at=now)
                     .returning(
-                        Approval.org_id, Approval.session_id, Approval.run_id, Approval.call_id
+                        Approval.org_id,
+                        Session.workspace_id,
+                        Approval.session_id,
+                        Approval.run_id,
+                        Approval.call_id,
                     )
                 )
             ).all()
-            for org_id, session_id, run_id, call_id in rows:
-                workspace_id = (
-                    await connection.execute(
-                        select(Session.workspace_id).where(
-                            Session.org_id == org_id, Session.id == session_id
-                        )
-                    )
-                ).scalar_one()
+            for org_id, workspace_id, session_id, run_id, call_id in rows:
                 ref = _Ref(org_id, workspace_id, session_id, run_id)
                 await self._audit(connection, ref, "approval.expired", call_id, {})
         return len(rows)
@@ -522,22 +552,16 @@ class GateService:
         self,
         connection: AsyncConnection,
         approval_id: uuid.UUID,
-        org_id: uuid.UUID,
-        workspace_id: uuid.UUID,
-        run_id: uuid.UUID,
+        ref: _Ref,
         call_id: str,
     ) -> None:
-        session_id = (
-            await connection.execute(
-                update(Approval)
-                .where(Approval.id == approval_id, Approval.status == "pending")
-                .values(status="expired", decided_at=self._clock())
-                .returning(Approval.session_id)
-            )
-        ).scalar_one_or_none()
-        if session_id is not None:
-            ref = _Ref(org_id, workspace_id, session_id, run_id)
-            await self._audit(connection, ref, "approval.expired", call_id, {})
+        """Times out one open approval. The caller holds the row lock."""
+        await connection.execute(
+            update(Approval)
+            .where(Approval.id == approval_id)
+            .values(status="expired", decided_at=self._clock())
+        )
+        await self._audit(connection, ref, "approval.expired", call_id, {})
 
     # -- audit ------------------------------------------------------------------------------
 

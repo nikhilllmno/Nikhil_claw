@@ -4,9 +4,11 @@ run token. The control plane answers with ``GateAnswer``."""
 
 from __future__ import annotations
 
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from sama.gate.decide import Action
 
 GATE_PATH: Final = "/gate"
 MAX_GATE_BODY_BYTES: Final = 1_000_000
@@ -23,6 +25,6 @@ class GateRequest(BaseModel):
 class GateAnswer(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    action: Literal["allow", "ask", "deny"]
+    action: Action
     reason: str = ""
     step: str = ""
