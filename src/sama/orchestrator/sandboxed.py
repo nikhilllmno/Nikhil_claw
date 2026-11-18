@@ -14,7 +14,8 @@ It measures and logs the sandbox start and the time to the first event (roadmap 
 Before a run it makes the idle timeout of the sandbox long enough for the run. After the last
 run of the session it sets the timeout back, so an idle sandbox pauses on time.
 
-A cancel ends the stream within ``CANCEL_DEADLINE_S``, also while the sandbox starts.
+A worker task does the sandbox work of each invocation. The stream reads its events, so a
+cancel ends the stream within ``CANCEL_DEADLINE_S`` even if a provider call hangs.
 
 The runner is a new process for each invocation, so the rules that span invocations are
 enforced here: one stream per run id, each approval resumes once, and a cancelled run cannot
@@ -28,7 +29,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -140,12 +141,12 @@ class _Active:
             self.cancelled.set()
 
     def time_left(self) -> float:
-        """The time to the cancel deadline. Call it only after a cancel."""
+        """The time that the stream waits for the runner after a cancel. Call it only after a
+        cancel. If the runner has no process yet, the stream does not wait: no runner event
+        can come, and the worker stops the late runner in the background."""
+        if self.process is None:
+            return 0.0
         return max(0.0, self.cancelled_at + CANCEL_DEADLINE_S - time.monotonic())
-
-
-class _CancelDeadlineError(Exception):
-    """The runner did not end the stream before the cancel deadline."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,21 +250,12 @@ class SandboxedRuntime:
         self._cancelled.add(run_id)
         self._paused.discard(run_id)
         active = self._active.get(run_id)
-        if active is None:
+        if active is None or active.cancelled.is_set():
             return
         active.cancel()
-        process = active.process
-        if process is None:
-            return  # The stream sees the flag while the sandbox or the runner starts.
-        try:
-            # The runner writes its last event and exits. Its output is buffered, so this does
-            # not wait for the caller to read the stream.
-            async with asyncio.timeout(CANCEL_KILL_AFTER_S):
-                await _send_cancel(process)
-                await process.wait()
-        except TimeoutError:
-            log.warning("the runner did not stop after cancel; killing it run=%s", run_id)
-            await _bounded_kill(process)
+        # If the runner has no job yet, the worker sees the flag after the job write.
+        if active.process is not None:
+            await _halt(active.process, run_id)
 
     async def session_sandbox(self, org_id: str, session_id: str) -> Sandbox | None:
         """The sandbox of a session, resumed, or None if the session has none."""
@@ -276,8 +268,8 @@ class SandboxedRuntime:
             return None
 
     async def wait_for_cleanup(self) -> None:
-        """Waits for the cleanup work that runs after a stream: idle timeouts, and sandboxes
-        or runners that started after a cancel."""
+        """Waits for the background work: the invocations that still run after their stream
+        ended (for example, after a cancel), and the runner stops."""
         # A done task leaves the set in a later loop step, so wait only for the pending ones.
         while pending := [task for task in self._tasks if not task.done()]:
             await asyncio.wait(pending)
@@ -350,25 +342,6 @@ class SandboxedRuntime:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _unless_cancelled[T](
-        self, active: _Active, work: Awaitable[T], late: Callable[[T], Awaitable[None]]
-    ) -> T | None:
-        """The result of ``work``, or None if the run is cancelled first. Then ``work`` goes on
-        in the background, and ``late`` cleans up its result."""
-        task = asyncio.ensure_future(work)
-        flag = asyncio.ensure_future(active.cancelled.wait())
-        try:
-            await asyncio.wait({task, flag}, return_when=asyncio.FIRST_COMPLETED)
-        except BaseException:
-            task.cancel()
-            raise
-        finally:
-            flag.cancel()
-        if task.done():
-            return task.result()
-        self._spawn(_clean_up_late(task, late))
-        return None
-
     async def _invoke(
         self,
         job: RunnerJob,
@@ -377,24 +350,75 @@ class SandboxedRuntime:
         *,
         approval_id: str | None = None,
     ) -> AsyncGenerator[RunEvent]:
+        """Streams the events of one invocation.
+
+        A worker task does the sandbox work and puts the events in a queue. This generator only
+        reads the queue, so it can end the stream at the cancel deadline while the worker still
+        waits for a slow provider. The worker then cleans up in the background.
+        """
         run_id = scope.run_id
-        key = (scope.org_id, scope.session_id)
         active = _Active()
         self._active[run_id] = active
+        events: asyncio.Queue[RunEvent] = asyncio.Queue()
+        self._spawn(self._work(job, scope, budget, active, events, approval_id))
         started = time.monotonic()
+        usage = Usage()
+        first = True
+        ended = False
+        try:
+            while (event := await _next_event(events, active)) is not None:
+                if first:
+                    first = False
+                    elapsed = time.monotonic() - started
+                    log.info("first runner event run=%s after_s=%.3f", run_id, elapsed)
+                usage = event.usage
+                if not is_terminal(event):
+                    yield event
+                    continue
+                ended = True
+                self._release(run_id, active)
+                if isinstance(event, ApprovalRequired):
+                    if active.cancelled.is_set() or run_id in self._cancelled:
+                        event = _cancelled(event.usage)
+                    else:
+                        self._paused.add(run_id)
+                yield event
+                return
+            if active.process is not None:
+                log.warning("the runner did not stop before the cancel deadline run=%s", run_id)
+            ended = True
+            yield _cancelled(usage)
+        finally:
+            self._release(run_id, active)
+            if not ended and not active.cancelled.is_set():
+                # The caller closed the stream early. Stop the runner as for a cancel.
+                active.cancel()
+                if active.process is not None:
+                    self._spawn(_halt(active.process, run_id))
+
+    async def _work(
+        self,
+        job: RunnerJob,
+        scope: RunScope,
+        budget: Budget,
+        active: _Active,
+        events: asyncio.Queue[RunEvent],
+        approval_id: str | None,
+    ) -> None:
+        """Gets the sandbox, starts the runner, sends the job, and puts the runner events in
+        ``events``. It always puts one terminal event, and it always cleans up."""
+        run_id = scope.run_id
+        key = (scope.org_id, scope.session_id)
         usage = Usage()
         sandbox: Sandbox | None = None
         process: SandboxProcess | None = None
         terminal = False
+        sent = False  # True when the job write started: the runner can have the job.
         try:
             try:
-                sandbox = await self._unless_cancelled(
-                    active,
-                    self.acquire(scope, budget),
-                    lambda late: self._end_session_run(key, late),
-                )
-                if sandbox is None or active.cancelled.is_set():
-                    yield _cancelled(usage)
+                sandbox = await self.acquire(scope, budget)
+                if active.cancelled.is_set():
+                    events.put_nowait(_cancelled(usage))
                     return
                 ttl = min(_wall_time_s(budget) + TOKEN_MARGIN_S, RUN_TOKEN_MAX_TTL_S)
                 env = {
@@ -404,13 +428,11 @@ class SandboxedRuntime:
                 }
                 if self._settings.model_url:
                     env[MODEL_URL_ENV] = self._settings.model_url
-                process = await self._unless_cancelled(
-                    active, sandbox.start(self._settings.runner_argv, env=env), _bounded_kill
-                )
-                if process is None:
-                    yield _cancelled(usage)
+                process = await sandbox.start(self._settings.runner_argv, env=env)
+                if active.cancelled.is_set():
+                    events.put_nowait(_cancelled(usage))
                     return
-                active.process = process
+                sent = True
                 try:
                     await asyncio.wait_for(
                         process.write(job.model_dump_json() + "\n"), timeout=PROVIDER_CALL_S
@@ -418,55 +440,46 @@ class SandboxedRuntime:
                 except TimeoutError:
                     raise SandboxError("the job write timed out") from None
             except SandboxError as error:
-                if approval_id is not None and not active.cancelled.is_set():
-                    # The runner never got the job, so the approved call did not run.
+                if active.cancelled.is_set():
+                    events.put_nowait(_cancelled(usage))
+                    return
+                log.warning("the sandbox failed run=%s: %s", run_id, error)
+                # Before the job write, the runner surely has no job, so the approved call did
+                # not run and a retry is safe. After a failed write it is not sure.
+                retryable = not sent or approval_id is None
+                if approval_id is not None and not sent:
                     self._used_approvals.discard(approval_id)
                     self._paused.add(run_id)
-                log.warning("the sandbox failed run=%s: %s", run_id, error)
-                yield _sandbox_failed(f"the sandbox failed: {error}", usage)
+                message = f"the sandbox failed: {error}"
+                events.put_nowait(_sandbox_failed(message, usage, retryable=retryable))
                 return
+            # Set the process only now, so a cancel line never comes before the job line.
+            active.process = process
             if active.cancelled.is_set():
-                await _send_cancel(process)
-            lines = aiter(process.lines())
-            first = True
+                self._spawn(_halt(process, run_id))
             try:
-                while (line := await _next_line(lines, active)) is not None:
+                async for line in process.lines():
                     event = _parse(line)
                     if event is None:
                         continue
-                    if first:
-                        first = False
-                        elapsed = time.monotonic() - started
-                        log.info("first runner event run=%s after_s=%.3f", run_id, elapsed)
                     usage = event.usage
-                    if not is_terminal(event):
-                        yield event
-                        continue
-                    terminal = True
-                    # The run ends when the runner has stopped, so the next invocation of the
-                    # session never meets a runner that is still shutting down.
-                    await _stop(process)
-                    self._release(run_id, active)
-                    if isinstance(event, ApprovalRequired):
-                        if active.cancelled.is_set() or run_id in self._cancelled:
-                            event = _cancelled(event.usage)
-                        else:
-                            self._paused.add(run_id)
-                    yield event
-                    return
-            except _CancelDeadlineError:
-                log.warning("the runner did not stop before the cancel deadline run=%s", run_id)
-                yield _cancelled(usage)
-                return
+                    if is_terminal(event):
+                        terminal = True
+                        # The run ends when the runner has stopped, so the next invocation of
+                        # the session never meets a runner that is still shutting down.
+                        await _stop(process)
+                    events.put_nowait(event)
+                    if terminal:
+                        return
             except SandboxError as error:
                 if active.cancelled.is_set():
-                    yield _cancelled(usage)
+                    events.put_nowait(_cancelled(usage))
                 else:
                     log.warning("the runner stream failed run=%s: %s", run_id, error)
-                    yield _sandbox_failed(f"the runner stream failed: {error}", usage)
+                    events.put_nowait(_sandbox_failed(f"the runner stream failed: {error}", usage))
                 return
             if active.cancelled.is_set():
-                yield _cancelled(usage)
+                events.put_nowait(_cancelled(usage))
                 return
             code = await _bounded_wait(process)
             log.warning(
@@ -475,13 +488,16 @@ class SandboxedRuntime:
                 code,
                 process.stderr_tail()[-2000:],
             )
-            yield _sandbox_failed(f"the runner ended without a result (exit code {code})", usage)
+            message = f"the runner ended without a result (exit code {code})"
+            events.put_nowait(_sandbox_failed(message, usage))
+        except Exception as error:
+            log.exception("the sandbox work failed run=%s", run_id)
+            events.put_nowait(_sandbox_failed(f"the sandbox work failed: {error!r}", usage))
         finally:
-            self._release(run_id, active)
             if process is not None and not terminal:
                 await _bounded_kill(process)
             if sandbox is not None:
-                self._spawn(self._end_session_run(key, sandbox))
+                await self._end_session_run(key, sandbox)
 
     def _release(self, run_id: str, owner: _Active) -> None:
         if self._active.get(run_id) is owner:
@@ -492,40 +508,36 @@ def _wall_time_s(budget: Budget) -> float:
     return budget.max_wall_time_s or DEFAULT_RUN_WALL_TIME_S
 
 
-async def _read(lines: AsyncIterator[str]) -> str | None:
-    return await anext(lines, None)
-
-
-async def _next_line(lines: AsyncIterator[str], active: _Active) -> str | None:
-    """The next stdout line, or None at the end. After a cancel, it waits only until the
-    cancel deadline, then raises ``_CancelDeadlineError``."""
-    step = asyncio.ensure_future(_read(lines))
+async def _next_event(events: asyncio.Queue[RunEvent], active: _Active) -> RunEvent | None:
+    """The next event, or None at the cancel deadline."""
+    if not events.empty():
+        return events.get_nowait()
+    get = asyncio.ensure_future(events.get())
     try:
         if not active.cancelled.is_set():
             flag = asyncio.ensure_future(active.cancelled.wait())
             try:
-                await asyncio.wait({step, flag}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait({get, flag}, return_when=asyncio.FIRST_COMPLETED)
             finally:
                 flag.cancel()
-        if not step.done():
-            await asyncio.wait({step}, timeout=active.time_left())
-        if not step.done():
-            raise _CancelDeadlineError
-        return step.result()
+        if not get.done() and (left := active.time_left()) > 0:
+            await asyncio.wait({get}, timeout=left)
+        return get.result() if get.done() else None
     finally:
-        step.cancel()
+        get.cancel()
 
 
-async def _clean_up_late[T](task: asyncio.Future[T], late: Callable[[T], Awaitable[None]]) -> None:
+async def _halt(process: SandboxProcess, run_id: str) -> None:
+    """Sends a cancel line and waits for the runner to stop, then kills it."""
     try:
-        result = await task
-    except Exception as error:
-        log.info("a start after a cancel failed: %r", error)
-        return
-    try:
-        await late(result)
-    except Exception:
-        log.exception("the cleanup after a cancel failed")
+        # The runner writes its last event and exits. Its output is buffered, so this does
+        # not wait for the caller to read the stream.
+        async with asyncio.timeout(CANCEL_KILL_AFTER_S):
+            await _send_cancel(process)
+            await process.wait()
+    except TimeoutError:
+        log.warning("the runner did not stop after cancel; killing it run=%s", run_id)
+        await _bounded_kill(process)
 
 
 async def _bounded_wait(process: SandboxProcess) -> int | None:
@@ -573,8 +585,10 @@ def _cancelled(usage: Usage) -> RunFailed:
     return RunFailed(code=FailureCode.CANCELLED, message="cancelled", usage=usage)
 
 
-def _sandbox_failed(message: str, usage: Usage) -> RunFailed:
-    return RunFailed(code=FailureCode.SANDBOX_ERROR, message=message, usage=usage, retryable=True)
+def _sandbox_failed(message: str, usage: Usage, *, retryable: bool = True) -> RunFailed:
+    return RunFailed(
+        code=FailureCode.SANDBOX_ERROR, message=message, usage=usage, retryable=retryable
+    )
 
 
 __all__: Sequence[str] = ["CAPABILITIES", "RUNNER_ARGV", "SandboxSettings", "SandboxedRuntime"]

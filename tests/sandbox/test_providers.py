@@ -178,6 +178,24 @@ async def test_kill_stops_the_process_in_the_sandbox(harness: Harness) -> None:
     assert (await sandbox.exec(["sh", "-c", _ALIVE, pid_file])).exit_code != 0
 
 
+async def test_kill_works_after_the_docker_client_ended(harness: Harness) -> None:
+    """A lost ``docker exec`` client does not stop the command in the container."""
+    if harness.name != "docker":
+        pytest.skip("only Docker has a host client")
+    from sama.sandbox.docker import DockerProcess
+
+    sandbox = await harness.create(harness.spec())
+    pid_file = f"{sandbox.workdir}/sleep.pid"
+    process = await sandbox.start(["sh", "-c", 'echo $$ > "$0"; exec sleep 300', pid_file])
+    wait = 'for _ in $(seq 50); do [ -s "$0" ] && exit 0; sleep 0.1; done; exit 1'
+    assert (await sandbox.exec(["sh", "-c", wait, pid_file])).exit_code == 0
+    assert isinstance(process, DockerProcess)
+    await process._client.kill()  # the connection is lost
+    assert (await sandbox.exec(["sh", "-c", _ALIVE, pid_file])).exit_code == 0
+    await process.kill()
+    assert (await sandbox.exec(["sh", "-c", _ALIVE, pid_file])).exit_code != 0
+
+
 async def test_the_runner_runs_in_the_sandbox(harness: Harness) -> None:
     """The whole path: the orchestrator starts the runner, which runs the fake runtime."""
     usage = Usage(output_tokens=1)

@@ -39,11 +39,13 @@ _GROUP_SCRIPT: Final = 'echo $$ > "$0"; "$@"; code=$?; rm -f "$0"; exit $code'
 """Runs the command as a child of this shell. ``setsid`` makes the shell the leader of a new
 process group, so the group id is ``$$``."""
 _KILL_SCRIPT: Final = (
-    'for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$0" ] && break; sleep 0.1; done; '
+    'for _ in $(seq "$1"); do [ -s "$0" ] && break; sleep 0.1; done; '
     'pid=$(cat "$0" 2>/dev/null) && kill -s KILL -- "-$pid" 2>/dev/null; rm -f "$0"'
 )
-"""Waits up to 1 second for the group file, then kills the group. The dash ``kill`` needs
-``-s KILL --`` for a group. It refuses ``-KILL -- -pid``."""
+"""Kills the group in the group file. It waits ``$1`` times 0.1 s for the file first, because
+a process that just started can still be without it. The dash ``kill`` needs ``-s KILL --``
+for a group. It refuses ``-KILL -- -pid``."""
+_KILL_TIMEOUT_S: Final = 5.0
 
 
 async def _docker(
@@ -93,9 +95,14 @@ class DockerProcess:
         return await self._client.wait()
 
     async def kill(self) -> None:
-        """Kills the process group in the container, then the client on the host."""
-        if self._client.returncode is None:
-            # If this fails, the client kill below still ends the stream.
+        """Kills the process group in the container, then the client on the host.
+
+        It kills the group also when the client already ended: a client that lost its
+        connection does not stop the command in the container. The group file is gone only
+        when the command ended, so then the script does nothing.
+        """
+        waits = "10" if self._client.returncode is None else "0"
+        try:
             with contextlib.suppress(SandboxError):
                 await _docker(
                     "exec",
@@ -106,9 +113,11 @@ class DockerProcess:
                     "-c",
                     _KILL_SCRIPT,
                     self._group_file,
-                    timeout_s=10,
+                    waits,
+                    timeout_s=_KILL_TIMEOUT_S,
                 )
-        await self._client.kill()
+        finally:
+            await self._client.kill()
 
     def stderr_tail(self) -> str:
         return self._client.stderr_tail()

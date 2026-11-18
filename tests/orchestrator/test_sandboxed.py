@@ -324,6 +324,77 @@ async def test_cancel_kills_a_runner_that_does_not_stop(
     await sandboxed.close_sandboxes(kill=True)
 
 
+async def test_cancel_ends_the_stream_while_the_job_write_hangs(
+    provider: CountingProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def hang(self: SubprocessProcess, data: str) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(SubprocessProcess, "write", hang)
+    monkeypatch.setattr(sandboxed_module, "CANCEL_DEADLINE_S", 0.5)
+    monkeypatch.setattr(sandboxed_module, "PROVIDER_CALL_S", 1.0)
+    sandboxed = _sandboxed(provider)
+    scope = make_scope("run-1")
+    collecting = asyncio.ensure_future(collect(sandboxed.run(_request(scope))))
+    await asyncio.sleep(0.3)  # the worker waits in the job write
+    async with asyncio.timeout(2):
+        await sandboxed.cancel(scope.run_id)
+        events = await collecting
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].code is FailureCode.CANCELLED
+    await sandboxed.close_sandboxes(kill=True)
+    idle = SandboxSpec(org_id="o", session_id="s", template="local").idle_timeout_s
+    assert provider.keep_alives[-1] == idle
+
+
+async def test_a_resume_with_a_failed_job_write_uses_the_approval(
+    runtime: SandboxedRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner can have the job after a failed write, so a retry can run the call twice."""
+    usage = Usage(output_tokens=1)
+    paused = ApprovalRequired(approval_id="a1", call_id="c1", tool_name="t", usage=usage)
+    done = (RunCompleted(output="ok", usage=usage),)
+    runtime.fake_scripts.append(FakeScript(events=(paused,), on_approve=done, on_reject=done))
+    scope = make_scope("run-1")
+    await collect(runtime.run(_request(scope)))
+
+    async def lost(self: SubprocessProcess, data: str) -> None:
+        raise SandboxError("the connection dropped")
+
+    monkeypatch.setattr(SubprocessProcess, "write", lost)
+    resume = ResumeRequest(
+        scope=scope, config=CONFIG, approval_id="a1", decision=ApprovalDecision.APPROVE
+    )
+    failed = await collect(runtime.resume(resume))
+    assert isinstance(failed[-1], RunFailed)
+    assert failed[-1].code is FailureCode.SANDBOX_ERROR
+    assert not failed[-1].retryable
+    again = await collect(runtime.resume(resume))
+    assert isinstance(again[-1], RunFailed)
+    assert "already used" in again[-1].message
+
+
+async def test_a_cancelled_consumer_does_not_leak_the_session_run(
+    runtime: SandboxedRuntime, provider: CountingProvider
+) -> None:
+    provider.create_gate = asyncio.Event()
+    collecting = asyncio.ensure_future(collect(runtime.run(_request(make_scope("run-1")))))
+    await asyncio.wait_for(provider.create_entered.wait(), timeout=5)
+    collecting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await collecting
+    provider.create_gate.set()
+    await runtime.wait_for_cleanup()
+    idle = SandboxSpec(org_id="o", session_id="s", template="local").idle_timeout_s
+    assert provider.keep_alives[-1] == idle
+    # The next run of the session works and sets the timeout back again.
+    runtime.fake_scripts.append(_reply("ok"))
+    events = await collect(runtime.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    await runtime.wait_for_cleanup()
+    assert provider.keep_alives[-1] == idle
+
+
 async def test_a_stream_error_is_a_sandbox_error(
     runtime: SandboxedRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -112,7 +112,8 @@ async def run_command(
     """Runs a program to the end. Returns the exit code, stdout, and stderr.
 
     ``env=None`` gives the program the environment of this process. Raises ``SandboxError``
-    if the program does not end in ``timeout_s``.
+    if the program does not end in ``timeout_s``. On a timeout or a cancel, it kills the
+    program.
     """
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -125,8 +126,16 @@ async def run_command(
     try:
         out, err = await asyncio.wait_for(process.communicate(stdin), timeout=timeout_s)
     except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        await process.wait()
+        await _reap(process)
         raise SandboxError(f"the command timed out after {timeout_s} s") from None
+    except asyncio.CancelledError:
+        await _reap(process)
+        raise
     return process.returncode or 0, out, err
+
+
+async def _reap(process: asyncio.subprocess.Process) -> None:
+    """Kills the program and waits for it, so no process is left behind."""
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
+    await asyncio.shield(process.wait())
