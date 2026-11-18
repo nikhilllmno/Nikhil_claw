@@ -2,8 +2,8 @@
 
 A cloud agent engine with Hermes-level features, built on the Claude Agent SDK and the OpenAI Agents SDK.
 
-Status: M1 (core engine) in progress. The runtime contract, the fake runtime, and the Claude
-Agent SDK adapter are done.
+Status: M1 (core engine) in progress. The runtime contract, the fake runtime, the Claude
+Agent SDK adapter, and the database with row-level security are done.
 
 ## Development
 
@@ -25,17 +25,50 @@ default group. Install the OpenAI Agents SDK only when you work on its adapter:
 uv sync --group runtime-openai   # openai-agents
 ```
 
-Live tests call the real Claude API. They cost money, so they run only when you ask:
+Live tests call real services (the Claude API and the Supabase project). They cost money,
+so they run only when you ask:
 
 ```bash
-SAMA_LIVE_TESTS=1 uv run pytest -m live   # needs ANTHROPIC_API_KEY
+SAMA_LIVE_TESTS=1 uv run pytest -m live   # needs ANTHROPIC_API_KEY and the SAMA_SUPABASE_* variables
 ```
 
-Code layout:
+### Database
+
+Sama uses Supabase Postgres (architecture Section 17.1). The database tests need a Postgres
+server. They create a new database, so the URL user must be able to create databases:
+
+```bash
+docker run -d --name sama-pg -e POSTGRES_PASSWORD=sama -p 55432:5432 postgres:17
+export SAMA_TEST_DATABASE_URL=postgresql://postgres:sama@localhost:55432/postgres
+uv run pytest tests/db
+```
+
+Without `SAMA_TEST_DATABASE_URL` these tests are skipped. CI runs them with a Postgres service.
+
+Migrations use Alembic. Set `SAMA_DATABASE_URL` to the database URL (for Supabase, the session
+pooler URL on port 5432), then run:
+
+```bash
+uv run alembic upgrade head      # apply the migrations
+uv run alembic check             # the models match the migrations
+```
+
+On a plain Postgres, run `tests/db/supabase_shim.sql` first. It adds the Supabase roles and
+`auth.uid()`.
+
+The live tenancy test uses the Supabase project. It needs `SAMA_SUPABASE_URL`,
+`SAMA_SUPABASE_ANON_KEY`, `SAMA_SUPABASE_SERVICE_ROLE_KEY`, and `SAMA_DATABASE_URL`:
+
+```bash
+SAMA_LIVE_TESTS=1 uv run pytest tests/db/test_supabase_live.py
+```
+
+### Code layout
 
 - `src/sama/runtime/contract.py`: the runtime contract (architecture Section 5.1).
 - `src/sama/runtime/fake.py`: the scripted runtime for tests.
 - `src/sama/runtime/claude.py`: the Claude Agent SDK adapter (architecture Section 5.3).
+- `src/sama/db/`: SQLAlchemy models and engine helpers. `migrations/`: Alembic migrations.
 
 ## Docs
 

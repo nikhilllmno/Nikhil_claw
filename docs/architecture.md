@@ -1159,6 +1159,65 @@ policy for all of them:
 - **Products on top**: vorflux creates one sama workspace per hotel and adds its own tables
   and tools through the extension points (D16).
 
+### 17.1 Data model and row-level security (M1.2)
+
+The first Alembic migration (`migrations/versions/0001_tenancy_and_sessions.py`) creates
+these tables in the `public` schema of the Supabase project `sama` (`ap-south-1`). The
+SQLAlchemy models are in `src/sama/db/models.py`. A test compares the models with the
+migrated schema.
+
+| Table | Key columns |
+|---|---|
+| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits` |
+| `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
+| `workspaces` | `org_id`, `name`, `slug` (unique per org) |
+| `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
+| `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
+| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status` |
+| `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content` |
+| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code` |
+| `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
+| `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
+| `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |
+| `audit_log` | `org_id`, `workspace_id`, `actor_kind`, `actor_user_id`, `action`, `target_type`, `target_id`, `run_id`, `details` |
+
+Rules:
+
+- **`org_id` on every row.** `orgs.id` is the org id. A user row belongs to one org. A
+  person in two orgs has two user rows with the same `auth_user_id`.
+- **No cross-org links.** Each parent has a unique key on `(org_id, id)`. Each child points
+  to its parent with a composite foreign key on `(org_id, parent_id)`. So a session in org A
+  cannot point to a workspace, profile, or user in org B.
+- **Roles.** A membership with `workspace_id` null gives the org role. A membership with a
+  `workspace_id` gives access to that workspace. Org `owner` and `admin` can see every
+  workspace of the org.
+- **Audience.** A `private` session has an `owner_user_id`, and only that user can read it.
+  A `shared` session can be read by every user who can see its workspace (Section 11.3).
+- **Append-only audit.** A trigger rejects `UPDATE` and `DELETE` on `audit_log`. To delete
+  an org, the control plane sets `sama.audit_purge = 'on'` in the transaction first.
+- **Private objects.** The policy helpers and the Alembic version table are in the schema
+  `sama_private`. The Data API does not expose it.
+
+Row-level security:
+
+- RLS is on for every table. The policies are for the Supabase role `authenticated` and use
+  `auth.uid()` from the user's JWT. Helper functions in the schema `sama_private` (not
+  exposed by the Data API) find the user rows of `auth.uid()` and check membership.
+- `authenticated` gets `SELECT` only. A user reads:
+  - the orgs, users, and memberships of the orgs where the user is a member;
+  - the workspaces and agent profiles that the user can see;
+  - the sessions whose audience includes the user, and the messages, runs, run events, tool
+    calls, and bindings of those sessions;
+  - the audit log only as an org `owner` or `admin`.
+- `anon` gets no access. All writes go through the control plane. The control plane
+  connects as the table owner, which RLS does not limit, and checks scope in code.
+- `sama.db.as_user()` runs a transaction as `authenticated` with the claims of one user.
+  The API uses it for user reads, so RLS is the second guard under the code check.
+- Tests: `tests/db/` runs the migration and the RLS tests on a local Postgres with a small
+  Supabase Auth shim (`tests/db/supabase_shim.sql`). CI runs them with a Postgres service.
+  A live test (`-m live`) checks isolation on the Supabase project through the Data API and
+  through SQL. The sama HTTP API repeats the check when it exists (M1.12).
+
 ---
 
 ## 18. Observability and cost
