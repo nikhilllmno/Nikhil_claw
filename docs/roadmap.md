@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1, M1.2, M1.3, and M1.4.
+Done: M1.1 to M1.5.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -48,6 +48,9 @@ Done: M1.1, M1.2, M1.3, and M1.4.
 - M1.3: contract in `src/sama/runtime/contract.py`, fake runtime in `src/sama/runtime/fake.py`.
 - M1.4: Claude adapter in `src/sama/runtime/claude.py` (architecture Section 5.3). Live tests
   of the adapter run with `SAMA_LIVE_TESTS=1 uv run --all-groups pytest -m live`.
+- M1.5: conformance suite in `tests/conformance/` (architecture Section 5.5). CI runs the
+  `fake` and `claude-scripted` targets. `.github/workflows/nightly-live.yml` runs the
+  `claude-live` target every night. It needs the repository secret `ANTHROPIC_API_KEY`.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

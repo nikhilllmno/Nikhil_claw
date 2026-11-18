@@ -18,11 +18,15 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "asyncpg-stubs>=0.32.0,<0.33",
+    # The conformance suite serves a scripted model and an MCP tool server.
+    "mcp>=2.3.0,<3",
     "mypy>=2.4.1,<3",
     "pre-commit>=4.7.0,<5",
     "pytest>=9.2.0,<10",
     "pytest-asyncio>=1.5.0,<2",
     "ruff>=0.17.5,<0.18",
+    "starlette>=1.10.0,<2",
+    "uvicorn>=0.54.0,<1",
 ]
 # Each runtime adapter pins its SDK (docs/architecture.md, Section 5.3).
 # `runtime-claude` is a default group because Claude is the default runtime.

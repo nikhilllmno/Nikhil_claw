@@ -457,6 +457,38 @@ Both adapters must pass one shared test suite before a profile can use them:
 CI runs the suite against a scripted model. A nightly job runs a small live suite with real
 models and a low budget.
 
+#### Suite design (M1.5)
+
+The suite is `tests/conformance/`. Each test runs once per **target**:
+
+| Target | Runtime | Model | Runs |
+|---|---|---|---|
+| `fake` | `FakeRuntime` with one script per scenario | none | CI |
+| `claude-scripted` | `ClaudeRuntime` and the real Claude CLI | scripted Messages API | CI |
+| `claude-live` | `ClaudeRuntime` and the real Claude CLI | `claude-haiku-4-5` | nightly, `-m live` |
+
+- **Scripted model.** A small local server copies the Anthropic Messages API, also its
+  streaming events. The CLI uses it through `ANTHROPIC_BASE_URL`, the same way as the model
+  proxy (D6). Its rules answer on the last user text: `CALL <tool> <json>` calls a tool, a
+  tool result gives `tool result: ...`, `SLOW n` streams slowly, and so on. So CI tests the
+  real CLI, its hooks, its MCP client, and its limits at no cost.
+- **Tool server.** A real streamable HTTP MCP server with a bearer token, like the sama MCP
+  server. `lookup` is allowed. `send_note` is gated. The suite also gates the native `Bash`
+  tool, because the CLI can send an approved native call through `can_use_tool` and an
+  approved MCP call through the hook (Section 5.3).
+- **Scenarios.** A target turns each scenario into input text. The tests check only contract
+  events and the records of the tool server, so every target passes the same tests.
+- **Covered now:** text streaming and one terminal event, session resume from
+  `runtime_state`, an MCP tool call, approve and reject for an MCP tool and a native tool, an
+  approval used once, cancel within 10 seconds, the `max_turns` budget stop, and a
+  `Compacted` event.
+- **Later items:** sandbox pause and resume (M1.6), usage against the model proxy record
+  (M1.7), skills (M2.2), and egress (M1.6). Each item adds its test to this suite.
+- **Clean CLI config.** Each Claude target uses a new `CLAUDE_CONFIG_DIR`, so skills, memory,
+  and settings of the host do not reach the run.
+- **New adapters.** A new runtime adds a target (for example `openai-scripted` in M3.6) and
+  must pass the suite.
+
 ---
 
 ## 6. Prompt assembly and context management

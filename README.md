@@ -3,7 +3,7 @@
 A cloud agent engine with Hermes-level features, built on the Claude Agent SDK and the OpenAI Agents SDK.
 
 Status: M1 (core engine) in progress. The runtime contract, the fake runtime, the Claude
-Agent SDK adapter, and the database with row-level security are done.
+Agent SDK adapter, the conformance suite, and the database with row-level security are done.
 
 ## Development
 
@@ -31,6 +31,10 @@ so they run only when you ask:
 ```bash
 SAMA_LIVE_TESTS=1 uv run pytest -m live   # needs ANTHROPIC_API_KEY and the SAMA_SUPABASE_* variables
 ```
+
+The runtime conformance suite (architecture Section 5.5) is in `tests/conformance/`. `uv run
+pytest` runs it on the fake runtime and on the Claude CLI with a scripted model, at no cost.
+`-m live` adds a real Claude model. A GitHub Actions job runs the live suite every night.
 
 ### Database
 
