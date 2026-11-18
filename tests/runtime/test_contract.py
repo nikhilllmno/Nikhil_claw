@@ -291,3 +291,17 @@ def test_any_runtime_state_bytes_round_trip_through_json() -> None:
     request = make_request(runtime_state=b"\xff\x00")
     parsed_request = RunRequest.model_validate_json(request.model_dump_json())
     assert parsed_request.runtime_state == b"\xff\x00"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ToolSchema(name="t", description="d").input_schema,
+        ToolCallStarted(call_id="c1", name="n").arguments,
+        ApprovalRequired(approval_id="a", call_id="c", tool_name="t").arguments,
+    ],
+    ids=["input_schema", "tool_call_arguments", "approval_arguments"],
+)
+def test_default_json_fields_are_read_only(value: Any) -> None:
+    with pytest.raises(TypeError):
+        value["x"] = 1

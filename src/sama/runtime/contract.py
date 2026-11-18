@@ -163,7 +163,7 @@ class SkillIndexEntry(_Frozen):
 class ToolSchema(_Frozen):
     name: str = Field(min_length=1, max_length=64)
     description: str
-    input_schema: FrozenJsonObject = Field(default_factory=dict)
+    input_schema: FrozenJsonObject = Field(default_factory=dict, validate_default=True)
 
 
 class McpServerConfig(_Frozen):
@@ -344,7 +344,7 @@ class ToolCallStarted(_Event):
     type: Literal["tool_call_started"] = "tool_call_started"
     call_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    arguments: FrozenJsonObject = Field(default_factory=dict)
+    arguments: FrozenJsonObject = Field(default_factory=dict, validate_default=True)
 
 
 class ToolCallFinished(_Event):
@@ -375,7 +375,7 @@ class ApprovalRequired(_Event):
     approval_id: str = Field(min_length=1)
     call_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
-    arguments: FrozenJsonObject = Field(default_factory=dict)
+    arguments: FrozenJsonObject = Field(default_factory=dict, validate_default=True)
     reason: str = ""
     runtime_state: bytes | None = None
 
