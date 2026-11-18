@@ -141,7 +141,8 @@ def claude_cli_env(token: str, model_url: str | None) -> dict[str, str]:
         "ANTHROPIC_API_KEY": token,
     }
     if model_url:
-        env["ANTHROPIC_BASE_URL"] = model_url
+        # The Anthropic route of the model proxy (docs/architecture.md, Section 16.6).
+        env["ANTHROPIC_BASE_URL"] = model_url.rstrip("/") + "/anthropic"
     return env
 
 

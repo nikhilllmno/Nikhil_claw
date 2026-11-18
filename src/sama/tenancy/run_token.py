@@ -2,7 +2,9 @@
 
 A run token is the only credential in the sandbox. The orchestrator issues one token per run
 invocation. The token binds ``org_id``, ``workspace_id``, ``session_id``, ``run_id``, and the
-user of a private session, and it expires after the run. The model proxy (M1.7) and the sama
+user of a private session, and it expires after the run. It also carries the model limits of
+the run budget (``max_tokens`` and ``max_cost_usd``), so the sandbox cannot change them. The
+model proxy (Section 16.6) and the sama
 MCP server (M1.8) accept only a valid run token, and they take the tenant scope from the token,
 never from the request.
 
@@ -14,12 +16,13 @@ from __future__ import annotations
 import secrets
 import time
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any, Final
 
 import jwt
 from pydantic import BaseModel, ConfigDict, Field
 
-from sama.runtime.contract import Audience, RunScope
+from sama.runtime.contract import Audience, Budget, RunScope
 
 ISSUER: Final = "sama"
 AUDIENCE: Final = "sama-run"
@@ -46,6 +49,8 @@ class RunTokenClaims(BaseModel):
     user_id: str | None = None
     token_id: str = Field(min_length=1)
     expires_at: int
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_cost_usd: Decimal | None = Field(default=None, gt=0)
 
     def matches(self, scope: RunScope) -> bool:
         """True if the token is for exactly this run scope."""
@@ -70,7 +75,7 @@ class RunTokenSigner:
     def __repr__(self) -> str:
         return "RunTokenSigner(key=<hidden>)"
 
-    def issue(self, scope: RunScope, *, ttl_s: float) -> str:
+    def issue(self, scope: RunScope, *, ttl_s: float, budget: Budget | None = None) -> str:
         if not 0 < ttl_s <= RUN_TOKEN_MAX_TTL_S:
             raise ValueError(f"ttl_s must be more than 0 and at most {RUN_TOKEN_MAX_TTL_S}")
         now = int(self._clock())
@@ -87,6 +92,11 @@ class RunTokenSigner:
         }
         if scope.audience is Audience.PRIVATE:
             claims["usr"] = scope.user_id
+        if budget is not None:
+            if budget.max_tokens is not None:
+                claims["bmt"] = budget.max_tokens
+            if budget.max_cost_usd is not None:
+                claims["bmc"] = str(budget.max_cost_usd)
         return jwt.encode(claims, self._key, algorithm=ALGORITHM)
 
     def verify(self, token: str) -> RunTokenClaims:
@@ -121,6 +131,8 @@ class RunTokenSigner:
                 user_id=raw.get("usr"),
                 token_id=raw["jti"],
                 expires_at=expires_at,
+                max_tokens=raw.get("bmt"),
+                max_cost_usd=raw.get("bmc"),
             )
         except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise InvalidRunTokenError("the run token is not valid") from None

@@ -280,6 +280,38 @@ async def test_budget_stops_the_run(target: Target) -> None:
     assert last.code is FailureCode.BUDGET_EXCEEDED
 
 
+async def test_the_usage_matches_the_model_proxy_record(target: Target) -> None:
+    """The model proxy record is the source of truth for usage (Section 16.6)."""
+    if target.model_calls is None:
+        pytest.skip("the model calls of this target do not go through the model proxy")
+    run_scope = scope()
+    done = completed(await run(target, target.prompt(Scenario.LOOKUP), run_scope=run_scope))
+    calls = [c for c in target.model_calls.calls if c.run_id == run_scope.run_id]
+    assert len(calls) >= 2  # the tool call and the answer
+    assert all(c.status_code == 200 and c.org_id == run_scope.org_id for c in calls)
+    assert done.usage.input_tokens == sum(c.counts.input for c in calls)
+    assert done.usage.output_tokens == sum(c.counts.output for c in calls)
+    assert sum(c.cost_usd for c in calls) > 0
+
+
+async def test_the_model_proxy_stops_a_run_over_max_tokens(target: Target) -> None:
+    """The first model call fits in the budget. The proxy refuses the call after the tool."""
+    if target.model_calls is None:
+        pytest.skip("the model calls of this target do not go through the model proxy")
+    run_scope = scope()
+    budget = Budget(max_tokens=1, max_wall_time_s=SCRIPTED_WALL_TIME_S)
+    run_request = RunRequest(
+        scope=run_scope, input=target.prompt(Scenario.LOOKUP), config=target.config, budget=budget
+    )
+    events = await collect(target.runtime.run(run_request))
+    validate_event_stream(events)
+    last = events[-1]
+    assert isinstance(last, RunFailed), last
+    assert last.code is FailureCode.BUDGET_EXCEEDED
+    calls = [c for c in target.model_calls.calls if c.run_id == run_scope.run_id]
+    assert len(calls) == 1
+
+
 async def test_compaction_streams_a_compacted_event(target: Target) -> None:
     first = completed(await run(target, target.prompt(Scenario.TEXT, new_word())))
     events = await run(target, target.prompt(Scenario.COMPACT), state=first.runtime_state)

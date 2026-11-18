@@ -1,0 +1,147 @@
+# Model prices for the model proxy (docs/architecture.md, Section 16.6).
+#
+# All prices are USD per million tokens. A model that is not in this file is not allowed.
+# `cache_write` is the short cache write (Anthropic 5 minutes, OpenAI 30 minutes).
+# `cache_write_long` is the long cache write (Anthropic 1 hour, OpenAI 12 hours).
+# `long_context` is the price set for a call whose prompt is more than `above_tokens`.
+#
+# Sources, read on 2026-11-18:
+# - https://platform.claude.com/docs/en/about-claude/pricing
+# - https://developers.openai.com/api/docs/pricing
+# - https://developers.openai.com/api/docs/guides/prompt-caching (cache write rates)
+
+[anthropic]
+web_search_per_1k = "10"
+
+[anthropic.models.claude-fable-5-2]
+input = "8"
+output = "40"
+cache_read = "0.20"
+cache_write = "10"
+cache_write_long = "16"
+
+[anthropic.models.claude-opus-5-5]
+input = "4"
+output = "20"
+cache_read = "0.20"
+cache_write = "5"
+cache_write_long = "8"
+
+[anthropic.models.claude-opus-5]
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+cache_write_long = "10"
+
+[anthropic.models.claude-sonnet-5-5]
+input = "2"
+output = "10"
+cache_read = "0.10"
+cache_write = "2.50"
+cache_write_long = "4"
+
+[anthropic.models.claude-sonnet-5]
+input = "2"
+output = "10"
+cache_read = "0.20"
+cache_write = "2.50"
+cache_write_long = "4"
+
+[anthropic.models.claude-sonnet-4-6]
+input = "3"
+output = "15"
+cache_read = "0.30"
+cache_write = "3.75"
+cache_write_long = "6"
+
+[anthropic.models.claude-sonnet-4-5]
+input = "3"
+output = "15"
+cache_read = "0.30"
+cache_write = "3.75"
+cache_write_long = "6"
+
+[anthropic.models.claude-haiku-5-5]
+input = "0.10"
+output = "0.50"
+cache_read = "0.01"
+cache_write = "0.125"
+cache_write_long = "0.20"
+
+[anthropic.models.claude-haiku-5-5.long_context]
+above_tokens = 100000
+input = "0.50"
+output = "2.50"
+cache_read = "0.05"
+cache_write = "0.625"
+cache_write_long = "1"
+
+[anthropic.models.claude-haiku-4-5]
+input = "1"
+output = "5"
+cache_read = "0.10"
+cache_write = "1.25"
+cache_write_long = "2"
+
+[openai]
+
+[openai.models."gpt-6.2-astra"]
+input = "8"
+output = "40"
+cache_read = "0.40"
+cache_write = "10"
+cache_write_long = "20"
+
+[openai.models."gpt-6.2-astra".long_context]
+above_tokens = 272000
+input = "16"
+output = "60"
+cache_read = "0.80"
+cache_write = "20"
+cache_write_long = "40"
+
+[openai.models."gpt-6.2-sol"]
+input = "2"
+output = "10"
+cache_read = "0.10"
+cache_write = "2.50"
+cache_write_long = "5"
+
+[openai.models."gpt-6.2-sol".long_context]
+above_tokens = 272000
+input = "4"
+output = "15"
+cache_read = "0.20"
+cache_write = "5"
+cache_write_long = "10"
+
+[openai.models."gpt-6.1-terra"]
+input = "1"
+output = "5"
+cache_read = "0.05"
+cache_write = "1.25"
+cache_write_long = "2.50"
+
+[openai.models."gpt-6.1-terra".long_context]
+above_tokens = 272000
+input = "2"
+output = "7.50"
+cache_read = "0.10"
+cache_write = "2.50"
+cache_write_long = "5"
+
+[openai.models."gpt-6-luna"]
+input = "0.10"
+output = "0.50"
+cache_read = "0.01"
+cache_write = "0.125"
+cache_write_long = "0.25"
+
+[openai.models."gpt-6-luna".long_context]
+above_tokens = 272000
+input = "0.20"
+output = "0.75"
+cache_read = "0.02"
+cache_write = "0.25"
+cache_write_long = "0.50"

@@ -2,7 +2,8 @@
 
 - ``fake`` and ``claude-scripted`` run in CI. ``claude-scripted`` needs the Claude SDK and
   its bundled CLI (the default ``runtime-claude`` group).
-- ``claude-runner`` runs in CI. It starts the runner in a local sandbox folder.
+- ``claude-runner`` runs in CI. It starts the runner in a local sandbox folder. Its model
+  calls go through the model proxy to the scripted model, as in production (Section 16.6).
 - ``claude-docker`` runs only with ``SAMA_DOCKER_IMAGE``, the tag of the sama image
   (``sandbox/Dockerfile``). The container uses the host network to reach the test servers.
 - ``claude-live`` runs only with ``SAMA_LIVE_TESTS=1`` and ``ANTHROPIC_API_KEY``. It has the
@@ -19,7 +20,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from pydantic import SecretStr
 
+from sama.modelproxy import MemoryUsageStore, ModelProxy, PriceTable, ProxySettings
 from sama.orchestrator.sandboxed import RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.runtime import RunConfig, RunScope, RuntimeKind
 from sama.runtime.runner import GatePolicy
@@ -94,6 +97,24 @@ def scripted_model() -> Iterator[tuple[ScriptedModel, str]]:
         yield model, url
 
 
+@pytest.fixture(scope="session")
+def model_proxy(
+    scripted_model: tuple[ScriptedModel, str], tool_server: tuple[ToolServer, str]
+) -> Iterator[tuple[MemoryUsageStore, str]]:
+    """The model proxy in front of the scripted model. It accepts the run tokens of the suite."""
+    _, model_url = scripted_model
+    tools, _ = tool_server
+    store = MemoryUsageStore()
+    proxy = ModelProxy(
+        signer=tools.run_tokens,
+        store=store,
+        prices=PriceTable.load(),
+        settings=ProxySettings(anthropic_url=model_url, anthropic_key=SecretStr("scripted-model")),
+    )
+    with serve(proxy.app()) as url:
+        yield store, url
+
+
 def _suite_gate() -> ToolGate:
     """Asks for the gated tools and allows the others."""
     from sama.runtime.claude import GateDecision
@@ -123,8 +144,8 @@ async def target(
         return
 
     if request.param in {"claude-runner", "claude-docker"}:
-        _, model_url = request.getfixturevalue("scripted_model")
-        sandboxed = _sandboxed_runtime(request.param, tools, model_url, tmp_path)
+        store, proxy_url = request.getfixturevalue("model_proxy")
+        sandboxed = _sandboxed_runtime(request.param, tools, proxy_url, tmp_path)
         yield ClaudeTarget(
             name=request.param,
             runtime=sandboxed,
@@ -132,6 +153,7 @@ async def target(
             tools=tools,
             prompts=SCRIPTED_PROMPTS,
             files=SandboxFiles(sandboxed),
+            model_calls=store,
         )
         await sandboxed.close_sandboxes(kill=True)
         return

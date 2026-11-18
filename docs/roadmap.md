@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.6.
+Done: M1.1 to M1.7.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -56,8 +56,11 @@ Done: M1.1 to M1.6.
   (architecture Section 16.2). The image is `sandbox/Dockerfile`. CI builds it and runs the
   Docker provider tests and the `claude-docker` conformance target. The nightly job builds the
   E2B template `sama-runner` and runs the E2B tests. It needs the repository secret
-  `E2B_API_KEY`. The model proxy (M1.7) is not there yet, so a live Claude run in E2B waits
-  for M1.7.
+  `E2B_API_KEY`.
+- M1.7: the model proxy in `src/sama/modelproxy/` (architecture Section 16.6), with the price
+  table `prices.toml` and the `model_calls` table (migration `0002`). The `claude-runner` and
+  `claude-docker` conformance targets send their model calls through the proxy. A live Claude
+  run in E2B needs a proxy URL that the sandbox can reach, so it waits for the deploy (M1.15).
 
 | # | Item | Acceptance criteria |
 |---|---|---|

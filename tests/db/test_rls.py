@@ -22,7 +22,14 @@ from tests.db.world import World
 pytestmark = pytest.mark.usefixtures("world")
 
 TABLES = sorted(Base.metadata.tables)
-SESSION_CHILDREN = ("runs", "messages", "run_events", "tool_calls", "session_bindings")
+SESSION_CHILDREN = (
+    "runs",
+    "messages",
+    "run_events",
+    "tool_calls",
+    "session_bindings",
+    "model_calls",
+)
 INSUFFICIENT_PRIVILEGE = "42501"
 
 # What each user can read. Session children are listed by their session.

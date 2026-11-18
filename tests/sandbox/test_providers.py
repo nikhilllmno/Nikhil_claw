@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import os
 import sys
 import uuid
@@ -22,6 +23,7 @@ import pytest
 from sama.orchestrator.sandboxed import RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.runtime import RunCompleted, RunConfig, RunRequest, RuntimeKind, Usage
 from sama.runtime.fake import FakeScript
+from sama.runtime.runner import forbidden_env
 from sama.sandbox import Sandbox, SandboxError, SandboxNotFoundError, SandboxProvider, SandboxSpec
 from sama.tenancy import RunTokenSigner
 from tests.support import collect, make_scope
@@ -216,6 +218,48 @@ async def test_the_runner_runs_in_the_sandbox(harness: Harness) -> None:
         await runtime.close_sandboxes(kill=True)
     assert isinstance(events[-1], RunCompleted), events[-1]
     assert events[-1].output == "hi"
+
+
+_ENV_DUMP: Final = (
+    "import json, os; "
+    "print(json.dumps({'type': 'run_completed', 'output': json.dumps(dict(os.environ)),"
+    " 'usage': {}}))"
+)
+
+
+async def test_the_sandbox_has_no_provider_key(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Roadmap M1.7: the host has provider keys, and the runner in the sandbox sees none of them.
+    It has the run token and the model proxy URL."""
+    secrets = {name: f"sk-host-{name.lower()}" for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    runtime = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=harness.provider,
+        signer=RunTokenSigner(b"t" * 32),
+        settings=SandboxSettings(
+            template=harness.spec().template,
+            runner_argv=(harness.runner[0], "-c", _ENV_DUMP),
+            model_url="http://proxy.test:8787",
+        ),
+    )
+    scope = make_scope(f"run-{uuid.uuid4().hex[:8]}").model_copy(
+        update={"session_id": f"sess-{uuid.uuid4().hex[:8]}"}
+    )
+    config = RunConfig(runtime=RuntimeKind.FAKE, model="fake")
+    try:
+        events = await collect(runtime.run(RunRequest(scope=scope, input="hi", config=config)))
+    finally:
+        await runtime.close_sandboxes(kill=True)
+    last = events[-1]
+    assert isinstance(last, RunCompleted), last
+    env: dict[str, str] = json.loads(last.output)
+    assert not forbidden_env(env)
+    assert not [name for name, value in env.items() if value in secrets.values()]
+    assert env["SAMA_MODEL_URL"] == "http://proxy.test:8787"
+    assert env["SAMA_RUN_TOKEN"]
 
 
 _CURL: Final = ("curl", "-sS", "-I", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10")
