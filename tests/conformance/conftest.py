@@ -121,7 +121,12 @@ def _suite_gate() -> ToolGate:
 
     class SuiteGate:
         async def check(
-            self, scope: RunScope, tool_name: str, arguments: Mapping[str, Any]
+            self,
+            scope: RunScope,
+            tool_name: str,
+            arguments: Mapping[str, Any],
+            *,
+            call_id: str,
         ) -> GateDecision:
             if is_gated(tool_name):
                 return GateDecision("ask", "the suite gates this tool")

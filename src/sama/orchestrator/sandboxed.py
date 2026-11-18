@@ -154,10 +154,12 @@ class SandboxSettings:
     """``template`` is the provider template or image. ``allow_out`` is the egress
     allowlist of every session sandbox: E2B blocks all other hosts, and an empty list blocks
     all of them. ``open_egress`` turns the block off, for development only. ``model_url`` is
-    the model proxy (M1.7)."""
+    the model proxy (M1.7). ``gate_url`` is the gate endpoint of the control plane (M1.9):
+    with it, the runner asks the control plane for each tool call."""
 
     template: str
     model_url: str | None = None
+    gate_url: str | None = None
     allow_out: tuple[str, ...] = ()
     open_egress: bool = False
     runner_argv: tuple[str, ...] = RUNNER_ARGV
@@ -179,6 +181,8 @@ class SandboxedRuntime:
     ) -> None:
         if kind not in CAPABILITIES:
             raise ValueError(f"the runner does not support runtime {kind}")
+        if gate is not None and settings.gate_url is not None:
+            raise ValueError("set settings.gate_url or a static gate, not both")
         self._kind = kind
         self._provider = provider
         self._signer = signer
@@ -216,7 +220,13 @@ class SandboxedRuntime:
             yield _invalid(problem)
             return
         scripts, self.fake_scripts = tuple(self.fake_scripts), []
-        job = RunnerJob(op="run", run=request, gate=self._gate, fake_scripts=scripts)
+        job = RunnerJob(
+            op="run",
+            run=request,
+            gate=self._gate,
+            gate_url=self._settings.gate_url,
+            fake_scripts=scripts,
+        )
         async with contextlib.aclosing(self._invoke(job, request.scope, request.budget)) as stream:
             async for event in stream:
                 yield event
@@ -238,7 +248,9 @@ class SandboxedRuntime:
         # reaches the runner, ``_invoke`` gives the approval back for a retry.
         self._used_approvals.add(request.approval_id)
         self._paused.discard(run_id)
-        job = RunnerJob(op="resume", resume=request, gate=self._gate)
+        job = RunnerJob(
+            op="resume", resume=request, gate=self._gate, gate_url=self._settings.gate_url
+        )
         # The usage at the pause is in the opaque runtime state. Only the runner reads it, so a
         # failure before the runner starts reports zero usage.
         stream = self._invoke(job, request.scope, request.budget, approval_id=request.approval_id)

@@ -111,10 +111,17 @@ class GateDecision:
 
 
 class ToolGate(Protocol):
-    """Decides each tool call. The real gate comes in M1.9 (architecture Section 16.1)."""
+    """Decides each tool call (architecture Section 16.1). ``call_id`` is the tool use id. In
+    the sandbox the runner uses ``RemoteGate``, which asks the ``GateService`` of the control
+    plane."""
 
     async def check(
-        self, scope: RunScope, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        scope: RunScope,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        call_id: str,
     ) -> GateDecision: ...
 
 
@@ -122,7 +129,12 @@ class AllowAllGate:
     """Allows every tool call. Only for tests and local development."""
 
     async def check(
-        self, scope: RunScope, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        scope: RunScope,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        call_id: str,
     ) -> GateDecision:
         return GateDecision("allow")
 
@@ -913,7 +925,7 @@ class ClaudeRuntime:
                 decision = GateDecision("allow", "approved by the user")
             else:
                 try:
-                    decision = await gate.check(scope, tool_name, arguments)
+                    decision = await gate.check(scope, tool_name, arguments, call_id=call_id)
                 except Exception as exc:
                     decision = GateDecision("deny", f"the tool gate failed: {type(exc).__name__}")
             action: Literal["allow", "deny", "defer"]

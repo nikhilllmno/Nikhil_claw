@@ -240,3 +240,24 @@ def test_the_claude_runtime_gets_the_static_gate(tmp_path: object) -> None:
     job = RunnerJob(op="run", run=request, gate=GatePolicy(ask=("Bash",), deny=("Write",)))
     runtime = build_runtime(job, {**ENV, "SAMA_WORKDIR": str(tmp_path)})
     assert runtime.kind is RuntimeKind.CLAUDE_AGENT_SDK
+
+
+def test_the_claude_runtime_gets_the_remote_gate(tmp_path: object) -> None:
+    pytest.importorskip("claude_agent_sdk")
+    from sama.runtime.remote_gate import RemoteGate
+
+    request = RunRequest(
+        scope=make_scope(), input="hi", config=make_config(RuntimeKind.CLAUDE_AGENT_SDK)
+    )
+    job = RunnerJob(op="run", run=request, gate_url="http://tools:8001/gate")
+    runtime = build_runtime(job, {**ENV, "SAMA_WORKDIR": str(tmp_path)})
+    gate = runtime._gate  # type: ignore[attr-defined]
+    assert isinstance(gate, RemoteGate)
+    assert "http://tools:8001/gate" in repr(gate)
+
+
+def test_a_job_has_a_gate_url_or_a_static_gate() -> None:
+    request = RunRequest(scope=make_scope(), input="hi", config=make_config())
+    with pytest.raises(ValidationError, match="gate_url or a static gate"):
+        RunnerJob(op="run", run=request, gate=GatePolicy(ask=("Bash",)), gate_url="http://x/gate")
+    assert RunnerJob(op="run", run=request, gate_url="http://x/gate").gate_url

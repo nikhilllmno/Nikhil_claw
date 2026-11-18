@@ -7,6 +7,8 @@ Org A has the workspaces ``a1`` and ``a2``. Org B has ``b1``.
 - ``dave``: org A member with no workspace.
 - ``bob``: org B owner and member of ``b1``. Owns the private session ``b1-bob``.
 - ``stranger``: a Supabase Auth user with no sama user row.
+
+Each org has an org-wide tool policy rule. Alice and dave each have a personal rule.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from sqlalchemy.pool import NullPool
 from sama.db import create_engine
 from sama.db.models import (
     AgentProfile,
+    Approval,
     AuditEntry,
     Membership,
     Message,
@@ -33,6 +36,7 @@ from sama.db.models import (
     SessionBinding,
     SessionTodo,
     ToolCall,
+    ToolPolicy,
     User,
     Workspace,
 )
@@ -165,6 +169,17 @@ def plan(
             tool_name="web_search",
         )
         add(
+            Approval,
+            org_id=org_id,
+            session_id=ids[session],
+            run_id=run_id,
+            call_id="call-1",
+            tool_name="Bash",
+            arguments={"command": "make test"},
+            arguments_digest="0" * 64,
+            expires_at=text("now() + interval '1 day'"),
+        )
+        add(
             SessionBinding,
             org_id=org_id,
             workspace_id=ids[workspace],
@@ -196,6 +211,21 @@ def plan(
             session_id=ids[session],
             items=[{"id": "1", "content": f"todo of {session}", "status": "pending"}],
             run_id=run_id,
+        )
+    policies: tuple[tuple[str, str, str | None], ...] = (
+        ("rule:org-a", "org-a", None),
+        ("rule:org-b", "org-b", None),
+        ("rule:alice", "org-a", "alice"),
+        ("rule:dave", "org-a", "dave"),
+    )
+    for label, org, owner in policies:
+        add(
+            ToolPolicy,
+            label,
+            org_id=ids[org],
+            user_id=ids[owner] if owner else None,
+            tool="Bash",
+            action="allow" if owner else "ask",
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")

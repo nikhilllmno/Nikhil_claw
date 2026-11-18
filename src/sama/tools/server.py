@@ -12,7 +12,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Protocol
 
 import anyio
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
@@ -20,13 +20,15 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import Field
+from pydantic import Field, ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sama.gate.decide import Verdict
+from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
 from sama.tools.clarify import (
     MAX_QUESTIONS,
@@ -62,6 +64,18 @@ MAX_ERROR_CHARS: Final = 2_000
 
 _EXPECTED = (ClarifyError, SearchError, TodoError)
 _NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
+
+
+class GateBackend(Protocol):
+    """The tool gate of the control plane, normally ``sama.gate.service.GateService``."""
+
+    async def check(
+        self, claims: RunTokenClaims, call_id: str, tool_name: str, arguments: Mapping[str, Any]
+    ) -> Verdict: ...
+
+    async def screen(
+        self, claims: RunTokenClaims, tool_name: str, arguments: Mapping[str, Any]
+    ) -> Verdict: ...
 
 
 def bearer_of(headers: Mapping[str, str] | None) -> str | None:
@@ -115,6 +129,9 @@ class ToolServer:
     - ``clarify``: the clarify broker. Without it, ``clarify`` is hidden.
     - ``spill``: where large outputs go. Without it, a large output keeps only its head and
       tail.
+    - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
+      it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
+      and the runner denies every call.
     """
 
     def __init__(
@@ -126,8 +143,10 @@ class ToolServer:
         search: SearchProvider | None = None,
         clarify: ClarifyBroker | None = None,
         spill: Spill | None = None,
+        gate: GateBackend | None = None,
     ) -> None:
         self.signer = signer
+        self.gate = gate
         self.todos = todos
         self.outbound = outbound or OutboundClient()
         self.search = search
@@ -149,13 +168,21 @@ class ToolServer:
             raise ToolError(str(error)) from None
 
     async def _call(
-        self, ctx: Context, tool: str, body: Callable[[RunTokenClaims], Awaitable[str]]
+        self,
+        ctx: Context,
+        tool: str,
+        arguments: Mapping[str, Any],
+        body: Callable[[RunTokenClaims], Awaitable[str]],
     ) -> str:
         claims = self.claims(ctx)
         started = time.monotonic()
         ok = False
         size = 0
         try:
+            if self.gate is not None:
+                verdict = await self.gate.screen(claims, tool, arguments)
+                if verdict.action == "deny":
+                    raise ToolError(f"the tool gate denied the call: {verdict.reason}")
             text = await cap(await body(claims), tool=tool, claims=claims, spill=self.spill)
             size = len(text.encode("utf-8"))
             ok = True
@@ -198,7 +225,7 @@ class ToolServer:
                 async def body(_claims: RunTokenClaims) -> str:
                     return format_hits(query, await search.search(query, limit))
 
-                return await self._call(ctx, WEB_SEARCH, body)
+                return await self._call(ctx, WEB_SEARCH, {"query": query, "limit": limit}, body)
 
         @server.tool(
             name=WEB_EXTRACT,
@@ -219,7 +246,7 @@ class ToolServer:
             async def body(_claims: RunTokenClaims) -> str:
                 return await extract(self.outbound, urls)
 
-            return await self._call(ctx, WEB_EXTRACT, body)
+            return await self._call(ctx, WEB_EXTRACT, {"urls": urls}, body)
 
         if self.clarify is not None:
             broker = self.clarify
@@ -243,7 +270,8 @@ class ToolServer:
                 async def body(claims: RunTokenClaims) -> str:
                     return render_answers(questions, await broker.ask(claims, questions))
 
-                return await self._call(ctx, CLARIFY, body)
+                arguments = {"questions": [q.model_dump(mode="json") for q in questions]}
+                return await self._call(ctx, CLARIFY, arguments, body)
 
         @server.tool(
             name=TODO,
@@ -271,7 +299,8 @@ class ToolServer:
                     )
                 )
 
-            return await self._call(ctx, TODO, body)
+            changes = None if todos is None else [t.model_dump(mode="json") for t in todos]
+            return await self._call(ctx, TODO, {"todos": changes, "merge": merge}, body)
 
         return server
 
@@ -301,10 +330,46 @@ class ToolServer:
         return Starlette(
             routes=[
                 Route("/healthz", healthz, methods=["GET"]),
+                Route(GATE_PATH, self._gate_endpoint, methods=["POST"]),
                 Mount("", app=_RunTokenGate(inner, self.signer)),
             ],
             lifespan=lifespan,
         )
+
+    async def _gate_endpoint(self, request: Request) -> Response:
+        """``POST /gate``: the verdict for one tool call of the run of the token."""
+        try:
+            claims = verify_bearer(self.signer, request.headers)
+        except InvalidRunTokenError as error:
+            return _unauthorized(error)
+        if self.gate is None:
+            return JSONResponse({"error": "the tool gate is not configured"}, status_code=503)
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > MAX_GATE_BODY_BYTES:
+                return JSONResponse({"error": "the gate request is too large"}, status_code=413)
+        try:
+            body = GateRequest.model_validate_json(bytes(raw))
+        except ValidationError:
+            return JSONResponse({"error": "the gate request is not valid"}, status_code=422)
+        try:
+            verdict = await self.gate.check(claims, body.call_id, body.tool_name, body.arguments)
+            answer = GateAnswer(
+                action=verdict.action, reason=verdict.reason, step=str(verdict.step)
+            )
+        except Exception as error:
+            log.error("gate failed run=%s error=%s", claims.run_id, type(error).__name__)
+            answer = GateAnswer(action="deny", reason="the tool gate failed")
+        return JSONResponse(answer.model_dump())
+
+
+def _unauthorized(error: InvalidRunTokenError) -> Response:
+    return JSONResponse(
+        {"error": str(error)},
+        status_code=401,
+        headers={"www-authenticate": 'Bearer realm="sama"'},
+    )
 
 
 class _RunTokenGate:
@@ -323,12 +388,7 @@ class _RunTokenGate:
         try:
             verify_bearer(self.signer, Request(scope).headers)
         except InvalidRunTokenError as error:
-            response = JSONResponse(
-                {"error": str(error)},
-                status_code=401,
-                headers={"www-authenticate": 'Bearer realm="sama"'},
-            )
-            await response(scope, receive, send)
+            await _unauthorized(error)(scope, receive, send)
             return
         await _cancel_on_disconnect(self.app, scope, receive, send)
 

@@ -52,6 +52,7 @@ MESSAGE_ROLES: Final = ("user", "assistant", "system", "tool")
 RUN_STATUSES: Final = ("queued", "running", "paused", "completed", "failed", "cancelled")
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
+APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
 CHANNELS: Final = ("web", "slack", "telegram", "extension")
 ACTOR_KINDS: Final = ("user", "agent", "system")
 PROVIDERS: Final = ("anthropic", "openai")
@@ -247,6 +248,9 @@ class Run(Base):
     budget: Mapped[dict[str, Any]] = _json()
     usage: Mapped[dict[str, Any]] = _json()
     runtime_state: Mapped[str | None] = mapped_column(Text)
+    unattended: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True for a run that no human watches, for example a cron job or a webhook. The tool
+    gate turns ``ask`` into ``deny`` in these runs (docs/architecture.md, Section 16.1)."""
     failure_code: Mapped[str | None] = mapped_column(Text)
     failure_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
@@ -330,6 +334,8 @@ class ToolCall(Base):
     call_id: Mapped[str] = mapped_column(Text, nullable=False)
     tool_name: Mapped[str] = mapped_column(Text, nullable=False)
     arguments: Mapped[dict[str, Any]] = _json()
+    # The digest of the full arguments. The gate binds a call id to one tool and one digest.
+    arguments_digest: Mapped[str | None] = mapped_column(Text)
     decision: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="started")
     result_preview: Mapped[str | None] = mapped_column(Text)
@@ -463,4 +469,80 @@ class SessionTodo(Base):
     )
     run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     """The run of the last change. Not a foreign key: the list outlives a deleted run."""
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class Approval(Base):
+    """A human decision for one tool call that the tool gate sent to ``ask``
+    (docs/architecture.md, Section 16.1). ``call_id`` is the approval id of the run."""
+
+    __tablename__ = "approvals"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "decided_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("run_id", "call_id"),
+        CheckConstraint(_one_of("status", APPROVAL_STATUSES), name="status"),
+        CheckConstraint("(status = 'pending') = (decided_at IS NULL)", name="decided_at"),
+        Index(None, "org_id", "session_id"),
+        Index(None, "status", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    call_id: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_name: Mapped[str] = mapped_column(Text, nullable=False)
+    arguments: Mapped[dict[str, Any]] = _json()
+    arguments_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    """The digest of the full arguments. ``arguments`` can be cut, so the gate compares this."""
+    reason: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ToolPolicy(Base):
+    """One policy rule of the tool gate (docs/architecture.md, Section 16.1, step 4).
+
+    No profile and no user: an org rule. A profile: a rule for that agent profile. A user: a
+    rule of that user ("always allow this tool for me"), for one profile or for all.
+    """
+
+    __tablename__ = "tool_policies"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint(
+            "org_id", "agent_profile_id", "user_id", "tool", postgresql_nulls_not_distinct=True
+        ),
+        CheckConstraint(_one_of("action", TOOL_DECISIONS), name="action"),
+        CheckConstraint("length(tool) BETWEEN 1 AND 200", name="tool_length"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    agent_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    """An exact tool name, or a prefix that ends with ``*``."""
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()

@@ -30,6 +30,7 @@ SESSION_CHILDREN = (
     "session_bindings",
     "model_calls",
     "session_todos",
+    "approvals",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 
@@ -71,6 +72,14 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "sessions": set(),
     },
 }
+# Org rules for every member; a personal rule for its user and the admins.
+TOOL_POLICIES = {
+    "alice": {"rule:org-a", "rule:alice"},
+    "carol": {"rule:org-a", "rule:alice", "rule:dave"},
+    "dave": {"rule:org-a", "rule:dave"},
+    "bob": {"rule:org-b"},
+    "stranger": set(),
+}
 AUDIT_ROWS = {"alice": 0, "carol": 1, "dave": 0, "bob": 1, "stranger": 0}
 MEMBERSHIP_ROWS = {"alice": 4, "carol": 4, "dave": 4, "bob": 2, "stranger": 0}
 
@@ -108,6 +117,7 @@ async def test_each_user_reads_only_the_rows_they_may_see(
             assert seen == expected["sessions"], table
         assert await count(connection, "memberships") == MEMBERSHIP_ROWS[user]
         assert await count(connection, "audit_log") == AUDIT_ROWS[user]
+        assert await labels(connection, world, "tool_policies", "id") == TOOL_POLICIES[user]
 
 
 @pytest.mark.parametrize("table", TABLES)

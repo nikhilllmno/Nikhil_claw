@@ -383,7 +383,8 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   `strict_mcp_config=True`. Remote MCP servers are `http` servers with the run token in an
   `Authorization` header. `include_partial_messages=True` gives text deltas. The preset prompt
   uses `exclude_dynamic_sections=True`, so the prefix stays the same for the prompt cache.
-- **Tool gate.** The `PreToolUse` hook calls the `ToolGate`. `allow` and `deny` go to the CLI.
+- **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
+  16.1). `allow` and `deny` go to the CLI.
   `ask` becomes `defer`. A sub-agent cannot pause the run, so `ask` inside a sub-agent becomes
   `deny`. If the gate fails, the call gets `deny`.
 - **Pause.** On `defer`, the CLI ends the turn with `stop_reason` `tool_deferred` and
@@ -1134,6 +1135,102 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
 the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
 
+**Code (M1.9).**
+
+| Part | Where | What it does |
+|---|---|---|
+| Verdict | `src/sama/gate/decide.py` | `decide(context, tool_name, arguments)` is a pure function. It runs the five steps and returns a `Verdict` (`action`, `step`, `reason`). |
+| Hardline | `src/sama/gate/hardline.py` | The fixed deny list for shell commands (`Bash`). |
+| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals. |
+| Wire | `src/sama/gate/wire.py` | `GateRequest` and `GateAnswer`, the body of `POST /gate`. |
+| Endpoint | `src/sama/tools/server.py` | `POST /gate` on the sama tool server. The runner sends the run token. |
+| Runner | `src/sama/runtime/remote_gate.py` | `RemoteGate` is the `ToolGate` of the runner. It posts each call to `/gate`. |
+
+Flow:
+
+1. The `PreToolUse` hook of the runner calls `RemoteGate.check` with the tool use id.
+2. The tool server checks the run token and calls `GateService.check`.
+3. `GateService` loads the run, its profile, the policy rules, the tool call row, and the
+   approval of this call id in one transaction. It records the verdict and returns it. A
+   transaction-level advisory lock on the run and the call id puts concurrent checks of one
+   call id in a sequence, so only one of them creates the approval.
+4. On `ask`, the adapter pauses the run (Section 5.3). The approval row already exists.
+
+If the control plane does not answer, or `GateService` fails, the call gets `deny`. Without
+a database the tool server has no gate: `/gate` answers `503`, so the runner denies every call.
+A static `GatePolicy` stays for tests and local development. A job cannot set both.
+
+Rules of the steps:
+
+- **Tool names.** `mcp__sama__X` is the sama tool `X`. Another MCP tool
+  (`mcp__server__tool`) is in no toolset until integrations add toolsets (Section 10), so it
+  gets `deny`.
+- **Toolsets.** `core` (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`,
+  `Grep`, `WebFetch`), `todo` (`todo`, `TodoWrite`), `web` (`web_search`, `web_extract`),
+  and `clarify`. They come from `agent_profiles.toolsets`. An unknown name has no tools. The
+  default is an empty list, so a new profile can use no tool until an admin sets its toolsets.
+- **Hardline.** Recursive deletes of `/`, `~`, `$HOME`, or a top-level system folder;
+  `--no-preserve-root`; fork bombs; `mkfs`, `wipefs`, `blkdiscard`; `dd`, `shred`, or `>` to
+  a disk device; a remote script piped to a root shell; and recursive `chmod`, `chown`, or
+  `chgrp` of `/`. A delete target is normalized first, so `/etc/../usr` is `/usr`. A
+  command longer than 32,000 characters is on the list too. The check takes linear time,
+  because it runs in the event loop of the tool server for all orgs: no pattern has a gap
+  that can follow many start positions, and each check with a gap scans each command segment
+  a fixed number of times. The
+  list is a guard against accidents, not a sandbox. The sandbox is the real boundary
+  (Section 16.2).
+- **Call identity.** The first check of a call id binds the id to the tool name and the
+  SHA-256 digest of the arguments (canonical JSON) in `tool_calls`. A later check of the
+  same id with another tool or other arguments gets `deny` and does not change the row. A
+  retry of the same call gets a verdict again.
+- **Recorded decision.** An approval holds the tool name and the digest of the arguments.
+  If the call does not match, it gets `deny`. `approved` gives
+  `allow`. `rejected` and `expired` give `deny`. `pending` gives `ask`.
+- **Policy.** `tool_policies` rows have a level: org (no profile, no user), profile, or user.
+  The user is the user who started the run, else the user of the run token. A rule matches an
+  exact tool name or a prefix that ends with `*`. At one level an exact name wins over a
+  prefix. A `deny` at any level wins. An org or profile `ask` holds over a user rule. Else
+  the user rule wins, then the profile rule, then the org rule. Without a rule, read-only
+  tools are allowed (`Read`, `Glob`, `Grep`, `todo`, `TodoWrite`, `web_search`,
+  `web_extract`, `clarify`) and every other tool gets `ask`. The classifier comes later.
+- **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
+  `deny`, and `ask` becomes `deny`. Job pre-approvals come with jobs (M3); until then the set
+  is empty.
+
+Records, all in the transaction of the verdict:
+
+- `tool_calls`: one row per call id, with the tool name, the arguments, `arguments_digest`
+  (migration `0004`), `decision`, and `status` (`started` or `denied`).
+- `approvals` (migration `0004`): one row per `ask`, keyed by `(run_id, call_id)`. The
+  approval id is the tool use id. Columns: the tool name, the arguments (cut at 8,000
+  characters), the digest, the reason, the status, `expires_at`, and the decider. RLS follows
+  the session.
+- `tool_policies` (migration `0004`): the rules. Unique per org, profile, user, and tool.
+  Members read the org and profile rules and their own user rules. Admins read all rules.
+- `audit_log`: `tool_gate.verdict` for each verdict, `approval.requested`,
+  `approval.approved`, `approval.rejected`, `approval.expired`, and `tool_policy.set`.
+  `tool_gate.screen` records a deny of the tool server check (below).
+
+Approvals:
+
+- `GateService.decide_approval` records a human decision. Only a user who can read the session
+  decides (the rule of `session_visible`). A decision after `expires_at` raises
+  `ApprovalExpiredError` and the approval becomes `expired`.
+- With "always allow", it writes a user rule (`allow`) for the tool and the run profile, and
+  the audit row `tool_policy.set`.
+- `GateService.expire()` times out due approvals in batches of 500. The worker calls it
+  (M1.10). The gate also times out an approval when it reads it.
+- The API (M1.12) and the channels (M1.13) call `decide_approval` and then resume the run.
+
+**Tool server check.** Before each sama MCP tool call, the tool server calls
+`GateService.screen`, which runs the same steps without a call id. The server refuses
+`deny`. It lets `ask` through, because the hook of the runner asked already.
+
+**Known gaps (M1.18).** A process in the sandbox has the run token, so it can call an `ask`
+tool of the sama MCP server directly in an attended run. On resume the Claude adapter allows
+the approved call without a new gate check, so the server has no ticket for that call. Live
+authority checks and per-call tickets close both gaps in M1.18.
+
 ### 16.2 Sandbox and runner (M1.6)
 
 - One E2B sandbox per session, from the sama template `sama-runner`. It pauses when idle and
@@ -1162,8 +1259,9 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 
 **Runner protocol.** One JSON object per line.
 
-- stdin, line 1: a `RunnerJob` with a `RunRequest` or a `ResumeRequest` and a static tool
-  policy (`ask`, `deny`). M1.9 replaces the static policy with a call to the control plane.
+- stdin, line 1: a `RunnerJob` with a `RunRequest` or a `ResumeRequest`, and `gate_url`, the
+  gate endpoint of the control plane (Section 16.1). Tests and local development can send a
+  static tool policy (`ask`, `deny`) instead.
 - stdin, later lines: `{"op": "cancel"}` cancels the run. The end of stdin also cancels it, so
   a runner never outlives its orchestrator.
 - stdout: one `RunEvent` per line. The last line is the terminal event. stderr: logs only.
@@ -1414,8 +1512,8 @@ one `clarify` call at a time: a new call of the same run ends the open call of t
 the old call returns "no answer". When a run ends, the orchestrator calls
 `cancel_run(org_id, run_id)` (M1.10). At most 5 questions of one session can be open. The broker is in
 the process of the tool server, so the API must run in the same process until the run queue
-(M1.10) moves the questions to Postgres. In unattended runs the tool gate (M1.9) denies
-`clarify`.
+(M1.10) moves the questions to Postgres. In unattended runs the tool gate denies `clarify`
+(Section 16.1).
 
 **Task list storage.** `session_todos` (migration `0003`) has one row per session: `org_id`,
 `workspace_id`, `session_id`, `items` (JSON), `run_id` of the last change, and `updated_at`. A
@@ -1427,10 +1525,12 @@ item. RLS follows the session, as for `model_calls`. Until the run queue writes 
 time (`sama.tools`). Arguments and results are not in the log, because they can contain
 personal data. An unexpected error in `web_extract` logs only the error type. The HTTPX and
 MCP SDK loggers log full URLs and error texts at `INFO`, so `python -m sama.tools` keeps only
-their warnings. The audit log rows come with the tool gate (M1.9).
+their warnings. The tool gate writes the audit log rows (Section 16.1).
 
-**Not in M1.8.** The tool gate checks toolsets and policy in M1.9. Until then the server lists
-every tool that it can serve. The Claude adapter does not yet map the native `TodoWrite` tool
+**Gate.** With a database, the server checks each call with the tool gate and refuses a
+`deny` (Section 16.1). It still lists every tool that it can serve.
+
+**Not in M1.8.** The Claude adapter does not yet map the native `TodoWrite` tool
 to `todo`. The search key comes from the environment of the server process. The vault replaces
 this in M1.17.
 
@@ -1471,13 +1571,15 @@ migrated schema.
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
 | `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status` |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content` |
-| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code` |
+| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
 | `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
 | `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |
 | `audit_log` | `org_id`, `workspace_id`, `actor_kind`, `actor_user_id`, `action`, `target_type`, `target_id`, `run_id`, `details` |
 | `model_calls` | One row per model proxy call (migration `0002`, Section 16.6) |
 | `session_todos` | The task list of a session, one row per session (migration `0003`, Section 16.7) |
+| `approvals` | One row per tool call that asks a human (migration `0004`, Section 16.1) |
+| `tool_policies` | Tool gate rules per org, profile, and user (migration `0004`, Section 16.1) |
 
 Rules:
 
