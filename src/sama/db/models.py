@@ -16,6 +16,7 @@ from typing import Any, Final
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -27,6 +28,7 @@ from sqlalchemy import (
     Numeric,
     Text,
     UniqueConstraint,
+    false,
     func,
     text,
 )
@@ -430,6 +432,7 @@ class ModelCall(Base):
         Integer, nullable=False, server_default="0"
     )
     web_search_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    usage_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = _created_at()

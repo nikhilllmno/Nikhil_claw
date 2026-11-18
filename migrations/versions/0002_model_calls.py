@@ -35,6 +35,7 @@ def upgrade() -> None:
         sa.Column("cache_write_tokens", sa.Integer(), server_default="0", nullable=False),
         sa.Column("cache_write_long_tokens", sa.Integer(), server_default="0", nullable=False),
         sa.Column("web_search_requests", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("usage_estimated", sa.Boolean(), server_default=sa.false(), nullable=False),
         sa.Column("cost_usd", sa.Numeric(precision=20, scale=10), nullable=False),
         sa.Column("duration_ms", sa.Integer(), nullable=False),
         sa.Column(

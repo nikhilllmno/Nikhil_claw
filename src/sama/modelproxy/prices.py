@@ -11,11 +11,9 @@ import tomllib
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final, Self
+from typing import Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from sama.runtime.contract import Usage
 
 PRICES_FILE: Final = Path(__file__).with_name("prices.toml")
 MILLION: Final = Decimal(1_000_000)
@@ -49,15 +47,6 @@ class TokenCounts(_Frozen):
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.output
-
-    def to_usage(self, cost_usd: Decimal) -> Usage:
-        return Usage(
-            input_tokens=self.input,
-            output_tokens=self.output,
-            cache_read_tokens=self.cache_read,
-            cache_write_tokens=self.cache_write + self.cache_write_long,
-            cost_usd=cost_usd,
-        )
 
 
 class Rates(_Frozen):
@@ -95,11 +84,7 @@ class PriceTable(_Frozen):
 
     @classmethod
     def load(cls, path: Path = PRICES_FILE) -> Self:
-        return cls.from_data(tomllib.loads(path.read_text(encoding="utf-8")))
-
-    @classmethod
-    def from_data(cls, data: dict[str, Any]) -> Self:
-        return cls.model_validate(data)
+        return cls.model_validate(tomllib.loads(path.read_text(encoding="utf-8")))
 
     def _prices(self, provider: Provider) -> ProviderPrices:
         return self.anthropic if provider is Provider.ANTHROPIC else self.openai

@@ -429,33 +429,151 @@ async def test_the_user_daily_limit_applies_only_to_that_user(harness: Harness) 
 # Client disconnect ----------------------------------------------------------------------------
 
 
-async def test_the_call_is_recorded_when_the_client_stops_reading() -> None:
-    """The real server, so the client can close the connection in the middle of the stream."""
-
-    async def slow_stream() -> AsyncIterator[bytes]:
-        yield anthropic_stream().split(b"\n\n")[0] + b"\n\n"  # message_start only
-        await asyncio.sleep(30)
-        yield b""
-
-    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
-    upstream.reply = lambda _: httpx.Response(200, content=slow_stream())
-    proxy = make_proxy(upstream, store, signer)
-    token = signer.issue(make_scope("run-1"), ttl_s=60)
+async def read_one_chunk(
+    proxy: ModelProxy, store: MemoryUsageStore, path: str, body: dict[str, Any], token: str
+) -> CallRecord:
+    """Runs the real server, reads one chunk, and closes the connection. Returns the record."""
     with serve(proxy.app()) as url:
         async with (
             httpx.AsyncClient(base_url=url) as client,
-            client.stream(
-                "POST",
-                "/anthropic/v1/messages",
-                json={"model": MODEL, "stream": True, "messages": []},
-                headers={"x-api-key": token},
-            ) as response,
+            client.stream("POST", path, json=body, headers={"x-api-key": token}) as response,
         ):
-            async for chunk in response.aiter_bytes():
-                assert b"message_start" in chunk
+            async for _ in response.aiter_bytes():
                 break
         async with asyncio.timeout(5):
             while not store.calls:  # noqa: ASYNC110 - the server thread writes the record
                 await asyncio.sleep(0.05)
     await proxy.aclose()
-    assert store.calls[0].counts == TokenCounts(input=50, output=1)
+    return store.calls[0]
+
+
+def events(*items: dict[str, Any]) -> list[bytes]:
+    return [f"data: {json.dumps(item)}\n\n".encode() for item in items]
+
+
+async def test_the_proxy_reads_the_rest_of_the_stream_when_the_client_stops() -> None:
+    """OpenAI sends the usage only at the end. A client that stops early still pays."""
+    first, last = events(
+        {"type": "response.output_text.delta", "delta": "hi"},
+        {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 40, "output_tokens": 900}},
+        },
+    )
+
+    async def stream() -> AsyncIterator[bytes]:
+        yield first
+        await asyncio.sleep(0.5)  # the client is gone now
+        yield last
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer)
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    body = {"model": "gpt-6-luna", "stream": True, "input": "hi"}
+    call = await read_one_chunk(proxy, store, "/openai/v1/responses", body, token)
+    assert call.counts == TokenCounts(input=40, output=900)
+    assert not call.usage_estimated
+
+
+async def test_a_stream_with_no_final_usage_is_charged_a_high_estimate() -> None:
+    async def stream() -> AsyncIterator[bytes]:
+        yield anthropic_stream().split(b"\n\n")[0] + b"\n\n"  # message_start only
+        await asyncio.sleep(30)
+        yield b""
+
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    upstream.reply = lambda _: httpx.Response(200, content=stream())
+    proxy = make_proxy(upstream, store, signer, drain_s=0.3)
+    token = signer.issue(make_scope("run-1"), ttl_s=60, budget=Budget(max_cost_usd=Decimal("0.01")))
+    body = {"model": MODEL, "stream": True, "max_tokens": 2000, "messages": []}
+    call = await read_one_chunk(proxy, store, "/anthropic/v1/messages", body, token)
+    assert call.usage_estimated
+    assert call.counts.input == 50  # the seen input is higher than the size estimate
+    assert call.counts.output == 2000
+    # 50 input at 2 USD and 2,000 output at 10 USD per million tokens.
+    assert call.cost_usd == Decimal("0.0201")
+    # The estimate counts against the budget.
+    proxy = make_proxy(upstream, store, signer)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+        refused = await client.post(
+            "/anthropic/v1/messages", json=body, headers={"x-api-key": token}
+        )
+    await proxy.aclose()
+    assert refused.status_code == 402
+
+
+class FailingStore(MemoryUsageStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.broken = True
+        self.reads_fail = False
+
+    async def record(self, call: CallRecord) -> None:
+        if self.broken:
+            raise RuntimeError("the database is down")
+        await super().record(call)
+
+    async def org_limits(self, org_id: str) -> OrgLimits:
+        if self.reads_fail:
+            raise RuntimeError("the database is down")
+        return await super().org_limits(org_id)
+
+
+async def test_a_record_that_cannot_be_written_blocks_the_org() -> None:
+    upstream, store, signer = Upstream(), FailingStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, record_retry_s=0.0)
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    other = signer.issue(make_scope("run-2").model_copy(update={"org_id": "org-2"}), ttl_s=60)
+    payload = {"model": MODEL, "max_tokens": 10, "messages": []}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+
+        async def call(key: str) -> httpx.Response:
+            return await client.post(
+                "/anthropic/v1/messages", json=payload, headers={"x-api-key": key}
+            )
+
+        assert (await call(token)).status_code == 200  # the response is already paid for
+        assert len(proxy.unrecorded) == 1
+        blocked = await call(token)
+        assert blocked.status_code == 503
+        assert len(upstream.requests) == 1
+        store.broken = False
+        assert (await call(other)).status_code == 200  # flushes the pending record
+        assert proxy.unrecorded == []
+        assert (await call(token)).status_code == 200
+    await proxy.aclose()
+    assert [c.run_id for c in store.calls] == ["run-1", "run-2", "run-1"]
+
+
+async def test_a_store_that_cannot_read_refuses_the_call() -> None:
+    upstream, store, signer = Upstream(), FailingStore(), RunTokenSigner(KEY)
+    store.broken, store.reads_fail = False, True
+    proxy = make_proxy(upstream, store, signer)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+        response = await client.post(
+            "/anthropic/v1/messages",
+            json={"model": MODEL, "messages": []},
+            headers={"x-api-key": signer.issue(make_scope("run-1"), ttl_s=60)},
+        )
+    await proxy.aclose()
+    assert response.status_code == 503
+    assert upstream.requests == []
+
+
+async def test_openai_calls_use_the_standard_tier(harness: Harness) -> None:
+    harness.upstream.reply = lambda _: reply(json_body={"usage": {"input_tokens": 1}})
+    for extra in ({}, {"service_tier": "auto"}):
+        response = await harness.client.post(
+            "/openai/v1/responses",
+            json={"model": "gpt-6-luna", "input": "hi", **extra},
+            headers={"authorization": f"Bearer {harness.token()}"},
+        )
+        assert response.status_code == 200
+        assert harness.upstream.body()["service_tier"] == "default"

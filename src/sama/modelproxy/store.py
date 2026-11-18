@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, func, insert, select
+from sqlalchemy import ColumnElement, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import ModelCall, Org
@@ -36,6 +36,8 @@ class CallRecord(BaseModel):
     endpoint: Endpoint
     status_code: int
     counts: TokenCounts
+    usage_estimated: bool = False
+    """True when the final usage was not known and the proxy recorded a high estimate."""
     cost_usd: Decimal = Field(ge=0)
     duration_ms: int = Field(ge=0)
     created_at: datetime
@@ -134,6 +136,7 @@ class PostgresUsageStore:
             "cache_write_tokens": call.counts.cache_write,
             "cache_write_long_tokens": call.counts.cache_write_long,
             "web_search_requests": call.counts.web_search_requests,
+            "usage_estimated": call.usage_estimated,
             "cost_usd": call.cost_usd,
             "duration_ms": call.duration_ms,
             "created_at": call.created_at,
@@ -144,26 +147,22 @@ class PostgresUsageStore:
     async def run_spend(self, org_id: str, run_id: str) -> Spend:
         query = select(
             func.coalesce(func.sum(_TOKENS), 0), func.coalesce(func.sum(ModelCall.cost_usd), 0)
-        ).where(and_(ModelCall.org_id == uuid.UUID(org_id), ModelCall.run_id == uuid.UUID(run_id)))
+        ).where(ModelCall.org_id == uuid.UUID(org_id), ModelCall.run_id == uuid.UUID(run_id))
         async with self._engine.connect() as connection:
             tokens, cost = (await connection.execute(query)).one()
         return Spend(tokens=int(tokens), cost_usd=Decimal(cost))
 
     async def org_cost(self, org_id: str, since: datetime) -> Decimal:
-        query = select(func.coalesce(func.sum(ModelCall.cost_usd), 0)).where(
-            and_(ModelCall.org_id == uuid.UUID(org_id), ModelCall.created_at >= since)
+        return await self._cost(
+            ModelCall.org_id == uuid.UUID(org_id), ModelCall.created_at >= since
         )
-        return await self._cost(query)
 
     async def user_cost(self, org_id: str, user_id: str, since: datetime) -> Decimal:
-        query = select(func.coalesce(func.sum(ModelCall.cost_usd), 0)).where(
-            and_(
-                ModelCall.org_id == uuid.UUID(org_id),
-                ModelCall.user_id == uuid.UUID(user_id),
-                ModelCall.created_at >= since,
-            )
+        return await self._cost(
+            ModelCall.org_id == uuid.UUID(org_id),
+            ModelCall.user_id == uuid.UUID(user_id),
+            ModelCall.created_at >= since,
         )
-        return await self._cost(query)
 
     async def org_limits(self, org_id: str) -> OrgLimits:
         query = select(Org.limits).where(Org.id == uuid.UUID(org_id))
@@ -171,15 +170,15 @@ class PostgresUsageStore:
             limits = (await connection.execute(query)).scalar_one_or_none()
         return OrgLimits.model_validate(limits or {})
 
-    async def _cost(self, query: Any) -> Decimal:
+    async def _cost(self, *where: ColumnElement[bool]) -> Decimal:
+        query = select(func.coalesce(func.sum(ModelCall.cost_usd), 0)).where(*where)
         async with self._engine.connect() as connection:
             return Decimal((await connection.execute(query)).scalar_one())
 
 
 def month_start(now: datetime) -> datetime:
     """The start of the calendar month of ``now`` in UTC."""
-    now = now.astimezone(UTC)
-    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return day_start(now).replace(day=1)
 
 
 def day_start(now: datetime) -> datetime:

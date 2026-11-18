@@ -6,7 +6,14 @@ import json
 from typing import Any
 
 from sama.modelproxy.prices import Provider, TokenCounts
-from sama.modelproxy.usage import UsageReader, anthropic_counts, openai_counts
+from sama.modelproxy.usage import (
+    DEFAULT_OUTPUT_ESTIMATE,
+    UsageReader,
+    _SseLines,
+    anthropic_counts,
+    estimate_counts,
+    openai_counts,
+)
 
 
 def sse(*events: dict[str, Any], named: bool = True) -> bytes:
@@ -17,7 +24,7 @@ def sse(*events: dict[str, Any], named: bool = True) -> bytes:
     return "".join(parts).encode()
 
 
-def read(provider: Provider, data: bytes, *, stream: bool, size: int = 7) -> TokenCounts | None:
+def read(provider: Provider, data: bytes, *, stream: bool, size: int = 7) -> TokenCounts:
     """Feeds ``data`` in small chunks, so events are split across chunks."""
     reader = UsageReader(provider, stream=stream)
     for start in range(0, len(data), size):
@@ -108,8 +115,8 @@ def test_an_anthropic_json_body() -> None:
 
 def test_an_error_body_has_no_usage() -> None:
     body = json.dumps({"type": "error", "error": {"type": "overloaded_error"}}).encode()
-    assert read(Provider.ANTHROPIC, body, stream=False) is None
-    assert read(Provider.ANTHROPIC, b"not json", stream=False) is None
+    assert read(Provider.ANTHROPIC, body, stream=False) == TokenCounts()
+    assert read(Provider.ANTHROPIC, b"not json", stream=False) == TokenCounts()
 
 
 def test_an_openai_responses_stream_reads_the_completed_event() -> None:
@@ -144,3 +151,39 @@ def test_a_stream_with_crlf_lines() -> None:
 def test_a_stream_that_stops_early_has_the_usage_so_far() -> None:
     data = sse({"type": "message_start", "message": {"usage": {"input_tokens": 8}}})
     assert read(Provider.ANTHROPIC, data + b"data: {broken", stream=True) == TokenCounts(input=8)
+
+
+def test_a_reader_knows_when_the_usage_is_final() -> None:
+    start = sse({"type": "message_start", "message": {"usage": {"input_tokens": 8}}})
+    reader = UsageReader(Provider.ANTHROPIC, stream=True)
+    reader.feed(start)
+    assert not reader.final
+    reader.feed(sse({"type": "message_delta", "usage": {"output_tokens": 3}}))
+    assert reader.final
+    openai = UsageReader(Provider.OPENAI, stream=True)
+    openai.feed(sse({"type": "response.output_text.delta", "delta": "hi"}))
+    assert not openai.final
+
+
+def test_a_huge_stream_event_stops_the_reader() -> None:
+    reader = UsageReader(Provider.OPENAI, stream=True)
+    reader._sse = _SseLines(limit=100)
+    reader.feed(b"data: " + b"x" * 200)
+    assert reader._sse.overflow
+    reader.feed(sse({"type": "response.completed", "response": {"usage": {"input_tokens": 1}}}))
+    assert not reader.final
+    assert reader.counts() == TokenCounts()
+
+
+def test_many_events_in_one_chunk_are_all_read() -> None:
+    lines = _SseLines(limit=1000)
+    data = b"".join(b"data: %d\n\n" % i for i in range(50))
+    assert lines.feed(data) == [b"%d" % i for i in range(50)]
+    assert not lines.overflow
+
+
+def test_an_estimate_is_high_and_keeps_the_seen_counts() -> None:
+    seen = TokenCounts(input=10, cache_read=4, output=900)
+    estimate = estimate_counts(1000, {"max_output_tokens": 500}, seen)
+    assert estimate == TokenCounts(input=496, cache_read=4, output=900)
+    assert estimate_counts(10, {}, TokenCounts()).output == DEFAULT_OUTPUT_ESTIMATE

@@ -1274,7 +1274,8 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
    `gpt-6-luna-2026-05-01`) uses the price of its base id. Options with a cost that the
    table does not have also get `400`: Anthropic `speed` other than `standard`,
    Anthropic `inference_geo` other than `global`, OpenAI `background`, and an OpenAI
-   `service_tier` other than `auto` or `default`.
+   `service_tier` other than `auto` or `default`. The proxy sends every OpenAI call with
+   `service_tier: default`, because `auto` can use a project tier with other prices.
 3. **Budget.** The proxy adds the recorded calls and refuses the call if one limit is used up:
    - the run: `max_tokens` and `max_cost_usd` of the run `Budget`. The orchestrator puts them
      in the run token, so the sandbox cannot change them;
@@ -1283,7 +1284,8 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
      token names a user (private sessions).
 
    A refused call gets `402` with the error type `budget_exceeded`, in the error format of
-   the provider. The SDKs do not retry `402`. The Claude adapter maps it to
+   the provider. The check fails closed: if the store cannot read the spend, or a record of
+   the org is not written yet, the call gets `503`. The SDKs do not retry `402`. The Claude adapter maps it to
    `RunFailed(budget_exceeded)`. A call that is in progress always ends, so the total can pass
    a limit by the calls that were in progress at the same time.
 4. **Forward.** The proxy sends the body unchanged with the provider key and an allowlist of
@@ -1294,8 +1296,19 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
    cannot be reached, the call gets `502`.
 5. **Record.** The proxy reads the usage from the response or from the stream events
    (`message_start` and `message_delta`, `response.completed`, or the last chunk). It
-   computes the cost and writes one row to `model_calls`. It also writes the row if the client
-   stops reading, with the usage that it saw.
+   computes the cost and writes one row to `model_calls` before the response ends.
+
+**Missing usage is never free.** A pump task reads the provider response, separately from
+the client. If the client stops reading, the pump reads on for at most 10 minutes
+(`drain_s`) to get the final usage. If the final usage still is not known (the stream
+stopped, or a stream event is larger than 16 MB), the proxy records a high estimate and sets
+`usage_estimated`: one input token for each 2 bytes of the request, and the output limit of
+the request (64,000 tokens if the request has none). The seen counts stay if they are higher.
+
+**A lost record blocks the org.** The proxy tries a record write 3 times. If all fail, it
+keeps the record in memory and refuses new calls of that org with `503`. Each new call tries
+the write again. A restart of the proxy loses these records. M1.10 moves them to a durable
+queue.
 
 **Price table.** `src/sama/modelproxy/prices.toml` has USD per million tokens for input,
 output, cache reads, short cache writes (Anthropic 5 minutes, OpenAI 30 minutes), and long
@@ -1313,7 +1326,7 @@ proxy record.
 
 **`model_calls`** (migration `0002`): `org_id`, `workspace_id`, `session_id`, `run_id`,
 `user_id`, `provider`, `model`, `endpoint`, `status_code`, the five token counts,
-`web_search_requests`, `cost_usd`, `duration_ms`, and `created_at`. The row points to its run
+`web_search_requests`, `usage_estimated`, `cost_usd`, `duration_ms`, and `created_at`. The row points to its run
 with `(org_id, session_id, run_id)`. RLS follows the session, as for `run_events`. Until the
 run queue writes `runs` rows (M1.10), local runs and tests use the in-memory store.
 

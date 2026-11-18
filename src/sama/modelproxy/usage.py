@@ -15,6 +15,11 @@ from sama.modelproxy.prices import Provider, TokenCounts
 
 MAX_BODY_BYTES: Final = 64 * 1024 * 1024
 """A JSON response that is larger than this is passed on, but its usage is not read."""
+MAX_EVENT_BYTES: Final = 16 * 1024 * 1024
+"""A stream line or event that is larger than this stops the usage reader."""
+DEFAULT_OUTPUT_ESTIMATE: Final = 64_000
+"""The output tokens of an estimate when the request sets no output limit."""
+_OUTPUT_LIMITS: Final = ("max_tokens", "max_output_tokens", "max_completion_tokens")
 _OPENAI_STREAM_END: Final = frozenset(
     {"response.completed", "response.incomplete", "response.failed"}
 )
@@ -83,34 +88,42 @@ def openai_counts(usage: Mapping[str, Any]) -> TokenCounts:
     )
 
 
-def _counts(provider: Provider, usage: Mapping[str, Any]) -> TokenCounts:
-    if provider is Provider.ANTHROPIC:
-        return anthropic_counts(usage)
-    return openai_counts(usage)
-
-
 class _SseLines:
-    """Splits a byte stream into the ``data`` payloads of server-sent events."""
+    """Splits a byte stream into the ``data`` payloads of server-sent events.
 
-    def __init__(self) -> None:
-        self._buffer = b""
+    A line or an event of more than ``limit`` bytes sets ``overflow``, and the parser stops.
+    """
+
+    def __init__(self, limit: int = MAX_EVENT_BYTES) -> None:
+        self._limit = limit
+        self._buffer = bytearray()
         self._data: list[bytes] = []
+        self._data_bytes = 0
+        self.overflow = False
 
     def feed(self, chunk: bytes) -> list[bytes]:
+        if self.overflow:
+            return []
+        start = len(self._buffer)
         self._buffer += chunk
         events: list[bytes] = []
-        while True:
-            end = self._buffer.find(b"\n")
-            if end < 0:
-                return events
-            line = self._buffer[:end].rstrip(b"\r")
-            self._buffer = self._buffer[end + 1 :]
+        line_start = 0
+        while (end := self._buffer.find(b"\n", max(start, line_start))) >= 0:
+            line = bytes(self._buffer[line_start:end]).rstrip(b"\r")
+            line_start = end + 1
             if not line:
                 if self._data:
                     events.append(b"\n".join(self._data))
-                    self._data = []
+                    self._data, self._data_bytes = [], 0
             elif line.startswith(b"data:"):
                 self._data.append(line[5:].lstrip(b" "))
+                self._data_bytes += len(line)
+        del self._buffer[:line_start]
+        if len(self._buffer) > self._limit or self._data_bytes > self._limit:
+            self.overflow = True
+            self._buffer.clear()
+            self._data.clear()
+        return events
 
 
 class UsageReader:
@@ -123,9 +136,11 @@ class UsageReader:
         self._body = bytearray()
         self._too_big = False
         self._usage: dict[str, Any] = {}
-        self._seen = False
+        self._final = False
 
     def feed(self, chunk: bytes) -> None:
+        if self._final and self._stream:
+            return
         if not self._stream:
             if not self._too_big:
                 self._body += chunk
@@ -136,13 +151,21 @@ class UsageReader:
         for data in self._sse.feed(chunk):
             self._event(data)
 
-    def counts(self) -> TokenCounts | None:
-        """The usage, or ``None`` if the response had none (for example, an error)."""
-        if not self._stream and not self._too_big and self._body:
+    @property
+    def final(self) -> bool:
+        """True when the reader saw the final usage of the call: the JSON body, the Anthropic
+        ``message_delta``, the OpenAI terminal event, or the last Chat Completions chunk."""
+        if not self._stream and not self._too_big and self._body and not self._final:
             self._json_body()
-        if not self._seen:
-            return None
-        return _counts(self._provider, self._usage)
+        return self._final
+
+    def counts(self) -> TokenCounts:
+        """The usage so far. A response with no usage (for example, an error) has zero counts."""
+        if not self._stream and not self._too_big and self._body and not self._final:
+            self._json_body()
+        if self._provider is Provider.ANTHROPIC:
+            return anthropic_counts(self._usage)
+        return openai_counts(self._usage)
 
     def _json_body(self) -> None:
         try:
@@ -151,7 +174,7 @@ class UsageReader:
             return
         usage = _dict(body, "usage") if isinstance(body, Mapping) else None
         if usage is not None:
-            self._merge(usage)
+            self._merge(usage, final=True)
 
     def _event(self, data: bytes) -> None:
         if data == b"[DONE]":
@@ -163,9 +186,10 @@ class UsageReader:
         if not isinstance(event, Mapping):
             return
         kind = event.get("type")
+        final = True
         if self._provider is Provider.ANTHROPIC:
             if kind == "message_start":
-                usage = _dict(_dict(event, "message"), "usage")
+                usage, final = _dict(_dict(event, "message"), "usage"), False
             elif kind == "message_delta":
                 usage = _dict(event, "usage")
             else:
@@ -178,12 +202,29 @@ class UsageReader:
         else:
             usage = None
         if usage is not None:
-            self._merge(usage)
+            self._merge(usage, final=final)
 
-    def _merge(self, usage: Mapping[str, Any]) -> None:
+    def _merge(self, usage: Mapping[str, Any], *, final: bool) -> None:
         """A later Anthropic ``message_delta`` has the final counts. It can leave out the
         input counts, so the values of ``message_start`` stay."""
-        self._seen = True
+        self._final = self._final or final
         for key, value in usage.items():
             if value is not None:
                 self._usage[key] = value
+
+
+def estimate_counts(request_bytes: int, body: Mapping[str, Any], seen: TokenCounts) -> TokenCounts:
+    """A high estimate for a call whose final usage is not known (Section 16.6).
+
+    The input is one token for every 2 bytes of the request. A token has about 4 bytes of
+    text, so the estimate is high. The output is the output limit of the request. Counts that
+    the reader saw stay if they are higher.
+    """
+    limit = next((body[k] for k in _OUTPUT_LIMITS if isinstance(body.get(k), int)), None)
+    output = limit if limit is not None and limit > 0 else DEFAULT_OUTPUT_ESTIMATE
+    return seen.model_copy(
+        update={
+            "input": max(seen.input, -(-request_bytes // 2) - seen.cache_read),
+            "output": max(seen.output, output),
+        }
+    )

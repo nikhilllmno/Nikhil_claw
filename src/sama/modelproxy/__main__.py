@@ -13,8 +13,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -56,15 +54,7 @@ def build_app(store_kind: str) -> FastAPI:
             anthropic_key=_secret("ANTHROPIC_API_KEY"), openai_key=_secret("OPENAI_API_KEY")
         ),
     )
-    app = proxy.app()
-
-    @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        await proxy.aclose()
-
-    app.router.lifespan_context = lifespan
-    return app
+    return proxy.app()
 
 
 def main() -> None:

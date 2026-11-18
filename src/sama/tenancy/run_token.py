@@ -16,7 +16,7 @@ from __future__ import annotations
 import secrets
 import time
 from collections.abc import Callable
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Final
 
 import jwt
@@ -92,10 +92,11 @@ class RunTokenSigner:
         }
         if scope.audience is Audience.PRIVATE:
             claims["usr"] = scope.user_id
-        if budget is not None and budget.max_tokens is not None:
-            claims["bmt"] = budget.max_tokens
-        if budget is not None and budget.max_cost_usd is not None:
-            claims["bmc"] = str(budget.max_cost_usd)
+        if budget is not None:
+            if budget.max_tokens is not None:
+                claims["bmt"] = budget.max_tokens
+            if budget.max_cost_usd is not None:
+                claims["bmc"] = str(budget.max_cost_usd)
         return jwt.encode(claims, self._key, algorithm=ALGORITHM)
 
     def verify(self, token: str) -> RunTokenClaims:
@@ -131,7 +132,7 @@ class RunTokenSigner:
                 token_id=raw["jti"],
                 expires_at=expires_at,
                 max_tokens=raw.get("bmt"),
-                max_cost_usd=Decimal(raw["bmc"]) if "bmc" in raw else None,
+                max_cost_usd=raw.get("bmc"),
             )
-        except (jwt.PyJWTError, KeyError, TypeError, ValueError, InvalidOperation):
+        except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise InvalidRunTokenError("the run token is not valid") from None

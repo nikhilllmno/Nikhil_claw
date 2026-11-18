@@ -67,12 +67,3 @@ def test_a_long_prompt_uses_the_long_context_prices() -> None:
     # Above it, 0.50 input, 0.05 cache read, and 2.50 output.
     expected = Decimal("0.045") + Decimal("0.00050005") + Decimal("0.0025")
     assert TABLE.cost(Provider.ANTHROPIC, "claude-haiku-5-5", long) == expected
-
-
-def test_usage_has_both_cache_writes() -> None:
-    usage = TokenCounts(
-        input=1, output=2, cache_read=3, cache_write=4, cache_write_long=5
-    ).to_usage(Decimal("0.5"))
-    assert usage.cache_write_tokens == 9
-    assert usage.total_tokens == 15
-    assert usage.cost_usd == Decimal("0.5")
