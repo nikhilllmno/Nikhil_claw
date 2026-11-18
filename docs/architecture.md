@@ -1188,13 +1188,20 @@ Rules:
 - **No cross-org links.** Each parent has a unique key on `(org_id, id)`. Each child points
   to its parent with a composite foreign key on `(org_id, parent_id)`. So a session in org A
   cannot point to a workspace, profile, or user in org B.
+- **No mixed scopes.** A message, run event, or tool call points to its run with
+  `(org_id, session_id, run_id)`, so the run always belongs to the same session. A session
+  binding points to its session with `(org_id, workspace_id, session_id)`, so the binding
+  workspace is always the session workspace. RLS on a child row follows its session, so a
+  mixed row could show private data to a shared audience.
 - **Roles.** A membership with `workspace_id` null gives the org role. A membership with a
   `workspace_id` gives access to that workspace. Org `owner` and `admin` can see every
   workspace of the org.
-- **Audience.** A `private` session has an `owner_user_id`, and only that user can read it.
-  A `shared` session can be read by every user who can see its workspace (Section 11.3).
-- **Append-only audit.** A trigger rejects `UPDATE` and `DELETE` on `audit_log`. To delete
-  an org, the control plane sets `sama.audit_purge = 'on'` in the transaction first.
+- **Audience.** A `private` session has an `owner_user_id`. Only that user can read it, and
+  only while the user can see its workspace. A `shared` session can be read by every user who
+  can see its workspace (Section 11.3).
+- **Append-only audit.** Triggers reject `UPDATE`, `DELETE`, and `TRUNCATE` on `audit_log`.
+  To delete an org, the control plane sets `sama.audit_purge = 'on'` in the transaction
+  first. The purge allows only the row deletes of that org delete.
 - **Private objects.** The policy helpers and the Alembic version table are in the schema
   `sama_private`. The Data API does not expose it.
 
@@ -1211,8 +1218,15 @@ Row-level security:
   - the audit log only as an org `owner` or `admin`.
 - `anon` gets no access. All writes go through the control plane. The control plane
   connects as the table owner, which RLS does not limit, and checks scope in code.
+- **Closed by default.** Supabase gives `anon` and `authenticated` all rights on new objects
+  in `public`. The first migration takes these default rights away for the role that runs
+  the migrations. A later migration that adds a table, view, or sequence must grant rights and
+  add RLS policies itself. Postgres still gives `EXECUTE` on new functions to `PUBLIC`, so a
+  migration that adds a function in `public` must revoke it. A view must use
+  `security_invoker = true`, or it reads the tables without RLS.
 - `sama.db.as_user()` runs a transaction as `authenticated` with the claims of one user.
-  The API uses it for user reads, so RLS is the second guard under the code check.
+  The API uses it for user reads, so RLS is the second guard under the code check. The role
+  and the claims are `LOCAL` to the transaction, so a pooled connection does not keep them.
 - Tests: `tests/db/` runs the migration and the RLS tests on a local Postgres with a small
   Supabase Auth shim (`tests/db/supabase_shim.sql`). CI runs them with a Postgres service.
   A live test (`-m live`) checks isolation on the Supabase project through the Data API and

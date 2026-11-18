@@ -3,6 +3,8 @@
 The Alembic migrations own the schema. These models must match it: a test compares them with
 the migrated database. Every table has ``org_id``. Each child points to its parent with a
 composite foreign key on ``(org_id, parent_id)``, so a row cannot link to a row of another org.
+A row that names a run and a session points to the run with ``(org_id, session_id, run_id)``,
+so the run always belongs to that session. A binding does the same with its workspace.
 """
 
 from __future__ import annotations
@@ -173,6 +175,8 @@ class Session(Base):
     __tablename__ = "sessions"
     __table_args__ = (
         UniqueConstraint("org_id", "id"),
+        # Lets a binding prove that its workspace is the workspace of its session.
+        UniqueConstraint("org_id", "workspace_id", "id"),
         ForeignKeyConstraint(
             ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
         ),
@@ -212,6 +216,8 @@ class Run(Base):
     __tablename__ = "runs"
     __table_args__ = (
         UniqueConstraint("org_id", "id"),
+        # Lets a child row prove that its run belongs to its session.
+        UniqueConstraint("org_id", "session_id", "id"),
         ForeignKeyConstraint(
             ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
         ),
@@ -248,7 +254,9 @@ class Message(Base):
         ForeignKeyConstraint(
             ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
         ),
-        ForeignKeyConstraint(["org_id", "run_id"], ["runs.org_id", "runs.id"]),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"], ["runs.org_id", "runs.session_id", "runs.id"]
+        ),
         ForeignKeyConstraint(["org_id", "author_user_id"], ["users.org_id", "users.id"]),
         CheckConstraint(_one_of("role", MESSAGE_ROLES), name="role"),
         Index(None, "session_id", "seq"),
@@ -271,7 +279,11 @@ class RunEvent(Base):
         ForeignKeyConstraint(
             ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
         ),
-        ForeignKeyConstraint(["org_id", "run_id"], ["runs.org_id", "runs.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
         UniqueConstraint("run_id", "seq"),
         Index(None, "org_id", "session_id"),
     )
@@ -292,7 +304,11 @@ class ToolCall(Base):
         ForeignKeyConstraint(
             ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
         ),
-        ForeignKeyConstraint(["org_id", "run_id"], ["runs.org_id", "runs.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
         UniqueConstraint("run_id", "call_id"),
         CheckConstraint(
             f"decision IS NULL OR {_one_of('decision', TOOL_DECISIONS)}", name="decision"
@@ -318,11 +334,11 @@ class ToolCall(Base):
 class SessionBinding(Base):
     __tablename__ = "session_bindings"
     __table_args__ = (
+        # One key: the workspace of a binding is always the workspace of its session.
         ForeignKeyConstraint(
-            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
-        ),
-        ForeignKeyConstraint(
-            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+            ["org_id", "workspace_id", "session_id"],
+            ["sessions.org_id", "sessions.workspace_id", "sessions.id"],
+            ondelete="CASCADE",
         ),
         ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
         UniqueConstraint("channel", "external_key"),

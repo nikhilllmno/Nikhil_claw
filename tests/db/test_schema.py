@@ -18,6 +18,12 @@ from tests.db.world import World
 pytestmark = pytest.mark.usefixtures("world")
 
 
+async def execute_all(engine: AsyncEngine, *statements: str) -> None:
+    async with engine.begin() as connection:
+        for statement in statements:
+            await connection.execute(text(statement))
+
+
 def _diff(connection: Connection) -> list[object]:
     context = MigrationContext.configure(connection, opts={"compare_server_default": True})
     return list(compare_metadata(context, Base.metadata))
@@ -68,6 +74,50 @@ async def test_a_message_cannot_point_to_a_session_of_another_org(
             )
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "INSERT INTO messages (org_id, session_id, run_id, role)"
+        " VALUES (:org, :shared, :private_run, 'user')",
+        "INSERT INTO run_events (org_id, session_id, run_id, seq, type)"
+        " VALUES (:org, :shared, :private_run, 99, 'text_delta')",
+        "INSERT INTO tool_calls (org_id, session_id, run_id, call_id, tool_name)"
+        " VALUES (:org, :shared, :private_run, 'call-x', 'web_search')",
+    ],
+)
+async def test_a_child_row_cannot_pair_a_run_with_another_session(
+    engine: AsyncEngine, world: World, statement: str
+) -> None:
+    # The run of Alice's private session with a shared session of her workspace: the RLS
+    # policy of the shared session would show the row to the whole workspace.
+    params = {
+        "org": world.ids["org-a"],
+        "shared": world.ids["a1-shared"],
+        "private_run": world.ids["run:a1-alice"],
+    }
+    with pytest.raises(IntegrityError, match="foreign key"):
+        async with engine.begin() as connection:
+            await connection.execute(text(statement), params)
+
+
+async def test_a_binding_workspace_must_be_the_session_workspace(
+    engine: AsyncEngine, world: World
+) -> None:
+    with pytest.raises(IntegrityError, match="foreign key"):
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO session_bindings (org_id, workspace_id, session_id, channel,"
+                    " external_key) VALUES (:org, :workspace, :session, 'web', 'web:x')"
+                ),
+                {
+                    "org": world.ids["org-a"],
+                    "workspace": world.ids["a2"],
+                    "session": world.ids["a1-shared"],
+                },
+            )
+
+
 async def test_a_private_session_needs_an_owner(engine: AsyncEngine, world: World) -> None:
     with pytest.raises(IntegrityError, match="private_has_owner"):
         async with engine.begin() as connection:
@@ -85,12 +135,19 @@ async def test_a_private_session_needs_an_owner(engine: AsyncEngine, world: Worl
 
 
 @pytest.mark.parametrize(
-    "statement", ["UPDATE audit_log SET action = 'x'", "DELETE FROM audit_log"]
+    "statement",
+    ["UPDATE audit_log SET action = 'x'", "DELETE FROM audit_log", "TRUNCATE audit_log"],
 )
 async def test_the_audit_log_is_append_only(engine: AsyncEngine, statement: str) -> None:
     with pytest.raises(DBAPIError, match="append-only"):
         async with engine.begin() as connection:
             await connection.execute(text(statement))
+
+
+@pytest.mark.parametrize("statement", ["UPDATE audit_log SET action = 'x'", "TRUNCATE audit_log"])
+async def test_the_audit_purge_allows_only_row_deletes(engine: AsyncEngine, statement: str) -> None:
+    with pytest.raises(DBAPIError, match="append-only"):
+        await execute_all(engine, "SET LOCAL sama.audit_purge = 'on'", statement)
 
 
 async def test_an_org_delete_removes_its_rows_with_the_audit_purge(

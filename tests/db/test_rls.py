@@ -13,8 +13,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
-from sama.db import as_user
+from sama.db import as_user, create_engine
 from sama.db.models import Base
 from tests.db.world import World
 
@@ -202,3 +203,137 @@ async def test_every_public_table_has_rls_and_a_policy(engine: AsyncEngine) -> N
         tables = {name: (rls, policies) for name, rls, policies in rows}
     assert set(tables) == set(TABLES)
     assert all(rls and policies > 0 for rls, policies in tables.values()), tables
+
+
+async def read_after(
+    engine: AsyncEngine, world: World, user: str, *changes: str
+) -> dict[str, set[str] | int]:
+    """What ``user`` reads after ``changes`` (run as the owner). Rolls everything back."""
+    async with engine.connect() as connection, connection.begin() as transaction:
+        for change in changes:
+            await connection.execute(
+                text(change),
+                {"alice": world.ids["alice"], "carol": world.ids["carol"], "a1": world.ids["a1"]},
+            )
+        claims = f'{{"sub": "{world.auth[user]}", "role": "authenticated"}}'
+        await connection.execute(
+            text("SELECT set_config('request.jwt.claims', :claims, true)"), {"claims": claims}
+        )
+        await connection.execute(text("SET LOCAL ROLE authenticated"))
+        seen: dict[str, set[str] | int] = {
+            table: await labels(connection, world, table, "id")
+            for table in ("orgs", "workspaces", "sessions")
+        }
+        seen["messages"] = await labels(connection, world, "messages", "session_id")
+        seen["audit_log"] = await count(connection, "audit_log")
+        await transaction.rollback()
+    return seen
+
+
+async def test_losing_the_workspace_hides_its_sessions(engine: AsyncEngine, world: World) -> None:
+    seen = await read_after(
+        engine,
+        world,
+        "alice",
+        "DELETE FROM memberships WHERE user_id = :alice AND workspace_id = :a1",
+    )
+    # Also her own private session: it is in a workspace she can no longer see.
+    assert seen["workspaces"] == set()
+    assert seen["sessions"] == set()
+    assert seen["messages"] == set()
+    assert seen["orgs"] == {"org-a"}
+
+
+async def test_losing_the_org_hides_everything(engine: AsyncEngine, world: World) -> None:
+    seen = await read_after(
+        engine,
+        world,
+        "alice",
+        "DELETE FROM memberships WHERE user_id = :alice AND workspace_id IS NULL",
+    )
+    assert seen == {
+        "orgs": set(),
+        "workspaces": set(),
+        "sessions": set(),
+        "messages": set(),
+        "audit_log": 0,
+    }
+
+
+async def test_losing_the_admin_role_hides_other_workspaces_and_the_audit_log(
+    engine: AsyncEngine, world: World
+) -> None:
+    seen = await read_after(
+        engine, world, "carol", "UPDATE memberships SET role = 'member' WHERE user_id = :carol"
+    )
+    assert seen["workspaces"] == set()
+    assert seen["sessions"] == set()
+    assert seen["audit_log"] == 0
+
+
+async def test_a_pooled_connection_does_not_keep_the_user(database_url: str, world: World) -> None:
+    engine = create_engine(
+        database_url, poolclass=AsyncAdaptedQueuePool, pool_size=1, max_overflow=0
+    )
+    try:
+        async with as_user(engine, world.auth["alice"]) as connection:
+            assert await labels(connection, world, "orgs", "id") == {"org-a"}
+        with pytest.raises(DBAPIError):
+            async with as_user(engine, world.auth["bob"]) as connection:
+                await connection.execute(text("SELECT 1 / 0"))
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT current_user, session_user,"
+                        " coalesce(current_setting('request.jwt.claims', true), '')"
+                    )
+                )
+            ).one()
+            assert await labels(connection, world, "orgs", "id") >= {"org-a", "org-b"}
+        assert row[0] == row[1]
+        assert row[2] == ""
+        async with as_user(engine, world.auth["bob"]) as connection:
+            assert await labels(connection, world, "orgs", "id") == {"org-b"}
+    finally:
+        await engine.dispose()
+
+
+async def test_only_authenticated_select_is_granted(engine: AsyncEngine) -> None:
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT grantee, table_name, privilege_type"
+                " FROM information_schema.role_table_grants"
+                " WHERE table_schema = 'public' AND grantee IN ('anon', 'authenticated', 'PUBLIC')"
+            )
+        )
+        grants = {(grantee, table, privilege) for grantee, table, privilege in rows}
+    assert grants == {("authenticated", table, "SELECT") for table in TABLES}
+
+
+async def test_new_objects_in_public_are_closed_by_default(engine: AsyncEngine) -> None:
+    async with engine.connect() as connection, connection.begin() as transaction:
+        await connection.execute(text("CREATE TABLE public.later_table (id int)"))
+        await connection.execute(text("CREATE VIEW public.later_view AS SELECT 1 AS one"))
+        await connection.execute(text("CREATE SEQUENCE public.later_sequence"))
+        rows = await connection.execute(
+            text(
+                "SELECT r.rolname, o.name, has_table_privilege(r.rolname, o.name, 'SELECT'),"
+                " has_table_privilege(r.rolname, o.name, 'INSERT')"
+                " FROM (VALUES ('anon'), ('authenticated')) AS r(rolname),"
+                " (VALUES ('public.later_table'), ('public.later_view')) AS o(name)"
+            )
+        )
+        tables = [tuple(row) for row in rows]
+        sequence = (
+            await connection.execute(
+                text(
+                    "SELECT has_sequence_privilege('anon', 'public.later_sequence', 'USAGE'),"
+                    " has_sequence_privilege('authenticated', 'public.later_sequence', 'USAGE')"
+                )
+            )
+        ).one()
+        await transaction.rollback()
+    assert all(not select and not insert for _, _, select, insert in tables), tables
+    assert tuple(sequence) == (False, False)

@@ -85,8 +85,8 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''
 AS $$
     SELECT CASE
         WHEN p_audience = 'private' THEN
-            sama_private.is_org_member(p_org)
-            AND p_owner IN (SELECT sama_private.my_user_ids())
+            p_owner IN (SELECT sama_private.my_user_ids())
+            AND sama_private.can_see_workspace(p_org, p_workspace)
         WHEN p_audience = 'shared' THEN sama_private.can_see_workspace(p_org, p_workspace)
         ELSE false
     END
@@ -109,7 +109,8 @@ CREATE FUNCTION sama_private.audit_log_append_only() RETURNS trigger
 LANGUAGE plpgsql SET search_path = ''
 AS $$
 BEGIN
-    IF TG_OP = 'DELETE' AND current_setting('sama.audit_purge', true) = 'on' THEN
+    IF TG_OP = 'DELETE' AND TG_LEVEL = 'ROW'
+        AND current_setting('sama.audit_purge', true) = 'on' THEN
         RETURN OLD;
     END IF;
     RAISE EXCEPTION 'audit_log is append-only' USING ERRCODE = 'insufficient_privilege';
@@ -136,6 +137,12 @@ TO authenticated
 CREATE TRIGGER audit_log_append_only BEFORE UPDATE OR DELETE ON public.audit_log
 FOR EACH ROW EXECUTE FUNCTION sama_private.audit_log_append_only()
 """,
+    # TRUNCATE does not fire row triggers, so it gets its own trigger. The purge does not
+    # allow it.
+    """
+CREATE TRIGGER audit_log_no_truncate BEFORE TRUNCATE ON public.audit_log
+FOR EACH STATEMENT EXECUTE FUNCTION sama_private.audit_log_append_only()
+""",
 )
 
 # One SELECT policy per table for `authenticated`. No policy exists for `anon`, and no
@@ -159,7 +166,22 @@ POLICIES = {
 }
 
 
+# Supabase gives `anon` and `authenticated` all rights on new objects in `public`. Sama takes
+# these defaults away for the role that runs the migrations, so a table, view, sequence, or
+# function that a later migration adds is closed until that migration grants rights.
+DEFAULT_KINDS = ("TABLES", "SEQUENCES", "FUNCTIONS")
+
+
+def _close_defaults() -> None:
+    for kind in DEFAULT_KINDS:
+        op.execute(
+            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON {kind}"
+            " FROM anon, authenticated"
+        )
+
+
 def _secure_tables() -> None:
+    _close_defaults()
     op.execute("CREATE SCHEMA IF NOT EXISTS sama_private")
     op.execute("REVOKE ALL ON SCHEMA sama_private FROM PUBLIC")
     for statement in FUNCTIONS:
@@ -185,6 +207,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Gives back the Supabase defaults that _close_defaults took away.
+    for kind in DEFAULT_KINDS:
+        op.execute(
+            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON {kind} TO anon, authenticated"
+        )
     _drop_tables()
     op.execute(
         "DROP FUNCTION sama_private.audit_log_append_only(),"
@@ -459,6 +486,9 @@ def _create_tables() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_sessions")),
         sa.UniqueConstraint("org_id", "id", name=op.f("uq_sessions_org_id_id")),
+        sa.UniqueConstraint(
+            "org_id", "workspace_id", "id", name=op.f("uq_sessions_org_id_workspace_id_id")
+        ),
     )
     op.create_index(
         op.f("ix_sessions_org_id_workspace_id"),
@@ -529,6 +559,9 @@ def _create_tables() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_runs")),
         sa.UniqueConstraint("org_id", "id", name=op.f("uq_runs_org_id_id")),
+        sa.UniqueConstraint(
+            "org_id", "session_id", "id", name=op.f("uq_runs_org_id_session_id_id")
+        ),
     )
     op.create_index(
         op.f("ix_runs_org_id_session_id"), "runs", ["org_id", "session_id"], unique=False
@@ -564,15 +597,9 @@ def _create_tables() -> None:
             name=op.f("fk_session_bindings_org_id_created_by_user_id_users"),
         ),
         sa.ForeignKeyConstraint(
-            ["org_id", "session_id"],
-            ["sessions.org_id", "sessions.id"],
-            name=op.f("fk_session_bindings_org_id_session_id_sessions"),
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["org_id", "workspace_id"],
-            ["workspaces.org_id", "workspaces.id"],
-            name=op.f("fk_session_bindings_org_id_workspace_id_workspaces"),
+            ["org_id", "workspace_id", "session_id"],
+            ["sessions.org_id", "sessions.workspace_id", "sessions.id"],
+            name=op.f("fk_session_bindings_org_id_workspace_id_session_id_sessions"),
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
@@ -622,9 +649,9 @@ def _create_tables() -> None:
             name=op.f("fk_messages_org_id_author_user_id_users"),
         ),
         sa.ForeignKeyConstraint(
-            ["org_id", "run_id"],
-            ["runs.org_id", "runs.id"],
-            name=op.f("fk_messages_org_id_run_id_runs"),
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            name=op.f("fk_messages_org_id_session_id_run_id_runs"),
         ),
         sa.ForeignKeyConstraint(
             ["org_id", "session_id"],
@@ -661,9 +688,9 @@ def _create_tables() -> None:
             nullable=False,
         ),
         sa.ForeignKeyConstraint(
-            ["org_id", "run_id"],
-            ["runs.org_id", "runs.id"],
-            name=op.f("fk_run_events_org_id_run_id_runs"),
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            name=op.f("fk_run_events_org_id_session_id_run_id_runs"),
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
@@ -717,9 +744,9 @@ def _create_tables() -> None:
             name=op.f("ck_tool_calls_status"),
         ),
         sa.ForeignKeyConstraint(
-            ["org_id", "run_id"],
-            ["runs.org_id", "runs.id"],
-            name=op.f("fk_tool_calls_org_id_run_id_runs"),
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            name=op.f("fk_tool_calls_org_id_session_id_run_id_runs"),
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
