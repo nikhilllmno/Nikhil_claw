@@ -1173,8 +1173,10 @@ Rules of the steps:
   `--no-preserve-root`; fork bombs; `mkfs`, `wipefs`, `blkdiscard`; `dd`, `shred`, or `>` to
   a disk device; a remote script piped to a root shell; and recursive `chmod`, `chown`, or
   `chgrp` of `/`. A delete target is normalized first, so `/etc/../usr` is `/usr`. A
-  command longer than 32,000 characters is on the list too. Each pattern has bounded gaps, so
-  the check takes linear time: it runs in the event loop of the tool server for all orgs. The
+  command longer than 32,000 characters is on the list too. The check takes linear time,
+  because it runs in the event loop of the tool server for all orgs: no pattern has a gap
+  that can follow many start positions, and each check with a gap scans each command segment
+  a fixed number of times. The
   list is a guard against accidents, not a sandbox. The sandbox is the real boundary
   (Section 16.2).
 - **Call identity.** The first check of a call id binds the id to the tool name and the

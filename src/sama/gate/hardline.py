@@ -20,10 +20,6 @@ MAX_COMMAND_CHARS: Final = 32_000
 """A longer shell command is on the hardline list. The check must stay fast, because the
 gate runs it in the event loop of the tool server for all orgs."""
 
-_SPAN: Final = r"{0,400}"
-"""The bound of each gap in a pattern. Each pattern then does at most a fixed amount of work
-at each start position, so a check takes linear time."""
-
 _SEPARATORS: Final = re.compile(r"\|\||&&|[;|&\n()`]|\$\(")
 _ROOT_DIRS: Final = frozenset(
     {
@@ -51,44 +47,87 @@ _WRAPPERS: Final = frozenset(
 _SHELLS: Final = r"(?:ba|z|da|k)?sh"
 
 _PATTERNS: Final = (
+    # Each pattern has no unbounded gap that can follow many start positions, so a search
+    # takes linear time. The patterns run on the squeezed command (one blank for each run of
+    # white space). Checks with a gap are the functions below, one scan for each segment.
     (
-        re.compile(
-            r"(?<!\w)(?P<f>\w{1,64}|:)\s{0,8}\(\)\s{0,8}\{\s{0,8}(?P=f)\s{0,8}\|\s{0,8}"
-            r"(?P=f)\s{0,8}&\s{0,8}\}\s{0,8};\s{0,8}(?P=f)"
-        ),
+        re.compile(r"(?<!\w)(?P<f>\w+|:) ?\(\) ?\{ ?(?P=f) ?\| ?(?P=f) ?& ?\} ?; ?(?P=f)"),
         "a fork bomb",
     ),
     (re.compile(r"\bmkfs(?:\.\w+)?\b"), "a command that formats a disk"),
     (re.compile(r"\b(?:wipefs|blkdiscard)\b"), "a command that wipes a disk"),
     (
-        re.compile(
-            rf"\b(?:dd\b[^;&|\n]{_SPAN}\bof=|shred\b[^;&|\n]{_SPAN}\s)/dev/(?!null\b|zero\b|std)"
-        ),
+        re.compile(r"> ?/dev/(?:sd|hd|vd|xvd|nvme|mmcblk|disk|dm-)"),
         "a write to a raw disk",
     ),
-    (
-        re.compile(r">\s{0,8}/dev/(?:sd|hd|vd|xvd|nvme|mmcblk|disk|dm-)"),
-        "a write to a raw disk",
-    ),
-    (
-        re.compile(
-            rf"\b(?:curl|wget)\b[^;\n]{_SPAN}\|\s{{0,8}}(?:sudo|doas)\b[^;|\n]{_SPAN}\b{_SHELLS}\b"
-        ),
-        "a remote script piped to a root shell",
-    ),
-    (
-        re.compile(
-            rf"\b(?:sudo|doas)\b(?=[^;\n]{_SPAN}\b{_SHELLS}\b)[^;\n]{_SPAN}(?:\$\(|<\(|`)\s{{0,8}}"
-            r"(?:curl|wget)\b"
-        ),
-        "a remote script run by a root shell",
-    ),
-    (
-        re.compile(
-            rf"\bch(?:mod|own|grp)\b(?=[^;&|\n]{_SPAN}\s-\w{{0,16}}R)[^;&|\n]{_SPAN}\s/\*?(?=\s|$)"
-        ),
-        "a recursive permission change of /",
-    ),
+)
+_BLANKS: Final = re.compile(r"\s+")
+_LINES: Final = re.compile(r"[;\n]")
+_COMMANDS: Final = re.compile(r"[;&|\n]")
+_DD: Final = re.compile(r"\bdd\b")
+_DD_TARGET: Final = re.compile(r"\bof=/dev/(?!null\b|zero\b|std)")
+_SHRED: Final = re.compile(r"\bshred\b")
+_SHRED_TARGET: Final = re.compile(r"\s/dev/(?!null\b|zero\b|std)")
+_DOWNLOAD: Final = re.compile(r"\b(?:curl|wget)\b")
+_ROOT: Final = re.compile(r"\b(?:sudo|doas)\b")
+_ROOT_SHELL_STAGE: Final = re.compile(rf" ?(?:sudo|doas)\b[^;|\n]*\b{_SHELLS}\b")
+_SHELL: Final = re.compile(rf"\b{_SHELLS}\b")
+_DOWNLOAD_RUN: Final = re.compile(r"(?:\$\(|<\(|`) ?(?:curl|wget)\b")
+_CHANGE: Final = re.compile(r"\bch(?:mod|own|grp)\b")
+_RECURSIVE: Final = re.compile(r"\s-\w*R")
+_SLASH: Final = re.compile(r"\s/\*?(?=\s|$)")
+
+
+def _squeeze(command: str) -> str:
+    """One blank for each run of white space. A run with a new line becomes a new line."""
+    return _BLANKS.sub(lambda m: "\n" if "\n" in m.group() else " ", command)
+
+
+def _after(first: re.Pattern[str], then: re.Pattern[str], text: str) -> bool:
+    """``then`` matches after the first match of ``first``. Two scans, so linear time."""
+    found = first.search(text)
+    return found is not None and then.search(text, found.end()) is not None
+
+
+def _raw_disk_write(text: str) -> bool:
+    return any(
+        _after(_DD, _DD_TARGET, part) or _after(_SHRED, _SHRED_TARGET, part)
+        for part in _COMMANDS.split(text)
+    )
+
+
+def _piped_to_root_shell(text: str) -> bool:
+    for line in _LINES.split(text):
+        downloaded = False
+        for stage in line.split("|"):
+            if downloaded and _ROOT_SHELL_STAGE.match(stage):
+                return True
+            downloaded = downloaded or _DOWNLOAD.search(stage) is not None
+    return False
+
+
+def _root_shell_runs_download(text: str) -> bool:
+    for line in _LINES.split(text):
+        root = _ROOT.search(line)
+        shell = _SHELL.search(line, root.end()) if root else None
+        if shell and _DOWNLOAD_RUN.search(line, shell.end()):
+            return True
+    return False
+
+
+def _recursive_change_of_root(text: str) -> bool:
+    for part in _COMMANDS.split(text):
+        change = _CHANGE.search(part)
+        if change and _RECURSIVE.search(part, change.end()) and _SLASH.search(part, change.end()):
+            return True
+    return False
+
+
+_CHECKS: Final = (
+    (_raw_disk_write, "a write to a raw disk"),
+    (_piped_to_root_shell, "a remote script piped to a root shell"),
+    (_root_shell_runs_download, "a remote script run by a root shell"),
+    (_recursive_change_of_root, "a recursive permission change of /"),
 )
 
 
@@ -109,8 +148,12 @@ def command_problem(command: str) -> str | None:
         return f"a shell command longer than {MAX_COMMAND_CHARS} characters"
     if "--no-preserve-root" in command:
         return "rm --no-preserve-root"
+    text = _squeeze(command)
     for pattern, problem in _PATTERNS:
-        if pattern.search(command):
+        if pattern.search(text):
+            return problem
+    for check, problem in _CHECKS:
+        if check(text):
             return problem
     for part in _SEPARATORS.split(command):
         if _is_root_delete(part):
