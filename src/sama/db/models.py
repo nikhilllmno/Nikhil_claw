@@ -437,3 +437,30 @@ class ModelCall(Base):
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = _created_at()
+
+
+class SessionTodo(Base):
+    """The task list of a session, written by the ``todo`` tool (docs/architecture.md,
+    Section 16.7)."""
+
+    __tablename__ = "session_todos"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id", "session_id"],
+            ["sessions.org_id", "sessions.workspace_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("jsonb_typeof(items) = 'array'", name="items_array"),
+    )
+
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), primary_key=True
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    items: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The run of the last change. Not a foreign key: the list outlives a deleted run."""
+    updated_at: Mapped[datetime] = _created_at()

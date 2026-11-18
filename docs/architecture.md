@@ -526,7 +526,7 @@ Rules:
 | Mechanism | How |
 |---|---|
 | Compaction | Native in both SDKs (Section 5.3). Before compaction, sama archives the full transcript and links the compacted session to its parent (session lineage). |
-| Tool output limits | Sama tools return at most 50 KB (head and tail kept). Larger output is written to a file in the sandbox, and the tool returns a preview plus the path (Hermes "spill"). |
+| Tool output limits | Sama tools return at most 50 KB (head and tail kept). Larger output is written to a file in the sandbox, and the tool returns a preview plus the path (Hermes "spill", Section 16.7). |
 | Tool search | Rare tools (most integrations, cron admin, image generation, TTS) are deferred. The model sees `tool_search`, `tool_describe`, and `tool_call` instead of their schemas. |
 | Progressive skills | Only the skill index is in the prompt. The agent loads a full skill when it needs it. |
 | Context pins | A user can pin a message or file so that compaction keeps it. |
@@ -1239,6 +1239,25 @@ policy for all of them:
 - A connection that has a private network route (SSH tunnel or relay, Section 10.6) may reach
   the private addresses of that route only. No other request can use the route.
 
+**Code (M1.8).** `src/sama/tools/outbound.py` has `UrlPolicy` and `OutboundClient`.
+
+- The URL must be `https` (`http` only if `UrlPolicy.allow_http` is set). A URL with a user
+  name or a password is refused.
+- The client resolves the host and refuses the request if one of the addresses is not a
+  public unicast address: private, loopback, link-local, shared (`100.64.0.0/10`), reserved,
+  multicast, or unspecified. IPv4 addresses inside IPv6 (mapped, 6to4, Teredo) get the same
+  check. Known cloud metadata addresses and names (`169.254.169.254`, `fd00:ec2::254`,
+  `100.100.100.200`, `metadata.google.internal`) have their own error text.
+- The client connects to the checked address. The `Host` header and the TLS server name are
+  the original host, so the certificate check is unchanged. The client keeps no open
+  connections between requests, so two hosts on one address cannot share a TLS connection.
+- Redirects are not followed by the HTTP library. The client checks each `Location` as a new
+  URL, at most 5 hops.
+- Limits: 5 MB of response body, 10 seconds for each hop, and 20 seconds for all hops. The
+  client asks for no compression and ignores proxy variables of the environment.
+- `allow_hosts` (only these hosts and their subdomains) and `block_hosts` are the org lists.
+  They apply to every hop. The org settings that fill them come with the vault (M1.17).
+
 ### 16.5 Untrusted content
 
 - Content from the web, email, webhooks, other people in groups, and files is untrusted.
@@ -1346,6 +1365,61 @@ this in M1.17. Langfuse traces come in M1.14. The live checks of membership and 
 come in M1.18. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 
+### 16.7 Sama MCP tool server (M1.8)
+
+The sama tools reach both runtimes through one MCP server (D3). The code is in
+`src/sama/tools/`. Start it with `python -m sama.tools`.
+
+**Transport and scope.** The server speaks streamable HTTP at `/mcp`, without MCP sessions
+(stateless, JSON responses). Every request carries a run token as the bearer. A request
+without a valid run token gets `401` before MCP reads it. Each tool call takes the tenant
+scope (org, workspace, session, run, user) from the token, never from its arguments. So the
+server acts as one server per run: the token selects the run. The token is the only guard,
+so the MCP check of the `Host` header (DNS rebinding) is off: a browser cannot add the token.
+`GET /healthz` returns `ok`.
+
+**Tools in M1.8.**
+
+| Tool | What it does | Needs |
+|---|---|---|
+| `web_search(query, limit)` | Searches the web and returns up to 10 results: title, URL, and snippet. | A search key (`BRAVE_API_KEY`, Brave Search API). Without a key the tool is hidden. |
+| `web_extract(urls)` | Gets 1 to 5 pages through the outbound client (Section 16.4) and returns their text. HTML becomes plain text. Text, Markdown, JSON, XML, and CSV stay as they are. Other types get an error for that URL. | Nothing. |
+| `clarify(questions)` | Asks the user 1 to 5 questions. Each question has 2 to 6 choices, or none for a free answer. The call waits for the answers, at most 10 minutes. If nobody answers, the tool tells the agent to continue and state its assumptions. | A clarify broker. Without one the tool is hidden. |
+| `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
+
+**Untrusted content.** `web_search` and `web_extract` put their results in an
+`<untrusted_content source="web">` block (Section 16.5). The tool escapes a closing tag in the
+content, so a page cannot end the block early.
+
+**Output cap and spill.** Each tool result is at most 50,000 bytes of UTF-8. A larger result
+goes to a file in the session sandbox, `.sama/spill/<tool>-<id>.txt` under the work folder. The
+tool returns the first 30,000 bytes, a note with the size and the path, and the last 10,000
+bytes. The agent reads the file with its native file tools. If the session has no sandbox or
+the write fails, the note says that the full output was not kept. The spill uses
+`SandboxedRuntime.session_sandbox`.
+
+**Clarify broker.** `ClarifyBroker` keeps the open questions in memory. The API (M1.12) and the
+channels (M1.13) list them with `pending(org_id, session_id)` and answer them with
+`answer(request_id, answers)`. A cancel of the run or a timeout ends the wait. The broker is in
+the process of the tool server, so the API must run in the same process until the run queue
+(M1.10) moves the questions to Postgres. In unattended runs the tool gate (M1.9) denies
+`clarify`.
+
+**Task list storage.** `session_todos` (migration `0003`) has one row per session: `org_id`,
+`workspace_id`, `session_id`, `items` (JSON), `run_id` of the last change, and `updated_at`. A
+change runs in one transaction with a row lock, so two changes at the same time do not lose an
+item. RLS follows the session, as for `model_calls`. Until the run queue writes `sessions` rows
+(M1.10), local runs and tests use the in-memory store.
+
+**Audit.** The server logs each tool call with the org, session, run, tool, result size, and
+time (`sama.tools`). Arguments and results are not in the log, because they can contain
+personal data. The audit log rows come with the tool gate (M1.9).
+
+**Not in M1.8.** The tool gate checks toolsets and policy in M1.9. Until then the server lists
+every tool that it can serve. The Claude adapter does not yet map the native `TodoWrite` tool
+to `todo`. The search key comes from the environment of the server process. The vault replaces
+this in M1.17.
+
 ---
 
 ## 17. Users, teams, and tenants
@@ -1389,6 +1463,7 @@ migrated schema.
 | `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |
 | `audit_log` | `org_id`, `workspace_id`, `actor_kind`, `actor_user_id`, `action`, `target_type`, `target_id`, `run_id`, `details` |
 | `model_calls` | One row per model proxy call (migration `0002`, Section 16.6) |
+| `session_todos` | The task list of a session, one row per session (migration `0003`, Section 16.7) |
 
 Rules:
 
@@ -1487,7 +1562,7 @@ src/sama/
   orchestrator/   # run queue, sandbox lifecycle, events (M1.6: sandboxed.py)
   sandbox/        # sandbox providers: base, e2b, docker, local, template build
   runtime/        # contract, claude adapter, openai adapter, fake, runner entry point
-  tools/          # sama MCP server and tool packs
+  tools/          # sama MCP server and tool packs (M1.8: server, web, todo, clarify, outbound)
   memory/  skills/  sessions/  scheduler/  workflows/  browser/  approvals/
   modelproxy/  vault/  tenancy/ (run tokens)  observability/
 skills/           # builtin skills (SKILL.md folders)

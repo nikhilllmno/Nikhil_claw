@@ -31,6 +31,7 @@ from sama.db.models import (
     RunEvent,
     Session,
     SessionBinding,
+    SessionTodo,
     ToolCall,
     User,
     Workspace,
@@ -187,6 +188,14 @@ def plan(
             output_tokens=5,
             cost_usd=Decimal("0.00007"),
             duration_ms=12,
+        )
+        add(
+            SessionTodo,
+            org_id=org_id,
+            workspace_id=ids[workspace],
+            session_id=ids[session],
+            items=[{"id": "1", "content": f"todo of {session}", "status": "pending"}],
+            run_id=run_id,
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")

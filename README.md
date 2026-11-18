@@ -4,7 +4,7 @@ A cloud agent engine with Hermes-level features, built on the Claude Agent SDK a
 
 Status: M1 (core engine) in progress. The runtime contract, the fake runtime, the Claude
 Agent SDK adapter, the conformance suite, the database with row-level security, the
-sandbox providers with the runner, and the model proxy are done.
+sandbox providers with the runner, the model proxy, and the MCP tool server are done.
 
 ## Development
 
@@ -75,6 +75,25 @@ Set `SandboxSettings.model_url` to the proxy URL. The runner then gives the Clau
 SAMA_LIVE_TESTS=1 uv run pytest -m live tests/modelproxy
 ```
 
+### MCP tool server
+
+The sama MCP tool server gives both runtimes the sama tools (architecture Section 16.7):
+`web_search`, `web_extract`, `clarify`, and `todo`. It accepts only run tokens. Start it on
+the control plane:
+
+```bash
+export SAMA_RUN_TOKEN_KEY=...   # the run token key of the orchestrator
+export BRAVE_API_KEY=...        # optional: without it, web_search is hidden
+uv run python -m sama.tools --port 8788
+```
+
+Add `McpServerConfig(name="sama", url="<url>/mcp")` to the `RunConfig`. The runner sets the
+run token as the bearer. A live test runs a real search and a real page fetch:
+
+```bash
+SAMA_LIVE_TESTS=1 uv run pytest -m live tests/tools
+```
+
 ### Database
 
 Sama uses Supabase Postgres (architecture Section 17.1). The database tests need a Postgres
@@ -115,6 +134,8 @@ SAMA_LIVE_TESTS=1 uv run pytest tests/db/test_supabase_live.py
 - `src/sama/sandbox/`, `src/sama/orchestrator/`, `src/sama/runtime/runner.py`: the sandbox
   providers, the orchestrator, and the runner (architecture Section 16.2).
 - `src/sama/modelproxy/`: the model proxy (architecture Section 16.6).
+- `src/sama/tools/`: the sama MCP tool server and the outbound URL policy (architecture
+  Sections 16.4 and 16.7).
 
 ## Docs
 

@@ -29,6 +29,7 @@ SESSION_CHILDREN = (
     "tool_calls",
     "session_bindings",
     "model_calls",
+    "session_todos",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 
