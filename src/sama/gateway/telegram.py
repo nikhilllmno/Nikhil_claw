@@ -199,7 +199,8 @@ class _Reply:
         self._text = ""
         self._shown = ""
         self._message_id: int | None = None
-        self._last = 0.0
+        self._last: float | None = None
+        """Loop time of the last shown text. ``None`` until the first text shows."""
         self.sent_any = False
         """True when text was shown since the start or the last ``restart``."""
 
@@ -214,7 +215,7 @@ class _Reply:
 
     async def flush(self, *, final: bool) -> None:
         loop = asyncio.get_running_loop()
-        if final or loop.time() - self._last >= self._interval_s:
+        if final or self._last is None or loop.time() - self._last >= self._interval_s:
             await self._show(self._text)
 
     def restart(self) -> None:
