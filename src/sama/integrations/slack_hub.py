@@ -43,7 +43,7 @@ from sama.db.models import Integration
 from sama.gate.service import GateService
 from sama.gateway.pairing import Lockout
 from sama.gateway.sessions import FollowSettings
-from sama.gateway.slack import SlackApp, SlackGateway, escape
+from sama.gateway.slack import SeenEvents, SlackApp, SlackGateway, escape
 from sama.gateway.slack_client import SlackClient, signed
 from sama.integrations.hub import GatewayCache
 from sama.integrations.service import SlackClientFactory, secret_hash
@@ -92,6 +92,7 @@ class SlackHub(GatewayCache[_App]):
         self._clock = clock
         self._lockout = Lockout()
         self._followers: set[object] = set()
+        self._seen = SeenEvents()
 
     def router(self) -> APIRouter:
         router = APIRouter()
@@ -230,6 +231,7 @@ class SlackHub(GatewayCache[_App]):
             gate=self._gate,
             lockout=self._lockout,
             followers=self._followers,
+            seen=self._seen,
         )
         return _App(gateway, client, signing, str(row.external_id), row.updated_at)
 
@@ -239,10 +241,15 @@ async def _body(request: Request) -> bytes:
     length = request.headers.get("content-length", "")
     if length.isdigit() and int(length) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="the body is too large")
-    body = await request.body()
-    if len(body) > MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="the body is too large")
-    return body
+    # Read in chunks and stop at the limit: a chunked body has no Content-Length.
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="the body is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _json(body: bytes) -> dict[str, Any]:

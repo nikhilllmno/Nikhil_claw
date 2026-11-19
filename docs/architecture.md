@@ -1403,10 +1403,13 @@ reads the row. An unknown id gets `401`. A row that is not `active` answers only
 secrets from the vault (not from the cache), and keeps it while `updated_at` of the row stays
 the same. A signing secret with a digest that is not `secret_hash` gets `503`. The hub checks
 `X-Slack-Signature` (HMAC-SHA256 of `v0:<timestamp>:<raw body>`) in constant time, and refuses a
-timestamp more than 5 minutes from now (`401`). A body larger than 1 MB gets `413`. A request
+timestamp more than 5 minutes from now (`401`). The hub reads the body in chunks and stops at
+1 MB (`413`), also when the request has no `Content-Length`. A request
 of another Slack workspace than the row is dropped. Events and button clicks run in the
-background, so Slack gets its answer at once. A repeated event (same `event_id`) is dropped. A
-`/sama` command gets an answer that only the sender sees.
+background, so Slack gets its answer at once. A repeated event (same integration and
+`event_id` in the last 10 minutes) is dropped. The hub keeps this log for all its gateways, so a
+gateway that is built again after a reconnect also drops a repeat. A `/sama` command gets an
+answer that only the sender sees.
 
 **Slack gateway.** `sama.gateway.slack.SlackGateway`:
 
@@ -1416,7 +1419,8 @@ background, so Slack gets its answer at once. A repeated event (same `event_id`)
   code, from a linked user) maps each thread to a `shared` session of the channel workspace,
   and the app answers in the thread. An unknown user or a channel that is not linked gets a
   message that only the sender sees;
-- `/sama new` (direct messages), `/sama stop` (the direct message, or all threads of the
+- `/sama new` (direct messages; it takes the lock of the direct message, so a message at the
+  same time cannot bind another session), `/sama stop` (the direct message, or all threads of the
   channel), `/sama pair CODE`, and `/sama help`;
 - the gateway escapes `&`, `<`, and `>` in all text that it sends, so the text of a model
   cannot mention people or channels. Approval cards use `plain_text` blocks;

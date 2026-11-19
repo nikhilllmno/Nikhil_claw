@@ -100,9 +100,9 @@ function signOut() {
   state.sessionId = null;
   // A pairing code is a secret of this user: the next user must not see it.
   state.signOuts += 1;
-  for (const channel of Object.values(CHANNELS)) {
-    $(`${channel.prefix}-code`).replaceChildren();
-    $(`${channel.prefix}-links`).replaceChildren();
+  for (const prefix of Object.values(CHANNELS)) {
+    $(`${prefix}-code`).replaceChildren();
+    $(`${prefix}-links`).replaceChildren();
   }
   $("int-orgs").replaceChildren();
   slackSetups.clear();
@@ -150,20 +150,17 @@ function selectedOrg() {
   return state.orgs.find((o) => o.workspaces.some((w) => w.id === workspace)) || null;
 }
 
-// Pairing needs an active Telegram bot in the org of the selected workspace.
-// The chat channels that have a pairing panel. The panel shows when the org of the selected
-// workspace has an active integration of the channel.
-const CHANNELS = {
-  telegram: { prefix: "tg", panel: "telegram" },
-  slack: { prefix: "sl", panel: "slack" },
-};
+// The chat channels that have a pairing panel (element id = channel) and the id prefix of its
+// parts. The panel shows when the org of the selected workspace has an active integration of
+// the channel.
+const CHANNELS = { telegram: "tg", slack: "sl" };
 
 function showPairing() {
   const org = selectedOrg();
-  for (const [kind, channel] of Object.entries(CHANNELS)) {
-    $(channel.panel).hidden =
+  for (const [kind, prefix] of Object.entries(CHANNELS)) {
+    $(kind).hidden =
       !org || !(org.integrations || []).some((i) => i.kind === kind && i.status === "active");
-    $(`${channel.prefix}-code`).replaceChildren();
+    $(`${prefix}-code`).replaceChildren();
   }
 }
 
@@ -687,7 +684,7 @@ async function loadChannelLinks(kind) {
   const signOut0 = state.signOuts;
   const links = await api(`/channels/${kind}/identities`);
   if (signOut0 !== state.signOuts) return;
-  $(`${CHANNELS[kind].prefix}-links`).replaceChildren(...links.map((link) => {
+  $(`${CHANNELS[kind]}-links`).replaceChildren(...links.map((link) => {
     const item = document.createElement("li");
     const org = state.orgs.find((o) => o.id === link.org_id);
     item.textContent = `Linked account (${org ? org.name : "org"}) `;
@@ -743,7 +740,7 @@ async function pairingCode(kind, codeKind) {
       parts.push(link);
     }
     parts.push(element("span", ` The code expires at ${until}.`));
-    $(`${CHANNELS[kind].prefix}-code`).replaceChildren(...parts);
+    $(`${CHANNELS[kind]}-code`).replaceChildren(...parts);
   } catch (error) {
     showError(error.message);
   }
@@ -819,10 +816,11 @@ function bind() {
     await start().catch((e) => showError(e.message));
   });
   $("sign-out").addEventListener("click", signOut);
-  $("tg-user").addEventListener("click", () => pairingCode("telegram", "user"));
-  $("tg-group").addEventListener("click", () => pairingCode("telegram", "group"));
-  $("sl-user").addEventListener("click", () => pairingCode("slack", "user"));
-  $("sl-group").addEventListener("click", () => pairingCode("slack", "group"));
+  for (const [kind, prefix] of Object.entries(CHANNELS)) {
+    for (const codeKind of ["user", "group"]) {
+      $(`${prefix}-${codeKind}`).addEventListener("click", () => pairingCode(kind, codeKind));
+    }
+  }
   $("workspace").addEventListener("change", () => {
     fillProfiles();
     showPairing();

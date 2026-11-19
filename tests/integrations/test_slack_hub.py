@@ -193,3 +193,46 @@ async def test_a_button_click_goes_to_the_gateway(
     assert (await http.post(url, content=stranger, headers=headers(stranger))).status_code == 200
     await drain(hub)
     assert slack.whispers("DMIA0001") == ["Link your Slack account to sama first."]
+
+
+async def test_a_chunked_body_stops_at_the_limit(
+    http: httpx.AsyncClient, tenant: Tenant, slack: FakeSlack
+) -> None:
+    """A body with no Content-Length is read in chunks and stops at the limit."""
+    chunk = b" " * (256 * 1024)
+    total = MAX_BODY_BYTES // len(chunk) + 8
+    sent = 0
+
+    async def chunks() -> AsyncIterator[bytes]:
+        nonlocal sent
+        for _ in range(total):
+            sent += 1
+            yield chunk
+
+    url = f"/slack/{uuid.uuid4()}/events"
+    response = await http.post(url, content=chunks())
+    assert response.status_code == 413
+    # The hub stops to read at the limit; it does not take the rest of the body.
+    assert sent < total
+    assert slack.calls == []
+
+
+async def test_a_repeat_after_a_reconnect_is_dropped(
+    http: httpx.AsyncClient, hub: SlackHub, engine: AsyncEngine, tenant: Tenant, slack: FakeSlack
+) -> None:
+    url = f"/slack/{tenant.ids['slack']}/events"
+    body = json.dumps(dm_event("EvRe")).encode()
+    assert (await http.post(url, content=body, headers=headers(body))).status_code == 200
+    await drain(hub)
+    first = hub._bots[tenant.ids["slack"]]
+    # A reconnect with the same secrets changes the row version: the hub builds a new gateway.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Integration)
+            .where(Integration.id == tenant.ids["slack"])
+            .values(updated_at=func.now() + func.make_interval(0, 0, 0, 0, 0, 0, 1))
+        )
+    assert (await http.post(url, content=body, headers=headers(body))).status_code == 200
+    assert hub._bots[tenant.ids["slack"]] is not first
+    await drain(hub)
+    assert slack.texts() == [PAIR_PROMPT]

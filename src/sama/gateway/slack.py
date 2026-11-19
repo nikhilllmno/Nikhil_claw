@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
@@ -200,6 +201,38 @@ def approval_blocks(row: Any) -> tuple[str, list[dict[str, Any]]]:
     return text, blocks
 
 
+class SeenEvents:
+    """The event ids that the gateways took in the last ``keep_s`` seconds. Slack sends an event
+    again when the answer is slow (after about 1 and 5 minutes), each time with a new signature.
+    The hub keeps one object for all its gateways, so that a gateway that is built again (after a
+    reconnect) also drops a repeat. A key holds the integration id and the event id."""
+
+    def __init__(
+        self,
+        *,
+        keep_s: float = 600.0,
+        max_size: int = 50_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._keep_s = keep_s
+        self._max_size = max_size
+        self._clock = clock
+        self._seen: OrderedDict[str, float] = OrderedDict()
+
+    def is_repeat(self, key: str) -> bool:
+        """True when ``key`` came before. Else it records ``key`` and returns False."""
+        now = self._clock()
+        while self._seen:
+            oldest, at = next(iter(self._seen.items()))
+            if now - at < self._keep_s and len(self._seen) < self._max_size:
+                break
+            del self._seen[oldest]
+        if key in self._seen:
+            return True
+        self._seen[key] = now
+        return False
+
+
 class SlackGateway:
     def __init__(
         self,
@@ -212,9 +245,10 @@ class SlackGateway:
         gate: GateService | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
+        seen: SeenEvents | None = None,
     ) -> None:
-        """``lockout`` and ``followers`` can be shared by all gateways of the process, so that
-        the limits hold for the whole process."""
+        """``lockout``, ``followers``, and ``seen`` can be shared by all gateways of the process,
+        so that the limits and the repeat check hold for the whole process."""
         self._engine = engine
         self._client = client
         self._app = app
@@ -222,15 +256,11 @@ class SlackGateway:
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
         self._lockout = lockout or Lockout()
-        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
         self._followers: set[object] = set() if followers is None else followers
         self._locks = KeyedLocks()
         self._mention = re.compile(rf"<@{re.escape(app.bot_user_id)}(?:\|[^>]*)?>")
-
-    @property
-    def app(self) -> SlackApp:
-        return self._app
 
     def accept(self, envelope: Mapping[str, Any]) -> None:
         """Takes one ``event_callback`` from the events route. A repeated event (Slack sends
@@ -249,12 +279,7 @@ class SlackGateway:
     def _is_repeat(self, event_id: Any) -> bool:
         if not isinstance(event_id, str) or not event_id:
             return False
-        if event_id in self._seen:
-            return True
-        self._seen[event_id] = None
-        while len(self._seen) > 2000:
-            self._seen.popitem(last=False)
-        return False
+        return self._seen.is_repeat(f"{self._app.integration_id}:{event_id}")
 
     def _spawn(self, work: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(work)
@@ -316,14 +341,7 @@ class SlackGateway:
             else:
                 await self._say(place, await self._pair(place.sender, place.channel, code, None))
             return
-        target = Target(
-            identity.org_id,
-            identity.user_id,
-            identity.workspace_id,
-            identity.agent_profile_id,
-            "private",
-        )
-        await self._start(place, target, text)
+        await self._start(place, Target.private(identity), text)
 
     async def _on_mention(self, place: _Place, text: str) -> None:
         text = unescape(self._mention.sub("", text)).strip()
@@ -463,33 +481,23 @@ class SlackGateway:
         if not channel.startswith("D"):
             return "Mention the sama app in a new message to start a new thread session."
         place = _Place(channel, None, sender)
-        target = Target(
-            identity.org_id,
-            identity.user_id,
-            identity.workspace_id,
-            identity.agent_profile_id,
-            "private",
-        )
+        target = Target.private(identity)
         async with self._engine.connect() as connection:
             grants = await load_grants(connection, target.org_id, target.user_id)
         if not grants.sees_workspace(target.workspace_id):
             return "You do not have access to this workspace now."
-        current = await self._session(place, target, grants, create=False)
-        profile = target.agent_profile_id if current is None else current.agent_profile_id
-        await new_session(self._engine, CHANNEL, self._key(place), target, profile)
+        # The lock of the messages: a message at the same time cannot bind another session.
+        async with self._locks.hold((place.channel, place.thread_ts)):
+            current = await self._session(place, target, grants, create=False)
+            profile = target.agent_profile_id if current is None else current.agent_profile_id
+            await new_session(self._engine, CHANNEL, self._key(place), target, profile)
         return "A new session started."
 
     async def _stop(self, sender: str, channel: str, identity: Any) -> str:
         """Stops the open runs of the direct message, or of all threads of the channel."""
         if channel.startswith("D"):
             place = _Place(channel, None, sender)
-            target = Target(
-                identity.org_id,
-                identity.user_id,
-                identity.workspace_id,
-                identity.agent_profile_id,
-                "private",
-            )
+            target = Target.private(identity)
             async with self._engine.connect() as connection:
                 grants = await load_grants(connection, target.org_id, target.user_id)
             current = await self._session(place, target, grants, create=False)

@@ -851,28 +851,27 @@ class SamaApi:
         except PairingError as error:
             raise HTTPException(status_code=429, detail=str(error)) from None
         if channel == "slack":
+            # The link opens the direct messages with the app. The code goes in by hand.
             app_id = (bot.settings or {}).get("app_id")
-            return {
-                "code": code,
-                "kind": body.kind,
-                "expires_at": expires_at.isoformat(),
-                "bot_username": bot.name,
-                # The link opens the direct messages with the app. The code goes in by hand.
-                "link": f"https://slack.com/app_redirect?app={app_id}&team={bot.external_id}"
+            link = (
+                f"https://slack.com/app_redirect?app={app_id}&team={bot.external_id}"
                 if app_id
-                else None,
-                "command": f"/sama pair {code}",
-            }
+                else None
+            )
+            command = f"/sama pair {code}"
+        else:
+            # The link opens the bot and sends the code with /start. A group link adds the bot
+            # to a group first.
+            start = "start" if body.kind == "user" else "startgroup"
+            link = f"https://t.me/{bot.name}?{start}={code}"
+            command = f"/pair {code}"
         return {
             "code": code,
             "kind": body.kind,
             "expires_at": expires_at.isoformat(),
             "bot_username": bot.name,
-            # The link opens the bot and sends the code with /start. A group link adds the bot
-            # to a group first.
-            "link": f"https://t.me/{bot.name}?{'start' if body.kind == 'user' else 'startgroup'}"
-            f"={code}",
-            "command": f"/pair {code}",
+            "link": link,
+            "command": command,
         }
 
     def _require_integrations(self) -> Integrations:

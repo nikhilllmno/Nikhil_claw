@@ -11,7 +11,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from sama.gateway.slack import MAX_CARD_CHARS, approval_blocks, escape, unescape
+from sama.gateway.slack import MAX_CARD_CHARS, SeenEvents, approval_blocks, escape, unescape
 from sama.gateway.slack_client import (
     BOT_TOKEN,
     SIGNING_SECRET,
@@ -122,3 +122,16 @@ async def test_the_client_reports_a_broken_answer() -> None:
         await client.auth_test()
     assert await client.app_id("B1") is None, "the app id is best effort"
     await client.aclose()
+
+
+def test_seen_events_forget_old_ids_and_keep_a_max_size() -> None:
+    now = [0.0]
+    seen = SeenEvents(keep_s=10, max_size=3, clock=lambda: now[0])
+    assert not seen.is_repeat("a")
+    assert seen.is_repeat("a")
+    now[0] = 11
+    assert not seen.is_repeat("a")
+    for key in ("b", "c", "d"):
+        assert not seen.is_repeat(key)
+    # The oldest id goes first when the log is full.
+    assert not seen.is_repeat("a")

@@ -357,13 +357,7 @@ class TelegramGateway:
         self, chat_id: int, message_id: int, group: bool, identity: Any
     ) -> Target | None:
         if not group:
-            return Target(
-                identity.org_id,
-                identity.user_id,
-                identity.workspace_id,
-                identity.agent_profile_id,
-                "private",
-            )
+            return Target.private(identity)
         async with self._engine.connect() as connection:
             row = (
                 await connection.execute(

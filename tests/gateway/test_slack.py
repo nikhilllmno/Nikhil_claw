@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import uuid
 from collections.abc import AsyncIterator
@@ -259,6 +260,27 @@ async def test_commands_in_a_direct_message(
     assert await gateway.command(command("new")) == "A new session started."
     (second,) = await bound(engine, f":dm:{DM}")
     assert second.id != first.id
+
+
+async def test_a_new_session_waits_for_the_message_of_the_chat(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+) -> None:
+    """/sama new takes the lock of the direct message, so a message at the same time cannot
+    bind another session."""
+    await pair(gateway, engine, tenant)
+    no_followers(gateway)
+    async with gateway._locks.hold((DM, None)):
+        task = asyncio.create_task(gateway.command(command("new")))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert await bound(engine, f":dm:{DM}") == []
+    assert await task == "A new session started."
+    (first,) = await bound(engine, f":dm:{DM}")
+    await gateway.handle_event(dm("hello"))
+    (same,) = await bound(engine, f":dm:{DM}")
+    assert same.id == first.id
 
 
 async def test_a_full_gateway_refuses_new_runs(

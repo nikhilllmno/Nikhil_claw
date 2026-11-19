@@ -70,6 +70,17 @@ class Target:
     audience: str
     """``private`` for a direct chat, ``shared`` for a group, a channel, or a thread."""
 
+    @classmethod
+    def private(cls, identity: Any) -> Target:
+        """The direct chat of a linked user (a ``channel_identities`` row)."""
+        return cls(
+            identity.org_id,
+            identity.user_id,
+            identity.workspace_id,
+            identity.agent_profile_id,
+            "private",
+        )
+
     @property
     def owner_user_id(self) -> uuid.UUID | None:
         return self.user_id if self.audience == "private" else None
