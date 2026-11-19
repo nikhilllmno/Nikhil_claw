@@ -172,6 +172,7 @@ Five rules shape the design:
 | D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. The control plane sends the traces from its stored rows after each run (Section 18.2). | One trace view for both SDKs. The proxy is the source of truth for cost. The sandbox has no Langfuse key (D6). |
 | D16 | **Sama is a library plus services.** Products import `sama` and register extra tools, skills, toolsets, channels, and policies through extension points. They do not patch sama code. | vorflux and later products build on the engine without a fork (Hermes rule: plugins never touch core). |
 | D17 | **Databases use a sama database gateway, and stdio MCP servers run in connector hosts.** The gateway enforces read-only transactions, one statement per call, timeouts, row limits, and hidden columns at the driver. A connector host is a separate sandbox per connection that holds only that connection's secrets. | A prompt cannot remove a limit that the driver enforces. Many SQL MCP servers give full rights through one tool. Running stdio servers outside the agent sandbox keeps credentials out of the sandbox (D6) and still supports the Hermes MCP ecosystem. |
+| D18 | **One control plane process per environment in M1.** The API, the tool server, the model proxy, the worker, the monitor, and the Telegram gateway run in one process on one Fly.io machine (Section 19.1). | The clarify broker and the event wake-ups are in memory, so the API and the tool server must share a process. One machine is enough for the team. Split into process groups when the broker moves to Postgres and more machines are needed. |
 
 ---
 
@@ -1174,9 +1175,9 @@ is not set and `429` when the user has 5 open codes. `GET /channels/telegram/ide
 the Telegram accounts of the user, and `DELETE /channels/telegram/identities/{id}` unlinks
 one. `/config` gives `telegram_bot_username` to the page.
 
-**Not in M1.12.** `python -m sama.api` runs only the API. The deploy (M1.15) puts the API, the
-worker, and the tool server in one control plane process, so that the API answers the
-`clarify` questions of the tool server. API keys for services come later.
+**Not in M1.12.** `python -m sama.api` runs only the API. The control plane process (Section
+19.1) puts the API, the worker, and the tool server in one process, so that the API answers
+the `clarify` questions of the tool server. API keys for services come later.
 
 ### 11.5 Telegram gateway (M1.13)
 
@@ -2089,7 +2090,7 @@ message. A new alert comes only 30 minutes or more after the last alert.
 | Runtimes | `claude-agent-sdk`, `openai-agents` (separate dependency groups) |
 | MCP | Official `mcp` Python SDK (streamable HTTP server) |
 | Database and storage | Supabase: Postgres, RLS, pgvector, Storage, Auth |
-| Hosting | Fly.io: `api`, `gateway`, `worker`, `scheduler` process groups |
+| Hosting | Fly.io: one control plane app per environment (`sama-staging`, `sama-production`) in M1 (D18). Process groups (`api`, `gateway`, `worker`, `scheduler`) come later. |
 | Sandboxes | E2B (custom template), Docker for local development |
 | Browser | Browserbase plus Playwright; Chrome extension (TypeScript, MV3) |
 | Connectors | Composio, remote MCP servers, hosted stdio MCP servers (E2B), database drivers (`asyncpg`, `aiomysql`, and others) with `sqlglot`, OpenAPI |
@@ -2109,14 +2110,104 @@ src/sama/
   tools/          # sama MCP server and tool packs (M1.8: server, web, todo, clarify, outbound)
   memory/  skills/  sessions/  scheduler/  workflows/  browser/  approvals/
   modelproxy/  vault/  tenancy/ (run tokens, access rules)  observability/
+  controlplane/   # one process with all the services (M1.15)
+  admin/          # operator commands: bootstrap (M1.15)
 skills/           # builtin skills (SKILL.md folders)
 extension/        # Chrome extension (TypeScript)
 web/              # Next.js app
 sandbox/          # Dockerfile of the sama image (Docker and the E2B template)
+deploy/           # Dockerfile of the control plane and the Fly.io configs (M1.15)
 migrations/       # Alembic
 tests/            # unit, conformance, integration
 docs/
 ```
+
+
+### 19.1 Control plane process (M1.15)
+
+`python -m sama.controlplane` runs all services in one process (D18). They share one database
+engine, one run token signer, one gate service, and one clarify broker.
+
+| Path | Service |
+|---|---|
+| `/` | The API and the web page (Section 11.4), and `/telegram/webhook` when a bot is set |
+| `/tools` | The sama MCP tool server: `/tools/mcp` and `/tools/gate` (Sections 16.1 and 16.7) |
+| `/model` | The model proxy: `/model/anthropic` and `/model/openai` (Section 16.6) |
+
+- The worker runs runs in E2B sandboxes with the Claude runtime. The sandbox reaches the
+  model proxy, the tool server, and the gate at `SAMA_PUBLIC_URL`. The egress allowlist of each
+  sandbox holds the host of `SAMA_PUBLIC_URL` and the hosts in `SAMA_SANDBOX_ALLOW_OUT`.
+- Large tool outputs spill into the session sandbox. `clarify` works, because the API answers
+  in the same process.
+- The trace export and the error rate alerts run in the process when their settings exist
+  (Section 18).
+- When a background loop ends with an error, the process logs it and stops, so that Fly.io
+  starts it again.
+- A stop (SIGTERM or SIGINT) has this order, because the runs in the sandboxes need the model
+  proxy and the tool server of the process:
+  1. The worker claims no more runs. HTTP still serves while the current runs end, for at
+     most 60 seconds. A run that is still open after that is ended by the next worker when its
+     lease runs out (Section 4.3).
+  2. uvicorn closes the listener and gives open requests (event streams too) 30 seconds.
+  3. The model proxy writes its last usage records (at most 25 seconds). Then the process tries
+     to pause the session sandboxes for at most 15 seconds. E2B pauses an idle sandbox by
+     itself, so this step is optional.
+  A second signal during step 1 cancels the worker and the monitor loops at once. The open
+  runs end when their leases run out.
+
+### 19.2 Settings (M1.15)
+
+The process reads its settings from the environment at start. A missing or bad value stops
+the start with a message that names the variable but not its value.
+
+| Variable | Required | Use |
+|---|---|---|
+| `SAMA_DATABASE_URL` | Yes | The database |
+| `SAMA_PUBLIC_URL` | Yes | The public address, with no path |
+| `SAMA_RUN_TOKEN_KEY` | Yes | The run token key, at least 32 bytes |
+| `SAMA_SUPABASE_URL`, `SAMA_SUPABASE_ANON_KEY` | Yes | Sign-in (Section 11.4) |
+| `E2B_API_KEY` | Yes | The sandbox provider |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy |
+| `BRAVE_API_KEY` | No | `web_search` |
+| `SAMA_TELEGRAM_BOT_TOKEN`, `SAMA_TELEGRAM_WEBHOOK_SECRET`, `SAMA_TELEGRAM_BOT_USERNAME` | No | The Telegram gateway. The process sets the webhook at start. |
+| `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
+| `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
+| `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY` | No | See the module doc of `sama.controlplane.__main__` |
+
+The vault (M1.17) replaces the provider, search, and bot keys.
+
+### 19.3 Fly.io apps and CI (M1.15)
+
+| Environment | Fly.io app | Supabase project | Config |
+|---|---|---|---|
+| Staging | `sama-staging` | `sama-staging` (`ap-south-1`) | `deploy/fly.staging.toml` |
+| Production | `sama-production` | `sama` (`ap-south-1`) | `deploy/fly.production.toml` |
+
+- Both apps run in `sin` (Singapore), the Fly.io region nearest to `ap-south-1` (Q4). Each app
+  has one machine with `shared-cpu-1x` and 1 GB of memory. The machine does not stop when it is
+  idle, because the worker must poll the queue.
+- `kill_timeout` is 180 seconds, longer than the whole stop of Section 19.1 (about 130
+  seconds).
+- `deploy/Dockerfile` builds the control plane image. It holds no agent runtime, because the
+  runner runs in the sandbox. Secrets come from Fly.io secrets, never from the image.
+- The release command `alembic upgrade head` applies the migrations before the new machine
+  starts. A failed migration stops the deploy, and the old machine keeps running.
+- `.github/workflows/deploy.yml`: after CI passes on a push to `main`, the `staging` job
+  deploys that commit to staging and labels the image `main-<sha>`. The `production` job runs
+  only by hand (`workflow_dispatch` with the commit SHA). It checks that the commit is on
+  `main` and deploys the staging image of that commit, so production runs the tested image.
+- The GitHub environments `staging` and `production` hold the secret `FLY_API_TOKEN`. Only
+  `main` can deploy to them.
+- The E2B template `sama-runner` is shared by both environments. The nightly job builds it
+  from `main` (Section 16.2).
+
+### 19.4 First org (M1.15)
+
+`python -m sama.admin bootstrap --org-slug <slug> --email <email>` creates the first org, an
+org-level `owner` membership, the workspace `main`, and the agent profile `sama` (model
+`claude-sonnet-5-5`, toolsets `core`, `todo`, `web`, `clarify`). The owner signs in on the web
+page one time first, so that the email finds the Supabase Auth user. A second run adds only
+what is missing. Run it on the app machine with `fly ssh console`.
 
 ---
 

@@ -1,6 +1,7 @@
 # Keep the build context small, and keep local files and secrets out of the image.
 # A deny list, not `**` with exceptions: the E2B template build reads this file too, and it
 # does not apply exceptions after `**`.
+# The control plane image (deploy/Dockerfile) copies `migrations` for the release command.
 .git
 .github
 .venv
@@ -12,7 +13,6 @@
 .pytest_cache
 .ruff_cache
 docs
-migrations
 tests
 extension
 web

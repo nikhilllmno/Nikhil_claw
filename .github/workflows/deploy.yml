@@ -1,0 +1,120 @@
+name: Deploy
+
+# Deploys main to staging after CI passes on main, and promotes a staging image to production
+# by hand (docs/architecture.md, Section 19.3).
+#
+# - Staging: each push to main that passes CI. The release command applies the migrations.
+# - Production: run this workflow by hand with the commit to promote. It deploys the image
+#   that staging built for that commit, so production runs the tested image.
+#
+# Each GitHub environment (staging, production) needs the secret FLY_API_TOKEN.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: The full commit SHA on main to promote to production.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FLYCTL_VERSION: "0.5.13"
+  FLYCTL_SHA256: "f1ae6fc1d0151d9a3a0086d22e0552e33cf9ab6f8f9c7c2baf7daa96d3ee0870"
+
+jobs:
+  staging:
+    name: Deploy to staging
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: staging
+      url: https://sama-staging.fly.dev
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Install flyctl (pinned, checksum verified)
+        run: |
+          curl -sSfL -o flyctl.tgz \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "${FLYCTL_SHA256}  flyctl.tgz" | sha256sum --check --strict
+          tar -xzf flyctl.tgz flyctl
+          rm flyctl.tgz
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: >-
+          ./flyctl deploy --config deploy/fly.staging.toml --remote-only --ha=false
+          --image-label "main-${SHA}" --wait-timeout 10m
+      - name: Check the health of each part
+        run: |
+          for path in /healthz /tools/healthz /model/healthz; do
+            curl -sSf --retry 10 --retry-all-errors --retry-delay 3 --max-time 10 \
+              "https://sama-staging.fly.dev${path}" > /dev/null
+          done
+
+  production:
+    name: Promote to production
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://sama-production.fly.dev
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      SHA: ${{ inputs.sha }}
+    steps:
+      - name: Check the commit
+        run: |
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Give the full 40-character commit SHA."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use the config of that commit, and only a commit on main
+        run: |
+          git merge-base --is-ancestor "$SHA" origin/main
+          git checkout --quiet "$SHA"
+      - name: Install flyctl (pinned, checksum verified)
+        run: |
+          curl -sSfL -o flyctl.tgz \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "${FLYCTL_SHA256}  flyctl.tgz" | sha256sum --check --strict
+          tar -xzf flyctl.tgz flyctl
+          rm flyctl.tgz
+      - name: Deploy the staging image of the commit
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: >-
+          ./flyctl deploy --config deploy/fly.production.toml --ha=false
+          --image "registry.fly.io/sama-staging:main-${SHA}" --wait-timeout 10m
+      - name: Check the health of each part
+        run: |
+          for path in /healthz /tools/healthz /model/healthz; do
+            curl -sSf --retry 10 --retry-all-errors --retry-delay 3 --max-time 10 \
+              "https://sama-production.fly.dev${path}" > /dev/null
+          done

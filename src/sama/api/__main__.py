@@ -10,8 +10,9 @@ Environment:
 - ``SAMA_TELEGRAM_BOT_USERNAME``: optional. The shared sama bot. It turns on Telegram pairing
   codes on the web page. ``python -m sama.gateway`` runs the bot.
 
-This process does not run the worker or the tool server. M1.15 puts them in one control plane
-process, so that the API can answer the clarify questions of the tool server.
+This process does not run the worker or the tool server. ``python -m sama.controlplane`` runs
+all of them in one process, so that the API can answer the clarify questions of the tool
+server.
 """
 
 from __future__ import annotations
