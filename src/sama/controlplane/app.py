@@ -95,6 +95,12 @@ class ControlPlane:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    def abort(self) -> None:
+        """Cancels the loops at once, for a second stop signal."""
+        self.stop.set()
+        for task in self.tasks:
+            task.cancel()
+
 
 def build(
     settings: ControlPlaneSettings,

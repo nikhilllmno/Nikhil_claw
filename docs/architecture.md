@@ -2152,7 +2152,8 @@ engine, one run token signer, one gate service, and one clarify broker.
   3. The model proxy writes its last usage records (at most 25 seconds). Then the process tries
      to pause the session sandboxes for at most 15 seconds. E2B pauses an idle sandbox by
      itself, so this step is optional.
-  A second signal during step 1 skips the rest of the drain.
+  A second signal during step 1 cancels the worker and the monitor loops at once. The open
+  runs end when their leases run out.
 
 ### 19.2 Settings (M1.15)
 

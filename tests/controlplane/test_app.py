@@ -200,3 +200,37 @@ async def test_a_stop_drains_the_runs_while_http_still_serves(
     assert await _status(engine, first) == "completed"
     # The worker took no new run during the drain. The next process takes it.
     assert await _status(engine, second) == "queued"
+
+
+async def test_a_second_stop_cancels_the_drain(engine: AsyncEngine, tenant: Tenant) -> None:
+    runtime = FakeRuntime()
+    words = [TextDelta(text=f"w{i} ", usage=Usage(output_tokens=i)) for i in range(1, 41)]
+    runtime.add_script(
+        FakeScript(events=(*words, RunCompleted(output="done", usage=words[-1].usage)), delay_s=0.5)
+    )
+    plane = build(
+        settings(), engine=engine, runtimes=(runtime,), worker_poll_s=0.02, exit_on_failure=False
+    )
+    port = _free_port()
+    server = DrainingServer(
+        uvicorn.Config(plane.app, host="127.0.0.1", port=port, log_config=None), plane
+    )
+    serving = asyncio.create_task(server.serve())
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+        await until(lambda: _true(server.started))
+        run_id = (
+            await client.post(
+                f"/sessions/{tenant.ids['s1']}/messages",
+                json={"text": "long"},
+                headers=bearer(tenant.ids["mia_auth"]),
+            )
+        ).json()["run_id"]
+        await until(lambda: _is(engine, run_id, "running"))
+    server.request_stop()
+    await until(lambda: _true(plane.stop.is_set()))
+    server.request_stop()
+    # The run needs 20 seconds more. The stop does not wait for it.
+    async with asyncio.timeout(5):
+        await serving
+    assert all(task.done() for task in plane.tasks)
+    assert await _status(engine, run_id) != "completed"
