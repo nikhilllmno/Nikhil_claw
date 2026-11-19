@@ -2048,6 +2048,11 @@ runtimes.
   ready 11 minutes after its end, because the model proxy can store the usage of a call up to
   600 seconds after the client goes away (`drain_s`, Section 16.6). A run that ended more
   than one day ago is not sent.
+  These delays cover the normal path only. When all write attempts of a call record fail,
+  the proxy keeps the record in memory, blocks the org, and writes it at a later request or at
+  shutdown (Section 16.6). Such a record can arrive after the trace is sent. The trace then
+  does not show that call. The `model_calls` table stays the source of truth for usage and
+  cost. Langfuse traces are best effort.
 - At most one send: Langfuse keeps each copy of a span that it gets, so a second send of a
   trace doubles its usage and cost. The exporter removes the mark and tries again at the next
   pass only when Langfuse surely did not store the trace: a connection error before the
