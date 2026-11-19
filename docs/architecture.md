@@ -1614,9 +1614,8 @@ in the sandbox with native tools. It cannot push yet.
   exists, the tool tells the agent to use git in that folder or give another name. The tool
   makes the empty folder with `mkdir` before the clone. `mkdir` is atomic, so of two calls
   with one folder only one clones, and a failed clone removes only a folder that its call
-  made. If `git clone` finds files in the folder that it did not write, the tool keeps the
-  files and tells the agent that the folder exists. So a clone never removes the files of
-  another clone.
+  made. If `git clone` stops because the folder is not empty, another writer put files in
+  it after `mkdir`. Then the tool keeps the folder and tells the agent that the folder exists.
 - **Instruction files.** The result gives the URL, the branch (or "a tag"), the commit, the
   path, and the text of `AGENTS.md` and `CLAUDE.md` at the repo root, if they exist. The tool
   reads them from the commit (`git ls-tree`, `git cat-file`), and only regular files. A
