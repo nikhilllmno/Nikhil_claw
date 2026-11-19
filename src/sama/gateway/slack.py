@@ -224,11 +224,14 @@ class SeenEvents:
         now = self._clock()
         while self._seen:
             oldest, at = next(iter(self._seen.items()))
-            if now - at < self._keep_s and len(self._seen) < self._max_size:
+            if now - at < self._keep_s:
                 break
             del self._seen[oldest]
         if key in self._seen:
             return True
+        # Make room only for a new key, so that a repeat of the oldest id is still found.
+        while len(self._seen) >= self._max_size:
+            self._seen.popitem(last=False)
         self._seen[key] = now
         return False
 

@@ -131,7 +131,10 @@ def test_seen_events_forget_old_ids_and_keep_a_max_size() -> None:
     assert seen.is_repeat("a")
     now[0] = 11
     assert not seen.is_repeat("a")
-    for key in ("b", "c", "d"):
+    for key in ("b", "c"):
         assert not seen.is_repeat(key)
-    # The oldest id goes first when the log is full.
+    # A full log still finds a repeat of its oldest id.
+    assert seen.is_repeat("a")
+    # A new id makes room: the oldest id goes first.
+    assert not seen.is_repeat("d")
     assert not seen.is_repeat("a")
