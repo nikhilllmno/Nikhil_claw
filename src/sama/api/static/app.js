@@ -492,8 +492,11 @@ function orgIntegrations(org, items) {
   const slackPart = element("div");
   slackPart.append(element("h4", "Slack"), slackSetup(org, slack));
   if (slack !== null) {
-    slackPart.append(disconnectButton(org, "slack", "Disconnect Slack",
-      "Disconnect the Slack app? sama revokes its token, and all Slack links of the org stop."));
+    slackPart.append(slack.status === "pending"
+      ? disconnectButton(org, "slack", "Remove the Slack setup",
+        "Remove the Slack setup? The request URLs of this setup stop.")
+      : disconnectButton(org, "slack", "Disconnect Slack",
+        "Disconnect the Slack app? sama revokes its token, and all Slack links of the org stop."));
   }
   block.append(telegramPart, slackPart);
   return block;
@@ -506,6 +509,8 @@ function disconnectButton(org, kind, label, question) {
     if (!confirm(question)) return;
     try {
       await api(`/orgs/${org.id}/integrations/${kind}`, { method: "DELETE" });
+      // The URLs of the setup belong to the removed integration.
+      if (kind === "slack") slackSetups.delete(org.id);
       await refreshIntegrations();
     } catch (error) {
       showError(error.message);

@@ -27,4 +27,5 @@ aside, #chat { background: #fff; border: 1px solid #ddd; border-radius: 8px; pad
 .integration ol { padding-left: 20px; margin: 6px 0; }
 .integration .failed { color: #b00020; }
 .hint { color: #555; font-size: 13px; }
+.hint li, .hint code { overflow-wrap: anywhere; }
 #tg-code a { overflow-wrap: anywhere; }

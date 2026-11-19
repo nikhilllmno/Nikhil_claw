@@ -1391,7 +1391,8 @@ connect has two steps:
    when the token is of another Slack workspace, sets the row `active` with the team, the
    digest of the signing secret, and `settings`, stores both secrets in the vault
    (`slack_bot_token`, `slack_signing_secret`), and writes `integration.connected`. The row keeps
-   its id, because the URLs in the Slack app hold it.
+   its id, because the URLs in the Slack app hold it. When the new bot token is not the old
+   one, sama then revokes the old token (`auth.revoke`, best effort).
 
 A connect holds the advisory locks of the org and kind and of the Slack workspace. A disconnect
 deletes the row, its links, and the vault entries, and then revokes the bot token

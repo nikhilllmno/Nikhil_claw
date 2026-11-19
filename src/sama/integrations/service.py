@@ -50,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sama.db.models import AuditEntry, ChannelGroup, ChannelIdentity, Integration, PairingCode
 from sama.gateway.slack_client import BOT_TOKEN, SIGNING_SECRET, SlackClient, SlackError
 from sama.gateway.telegram_client import TelegramClient, TelegramError
+from sama.vault.crypto import VaultError
 from sama.vault.store import SecretName, Vault
 
 log: Final = logging.getLogger("sama.integrations")
@@ -440,6 +441,10 @@ class Integrations:
             await client.aclose()
         async with _locked(self._engine, _org_key(org_id, "slack"), _team_key(team_id)):
             try:
+                old = await vault.get(org_id, SecretName.SLACK_BOT_TOKEN, fresh=True)
+            except VaultError:
+                old = None
+            try:
                 async with self._engine.begin() as connection:
                     view = await self._store_slack(
                         connection, vault, org_id, user_id, team_id, team, settings, token, signing
@@ -449,6 +454,9 @@ class Integrations:
                     "another connect is in progress. Try again.", status_code=409
                 ) from None
         self._changed(view.id)
+        if old is not None and old.get_secret_value() != token:
+            # The new app replaces the old one: the old token must not post again.
+            await self._forget_slack(org_id, old)
         return view
 
     async def _store_slack(

@@ -214,7 +214,7 @@ async def test_a_workspace_belongs_to_one_org(
 
 
 async def test_another_workspace_drops_the_links_of_the_old_one(
-    integrations: Integrations, engine: AsyncEngine, tenant: Tenant
+    integrations: Integrations, engine: AsyncEngine, tenant: Tenant, slack: FakeSlack
 ) -> None:
     user = tenant.ids["mia"]
     setup = await integrations.setup_slack(tenant.org, user)
@@ -248,11 +248,14 @@ async def test_another_workspace_drops_the_links_of_the_old_one(
     # The same workspace keeps the links (for example a new signing secret).
     await integrations.connect_slack(tenant.org, user, SecretStr(SLACK_TOKEN), SecretStr("8" * 32))
     assert await links() == 1
+    assert slack.method_calls("auth.revoke") == [], "the same token is not revoked"
     second = await integrations.connect_slack(
         tenant.org, user, SecretStr(SECOND_TOKEN), SecretStr(SIGNING)
     )
     assert (second.id, second.name) == (setup.integration.id, "Second")
     assert await links() == 0
+    # The old token cannot post again.
+    assert [token for token, method in slack.tokens if method == "auth.revoke"] == [SLACK_TOKEN]
     async with engine.connect() as connection:
         codes = await connection.scalar(
             select(func.count()).select_from(PairingCode).where(PairingCode.org_id == tenant.org)
