@@ -1351,9 +1351,11 @@ effort).
 
 **Changes at the same time.** A connect or a disconnect holds two Postgres advisory locks
 (transaction locks on their own connection): one for the org and kind, then one for the bot.
-It holds them from its first database write to the end of its Telegram calls. Thus a second
-change of the same org or the same bot waits, also in another process, and the stored digest
-is always the digest of the last secret that Telegram got. The last status update also
+It holds them from its first database write to the end of its Telegram calls. A second change
+of the same org or the same bot, also in another process, gets `409` at once and does not
+wait, so it does not keep a pooled connection that the first change needs. Thus the stored
+digest is always the digest of the last secret that Telegram got. The lock transaction sets
+`idle_in_transaction_session_timeout` to 5 minutes, which is longer than its Telegram calls. The last status update also
 matches only the digest that this connect registered. The page asks the admin to confirm a
 replace, because a different bot deletes the links of the old bot.
 

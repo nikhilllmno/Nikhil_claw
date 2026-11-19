@@ -1,25 +1,25 @@
 """Tests of connects and disconnects that run at the same time (docs/architecture.md,
 Section 11.6). Each test holds one Telegram call open, starts a second change, and checks that
-the second change waits for the first one."""
+the second change gets 409 and does not change the first one."""
 
 from __future__ import annotations
 
 import asyncio
 
 import httpx
+import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.db import create_engine
 from sama.db.models import Integration
 from sama.gateway.telegram_client import TelegramClient
-from sama.integrations.service import Integrations, secret_hash
+from sama.integrations.service import IntegrationError, Integrations, secret_hash
 from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import Vault
 from tests.integrations.support import TOKEN, FakeTelegram
 from tests.orchestrator.conftest import Tenant
-
-WAIT_S = 0.3
 
 
 class HeldTelegram(FakeTelegram):
@@ -66,7 +66,7 @@ async def stored(engine: AsyncEngine, tenant: Tenant) -> Integration | None:
         ).one_or_none()  # type: ignore[return-value]
 
 
-async def test_two_connects_keep_the_secret_that_telegram_has(
+async def test_a_second_connect_during_a_connect_gets_409(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:
     telegram = HeldTelegram("setWebhook")
@@ -74,23 +74,25 @@ async def test_two_connects_keep_the_secret_that_telegram_has(
         service(engine, telegram).connect_telegram(tenant.org, tenant.ids["mia"], SecretStr(TOKEN))
     )
     await asyncio.wait_for(telegram.reached.wait(), 5)
-    second = asyncio.create_task(
-        service(engine, telegram).connect_telegram(tenant.org, tenant.ids["mia"], SecretStr(TOKEN))
-    )
-    await asyncio.sleep(WAIT_S)
-    assert telegram.started.count("setWebhook") == 1, "the second connect waits"
+    with pytest.raises(IntegrationError) as busy:
+        await service(engine, telegram).connect_telegram(
+            tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
+        )
+    assert busy.value.status_code == 409
+    assert telegram.started.count("setWebhook") == 1
     telegram.release.set()
-    views = await asyncio.gather(first, second)
-    assert [view.status for view in views] == ["active", "active"]
+    assert (await first).status == "active"
+    again = await service(engine, telegram).connect_telegram(
+        tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
+    )
+    assert again.status == "active"
     last = telegram.method_calls("setWebhook")[-1]["secret_token"]
     row = await stored(engine, tenant)
     assert row is not None
     assert (row.status, row.secret_hash) == ("active", secret_hash(last))
 
 
-async def test_a_disconnect_does_not_delete_the_webhook_of_a_later_connect(
-    engine: AsyncEngine, tenant: Tenant
-) -> None:
+async def test_a_connect_during_a_disconnect_gets_409(engine: AsyncEngine, tenant: Tenant) -> None:
     telegram = HeldTelegram("deleteWebhook")
     await service(engine, telegram).connect_telegram(
         tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
@@ -99,14 +101,47 @@ async def test_a_disconnect_does_not_delete_the_webhook_of_a_later_connect(
         service(engine, telegram).disconnect(tenant.org, "telegram", tenant.ids["mia"])
     )
     await asyncio.wait_for(telegram.reached.wait(), 5)
-    again = asyncio.create_task(
-        service(engine, telegram).connect_telegram(tenant.org, tenant.ids["mia"], SecretStr(TOKEN))
-    )
-    await asyncio.sleep(WAIT_S)
-    assert telegram.started.count("setWebhook") == 1, "the connect waits for the disconnect"
+    with pytest.raises(IntegrationError) as busy:
+        await service(engine, telegram).connect_telegram(
+            tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
+        )
+    assert busy.value.status_code == 409
     telegram.release.set()
     assert await gone is True
-    view = await again
-    assert view.status == "active"
+    assert (
+        await service(engine, telegram).connect_telegram(
+            tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
+        )
+    ).status == "active"
     methods = [name for name, _ in telegram.calls if name in {"setWebhook", "deleteWebhook"}]
     assert methods == ["setWebhook", "deleteWebhook", "setWebhook"]
+
+
+async def test_changes_that_wait_do_not_use_up_a_small_pool(
+    queue_database_url: str, tenant: Tenant
+) -> None:
+    """The change with the locks needs a second connection. The other changes must not keep
+    the pool while the first one waits for Telegram."""
+    small = create_engine(queue_database_url, pool_size=2, max_overflow=0, pool_timeout=2)
+    try:
+        telegram = HeldTelegram("setWebhook")
+        first = asyncio.create_task(
+            service(small, telegram).connect_telegram(
+                tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
+            )
+        )
+        await asyncio.wait_for(telegram.reached.wait(), 5)
+        others = await asyncio.gather(
+            *(
+                service(small, telegram).connect_telegram(
+                    tenant.org, tenant.ids["mia"], SecretStr(TOKEN)
+                )
+                for _ in range(5)
+            ),
+            return_exceptions=True,
+        )
+        assert all(isinstance(e, IntegrationError) and e.status_code == 409 for e in others)
+        telegram.release.set()
+        assert (await asyncio.wait_for(first, 10)).status == "active"
+    finally:
+        await small.dispose()

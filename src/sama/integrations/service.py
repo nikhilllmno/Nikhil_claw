@@ -12,7 +12,9 @@ the webhook at Telegram. Each change writes an audit entry without secrets.
 
 A connect or a disconnect holds Postgres advisory locks for the org (and the kind) and for the
 bot from the start of its database work to the end of its Telegram calls. Thus two changes of
-one org or one bot, also in two processes, cannot interleave their webhook registrations.
+one org or one bot, also in two processes, cannot interleave their webhook registrations. A
+change that does not get a lock at once gets ``409``: it does not wait, so it does not keep a
+pooled connection that the change with the lock needs.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from datetime import datetime
 from typing import Any, Final
 
 from pydantic import SecretStr
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -289,7 +291,8 @@ class Integrations:
             if bot is None:
                 return False
             if kind == "telegram":
-                # A connect of the same bot in another org waits until the webhook is gone.
+                # A connect of the same bot in another org cannot start before the webhook is
+                # gone.
                 await _lock(lock, _bot_key(bot))
             return await self._disconnect(vault, org_id, kind, user_id)
 
@@ -361,16 +364,31 @@ def _bot_key(bot_id: str) -> str:
     return f"sama.integration:telegram:{bot_id}"
 
 
+# Longer than the Telegram calls in a lock (timeouts and 429 waits), and an upper limit for a
+# lock of a process that hangs.
+LOCK_IDLE_TIMEOUT: Final = "5min"
+
+
 async def _lock(connection: AsyncConnection, key: str) -> None:
-    await connection.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(key, 0))))
+    """Takes the advisory lock of ``key`` or raises ``IntegrationError`` (409) at once."""
+    taken = await connection.scalar(
+        select(func.pg_try_advisory_xact_lock(func.hashtextextended(key, 0)))
+    )
+    if not taken:
+        raise IntegrationError(
+            "another change of this integration is in progress. Try again.", status_code=409
+        )
 
 
 @asynccontextmanager
 async def _locked(engine: AsyncEngine, *keys: str) -> AsyncIterator[AsyncConnection]:
-    """Holds an advisory lock for each key, in this order, until the block ends. The org key
-    always comes before the bot key, so two changes cannot wait for each other in a circle.
-    The locks end with their transaction, also when the process stops."""
+    """Holds an advisory lock for each key until the block ends. The locks end with their
+    transaction, also when the process stops. The transaction is idle during the Telegram
+    calls, so it sets its own idle limit."""
     async with engine.begin() as connection:
+        await connection.execute(
+            text(f"SET LOCAL idle_in_transaction_session_timeout = '{LOCK_IDLE_TIMEOUT}'")
+        )
         for key in keys:
             await _lock(connection, key)
         yield connection
