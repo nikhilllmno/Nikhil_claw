@@ -1,0 +1,148 @@
+"""A small client for the Telegram Bot API (https://core.telegram.org/bots/api).
+
+The bot token is part of each request URL. Errors never contain the URL, and the
+``python -m sama.gateway`` entry point sets the ``httpx`` logger to ``WARNING`` so that
+request URLs are not logged.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Final
+
+import httpx
+from pydantic import SecretStr
+
+API_URL: Final = "https://api.telegram.org"
+MAX_TEXT: Final = 4096
+"""The longest message text that Telegram accepts."""
+
+
+class TelegramError(Exception):
+    """A failed Bot API call. ``retry_after`` is set when Telegram asks the bot to wait."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def bot_id(token: SecretStr) -> int | None:
+    """The user id of the bot: the number before the colon in its token."""
+    head, _, _ = token.get_secret_value().partition(":")
+    return int(head) if head.isdigit() else None
+
+
+class TelegramClient:
+    def __init__(
+        self,
+        token: SecretStr,
+        *,
+        base_url: str = API_URL,
+        http: httpx.AsyncClient | None = None,
+        timeout_s: float = 20.0,
+    ) -> None:
+        self._token = token
+        self._base_url = base_url.rstrip("/")
+        self._http = http or httpx.AsyncClient(timeout=timeout_s)
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def call(self, method: str, **params: Any) -> Any:
+        url = f"{self._base_url}/bot{self._token.get_secret_value()}/{method}"
+        body = {name: value for name, value in params.items() if value is not None}
+        try:
+            response = await self._http.post(url, json=body)
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise TelegramError(f"{method} failed: {type(error).__name__}") from None
+        if not isinstance(data, dict) or not data.get("ok"):
+            data = data if isinstance(data, dict) else {}
+            parameters = data.get("parameters") or {}
+            raise TelegramError(
+                f"{method} failed: {data.get('description', response.status_code)}",
+                retry_after=parameters.get("retry_after"),
+            )
+        return data.get("result")
+
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        buttons: list[list[dict[str, str]]] | None = None,
+    ) -> int:
+        """Sends plain text and returns the message id."""
+        result = await self.call(
+            "sendMessage",
+            chat_id=chat_id,
+            text=text[:MAX_TEXT],
+            reply_parameters=(
+                None
+                if reply_to is None
+                else {"message_id": reply_to, "allow_sending_without_reply": True}
+            ),
+            reply_markup=None if buttons is None else {"inline_keyboard": buttons},
+            link_preview_options={"is_disabled": True},
+        )
+        return int(result["message_id"])
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        buttons: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        """Changes the text of a message. Without ``buttons`` the buttons go away."""
+        try:
+            await self.call(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text[:MAX_TEXT],
+                reply_markup={"inline_keyboard": buttons or []},
+                link_preview_options={"is_disabled": True},
+            )
+        except TelegramError as error:
+            if "message is not modified" not in str(error):
+                raise
+
+    async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
+        await self.call("answerCallbackQuery", callback_query_id=callback_id, text=text)
+
+    async def typing(self, chat_id: int) -> None:
+        await self.call("sendChatAction", chat_id=chat_id, action="typing")
+
+    async def download(self, file_id: str, *, max_bytes: int) -> bytes:
+        """Downloads a file that a user sent. Raises ``TelegramError`` above ``max_bytes``."""
+        info = await self.call("getFile", file_id=file_id)
+        if int(info.get("file_size") or 0) > max_bytes or not info.get("file_path"):
+            raise TelegramError("getFile failed: the file is too large")
+        url = f"{self._base_url}/file/bot{self._token.get_secret_value()}/{info['file_path']}"
+        try:
+            async with self._http.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise TelegramError(f"download failed: {response.status_code}")
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise TelegramError("download failed: the file is too large")
+        except httpx.HTTPError as error:
+            raise TelegramError(f"download failed: {type(error).__name__}") from None
+        return bytes(data)
+
+    async def set_webhook(self, url: str, secret: SecretStr) -> None:
+        await self.call(
+            "setWebhook",
+            url=url,
+            secret_token=secret.get_secret_value(),
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=False,
+        )
+
+    async def username(self) -> str:
+        me = await self.call("getMe")
+        return str(me["username"])

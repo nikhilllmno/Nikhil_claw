@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, insert, or_, select
+from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.api.auth import AuthError, JwtVerifier, Principal
@@ -38,6 +38,7 @@ from sama.db.models import (
     AgentProfile,
     Approval,
     AuditEntry,
+    ChannelIdentity,
     Message,
     Org,
     Run,
@@ -47,6 +48,7 @@ from sama.db.models import (
     Workspace,
 )
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
+from sama.gateway.pairing import PairingError, create_code
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -81,6 +83,8 @@ class ApiSettings(BaseModel):
     """The open event streams of this process. One more stream gets ``429``."""
     max_streams_per_user: int = Field(default=8, gt=0)
     """The open event streams of one user in this process."""
+    telegram_bot_username: str | None = None
+    """The shared sama bot, without the ``@``. Without it, Telegram pairing is off."""
 
 
 # -- request and response bodies ------------------------------------------------------------
@@ -108,6 +112,13 @@ class Decision(_Body):
 class Approve(Decision):
     always_allow: bool = False
     """Also allow this tool for this user and this agent profile from now on."""
+
+
+class NewPairingCode(_Body):
+    workspace_id: uuid.UUID
+    agent_profile_id: uuid.UUID
+    kind: Literal["user", "group"] = "user"
+    """``user`` links the Telegram account of the user. ``group`` links a group chat."""
 
 
 class Answers(_Body):
@@ -345,6 +356,7 @@ class SamaApi:
             return {
                 "supabase_url": settings.supabase_url,
                 "supabase_anon_key": settings.supabase_anon_key,
+                "telegram_bot_username": settings.telegram_bot_username,
             }
 
         @app.get("/me")
@@ -433,6 +445,19 @@ class SamaApi:
             principal: Me, session_id: uuid.UUID, request_id: str, body: Answers
         ) -> Response:
             await self._answer(principal, session_id, request_id, body.answers)
+            return Response(status_code=204)
+
+        @app.post("/channels/telegram/pairing-codes", status_code=201)
+        async def pairing_code(principal: Me, body: NewPairingCode) -> dict[str, Any]:
+            return await self._pairing_code(principal, body)
+
+        @app.get("/channels/telegram/identities")
+        async def identities(principal: Me) -> list[dict[str, Any]]:
+            return await self._identities(principal)
+
+        @app.delete("/channels/telegram/identities/{identity_id}", status_code=204)
+        async def unlink(principal: Me, identity_id: uuid.UUID) -> Response:
+            await self._unlink(principal, identity_id)
             return Response(status_code=204)
 
         return app
@@ -639,28 +664,38 @@ class SamaApi:
 
     # -- writes -----------------------------------------------------------------------------
 
-    async def _create_session(self, principal: Principal, body: NewSession) -> SessionOut:
+    async def _workspace_access(
+        self, principal: Principal, workspace_id: uuid.UUID, agent_profile_id: uuid.UUID
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        """The org and the user row for a new session in the workspace with the agent profile.
+        Raises ``404`` if the user cannot see the workspace or the profile is not in it."""
         async with as_user(self._engine, principal.auth_user_id) as connection:
             org_id = (
                 await connection.execute(
-                    select(Workspace.org_id).where(Workspace.id == body.workspace_id)
+                    select(Workspace.org_id).where(Workspace.id == workspace_id)
                 )
             ).scalar_one_or_none()
             user_id = None if org_id is None else await _user_id(connection, principal, org_id)
             if org_id is None or user_id is None:
                 raise _not_found("the workspace does not exist")
             grants = await load_grants(connection, org_id, user_id)
-            if not grants.sees_workspace(body.workspace_id):
+            if not grants.sees_workspace(workspace_id):
                 raise _not_found("the workspace does not exist")
             profile_workspace = (
                 await connection.execute(
                     select(AgentProfile.workspace_id).where(
-                        AgentProfile.org_id == org_id, AgentProfile.id == body.agent_profile_id
+                        AgentProfile.org_id == org_id, AgentProfile.id == agent_profile_id
                     )
                 )
             ).one_or_none()
-            if profile_workspace is None or profile_workspace[0] not in (None, body.workspace_id):
+            if profile_workspace is None or profile_workspace[0] not in (None, workspace_id):
                 raise _not_found("the agent profile does not exist in this workspace")
+        return org_id, user_id
+
+    async def _create_session(self, principal: Principal, body: NewSession) -> SessionOut:
+        org_id, user_id = await self._workspace_access(
+            principal, body.workspace_id, body.agent_profile_id
+        )
         session_id = uuid.uuid4()
         async with self._engine.begin() as connection:
             row = (
@@ -691,6 +726,90 @@ class SamaApi:
                 )
             )
         return _session_out(row)
+
+    async def _pairing_code(self, principal: Principal, body: NewPairingCode) -> dict[str, Any]:
+        if not self._settings.telegram_bot_username:
+            raise HTTPException(status_code=409, detail="Telegram is not set up")
+        org_id, user_id = await self._workspace_access(
+            principal, body.workspace_id, body.agent_profile_id
+        )
+        try:
+            async with self._engine.begin() as connection:
+                code, expires_at = await create_code(
+                    connection,
+                    org_id=org_id,
+                    user_id=user_id,
+                    channel="telegram",
+                    kind=body.kind,
+                    workspace_id=body.workspace_id,
+                    agent_profile_id=body.agent_profile_id,
+                )
+        except PairingError as error:
+            raise HTTPException(status_code=429, detail=str(error)) from None
+        return {
+            "code": code,
+            "kind": body.kind,
+            "expires_at": expires_at.isoformat(),
+            "bot_username": self._settings.telegram_bot_username,
+        }
+
+    async def _identities(self, principal: Principal) -> list[dict[str, Any]]:
+        """The Telegram accounts that are linked to the user, in all orgs."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            rows = await connection.execute(
+                select(
+                    ChannelIdentity.id,
+                    ChannelIdentity.org_id,
+                    ChannelIdentity.workspace_id,
+                    ChannelIdentity.agent_profile_id,
+                    ChannelIdentity.created_at,
+                )
+                .where(ChannelIdentity.channel == "telegram")
+                .order_by(ChannelIdentity.created_at)
+            )
+            return [
+                {
+                    "id": str(row.id),
+                    "org_id": str(row.org_id),
+                    "workspace_id": str(row.workspace_id),
+                    "agent_profile_id": str(row.agent_profile_id),
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+
+    async def _unlink(self, principal: Principal, identity_id: uuid.UUID) -> None:
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        ChannelIdentity.org_id,
+                        ChannelIdentity.user_id,
+                        ChannelIdentity.workspace_id,
+                        ChannelIdentity.channel,
+                        ChannelIdentity.external_id,
+                    ).where(ChannelIdentity.id == identity_id)
+                )
+            ).one_or_none()
+        if row is None:
+            raise _not_found("the linked account does not exist")
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                delete(ChannelIdentity).where(
+                    ChannelIdentity.org_id == row.org_id, ChannelIdentity.id == identity_id
+                )
+            )
+            await connection.execute(
+                insert(AuditEntry).values(
+                    org_id=row.org_id,
+                    workspace_id=row.workspace_id,
+                    actor_kind="user",
+                    actor_user_id=row.user_id,
+                    action="channel_identity.unlinked",
+                    target_type="channel_identity",
+                    target_id=f"{row.channel}:{row.external_id}",
+                )
+            )
 
     async def _send(
         self, principal: Principal, session_id: uuid.UUID, body: NewMessage

@@ -400,6 +400,48 @@ async function start() {
   if (!state.auth) return;
   await loadMe();
   await loadSessions();
+  $("telegram").hidden = !state.config.telegram_bot_username;
+  if (state.config.telegram_bot_username) await loadTelegram();
+}
+
+// -- Telegram -----------------------------------------------------------------------------------
+
+async function loadTelegram() {
+  const links = await api("/channels/telegram/identities");
+  $("tg-links").replaceChildren(...links.map((link) => {
+    const item = document.createElement("li");
+    const org = state.orgs.find((o) => o.id === link.org_id);
+    item.textContent = `Linked account (${org ? org.name : "org"}) `;
+    const unlink = document.createElement("button");
+    unlink.type = "button";
+    unlink.textContent = "Unlink";
+    unlink.addEventListener("click", async () => {
+      try {
+        await api(`/channels/telegram/identities/${link.id}`, { method: "DELETE" });
+        await loadTelegram();
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+    item.append(unlink);
+    return item;
+  }));
+}
+
+async function pairingCode(kind) {
+  try {
+    const result = await api("/channels/telegram/pairing-codes", {
+      method: "POST",
+      body: { workspace_id: $("workspace").value, agent_profile_id: $("profile").value, kind },
+    });
+    const until = new Date(result.expires_at).toLocaleTimeString();
+    $("tg-code").textContent = kind === "user"
+      ? `Send /start ${result.code} to @${result.bot_username}. The code expires at ${until}.`
+      : `Add @${result.bot_username} to the group, then send /pair ${result.code} in the group.`
+        + ` The code expires at ${until}.`;
+  } catch (error) {
+    showError(error.message);
+  }
 }
 
 function base64url(bytes) {
@@ -472,6 +514,8 @@ function bind() {
     await start().catch((e) => showError(e.message));
   });
   $("sign-out").addEventListener("click", signOut);
+  $("tg-user").addEventListener("click", () => pairingCode("user"));
+  $("tg-group").addEventListener("click", () => pairingCode("group"));
   $("workspace").addEventListener("change", fillProfiles);
   $("new-session").addEventListener("submit", async (event) => {
     event.preventDefault();

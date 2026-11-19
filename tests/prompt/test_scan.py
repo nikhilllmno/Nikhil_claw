@@ -152,3 +152,13 @@ def test_environment_uses_utc_and_the_audience() -> None:
     assert "Session start: 2026-11-19 00:09 UTC." in text
     assert "Audience: private." in text
     assert environment(run, datetime(2026, 11, 19, 0, 9, tzinfo=UTC)) == text
+    assert "Channel" not in text
+
+
+def test_environment_adds_the_channel_hint() -> None:
+    run = cast(Any, SimpleNamespace(audience="shared"))
+    text = environment(run, datetime(2026, 11, 19, tzinfo=UTC), "telegram")
+    assert "Audience: shared.\nChannel: Telegram." in text
+    assert environment(run, datetime(2026, 11, 19, tzinfo=UTC), "web") == environment(
+        run, datetime(2026, 11, 19, tzinfo=UTC)
+    )

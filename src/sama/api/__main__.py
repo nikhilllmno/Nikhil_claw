@@ -7,6 +7,8 @@ Environment:
   reads the signing keys of the project from its JWKS.
 - ``SAMA_SUPABASE_ANON_KEY``: the public key of the project. The web page uses it to sign in.
 - ``SAMA_SUPABASE_JWT_SECRET``: optional. The legacy shared secret (``HS256``) of the project.
+- ``SAMA_TELEGRAM_BOT_USERNAME``: optional. The shared sama bot. It turns on Telegram pairing
+  codes on the web page. ``python -m sama.gateway`` runs the bot.
 
 This process does not run the worker or the tool server. M1.15 puts them in one control plane
 process, so that the API can answer the clarify questions of the tool server.
@@ -48,6 +50,8 @@ def build_app() -> FastAPI:
         settings=ApiSettings(
             supabase_url=supabase_url,
             supabase_anon_key=_required("SAMA_SUPABASE_ANON_KEY"),
+            telegram_bot_username=os.environ.get("SAMA_TELEGRAM_BOT_USERNAME", "").lstrip("@")
+            or None,
         ),
     )
     return api.app()

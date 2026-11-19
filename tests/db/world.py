@@ -26,10 +26,13 @@ from sama.db.models import (
     AgentProfile,
     Approval,
     AuditEntry,
+    ChannelGroup,
+    ChannelIdentity,
     Membership,
     Message,
     ModelCall,
     Org,
+    PairingCode,
     Run,
     RunEvent,
     Session,
@@ -244,6 +247,40 @@ def plan(
             agent_profile_id=ids[owner_profile] if owner_profile else None,
             path="AGENTS.md",
             content=f"rules of {label}",
+        )
+    # Telegram links: each user reads only their own; a group shows to the workspace.
+    for user, org, workspace, profile in (
+        ("alice", "org-a", "a1", "profile-a"),
+        ("bob", "org-b", "b1", "profile-b"),
+    ):
+        links = {
+            "org_id": ids[org],
+            "channel": "telegram",
+            "workspace_id": ids[workspace],
+            "agent_profile_id": ids[profile],
+        }
+        add(
+            ChannelIdentity,
+            f"tg:{user}",
+            user_id=ids[user],
+            external_id=str(uuid.uuid4().int % 10**12),
+            **links,
+        )
+        add(
+            ChannelGroup,
+            f"group:{workspace}",
+            created_by_user_id=ids[user],
+            external_id=f"-{uuid.uuid4().int % 10**12}",
+            **links,
+        )
+        add(
+            PairingCode,
+            f"code:{user}",
+            user_id=ids[user],
+            kind="user",
+            code_hash=uuid.uuid4().hex * 2,
+            expires_at=text("now() + interval '10 minutes'"),
+            **links,
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")
