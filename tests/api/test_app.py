@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import SamaApi
+from sama.api.app import STREAM_GRACE_S, _EventStream
 from sama.db.models import AgentProfile, AuditEntry, Membership, Org, Run, Session, User, Workspace
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
@@ -364,6 +366,48 @@ async def test_a_stream_ends_when_the_token_expires(
         )
     assert response.status_code == 200
     assert [e for e in sse(response.text) if e[0] == "run_event"] == []
+
+
+async def test_an_open_stream_ends_when_a_valid_token_expires(
+    api: SamaApi, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    long = SamaApi(
+        engine,
+        verifier=api._verifier,
+        settings=api._settings.model_copy(update={"max_stream_s": 30}),
+    )
+    transport = httpx.ASGITransport(app=long.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        headers = bearer(tenant.ids["mia_auth"], expires_in=2)
+        started = asyncio.get_running_loop().time()
+        response = await asyncio.wait_for(
+            client.get(f"/sessions/{tenant.ids['s1']}/events", headers=headers), timeout=6
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+    assert response.status_code == 200
+    assert sse(response.text)[0][0] == "runs", "the stream worked before the token expired"
+    assert elapsed < 4
+
+
+async def test_a_blocked_send_cannot_hold_a_stream_past_its_end() -> None:
+    released: list[bool] = []
+
+    async def chunks() -> AsyncIterator[str]:
+        while True:
+            yield ": ping\n\n"
+
+    async def receive() -> dict[str, Any]:
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message.get("type") == "http.response.body":
+            await asyncio.Event().wait()  # a slow client that never reads
+
+    stream = _EventStream(chunks(), release=lambda: released.append(True), lifetime=0.1)
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}
+    await asyncio.wait_for(stream(scope, receive, send), timeout=1 + STREAM_GRACE_S)
+    assert released == [True]
 
 
 async def test_too_many_streams_get_429(api: SamaApi, engine: AsyncEngine, tenant: Tenant) -> None:

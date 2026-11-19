@@ -1142,7 +1142,9 @@ cross-org check of Section 17.1 through the API.
 
 The stream reads new rows every 0.5 seconds, sends `: ping` every 15 seconds, and checks the
 access again at each read. It ends after one hour, or when the access token expires if that is
-earlier. The client then connects again with a fresh token. One process has at most 1,000 open
+earlier. The time limit covers the whole response, also a slow database read or a send to a
+client that does not read: the response stops at most one second after it. The client then
+connects again with a fresh token. One process has at most 1,000 open
 streams, and one user at most 8 (`ApiSettings`). One more stream gets `429`. The limits are per
 process.
 

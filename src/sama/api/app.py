@@ -58,6 +58,8 @@ MAX_TITLE_CHARS: Final = 200
 MAX_REASON_CHARS: Final = 500
 STREAM_BATCH: Final = 500
 RECENT_RUNS: Final = 20
+STREAM_GRACE_S: Final = 1.0
+"""The response of a stream stops this long after the end time of the stream at the latest."""
 OPEN_RUN_STATUSES: Final = frozenset({"queued", "running", "paused"})
 NOT_FOUND: Final = "the session does not exist"
 STATIC: Final = resources.files("sama.api") / "static"
@@ -212,21 +214,31 @@ def _sse(event: str, data: Any, event_id: int | None = None) -> str:
 
 
 class _EventStream(StreamingResponse):
-    """A streaming response that gives back its stream slot when the response ends.
+    """A streaming response with a hard end time that gives back its stream slot at the end.
 
     The slot goes back also when the client goes away before the first chunk, because the
-    release is in the response, not in the generator.
+    release is in the response, not in the generator. The time limit covers the whole
+    response, also a database read or a send to a slow client that blocks.
     """
 
     def __init__(
-        self, content: AsyncIterator[str], *, release: Callable[[], None], **kwargs: Any
+        self,
+        content: AsyncIterator[str],
+        *,
+        release: Callable[[], None],
+        lifetime: float,
+        **kwargs: Any,
     ) -> None:
         super().__init__(content, **kwargs)
         self._release = release
+        self._lifetime = lifetime
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            async with asyncio.timeout(max(0.0, self._lifetime) + STREAM_GRACE_S):
+                await super().__call__(scope, receive, send)
+        except TimeoutError:
+            log.info("an event stream reached its end time")
         finally:
             self._release()
 
@@ -380,10 +392,12 @@ class SamaApi:
                 await session_access(connection, principal, session_id)
                 if cursor is None:
                     cursor = await self._last_event_id(connection, session_id)
+            lifetime = self._stream_lifetime(principal)
             release = self._open_stream(principal.auth_user_id)
             return _EventStream(
-                self._stream(principal, session_id, cursor),
+                self._stream(principal, session_id, cursor, lifetime),
                 release=release,
+                lifetime=lifetime,
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -791,8 +805,15 @@ class SamaApi:
 
         return release
 
+    def _stream_lifetime(self, principal: Principal) -> float:
+        """Seconds until the stream ends: ``max_stream_s``, or the token expiry if earlier."""
+        lifetime = self._settings.max_stream_s
+        if principal.expires_at is not None:
+            lifetime = min(lifetime, principal.expires_at - time.time())
+        return lifetime
+
     async def _stream(
-        self, principal: Principal, session_id: uuid.UUID, cursor: int
+        self, principal: Principal, session_id: uuid.UUID, cursor: int, lifetime: float
     ) -> AsyncIterator[str]:
         """Server-sent events of a session.
 
@@ -809,9 +830,6 @@ class SamaApi:
         """
         settings = self._settings
         loop = asyncio.get_running_loop()
-        lifetime = settings.max_stream_s
-        if principal.expires_at is not None:
-            lifetime = min(lifetime, principal.expires_at - time.time())
         deadline = loop.time() + lifetime
         next_ping = loop.time() + settings.heartbeat_s
         statuses: dict[uuid.UUID, str] = {}
@@ -863,6 +881,8 @@ class SamaApi:
                 if not first:
                     out += [_sse("run", _run_out(run)) for run in changed]
             first = False
+            if loop.time() >= deadline:
+                return  # The token can have expired during the reads.
             for chunk in out:
                 yield chunk
             if loop.time() >= next_ping:
