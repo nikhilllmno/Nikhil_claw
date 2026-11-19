@@ -1,9 +1,10 @@
-"""The Telegram channel (docs/architecture.md, Sections 11.1 to 11.3).
+"""The Telegram channel (docs/architecture.md, Sections 11.1 to 11.3 and 11.6).
 
-One shared sama bot serves the team. Telegram sends each update to ``POST /telegram/webhook``
-with the webhook secret in ``X-Telegram-Bot-Api-Secret-Token``. The gateway:
+Each org connects its own bot as an integration. One ``TelegramGateway`` serves one bot. The
+``TelegramHub`` (``sama.integrations.hub``) checks the webhook secret of the bot and gives each
+update to ``accept``. The gateway:
 
-1. checks the secret, drops repeated updates, and handles the update in the background;
+1. drops repeated updates and handles the update in the background;
 2. finds the linked user of the sender (``channel_identities``) and, in a group, the linked
    group (``channel_groups``). An unknown sender gets a pairing prompt in a direct chat and
    nothing in a group;
@@ -21,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json
 import logging
 import re
@@ -29,10 +29,9 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Final
+from typing import Any, Final
 
-from fastapi import APIRouter, Header, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -81,11 +80,23 @@ HELP: Final = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramBot:
+    """The bot of one Telegram integration (Section 11.6)."""
+
+    integration_id: uuid.UUID
+    org_id: uuid.UUID
+    username: str
+    """Without the ``@``. Group messages must mention it."""
+    user_id: int | None = None
+    """The Telegram user id of the bot. A reply to a message of the bot addresses it."""
+
+
 class TelegramSettings(BaseModel):
+    """The settings that all bots share."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    bot_username: str = Field(min_length=1)
-    """Without the ``@``. Group messages must mention it."""
     poll_s: float = Field(default=0.5, gt=0)
     paused_poll_s: float = Field(default=5.0, gt=0)
     """The poll interval while a run waits for an approval."""
@@ -117,10 +128,6 @@ class Target:
 class _Bound:
     session_id: uuid.UUID
     agent_profile_id: uuid.UUID
-
-
-def _binding_key(chat_id: int) -> str:
-    return f"chat:{chat_id}"
 
 
 def split_point(text: str, limit: int = SPLIT_AT) -> int:
@@ -258,58 +265,42 @@ class TelegramGateway:
         engine: AsyncEngine,
         client: TelegramClient,
         *,
-        settings: TelegramSettings,
-        webhook_secret: SecretStr,
-        bot_user_id: int | None = None,
+        bot: TelegramBot,
+        settings: TelegramSettings | None = None,
         queue: RunQueue | None = None,
         gate: GateService | None = None,
         transcriber: Transcriber | None = None,
         lockout: Lockout | None = None,
+        followers: set[object] | None = None,
     ) -> None:
-        if len(webhook_secret.get_secret_value()) < 16:
-            raise ValueError("the webhook secret needs at least 16 characters")
+        """``lockout`` and ``followers`` can be shared by the gateways of all bots, so that
+        the limits hold for the whole process."""
         self._engine = engine
         self._client = client
-        self._settings = settings
-        self._secret = webhook_secret
-        self._bot_user_id = bot_user_id
+        self._bot = bot
+        self._settings = settings or TelegramSettings()
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
         self._seen: OrderedDict[int, None] = OrderedDict()
         self._tasks: set[asyncio.Task[None]] = set()
-        self._followers: set[object] = set()
+        self._followers: set[object] = set() if followers is None else followers
         """One place per followed run. A message takes its place before it queues the run."""
         self._chat_locks: dict[int, _ChatLock] = {}
-        mention = re.escape(settings.bot_username)
+        mention = re.escape(bot.username)
         self._mention = re.compile(rf"(?<!\w)@{mention}\b", re.IGNORECASE)
 
-    # -- HTTP -----------------------------------------------------------------------------
+    @property
+    def bot(self) -> TelegramBot:
+        return self._bot
 
-    def router(self) -> APIRouter:
-        router = APIRouter()
-
-        @router.post("/telegram/webhook")
-        async def webhook(
-            request: Request,
-            x_telegram_bot_api_secret_token: Annotated[str | None, Header()] = None,
-        ) -> dict[str, str]:
-            given = (x_telegram_bot_api_secret_token or "").encode()
-            if not hmac.compare_digest(given, self._secret.get_secret_value().encode()):
-                raise HTTPException(status_code=401, detail="wrong webhook secret")
-            try:
-                update = await request.json()
-            except ValueError:
-                raise HTTPException(status_code=400, detail="the body is not JSON") from None
-            if not isinstance(update, dict):
-                raise HTTPException(status_code=400, detail="the body is not an update")
-            if self._is_repeat(update.get("update_id")):
-                return {}
-            self._spawn(self.handle_update(update))
-            return {}
-
-        return router
+    def accept(self, update: Mapping[str, Any]) -> None:
+        """Takes one update from the webhook. A repeated update is dropped; the others are
+        handled in the background, so Telegram gets its answer at once."""
+        if self._is_repeat(update.get("update_id")):
+            return
+        self._spawn(self.handle_update(update))
 
     def _is_repeat(self, update_id: Any) -> bool:
         if not isinstance(update_id, int):
@@ -365,7 +356,7 @@ class TelegramGateway:
         if match is None:
             return None, text
         name, to, rest = match.groups()
-        if to is not None and to.lower() != self._settings.bot_username.lower():
+        if to is not None and to.lower() != self._bot.username.lower():
             return None, text
         return f"/{name.lower()}", (rest or "").strip()
 
@@ -374,7 +365,7 @@ class TelegramGateway:
             return True
         replied = message.get("reply_to_message") or {}
         sender = replied.get("from") or {}
-        return self._bot_user_id is not None and sender.get("id") == self._bot_user_id
+        return self._bot.user_id is not None and sender.get("id") == self._bot.user_id
 
     async def _on_message(self, message: Mapping[str, Any]) -> None:
         chat = message["chat"]
@@ -460,7 +451,8 @@ class TelegramGateway:
             return (
                 await connection.execute(
                     select(ChannelIdentity).where(
-                        ChannelIdentity.channel == CHANNEL, ChannelIdentity.external_id == sender_id
+                        ChannelIdentity.integration_id == self._bot.integration_id,
+                        ChannelIdentity.external_id == sender_id,
                     )
                 )
             ).one_or_none()
@@ -480,7 +472,8 @@ class TelegramGateway:
             row = (
                 await connection.execute(
                     select(ChannelGroup).where(
-                        ChannelGroup.channel == CHANNEL, ChannelGroup.external_id == str(chat_id)
+                        ChannelGroup.integration_id == self._bot.integration_id,
+                        ChannelGroup.external_id == str(chat_id),
                     )
                 )
             ).one_or_none()
@@ -508,7 +501,7 @@ class TelegramGateway:
         text: str,
         identity: Any,
     ) -> None:
-        key = f"{CHANNEL}:{sender_id}"
+        key = f"{CHANNEL}:{self._bot.integration_id}:{sender_id}"
         # ``attempt`` counts the try before the database work, so tries at the same time
         # cannot pass the limit.
         if not self._lockout.attempt(key):
@@ -518,7 +511,7 @@ class TelegramGateway:
             await self._say(
                 chat_id,
                 f"Link your own Telegram account first: send your code to"
-                f" @{self._settings.bot_username} in a direct chat.",
+                f" @{self._bot.username} in a direct chat.",
                 reply_to=message_id,
             )
             return
@@ -528,7 +521,7 @@ class TelegramGateway:
             async with self._engine.begin() as connection:
                 linked = await redeem(
                     connection,
-                    channel=CHANNEL,
+                    integration_id=self._bot.integration_id,
                     code=code,
                     kind="group" if group else "user",
                     external_id=str(chat_id) if group else sender_id,
@@ -543,7 +536,7 @@ class TelegramGateway:
             return
         self._lockout.succeeded(key)
         done = (
-            f"This group is linked to sama. Mention @{self._settings.bot_username} to talk."
+            f"This group is linked to sama. Mention @{self._bot.username} to talk."
             if group
             else "This Telegram account is linked to sama. Send a message to start."
         )
@@ -658,6 +651,10 @@ class TelegramGateway:
 
     # -- sessions -------------------------------------------------------------------------
 
+    def _binding_key(self, chat_id: int) -> str:
+        """A chat id is unique only for one bot, so the key holds the integration."""
+        return f"{self._bot.integration_id}:chat:{chat_id}"
+
     async def _session(
         self, chat_id: int, target: Target, grants: Grants, *, create: bool
     ) -> _Bound | None:
@@ -681,7 +678,7 @@ class TelegramGateway:
                     )
                     .where(
                         SessionBinding.channel == CHANNEL,
-                        SessionBinding.external_key == _binding_key(chat_id),
+                        SessionBinding.external_key == self._binding_key(chat_id),
                     )
                 )
             ).one_or_none()
@@ -720,7 +717,7 @@ class TelegramGateway:
                     lineage=None if parent is None else "branch",
                 )
             )
-            await _bind(connection, chat_id, target, session_id)
+            await _bind(connection, self._binding_key(chat_id), target, session_id)
             await connection.execute(
                 insert(AuditEntry).values(
                     org_id=target.org_id,
@@ -752,7 +749,7 @@ class TelegramGateway:
         if target.audience == "private":
             linked = await connection.scalar(
                 select(ChannelIdentity.id).where(
-                    ChannelIdentity.channel == CHANNEL,
+                    ChannelIdentity.integration_id == self._bot.integration_id,
                     ChannelIdentity.external_id == str(chat_id),
                     ChannelIdentity.org_id == target.org_id,
                     ChannelIdentity.user_id == target.user_id,
@@ -764,7 +761,7 @@ class TelegramGateway:
             return grants.sees_workspace(target.workspace_id)
         linked = await connection.scalar(
             select(ChannelGroup.id).where(
-                ChannelGroup.channel == CHANNEL,
+                ChannelGroup.integration_id == self._bot.integration_id,
                 ChannelGroup.external_id == str(chat_id),
                 ChannelGroup.org_id == target.org_id,
                 ChannelGroup.workspace_id == target.workspace_id,
@@ -970,14 +967,14 @@ class _ChatLock:
 
 
 async def _bind(
-    connection: AsyncConnection, chat_id: int, target: Target, session_id: uuid.UUID
+    connection: AsyncConnection, key: str, target: Target, session_id: uuid.UUID
 ) -> None:
     statement = pg_insert(SessionBinding).values(
         org_id=target.org_id,
         workspace_id=target.workspace_id,
         session_id=session_id,
         channel=CHANNEL,
-        external_key=_binding_key(chat_id),
+        external_key=key,
         created_by_user_id=target.user_id,
     )
     await connection.execute(

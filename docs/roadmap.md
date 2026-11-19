@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.18.
+Done: M1.1 to M1.19.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -122,8 +122,8 @@ Done: M1.1 to M1.18.
   known secrets and secret patterns from logs, stored transcripts, run events, tool arguments,
   approval reasons, tool server output, and traces. Traces now have the tool arguments and
   output. A test plants a secret and checks every stored table, the trace, and the logs. Not in
-  M1.17: an HTTP API for secrets (M3), key rotation, org keys for the shared Telegram bot and
-  for voice notes (M6), and redaction of native tool output in the sandbox.
+  M1.17: an HTTP API for secrets (M3), key rotation, org Telegram bots and org keys for voice
+  notes (both in M1.19), and redaction of native tool output in the sandbox.
 - M1.18: live authority in `src/sama/tenancy/authority.py` (architecture Sections 5.1 and
   16.1). The tool gate and the model proxy read the run status, the access of the run user,
   and the run budget again at each call. The live budget is the lower of the run budget and
@@ -133,6 +133,12 @@ Done: M1.1 to M1.18.
   with an unused ticket for the same tool and arguments. No migration. Not in M1.18: live
   checks of connection access (connections come in M3.4) and a live check of the worker
   limits `max_turns` and `max_wall_time_s`, which stay frozen for the run.
+- M1.19: integrations in `src/sama/integrations/` (architecture Section 11.6). Migration `0011`
+  adds `integrations` and puts `integration_id` on the Telegram links and codes. An org admin
+  connects the Telegram bot of the org on the web page with a BotFather token. The vault keeps
+  the token, and the hub serves one webhook for each bot. The shared bot and its
+  `SAMA_TELEGRAM_*` settings are gone, and migration `0011` deletes its links. Voice notes use
+  the OpenAI key of the org. Not in M1.19: Slack (M3.1).
 
 | # | Item | Acceptance criteria |
 |---|---|---|
@@ -148,12 +154,13 @@ Done: M1.1 to M1.18.
 | M1.10 | Run orchestrator and queue | Postgres queue with `FOR UPDATE SKIP LOCKED` and leases. A crashed worker's run is marked failed or resumed. One active run per session; new messages queue. |
 | M1.11 | Prompt assembly | SOUL per profile, context files (20,000-char cap, injection scan), frozen prefix per session. Prompt changes apply from the next session. |
 | M1.12 | HTTP API and minimal web chat | `POST /sessions/{id}/messages`, server-sent events for run events, approve and deny endpoints. Supabase Auth login. A minimal web page for chat and approvals. |
-| M1.13 | Telegram channel | One shared sama bot for the team. Webhook adapter, pairing codes from the web page, streaming edits, inline-keyboard approvals, voice notes transcribed, `/new`, `/stop`, `/model` (starts a child session). DMs are private sessions. Groups are shared sessions without `user` memory or personal connections (architecture §11.3). |
+| M1.13 | Telegram channel | One shared sama bot for the team (M1.19 replaces it with one bot per org). Webhook adapter, pairing codes from the web page, streaming edits, inline-keyboard approvals, voice notes transcribed, `/new`, `/stop`, `/model` (starts a child session). DMs are private sessions. Groups are shared sessions without `user` memory or personal connections (architecture §11.3). |
 | M1.14 | Observability | Langfuse traces per run for the Claude adapter. Structured logs. Alerts to a Slack channel on error rate. |
 | M1.15 | Deploy | Fly.io apps for `api`, `gateway`, `worker`. CI deploys `main` to staging. A manual promote step deploys to production. |
 | M1.16 | Code editing in the sandbox | The agent clones a public repo, edits files, and runs tests in the sandbox with native tools. No push yet. |
 | M1.17 | Vault and redaction | Encrypted secrets per org for provider, search, and bot keys. Redaction of known secrets in tool output, logs, and traces. A test checks that a planted secret does not appear in a transcript or trace. |
 | M1.18 | Live authority checks | The control plane checks membership, policy, budgets, and revocations at every tool call, model call, and approval resume. A test revokes a tool during a session and the next call gets `deny`. |
+| M1.19 | Integrations | An org admin connects the Telegram bot of the org from the web page, without the operator. The token is in the vault. Each bot has its own webhook and secret. Members see the integrations; only admins change them. A code pairs only with the bot of its org. |
 
 ## M2 — Learning loop
 
@@ -172,7 +179,7 @@ Done: M1.1 to M1.18.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
-| M3.1 | Slack channel | Slack app with OAuth install, DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. |
+| M3.1 | Slack channel | A Slack integration per org (architecture §11.6): an org admin installs a Slack app from a manifest and pastes its tokens. DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. |
 | M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
 | M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. |
 | M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. |
@@ -223,7 +230,7 @@ Done: M1.1 to M1.18.
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. |
 | M6.5 | Customer sign-up | Self-serve sign-up, org creation, invites, roles. |
 | M6.6 | Billing and quotas | Stripe plans and usage billing from proxy cost. Quotas per plan. |
-| M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys and its own Telegram bot. Region per org. |
+| M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys (its own Telegram bot came in M1.19). Region per org. |
 | M6.8 | Data controls | Export and delete per user and per org. Retention per plan. |
 | M6.9 | Customer-ready web app | Onboarding, billing pages, admin views, and docs. |
 

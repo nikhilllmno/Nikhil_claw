@@ -150,3 +150,28 @@ async def test_org_keys_without_a_vault_use_the_defaults() -> None:
     value = await keys.get(uuid.uuid4(), SecretName.BRAVE_API_KEY)
     assert value is not None
     assert value.get_secret_value() == "brave-default"
+
+
+async def test_put_and_delete_join_the_transaction_of_the_caller(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    vault = Vault(engine, KEY)
+    name = SecretName.TELEGRAM_BOT_TOKEN
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        await vault.put(tenant.org, name, "token-rolled-back", connection=connection)
+        await transaction.rollback()
+    assert await vault.get(tenant.org, name) is None, "a rollback keeps no value and no cache"
+    async with engine.begin() as connection:
+        await vault.put(tenant.org, name, "token-kept", connection=connection)
+    value = await vault.get(tenant.org, name)
+    assert value is not None
+    assert value.get_secret_value() == "token-kept"
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        assert await vault.delete(tenant.org, name, connection=connection)
+        await transaction.rollback()
+    assert await vault.get(tenant.org, name) is not None
+    async with engine.begin() as connection:
+        assert await vault.delete(tenant.org, name, connection=connection)
+    assert await vault.get(tenant.org, name) is None

@@ -1,14 +1,14 @@
 """The control plane process (docs/architecture.md, Section 19.1).
 
 One process holds the HTTP API, the sama MCP tool server, the model proxy, the run worker, the
-monitor, the vault (when ``SAMA_VAULT_KEY`` is set), and the Telegram gateway when a bot token
-is set. They share one database engine.
+monitor, and, when ``SAMA_VAULT_KEY`` is set, the vault and the integrations with the Telegram
+hub (Section 11.6). They share one database engine.
 The clarify broker is in memory, so the API that answers a question and the tool server that
 asks it must be in the same process.
 
 Paths:
 
-- ``/``: the API and the web page (Section 11.4), and ``/telegram/webhook``.
+- ``/``: the API and the web page (Section 11.4), and ``/telegram/<integration id>/webhook``.
 - ``/tools``: the tool server. The sandbox runner uses ``/tools/mcp`` and ``/tools/gate``.
 - ``/model``: the model proxy. The runner uses ``/model/anthropic`` and ``/model/openai``.
 """
@@ -24,7 +24,6 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -35,9 +34,8 @@ from sama.controlplane.settings import ControlPlaneSettings
 from sama.db.engine import create_engine
 from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
-from sama.gateway.telegram import TelegramGateway, TelegramSettings
-from sama.gateway.telegram_client import TelegramClient, bot_id
-from sama.gateway.transcribe import OpenAITranscriber
+from sama.integrations.hub import TelegramHub
+from sama.integrations.service import Integrations
 from sama.modelproxy.app import ModelProxy, ProxySettings
 from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import PostgresUsageStore
@@ -191,6 +189,13 @@ def build(
         ),
         keys=keys,
     )
+    hub = TelegramHub(engine, vault, keys=keys, gate=gate) if vault is not None else None
+    integrations = Integrations(
+        engine,
+        vault,
+        public_url=settings.public_url,
+        on_change=hub.forget if hub is not None else None,
+    )
     api = SamaApi(
         engine,
         verifier=JwtVerifier(
@@ -202,22 +207,21 @@ def build(
         settings=ApiSettings(
             supabase_url=settings.supabase_url,
             supabase_anon_key=settings.supabase_anon_key,
-            telegram_bot_username=settings.telegram.bot_username if settings.telegram else None,
         ),
+        integrations=integrations,
     )
     api_app = api.app()
     tools_app = tools.app()
     proxy_app = proxy.app()
 
-    telegram = _telegram(settings, engine)
-    if telegram is not None:
-        api_app.include_router(telegram.gateway.router())
+    if hub is not None:
+        api_app.include_router(hub.router())
 
     stop = asyncio.Event()
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:
-        # The exit stack closes in the reverse order: the loops, Telegram, the tool server,
+        # The exit stack closes in the reverse order: the loops, the bots, the tool server,
         # the model proxy (it writes its last usage records), the sandboxes, the engine.
         async with contextlib.AsyncExitStack() as stack:
             stack.push_async_callback(engine.dispose)
@@ -225,11 +229,8 @@ def build(
                 stack.push_async_callback(_close_sandboxes, sandboxed)
             await stack.enter_async_context(proxy_app.router.lifespan_context(proxy_app))
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
-            if telegram is not None:
-                stack.push_async_callback(telegram.aclose)
-                await telegram.client.set_webhook(
-                    f"{settings.public_url}/telegram/webhook", telegram.webhook_secret
-                )
+            if hub is not None:
+                stack.push_async_callback(hub.aclose)
             loops = _monitor(settings, engine, stack)
             if vault is not None:
                 # The redactor must know every vault value before the first run, request,
@@ -247,7 +248,7 @@ def build(
                 "the control plane started",
                 extra={
                     "worker_concurrency": settings.worker_concurrency,
-                    "telegram": telegram is not None,
+                    "integrations": integrations.enabled,
                     "traces": settings.langfuse is not None,
                     "alerts": settings.slack_webhook_url is not None,
                     "vault": vault is not None,
@@ -325,36 +326,3 @@ def _monitor(
         stack.push_async_callback(slack.aclose)
         loops.append(ErrorRateAlerter(engine, slack, environment=settings.environment))
     return loops
-
-
-@dataclass
-class _Telegram:
-    gateway: TelegramGateway
-    client: TelegramClient
-    webhook_secret: SecretStr
-    transcriber: OpenAITranscriber | None
-
-    async def aclose(self) -> None:
-        await self.gateway.aclose()
-        await self.client.aclose()
-        if self.transcriber is not None:
-            await self.transcriber.aclose()
-
-
-def _telegram(settings: ControlPlaneSettings, engine: AsyncEngine) -> _Telegram | None:
-    config = settings.telegram
-    if config is None:
-        return None
-    if not config.bot_username:
-        raise ValueError("the Telegram bot username is not known; set SAMA_TELEGRAM_BOT_USERNAME")
-    client = TelegramClient(config.bot_token)
-    transcriber = OpenAITranscriber(settings.openai_key) if settings.openai_key else None
-    gateway = TelegramGateway(
-        engine,
-        client,
-        settings=TelegramSettings(bot_username=config.bot_username),
-        webhook_secret=config.webhook_secret,
-        bot_user_id=bot_id(config.bot_token),
-        transcriber=transcriber,
-    )
-    return _Telegram(gateway, client, config.webhook_secret, transcriber)

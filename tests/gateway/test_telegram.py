@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import json
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -26,10 +25,17 @@ from sama.db.models import (
     User,
 )
 from sama.gateway.pairing import create_code
-from sama.gateway.telegram import BUSY, PAIR_PROMPT, TelegramGateway, TelegramSettings
+from sama.gateway.telegram import (
+    BUSY,
+    PAIR_PROMPT,
+    TelegramBot,
+    TelegramGateway,
+    TelegramSettings,
+)
 from sama.gateway.telegram_client import TelegramClient
 from sama.runtime.contract import FailureCode, RunCompleted, RunFailed, TextDelta
 from sama.runtime.fake import FakeScript
+from tests.integrations.support import BOT_ID, FakeTelegram, add_bot
 from tests.orchestrator.conftest import (  # noqa: F401
     Tenant,
     add_tenant,
@@ -39,50 +45,9 @@ from tests.orchestrator.conftest import (  # noqa: F401
 )
 from tests.orchestrator.test_worker import Harness, approval_script, until
 
-BOT_ID = 999
-SECRET = "webhook-secret-0123456789"
 MIA_TG = 1001
 DM = MIA_TG
 GROUP = -5005
-
-
-class FakeTelegram:
-    """The Bot API: it records calls and gives each sent message a new id."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.messages: dict[int, tuple[int, str]] = {}
-        self._ids = itertools.count(100)
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        if "/file/" in request.url.path:
-            return httpx.Response(200, content=b"OGG")
-        method = request.url.path.rsplit("/", 1)[-1]
-        body = json.loads(request.content or b"{}")
-        self.calls.append((method, body))
-        if method == "sendMessage":
-            message_id = next(self._ids)
-            self.messages[message_id] = (body["chat_id"], body["text"])
-            return httpx.Response(200, json={"ok": True, "result": {"message_id": message_id}})
-        if method == "editMessageText" and body["message_id"] in self.messages:
-            self.messages[body["message_id"]] = (body["chat_id"], body["text"])
-        if method == "getFile":
-            return httpx.Response(200, json={"ok": True, "result": {"file_path": "v.oga"}})
-        return httpx.Response(200, json={"ok": True, "result": True})
-
-    def sent(self, chat_id: int | None = None) -> list[dict[str, Any]]:
-        return [
-            body
-            for method, body in self.calls
-            if method == "sendMessage" and chat_id in (None, body["chat_id"])
-        ]
-
-    def texts(self, chat_id: int | None = None) -> list[str]:
-        return [body["text"] for body in self.sent(chat_id)]
-
-    def shown(self, chat_id: int) -> list[str]:
-        """The text of each message in the chat, after the edits."""
-        return [text for chat, text in self.messages.values() if chat == chat_id]
 
 
 class FakeTranscriber:
@@ -108,6 +73,7 @@ def transcriber() -> FakeTranscriber:
 @pytest.fixture
 async def gateway(
     engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
     telegram: FakeTelegram,
     transcriber: FakeTranscriber,
 ) -> AsyncIterator[TelegramGateway]:
@@ -116,14 +82,12 @@ async def gateway(
         base_url="https://tg.test",
         http=httpx.AsyncClient(transport=httpx.MockTransport(telegram)),
     )
+    integration_id = await add_bot(engine, tenant)
     gateway = TelegramGateway(
         engine,
         client,
-        settings=TelegramSettings(
-            bot_username="sama_bot", poll_s=0.02, paused_poll_s=0.02, edit_interval_s=0
-        ),
-        webhook_secret=SecretStr(SECRET),
-        bot_user_id=BOT_ID,
+        bot=TelegramBot(integration_id, tenant.org, "sama_bot", BOT_ID),
+        settings=TelegramSettings(poll_s=0.02, paused_poll_s=0.02, edit_interval_s=0),
         transcriber=transcriber,
     )
     yield gateway
@@ -161,11 +125,14 @@ async def code_for(
     kind: str = "user",
     user: str = "mia",
 ) -> str:
+    if "bot" not in tenant.ids:
+        await add_bot(engine, tenant, username=f"other_{uuid.uuid4().hex[:8]}_bot")
     async with engine.begin() as connection:
         code, _ = await create_code(
             connection,
             org_id=tenant.org,
             user_id=tenant.ids[user],
+            integration_id=tenant.ids["bot"],
             channel="telegram",
             kind=kind,  # type: ignore[arg-type]
             workspace_id=tenant.ids["ws"],
@@ -192,7 +159,7 @@ async def bound_session(engine: AsyncEngine, chat: int) -> Any:  # noqa: F811
                 .join(SessionBinding, SessionBinding.session_id == Session.id)
                 .where(
                     SessionBinding.channel == "telegram",
-                    SessionBinding.external_key == f"chat:{chat}",
+                    SessionBinding.external_key.endswith(f":chat:{chat}"),
                 )
             )
         ).one_or_none()
@@ -211,51 +178,11 @@ def no_followers(gateway: TelegramGateway) -> None:
 
 @pytest.fixture(autouse=True)
 async def clean_links(engine: AsyncEngine) -> None:  # noqa: F811
-    """Telegram ids are global, so each test starts without links."""
+    """Each test starts without links."""
     async with engine.begin() as connection:
         await connection.execute(delete(ChannelIdentity))
         await connection.execute(delete(ChannelGroup))
         await connection.execute(delete(SessionBinding).where(SessionBinding.channel == "telegram"))
-
-
-# -- webhook ------------------------------------------------------------------------------------
-
-
-async def test_the_webhook_checks_the_secret_and_drops_repeats(
-    gateway: TelegramGateway, telegram: FakeTelegram
-) -> None:
-    from fastapi import FastAPI
-
-    app = FastAPI()
-    app.include_router(gateway.router())
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as http:
-        update = message("hello")
-        wrong = await http.post(
-            "/telegram/webhook", json=update, headers={"X-Telegram-Bot-Api-Secret-Token": "x"}
-        )
-        assert wrong.status_code == 401
-        missing = await http.post("/telegram/webhook", json=update)
-        assert missing.status_code == 401
-        headers = {"X-Telegram-Bot-Api-Secret-Token": SECRET}
-        bad = await http.post("/telegram/webhook", content=b"{", headers=headers)
-        assert bad.status_code == 400
-        for _ in range(2):
-            ok = await http.post("/telegram/webhook", json=update, headers=headers)
-            assert ok.status_code == 200
-    await gateway.drain()
-    assert telegram.texts(DM) == [PAIR_PROMPT], "a repeated update runs once"
-
-
-def test_a_short_webhook_secret_is_refused(engine: AsyncEngine) -> None:  # noqa: F811
-    client = TelegramClient(SecretStr("1:t"))
-    with pytest.raises(ValueError, match="16 characters"):
-        TelegramGateway(
-            engine,
-            client,
-            settings=TelegramSettings(bot_username="b"),
-            webhook_secret=SecretStr("short"),
-        )
 
 
 # -- pairing ------------------------------------------------------------------------------------
@@ -389,7 +316,7 @@ async def test_an_approval_card_is_decided_with_a_button(
     approve = card["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
     assert approve.endswith(":y")
 
-    # Another org's user cannot decide.
+    # A user of another org cannot link to this bot, so cannot decide.
     other = await add_tenant(engine)
     await pair(gateway, engine, other, sender=4004)
     await gateway.handle_update(
@@ -399,7 +326,7 @@ async def test_an_approval_card_is_decided_with_a_button(
         }
     )
     answers = [body for method, body in telegram.calls if method == "answerCallbackQuery"]
-    assert answers[-1]["text"] == "You cannot decide this approval."
+    assert answers[-1]["text"] == "Link your Telegram account to sama first."
 
     await gateway.handle_update(
         {
@@ -571,10 +498,13 @@ async def test_a_group_needs_a_paired_sender_from_the_same_org(
     await gateway.handle_update(message(f"/pair {group_code}", chat=GROUP, sender=8008))
     assert "Link your own Telegram account first" in telegram.texts(GROUP)[-1]
     await gateway.handle_update(message(f"/pair {group_code}", chat=GROUP))
+    # The code of another org is for the bot of that org: it does not work here.
     other = await add_tenant(engine)
     await pair(gateway, engine, other, sender=8008)
+    assert "wrong, used, or expired" in telegram.texts(8008)[-1]
+    before = len(telegram.texts(GROUP))
     await gateway.handle_update(message("@sama_bot hi", chat=GROUP, sender=8008))
-    assert telegram.texts(GROUP)[-1] == "You cannot use sama in this group."
+    assert len(telegram.texts(GROUP)) == before, "the bot ignores a sender it does not know"
 
 
 async def test_a_group_code_is_only_for_its_maker(
@@ -609,6 +539,7 @@ async def test_a_group_code_is_only_for_its_maker(
             connection,
             org_id=tenant.org,
             user_id=ben,
+            integration_id=tenant.ids["bot"],
             channel="telegram",
             kind="user",
             workspace_id=tenant.ids["ws"],

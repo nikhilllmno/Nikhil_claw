@@ -36,7 +36,7 @@ def test_the_minimum_gives_the_urls_and_turns_the_options_off() -> None:
     assert s.sandbox_template == "sama-runner"
     assert s.worker_concurrency == 4
     assert s.trace_content
-    assert (s.telegram, s.langfuse, s.slack_webhook_url, s.brave_key) == (None, None, None, None)
+    assert (s.langfuse, s.slack_webhook_url, s.brave_key) == (None, None, None)
 
 
 @pytest.mark.parametrize(
@@ -63,7 +63,6 @@ def test_a_missing_required_variable_is_named(name: str) -> None:
         ({"SAMA_PUBLIC_URL": "https://sama.fly.dev/api"}, "no path"),
         ({"SAMA_WORKER_CONCURRENCY": "0"}, "1 or more"),
         ({"SAMA_WORKER_CONCURRENCY": "two"}, "1 or more"),
-        ({"SAMA_TELEGRAM_BOT_TOKEN": "1:abc"}, "set SAMA_TELEGRAM_WEBHOOK_SECRET"),
         ({"LANGFUSE_PUBLIC_KEY": "pk"}, "set LANGFUSE_BASE_URL"),
     ],
 )
@@ -79,9 +78,6 @@ def test_the_options_are_read() -> None:
     s = settings(
         SAMA_SANDBOX_ALLOW_OUT=" GitHub.com, pypi.org,,example.org,sama-staging.fly.dev ",
         SAMA_SANDBOX_TEMPLATE="sama-runner-next",
-        SAMA_TELEGRAM_BOT_TOKEN="1:abc",
-        SAMA_TELEGRAM_WEBHOOK_SECRET="hook-secret",
-        SAMA_TELEGRAM_BOT_USERNAME="@sama_bot",
         LANGFUSE_PUBLIC_KEY="pk",
         LANGFUSE_SECRET_KEY="sk",
         LANGFUSE_BASE_URL="https://us.cloud.langfuse.com/",
@@ -93,8 +89,6 @@ def test_the_options_are_read() -> None:
     )
     assert s.allow_out == ("sama-staging.fly.dev", *DEFAULT_SANDBOX_HOSTS, "example.org")
     assert s.sandbox_template == "sama-runner-next"
-    assert s.telegram is not None
-    assert s.telegram.bot_username == "sama_bot"
     assert s.langfuse is not None
     assert s.langfuse.base_url == "https://us.cloud.langfuse.com"
     assert s.slack_webhook_url is not None
@@ -131,9 +125,6 @@ def test_the_secret_values_cover_every_secret() -> None:
     s = settings(
         SAMA_VAULT_KEY=vault_text,
         ANTHROPIC_API_KEY="anthropic-value",
-        SAMA_TELEGRAM_BOT_TOKEN="telegram-token",
-        SAMA_TELEGRAM_WEBHOOK_SECRET="telegram-hook",
-        SAMA_TELEGRAM_BOT_USERNAME="bot",
     )
     values = s.secret_values()
     for expected in (
@@ -142,8 +133,6 @@ def test_the_secret_values_cover_every_secret() -> None:
         BASE["SAMA_RUN_TOKEN_KEY"],
         BASE["E2B_API_KEY"],
         "anthropic-value",
-        "telegram-token",
-        "telegram-hook",
         vault_text,
     ):
         assert expected in values

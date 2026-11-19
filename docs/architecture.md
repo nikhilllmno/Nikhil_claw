@@ -172,7 +172,7 @@ Five rules shape the design:
 | D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. The control plane sends the traces from its stored rows after each run (Section 18.2). | One trace view for both SDKs. The proxy is the source of truth for cost. The sandbox has no Langfuse key (D6). |
 | D16 | **Sama is a library plus services.** Products import `sama` and register extra tools, skills, toolsets, channels, and policies through extension points. They do not patch sama code. | vorflux and later products build on the engine without a fork (Hermes rule: plugins never touch core). |
 | D17 | **Databases use a sama database gateway, and stdio MCP servers run in connector hosts.** The gateway enforces read-only transactions, one statement per call, timeouts, row limits, and hidden columns at the driver. A connector host is a separate sandbox per connection that holds only that connection's secrets. | A prompt cannot remove a limit that the driver enforces. Many SQL MCP servers give full rights through one tool. Running stdio servers outside the agent sandbox keeps credentials out of the sandbox (D6) and still supports the Hermes MCP ecosystem. |
-| D18 | **One control plane process per environment in M1.** The API, the tool server, the model proxy, the worker, the monitor, and the Telegram gateway run in one process on one Fly.io machine (Section 19.1). | The clarify broker and the event wake-ups are in memory, so the API and the tool server must share a process. One machine is enough for the team. Split into process groups when the broker moves to Postgres and more machines are needed. |
+| D18 | **One control plane process per environment in M1.** The API, the tool server, the model proxy, the worker, the monitor, and the Telegram hub (Section 11.6) run in one process on one Fly.io machine (Section 19.1). | The clarify broker and the event wake-ups are in memory, so the API and the tool server must share a process. One machine is enough for the team. Split into process groups when the broker moves to Postgres and more machines are needed. |
 
 ---
 
@@ -1074,7 +1074,7 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 |---|---|---|
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
 | Slack | Slack Bolt for Python, Events API over HTTP, interactive components | One Slack app per org install (OAuth). DMs and mentions. A thread is a session. Approval buttons through Block Kit. |
-| Telegram | Bot API webhook | One shared sama bot for our team now. One bot per org for customers later, with its token in the org vault (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
+| Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
 | Chrome extension | WebSocket from the extension to the gateway | Side panel chat bound to the current tab. Also the `my_chrome` browser target (Section 14). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
 
@@ -1180,10 +1180,14 @@ The Next.js app in `web/` replaces this page in M3. The web app keeps the same A
 
 **Telegram pairing.** `POST /channels/telegram/pairing-codes` with `workspace_id`,
 `agent_profile_id`, and `kind` (`user` or `group`) makes a pairing code (Section 11.5). It does
-the same access checks as `POST /sessions`. It returns `409` when `SAMA_TELEGRAM_BOT_USERNAME`
-is not set and `429` when the user has 5 open codes. `GET /channels/telegram/identities` lists
-the Telegram accounts of the user, and `DELETE /channels/telegram/identities/{id}` unlinks
-one. `/config` gives `telegram_bot_username` to the page.
+the same access checks as `POST /sessions`. The code is for the Telegram bot of the org of the
+workspace. The answer has the bot username and a `t.me` link that opens the bot with the code
+(`?start=` for a `user` code, `?startgroup=` for a `group` code). It returns `409` when the org
+has no active Telegram integration (Section 11.6) and `429` when the user has 5 open codes.
+`GET /channels/telegram/identities` lists the Telegram accounts of the user, and
+`DELETE /channels/telegram/identities/{id}` unlinks one. `/config` gives `integrations: true`
+to the page when the process can connect integrations. `/me` gives, for each org, `admin`
+(the user is an org owner or admin) and the integrations of the org (kind, status, name).
 
 **Not in M1.12.** `python -m sama.api` runs only the API. The control plane process (Section
 19.1) puts the API, the worker, and the tool server in one process, so that the API answers
@@ -1191,19 +1195,22 @@ the `clarify` questions of the tool server. API keys for services come later.
 
 ### 11.5 Telegram gateway (M1.13)
 
-`sama.gateway.telegram.TelegramGateway` is the Telegram adapter. `python -m sama.gateway`
-starts it on port 8081. It needs `SAMA_DATABASE_URL`, `SAMA_TELEGRAM_BOT_TOKEN`, and
-`SAMA_TELEGRAM_WEBHOOK_SECRET`. `SAMA_PUBLIC_URL` registers the webhook at start, and
-`OPENAI_API_KEY` turns on voice notes. A worker must run too: the gateway only queues runs and
-reads their events.
+`sama.gateway.telegram.TelegramGateway` is the Telegram adapter. One gateway serves the bot of
+one org. The Telegram hub (Section 11.6) builds a gateway for each connected bot. The control
+plane process serves the hub. `python -m sama.gateway` serves only the hub, on port 8081, with
+`SAMA_DATABASE_URL` and `SAMA_VAULT_KEY`. A worker must run too: the gateway only queues runs
+and reads their events.
 
 **Tables (migration `0008`).**
 
 | Table | Key columns |
 |---|---|
-| `channel_identities` | `org_id`, `user_id`, `channel`, `external_id` (the Telegram user id, unique per channel), `workspace_id`, `agent_profile_id` |
-| `channel_groups` | `org_id`, `channel`, `external_id` (the chat id, unique per channel), `workspace_id`, `agent_profile_id`, `created_by_user_id` |
-| `pairing_codes` | `org_id`, `user_id`, `channel`, `kind` (`user` or `group`), `code_hash` (SHA-256, unique), `workspace_id`, `agent_profile_id`, `expires_at`, `used_at` |
+| `channel_identities` | `org_id`, `user_id`, `channel`, `integration_id`, `external_id` (the Telegram user id, unique per integration), `workspace_id`, `agent_profile_id` |
+| `channel_groups` | `org_id`, `channel`, `integration_id`, `external_id` (the chat id, unique per integration), `workspace_id`, `agent_profile_id`, `created_by_user_id` |
+| `pairing_codes` | `org_id`, `user_id`, `channel`, `integration_id`, `kind` (`user` or `group`), `code_hash` (SHA-256, unique), `workspace_id`, `agent_profile_id`, `expires_at`, `used_at` |
+
+Migration `0011` adds `integration_id` (Section 11.6). A delete of the integration deletes its
+links and codes.
 
 RLS: a user reads only their own identities and codes. A member of the workspace reads its
 groups. Only the control plane writes these tables.
@@ -1215,8 +1222,9 @@ groups. Only the control plane writes these tables.
    The table keeps only the SHA-256 digest. A user has at most 5 open codes. A row lock on
    the user keeps this cap when two requests come at the same time.
 2. A `user` code: the user sends `/start <code>` (or only the code) to the bot in a direct chat.
-   The Telegram account then links to the user, the workspace, and the profile. One Telegram
-   account links to one org. A new code moves the link.
+   The `t.me` link of the code does this in one tap. The Telegram account then links to the
+   user, the workspace, and the profile. A code works only with the bot of its org. One
+   Telegram account has one link for each bot. A new code moves the link.
 3. A `group` code: the user adds the bot to a group and sends `/pair <code>` there. Only the
    linked Telegram account of the user who made the code can use it. The group then links to
    the workspace and the profile of the code.
@@ -1228,8 +1236,9 @@ groups. Only the control plane writes these tables.
    and clears the count of the account when the code is right. Thus tries at the same time
    cannot pass the limit. The counts are in memory, per gateway process.
 
-**Inbound.** Telegram sends each update to `POST /telegram/webhook` with the secret in
-`X-Telegram-Bot-Api-Secret-Token`. The gateway compares it in constant time, drops a repeated
+**Inbound.** Telegram sends each update to `POST /telegram/<integration id>/webhook` with the
+secret of the bot in `X-Telegram-Bot-Api-Secret-Token`. The hub compares its digest in constant
+time (Section 11.6). The gateway drops a repeated
 `update_id`, answers at once, and handles the update in the background. Updates of one chat
 run one at a time. Messages from bots and from other chat types are dropped. In a group the
 bot reacts only to a command, an `@` mention of the bot, or a reply to a bot message. A voice
@@ -1237,11 +1246,13 @@ note of at most 5 minutes and 10 MB is downloaded and transcribed (OpenAI `whisp
 
 **Access.** An unknown sender gets a pairing prompt in a direct chat and nothing in a group.
 For each message the gateway loads the grants of the user again. A user who lost the workspace
-gets a refusal. In a group, the sender must be linked in the org of the group.
+gets a refusal. In a group, the sender must be linked to the same bot. All links of a bot are in
+the org of the bot.
 
 **Sessions.** A direct chat is a `private` session of the user. A group is a `shared` session
 of the group workspace. The binding is `session_bindings` with `channel = telegram` and
-`external_key = chat:<chat id>`. The gateway reuses the bound session only when it is active,
+`external_key = <integration id>:chat:<chat id>`, because a chat id is unique only for one
+bot. The gateway reuses the bound session only when it is active,
 in the same org, workspace, and audience, and visible to the user. Otherwise it makes a new
 session (audit `session.created` with `channel: telegram`). Sessions that Telegram made get a
 channel hint in the volatile prompt tier (Section 6.1).
@@ -1284,10 +1295,83 @@ the person.
   loses the followers: the runs go on, but their replies do not reach Telegram.
 - The group toolset (Section 11.3) is not applied yet.
 - `clarify` questions do not show in Telegram yet.
-- The OpenAI key for voice notes is an environment variable of the gateway. The shared bot
-  serves all orgs, so an org key does not apply yet (M6). The key never goes to a sandbox.
-- `httpx` logs request URLs, and a Telegram URL holds the bot token. `python -m sama.gateway`
-  sets the `httpx` logger to `WARNING`.
+- Voice notes use the OpenAI key of the org in the vault, else the `OPENAI_API_KEY` of the
+  process. Without a key, voice notes are off. The key never goes to a sandbox.
+- `httpx` logs request URLs, and a Telegram URL holds the bot token. The control plane and
+  `python -m sama.gateway` set the `httpx` logger to `WARNING`.
+
+### 11.6 Integrations
+
+An **integration** connects a chat app to an org: now the Telegram bot of the org, and Slack
+next (M3.1). Any org admin connects one from the web page, without the operator. The secrets
+of an integration are in the vault (Section 16.3). `SAMA_VAULT_KEY` and `SAMA_PUBLIC_URL` turn
+integrations on. Without them the routes answer `409`.
+
+**Table `integrations` (migration `0011`).**
+
+| Column | Meaning |
+|---|---|
+| `org_id`, `kind` | `telegram` or `slack`. One integration of each kind per org (unique). |
+| `status` | `pending`, `active`, or `failed`. Only an `active` integration makes pairing codes. |
+| `external_id`, `name` | The bot id and username (Telegram). One bot belongs to one org (unique per kind). |
+| `secret_hash` | The SHA-256 digest of the webhook secret, in hex. The row has no clear text secret. |
+| `last_error`, `created_by_user_id`, `settings` | The last connect error, the admin, and options. |
+
+RLS: every member of the org reads the rows. Only the control plane writes them.
+`channel_identities`, `channel_groups`, and `pairing_codes` refer to the integration with a
+cascade delete. Migration `0011` deletes the links and codes of the old shared bot: users pair
+again with the bot of their org.
+
+**Routes.**
+
+| Route | Who | Does |
+|---|---|---|
+| `GET /orgs/{org_id}/integrations` | A member of the org | Lists the integrations, without secrets. |
+| `POST /orgs/{org_id}/integrations/telegram` with `bot_token` | An org owner or admin | Connects or replaces the bot of the org. |
+| `DELETE /orgs/{org_id}/integrations/{kind}` | An org owner or admin | Disconnects the integration. |
+
+A user who is not a member gets `404`. A member who is not an admin gets `403`.
+
+**Connect Telegram.** The admin makes a bot with @BotFather (`/newbot`) and pastes the token on
+the web page. `sama.integrations.Integrations`:
+
+1. checks the shape of the token and asks Telegram for the bot (`getMe`). A wrong token gets
+   `400`;
+2. in one transaction: refuses (`409`) a bot that another org connected, deletes the old row
+   when the org connects a different bot (its links go with it), writes the row as `pending`
+   with the digest of a new random webhook secret, stores the token in the vault
+   (`telegram_bot_token`), and writes `integration.connected` to the audit log;
+3. registers `<SAMA_PUBLIC_URL>/telegram/<integration id>/webhook` with the secret
+   (`setWebhook`). The status becomes `active`, or `failed` with `last_error`. A connect again
+   with the same token makes a new secret and tries again.
+
+**Disconnect** deletes the row (with its links and codes) and the vault entries in one
+transaction, writes `integration.disconnected`, and then deletes the webhook at Telegram (best
+effort).
+
+**Changes at the same time.** A connect or a disconnect holds two Postgres advisory locks
+(transaction locks on their own connection): one for the org and kind, then one for the bot.
+It holds them from its first database write to the end of its Telegram calls. A second change
+of the same org or the same bot, also in another process, gets `409` at once and does not
+wait, so it does not keep a pooled connection that the first change needs. Thus the stored
+digest is always the digest of the last secret that Telegram got. The lock transaction sets
+`idle_in_transaction_session_timeout` to 5 minutes, which is longer than its Telegram calls. The last status update also
+matches only the digest that this connect registered. The page asks the admin to confirm a
+replace, because a different bot deletes the links of the old bot.
+
+**Telegram hub.** `sama.integrations.TelegramHub` serves
+`POST /telegram/<integration id>/webhook`. For each update it reads the row and compares the
+SHA-256 digest of the given secret with `secret_hash` in constant time, also for an unknown id.
+An unknown id, a wrong secret, or a `failed` integration gets `401`. The hub keeps one gateway
+for each bot and builds it on the first update with the token from the vault. It reads the
+token from the table and not from the vault cache, because another process can have replaced
+the bot a moment ago. A token of a different bot than `external_id` gets `503`. A new connect
+makes a new secret, so a gateway with an old digest is built again. The process that changes an
+integration also drops the gateway at once. An old gateway ends its open work in the background.
+All gateways share one pairing lockout and one limit of 200 followed runs.
+
+**Not in this step.** Slack (M3.1), integrations for each workspace, more than one bot of a kind
+per org, and a check that the webhook still works after the connect.
 
 ---
 
@@ -1749,8 +1833,8 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 ### 16.3 Secrets
 
 - The **sama vault** (`sama.vault`, M1.17) holds the secrets of each org. M1 stores the
-  Anthropic, OpenAI, and Brave keys and a Telegram bot token. Integration tokens and browser
-  logins come with their milestones (M2, M5).
+  Anthropic, OpenAI, and Brave keys and the tokens of the integrations (Section 11.6).
+  Connection tokens and browser logins come with their milestones (M3, M5).
 - **Envelope encryption.** Each entry has its own random 256-bit data key. AES-256-GCM
   encrypts the value with the data key, and the vault key (`SAMA_VAULT_KEY`, 32 bytes in
   base64) encrypts the data key. Both steps bind the org id and the name, so a row that is
@@ -2055,6 +2139,7 @@ migrated schema.
 | `tool_policies` | Tool gate rules per org, profile, and user (migration `0004`, Section 16.1) |
 | `context_files` | Context files per org, workspace, and profile (migration `0006`, Section 6.1) |
 | `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
+| `integrations` | The chat apps of each org, for example its Telegram bot (migration `0011`, Section 11.6) |
 
 Rules:
 
@@ -2254,7 +2339,7 @@ engine, one run token signer, one gate service, and one clarify broker.
 
 | Path | Service |
 |---|---|
-| `/` | The API and the web page (Section 11.4), and `/telegram/webhook` when a bot is set |
+| `/` | The API and the web page (Section 11.4), and `/telegram/<integration id>/webhook` when the vault is on (Section 11.6) |
 | `/tools` | The sama MCP tool server: `/tools/mcp` and `/tools/gate` (Sections 16.1 and 16.7) |
 | `/model` | The model proxy: `/model/anthropic` and `/model/openai` (Section 16.6) |
 
@@ -2292,10 +2377,9 @@ the start with a message that names the variable but not its value.
 | `SAMA_RUN_TOKEN_KEY` | Yes | The run token key, at least 32 bytes |
 | `SAMA_SUPABASE_URL`, `SAMA_SUPABASE_ANON_KEY` | Yes | Sign-in (Section 11.4) |
 | `E2B_API_KEY` | Yes | The sandbox provider |
-| `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault is off and only the environment keys work. |
+| `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy |
 | `BRAVE_API_KEY` | No | `web_search` |
-| `SAMA_TELEGRAM_BOT_TOKEN`, `SAMA_TELEGRAM_WEBHOOK_SECRET`, `SAMA_TELEGRAM_BOT_USERNAME` | No | The Telegram gateway. The process sets the webhook at start. |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY` | No | See the module doc of `sama.controlplane.__main__` |
@@ -2379,13 +2463,13 @@ The owner answered these questions on 2026-11-18. The answers are binding for M1
 |---|---|---|
 | Q1 | vorflux chose Fly Machines for sandboxes. Sama uses E2B. Should sama support both? | Sama uses E2B now, behind the `SandboxProvider` interface (D5). Sama adds a Fly Machines provider later only if a product needs it. vorflux decides when it adopts sama. |
 | Q2 | Python package and service name? | Package `sama`. Services `sama-api`, `sama-gateway`, `sama-worker`, and `sama-scheduler`. |
-| Q3 | Telegram: one shared bot or one bot per org? | One shared sama bot for our team now. One bot per org for customers later (M6), with its token in the org vault. |
+| Q3 | Telegram: one shared bot or one bot per org? | One bot per org. An org admin connects it as an integration, and its token is in the org vault (Section 11.6). |
 | Q4 | Which region? | Supabase in `ap-south-1` (Mumbai), the same as vorflux. Fly.io in the region nearest to it. |
 | Q5 | Who may approve changes to workspace memory, workspace skills, and SOUL? | Workspace `admin` and org `owner`. Org-scope changes need the org `owner`. |
 | Q6 | When do we build the web app? | A minimal web chat and approvals page in M1. Web app v1 for the team in M3. The customer-ready web app in M6. |
 | Q7 | How do we start M1? | Foundations first. The first pull request has M1.1 (repo foundations) and M1.3 (runtime contract and fake runtime). Then one pull request per item or per small group. |
 | Q8 | Which Supabase project does sama use? | A new Supabase project for sama in `ap-south-1`. Sama tables do not share a project with other apps. |
-| Q9 | Which service keys does sama use? | The existing E2B, Anthropic, OpenAI, and Langfuse keys. Keys for the Telegram bot and for connectors are added later, when those items are ready. |
+| Q9 | Which service keys does sama use? | The existing E2B, Anthropic, OpenAI, and Langfuse keys. Each org connects its own Telegram bot (Section 11.6). Keys for connectors are added later, when those items are ready. |
 | Q10 | Where does sama deploy? | Fly.io. The owner adds `FLY_API_TOKEN` at M1.15. |
 | Q11 | What is the name of the app? | Sama. The product, the Python package (`sama`), and the services (`sama-api`, `sama-gateway`, `sama-worker`, `sama-scheduler`) use this name. The earlier working name was claw. The GitHub repository keeps the name `Nikhil_claw`. |
 

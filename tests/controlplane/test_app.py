@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import logging
 import socket
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -63,10 +64,18 @@ async def test_each_part_answers_on_its_path(engine: AsyncEngine) -> None:
             assert response.status_code == 200, path
         config = (await client.get("/config")).json()
         assert config["supabase_url"] == "https://project.example.test"
-        assert config["telegram_bot_username"] is None
+        assert config["integrations"] is False
         # The tool server and the model proxy need a run token.
         assert (await client.post("/tools/mcp", json={})).status_code == 401
         assert (await client.post("/model/anthropic/v1/messages", json={})).status_code == 401
+
+
+async def test_the_vault_turns_on_the_integrations(engine: AsyncEngine) -> None:
+    plane = fake_plane(engine, vault_key=VaultKey.from_text(VaultKey.generate()))
+    async with running(plane) as client:
+        assert (await client.get("/config")).json()["integrations"] is True
+        hook = await client.post(f"/telegram/{uuid.uuid4()}/webhook", json={"update_id": 1})
+        assert hook.status_code == 401
 
 
 async def test_a_message_runs_to_the_end_in_the_process(

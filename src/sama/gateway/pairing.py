@@ -86,12 +86,15 @@ async def create_code(
     *,
     org_id: uuid.UUID,
     user_id: uuid.UUID,
+    integration_id: uuid.UUID,
     channel: str,
     kind: Kind,
     workspace_id: uuid.UUID,
     agent_profile_id: uuid.UUID,
 ) -> tuple[str, datetime]:
     """Stores a new code and returns it with its expiry. The caller checks the access first.
+
+    Only the bot of ``integration_id`` accepts the code.
 
     Run it as the table owner. Raises ``PairingError`` when the user has too many open codes.
     """
@@ -126,6 +129,7 @@ async def create_code(
         insert(PairingCode).values(
             org_id=org_id,
             user_id=user_id,
+            integration_id=integration_id,
             channel=channel,
             kind=kind,
             code_hash=code_hash(code),
@@ -140,7 +144,7 @@ async def create_code(
 async def redeem(
     connection: AsyncConnection,
     *,
-    channel: str,
+    integration_id: uuid.UUID,
     code: str,
     kind: Kind,
     external_id: str,
@@ -148,8 +152,9 @@ async def redeem(
 ) -> Linked | None:
     """Uses a code. Returns None for a wrong, used, or expired code. Run it as the table owner.
 
-    ``external_id`` is the chat account for a ``user`` code and the group chat for a ``group``
-    code. A ``group`` code needs ``sender_user_id``: the user of the linked sender account.
+    Only a code of ``integration_id`` works. ``external_id`` is the chat account for a ``user``
+    code and the group chat for a ``group`` code. A ``group`` code needs ``sender_user_id``: the
+    user of the linked sender account.
     The code is used up only when the link is made.
     """
     row = (
@@ -157,7 +162,7 @@ async def redeem(
             select(PairingCode)
             .where(
                 PairingCode.code_hash == code_hash(code),
-                PairingCode.channel == channel,
+                PairingCode.integration_id == integration_id,
                 PairingCode.kind == kind,
                 PairingCode.used_at.is_(None),
                 PairingCode.expires_at > func.now(),
@@ -197,10 +202,13 @@ async def redeem(
         "agent_profile_id": link.agent_profile_id,
         owner: link.user_id,
     }
-    statement = pg_insert(table).values(channel=channel, external_id=external_id, **changed)
+    channel = row.channel
+    statement = pg_insert(table).values(
+        integration_id=integration_id, channel=channel, external_id=external_id, **changed
+    )
     await connection.execute(
         statement.on_conflict_do_update(
-            index_elements=["channel", "external_id"],
+            index_elements=["integration_id", "external_id"],
             set_={
                 **{name: statement.excluded[name] for name in changed},
                 "updated_at": func.now(),

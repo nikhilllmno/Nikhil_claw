@@ -64,13 +64,6 @@ def _count(env: Mapping[str, str], name: str, default: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class TelegramConfig:
-    bot_token: SecretStr
-    webhook_secret: SecretStr
-    bot_username: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class LangfuseConfig:
     base_url: str
     public_key: str
@@ -95,7 +88,6 @@ class ControlPlaneSettings:
     anthropic_key: SecretStr | None = None
     openai_key: SecretStr | None = None
     brave_key: SecretStr | None = None
-    telegram: TelegramConfig | None = None
     langfuse: LangfuseConfig | None = None
     slack_webhook_url: SecretStr | None = None
     environment: str | None = None
@@ -115,8 +107,6 @@ class ControlPlaneSettings:
             self.brave_key,
             self.slack_webhook_url,
         ]
-        if self.telegram is not None:
-            secrets += [self.telegram.bot_token, self.telegram.webhook_secret]
         if self.langfuse is not None:
             secrets.append(self.langfuse.secret_key)
         values = [secret.get_secret_value() for secret in secrets if secret is not None]
@@ -150,14 +140,6 @@ class ControlPlaneSettings:
         key = _required(env, "SAMA_RUN_TOKEN_KEY")
         if len(key.encode()) < 32:
             raise SettingsError("SAMA_RUN_TOKEN_KEY must have at least 32 bytes")
-        telegram = None
-        bot_token = _secret(env, "SAMA_TELEGRAM_BOT_TOKEN")
-        if bot_token is not None:
-            telegram = TelegramConfig(
-                bot_token=bot_token,
-                webhook_secret=SecretStr(_required(env, "SAMA_TELEGRAM_WEBHOOK_SECRET")),
-                bot_username=env.get("SAMA_TELEGRAM_BOT_USERNAME", "").strip().lstrip("@") or None,
-            )
         langfuse = None
         langfuse_key = env.get("LANGFUSE_PUBLIC_KEY", "").strip()
         if langfuse_key:
@@ -185,7 +167,6 @@ class ControlPlaneSettings:
             anthropic_key=_secret(env, "ANTHROPIC_API_KEY"),
             openai_key=_secret(env, "OPENAI_API_KEY"),
             brave_key=_secret(env, "BRAVE_API_KEY"),
-            telegram=telegram,
             langfuse=langfuse,
             slack_webhook_url=_secret(env, "SAMA_ALERT_SLACK_WEBHOOK_URL"),
             environment=env.get("SAMA_ENVIRONMENT", "").strip() or None,

@@ -28,6 +28,7 @@ from sama.db.models import (
     AuditEntry,
     ChannelGroup,
     ChannelIdentity,
+    Integration,
     Membership,
     Message,
     ModelCall,
@@ -249,6 +250,18 @@ def plan(
             path="AGENTS.md",
             content=f"rules of {label}",
         )
+    # One Telegram bot for each org: every member sees it.
+    for user, org in (("alice", "org-a"), ("bob", "org-b")):
+        add(
+            Integration,
+            f"int:{org}",
+            org_id=ids[org],
+            kind="telegram",
+            status="active",
+            external_id=str(uuid.uuid4().int % 10**10),
+            name=f"{org}_bot",
+            created_by_user_id=ids[user],
+        )
     # Telegram links: each user reads only their own; a group shows to the workspace.
     for user, org, workspace, profile in (
         ("alice", "org-a", "a1", "profile-a"),
@@ -257,6 +270,7 @@ def plan(
         links = {
             "org_id": ids[org],
             "channel": "telegram",
+            "integration_id": ids[f"int:{org}"],
             "workspace_id": ids[workspace],
             "agent_profile_id": ids[profile],
         }
