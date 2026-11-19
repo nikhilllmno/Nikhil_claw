@@ -496,9 +496,10 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   uses `exclude_dynamic_sections=True`, so the prefix stays the same for the prompt cache.
 - **Tool search off.** The adapter sets `ENABLE_TOOL_SEARCH=false` in the CLI env. With tool
   search on, the CLI defers MCP tools, and the model must call the native `ToolSearch` tool
-  to load a tool first. `ToolSearch` is in no toolset, so the gate denies it, and the model
-  cannot call a sama MCP tool. The staging check of M1.16 found this. `ClaudeSettings.env`
-  can override the switch. When a run has many connector tools, sama `tool_search`
+  to load a tool first. The staging check of M1.16 found this. `ClaudeSettings.env` can
+  override the switch. The staging check of M1.18 found that the CLI can still defer the
+  tools with the switch off, so the gate allows `ToolSearch` in every run (a tool loader,
+  Section 16.1). When a run has many connector tools, sama `tool_search`
   (Section 10.3) does this job.
 - **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
   16.1). `allow` and `deny` go to the CLI.
@@ -1550,6 +1551,9 @@ A static `GatePolicy` stays for tests and local development. A job cannot set bo
 
 Rules of the steps:
 
+- **Tool loaders.** The native `ToolSearch` tool only loads the schema of another tool of
+  the run. Every run has it, in no toolset, and it is allowed without a rule. A deny rule or
+  the authority step still stops it. The loaded tool passes the gate again at its own call.
 - **Tool names.** `mcp__sama__X` is the sama tool `X`. Another MCP tool
   (`mcp__server__tool`) is in no toolset until integrations add toolsets (Section 10), so it
   gets `deny`.
@@ -1579,8 +1583,8 @@ Rules of the steps:
   exact tool name or a prefix that ends with `*`. At one level an exact name wins over a
   prefix. A `deny` at any level wins. An org or profile `ask` holds over a user rule. Else
   the user rule wins, then the profile rule, then the org rule. Without a rule, read-only
-  tools are allowed (`Read`, `Glob`, `Grep`, `todo`, `TodoWrite`, `web_search`,
-  `web_extract`, `clarify`), and `repo_clone`, which only copies public data into the
+  tools are allowed (`ToolSearch`, `Read`, `Glob`, `Grep`, `todo`, `TodoWrite`,
+  `web_search`, `web_extract`, `clarify`), and `repo_clone`, which only copies public data into the
   sandbox. Every other tool gets `ask`. The classifier comes later.
 - **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
   `deny`, and `ask` becomes `deny`. Job pre-approvals come with jobs (M3); until then the set

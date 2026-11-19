@@ -32,8 +32,15 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
 
+TOOL_LOADERS: Final = frozenset({"ToolSearch"})
+"""Native Claude tools that only load the schema of another tool of the run. Every run has
+them, in no toolset. A tool that a loader loads passes the gate again when the model calls it.
+The Claude CLI can defer MCP tools even with ``ENABLE_TOOL_SEARCH=false``; then the model must
+call ``ToolSearch`` before it can call a sama tool."""
+
 DEFAULT_ALLOW: Final = frozenset(
     {
+        "ToolSearch",
         "Read",
         "Glob",
         "Grep",
@@ -166,7 +173,7 @@ def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdic
 def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
     if context.revoked is not None:
         return Verdict("deny", GateStep.AUTHORITY, context.revoked)
-    if name not in tools_of(context.toolsets):
+    if name not in TOOL_LOADERS and name not in tools_of(context.toolsets):
         return Verdict("deny", GateStep.TOOLSET, f"{name} is not in the toolsets of this run")
     return None
 
