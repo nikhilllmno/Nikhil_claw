@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.10.
+Done: M1.1 to M1.11.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -75,7 +75,12 @@ Done: M1.1 to M1.10.
   `runs` and `sessions.sandbox_id` (migration `0005`). `PostgresSandboxDirectory` stores the
   sandbox of each session. A crashed run starts again only if the worker did not start the
   runner (`runs.dispatched_at`). Per-org concurrency and rate limits come with the API (M1.12). The
-  deploy (M1.15) applies migrations `0004` and `0005` to Supabase.
+  deploy (M1.15) applies migrations `0004` to `0006` to Supabase.
+- M1.11: prompt assembly in `src/sama/prompt/` (architecture Section 6.1). The first run of a
+  session builds the `RunConfig` and stores it in `sessions.run_config` (migration `0006`).
+  Later runs reuse it. Context files come from the table `context_files`, with the injection
+  scan and the 20,000-character cap. Channel hints come with M1.13, repo `AGENTS.md` files
+  with M1.16, and memory and skills later.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

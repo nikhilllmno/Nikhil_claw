@@ -182,8 +182,9 @@ class RunQueue:
     ) -> uuid.UUID:
         """Stores a user message and queues a run for it. Returns the run id.
 
-        The run uses the runtime and the budget of the session profile. If the session has
-        an active run, the new run waits in the queue.
+        The run uses the budget of the session profile. It uses the runtime of the frozen
+        session config, or the runtime of the profile before the first run builds the config
+        (Section 6.1). If the session has an active run, the new run waits in the queue.
         """
         async with self._engine.begin() as connection:
             session = (
@@ -191,7 +192,9 @@ class RunQueue:
                     select(
                         Session.status,
                         Session.agent_profile_id,
-                        AgentProfile.runtime,
+                        func.coalesce(
+                            Session.run_config["runtime"].astext, AgentProfile.runtime
+                        ).label("runtime"),
                         AgentProfile.budget,
                     )
                     .join(
@@ -447,15 +450,19 @@ class RunQueue:
         ).scalar_one_or_none()
         return _decode_state(state)
 
-    async def dispatch(self, run: ClaimedRun, owner: str) -> bool:
+    async def dispatch(
+        self, run: ClaimedRun, owner: str, *, config_fingerprint: str | None = None
+    ) -> bool:
         """Records that the worker gives the run to its runtime. Returns False if the lease is
-        lost. After this mark, ``reap`` does not start the run again, because a tool can run."""
+        lost. After this mark, ``reap`` does not start the run again, because a tool can run.
+
+        ``config_fingerprint`` is the fingerprint of the ``RunConfig`` that the run uses."""
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
                     update(Run)
                     .where(*self._owned(run, owner))
-                    .values(dispatched_at=func.now())
+                    .values(dispatched_at=func.now(), config_fingerprint=config_fingerprint)
                     .returning(Run.id)
                 )
             ).one_or_none()

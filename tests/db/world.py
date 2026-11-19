@@ -35,6 +35,7 @@ from sama.db.models import (
     Session,
     SessionBinding,
     SessionTodo,
+    StoredContextFile,
     ToolCall,
     ToolPolicy,
     User,
@@ -226,6 +227,23 @@ def plan(
             user_id=ids[owner] if owner else None,
             tool="Bash",
             action="allow" if owner else "ask",
+        )
+    # file:profile-a2 has no workspace, but its profile is in a2.
+    files: tuple[tuple[str, str, str | None, str | None], ...] = (
+        ("file:org-a", "org-a", None, None),
+        ("file:a2", "org-a", "a2", None),
+        ("file:profile-a2", "org-a", None, "profile-a2"),
+        ("file:org-b", "org-b", None, None),
+    )
+    for label, org, workspace, owner_profile in files:
+        add(
+            StoredContextFile,
+            label,
+            org_id=ids[org],
+            workspace_id=ids[workspace] if workspace else None,
+            agent_profile_id=ids[owner_profile] if owner_profile else None,
+            path="AGENTS.md",
+            content=f"rules of {label}",
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")

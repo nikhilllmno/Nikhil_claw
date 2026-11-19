@@ -8,7 +8,7 @@
 
 from sama.orchestrator.directory import PostgresSandboxDirectory
 from sama.orchestrator.queue import ClaimedRun, Lease, QueueError, RunQueue, RunRef
-from sama.orchestrator.worker import Worker, profile_config
+from sama.orchestrator.worker import Worker
 
 __all__ = [
     "ClaimedRun",
@@ -18,5 +18,4 @@ __all__ = [
     "RunQueue",
     "RunRef",
     "Worker",
-    "profile_config",
 ]
