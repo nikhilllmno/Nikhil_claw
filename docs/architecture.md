@@ -1737,12 +1737,14 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 - **Redaction.** One redactor in each process removes known secret values and secret
   patterns (provider keys, bearer tokens, the password in a database URL, private keys, JWTs)
   and puts `[REDACTED]` in their place. The known values are the secrets from the environment
-  and all vault values, which the control plane loads every 60 seconds. Values shorter than
-  8 characters are not used. The redactor runs on:
+  and all vault values. The control plane loads the vault values before it starts work, and
+  then every 60 seconds. A known value stays for the life of the process, also after a change
+  in the vault, because a cache or a run can still use it. Values shorter than 8 characters
+  are not used. Each pattern runs in linear time on hostile text. The redactor runs on:
   - log lines (both formats),
   - the user message, the run events, the reply, and the failure message before the queue
     stores them,
-  - the stored tool arguments and the approval reasons,
+  - the stored tool arguments, the approval reasons, and the audit details of the tool gate,
   - the text that the sama tool server returns and its error text,
   - trace input, output, and tool spans (Section 18.2).
 - **Limits.**

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from sama.vault.redact import REDACTED, Redactor, env_secrets
@@ -48,13 +50,35 @@ def test_the_longest_known_value_wins() -> None:
     assert redactor.text("x value-one-and-more y") == f"x {REDACTED} y"
 
 
-def test_vault_values_are_replaced_and_fixed_values_stay() -> None:
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "-----BEGIN PRIVATE KEY-----\n",
+        "postgresql://u:",
+        "eyJabcdefghijklmn-",
+        "Bearer ",
+        "sk-",
+    ],
+)
+def test_hostile_text_takes_linear_time(unit: str) -> None:
+    redactor = Redactor(["known-value-1"])
+    small, large = unit * 2_000, unit * 20_000
+    elapsed = []
+    for text in (small, large):
+        started = time.perf_counter()
+        redactor.text(text)
+        elapsed.append(time.perf_counter() - started)
+    # Quadratic work takes about 100 times longer for 10 times the text.
+    assert elapsed[1] < 1.0
+    assert elapsed[1] < 30 * elapsed[0] + 0.05
+
+
+def test_known_values_only_grow() -> None:
     redactor = Redactor(["fixed-value-1"])
-    redactor.set_vault_values(["vault-value-1"])
-    redactor.add_vault_value("vault-value-2")
+    redactor.add("vault-value-1")
+    redactor.add("vault-value-2", None, "short")
     assert redactor.text("fixed-value-1 vault-value-1 vault-value-2").count(REDACTED) == 3
-    redactor.set_vault_values(["vault-value-3"])
-    assert redactor.text("fixed-value-1 vault-value-1") == f"{REDACTED} vault-value-1"
+    assert redactor.text("short") == "short"
     redactor.forget("fixed-value-1")
     assert redactor.text("fixed-value-1") == "fixed-value-1"
 

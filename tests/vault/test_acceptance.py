@@ -111,6 +111,7 @@ async def test_a_planted_secret_stays_out_of_the_transcript_the_trace_and_the_lo
             call_id="call-2",
             user_id=tenant.ids["mia"],
             approve=True,
+            reason=f"fine, {secret}",
         )
         await harness.worker.maintain()
         assert await harness.worker.run_once()
@@ -120,7 +121,7 @@ async def test_a_planted_secret_stays_out_of_the_transcript_the_trace_and_the_lo
         langfuse = Langfuse()
         assert await langfuse.exporter(engine).export_pending() >= 1
     finally:
-        default_redactor().set_vault_values([])
+        default_redactor().forget(secret)
 
     stored = await _stored(engine, tenant.org)
     assert REDACTED in stored

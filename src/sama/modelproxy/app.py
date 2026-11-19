@@ -506,16 +506,14 @@ class ModelProxy:
         # Identity encoding: the usage reader parses the bytes that the client gets.
         headers["accept-encoding"] = "identity"
         key = await self._key(route.provider, org_id)
-        if route.provider is Provider.ANTHROPIC:
-            base = self._settings.anthropic_url
-            if key is not None:
-                headers["x-api-key"] = key.get_secret_value()
-        else:
-            base = self._settings.openai_url
-            if key is not None:
-                headers["authorization"] = f"Bearer {key.get_secret_value()}"
         if key is None:
             raise ProxyError(503, "api_error", f"the proxy has no {route.provider} key")
+        if route.provider is Provider.ANTHROPIC:
+            base = self._settings.anthropic_url
+            headers["x-api-key"] = key.get_secret_value()
+        else:
+            base = self._settings.openai_url
+            headers["authorization"] = f"Bearer {key.get_secret_value()}"
         upstream = self._client.build_request(
             "POST",
             base.rstrip("/") + route.upstream_path,

@@ -68,7 +68,7 @@ def test_set_list_and_delete(
         assert _run(capsys, "secret", "delete", "--org", org, *name)["deleted"] is True
         assert _run(capsys, "secret", "delete", "--org", org, *name)["deleted"] is False
     finally:
-        default_redactor().set_vault_values([])
+        default_redactor().forget("brave-cli-secret")
 
 
 def test_the_command_needs_a_name_and_the_key(monkeypatch: pytest.MonkeyPatch) -> None:

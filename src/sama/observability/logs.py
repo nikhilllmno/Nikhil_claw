@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Final, TextIO
 
-from sama.vault.redact import default_redactor
+from sama.vault.redact import default_redactor, redact
 
 _context: Final[contextvars.ContextVar[Mapping[str, str] | None]] = contextvars.ContextVar(
     "sama_log_context", default=None
@@ -58,7 +58,7 @@ def current_context() -> Mapping[str, str]:
 class JsonFormatter(logging.Formatter):
     """Formats a record as one JSON object. Fields from ``log_context`` and from ``extra=``
     become top-level keys. A key never replaces ``ts``, ``level``, ``logger``, or ``msg``.
-    The redactor sees the whole line."""
+    The redactor sees each value of the line."""
 
     def __init__(self, service: str) -> None:
         super().__init__()
@@ -81,14 +81,17 @@ class JsonFormatter(logging.Formatter):
             entry["exc"] = self.formatException(record.exc_info)
         elif record.exc_text:
             entry["exc"] = record.exc_text
-        return default_redactor().text(json.dumps(entry, ensure_ascii=False, default=str))
+        # Redact the values, not the JSON text: JSON escapes quotes and backslashes, so a
+        # known value can differ from its form in the text.
+        plain = json.loads(json.dumps(entry, ensure_ascii=False, default=str))
+        return json.dumps(default_redactor().json(plain), ensure_ascii=False)
 
 
 class _TextFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         line = super().format(record)
         fields = " ".join(f"{key}={value}" for key, value in current_context().items())
-        return default_redactor().text(f"{line} {fields}" if fields else line)
+        return redact(f"{line} {fields}" if fields else line)
 
 
 def configure_logging(service: str, *, stream: TextIO | None = None) -> None:

@@ -47,6 +47,9 @@ class SecretName(StrEnum):
     """For the bot of an org (M6). The shared sama bot uses the environment."""
 
 
+_SEALED: Final = (VaultSecret.key_id, VaultSecret.wrapped_key, VaultSecret.ciphertext)
+
+
 def _context(org_id: uuid.UUID, name: str) -> bytes:
     return f"sama-vault:{org_id}:{name}".encode()
 
@@ -95,7 +98,7 @@ class Vault:
                 )
             )
             await _audit(connection, org_id, "vault.secret_set", name, actor_user_id)
-        self._redactor.add_vault_value(value)
+        self._redactor.add(value)
         self._cache[(org_id, name)] = (self._clock() + self._cache_s, value)
 
     async def delete(
@@ -133,32 +136,25 @@ class Vault:
         async with self._engine.connect() as connection:
             row = (
                 await connection.execute(
-                    select(
-                        VaultSecret.key_id, VaultSecret.wrapped_key, VaultSecret.ciphertext
-                    ).where(VaultSecret.org_id == org_id, VaultSecret.name == name.value)
+                    select(*_SEALED).where(
+                        VaultSecret.org_id == org_id, VaultSecret.name == name.value
+                    )
                 )
             ).first()
         value = None
         if row is not None:
             value = unseal(self._key, Sealed(*row), context=_context(org_id, name))
-            self._redactor.add_vault_value(value)
+            self._redactor.add(value)
         self._cache[(org_id, name)] = (now + self._cache_s, value)
         return SecretStr(value) if value is not None else None
 
     async def refresh_redactor(self) -> int:
         """Gives the redactor every value in the vault. Returns the count of values. An entry
-        that does not decrypt is logged and left out."""
+        that does not decrypt is logged and left out. The redactor keeps the values that it
+        already has, so a value that a cache or a run still uses stays redacted."""
         async with self._engine.connect() as connection:
             rows = (
-                await connection.execute(
-                    select(
-                        VaultSecret.org_id,
-                        VaultSecret.name,
-                        VaultSecret.key_id,
-                        VaultSecret.wrapped_key,
-                        VaultSecret.ciphertext,
-                    )
-                )
+                await connection.execute(select(VaultSecret.org_id, VaultSecret.name, *_SEALED))
             ).all()
         values = []
         for org_id, name, key_id, wrapped_key, ciphertext in rows:
@@ -167,18 +163,21 @@ class Vault:
                 values.append(unseal(self._key, sealed, context=_context(org_id, name)))
             except VaultError as error:
                 log.error("a vault entry does not decrypt org=%s name=%s: %s", org_id, name, error)
-        self._redactor.set_vault_values(values)
+        self._redactor.add(*values)
         return len(values)
 
     async def serve(self, stop: asyncio.Event, *, interval_s: float = REFRESH_S) -> None:
-        """Refreshes the redactor until ``stop`` is set. A failed refresh is logged."""
-        while not stop.is_set():
+        """Refreshes the redactor every ``interval_s`` until ``stop`` is set. A failed refresh
+        is logged. The caller does the first refresh before it starts work."""
+        while True:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), interval_s)
+            if stop.is_set():
+                return
             try:
                 await self.refresh_redactor()
             except Exception:
                 log.exception("the vault refresh of the redactor failed")
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), interval_s)
 
 
 async def _audit(

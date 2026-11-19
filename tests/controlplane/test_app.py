@@ -22,6 +22,9 @@ from sama.db.models import Run
 from sama.runtime.contract import RunCompleted, RuntimeKind, TextDelta, Usage
 from sama.runtime.fake import FakeRuntime, FakeScript
 from sama.sandbox.local import LocalProvider
+from sama.vault.crypto import VaultKey
+from sama.vault.redact import REDACTED, Redactor, default_redactor, redact
+from sama.vault.store import SecretName, Vault
 from tests.api.conftest import SECRET, bearer
 from tests.controlplane.test_settings import BASE
 from tests.orchestrator.conftest import Tenant
@@ -102,6 +105,32 @@ async def test_the_runner_reaches_the_process_by_its_public_url(
     assert [(s.name, s.url) for s in servers] == [
         ("sama", "https://sama-staging.fly.dev/tools/mcp")
     ]
+
+
+async def test_the_redactor_knows_the_vault_before_the_start_ends(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    key = VaultKey.generate()
+    secret = "vault-value-written-before-the-start"
+    await Vault(engine, VaultKey.from_text(key), redactor=Redactor()).put(
+        tenant.org, SecretName.BRAVE_API_KEY, secret
+    )
+    plane = fake_plane(engine, vault_key=VaultKey.from_text(key))
+    started = []
+    original = plane.worker.serve
+
+    async def serve(stop: asyncio.Event, *, concurrency: int = 1) -> None:
+        started.append(redact(secret))
+        await original(stop, concurrency=concurrency)
+
+    plane.worker.serve = serve  # type: ignore[method-assign]
+    try:
+        async with running(plane):
+            assert redact(secret) == REDACTED
+            await until(lambda: _true(bool(started)))
+        assert started == [REDACTED]
+    finally:
+        default_redactor().forget(secret)
 
 
 async def test_a_failed_loop_stops_the_process(

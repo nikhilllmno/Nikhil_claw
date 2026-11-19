@@ -232,6 +232,9 @@ def build(
                 )
             loops = _monitor(settings, engine, stack)
             if vault is not None:
+                # The redactor must know every vault value before the first run, request,
+                # or trace. A failed refresh stops the start.
+                await vault.refresh_redactor()
                 loops.append(vault)
             plane.tasks = [
                 asyncio.create_task(worker.serve(stop, concurrency=settings.worker_concurrency)),

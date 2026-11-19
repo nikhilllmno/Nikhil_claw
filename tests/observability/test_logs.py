@@ -119,3 +119,17 @@ def test_secrets_are_redacted_in_the_logs(stream: io.StringIO) -> None:
     [line] = _lines(stream)
     assert line["msg"] == "key [REDACTED] and [REDACTED]"
     assert line["url"] == "[REDACTED]"
+
+
+def test_a_secret_that_json_escapes_is_redacted(stream: io.StringIO) -> None:
+    from sama.vault.redact import default_redactor
+
+    secret = 'planted"log\\secret'
+    default_redactor().add(secret)
+    try:
+        logging.getLogger("sama.test").warning("key %s", secret, extra={"field": [secret]})
+    finally:
+        default_redactor().forget(secret)
+    [line] = _lines(stream)
+    assert line["msg"] == "key [REDACTED]"
+    assert line["field"] == ["[REDACTED]"]

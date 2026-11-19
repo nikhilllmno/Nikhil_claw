@@ -74,19 +74,13 @@ async def _secret(args: argparse.Namespace) -> dict[str, Any]:
     org_id: uuid.UUID = args.org
     try:
         if args.action == "list":
-            return {
-                "org_id": str(org_id),
-                "names": [name.value for name in await vault.names(org_id)],
-            }
+            return {"org_id": str(org_id), "names": [n.value for n in await vault.names(org_id)]}
         name = SecretName(args.name)
+        result: dict[str, Any] = {"org_id": str(org_id), "name": name.value}
         if args.action == "set":
             await vault.put(org_id, name, _read_value())
-            return {"org_id": str(org_id), "name": name.value, "set": True}
-        return {
-            "org_id": str(org_id),
-            "name": name.value,
-            "deleted": await vault.delete(org_id, name),
-        }
+            return result | {"set": True}
+        return result | {"deleted": await vault.delete(org_id, name)}
     finally:
         await engine.dispose()
 

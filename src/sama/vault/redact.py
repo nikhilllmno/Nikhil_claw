@@ -4,13 +4,17 @@ A ``Redactor`` replaces two kinds of secrets with ``[REDACTED]``:
 
 - **Known values**: the secrets of the process (the settings) and the values in the vault.
   A known value is replaced wherever it occurs. Values shorter than ``MIN_KNOWN_CHARS`` are
-  ignored, so that a short value does not hide normal text.
+  ignored, so that a short value does not hide normal text. A known value stays for the life
+  of the process, also after the vault changes, because a cache or a run can still use it.
 - **Patterns**: common key and token forms, for example ``sk-...``, ``ghp_...``, ``AKIA...``,
   JSON web tokens, private key blocks, ``Bearer`` tokens, and passwords in database URLs.
 
 The process has one default redactor (``default_redactor``). The logs, the run queue (the
 transcript), the tool gate (stored arguments), the tool server (tool output), and the trace
 export use it.
+
+Each pattern runs in linear time, also on hostile text: a scan from one start position stops
+at a delimiter that the next start position also needs. The tests check this.
 """
 
 from __future__ import annotations
@@ -31,7 +35,10 @@ _T = TypeVar("_T")
 PATTERNS: Final = tuple(
     re.compile(pattern)
     for pattern in (
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        # The body stops at the next "-----", so a BEGIN with no END scans only to the next
+        # BEGIN.
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*(?:-(?!----)[^-]*)*"
+        r"-----END [A-Z ]*PRIVATE KEY-----",
         r"\bsk-[A-Za-z0-9_-]{20,}",
         r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}",
         r"\bgithub_pat_[A-Za-z0-9_]{22,}",
@@ -42,9 +49,9 @@ PATTERNS: Final = tuple(
         r"\bAIza[0-9A-Za-z_-]{35}\b",
         r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}",
         r"\be2b_[0-9a-f]{40}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+        r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
         r"(?i)\bbearer\s+(?P<s>[A-Za-z0-9._~+/-]{20,}=*)",
-        r"(?i)\b(?:postgres(?:ql)?|mysql|redis|mongodb(?:\+srv)?)://[^:@/\s\"']+:(?P<s>[^@\s\"']+)@",
+        r"(?i)\b(?:postgres(?:ql)?|mysql|redis|mongodb(?:\+srv)?)://[^:@/\s\"']+:(?P<s>[^@/\s\"']+)@",
     )
 )
 
@@ -61,42 +68,27 @@ class Redactor:
 
     def __init__(self, values: Iterable[str | None] = ()) -> None:
         self._lock = threading.Lock()
-        self._fixed: set[str] = set()
-        self._vault: set[str] = set()
+        self._values: frozenset[str] = frozenset()
         self._known: re.Pattern[str] | None = None
         self.add(*values)
 
     def add(self, *values: str | None) -> None:
-        """Adds known values that stay for the life of the process."""
+        """Adds known values. They stay for the life of the process."""
+        usable = _usable(values)
+        if usable <= self._values:
+            return
         with self._lock:
-            self._fixed |= _usable(values)
+            self._values = self._values | usable
             self._build()
 
     def forget(self, *values: str) -> None:
-        """Removes known values that ``add`` added. For tests."""
+        """Removes known values. For tests."""
         with self._lock:
-            self._fixed -= set(values)
-            self._build()
-
-    def set_vault_values(self, values: Iterable[str]) -> None:
-        """Replaces the known values that come from the vault."""
-        usable = _usable(values)
-        with self._lock:
-            if usable == self._vault:
-                return
-            self._vault = usable
-            self._build()
-
-    def add_vault_value(self, value: str) -> None:
-        """Adds one value that the vault read, before the next full refresh."""
-        if value in self._vault or len(value) < MIN_KNOWN_CHARS:
-            return
-        with self._lock:
-            self._vault = self._vault | {value}
+            self._values = self._values - set(values)
             self._build()
 
     def _build(self) -> None:
-        values = sorted(self._fixed | self._vault, key=len, reverse=True)
+        values = sorted(self._values, key=len, reverse=True)
         # One assignment, so a reader sees the old pattern or the new one.
         self._known = re.compile("|".join(map(re.escape, values))) if values else None
 
