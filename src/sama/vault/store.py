@@ -126,20 +126,11 @@ class Vault:
     ) -> bool:
         """Deletes a secret. With ``connection`` it is part of the transaction of the caller."""
         self._cache.pop((org_id, name), None)
-        if connection is not None:
-            return await self._delete(connection, org_id, name, actor_user_id)
-        async with self._engine.begin() as own:
-            gone = await self._delete(own, org_id, name, actor_user_id)
-        self._cache.pop((org_id, name), None)
-        return gone
-
-    async def _delete(
-        self,
-        connection: AsyncConnection,
-        org_id: uuid.UUID,
-        name: SecretName,
-        actor_user_id: uuid.UUID | None,
-    ) -> bool:
+        if connection is None:
+            async with self._engine.begin() as own:
+                gone = await self.delete(org_id, name, actor_user_id=actor_user_id, connection=own)
+            self._cache.pop((org_id, name), None)
+            return gone
         gone = (
             await connection.execute(
                 delete(VaultSecret)
@@ -161,11 +152,17 @@ class Vault:
             )
             return [SecretName(name) for (name,) in rows]
 
-    async def get(self, org_id: uuid.UUID, name: SecretName) -> SecretStr | None:
-        """The secret, or None. Raises ``VaultError`` if the entry does not decrypt."""
+    async def get(
+        self, org_id: uuid.UUID, name: SecretName, *, fresh: bool = False
+    ) -> SecretStr | None:
+        """The secret, or None. Raises ``VaultError`` if the entry does not decrypt.
+
+        ``fresh`` reads the table and not the cache, for a value that another process can have
+        changed a moment ago.
+        """
         now = self._clock()
         cached = self._cache.get((org_id, name))
-        if cached is not None and cached[0] > now:
+        if not fresh and cached is not None and cached[0] > now:
             return SecretStr(cached[1]) if cached[1] is not None else None
         async with self._engine.connect() as connection:
             row = (

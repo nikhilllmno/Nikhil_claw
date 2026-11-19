@@ -147,15 +147,11 @@ function selectedOrg() {
   return state.orgs.find((o) => o.workspaces.some((w) => w.id === workspace)) || null;
 }
 
-function activeIntegration(org, kind) {
-  return (org.integrations || []).find((i) => i.kind === kind && i.status === "active") || null;
-}
-
 // Pairing needs an active Telegram bot in the org of the selected workspace.
 function showTelegram() {
   const org = selectedOrg();
-  const bot = org ? activeIntegration(org, "telegram") : null;
-  $("telegram").hidden = !bot;
+  $("telegram").hidden =
+    !org || !(org.integrations || []).some((i) => i.kind === "telegram" && i.status === "active");
   $("tg-code").replaceChildren();
 }
 
@@ -455,7 +451,7 @@ async function loadIntegrations() {
 
 function orgIntegrations(org, items) {
   const block = element("div", undefined, "integration");
-  block.append(element("h3", org.display_name || org.name));
+  block.append(element("h3", org.name));
   const telegram = items.find((i) => i.kind === "telegram") || null;
   if (telegram === null) {
     block.append(element("p", "Telegram: not connected."));
@@ -510,6 +506,8 @@ function telegramForm(org, connected) {
   form.append(steps, label, submit, status);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (connected && !confirm("Replace the bot? If it is a different bot, all Telegram links of"
+      + " the org stop, and users must pair again.")) return;
     submit.disabled = true;
     status.textContent = "Connecting...";
     try {

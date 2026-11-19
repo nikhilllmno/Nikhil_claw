@@ -82,8 +82,6 @@ class ControlPlane:
     sandboxed: SandboxedRuntime | None
     stop: asyncio.Event
     """Set at the start of a stop: the worker claims no more runs."""
-    integrations: Integrations
-    hub: TelegramHub | None = None
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
     """The background loops while the app runs."""
 
@@ -275,8 +273,6 @@ def build(
         proxy=proxy,
         sandboxed=sandboxed,
         stop=stop,
-        integrations=integrations,
-        hub=hub,
     )
     return plane
 

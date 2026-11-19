@@ -16,7 +16,6 @@ All gateways share one pairing lockout and one follower limit.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hmac
 import logging
 import uuid
@@ -141,14 +140,15 @@ class TelegramHub:
         async with self._lock:
             bot = self._bots.get(key)
             if bot is None or bot.secret_hash != stored:
-                self._retire(key)
+                self.forget(key)
                 bot = await self._build(row, stored)
                 self._bots[key] = bot
         return bot.gateway
 
     async def _build(self, row: Any, stored: str) -> _Bot:
         try:
-            token = await self._vault.get(row.org_id, SecretName.TELEGRAM_BOT_TOKEN)
+            # Not from the cache: another process can have replaced the bot a moment ago.
+            token = await self._vault.get(row.org_id, SecretName.TELEGRAM_BOT_TOKEN, fresh=True)
             openai = (
                 None
                 if self._keys is None
@@ -157,8 +157,8 @@ class TelegramHub:
         except VaultError:
             log.exception("a Telegram integration secret does not decrypt id=%s", row.id)
             raise HTTPException(status_code=503, detail="the bot is not available") from None
-        if token is None:
-            log.error("a Telegram integration has no token id=%s", row.id)
+        if token is None or str(bot_id(token)) != row.external_id:
+            log.error("a Telegram integration has no token for its bot id=%s", row.id)
             raise HTTPException(status_code=503, detail="the bot is not available")
         client = self._telegram_client(token)
         transcriber = None if openai is None else self._transcriber(openai)
@@ -183,9 +183,6 @@ class TelegramHub:
     def forget(self, integration_id: uuid.UUID) -> None:
         """Drops the gateway of an integration that changed or went. Its open work ends in
         the background."""
-        self._retire(integration_id)
-
-    def _retire(self, integration_id: uuid.UUID) -> None:
         bot = self._bots.pop(integration_id, None)
         if bot is None:
             return
@@ -210,8 +207,7 @@ class TelegramHub:
     async def aclose(self) -> None:
         for task in list(self._retiring):
             task.cancel()
-        with contextlib.suppress(Exception):
-            await asyncio.gather(*list(self._retiring), return_exceptions=True)
+        await asyncio.gather(*list(self._retiring), return_exceptions=True)
         bots, self._bots = list(self._bots.values()), {}
         for bot in bots:
             await bot.aclose()

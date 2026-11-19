@@ -72,8 +72,6 @@ async def test_each_part_answers_on_its_path(engine: AsyncEngine) -> None:
 
 async def test_the_vault_turns_on_the_integrations(engine: AsyncEngine) -> None:
     plane = fake_plane(engine, vault_key=VaultKey.from_text(VaultKey.generate()))
-    assert plane.hub is not None
-    assert plane.integrations.enabled
     async with running(plane) as client:
         assert (await client.get("/config")).json()["integrations"] is True
         hook = await client.post(f"/telegram/{uuid.uuid4()}/webhook", json={"update_id": 1})

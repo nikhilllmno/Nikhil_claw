@@ -1349,11 +1349,21 @@ the web page. `sama.integrations.Integrations`:
 transaction, writes `integration.disconnected`, and then deletes the webhook at Telegram (best
 effort).
 
+**Changes at the same time.** A connect or a disconnect holds two Postgres advisory locks
+(transaction locks on their own connection): one for the org and kind, then one for the bot.
+It holds them from its first database write to the end of its Telegram calls. Thus a second
+change of the same org or the same bot waits, also in another process, and the stored digest
+is always the digest of the last secret that Telegram got. The last status update also
+matches only the digest that this connect registered. The page asks the admin to confirm a
+replace, because a different bot deletes the links of the old bot.
+
 **Telegram hub.** `sama.integrations.TelegramHub` serves
 `POST /telegram/<integration id>/webhook`. For each update it reads the row and compares the
 SHA-256 digest of the given secret with `secret_hash` in constant time, also for an unknown id.
 An unknown id, a wrong secret, or a `failed` integration gets `401`. The hub keeps one gateway
-for each bot and builds it on the first update with the token from the vault. A new connect
+for each bot and builds it on the first update with the token from the vault. It reads the
+token from the table and not from the vault cache, because another process can have replaced
+the bot a moment ago. A token of a different bot than `external_id` gets `503`. A new connect
 makes a new secret, so a gateway with an old digest is built again. The process that changes an
 integration also drops the gateway at once. An old gateway ends its open work in the background.
 All gateways share one pairing lockout and one limit of 200 followed runs.

@@ -19,7 +19,7 @@ from sama.integrations.hub import TelegramHub
 from sama.integrations.service import secret_hash
 from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import SecretName, Vault
-from tests.integrations.support import TOKEN, FakeTelegram, add_bot
+from tests.integrations.support import BOT_ID, TOKEN, FakeTelegram, add_bot
 from tests.orchestrator.conftest import Tenant
 
 SECRET = "webhook-secret-0123456789"
@@ -54,7 +54,7 @@ async def hub(
     engine: AsyncEngine, tenant: Tenant, telegram: FakeTelegram, vault: Vault
 ) -> AsyncIterator[TelegramHub]:
     await vault.put(tenant.org, SecretName.TELEGRAM_BOT_TOKEN, TOKEN)
-    await add_bot(engine, tenant, secret_hash=secret_hash(SECRET))
+    await add_bot(engine, tenant, secret_hash=secret_hash(SECRET), external_id=str(BOT_ID))
     hub = TelegramHub(engine, vault, telegram_client=telegram.client)
     yield hub
     await hub.aclose()
@@ -133,5 +133,33 @@ async def test_a_bot_without_a_token_is_not_available(
     vault: Vault, tenant: Tenant, http: httpx.AsyncClient
 ) -> None:
     await vault.delete(tenant.org, SecretName.TELEGRAM_BOT_TOKEN)
+    url = f"/telegram/{tenant.ids['bot']}/webhook"
+    assert (await http.post(url, json=start(), headers={HEADER: SECRET})).status_code == 503
+
+
+async def test_a_new_bot_from_another_process_gets_its_new_token(
+    hub: TelegramHub, engine: AsyncEngine, tenant: Tenant, telegram: FakeTelegram, vault: Vault
+) -> None:
+    key = str(tenant.ids["bot"])
+    await hub.gateway(key, SECRET)  # the vault of the hub now caches the old token
+    new_token = "1000:" + "b" * 35
+    other_process = Vault(engine, VaultKey(b"h" * KEY_BYTES))
+    await other_process.put(tenant.org, SecretName.TELEGRAM_BOT_TOKEN, new_token)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Integration)
+            .where(Integration.id == tenant.ids["bot"])
+            .values(external_id="1000", name="new_bot", secret_hash=secret_hash("s" * 32))
+        )
+    gateway = await hub.gateway(key, "s" * 32)
+    assert gateway.bot.user_id == 1000
+    assert gateway.bot.username == "new_bot"
+    await hub.drain()
+
+
+async def test_a_token_of_another_bot_is_not_used(
+    vault: Vault, tenant: Tenant, http: httpx.AsyncClient
+) -> None:
+    await vault.put(tenant.org, SecretName.TELEGRAM_BOT_TOKEN, "1000:" + "b" * 35)
     url = f"/telegram/{tenant.ids['bot']}/webhook"
     assert (await http.post(url, json=start(), headers={HEADER: SECRET})).status_code == 503

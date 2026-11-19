@@ -96,6 +96,7 @@ async def add_bot(
     *,
     status: str = "active",
     secret_hash: str | None = None,
+    external_id: str | None = None,
 ) -> uuid.UUID:
     """Connects a Telegram bot to the org of ``tenant`` without the Bot API. The id goes to
     ``tenant.ids["bot"]``."""
@@ -107,7 +108,7 @@ async def add_bot(
                 org_id=tenant.org,
                 kind="telegram",
                 status=status,
-                external_id=str(uuid.uuid4().int % 10**10),
+                external_id=external_id or str(uuid.uuid4().int % 10**10),
                 name=username,
                 secret_hash=secret_hash,
             )

@@ -7,8 +7,12 @@ An org admin connects the Telegram bot of the org with its BotFather token. ``In
    new random webhook secret. Only the SHA-256 digest of the secret is stored;
 3. registers ``<public_url>/telegram/<integration id>/webhook`` with the secret at Telegram.
 
-A disconnect deletes the webhook at Telegram, the row (with its linked chats and pairing codes),
-and the vault entry. Each change writes an audit entry without secrets.
+A disconnect deletes the row (with its linked chats and pairing codes), the vault entry, and
+the webhook at Telegram. Each change writes an audit entry without secrets.
+
+A connect or a disconnect holds Postgres advisory locks for the org (and the kind) and for the
+bot from the start of its database work to the end of its Telegram calls. Thus two changes of
+one org or one bot, also in two processes, cannot interleave their webhook registrations.
 """
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ import logging
 import re
 import secrets
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
@@ -53,7 +58,6 @@ class IntegrationView:
     """An integration without secrets."""
 
     id: uuid.UUID
-    org_id: uuid.UUID
     kind: str
     status: str
     external_id: str | None
@@ -77,7 +81,6 @@ class IntegrationView:
 
 _VIEW: Final = (
     Integration.id,
-    Integration.org_id,
     Integration.kind,
     Integration.status,
     Integration.external_id,
@@ -91,10 +94,6 @@ _VIEW: Final = (
 def secret_hash(secret: str) -> str:
     """The digest that ``integrations.secret_hash`` stores."""
     return hashlib.sha256(secret.encode()).hexdigest()
-
-
-def telegram_webhook_path(integration_id: uuid.UUID) -> str:
-    return f"/telegram/{integration_id}/webhook"
 
 
 class Integrations:
@@ -127,15 +126,6 @@ class Integrations:
             )
             return [IntegrationView(*row) for row in rows]
 
-    async def get(self, org_id: uuid.UUID, kind: str) -> IntegrationView | None:
-        async with self._engine.connect() as connection:
-            row = (
-                await connection.execute(
-                    select(*_VIEW).where(Integration.org_id == org_id, Integration.kind == kind)
-                )
-            ).one_or_none()
-        return None if row is None else IntegrationView(*row)
-
     # -- Telegram ---------------------------------------------------------------------------
 
     async def connect_telegram(
@@ -160,35 +150,43 @@ class Integrations:
             if not username:
                 raise IntegrationError("the bot has no username. Set one in @BotFather.")
             webhook_secret = secrets.token_urlsafe(32)
-            integration_id = await self._store_telegram(
-                vault, org_id, user_id, token, bot_id, username, webhook_secret
-            )
-            self._changed(integration_id)
-            url = f"{public_url}{telegram_webhook_path(integration_id)}"
-            error: str | None = None
-            try:
-                await client.set_webhook(url, SecretStr(webhook_secret))
-            except TelegramError as failure:
-                error = str(failure)[:MAX_ERROR_CHARS]
-                log.warning("a Telegram webhook registration failed org=%s: %s", org_id, error)
+            async with _locked(self._engine, _org_key(org_id, "telegram"), _bot_key(bot_id)):
+                integration_id = await self._store_telegram(
+                    vault, org_id, user_id, token, bot_id, username, webhook_secret
+                )
+                self._changed(integration_id)
+                url = f"{public_url}/telegram/{integration_id}/webhook"
+                error: str | None = None
+                try:
+                    await client.set_webhook(url, SecretStr(webhook_secret))
+                except TelegramError as failure:
+                    error = str(failure)[:MAX_ERROR_CHARS]
+                    log.warning("a Telegram webhook registration failed org=%s: %s", org_id, error)
+                async with self._engine.begin() as connection:
+                    row = (
+                        await connection.execute(
+                            update(Integration)
+                            .where(
+                                Integration.org_id == org_id,
+                                Integration.id == integration_id,
+                                # Only the secret that this connect registered.
+                                Integration.secret_hash == secret_hash(webhook_secret),
+                            )
+                            .values(
+                                status="failed" if error else "active",
+                                last_error=error,
+                                updated_at=func.now(),
+                            )
+                            .returning(*_VIEW)
+                        )
+                    ).one_or_none()
         finally:
             await client.aclose()
-        async with self._engine.begin() as connection:
-            await connection.execute(
-                update(Integration)
-                .where(Integration.org_id == org_id, Integration.id == integration_id)
-                .values(
-                    status="failed" if error else "active",
-                    last_error=error,
-                    updated_at=func.now(),
-                )
-            )
-        view = await self.get(org_id, "telegram")
-        if view is None or view.id != integration_id:
+        if row is None:
             raise IntegrationError(
                 "the integration changed at the same time. Try again.", status_code=409
             )
-        return view
+        return IntegrationView(**row._asdict())
 
     async def _store_telegram(
         self,
@@ -282,10 +280,25 @@ class Integrations:
     async def disconnect(self, org_id: uuid.UUID, kind: str, user_id: uuid.UUID) -> bool:
         """Removes the integration of ``kind``. False when the org has none."""
         vault, _ = self._require()
-        names = _SECRETS[kind]
+        async with _locked(self._engine, _org_key(org_id, kind)) as lock:
+            bot = await lock.scalar(
+                select(Integration.external_id).where(
+                    Integration.org_id == org_id, Integration.kind == kind
+                )
+            )
+            if bot is None:
+                return False
+            if kind == "telegram":
+                # A connect of the same bot in another org waits until the webhook is gone.
+                await _lock(lock, _bot_key(bot))
+            return await self._disconnect(vault, org_id, kind, user_id)
+
+    async def _disconnect(
+        self, vault: Vault, org_id: uuid.UUID, kind: str, user_id: uuid.UUID
+    ) -> bool:
         token = None
         if kind == "telegram":
-            token = await vault.get(org_id, SecretName.TELEGRAM_BOT_TOKEN)
+            token = await vault.get(org_id, SecretName.TELEGRAM_BOT_TOKEN, fresh=True)
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
@@ -296,7 +309,7 @@ class Integrations:
             ).one_or_none()
             if row is None:
                 return False
-            for name in names:
+            for name in _SECRETS[kind]:
                 await vault.delete(org_id, name, actor_user_id=user_id, connection=connection)
             await _audit(
                 connection,
@@ -338,6 +351,29 @@ _SECRETS: Final = {
     "telegram": (SecretName.TELEGRAM_BOT_TOKEN,),
     "slack": (SecretName.SLACK_BOT_TOKEN, SecretName.SLACK_SIGNING_SECRET),
 }
+
+
+def _org_key(org_id: uuid.UUID, kind: str) -> str:
+    return f"sama.integration:org:{org_id}:{kind}"
+
+
+def _bot_key(bot_id: str) -> str:
+    return f"sama.integration:telegram:{bot_id}"
+
+
+async def _lock(connection: AsyncConnection, key: str) -> None:
+    await connection.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(key, 0))))
+
+
+@asynccontextmanager
+async def _locked(engine: AsyncEngine, *keys: str) -> AsyncIterator[AsyncConnection]:
+    """Holds an advisory lock for each key, in this order, until the block ends. The org key
+    always comes before the bot key, so two changes cannot wait for each other in a circle.
+    The locks end with their transaction, also when the process stops."""
+    async with engine.begin() as connection:
+        for key in keys:
+            await _lock(connection, key)
+        yield connection
 
 
 async def _audit(
