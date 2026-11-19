@@ -84,6 +84,13 @@ from sama.runtime.contract import (
 DROP_DEFERRED_ENV: Final = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL"
 """CLI switch: drop a deferred tool call when the tool is not available on resume."""
 
+TOOL_SEARCH_ENV: Final = "ENABLE_TOOL_SEARCH"
+"""CLI switch for tool search. With tool search on, the CLI defers MCP tools: the model must
+call the native ``ToolSearch`` tool to load a tool schema first. ``ToolSearch`` is in no sama
+toolset, so the gate denies it and the model cannot call a sama MCP tool. The adapter sets the
+switch to ``false``, so the CLI loads all MCP tools at the start. ``ClaudeSettings.env`` can
+override it."""
+
 _ABORTED: Final = frozenset({"aborted_streaming", "aborted_tools"})
 _BUDGET_SUBTYPES: Final = frozenset({"error_max_turns", "error_max_budget_usd"})
 _PROXY_BUDGET_STATUS: Final = 402
@@ -883,7 +890,7 @@ class ClaudeRuntime:
             }
         else:
             system_prompt = prefix
-        env = dict(settings.env)
+        env = {TOOL_SEARCH_ENV: "false", **settings.env}
         disallowed: list[str] = []
         if phase.drop_tool is not None:
             env[DROP_DEFERRED_ENV] = "1"

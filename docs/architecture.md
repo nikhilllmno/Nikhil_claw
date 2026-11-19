@@ -493,6 +493,12 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   `strict_mcp_config=True`. Remote MCP servers are `http` servers with the run token in an
   `Authorization` header. `include_partial_messages=True` gives text deltas. The preset prompt
   uses `exclude_dynamic_sections=True`, so the prefix stays the same for the prompt cache.
+- **Tool search off.** The adapter sets `ENABLE_TOOL_SEARCH=false` in the CLI env. With tool
+  search on, the CLI defers MCP tools, and the model must call the native `ToolSearch` tool
+  to load a tool first. `ToolSearch` is in no toolset, so the gate denies it, and the model
+  cannot call a sama MCP tool. The staging check of M1.16 found this. `ClaudeSettings.env`
+  can override the switch. When a run has many connector tools, sama `tool_search`
+  (Section 10.3) does this job.
 - **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
   16.1). `allow` and `deny` go to the CLI.
   `ask` becomes `defer`. A sub-agent cannot pause the run, so `ask` inside a sub-agent becomes

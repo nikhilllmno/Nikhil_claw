@@ -56,6 +56,7 @@ from sama.runtime import (
 )
 from sama.runtime.claude import (
     DROP_DEFERRED_ENV,
+    TOOL_SEARCH_ENV,
     ClaudeClient,
     ClaudeRuntime,
     ClaudeSettings,
@@ -352,9 +353,17 @@ async def test_maps_the_request_to_options() -> None:
     assert options.resume is None
     assert options.disallowed_tools == []
     assert options.cwd == "/workspace"
-    assert options.env == {"ANTHROPIC_BASE_URL": "https://proxy.test"}
+    # Tool search off: the CLI loads the sama MCP tools at the start (no ``ToolSearch`` call).
+    assert options.env == {TOOL_SEARCH_ENV: "false", "ANTHROPIC_BASE_URL": "https://proxy.test"}
     assert factory.clients[0].prompts == ["hello"]
     assert factory.clients[0].disconnected
+
+
+async def test_the_settings_can_turn_tool_search_on() -> None:
+    factory = Factory([result()])
+    settings = ClaudeSettings(env={TOOL_SEARCH_ENV: "true"})
+    await collect(ClaudeRuntime(settings=settings, client_factory=factory).run(request()))
+    assert factory.clients[0].options.env[TOOL_SEARCH_ENV] == "true"
 
 
 async def test_custom_system_prompt_without_the_preset() -> None:
