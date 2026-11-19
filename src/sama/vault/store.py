@@ -44,7 +44,11 @@ class SecretName(StrEnum):
     OPENAI_API_KEY = "openai_api_key"
     BRAVE_API_KEY = "brave_api_key"
     TELEGRAM_BOT_TOKEN = "telegram_bot_token"  # noqa: S105 (a name, not a secret)
-    """For the bot of an org (M6). The shared sama bot uses the environment."""
+    """The token of the Telegram integration of the org (Section 11.6)."""
+    SLACK_BOT_TOKEN = "slack_bot_token"  # noqa: S105
+    """The bot token of the Slack integration of the org (Section 11.6)."""
+    SLACK_SIGNING_SECRET = "slack_signing_secret"  # noqa: S105
+    """The signing secret of the Slack app of the org (Section 11.6)."""
 
 
 _SEALED: Final = (VaultSecret.key_id, VaultSecret.wrapped_key, VaultSecret.ciphertext)
@@ -78,8 +82,13 @@ class Vault:
         value: str,
         *,
         actor_user_id: uuid.UUID | None = None,
+        connection: AsyncConnection | None = None,
     ) -> None:
-        """Stores or replaces a secret, and writes an audit entry without the value."""
+        """Stores or replaces a secret, and writes an audit entry without the value.
+
+        With ``connection`` the write is part of the transaction of the caller, and the cache
+        forgets the name, so a rollback cannot leave a wrong value in the cache.
+        """
         value = value.strip()
         if not value or len(value) > MAX_VALUE_CHARS:
             raise ValueError(f"a secret must have 1 to {MAX_VALUE_CHARS} characters")
@@ -89,32 +98,57 @@ class Vault:
             "wrapped_key": sealed.wrapped_key,
             "ciphertext": sealed.ciphertext,
         }
-        async with self._engine.begin() as connection:
-            await connection.execute(
-                pg_insert(VaultSecret)
-                .values(org_id=org_id, name=name.value, **row)
-                .on_conflict_do_update(
-                    index_elements=["org_id", "name"], set_={**row, "updated_at": func.now()}
-                )
+        statement = (
+            pg_insert(VaultSecret)
+            .values(org_id=org_id, name=name.value, **row)
+            .on_conflict_do_update(
+                index_elements=["org_id", "name"], set_={**row, "updated_at": func.now()}
             )
-            await _audit(connection, org_id, "vault.secret_set", name, actor_user_id)
+        )
         self._redactor.add(value)
+        if connection is not None:
+            self._cache.pop((org_id, name), None)
+            await connection.execute(statement)
+            await _audit(connection, org_id, "vault.secret_set", name, actor_user_id)
+            return
+        async with self._engine.begin() as own:
+            await own.execute(statement)
+            await _audit(own, org_id, "vault.secret_set", name, actor_user_id)
         self._cache[(org_id, name)] = (self._clock() + self._cache_s, value)
 
     async def delete(
-        self, org_id: uuid.UUID, name: SecretName, *, actor_user_id: uuid.UUID | None = None
+        self,
+        org_id: uuid.UUID,
+        name: SecretName,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        connection: AsyncConnection | None = None,
     ) -> bool:
-        async with self._engine.begin() as connection:
-            gone = (
-                await connection.execute(
-                    delete(VaultSecret)
-                    .where(VaultSecret.org_id == org_id, VaultSecret.name == name.value)
-                    .returning(VaultSecret.id)
-                )
-            ).first() is not None
-            if gone:
-                await _audit(connection, org_id, "vault.secret_deleted", name, actor_user_id)
+        """Deletes a secret. With ``connection`` it is part of the transaction of the caller."""
         self._cache.pop((org_id, name), None)
+        if connection is not None:
+            return await self._delete(connection, org_id, name, actor_user_id)
+        async with self._engine.begin() as own:
+            gone = await self._delete(own, org_id, name, actor_user_id)
+        self._cache.pop((org_id, name), None)
+        return gone
+
+    async def _delete(
+        self,
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        name: SecretName,
+        actor_user_id: uuid.UUID | None,
+    ) -> bool:
+        gone = (
+            await connection.execute(
+                delete(VaultSecret)
+                .where(VaultSecret.org_id == org_id, VaultSecret.name == name.value)
+                .returning(VaultSecret.id)
+            )
+        ).first() is not None
+        if gone:
+            await _audit(connection, org_id, "vault.secret_deleted", name, actor_user_id)
         return gone
 
     async def names(self, org_id: uuid.UUID) -> list[SecretName]:

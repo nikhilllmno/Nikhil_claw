@@ -13,13 +13,12 @@ Required environment:
 Optional environment:
 
 - ``SAMA_VAULT_KEY``: the vault key, 32 bytes in base64 (Section 16.3). It turns on the
-  vault, which keeps the provider, search, and bot keys of each org.
+  vault, which keeps the provider, search, and bot keys of each org, and the integrations
+  (Section 11.6): org admins connect their own Telegram bot on the web page.
 - ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``: the default provider keys of the model proxy.
   An org key in the vault comes first.
 - ``BRAVE_API_KEY``: the default search key. ``web_search`` is on when this key or the vault
   is set.
-- ``SAMA_TELEGRAM_BOT_TOKEN``, ``SAMA_TELEGRAM_WEBHOOK_SECRET``, ``SAMA_TELEGRAM_BOT_USERNAME``:
-  turn on the Telegram gateway. Without the username, the process asks Telegram at start.
 - ``LANGFUSE_BASE_URL``, ``LANGFUSE_PUBLIC_KEY``, ``LANGFUSE_SECRET_KEY``: turn on traces.
 - ``SAMA_ALERT_SLACK_WEBHOOK_URL``: turns on the error rate alerts.
 - ``SAMA_ENVIRONMENT``, ``SAMA_TRACE_CONTENT``, ``SAMA_SUPABASE_JWT_SECRET``,
@@ -30,8 +29,6 @@ Optional environment:
 from __future__ import annotations
 
 import argparse
-import asyncio
-import dataclasses
 import os
 
 import uvicorn
@@ -39,27 +36,12 @@ import uvicorn
 from sama.controlplane.app import build
 from sama.controlplane.server import DrainingServer
 from sama.controlplane.settings import ControlPlaneSettings, SettingsError
-from sama.gateway.telegram_client import TelegramClient
 from sama.observability.logs import configure_logging
 from sama.tools.server import quiet_dependency_logs
 
 SHUTDOWN_GRACE_S = 30
 """How long uvicorn waits for open requests (event streams included) after the drain of the
 worker (``DRAIN_S``). The Fly.io ``kill_timeout`` must be longer than the whole stop."""
-
-
-async def _username(settings: ControlPlaneSettings) -> ControlPlaneSettings:
-    telegram = settings.telegram
-    if telegram is None or telegram.bot_username:
-        return settings
-    client = TelegramClient(telegram.bot_token)
-    try:
-        username = await client.username()
-    finally:
-        await client.aclose()
-    return dataclasses.replace(
-        settings, telegram=dataclasses.replace(telegram, bot_username=username)
-    )
 
 
 def main() -> None:
@@ -73,7 +55,6 @@ def main() -> None:
         settings = ControlPlaneSettings.from_env(os.environ)
     except SettingsError as error:
         raise SystemExit(str(error)) from None
-    settings = asyncio.run(_username(settings))
     plane = build(settings)
     config = uvicorn.Config(
         plane.app,

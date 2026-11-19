@@ -28,7 +28,7 @@ from typing import Annotated, Any, Final, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -39,6 +39,7 @@ from sama.db.models import (
     Approval,
     AuditEntry,
     ChannelIdentity,
+    Integration,
     Message,
     Org,
     Run,
@@ -49,6 +50,7 @@ from sama.db.models import (
 )
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.gateway.pairing import PairingError, create_code
+from sama.integrations.service import IntegrationError, Integrations
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -83,8 +85,6 @@ class ApiSettings(BaseModel):
     """The open event streams of this process. One more stream gets ``429``."""
     max_streams_per_user: int = Field(default=8, gt=0)
     """The open event streams of one user in this process."""
-    telegram_bot_username: str | None = None
-    """The shared sama bot, without the ``@``. Without it, Telegram pairing is off."""
 
 
 # -- request and response bodies ------------------------------------------------------------
@@ -119,6 +119,11 @@ class NewPairingCode(_Body):
     agent_profile_id: uuid.UUID
     kind: Literal["user", "group"] = "user"
     """``user`` links the Telegram account of the user. ``group`` links a group chat."""
+
+
+class TelegramConnect(_Body):
+    bot_token: SecretStr = Field(min_length=1, max_length=200)
+    """The token of the bot from @BotFather."""
 
 
 class Answers(_Body):
@@ -296,8 +301,11 @@ class SamaApi:
         gate: GateService | None = None,
         clarify: ClarifyBroker | None = None,
         settings: ApiSettings | None = None,
+        integrations: Integrations | None = None,
     ) -> None:
+        """Without ``integrations`` the integration routes answer ``409``."""
         self._engine = engine
+        self._integrations = integrations
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
@@ -352,11 +360,11 @@ class SamaApi:
         app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
         @app.get("/config")
-        async def config() -> dict[str, str | None]:
+        async def config() -> dict[str, Any]:
             return {
                 "supabase_url": settings.supabase_url,
                 "supabase_anon_key": settings.supabase_anon_key,
-                "telegram_bot_username": settings.telegram_bot_username,
+                "integrations": self._integrations is not None and self._integrations.enabled,
             }
 
         @app.get("/me")
@@ -447,6 +455,37 @@ class SamaApi:
             await self._answer(principal, session_id, request_id, body.answers)
             return Response(status_code=204)
 
+        @app.get("/orgs/{org_id}/integrations")
+        async def list_integrations(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            await self._org_grants(principal, org_id)
+            return [view.public() for view in await self._require_integrations().list(org_id)]
+
+        @app.post("/orgs/{org_id}/integrations/telegram", status_code=201)
+        async def connect_telegram(
+            principal: Me, org_id: uuid.UUID, body: TelegramConnect
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                view = await self._require_integrations().connect_telegram(
+                    org_id, grants.user_id, body.bot_token
+                )
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return view.public()
+
+        @app.delete("/orgs/{org_id}/integrations/{kind}", status_code=204)
+        async def disconnect(
+            principal: Me, org_id: uuid.UUID, kind: Literal["telegram", "slack"]
+        ) -> Response:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                gone = await self._require_integrations().disconnect(org_id, kind, grants.user_id)
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            if not gone:
+                raise _not_found("the org has no such integration")
+            return Response(status_code=204)
+
         @app.post("/channels/telegram/pairing-codes", status_code=201)
         async def pairing_code(principal: Me, body: NewPairingCode) -> dict[str, Any]:
             return await self._pairing_code(principal, body)
@@ -508,14 +547,24 @@ class SamaApi:
                     )
                     if p.workspace_id is None or grants.sees_workspace(p.workspace_id)
                 ]
+                integrations = [
+                    {"kind": i.kind, "status": i.status, "name": i.name}
+                    for i in await connection.execute(
+                        select(Integration.kind, Integration.status, Integration.name)
+                        .where(Integration.org_id == user.org_id)
+                        .order_by(Integration.kind)
+                    )
+                ]
                 result.append(
                     {
                         "id": str(user.org_id),
                         "name": user.name,
                         "user_id": str(user.id),
                         "display_name": user.display_name,
+                        "admin": grants.org_admin,
                         "workspaces": workspaces,
                         "agent_profiles": profiles,
+                        "integrations": integrations,
                     }
                 )
         return result
@@ -728,17 +777,31 @@ class SamaApi:
         return _session_out(row)
 
     async def _pairing_code(self, principal: Principal, body: NewPairingCode) -> dict[str, Any]:
-        if not self._settings.telegram_bot_username:
-            raise HTTPException(status_code=409, detail="Telegram is not set up")
         org_id, user_id = await self._workspace_access(
             principal, body.workspace_id, body.agent_profile_id
         )
+        async with self._engine.connect() as connection:
+            bot = (
+                await connection.execute(
+                    select(Integration.id, Integration.name).where(
+                        Integration.org_id == org_id,
+                        Integration.kind == "telegram",
+                        Integration.status == "active",
+                    )
+                )
+            ).one_or_none()
+        if bot is None:
+            raise HTTPException(
+                status_code=409,
+                detail="the org has no Telegram bot. An org admin connects one under Integrations.",
+            )
         try:
             async with self._engine.begin() as connection:
                 code, expires_at = await create_code(
                     connection,
                     org_id=org_id,
                     user_id=user_id,
+                    integration_id=bot.id,
                     channel="telegram",
                     kind=body.kind,
                     workspace_id=body.workspace_id,
@@ -750,8 +813,34 @@ class SamaApi:
             "code": code,
             "kind": body.kind,
             "expires_at": expires_at.isoformat(),
-            "bot_username": self._settings.telegram_bot_username,
+            "bot_username": bot.name,
+            # The link opens the bot and sends the code with /start. A group link adds the bot
+            # to a group first.
+            "link": f"https://t.me/{bot.name}?{'start' if body.kind == 'user' else 'startgroup'}"
+            f"={code}",
         }
+
+    def _require_integrations(self) -> Integrations:
+        if self._integrations is None:
+            raise HTTPException(status_code=409, detail="integrations are off in this process")
+        return self._integrations
+
+    async def _org_grants(self, principal: Principal, org_id: uuid.UUID) -> Grants:
+        """The grants of the user in the org. Raises ``404`` for a user who is not a member."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            user_id = await _user_id(connection, principal, org_id)
+            grants = None if user_id is None else await load_grants(connection, org_id, user_id)
+        if grants is None or not grants.org_member:
+            raise _not_found("the org does not exist")
+        return grants
+
+    async def _org_admin(self, principal: Principal, org_id: uuid.UUID) -> Grants:
+        """Raises ``404`` for a user who is not a member and ``403`` for a member who is not an
+        owner or an admin of the org."""
+        grants = await self._org_grants(principal, org_id)
+        if not grants.org_admin:
+            raise HTTPException(status_code=403, detail="only an org owner or admin can do this")
+        return grants
 
     async def _identities(self, principal: Principal) -> list[dict[str, Any]]:
         """The Telegram accounts that are linked to the user, in all orgs."""
@@ -762,6 +851,7 @@ class SamaApi:
                     ChannelIdentity.org_id,
                     ChannelIdentity.workspace_id,
                     ChannelIdentity.agent_profile_id,
+                    ChannelIdentity.integration_id,
                     ChannelIdentity.created_at,
                 )
                 .where(ChannelIdentity.channel == "telegram")
@@ -773,6 +863,7 @@ class SamaApi:
                     "org_id": str(row.org_id),
                     "workspace_id": str(row.workspace_id),
                     "agent_profile_id": str(row.agent_profile_id),
+                    "integration_id": str(row.integration_id),
                     "created_at": row.created_at.isoformat(),
                 }
                 for row in rows

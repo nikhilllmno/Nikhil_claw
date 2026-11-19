@@ -2,8 +2,8 @@
 # root: flyctl deploy --config deploy/fly.staging.toml --ha=false
 # Secrets (set with flyctl secrets set): SAMA_DATABASE_URL, SAMA_RUN_TOKEN_KEY,
 # SAMA_SUPABASE_ANON_KEY, E2B_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, BRAVE_API_KEY,
-# LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and optional SAMA_TELEGRAM_BOT_TOKEN,
-# SAMA_TELEGRAM_WEBHOOK_SECRET, SAMA_ALERT_SLACK_WEBHOOK_URL.
+# LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and optional SAMA_VAULT_KEY (it turns on the
+# vault and the integrations, Section 11.6), SAMA_ALERT_SLACK_WEBHOOK_URL.
 
 app = "sama-staging"
 primary_region = "sin"

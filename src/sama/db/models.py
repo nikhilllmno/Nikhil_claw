@@ -65,7 +65,12 @@ VAULT_NAMES: Final = (
     "openai_api_key",
     "brave_api_key",
     "telegram_bot_token",
+    "slack_bot_token",
+    "slack_signing_secret",
 )
+INTEGRATION_KINDS: Final = ("telegram", "slack")
+"""The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
+INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
 
 
 def _one_of(column: str, values: tuple[str, ...]) -> str:
@@ -663,6 +668,48 @@ PAIRING_KINDS: Final = ("user", "group")
 """A ``user`` code links a chat account to a user. A ``group`` code links a group chat."""
 
 
+class Integration(Base):
+    """A chat app that an org connected, for example its own Telegram bot (Section 11.6).
+
+    The secrets of the integration are in the vault. The row has no clear text: only the
+    SHA-256 digest of the webhook secret.
+    """
+
+    __tablename__ = "integrations"
+    __table_args__ = (
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("org_id", "kind"),
+        UniqueConstraint("kind", "external_id"),
+        CheckConstraint(_one_of("kind", INTEGRATION_KINDS), name="kind"),
+        CheckConstraint(_one_of("status", INTEGRATION_STATUSES), name="status"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    external_id: Mapped[str | None] = mapped_column(Text)
+    """The id of the bot (Telegram) or of the workspace (Slack). Empty while pending."""
+    name: Mapped[str | None] = mapped_column(Text)
+    """The bot username (Telegram) or the workspace name (Slack)."""
+    settings: Mapped[dict[str, Any]] = _json()
+    secret_hash: Mapped[str | None] = mapped_column(Text)
+    """The SHA-256 digest of the webhook secret, in hex."""
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+def _integration_fk() -> ForeignKeyConstraint:
+    return ForeignKeyConstraint(
+        ["org_id", "integration_id"],
+        ["integrations.org_id", "integrations.id"],
+        ondelete="CASCADE",
+    )
+
+
 class ChannelIdentity(Base):
     """A chat account that is linked to a sama user (docs/architecture.md, Section 11.3).
 
@@ -682,7 +729,8 @@ class ChannelIdentity(Base):
             ["agent_profiles.org_id", "agent_profiles.id"],
             ondelete="CASCADE",
         ),
-        UniqueConstraint("channel", "external_id"),
+        _integration_fk(),
+        UniqueConstraint("integration_id", "external_id"),
         CheckConstraint(_one_of("channel", CHANNELS), name="channel"),
         Index(None, "org_id", "user_id"),
     )
@@ -690,6 +738,8 @@ class ChannelIdentity(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     org_id: Mapped[uuid.UUID] = _org_id()
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    integration_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The integration (the bot) that the chat uses."""
     channel: Mapped[str] = mapped_column(Text, nullable=False)
     external_id: Mapped[str] = mapped_column(Text, nullable=False)
     """The account id in the channel, for example the Telegram user id."""
@@ -713,13 +763,16 @@ class ChannelGroup(Base):
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
-        UniqueConstraint("channel", "external_id"),
+        _integration_fk(),
+        UniqueConstraint("integration_id", "external_id"),
         CheckConstraint(_one_of("channel", CHANNELS), name="channel"),
         Index(None, "org_id", "workspace_id"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     org_id: Mapped[uuid.UUID] = _org_id()
+    integration_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The integration (the bot) that the chat uses."""
     channel: Mapped[str] = mapped_column(Text, nullable=False)
     external_id: Mapped[str] = mapped_column(Text, nullable=False)
     """The chat id in the channel."""
@@ -749,6 +802,7 @@ class PairingCode(Base):
             ["agent_profiles.org_id", "agent_profiles.id"],
             ondelete="CASCADE",
         ),
+        _integration_fk(),
         UniqueConstraint("code_hash"),
         CheckConstraint(_one_of("channel", CHANNELS), name="channel"),
         CheckConstraint(_one_of("kind", PAIRING_KINDS), name="kind"),
@@ -760,6 +814,8 @@ class PairingCode(Base):
     org_id: Mapped[uuid.UUID] = _org_id()
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     """The user who made the code. Only this user can use it."""
+    integration_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The integration that the code is for. Only that bot accepts the code."""
     channel: Mapped[str] = mapped_column(Text, nullable=False)
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     code_hash: Mapped[str] = mapped_column(Text, nullable=False)

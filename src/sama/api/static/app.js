@@ -100,8 +100,9 @@ function signOut() {
   state.sessionId = null;
   // A pairing code is a secret of this user: the next user must not see it.
   state.signOuts += 1;
-  $("tg-code").textContent = "";
+  $("tg-code").replaceChildren();
   $("tg-links").replaceChildren();
+  $("int-orgs").replaceChildren();
   render();
 }
 
@@ -137,6 +138,25 @@ async function loadMe() {
     o.workspaces.map((w) => ({ id: w.id, name: state.orgs.length > 1 ? `${o.name} / ${w.name}` : w.name })));
   fill($("workspace"), workspaces);
   fillProfiles();
+  showTelegram();
+}
+
+// The org of the workspace that is selected.
+function selectedOrg() {
+  const workspace = $("workspace").value;
+  return state.orgs.find((o) => o.workspaces.some((w) => w.id === workspace)) || null;
+}
+
+function activeIntegration(org, kind) {
+  return (org.integrations || []).find((i) => i.kind === kind && i.status === "active") || null;
+}
+
+// Pairing needs an active Telegram bot in the org of the selected workspace.
+function showTelegram() {
+  const org = selectedOrg();
+  const bot = org ? activeIntegration(org, "telegram") : null;
+  $("telegram").hidden = !bot;
+  $("tg-code").replaceChildren();
 }
 
 async function loadSessions() {
@@ -405,8 +425,123 @@ async function start() {
   if (!state.auth) return;
   await loadMe();
   await loadSessions();
-  $("telegram").hidden = !state.config.telegram_bot_username;
-  if (state.config.telegram_bot_username) await loadTelegram();
+  await loadTelegram();
+  await loadIntegrations();
+}
+
+// -- integrations -------------------------------------------------------------------------------
+
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+async function loadIntegrations() {
+  const panel = $("integrations");
+  panel.hidden = !state.config.integrations;
+  if (panel.hidden) return;
+  const signOut0 = state.signOuts;
+  const blocks = [];
+  for (const org of state.orgs) {
+    // Admins read the full list, which has the last error. The others use /me.
+    const items = org.admin ? await api(`/orgs/${org.id}/integrations`) : org.integrations || [];
+    if (signOut0 !== state.signOuts) return;
+    blocks.push(orgIntegrations(org, items));
+  }
+  $("int-orgs").replaceChildren(...blocks);
+}
+
+function orgIntegrations(org, items) {
+  const block = element("div", undefined, "integration");
+  block.append(element("h3", org.display_name || org.name));
+  const telegram = items.find((i) => i.kind === "telegram") || null;
+  if (telegram === null) {
+    block.append(element("p", "Telegram: not connected."));
+  } else if (telegram.status === "active") {
+    block.append(element("p", `Telegram: @${telegram.name} is connected.`));
+  } else {
+    const error = telegram.last_error ? ` ${telegram.last_error}` : "";
+    block.append(element("p", `Telegram: @${telegram.name || "bot"} is ${telegram.status}.${error}`,
+      telegram.status === "failed" ? "failed" : undefined));
+  }
+  if (!org.admin) {
+    block.append(element("p", "Ask an admin of the org to connect integrations.", "hint"));
+    return block;
+  }
+  block.append(telegramForm(org, telegram !== null));
+  if (telegram !== null) {
+    const remove = element("button", "Disconnect Telegram");
+    remove.type = "button";
+    remove.addEventListener("click", async () => {
+      if (!confirm(`Disconnect @${telegram.name || "bot"}? All Telegram links of the org stop.`)) return;
+      try {
+        await api(`/orgs/${org.id}/integrations/telegram`, { method: "DELETE" });
+        await refreshIntegrations();
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+    block.append(remove);
+  }
+  return block;
+}
+
+function telegramForm(org, connected) {
+  const form = element("form");
+  const steps = element("ol");
+  for (const step of [
+    "In Telegram, open @BotFather.",
+    "Send /newbot and follow the steps.",
+    "Copy the token that @BotFather gives you and paste it here.",
+  ]) steps.append(element("li", step));
+  const label = element("label", connected ? "New bot token " : "Bot token ");
+  const input = element("input");
+  input.type = "password";
+  input.autocomplete = "off";
+  input.required = true;
+  input.placeholder = "123456789:AA...";
+  label.append(input);
+  const submit = element("button", connected ? "Replace bot" : "Connect Telegram");
+  submit.type = "submit";
+  const status = element("p", "", "hint");
+  status.setAttribute("role", "status");
+  form.append(steps, label, submit, status);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    status.textContent = "Connecting...";
+    try {
+      const result = await api(`/orgs/${org.id}/integrations/telegram`, {
+        method: "POST",
+        body: { bot_token: input.value.trim() },
+      });
+      input.value = "";
+      status.textContent = result.status === "active"
+        ? `@${result.name} is connected.`
+        : `@${result.name} is ${result.status}. ${result.last_error || ""}`;
+      await refreshIntegrations();
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  return form;
+}
+
+// /me has the integrations of each org, which show or hide the pairing panel.
+async function refreshIntegrations() {
+  const workspace = $("workspace").value;
+  await loadMe();
+  if ([...$("workspace").options].some((o) => o.value === workspace)) {
+    $("workspace").value = workspace;
+    fillProfiles();
+    showTelegram();
+  }
+  await loadTelegram();
+  await loadIntegrations();
 }
 
 // -- Telegram -----------------------------------------------------------------------------------
@@ -445,10 +580,16 @@ async function pairingCode(kind) {
     // The user signed out while the request ran: do not show the code.
     if (signOut0 !== state.signOuts) return;
     const until = new Date(result.expires_at).toLocaleTimeString();
-    $("tg-code").textContent = kind === "user"
-      ? `Send /start ${result.code} to @${result.bot_username}. The code expires at ${until}.`
-      : `Add @${result.bot_username} to the group, then send /pair ${result.code} in the group.`
-        + ` The code expires at ${until}.`;
+    const link = element("a", result.link);
+    link.href = result.link;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    const text = kind === "user"
+      ? `Open the link, or send /start ${result.code} to @${result.bot_username}. `
+      : `Open the link and pick the group, or add @${result.bot_username} to the group and send`
+        + ` /pair ${result.code} in the group. `;
+    $("tg-code").replaceChildren(
+      element("span", text), link, element("span", ` The code expires at ${until}.`));
   } catch (error) {
     showError(error.message);
   }
@@ -526,7 +667,10 @@ function bind() {
   $("sign-out").addEventListener("click", signOut);
   $("tg-user").addEventListener("click", () => pairingCode("user"));
   $("tg-group").addEventListener("click", () => pairingCode("group"));
-  $("workspace").addEventListener("change", fillProfiles);
+  $("workspace").addEventListener("change", () => {
+    fillProfiles();
+    showTelegram();
+  });
   $("new-session").addEventListener("submit", async (event) => {
     event.preventDefault();
     try {

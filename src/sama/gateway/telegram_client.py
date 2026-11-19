@@ -159,6 +159,12 @@ class TelegramClient:
             drop_pending_updates=False,
         )
 
-    async def username(self) -> str:
+    async def get_me(self) -> dict[str, Any]:
+        """The bot of the token. Raises ``TelegramError`` for a wrong token."""
         me = await self.call("getMe")
-        return str(me["username"])
+        if not isinstance(me, dict) or not me.get("is_bot") or "id" not in me:
+            raise TelegramError("getMe failed: the token is not the token of a bot")
+        return me
+
+    async def delete_webhook(self) -> None:
+        await self.call("deleteWebhook", drop_pending_updates=True)

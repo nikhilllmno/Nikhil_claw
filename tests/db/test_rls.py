@@ -46,6 +46,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_identities": {"tg:alice"},
         "channel_groups": {"group:a1"},
         "pairing_codes": {"code:alice"},
+        "integrations": {"int:org-a"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -57,6 +58,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_identities": set(),
         "channel_groups": {"group:a1"},
         "pairing_codes": set(),
+        "integrations": {"int:org-a"},
     },
     "dave": {
         "orgs": {"org-a"},
@@ -68,6 +70,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_identities": set(),
         "channel_groups": set(),
         "pairing_codes": set(),
+        "integrations": {"int:org-a"},
     },
     "bob": {
         "orgs": {"org-b"},
@@ -79,6 +82,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_identities": {"tg:bob"},
         "channel_groups": {"group:b1"},
         "pairing_codes": {"code:bob"},
+        "integrations": {"int:org-b"},
     },
     "stranger": {
         "orgs": set(),
@@ -90,6 +94,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_identities": set(),
         "channel_groups": set(),
         "pairing_codes": set(),
+        "integrations": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

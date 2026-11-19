@@ -21,3 +21,9 @@ aside, #chat { background: #fff; border: 1px solid #ddd; border-radius: 8px; pad
 .card pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
 .row { display: flex; gap: 8px; margin-top: 6px; }
 #error { color: #b00020; padding: 0 16px; }
+.integration { border-top: 1px solid #eee; padding: 8px 0; }
+.integration h3 { font-size: 15px; margin: 4px 0; }
+.integration ol { padding-left: 20px; margin: 6px 0; }
+.integration .failed { color: #b00020; }
+.hint { color: #555; font-size: 13px; }
+#tg-code a { overflow-wrap: anywhere; }
