@@ -83,7 +83,7 @@ async def test_the_runner_reaches_the_process_by_its_public_url(
     engine: AsyncEngine, tmp_path: Path
 ) -> None:
     plane = build(
-        settings(sandbox_allow_out=("github.com",)),
+        settings(sandbox_allow_out=("example.org",)),
         engine=engine,
         provider=LocalProvider(tmp_path),
         exit_on_failure=False,
@@ -93,7 +93,10 @@ async def test_the_runner_reaches_the_process_by_its_public_url(
     sandbox = plane.sandboxed._settings
     assert sandbox.model_url == "https://sama-staging.fly.dev/model"
     assert sandbox.gate_url == "https://sama-staging.fly.dev/tools/gate"
-    assert sandbox.allow_out == ("sama-staging.fly.dev", "github.com")
+    assert sandbox.allow_out[0] == "sama-staging.fly.dev"
+    assert sandbox.allow_out[-1] == "example.org"
+    assert "github.com" in sandbox.allow_out
+    assert plane.tools.repos is not None
     assert not sandbox.open_egress
     servers = plane.worker._config._mcp_servers  # type: ignore[attr-defined]
     assert [(s.name, s.url) for s in servers] == [

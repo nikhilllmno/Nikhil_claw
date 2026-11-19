@@ -5,11 +5,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Final
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
+
+DEFAULT_SANDBOX_HOSTS: Final = (
+    "github.com",
+    "codeload.github.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.npmjs.org",
+)
+"""Hosts that every session sandbox can reach, for code work (Section 16.2): GitHub for
+public clones, and the Python and npm package registries for test dependencies."""
 
 
 class SettingsError(ValueError):
@@ -99,10 +110,10 @@ class ControlPlaneSettings:
 
     @property
     def allow_out(self) -> tuple[str, ...]:
-        """The egress allowlist of the session sandboxes: this process first, then the extra
-        hosts of ``SAMA_SANDBOX_ALLOW_OUT``."""
+        """The egress allowlist of the session sandboxes: this process first, then
+        ``DEFAULT_SANDBOX_HOSTS``, then the extra hosts of ``SAMA_SANDBOX_ALLOW_OUT``."""
         host = urlsplit(self.public_url).hostname or ""
-        return tuple(dict.fromkeys((host, *self.sandbox_allow_out)))
+        return tuple(dict.fromkeys((host, *DEFAULT_SANDBOX_HOSTS, *self.sandbox_allow_out)))
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ControlPlaneSettings:

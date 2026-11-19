@@ -50,6 +50,7 @@ from sama.sandbox.base import SandboxProvider
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
 from sama.tools.output import SandboxSpill
+from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
 from sama.tools.todo import PostgresTodoStore
 from sama.tools.web import BraveSearch
@@ -160,6 +161,7 @@ def build(
         search=BraveSearch(settings.brave_key) if settings.brave_key else None,
         clarify=broker,
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
+        repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
         gate=gate,
     )
     proxy = ModelProxy(

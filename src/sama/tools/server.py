@@ -39,6 +39,8 @@ from sama.tools.clarify import (
 )
 from sama.tools.outbound import OutboundClient
 from sama.tools.output import Spill, cap
+from sama.tools.repos import RepoCloner, RepoError
+from sama.tools.repos import render as render_clone
 from sama.tools.todo import MAX_ITEMS, TodoChange, TodoError, TodoStore, apply, render
 from sama.tools.web import (
     MAX_EXTRACT_URLS,
@@ -58,11 +60,12 @@ WEB_SEARCH: Final = "web_search"
 WEB_EXTRACT: Final = "web_extract"
 CLARIFY: Final = "clarify"
 TODO: Final = "todo"
+REPO_CLONE: Final = "repo_clone"
 
 MAX_ERROR_CHARS: Final = 2_000
 """An error result is cut to this length. Argument errors of the SDK can be long."""
 
-_EXPECTED = (ClarifyError, SearchError, TodoError)
+_EXPECTED = (ClarifyError, RepoError, SearchError, TodoError)
 _NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
 
 
@@ -129,6 +132,8 @@ class ToolServer:
     - ``clarify``: the clarify broker. Without it, ``clarify`` is hidden.
     - ``spill``: where large outputs go. Without it, a large output keeps only its head and
       tail.
+    - ``repos``: clones repositories into the session sandbox. Without it, ``repo_clone`` is
+      hidden.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -143,6 +148,7 @@ class ToolServer:
         search: SearchProvider | None = None,
         clarify: ClarifyBroker | None = None,
         spill: Spill | None = None,
+        repos: RepoCloner | None = None,
         gate: GateBackend | None = None,
     ) -> None:
         self.signer = signer
@@ -152,6 +158,7 @@ class ToolServer:
         self.search = search
         self.clarify = clarify
         self.spill = spill
+        self.repos = repos
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
@@ -301,6 +308,33 @@ class ToolServer:
 
             changes = None if todos is None else [t.model_dump(mode="json") for t in todos]
             return await self._call(ctx, TODO, {"todos": changes, "merge": merge}, body)
+
+        if self.repos is not None:
+            repos = self.repos
+
+            @server.tool(
+                name=REPO_CLONE,
+                description=(
+                    "Clone a public GitHub repository into the work folder of your sandbox. "
+                    "Then use your file and shell tools in its folder to read, change, and "
+                    "test the code. Give the repository as https://github.com/<owner>/<name>. "
+                    "ref is a branch or a tag (default: the default branch). folder is the "
+                    "folder name (default: the repository name). You cannot push."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+                structured_output=False,
+            )
+            async def repo_clone(
+                repo: Annotated[str, Field(min_length=1, max_length=300)],
+                ctx: Context,
+                ref: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+                folder: Annotated[str | None, Field(min_length=1, max_length=100)] = None,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return render_clone(await repos.clone(claims, repo, ref=ref, folder=folder))
+
+                arguments = {"repo": repo, "ref": ref, "folder": folder}
+                return await self._call(ctx, REPO_CLONE, arguments, body)
 
         return server
 
