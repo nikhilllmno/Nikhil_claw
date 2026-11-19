@@ -50,6 +50,7 @@ from sama.gate.decide import (
 )
 from sama.tenancy.access import load_grants
 from sama.tenancy.run_token import RunTokenClaims
+from sama.vault.redact import default_redactor, redact
 
 log = logging.getLogger("sama.gate")
 
@@ -96,8 +97,12 @@ def _utcnow() -> datetime:
 
 
 def stored_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """The arguments to store. Long arguments are cut, so one call cannot fill the table."""
-    text = json.dumps(arguments, ensure_ascii=False, default=json_default)
+    """The arguments to store, with secrets redacted (Section 16.3). Long arguments are cut,
+    so one call cannot fill the table. The digest is of the full arguments, not of these."""
+    text = json.dumps(
+        default_redactor().json(json.loads(json.dumps(arguments, default=json_default))),
+        ensure_ascii=False,
+    )
     if len(text) <= MAX_STORED_ARGUMENT_CHARS:
         return cast(dict[str, Any], json.loads(text))
     return {"_cut": True, "preview": text[:MAX_STORED_ARGUMENT_CHARS]}
@@ -441,7 +446,7 @@ class GateService:
                         status=status,
                         decided_by_user_id=user_id,
                         decided_at=now,
-                        decision_reason=reason,
+                        decision_reason=redact(reason) if reason else reason,
                     )
                 )
                 await self._audit(

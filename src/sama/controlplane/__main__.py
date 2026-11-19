@@ -12,8 +12,12 @@ Required environment:
 
 Optional environment:
 
-- ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``: the provider keys of the model proxy.
-- ``BRAVE_API_KEY``: turns on ``web_search``.
+- ``SAMA_VAULT_KEY``: the vault key, 32 bytes in base64 (Section 16.3). It turns on the
+  vault, which keeps the provider, search, and bot keys of each org.
+- ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``: the default provider keys of the model proxy.
+  An org key in the vault comes first.
+- ``BRAVE_API_KEY``: the default search key. ``web_search`` is on when this key or the vault
+  is set.
 - ``SAMA_TELEGRAM_BOT_TOKEN``, ``SAMA_TELEGRAM_WEBHOOK_SECRET``, ``SAMA_TELEGRAM_BOT_USERNAME``:
   turn on the Telegram gateway. Without the username, the process asks Telegram at start.
 - ``LANGFUSE_BASE_URL``, ``LANGFUSE_PUBLIC_KEY``, ``LANGFUSE_SECRET_KEY``: turn on traces.

@@ -1,7 +1,8 @@
 """The control plane process (docs/architecture.md, Section 19.1).
 
 One process holds the HTTP API, the sama MCP tool server, the model proxy, the run worker, the
-monitor, and the Telegram gateway when a bot token is set. They share one database engine.
+monitor, the vault (when ``SAMA_VAULT_KEY`` is set), and the Telegram gateway when a bot token
+is set. They share one database engine.
 The clarify broker is in memory, so the API that answers a question and the tool server that
 asks it must be in the same process.
 
@@ -21,6 +22,7 @@ import os
 import signal
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -54,6 +56,8 @@ from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
 from sama.tools.todo import PostgresTodoStore
 from sama.tools.web import BraveSearch
+from sama.vault.redact import default_redactor
+from sama.vault.store import OrgKeys, SecretName, Vault
 
 log = logging.getLogger("sama.controlplane")
 
@@ -115,7 +119,17 @@ def build(
     """Builds the process. ``runtimes`` replaces the sandboxed Claude runtime, for tests.
     ``exit_on_failure`` stops the process when a background loop ends with an error, so
     that the platform starts it again."""
+    default_redactor().add(*settings.secret_values())
     engine = engine or create_engine(settings.database_url.get_secret_value())
+    vault = Vault(engine, settings.vault_key) if settings.vault_key is not None else None
+    keys = OrgKeys(
+        vault,
+        {
+            SecretName.ANTHROPIC_API_KEY: settings.anthropic_key,
+            SecretName.OPENAI_API_KEY: settings.openai_key,
+            SecretName.BRAVE_API_KEY: settings.brave_key,
+        },
+    )
     signer = RunTokenSigner(settings.run_token_key.get_secret_value().encode())
     gate = GateService(engine)
     broker = ClarifyBroker()
@@ -158,7 +172,11 @@ def build(
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),
-        search=BraveSearch(settings.brave_key) if settings.brave_key else None,
+        search=(
+            BraveSearch(lambda org_id: keys.get(org_id, SecretName.BRAVE_API_KEY))
+            if keys.available(SecretName.BRAVE_API_KEY)
+            else None
+        ),
         clarify=broker,
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
@@ -171,6 +189,7 @@ def build(
         settings=ProxySettings(
             anthropic_key=settings.anthropic_key, openai_key=settings.openai_key
         ),
+        keys=keys,
     )
     api = SamaApi(
         engine,
@@ -212,6 +231,8 @@ def build(
                     f"{settings.public_url}/telegram/webhook", telegram.webhook_secret
                 )
             loops = _monitor(settings, engine, stack)
+            if vault is not None:
+                loops.append(vault)
             plane.tasks = [
                 asyncio.create_task(worker.serve(stop, concurrency=settings.worker_concurrency)),
                 *(asyncio.create_task(loop.serve(stop)) for loop in loops),
@@ -226,6 +247,7 @@ def build(
                     "telegram": telegram is not None,
                     "traces": settings.langfuse is not None,
                     "alerts": settings.slack_webhook_url is not None,
+                    "vault": vault is not None,
                 },
             )
             yield
@@ -270,11 +292,15 @@ def _ended(task: asyncio.Task[None], stop: asyncio.Event, exit_on_failure: bool)
         os.kill(os.getpid(), signal.SIGTERM)
 
 
+class _Loop(Protocol):
+    async def serve(self, stop: asyncio.Event) -> None: ...
+
+
 def _monitor(
     settings: ControlPlaneSettings, engine: AsyncEngine, stack: contextlib.AsyncExitStack
-) -> list[TraceExporter | ErrorRateAlerter]:
+) -> list[_Loop]:
     """The trace export and the error rate alerts of Section 18, when they are set."""
-    loops: list[TraceExporter | ErrorRateAlerter] = []
+    loops: list[_Loop] = []
     if settings.langfuse is not None:
         langfuse = LangfuseClient(
             settings.langfuse.base_url,

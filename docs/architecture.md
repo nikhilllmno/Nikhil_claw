@@ -1282,8 +1282,8 @@ the person.
   loses the followers: the runs go on, but their replies do not reach Telegram.
 - The group toolset (Section 11.3) is not applied yet.
 - `clarify` questions do not show in Telegram yet.
-- The OpenAI key for voice notes is an environment variable of the gateway until the vault
-  (M1.17). It never goes to a sandbox.
+- The OpenAI key for voice notes is an environment variable of the gateway. The shared bot
+  serves all orgs, so an org key does not apply yet (M6). The key never goes to a sandbox.
 - `httpx` logs request URLs, and a Telegram URL holds the bot token. `python -m sama.gateway`
   sets the `httpx` logger to `WARNING`.
 
@@ -1715,13 +1715,45 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 
 ### 16.3 Secrets
 
-- The **sama vault** holds provider keys, integration tokens, bot tokens, and browser
-  logins. It uses encrypted columns in Postgres (Supabase Vault or envelope encryption with a
-  KMS key).
-- Secrets never enter prompts, transcripts, or tool output. Sama redacts known secret
-  patterns from tool output and logs.
-- Each org can bring its own Anthropic and OpenAI keys later. Our keys are the default for
-  our team.
+- The **sama vault** (`sama.vault`, M1.17) holds the secrets of each org. M1 stores the
+  Anthropic, OpenAI, and Brave keys and a Telegram bot token. Integration tokens and browser
+  logins come with their milestones (M2, M5).
+- **Envelope encryption.** Each entry has its own random 256-bit data key. AES-256-GCM
+  encrypts the value with the data key, and the vault key (`SAMA_VAULT_KEY`, 32 bytes in
+  base64) encrypts the data key. Both steps bind the org id and the name, so a row that is
+  copied to another org or name does not open. The table `vault_secrets` holds only the key
+  id, the wrapped data key, and the ciphertext. We do not use Supabase Vault: envelope
+  encryption works on any Postgres and in the tests.
+- **Access.** Only the control plane decrypts. It writes the table as the owner. RLS lets
+  org admins see which names exist, never a value. Each change writes an audit row
+  (`vault.secret_set`, `vault.secret_deleted`) without the value.
+- **Use.** The model proxy and `web_search` use the org key first and our environment key
+  second. An org with no key and no default gets an error, not another org's key. The vault
+  keeps each value in memory for 60 seconds. If the vault cannot be read, the proxy returns
+  `503` and `web_search` returns an error. They do not fall back to our key.
+- **Admin CLI.** `python -m sama.admin secret set|list|delete --org <uuid> --name <name>`
+  reads the value from stdin and never prints it. An HTTP API comes with the org settings
+  (M3).
+- **Redaction.** One redactor in each process removes known secret values and secret
+  patterns (provider keys, bearer tokens, the password in a database URL, private keys, JWTs)
+  and puts `[REDACTED]` in their place. The known values are the secrets from the environment
+  and all vault values, which the control plane loads every 60 seconds. Values shorter than
+  8 characters are not used. The redactor runs on:
+  - log lines (both formats),
+  - the user message, the run events, the reply, and the failure message before the queue
+    stores them,
+  - the stored tool arguments and the approval reasons,
+  - the text that the sama tool server returns and its error text,
+  - trace input, output, and tool spans (Section 18.2).
+- **Limits.**
+  - A user message is redacted before the runtime reads it. So a user cannot give a key in
+    the chat. Use the vault for keys.
+  - A secret that is split over two text events is not found in `run_events`. The final
+    reply is redacted in full.
+  - Native tool output inside the sandbox goes to the model without redaction. The sandbox
+    has no secrets (Section 16.2).
+  - If the vault key is lost, the entries do not open. Set them again. Key rotation comes
+    later: the key id is stored so that two keys can work at the same time.
 
 ### 16.4 Outbound requests from the control plane
 
@@ -1762,7 +1794,7 @@ policy for all of them:
 - `allow_hosts` (only these hosts and their subdomains) and `block_hosts` are the org lists.
   They apply to every hop. The client compares host names in their IDNA (punycode) form, in
   lower case, without a final dot. So `bücher.de` and `xn--bcher-kva.de` match the same entry.
-  The org settings that fill the lists come with the vault (M1.17).
+  The org settings that fill the lists come with the org settings API (M3).
 
 ### 16.5 Untrusted content
 
@@ -1867,8 +1899,8 @@ with `(org_id, session_id, run_id)`. RLS follows the session, as for `run_events
 queue writes the `runs` rows (Section 4.3). Local runs and tests without a database use the
 in-memory store.
 
-**Not in M1.7.** The keys come from the environment of the proxy process. The vault replaces
-this in M1.17. The Langfuse traces (M1.14, Section 18.2) read these rows. The live checks of membership and revocations
+**Keys (M1.17).** The proxy uses the org key from the vault first and the key from its
+environment second (Section 16.3). The Langfuse traces (M1.14, Section 18.2) read these rows. The live checks of membership and revocations
 come in M1.18. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 
@@ -1934,8 +1966,8 @@ their warnings. The tool gate writes the audit log rows (Section 16.1).
 `deny` (Section 16.1). It still lists every tool that it can serve.
 
 **Not in M1.8.** The Claude adapter does not yet map the native `TodoWrite` tool
-to `todo`. The search key comes from the environment of the server process. The vault replaces
-this in M1.17.
+to `todo`. The search key of the org comes from the vault, with the key of the server
+environment as the default (Section 16.3).
 
 ---
 
@@ -2081,7 +2113,7 @@ runtimes.
 |---|---|---|
 | Root, type `agent`, name `run` | `runs`, the profile name | Input: the user message. Output: the answer. Level `ERROR` and the failure code for a failed run, `WARNING` for a cancelled run. |
 | `generation`, name = model | `model_calls` (Section 16.6) | Model, tokens (`input`, `output`, cache read, cache write), cost in USD, provider, endpoint, status. Start = end minus `duration_ms`. `ERROR` for a status of 400 or more. |
-| `tool`, name = tool | `tool_calls` | Gate decision and status. `ERROR` when failed, `WARNING` when denied. No arguments and no result until redaction (M1.17). |
+| `tool`, name = tool | `tool_calls`, `run_events` | Gate decision and status. `ERROR` when failed, `WARNING` when denied. With `SAMA_TRACE_CONTENT`, the redacted arguments as input and the redacted output preview of `tool_call_finished` as output, at most 4,000 characters each. |
 | `event` | `run_events` | `approval` (the tool name) and `compaction` (tokens before and after). |
 
 - The trace id is the run id. The span ids come from a hash of the run id and the row, so the
@@ -2222,6 +2254,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_RUN_TOKEN_KEY` | Yes | The run token key, at least 32 bytes |
 | `SAMA_SUPABASE_URL`, `SAMA_SUPABASE_ANON_KEY` | Yes | Sign-in (Section 11.4) |
 | `E2B_API_KEY` | Yes | The sandbox provider |
+| `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault is off and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy |
 | `BRAVE_API_KEY` | No | `web_search` |
 | `SAMA_TELEGRAM_BOT_TOKEN`, `SAMA_TELEGRAM_WEBHOOK_SECRET`, `SAMA_TELEGRAM_BOT_USERNAME` | No | The Telegram gateway. The process sets the webhook at start. |
@@ -2229,7 +2262,8 @@ the start with a message that names the variable but not its value.
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY` | No | See the module doc of `sama.controlplane.__main__` |
 
-The vault (M1.17) replaces the provider, search, and bot keys.
+The provider and search keys are the defaults. An org key in the vault comes first
+(Section 16.3).
 
 ### 19.3 Fly.io apps and CI (M1.15)
 

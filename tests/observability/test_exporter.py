@@ -78,7 +78,11 @@ async def test_an_ended_run_is_sent_one_time_with_its_details(
     assert root_attributes["langfuse.observation.input"] == {"stringValue": "Hi there"}
     assert root_attributes["langfuse.observation.output"] == {"stringValue": "Hello!"}
     assert root_attributes["langfuse.trace.name"] == {"stringValue": "p"}
-    assert "secret plans" not in json.dumps(langfuse.traces)
+    tool_attributes = {a["key"]: a["value"] for a in spans[2]["attributes"]}
+    assert tool_attributes["langfuse.observation.input"] == {
+        "stringValue": '{"query":"secret plans"}'
+    }
+    assert tool_attributes["langfuse.observation.output"] == {"stringValue": "the result"}
     assert await _exported(engine, run_id)
 
 

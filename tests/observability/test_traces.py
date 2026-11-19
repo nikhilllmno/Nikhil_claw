@@ -12,7 +12,14 @@ import pytest
 from pydantic import SecretStr
 
 from sama.observability.langfuse import LangfuseClient, LangfuseError, Span
-from sama.observability.traces import MAX_TEXT_CHARS, RunRecord, build_trace, span_id
+from sama.observability.traces import (
+    MAX_TEXT_CHARS,
+    MAX_TOOL_CHARS,
+    RunRecord,
+    build_trace,
+    span_id,
+)
+from sama.vault.redact import default_redactor
 
 T0 = datetime(2026, 11, 19, 1, 0, 0, 123456, tzinfo=UTC)
 
@@ -123,11 +130,44 @@ def test_the_root_holds_the_run_and_the_children_point_to_it() -> None:
     assert approval.attributes["langfuse.observation.metadata.tool_name"] == "shell"
 
 
-def test_tool_arguments_and_results_stay_out_of_the_trace() -> None:
-    record = RunRecord(run=_run(), tool_calls=[_tool()])
-    text = json.dumps([dict(span.attributes) for span in build_trace(record)], default=str)
+def test_a_tool_span_has_the_arguments_and_the_output() -> None:
+    record = RunRecord(
+        run=_run(), tool_calls=[_tool(), _tool(call_id="t2")], tool_outputs={"t1": "found-it"}
+    )
+    _, first, second = build_trace(record)
+    assert json.loads(str(first.attributes["langfuse.observation.input"])) == {"query": "secret"}
+    assert first.attributes["langfuse.observation.output"] == "found-it"
+    assert "langfuse.observation.output" not in second.attributes
+    long = RunRecord(
+        run=_run(), tool_calls=[_tool()], tool_outputs={"t1": "y" * (MAX_TOOL_CHARS + 50)}
+    )
+    output = str(build_trace(long)[1].attributes["langfuse.observation.output"])
+    assert len(output) < MAX_TOOL_CHARS + 10
+    off = build_trace(record, include_content=False)
+    text = json.dumps([dict(span.attributes) for span in off], default=str)
     assert "secret" not in text
     assert "found-it" not in text
+
+
+def test_the_trace_text_is_redacted() -> None:
+    planted = "planted-trace-secret-1"
+    token = "sk-" + "t" * 30
+    default_redactor().add(planted)
+    try:
+        record = RunRecord(
+            run=_run(status="failed", failure_code="tool_error", failure_message=f"bad {planted}"),
+            input_text=f"use {planted}",
+            output_text=f"the key is {token}",
+            tool_calls=[_tool(arguments={"command": f"curl -H 'k: {planted}'", planted: 1})],
+            tool_outputs={"t1": f"echo {planted}"},
+        )
+        spans = build_trace(record)
+    finally:
+        default_redactor().forget(planted)
+    text = json.dumps([(span.error, dict(span.attributes)) for span in spans], default=str)
+    assert planted not in text
+    assert token not in text
+    assert text.count("[REDACTED]") >= 6
 
 
 def test_a_failed_run_and_a_failed_call_are_errors() -> None:

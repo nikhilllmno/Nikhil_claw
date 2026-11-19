@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.16.
+Done: M1.1 to M1.17.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -98,7 +98,7 @@ Done: M1.1 to M1.16.
   monitor) sends one Langfuse trace per ended run over OTLP and posts error rate alerts to
   Slack. Migration `0009` adds `runs.trace_exported_at`. The traces come from the stored
   rows, so they work for both runtimes. Not in M1.14: tool arguments and results in traces
-  (they wait for redaction, M1.17), metrics such as queue depth, and a dashboard. The deploy
+  (M1.17 adds them, redacted), metrics such as queue depth, and a dashboard. The deploy
   (M1.15) runs the monitor next to the worker and sets the Langfuse and Slack secrets.
 - M1.15: the deploy (architecture Section 19.1 to 19.4, decision D18). `python -m
   sama.controlplane` runs the API, the tool server, the model proxy, the worker, the monitor,
@@ -115,6 +115,15 @@ Done: M1.1 to M1.16.
   native tools. The sandbox can reach GitHub, PyPI, and npm by default. Not in M1.16: private
   repos, push, `pr_create`, and the git proxy (M2). See the exfiltration risk in architecture
   Section 16.2.
+- M1.17: vault and redaction in `src/sama/vault/` (architecture Section 16.3). Migration
+  `0010` adds `vault_secrets` (envelope encryption with `SAMA_VAULT_KEY`, RLS for org
+  admins). The model proxy and `web_search` use the org key first and the environment key
+  second. `python -m sama.admin secret` sets, lists, and deletes entries. One redactor removes
+  known secrets and secret patterns from logs, stored transcripts, run events, tool arguments,
+  approval reasons, tool server output, and traces. Traces now have the tool arguments and
+  output. A test plants a secret and checks every stored table, the trace, and the logs. Not in
+  M1.17: an HTTP API for secrets (M3), key rotation, org keys for the shared Telegram bot and
+  for voice notes (M6), and redaction of native tool output in the sandbox.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

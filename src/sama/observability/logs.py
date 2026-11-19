@@ -5,6 +5,9 @@ line on stderr, with the time, the level, the logger, the message, the service, 
 of the current run. ``log_context`` adds ids such as ``run_id`` to every record that the code
 logs inside it, also in tasks that start inside it.
 
+Each line goes through the redactor of the process (``sama.vault.redact``), so known secrets
+and common key forms never reach the logs (Section 16.3).
+
 ``SAMA_LOG_FORMAT=text`` gives plain lines for a terminal. ``SAMA_LOG_LEVEL`` sets the level
 (default ``INFO``).
 """
@@ -20,6 +23,8 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Final, TextIO
+
+from sama.vault.redact import default_redactor
 
 _context: Final[contextvars.ContextVar[Mapping[str, str] | None]] = contextvars.ContextVar(
     "sama_log_context", default=None
@@ -52,7 +57,8 @@ def current_context() -> Mapping[str, str]:
 
 class JsonFormatter(logging.Formatter):
     """Formats a record as one JSON object. Fields from ``log_context`` and from ``extra=``
-    become top-level keys. A key never replaces ``ts``, ``level``, ``logger``, or ``msg``."""
+    become top-level keys. A key never replaces ``ts``, ``level``, ``logger``, or ``msg``.
+    The redactor sees the whole line."""
 
     def __init__(self, service: str) -> None:
         super().__init__()
@@ -75,14 +81,14 @@ class JsonFormatter(logging.Formatter):
             entry["exc"] = self.formatException(record.exc_info)
         elif record.exc_text:
             entry["exc"] = record.exc_text
-        return json.dumps(entry, ensure_ascii=False, default=str)
+        return default_redactor().text(json.dumps(entry, ensure_ascii=False, default=str))
 
 
 class _TextFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         line = super().format(record)
         fields = " ".join(f"{key}={value}" for key, value in current_context().items())
-        return f"{line} {fields}" if fields else line
+        return default_redactor().text(f"{line} {fields}" if fields else line)
 
 
 def configure_logging(service: str, *, stream: TextIO | None = None) -> None:

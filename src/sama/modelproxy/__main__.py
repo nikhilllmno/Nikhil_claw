@@ -23,6 +23,7 @@ from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import MemoryUsageStore, PostgresUsageStore, UsageStore
 from sama.observability.logs import configure_logging
 from sama.tenancy.run_token import RunTokenSigner
+from sama.vault.redact import default_redactor, env_secrets
 
 log = logging.getLogger("sama.modelproxy")
 
@@ -65,6 +66,11 @@ def main() -> None:
     parser.add_argument("--store", choices=("memory", "postgres"), default="memory")
     args = parser.parse_args()
     configure_logging("modelproxy")
+    default_redactor().add(
+        *env_secrets(
+            "SAMA_RUN_TOKEN_KEY", "SAMA_DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"
+        )
+    )
     uvicorn.run(build_app(args.store), host=args.host, port=args.port, log_config=None)
 
 

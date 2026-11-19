@@ -34,7 +34,7 @@ async def test_extract_a_real_page() -> None:
 async def test_brave_search() -> None:
     search = BraveSearch(SecretStr(os.environ["BRAVE_API_KEY"]))
     try:
-        hits = await search.search("Model Context Protocol", 3)
+        hits = await search.search("Model Context Protocol", 3, org_id="org-1")
     finally:
         await search.aclose()
     assert 1 <= len(hits) <= 3

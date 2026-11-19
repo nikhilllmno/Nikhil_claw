@@ -3,6 +3,7 @@ Section 19.2)."""
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr
 
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
+from sama.vault.crypto import VaultKey
 
 DEFAULT_SANDBOX_HOSTS: Final = (
     "github.com",
@@ -99,6 +101,34 @@ class ControlPlaneSettings:
     environment: str | None = None
     trace_content: bool = True
     worker_concurrency: int = 4
+    vault_key: VaultKey | None = None
+
+    def secret_values(self) -> list[str]:
+        """Every secret of the settings, for the redactor (Section 16.3)."""
+        secrets = [
+            self.database_url,
+            self.run_token_key,
+            self.e2b_api_key,
+            self.supabase_jwt_secret,
+            self.anthropic_key,
+            self.openai_key,
+            self.brave_key,
+            self.slack_webhook_url,
+        ]
+        if self.telegram is not None:
+            secrets += [self.telegram.bot_token, self.telegram.webhook_secret]
+        if self.langfuse is not None:
+            secrets.append(self.langfuse.secret_key)
+        values = [secret.get_secret_value() for secret in secrets if secret is not None]
+        password = urlsplit(self.database_url.get_secret_value()).password
+        if password:
+            values.append(password)
+        if self.vault_key is not None:
+            values += [
+                base64.b64encode(self.vault_key.secret).decode(),
+                base64.urlsafe_b64encode(self.vault_key.secret).decode(),
+            ]
+        return values
 
     @property
     def model_url(self) -> str:
@@ -136,6 +166,12 @@ class ControlPlaneSettings:
                 public_key=langfuse_key,
                 secret_key=SecretStr(_required(env, "LANGFUSE_SECRET_KEY")),
             )
+        vault_key = None
+        if env.get("SAMA_VAULT_KEY", "").strip():
+            try:
+                vault_key = VaultKey.from_text(env["SAMA_VAULT_KEY"])
+            except ValueError:
+                raise SettingsError("SAMA_VAULT_KEY must be 32 bytes in base64") from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
             public_url=_public_url(_required(env, "SAMA_PUBLIC_URL")),
@@ -155,4 +191,5 @@ class ControlPlaneSettings:
             environment=env.get("SAMA_ENVIRONMENT", "").strip() or None,
             trace_content=env.get("SAMA_TRACE_CONTENT", "on").strip().lower() != "off",
             worker_concurrency=_count(env, "SAMA_WORKER_CONCURRENCY", 4),
+            vault_key=vault_key,
         )

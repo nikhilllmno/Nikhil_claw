@@ -32,6 +32,7 @@ from sama.gateway.telegram import TelegramGateway, TelegramSettings
 from sama.gateway.telegram_client import TelegramClient, bot_id
 from sama.gateway.transcribe import OpenAITranscriber
 from sama.observability.logs import configure_logging
+from sama.vault.redact import default_redactor, env_secrets
 
 
 def _required(name: str) -> str:
@@ -98,6 +99,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()
     configure_logging("gateway")
+    default_redactor().add(
+        *env_secrets(
+            "SAMA_DATABASE_URL",
+            "SAMA_TELEGRAM_BOT_TOKEN",
+            "SAMA_TELEGRAM_WEBHOOK_SECRET",
+            "OPENAI_API_KEY",
+        )
+    )
     uvicorn.run(build_app(), host=args.host, port=args.port, log_config=None)
 
 

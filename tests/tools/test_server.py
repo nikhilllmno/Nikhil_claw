@@ -31,7 +31,7 @@ class FakeSearch:
     hits: list[SearchHit] = field(default_factory=list)
     queries: list[tuple[str, int]] = field(default_factory=list)
 
-    async def search(self, query: str, limit: int) -> list[SearchHit]:
+    async def search(self, query: str, limit: int, *, org_id: str) -> list[SearchHit]:
         self.queries.append((query, limit))
         return self.hits[:limit]
 

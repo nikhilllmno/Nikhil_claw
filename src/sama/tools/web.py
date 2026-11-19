@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
@@ -34,14 +34,22 @@ class SearchHit:
 
 
 class SearchProvider(Protocol):
-    async def search(self, query: str, limit: int) -> list[SearchHit]: ...
+    async def search(self, query: str, limit: int, *, org_id: str) -> list[SearchHit]: ...
+
+
+KeyLookup = Callable[[str], Awaitable[SecretStr | None]]
+"""Gives the key of an org (``sama.vault.store.OrgKeys``)."""
 
 
 class BraveSearch:
-    """The Brave Search API. The key stays on the control plane."""
+    """The Brave Search API. The key stays on the control plane. ``api_key`` is one key for
+    all orgs, or a lookup that gives the key of each org (the vault, Section 16.3)."""
 
     def __init__(
-        self, api_key: SecretStr, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        api_key: SecretStr | KeyLookup,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._key = api_key
         self._client = httpx.AsyncClient(transport=transport, timeout=15.0, trust_env=False)
@@ -49,14 +57,27 @@ class BraveSearch:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def search(self, query: str, limit: int) -> list[SearchHit]:
+    async def _key_of(self, org_id: str) -> SecretStr:
+        if isinstance(self._key, SecretStr):
+            return self._key
+        try:
+            key = await self._key(org_id)
+        except Exception:
+            log.exception("the search key of an org cannot be read org=%s", org_id)
+            raise SearchError("the search key cannot be read now") from None
+        if key is None:
+            raise SearchError("web search has no API key for this org")
+        return key
+
+    async def search(self, query: str, limit: int, *, org_id: str) -> list[SearchHit]:
+        key = await self._key_of(org_id)
         try:
             response = await self._client.get(
                 BRAVE_URL,
                 params={"q": query, "count": limit, "text_decorations": "false"},
                 headers={
                     "accept": "application/json",
-                    "x-subscription-token": self._key.get_secret_value(),
+                    "x-subscription-token": key.get_secret_value(),
                 },
             )
         except httpx.HTTPError as error:
