@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.14.
+Done: M1.1 to M1.15.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -100,6 +100,15 @@ Done: M1.1 to M1.14.
   rows, so they work for both runtimes. Not in M1.14: tool arguments and results in traces
   (they wait for redaction, M1.17), metrics such as queue depth, and a dashboard. The deploy
   (M1.15) runs the monitor next to the worker and sets the Langfuse and Slack secrets.
+- M1.15: the deploy (architecture Section 19.1 to 19.4, decision D18). `python -m
+  sama.controlplane` runs the API, the tool server, the model proxy, the worker, the monitor,
+  and the Telegram gateway in one process, so the Fly.io apps are `sama-staging` and
+  `sama-production` with one machine each, not separate `api`, `gateway`, and `worker` apps.
+  CI deploys `main` to staging. The `Deploy` workflow promotes a staging image to production by
+  hand. The release command applies the migrations. `python -m sama.admin bootstrap` creates
+  the first org. Not in M1.15: the Telegram bot and the Slack alerts in the deployed apps (no
+  valid bot token or Slack webhook exists yet; the settings turn them on when they are set), a
+  custom domain, and more than one machine.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

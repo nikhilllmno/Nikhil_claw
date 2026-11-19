@@ -1,0 +1,52 @@
+# The sama production app on Fly.io (docs/architecture.md, Section 19). Deploy from the repository
+# root: flyctl deploy --config deploy/fly.production.toml --ha=false
+# Secrets (set with flyctl secrets set): SAMA_DATABASE_URL, SAMA_RUN_TOKEN_KEY,
+# SAMA_SUPABASE_ANON_KEY, E2B_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, BRAVE_API_KEY,
+# LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and optional SAMA_TELEGRAM_BOT_TOKEN,
+# SAMA_TELEGRAM_WEBHOOK_SECRET, SAMA_ALERT_SLACK_WEBHOOK_URL.
+
+app = "sama-production"
+primary_region = "sin"
+kill_signal = "SIGTERM"
+kill_timeout = 180
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  release_command = "alembic upgrade head"
+  release_command_timeout = "10m"
+
+[env]
+  SAMA_ENVIRONMENT = "production"
+  SAMA_PUBLIC_URL = "https://sama-production.fly.dev"
+  SAMA_SUPABASE_URL = "https://yuekhvwifbjukuujuqwb.supabase.co"
+  LANGFUSE_BASE_URL = "https://us.cloud.langfuse.com"
+  SAMA_WORKER_CONCURRENCY = "4"
+
+# One machine only: the clarify broker is in memory (Section 19.1).
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "15s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
