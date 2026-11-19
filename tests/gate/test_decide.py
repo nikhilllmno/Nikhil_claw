@@ -80,6 +80,25 @@ def test_an_unknown_mcp_tool_is_in_no_toolset() -> None:
     assert verdict.step is GateStep.TOOLSET
 
 
+def test_tool_search_is_in_every_run_and_allowed() -> None:
+    verdict = decide(context(toolsets=frozenset({"todo"})), "ToolSearch", {"query": "select:x"})
+    assert verdict.action == "allow"
+
+
+def test_tool_search_does_not_open_the_tool_it_loads() -> None:
+    only_todo = context(toolsets=frozenset({"todo"}))
+    assert decide(only_todo, "ToolSearch", {"query": "select:Bash"}).action == "allow"
+    verdict = decide(only_todo, "Bash", {"command": "ls"})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+
+
+def test_a_deny_rule_and_a_revoke_still_stop_tool_search() -> None:
+    denied = decide(context(rules=(rule("ToolSearch", "deny"),)), "ToolSearch", {})
+    assert (denied.action, denied.step) == ("deny", GateStep.POLICY)
+    revoked = decide(context(revoked="the run ended"), "ToolSearch", {})
+    assert (revoked.action, revoked.step) == ("deny", GateStep.AUTHORITY)
+
+
 def test_the_toolset_step_comes_before_an_approval() -> None:
     recorded = Recorded("approved", "Bash", arguments_digest({"command": "ls"}))
     verdict = decide(
