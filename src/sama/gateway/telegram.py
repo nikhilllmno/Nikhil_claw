@@ -28,7 +28,7 @@ import re
 import uuid
 from collections import OrderedDict
 from collections.abc import Coroutine, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -66,8 +66,8 @@ MAX_VOICE_BYTES: Final = 10 * 1024 * 1024
 MAX_VOICE_S: Final = 300
 SPLIT_AT: Final = 4000
 """A reply longer than this goes on in a new message (Telegram accepts 4,096 characters)."""
-OPEN_STATUSES: Final = ("queued", "running", "paused")
 
+BUSY: Final = "sama is busy now. Send the message again in a few minutes."
 PAIR_PROMPT: Final = (
     "This Telegram account is not linked to sama. Open the sama web page, make a Telegram"
     " pairing code, and send the code here."
@@ -93,7 +93,8 @@ class TelegramSettings(BaseModel):
     """The shortest time between two edits of one reply (Telegram limits edits)."""
     max_follow_s: float = Field(default=6 * 3600, gt=0)
     max_followers: int = Field(default=200, ge=1)
-    """The most runs that this process follows at one time. Others get only the end."""
+    """The most runs that this process follows at one time. When all places are in use, the
+    gateway does not queue a new run and tells the chat to try again later."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,8 +227,9 @@ class TelegramGateway:
         self._lockout = lockout or Lockout()
         self._seen: OrderedDict[int, None] = OrderedDict()
         self._tasks: set[asyncio.Task[None]] = set()
-        self._followers: set[uuid.UUID] = set()
-        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._followers: set[object] = set()
+        """One place per followed run. A message takes its place before it queues the run."""
+        self._chat_locks: dict[int, _ChatLock] = {}
         mention = re.escape(settings.bot_username)
         self._mention = re.compile(rf"(?<!\w)@{mention}\b", re.IGNORECASE)
 
@@ -290,12 +292,15 @@ class TelegramGateway:
             if isinstance(update.get("message"), dict):
                 message = update["message"]
                 chat_id = int(message["chat"]["id"])
-                lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+                entry = self._chat_locks.setdefault(chat_id, _ChatLock())
+                entry.users += 1
                 try:
-                    async with lock:
+                    async with entry.lock:
                         await self._on_message(message)
                 finally:
-                    if not lock.locked():
+                    # Remove the lock only when no update holds it or waits for it.
+                    entry.users -= 1
+                    if entry.users == 0:
                         self._chat_locks.pop(chat_id, None)
             elif isinstance(update.get("callback_query"), dict):
                 await self._on_callback(update["callback_query"])
@@ -322,9 +327,11 @@ class TelegramGateway:
     async def _on_message(self, message: Mapping[str, Any]) -> None:
         chat = message["chat"]
         sender = message.get("from") or {}
-        if chat.get("type") not in ("private", "group", "supergroup") or sender.get("is_bot"):
-            return
-        if "id" not in sender:
+        if (
+            chat.get("type") not in ("private", "group", "supergroup")
+            or sender.get("is_bot")
+            or "id" not in sender
+        ):
             return
         chat_id = int(chat["id"])
         group = chat.get("type") != "private"
@@ -332,7 +339,6 @@ class TelegramGateway:
         message_id = int(message["message_id"])
         text = str(message.get("text") or message.get("caption") or "").strip()
         command, rest = self._command(text)
-        voice = message.get("voice") or message.get("audio")
         if group and command is None and not self._addressed(message, text):
             return
         if group:
@@ -365,6 +371,7 @@ class TelegramGateway:
         if command is not None:
             await self._run_command(chat_id, message_id, command, rest, target, grants)
             return
+        voice = message.get("voice") or message.get("audio")
         if not text and isinstance(voice, dict):
             text = await self._transcribe(chat_id, message_id, voice) or ""
         if not text:
@@ -372,17 +379,28 @@ class TelegramGateway:
         if len(text) > MAX_INPUT_CHARS:
             await self._say(chat_id, "The message is too long.", reply_to=message_id)
             return
-        bound = await self._session(chat_id, target, grants, create=True)
-        if bound is None:
+        if len(self._followers) >= self._settings.max_followers:
+            log.warning("too many runs to follow; chat=%s must try again", chat_id)
+            await self._say(chat_id, BUSY, reply_to=message_id)
             return
+        place = object()
+        self._followers.add(place)
         try:
+            bound = await self._session(chat_id, target, grants, create=True)
+            if bound is None:
+                self._followers.discard(place)
+                return
             run_id = await self._queue.enqueue(
                 org_id=target.org_id, session_id=bound.session_id, text=text, user_id=target.user_id
             )
         except QueueError as error:
+            self._followers.discard(place)
             await self._say(chat_id, str(error), reply_to=message_id)
             return
-        self._follow(chat_id, target.org_id, run_id, message_id)
+        except BaseException:
+            self._followers.discard(place)
+            raise
+        self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
 
     async def _identity(self, sender_id: str) -> Any:
         """The `channel_identities` row of the sender, or None."""
@@ -439,7 +457,9 @@ class TelegramGateway:
         identity: Any,
     ) -> None:
         key = f"{CHANNEL}:{sender_id}"
-        if self._lockout.locked(key):
+        # ``attempt`` counts the try before the database work, so tries at the same time
+        # cannot pass the limit.
+        if not self._lockout.attempt(key):
             await self._say(chat_id, "Too many wrong codes. Try again later.", reply_to=message_id)
             return
         if group and identity is None:
@@ -463,7 +483,6 @@ class TelegramGateway:
                     sender_user_id=None if identity is None else identity.user_id,
                 )
         if linked is None:
-            self._lockout.failed(key)
             await self._say(
                 chat_id,
                 "This code is wrong, used, or expired. Make a new code on the sama web page.",
@@ -531,16 +550,15 @@ class TelegramGateway:
 
     async def _stop(self, org_id: uuid.UUID, session_id: uuid.UUID) -> int:
         async with self._engine.connect() as connection:
-            runs = (
-                await connection.execute(
+            run_ids = (
+                await connection.scalars(
                     select(Run.id).where(
                         Run.org_id == org_id,
                         Run.session_id == session_id,
-                        Run.status.in_(OPEN_STATUSES),
+                        Run.status.not_in(ENDED_RUN_STATUSES),
                     )
                 )
-            ).scalars()
-            run_ids = list(runs)
+            ).all()
         for run_id in run_ids:
             await self._queue.cancel(org_id=org_id, run_id=run_id)
         return len(run_ids)
@@ -673,17 +691,40 @@ class TelegramGateway:
         except TelegramError as error:
             log.warning("a Telegram send failed chat=%s error=%s", chat_id, error)
 
-    def _follow(self, chat_id: int, org_id: uuid.UUID, run_id: uuid.UUID, reply_to: int) -> None:
-        if len(self._followers) >= self._settings.max_followers:
-            log.warning("too many runs to follow; run=%s gets no stream", run_id)
-            return
-        self._followers.add(run_id)
-        self._spawn(self._follow_run(chat_id, org_id, run_id, reply_to))
+    async def _may_deliver(self, connection: AsyncConnection, chat_id: int, target: Target) -> bool:
+        """True when the chat is still linked as it was when the run started.
+
+        An unlinked account, a group linked to another workspace, or a user who lost the
+        workspace stops the delivery (docs/architecture.md, Section 11.3).
+        """
+        if target.audience == "private":
+            linked = await connection.scalar(
+                select(ChannelIdentity.id).where(
+                    ChannelIdentity.channel == CHANNEL,
+                    ChannelIdentity.external_id == str(chat_id),
+                    ChannelIdentity.org_id == target.org_id,
+                    ChannelIdentity.user_id == target.user_id,
+                )
+            )
+            if linked is None:
+                return False
+            grants = await load_grants(connection, target.org_id, target.user_id)
+            return grants.sees_workspace(target.workspace_id)
+        linked = await connection.scalar(
+            select(ChannelGroup.id).where(
+                ChannelGroup.channel == CHANNEL,
+                ChannelGroup.external_id == str(chat_id),
+                ChannelGroup.org_id == target.org_id,
+                ChannelGroup.workspace_id == target.workspace_id,
+            )
+        )
+        return linked is not None
 
     async def _follow_run(
-        self, chat_id: int, org_id: uuid.UUID, run_id: uuid.UUID, reply_to: int
+        self, chat_id: int, target: Target, run_id: uuid.UUID, reply_to: int, place: object
     ) -> None:
         settings = self._settings
+        org_id = target.org_id
         reply = _Reply(self._client, chat_id, reply_to, settings.edit_interval_s)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settings.max_follow_s
@@ -731,11 +772,17 @@ class TelegramGateway:
                             )
                         ).all()
                     )
+                    new = [row for row in pending if row.id not in carded]
+                    ended = status in ENDED_RUN_STATUSES and len(events) < 500
+                    if (events or new or ended) and not await self._may_deliver(
+                        connection, chat_id, target
+                    ):
+                        log.warning("the chat lost its link; run=%s is not delivered", run_id)
+                        return
                 for event in events:
                     seq = event.seq
                     if event.type == "text_delta":
                         await reply.add(str(event.payload.get("text", "")))
-                new = [row for row in pending if row.id not in carded]
                 if new:
                     await reply.flush(final=True)
                     reply.restart()
@@ -743,7 +790,7 @@ class TelegramGateway:
                         carded.add(row.id)
                         text, buttons = _approval_card(row)
                         await self._client.send_message(chat_id, text, buttons=buttons)
-                if status in ENDED_RUN_STATUSES and len(events) < 500:
+                if ended:
                     break
                 await reply.flush(final=False)
                 paused = status == "paused"
@@ -753,7 +800,7 @@ class TelegramGateway:
         except TelegramError as error:
             log.warning("a Telegram reply failed run=%s error=%s", run_id, error)
         finally:
-            self._followers.discard(run_id)
+            self._followers.discard(place)
 
     async def _ending(
         self, chat_id: int, org_id: uuid.UUID, run_id: uuid.UUID, status: str, reply: _Reply
@@ -858,6 +905,14 @@ class TelegramGateway:
             await self._client.answer_callback(callback_id, text)
         except TelegramError as error:
             log.warning("a callback answer failed error=%s", error)
+
+
+@dataclass(slots=True)
+class _ChatLock:
+    """The lock of one chat and the count of updates that hold it or wait for it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 async def _bind(

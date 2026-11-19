@@ -33,6 +33,7 @@ from sama.db.models import (
     ChannelGroup,
     ChannelIdentity,
     PairingCode,
+    User,
 )
 from sama.tenancy.access import load_grants
 
@@ -94,6 +95,10 @@ async def create_code(
 
     Run it as the table owner. Raises ``PairingError`` when the user has too many open codes.
     """
+    # Lock the user row, so that two requests at the same time cannot pass the cap together.
+    await connection.execute(
+        select(User.id).where(User.org_id == org_id, User.id == user_id).with_for_update()
+    )
     now = (await connection.execute(select(func.now()))).scalar_one()
     await connection.execute(
         delete(PairingCode).where(
@@ -181,30 +186,23 @@ async def redeem(
         update(PairingCode).where(PairingCode.id == row.id).values(used_at=func.now())
     )
     link = Linked(kind, row.org_id, row.user_id, row.workspace_id, row.agent_profile_id)
-    values = {
+    table: type[ChannelIdentity | ChannelGroup]
+    if kind == "user":
+        table, target, owner = ChannelIdentity, "channel_identity", "user_id"
+    else:
+        table, target, owner = ChannelGroup, "channel_group", "created_by_user_id"
+    changed = {
         "org_id": link.org_id,
-        "channel": channel,
-        "external_id": external_id,
         "workspace_id": link.workspace_id,
         "agent_profile_id": link.agent_profile_id,
+        owner: link.user_id,
     }
-    if kind == "user":
-        statement = pg_insert(ChannelIdentity).values(user_id=link.user_id, **values)
-        target = "channel_identity"
-    else:
-        statement = pg_insert(ChannelGroup).values(created_by_user_id=link.user_id, **values)
-        target = "channel_group"
-    excluded = statement.excluded
+    statement = pg_insert(table).values(channel=channel, external_id=external_id, **changed)
     await connection.execute(
         statement.on_conflict_do_update(
             index_elements=["channel", "external_id"],
             set_={
-                **{name: excluded[name] for name in values if name != "external_id"},
-                **(
-                    {"user_id": excluded.user_id}
-                    if kind == "user"
-                    else {"created_by_user_id": excluded.created_by_user_id}
-                ),
+                **{name: statement.excluded[name] for name in changed},
                 "updated_at": func.now(),
             },
         )
@@ -259,6 +257,17 @@ class Lockout:
             self._failures.pop(key, None)
             return False
         return failures >= self._max_failures
+
+    def attempt(self, key: str, now: float | None = None) -> bool:
+        """Counts one try as a wrong code before the check, or returns False when locked.
+
+        Call ``succeeded`` when the code is right. The check and the count have no ``await``
+        between them, so tries at the same time cannot pass the limit.
+        """
+        if self.locked(key, now):
+            return False
+        self.failed(key, now)
+        return True
 
     def failed(self, key: str, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now

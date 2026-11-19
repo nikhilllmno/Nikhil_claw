@@ -1201,7 +1201,8 @@ groups. Only the control plane writes these tables.
 
 1. The user picks a workspace and an agent profile on the web page and makes a code. The code
    has 8 characters without `0`, `O`, `1`, and `I`. It expires after 10 minutes and works once.
-   The table keeps only the SHA-256 digest. A user has at most 5 open codes.
+   The table keeps only the SHA-256 digest. A user has at most 5 open codes. A row lock on
+   the user keeps this cap when two requests come at the same time.
 2. A `user` code: the user sends `/start <code>` (or only the code) to the bot in a direct chat.
    The Telegram account then links to the user, the workspace, and the profile. One Telegram
    account links to one org. A new code moves the link.
@@ -1212,7 +1213,9 @@ groups. Only the control plane writes these tables.
    Links and unlinks write `channel_identity.linked`, `channel_group.linked`, and
    `channel_identity.unlinked` to the audit log.
 5. Five wrong codes from one Telegram account lock it for one hour. All accounts together get
-   at most 60 wrong codes a minute. The counts are in memory, per gateway process.
+   at most 60 tries a minute. The gateway counts each try as wrong before it checks the code,
+   and clears the count of the account when the code is right. Thus tries at the same time
+   cannot pass the limit. The counts are in memory, per gateway process.
 
 **Inbound.** Telegram sends each update to `POST /telegram/webhook` with the secret in
 `X-Telegram-Bot-Api-Secret-Token`. The gateway compares it in constant time, drops a repeated
@@ -1244,6 +1247,18 @@ Replies are plain text, without `parse_mode`. When the run pauses, the gateway s
 approval card per pending approval, with the tool name, the reason, the arguments (cut at
 1,500 characters), and the buttons Approve and Deny. A failed run gets its failure message.
 A stopped run gets a notice. A run without text deltas gets its stored answer.
+
+Before the gateway sends output of a run, it checks the chat again. A direct chat must still
+link to the user and org of the run, and the user must still see the workspace. A group must
+still link to the org and workspace of the run. If a check fails, the gateway stops the
+delivery. Thus an unlink or a new group link stops the output of runs that are open.
+
+When Telegram answers `429 Too Many Requests`, the client waits `retry_after` seconds and
+tries again, at most 3 times and only for waits of 30 seconds or less.
+
+One gateway process follows at most 200 runs. When all places are in use, the gateway does not
+queue the message and asks the chat to send it again later. A message takes its place before
+it queues the run.
 
 **Approval buttons.** The callback data is `ap:<approval id>:y` or `ap:<approval id>:n`. The
 gateway finds the linked user of the presser, checks that the user can see the session, calls

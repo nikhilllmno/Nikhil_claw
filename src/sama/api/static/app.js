@@ -11,6 +11,7 @@ const state = {
   sessionId: null,
   stream: null, // AbortController of the event stream
   openRuns: new Set(),
+  signOuts: 0, // grows at each sign-out, so that late answers for the old user are dropped
 };
 const AUTH_KEY = "sama.auth";
 // The sign-in link uses PKCE. The page that asks for the link keeps the verifier, so only this
@@ -97,6 +98,10 @@ function signOut() {
   stopStream();
   clearAuth();
   state.sessionId = null;
+  // A pairing code is a secret of this user: the next user must not see it.
+  state.signOuts += 1;
+  $("tg-code").textContent = "";
+  $("tg-links").replaceChildren();
   render();
 }
 
@@ -407,7 +412,9 @@ async function start() {
 // -- Telegram -----------------------------------------------------------------------------------
 
 async function loadTelegram() {
+  const signOut0 = state.signOuts;
   const links = await api("/channels/telegram/identities");
+  if (signOut0 !== state.signOuts) return;
   $("tg-links").replaceChildren(...links.map((link) => {
     const item = document.createElement("li");
     const org = state.orgs.find((o) => o.id === link.org_id);
@@ -429,11 +436,14 @@ async function loadTelegram() {
 }
 
 async function pairingCode(kind) {
+  const signOut0 = state.signOuts;
   try {
     const result = await api("/channels/telegram/pairing-codes", {
       method: "POST",
       body: { workspace_id: $("workspace").value, agent_profile_id: $("profile").value, kind },
     });
+    // The user signed out while the request ran: do not show the code.
+    if (signOut0 !== state.signOuts) return;
     const until = new Date(result.expires_at).toLocaleTimeString();
     $("tg-code").textContent = kind === "user"
       ? `Send /start ${result.code} to @${result.bot_username}. The code expires at ${until}.`

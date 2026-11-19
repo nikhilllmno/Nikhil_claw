@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import uuid
@@ -25,7 +26,7 @@ from sama.db.models import (
     User,
 )
 from sama.gateway.pairing import create_code
-from sama.gateway.telegram import PAIR_PROMPT, TelegramGateway, TelegramSettings
+from sama.gateway.telegram import BUSY, PAIR_PROMPT, TelegramGateway, TelegramSettings
 from sama.gateway.telegram_client import TelegramClient
 from sama.runtime.contract import FailureCode, RunCompleted, RunFailed, TextDelta
 from sama.runtime.fake import FakeScript
@@ -195,6 +196,17 @@ async def bound_session(engine: AsyncEngine, chat: int) -> Any:  # noqa: F811
                 )
             )
         ).one_or_none()
+
+
+def no_followers(gateway: TelegramGateway) -> None:
+    """The gateway queues runs but does not follow them."""
+
+    async def skip(
+        chat_id: int, target: Any, run_id: uuid.UUID, reply_to: int, place: object
+    ) -> None:
+        gateway._followers.discard(place)
+
+    gateway._follow_run = skip  # type: ignore[method-assign]
 
 
 @pytest.fixture(autouse=True)
@@ -417,8 +429,7 @@ async def test_commands_new_stop_and_model(
     telegram: FakeTelegram,
 ) -> None:
     await pair(gateway, engine, tenant)
-    gateway._settings = gateway._settings.model_copy(update={"max_followers": 1})
-    gateway._followers.add(uuid.uuid4())  # the runs below are not followed
+    no_followers(gateway)  # the runs below are not followed
     await gateway.handle_update(message("first"))
     first = await bound_session(engine, DM)
 
@@ -455,7 +466,7 @@ async def test_a_voice_note_is_transcribed(
     transcriber: FakeTranscriber,
 ) -> None:
     await pair(gateway, engine, tenant)
-    gateway._followers.update(uuid.uuid4() for _ in range(200))
+    no_followers(gateway)
     await gateway.handle_update(
         message(None, voice={"file_id": "f1", "duration": 3, "mime_type": "audio/ogg"})
     )
@@ -507,7 +518,7 @@ async def test_a_group_is_linked_and_shares_a_session(
     tenant: Tenant,  # noqa: F811
     telegram: FakeTelegram,
 ) -> None:
-    gateway._followers.update(uuid.uuid4() for _ in range(200))
+    no_followers(gateway)
     # A stranger and an unlinked group get no session.
     await gateway.handle_update(message("@sama_bot hi", chat=GROUP, sender=7007))
     assert telegram.texts(GROUP) == []
@@ -609,3 +620,83 @@ async def test_a_group_code_is_only_for_its_maker(
     assert "wrong, used, or expired" in telegram.texts(GROUP)[-1]
     await gateway.handle_update(message(f"/pair {ben_group}", chat=GROUP, sender=9009))
     assert "This group is linked" in telegram.texts(GROUP)[-1]
+
+
+# -- review fixes -------------------------------------------------------------------------------
+
+
+async def test_an_unlinked_chat_gets_no_more_output(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(approval_script())
+    await gateway.handle_update(message("clean up"))
+    assert await harness.worker.run_once()
+
+    async def carded() -> bool:
+        return any("reply_markup" in body for body in telegram.sent(DM))
+
+    await until(carded)
+    card = next(body for body in telegram.sent(DM) if "reply_markup" in body)
+    await gateway.handle_update(
+        {
+            "update_id": next(_update_ids),
+            "callback_query": {
+                "id": "cb1",
+                "from": {"id": MIA_TG, "first_name": "Mia"},
+                "data": card["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                "message": {"message_id": 101, "chat": {"id": DM}, "text": card["text"]},
+            },
+        }
+    )
+    sent = len(telegram.sent(DM))
+    async with engine.begin() as connection:
+        await connection.execute(delete(ChannelIdentity))
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert len(telegram.sent(DM)) == sent, "the answer does not reach an unlinked chat"
+    assert "deleted" not in telegram.shown(DM)
+
+
+async def test_a_full_gateway_refuses_new_runs(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    places = [object() for _ in range(200)]
+    gateway._followers.update(places)
+    try:
+        await gateway.handle_update(message("hi"))
+    finally:
+        gateway._followers.difference_update(places)
+    assert telegram.texts(DM)[-1] == BUSY
+    assert await bound_session(engine, DM) is None, "no session and no run were made"
+    assert not gateway._followers
+
+
+async def test_updates_of_one_chat_run_one_at_a_time(
+    gateway: TelegramGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    active = 0
+    most = 0
+    order: list[str] = []
+
+    async def slow(message: dict[str, Any]) -> None:
+        nonlocal active, most
+        active += 1
+        most = max(most, active)
+        await asyncio.sleep(0.01)
+        order.append(message["text"])
+        active -= 1
+
+    monkeypatch.setattr(gateway, "_on_message", slow)
+    await asyncio.gather(*(gateway.handle_update(message(text)) for text in ("a", "b", "c")))
+    assert most == 1
+    assert sorted(order) == ["a", "b", "c"]
+    assert gateway._chat_locks == {}, "the lock goes away when no update waits"

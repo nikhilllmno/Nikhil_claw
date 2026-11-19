@@ -7,6 +7,7 @@ request URLs are not logged.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Final
 
 import httpx
@@ -18,11 +19,7 @@ MAX_TEXT: Final = 4096
 
 
 class TelegramError(Exception):
-    """A failed Bot API call. ``retry_after`` is set when Telegram asks the bot to wait."""
-
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
+    """A failed Bot API call."""
 
 
 def bot_id(token: SecretStr) -> int | None:
@@ -39,8 +36,14 @@ class TelegramClient:
         base_url: str = API_URL,
         http: httpx.AsyncClient | None = None,
         timeout_s: float = 20.0,
+        max_retries: int = 3,
+        max_wait_s: float = 30.0,
     ) -> None:
+        """``max_retries`` and ``max_wait_s`` limit the waits when Telegram answers
+        ``429 Too Many Requests`` with ``retry_after``. A longer wait raises at once."""
         self._token = token
+        self._max_retries = max_retries
+        self._max_wait_s = max_wait_s
         self._base_url = base_url.rstrip("/")
         self._http = http or httpx.AsyncClient(timeout=timeout_s)
 
@@ -50,19 +53,24 @@ class TelegramClient:
     async def call(self, method: str, **params: Any) -> Any:
         url = f"{self._base_url}/bot{self._token.get_secret_value()}/{method}"
         body = {name: value for name, value in params.items() if value is not None}
-        try:
-            response = await self._http.post(url, json=body)
-            data = response.json()
-        except (httpx.HTTPError, ValueError) as error:
-            raise TelegramError(f"{method} failed: {type(error).__name__}") from None
-        if not isinstance(data, dict) or not data.get("ok"):
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await self._http.post(url, json=body)
+                data = response.json()
+            except (httpx.HTTPError, ValueError) as error:
+                raise TelegramError(f"{method} failed: {type(error).__name__}") from None
+            if isinstance(data, dict) and data.get("ok"):
+                return data.get("result")
             data = data if isinstance(data, dict) else {}
-            parameters = data.get("parameters") or {}
-            raise TelegramError(
-                f"{method} failed: {data.get('description', response.status_code)}",
-                retry_after=parameters.get("retry_after"),
-            )
-        return data.get("result")
+            wait = (data.get("parameters") or {}).get("retry_after")
+            if (
+                not isinstance(wait, int | float)
+                or wait > self._max_wait_s
+                or attempt == self._max_retries
+            ):
+                break
+            await asyncio.sleep(wait)
+        raise TelegramError(f"{method} failed: {data.get('description', response.status_code)}")
 
     async def send_message(
         self,
@@ -87,22 +95,15 @@ class TelegramClient:
         )
         return int(result["message_id"])
 
-    async def edit_message(
-        self,
-        chat_id: int,
-        message_id: int,
-        text: str,
-        *,
-        buttons: list[list[dict[str, str]]] | None = None,
-    ) -> None:
-        """Changes the text of a message. Without ``buttons`` the buttons go away."""
+    async def edit_message(self, chat_id: int, message_id: int, text: str) -> None:
+        """Changes the text of a message and removes its buttons."""
         try:
             await self.call(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=message_id,
                 text=text[:MAX_TEXT],
-                reply_markup={"inline_keyboard": buttons or []},
+                reply_markup={"inline_keyboard": []},
                 link_preview_options={"is_disabled": True},
             )
         except TelegramError as error:

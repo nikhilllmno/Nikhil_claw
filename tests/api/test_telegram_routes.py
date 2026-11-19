@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 
@@ -118,6 +119,18 @@ async def test_a_code_needs_access_to_the_workspace(
     assert response.status_code == 422
     missing = await tg.delete(f"/channels/telegram/identities/{uuid.uuid4()}", headers=mia(tenant))
     assert missing.status_code == 404
+
+
+async def test_codes_made_at_the_same_time_keep_the_cap(
+    tg: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    responses = await asyncio.gather(
+        *(
+            tg.post("/channels/telegram/pairing-codes", headers=mia(tenant), json=new_code(tenant))
+            for _ in range(8)
+        )
+    )
+    assert sorted(response.status_code for response in responses) == [201] * 5 + [429] * 3
 
 
 async def test_a_user_has_at_most_five_open_codes(tg: httpx.AsyncClient, tenant: Tenant) -> None:

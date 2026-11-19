@@ -65,6 +65,16 @@ def test_the_lockout_has_a_global_limit_and_a_size_limit() -> None:
     assert len(lockout._failures) <= 3
 
 
+def test_an_attempt_counts_before_the_check() -> None:
+    lockout = Lockout()
+    # Tries at the same time: each attempt counts at once, so the sixth is refused.
+    assert all(lockout.attempt("a", now=1.0) for _ in range(MAX_FAILURES))
+    assert not lockout.attempt("a", now=1.0)
+    assert lockout.attempt("b", now=1.0)
+    lockout.succeeded("b")
+    assert not lockout.locked("b", now=1.0)
+
+
 def test_split_point_prefers_a_line_end_then_a_space() -> None:
     text = "a" * 3000 + "\n" + "b" * 2000
     assert split_point(text) == 3001
@@ -118,18 +128,13 @@ async def test_the_client_sends_plain_text_with_buttons() -> None:
 async def test_client_errors_hide_the_token() -> None:
     recorder = Recorder(
         {
-            "sendMessage": {
-                "ok": False,
-                "description": "Too Many Requests",
-                "parameters": {"retry_after": 3},
-            },
+            "sendMessage": {"ok": False, "description": "Too Many Requests"},
             "editMessageText": {"ok": False, "description": "Bad Request: message is not modified"},
         }
     )
     tg = client(recorder)
     with pytest.raises(TelegramError) as caught:
         await tg.send_message(1, "x")
-    assert caught.value.retry_after == 3
     assert "secret-token" not in str(caught.value)
     await tg.edit_message(1, 2, "same")  # "not modified" is not an error
 
@@ -144,6 +149,41 @@ async def test_client_errors_hide_the_token() -> None:
     with pytest.raises(TelegramError) as caught:
         await failing.typing(1)
     assert "secret-token" not in str(caught.value)
+
+
+async def test_the_client_waits_when_telegram_asks() -> None:
+    limited = {
+        "ok": False,
+        "description": "Too Many Requests: retry after 0",
+        "parameters": {"retry_after": 0},
+    }
+    replies = [limited, limited, {"ok": True, "result": {"message_id": 9}}]
+    calls: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(429 if len(replies) > 1 else 200, json=replies.pop(0))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    tg = TelegramClient(TOKEN, base_url="https://tg.test", http=http, max_retries=3)
+    assert await tg.send_message(1, "x") == 9
+    assert len(calls) == 3
+
+    always = Recorder({"sendMessage": limited})
+    capped = TelegramClient(
+        TOKEN,
+        base_url="https://tg.test",
+        http=httpx.AsyncClient(transport=httpx.MockTransport(always)),
+        max_retries=2,
+    )
+    with pytest.raises(TelegramError):
+        await capped.send_message(1, "x")
+    assert len(always.calls) == 3, "the first try and two retries"
+
+    too_long = Recorder({"sendMessage": limited | {"parameters": {"retry_after": 60}}})
+    with pytest.raises(TelegramError):
+        await client(too_long).send_message(1, "x")
+    assert len(too_long.calls) == 1, "a wait above max_wait_s is not done"
 
 
 async def test_the_client_downloads_with_a_size_cap() -> None:
