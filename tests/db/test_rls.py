@@ -42,6 +42,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workspaces": {"a1"},
         "agent_profiles": {"profile-a"},
         "sessions": {"a1-shared", "a1-alice"},
+        "context_files": {"file:org-a"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -49,6 +50,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workspaces": {"a1", "a2"},
         "agent_profiles": {"profile-a", "profile-a2"},
         "sessions": {"a1-shared", "a2-shared"},
+        "context_files": {"file:org-a", "file:a2"},
     },
     "dave": {
         "orgs": {"org-a"},
@@ -56,6 +58,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workspaces": set(),
         "agent_profiles": {"profile-a"},
         "sessions": set(),
+        "context_files": {"file:org-a"},
     },
     "bob": {
         "orgs": {"org-b"},
@@ -63,6 +66,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workspaces": {"b1"},
         "agent_profiles": {"profile-b"},
         "sessions": {"b1-shared", "b1-bob"},
+        "context_files": {"file:org-b"},
     },
     "stranger": {
         "orgs": set(),
@@ -70,6 +74,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workspaces": set(),
         "agent_profiles": set(),
         "sessions": set(),
+        "context_files": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

@@ -34,6 +34,7 @@ from typing import Any, Final
 
 from sama.gate.service import GateService
 from sama.orchestrator.queue import ClaimedRun, Lease, RunQueue
+from sama.prompt import PromptAssembler
 from sama.runtime.contract import (
     AgentRuntime,
     ApprovalRequired,
@@ -57,17 +58,12 @@ from sama.runtime.contract import (
 log: Final = logging.getLogger("sama.orchestrator")
 
 ConfigBuilder = Callable[[ClaimedRun], Awaitable[RunConfig]]
-"""Builds the ``RunConfig`` of a run. Prompt assembly (M1.11) replaces the default."""
+"""Builds the ``RunConfig`` of a run. The default is ``sama.prompt.PromptAssembler``."""
 RunEndHook = Callable[[str, str], None]
 """Called with ``(org_id, run_id)`` when a run ends and is not paused."""
 
 MAX_FAILURE_CHARS: Final = 2_000
 FLUSH_EVENTS: Final = 50
-
-
-async def profile_config(run: ClaimedRun) -> RunConfig:
-    """The minimal config: the runtime, model, and SOUL of the agent profile."""
-    return RunConfig(runtime=RuntimeKind(run.runtime), model=run.model, soul=run.soul)
 
 
 def default_owner() -> str:
@@ -128,7 +124,7 @@ class Worker:
         runtimes: RuntimeRegistry,
         *,
         owner: str | None = None,
-        config: ConfigBuilder = profile_config,
+        config: ConfigBuilder | None = None,
         gate: GateService | None = None,
         on_run_end: Sequence[RunEndHook] = (),
         heartbeat_s: float | None = None,
@@ -139,7 +135,7 @@ class Worker:
         self.owner = owner or default_owner()
         self._queue = queue
         self._runtimes = runtimes
-        self._config = config
+        self._config = config or PromptAssembler(queue.engine)
         self._gate = gate or GateService(queue.engine)
         self._on_run_end = tuple(on_run_end)
         self._heartbeat_s = heartbeat_s or queue.lease.total_seconds() / 3
@@ -221,7 +217,7 @@ class Worker:
             message = f"the run cannot start: {error}"[:MAX_FAILURE_CHARS]
             await self._fail(run, FailureCode.INVALID_REQUEST, message, Usage())
             return
-        if not await self._queue.dispatch(run, self.owner):
+        if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
         stream = _stream(runtime, run, scope, config, budget)

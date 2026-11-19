@@ -203,6 +203,9 @@ class Session(Base):
         CheckConstraint(
             "(parent_session_id IS NULL) = (lineage IS NULL)", name="lineage_has_parent"
         ),
+        CheckConstraint(
+            "(run_config IS NULL) = (config_fingerprint IS NULL)", name="config_has_fingerprint"
+        ),
         Index(None, "org_id", "workspace_id"),
         Index(None, "owner_user_id"),
     )
@@ -219,6 +222,10 @@ class Session(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
     sandbox_id: Mapped[str | None] = mapped_column(Text)
     """The provider id of the session sandbox (docs/architecture.md, Section 16.2)."""
+    run_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """The frozen ``RunConfig`` of the session, set by the first run (Section 6.1)."""
+    config_fingerprint: Mapped[str | None] = mapped_column(Text)
+    """``RunConfig.fingerprint()`` of ``run_config``."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -580,6 +587,49 @@ class ToolPolicy(Base):
     tool: Mapped[str] = mapped_column(Text, nullable=False)
     """An exact tool name, or a prefix that ends with ``*``."""
     action: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+CONTEXT_FILE_STORED_MAX_CHARS: Final = 100_000
+"""Cap for a stored context file. The prompt gets at most 20,000 characters of it."""
+
+
+class StoredContextFile(Base):
+    """A context file for the prompt of new sessions (docs/architecture.md, Section 6.1).
+
+    No workspace: the file is for the whole org. No profile: the file is for all profiles.
+    """
+
+    __tablename__ = "context_files"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "org_id", "workspace_id", "agent_profile_id", "path", postgresql_nulls_not_distinct=True
+        ),
+        CheckConstraint(
+            "length(path) BETWEEN 1 AND 200 AND path !~ '[\"<>\\r\\n]'", name="path_text"
+        ),
+        CheckConstraint(
+            f"length(content) <= {CONTEXT_FILE_STORED_MAX_CHARS}", name="content_length"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    agent_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    """The name in the prompt, for example ``AGENTS.md``."""
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()

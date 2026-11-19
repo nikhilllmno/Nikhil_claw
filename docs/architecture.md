@@ -258,7 +258,7 @@ flowchart LR
 3. **Queue.** The API stores the message and queues a run.
 4. **Prepare.** The orchestrator builds the frozen `RunConfig` for a new session: SOUL,
    context files, memory snapshot, skill index, toolsets, runtime, and model. For an open
-   session it reuses the stored `RunConfig`.
+   session it reuses the stored `RunConfig` (Section 6.1, M1.11).
 5. **Provision.** The orchestrator resumes the session sandbox (or creates one from the sama
    E2B template) and issues a run token. The token is bound to `org_id`, `user_id`,
    `session_id`, and `run_id`, and expires after the run.
@@ -359,8 +359,9 @@ approval id. No worker can continue such a run, so the upgrade ends each one as 
 session and does not create a new one (Section 16.2).
 
 **Not in M1.10.** Per-org concurrency limits and rate limits come with the API (M1.12). The
-prompt assembly (M1.11) replaces the minimal `RunConfig` (runtime, model, SOUL). The clarify
-broker stays in memory (Section 16.7).
+clarify broker stays in memory (Section 16.7). Since M1.11, the worker gets the `RunConfig`
+from the prompt assembler (Section 6.1). The worker stores the config fingerprint on the run
+when it dispatches the run.
 
 ---
 
@@ -408,8 +409,9 @@ RunEvent = (
   runtime state from the previous run. `ResumeRequest` holds the approval id, the decision
   (`approve` or `reject`), and the runtime state from `ApprovalRequired`.
 - `RunConfig` is frozen per session. It holds only what the model sees and what the cache
-  needs: runtime, model, SOUL, context files, memory snapshot, skill index, tool schemas, and
-  MCP server configs. It has `fingerprint()` (SHA-256 of canonical JSON, the same in every
+  needs: runtime, model, the sama system text, SOUL, context files, memory snapshot, skill
+  index, the environment text, tool schemas, and MCP server configs. A context file path
+  cannot have `"`, `<`, `>`, or a line break, so it cannot close its tag. It has `fingerprint()` (SHA-256 of canonical JSON, the same in every
   process) and `render_prefix()` (the tiers of Section 6.1). Remote MCP configs hide their
   bearer token in `repr`. The token changes per run, so it is not in the fingerprint.
   JSON objects in the contract (tool input schemas and tool call arguments) are read-only
@@ -609,6 +611,41 @@ Rules:
   message, not as a prompt change.
 - Context files are capped (20,000 characters each, as in Hermes) and scanned for prompt
   injection patterns before use.
+
+**Code (M1.11).** The package `src/sama/prompt/` builds the `RunConfig`.
+
+- `render_prefix()` puts the parts in this order: the sama system text (`system`), the
+  SOUL, the context files, the skill index, the memory snapshot, and the environment text
+  (`environment`).
+- `PromptAssembler(engine)` is the `ConfigBuilder` of the worker. It locks the session row.
+  If `sessions.run_config` is set, it returns that config. If not, it builds the config and
+  stores it with its fingerprint in `sessions.run_config` and `sessions.config_fingerprint`
+  (migration `0006`). So all runs of a session use the same prefix, also when two runs start
+  at the same time. A change to the profile SOUL, model, or runtime, or to a context file,
+  applies from the next session.
+- `RunQueue.enqueue` takes the runtime from the frozen config of the session, if there is
+  one. So a session does not change its runtime. The assembler fails a run whose runtime is
+  not the session runtime.
+- The environment text has the session start time in UTC (`sessions.created_at`) and the
+  audience. The time does not change during the session, so the prefix stays stable.
+- Context files come from the table `context_files`. A file has no workspace (the whole org)
+  or one workspace, and no profile (all profiles) or one profile. The order is: org files,
+  workspace files, profile files, profile files of the workspace, and by path in each group.
+  The prompt gets at most 20 files (`MAX_CONTEXT_FILES`). The table stores at most 100,000
+  characters per file.
+- `sama.prompt.scan` checks the path and the full text for these patterns: instructions that
+  override earlier instructions, a new identity, text that hides things from the user,
+  instructions in HTML comments, invisible Unicode characters (zero-width, bidi, and tag
+  characters), commands that send secrets out (`curl` or `wget` with a key variable, `cat` of
+  `.env` or `~/.ssh`), and fake role markers. If a pattern matches, the prompt gets a note in
+  place of the file. Sama logs a warning and writes the audit action `context_file.blocked`
+  with the finding ids. The scan is a filter for common attacks. It is not a full defence, so
+  the system text also tells the model that file text is data.
+- A file longer than 20,000 characters keeps its head (70%) and its tail (30%). A marker
+  `[... N characters cut ...]` replaces the middle.
+- Not in M1.11: channel formatting hints (M1.13), `AGENTS.md` files from cloned repos in the
+  sandbox (M1.16), pinned skills, the skill index, the memory snapshot, and the user profile
+  block (later milestones). The `RunConfig` fields for them exist, and they are empty.
 
 ### 6.2 Context management
 
@@ -1663,7 +1700,7 @@ migrated schema.
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
-| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`) |
+| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content` |
 | `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
@@ -1674,6 +1711,7 @@ migrated schema.
 | `session_todos` | The task list of a session, one row per session (migration `0003`, Section 16.7) |
 | `approvals` | One row per tool call that asks a human (migration `0004`, Section 16.1) |
 | `tool_policies` | Tool gate rules per org, profile, and user (migration `0004`, Section 16.1) |
+| `context_files` | Context files per org, workspace, and profile (migration `0006`, Section 6.1) |
 
 Rules:
 

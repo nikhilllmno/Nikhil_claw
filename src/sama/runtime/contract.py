@@ -148,8 +148,12 @@ CONTEXT_FILE_MAX_CHARS: Final = 20_000
 """Cap for one context file, as in Hermes (docs/architecture.md, Section 6.1)."""
 
 
+CONTEXT_FILE_PATH_PATTERN: Final = r'^[^"<>\r\n]{1,200}$'
+"""A path is the attribute of a ``<context_file>`` tag, so it cannot close the tag."""
+
+
 class ContextFile(_Frozen):
-    path: str = Field(min_length=1)
+    path: str = Field(pattern=CONTEXT_FILE_PATH_PATTERN)
     content: str = Field(max_length=CONTEXT_FILE_MAX_CHARS)
 
 
@@ -183,10 +187,14 @@ class RunConfig(_Frozen):
 
     runtime: RuntimeKind
     model: str = Field(min_length=1)
+    system: str = ""
+    """Sama identity and tool-use guidance (stable tier)."""
     soul: str = ""
     context_files: tuple[ContextFile, ...] = ()
     skill_index: tuple[SkillIndexEntry, ...] = ()
     memory_snapshot: str = ""
+    environment: str = ""
+    """Facts of the session start, for example the date (volatile tier)."""
     tool_schemas: tuple[ToolSchema, ...] = ()
     mcp_servers: tuple[McpServerConfig, ...] = ()
 
@@ -216,6 +224,8 @@ class RunConfig(_Frozen):
         Empty parts are left out. The output is deterministic for the same config.
         """
         parts: list[str] = []
+        if self.system.strip():
+            parts.append(self.system.strip())
         if self.soul.strip():
             parts.append(self.soul.strip())
         for f in self.context_files:
@@ -225,6 +235,8 @@ class RunConfig(_Frozen):
             parts.append(f"<skills>\n{lines}\n</skills>")
         if self.memory_snapshot.strip():
             parts.append(f"<memory>\n{self.memory_snapshot.strip()}\n</memory>")
+        if self.environment.strip():
+            parts.append(f"<environment>\n{self.environment.strip()}\n</environment>")
         return "\n\n".join(parts)
 
 

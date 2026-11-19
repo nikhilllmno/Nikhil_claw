@@ -147,13 +147,24 @@ def test_context_file_cap() -> None:
         ContextFile(path="a", content="x" * (CONTEXT_FILE_MAX_CHARS + 1))
 
 
+@pytest.mark.parametrize("path", ["", 'a"b', "a>b", "<a", "a\nb", "x" * 201])
+def test_a_context_file_path_cannot_close_its_tag(path: str) -> None:
+    with pytest.raises(ValidationError):
+        ContextFile(path=path, content="x")
+
+
 def test_render_prefix_orders_the_tiers() -> None:
-    prefix = make_config().render_prefix()
+    config = make_config().model_copy(
+        update={"system": "You are Sama.", "environment": "Session start: today."}
+    )
+    prefix = config.render_prefix()
     positions = [
+        prefix.index("You are Sama."),
         prefix.index("You help."),
         prefix.index('<context_file path="AGENTS.md">'),
         prefix.index("- deploy: Deploy to Fly.io."),
         prefix.index("<memory>\nThe user is in IST.\n</memory>"),
+        prefix.index("<environment>\nSession start: today.\n</environment>"),
     ]
     assert positions == sorted(positions)
     assert "web_search" not in prefix  # tools go through the SDK, not the text
