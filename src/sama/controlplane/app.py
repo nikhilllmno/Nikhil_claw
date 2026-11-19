@@ -2,13 +2,14 @@
 
 One process holds the HTTP API, the sama MCP tool server, the model proxy, the run worker, the
 monitor, and, when ``SAMA_VAULT_KEY`` is set, the vault and the integrations with the Telegram
-hub (Section 11.6). They share one database engine.
+and Slack hubs (Section 11.6). They share one database engine.
 The clarify broker is in memory, so the API that answers a question and the tool server that
 asks it must be in the same process.
 
 Paths:
 
-- ``/``: the API and the web page (Section 11.4), and ``/telegram/<integration id>/webhook``.
+- ``/``: the API and the web page (Section 11.4), ``/telegram/<integration id>/webhook``, and
+  ``/slack/<integration id>/{events,interactions,commands}``.
 - ``/tools``: the tool server. The sandbox runner uses ``/tools/mcp`` and ``/tools/gate``.
 - ``/model``: the model proxy. The runner uses ``/model/anthropic`` and ``/model/openai``.
 """
@@ -20,6 +21,7 @@ import contextlib
 import logging
 import os
 import signal
+import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -36,6 +38,7 @@ from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
 from sama.integrations.hub import TelegramHub
 from sama.integrations.service import Integrations
+from sama.integrations.slack_hub import SlackHub
 from sama.modelproxy.app import ModelProxy, ProxySettings
 from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import PostgresUsageStore
@@ -190,11 +193,18 @@ def build(
         keys=keys,
     )
     hub = TelegramHub(engine, vault, keys=keys, gate=gate) if vault is not None else None
+    slack = SlackHub(engine, vault, gate=gate) if vault is not None else None
+
+    def forget(integration_id: uuid.UUID) -> None:
+        for cache in (hub, slack):
+            if cache is not None:
+                cache.forget(integration_id)
+
     integrations = Integrations(
         engine,
         vault,
         public_url=settings.public_url,
-        on_change=hub.forget if hub is not None else None,
+        on_change=forget if vault is not None else None,
     )
     api = SamaApi(
         engine,
@@ -216,6 +226,8 @@ def build(
 
     if hub is not None:
         api_app.include_router(hub.router())
+    if slack is not None:
+        api_app.include_router(slack.router())
 
     stop = asyncio.Event()
 
@@ -231,6 +243,8 @@ def build(
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
             if hub is not None:
                 stack.push_async_callback(hub.aclose)
+            if slack is not None:
+                stack.push_async_callback(slack.aclose)
             loops = _monitor(settings, engine, stack)
             if vault is not None:
                 # The redactor must know every vault value before the first run, request,

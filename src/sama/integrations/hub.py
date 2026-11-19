@@ -21,7 +21,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Protocol
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import SecretStr
@@ -59,7 +59,62 @@ class _Bot:
             await self.transcriber.aclose()
 
 
-class TelegramHub:
+class _Entry(Protocol):
+    """A cached gateway with its clients."""
+
+    @property
+    def gateway(self) -> _Gateway: ...
+
+    async def aclose(self) -> None: ...
+
+
+class _Gateway(Protocol):
+    async def drain(self) -> None: ...
+
+
+class GatewayCache[E: _Entry]:
+    """The gateways of the integrations of one kind, built on first use. A gateway that is
+    dropped ends its open work in the background, then closes."""
+
+    def __init__(self) -> None:
+        self._bots: dict[uuid.UUID, E] = {}
+        self._lock = asyncio.Lock()
+        self._retiring: set[asyncio.Task[None]] = set()
+
+    def forget(self, integration_id: uuid.UUID) -> None:
+        """Drops the gateway of an integration that changed or went. Its open work ends in
+        the background."""
+        bot = self._bots.pop(integration_id, None)
+        if bot is None:
+            return
+        task = asyncio.create_task(self._close_later(bot))
+        self._retiring.add(task)
+        task.add_done_callback(self._retiring.discard)
+
+    async def _close_later(self, bot: E) -> None:
+        """Lets the runs that the old gateway follows end, then closes it."""
+        try:
+            await bot.gateway.drain()
+        finally:
+            await bot.aclose()
+
+    async def drain(self) -> None:
+        """Waits for the background work of all gateways (for tests)."""
+        for bot in list(self._bots.values()):
+            await bot.gateway.drain()
+        while self._retiring:
+            await asyncio.gather(*list(self._retiring), return_exceptions=True)
+
+    async def aclose(self) -> None:
+        for task in list(self._retiring):
+            task.cancel()
+        await asyncio.gather(*list(self._retiring), return_exceptions=True)
+        bots, self._bots = list(self._bots.values()), {}
+        for bot in bots:
+            await bot.aclose()
+
+
+class TelegramHub(GatewayCache[_Bot]):
     def __init__(
         self,
         engine: AsyncEngine,
@@ -74,6 +129,7 @@ class TelegramHub:
     ) -> None:
         """``keys`` gives the OpenAI key of an org for voice notes: the vault entry of the
         org, then the default key of the process. Without a key voice notes are off."""
+        super().__init__()
         self._engine = engine
         self._vault = vault
         self._keys = keys
@@ -84,9 +140,6 @@ class TelegramHub:
         self._gate = gate or GateService(engine)
         self._lockout = Lockout()
         self._followers: set[object] = set()
-        self._bots: dict[uuid.UUID, _Bot] = {}
-        self._lock = asyncio.Lock()
-        self._retiring: set[asyncio.Task[None]] = set()
 
     def router(self) -> APIRouter:
         router = APIRouter()
@@ -179,35 +232,3 @@ class TelegramHub:
             followers=self._followers,
         )
         return _Bot(gateway, client, transcriber, stored)
-
-    def forget(self, integration_id: uuid.UUID) -> None:
-        """Drops the gateway of an integration that changed or went. Its open work ends in
-        the background."""
-        bot = self._bots.pop(integration_id, None)
-        if bot is None:
-            return
-        task = asyncio.create_task(self._close_later(bot))
-        self._retiring.add(task)
-        task.add_done_callback(self._retiring.discard)
-
-    async def _close_later(self, bot: _Bot) -> None:
-        """Lets the runs that the old gateway follows end, then closes it."""
-        try:
-            await bot.gateway.drain()
-        finally:
-            await bot.aclose()
-
-    async def drain(self) -> None:
-        """Waits for the background work of all gateways (for tests)."""
-        for bot in list(self._bots.values()):
-            await bot.gateway.drain()
-        while self._retiring:
-            await asyncio.gather(*list(self._retiring), return_exceptions=True)
-
-    async def aclose(self) -> None:
-        for task in list(self._retiring):
-            task.cancel()
-        await asyncio.gather(*list(self._retiring), return_exceptions=True)
-        bots, self._bots = list(self._bots.values()), {}
-        for bot in bots:
-            await bot.aclose()

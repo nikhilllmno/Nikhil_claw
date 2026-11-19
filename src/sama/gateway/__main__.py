@@ -1,14 +1,16 @@
-"""Starts the Telegram gateway: ``python -m sama.gateway`` (docs/architecture.md, Sections 11.5
+"""Starts the chat gateway: ``python -m sama.gateway`` (docs/architecture.md, Sections 11.5
 and 11.6).
 
-The gateway takes the updates of the Telegram bots that the orgs connected as integrations, at
-``POST /telegram/<integration id>/webhook``. ``python -m sama.controlplane`` serves the same
-routes; run this process only when the API runs on its own (``python -m sama.api``).
+The gateway takes the updates of the Telegram bots and the requests of the Slack apps that the
+orgs connected as integrations, at ``POST /telegram/<integration id>/webhook`` and
+``POST /slack/<integration id>/{events,interactions,commands}``. ``python -m sama.controlplane``
+serves the same routes; run this process only when the API runs on its own
+(``python -m sama.api``).
 
 Environment:
 
 - ``SAMA_DATABASE_URL``: the control plane database.
-- ``SAMA_VAULT_KEY``: the vault key. The vault keeps the bot tokens.
+- ``SAMA_VAULT_KEY``: the vault key. The vault keeps the bot tokens and the signing secrets.
 - ``OPENAI_API_KEY``: optional. The default key for voice notes. An org key in the vault comes
   first.
 
@@ -28,6 +30,7 @@ from pydantic import SecretStr
 
 from sama.db.engine import create_engine
 from sama.integrations.hub import TelegramHub
+from sama.integrations.slack_hub import SlackHub
 from sama.observability.logs import configure_logging
 from sama.tools.server import quiet_dependency_logs
 from sama.vault.crypto import VaultKey
@@ -53,6 +56,7 @@ def build_app() -> FastAPI:
         vault, {SecretName.OPENAI_API_KEY: SecretStr(openai_key) if openai_key else None}
     )
     hub = TelegramHub(engine, vault, keys=keys)
+    slack = SlackHub(engine, vault)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -60,11 +64,13 @@ def build_app() -> FastAPI:
         try:
             yield
         finally:
+            await slack.aclose()
             await hub.aclose()
             await engine.dispose()
 
-    app = FastAPI(title="sama Telegram gateway", lifespan=lifespan)
+    app = FastAPI(title="sama chat gateway", lifespan=lifespan)
     app.include_router(hub.router())
+    app.include_router(slack.router())
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -74,7 +80,7 @@ def build_app() -> FastAPI:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="The sama Telegram gateway.")
+    parser = argparse.ArgumentParser(description="The sama chat gateway (Telegram and Slack).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()

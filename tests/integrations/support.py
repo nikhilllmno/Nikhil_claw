@@ -1,4 +1,4 @@
-"""Fakes and helpers for the tests of the integrations and the Telegram gateway."""
+"""Fakes and helpers for the tests of the integrations and the chat gateways."""
 
 from __future__ import annotations
 
@@ -13,11 +13,19 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import Integration
+from sama.gateway.slack_client import SlackClient
 from sama.gateway.telegram_client import TelegramClient
+from sama.integrations.service import secret_hash
 from tests.orchestrator.conftest import Tenant
 
 BOT_ID = 999
 TOKEN = f"{BOT_ID}:" + "a" * 35
+
+TEAM = "T0SAMA"
+BOT_USER = "UBOTSAMA"
+APP_ID = "A0SAMA"
+SLACK_TOKEN = "xoxb-" + "1" * 12 + "-" + "b" * 24
+SIGNING = "5" * 32
 
 
 class FakeTelegram:
@@ -114,4 +122,114 @@ async def add_bot(
             )
         )
     tenant.ids["bot"] = integration_id
+    return integration_id
+
+
+class FakeSlack:
+    """The Slack Web API: it records calls and gives each posted message a new ``ts``.
+
+    ``teams`` maps a bot token to the answer of ``auth.test``. ``failing`` holds the methods
+    that fail. ``limited`` holds the methods that answer ``429`` once.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.tokens: list[tuple[str, str]] = []
+        self.messages: dict[str, tuple[str, str]] = {}
+        self.teams: dict[str, dict[str, Any]] = {
+            SLACK_TOKEN: {
+                "team_id": TEAM,
+                "team": "Sama HQ",
+                "user_id": BOT_USER,
+                "bot_id": "B0SAMA",
+            }
+        }
+        self.failing: set[str] = set()
+        self.limited: set[str] = set()
+        self._ts = itertools.count(1)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        body = json.loads(request.content or b"{}")
+        self.calls.append((method, body))
+        self.tokens.append((token, method))
+        if method in self.limited:
+            self.limited.discard(method)
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        if method in self.failing:
+            return httpx.Response(200, json={"ok": False, "error": "channel_not_found"})
+        if method == "auth.test":
+            me = self.teams.get(token)
+            if me is None:
+                return httpx.Response(200, json={"ok": False, "error": "invalid_auth"})
+            return httpx.Response(200, json={"ok": True, **me})
+        if method == "bots.info":
+            return httpx.Response(200, json={"ok": True, "bot": {"app_id": APP_ID}})
+        if method == "chat.postMessage":
+            ts = f"1700000000.{next(self._ts):06d}"
+            self.messages[ts] = (body["channel"], body["text"])
+            return httpx.Response(200, json={"ok": True, "ts": ts, "channel": body["channel"]})
+        if method == "chat.update" and body["ts"] in self.messages:
+            self.messages[body["ts"]] = (body["channel"], body["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    def client(self, token: SecretStr) -> SlackClient:
+        """A client factory for ``Integrations`` and ``SlackHub``."""
+        return SlackClient(
+            token,
+            base_url="https://slack.test/api",
+            http=httpx.AsyncClient(transport=httpx.MockTransport(self)),
+        )
+
+    def method_calls(self, method: str) -> list[dict[str, Any]]:
+        return [body for name, body in self.calls if name == method]
+
+    def posted(self, channel: str | None = None) -> list[dict[str, Any]]:
+        return [
+            body
+            for body in self.method_calls("chat.postMessage")
+            if channel in (None, body["channel"])
+        ]
+
+    def texts(self, channel: str | None = None) -> list[str]:
+        return [body["text"] for body in self.posted(channel)]
+
+    def whispers(self, channel: str | None = None) -> list[str]:
+        return [
+            body["text"]
+            for body in self.method_calls("chat.postEphemeral")
+            if channel in (None, body["channel"])
+        ]
+
+    def shown(self, channel: str) -> list[str]:
+        """The text of each message in the channel, after the edits."""
+        return [text for place, text in self.messages.values() if place == channel]
+
+
+async def add_slack(
+    engine: AsyncEngine,
+    tenant: Tenant,
+    *,
+    status: str = "active",
+    team_id: str | None = TEAM,
+    signing: str | None = SIGNING,
+) -> uuid.UUID:
+    """Connects a Slack app to the org of ``tenant`` without the Web API. The id goes to
+    ``tenant.ids["slack"]``."""
+    integration_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Integration).values(
+                id=integration_id,
+                org_id=tenant.org,
+                kind="slack",
+                status=status,
+                external_id=team_id,
+                name="Sama HQ",
+                settings={"bot_user_id": BOT_USER, "bot_id": "B0SAMA", "app_id": APP_ID},
+                secret_hash=None if signing is None else secret_hash(signing),
+            )
+        )
+    tenant.ids["slack"] = integration_id
     return integration_id

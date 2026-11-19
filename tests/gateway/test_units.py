@@ -20,7 +20,8 @@ from sama.gateway.pairing import (
     new_code,
     normalize,
 )
-from sama.gateway.telegram import SPLIT_AT, _Outbox, _Reply, _Unlinked, split_point
+from sama.gateway.sessions import SPLIT_AT, Reply, split_point
+from sama.gateway.telegram import _Outbox, _Unlinked
 from sama.gateway.telegram_client import TelegramClient, TelegramError, bot_id
 from sama.gateway.transcribe import OpenAITranscriber, TranscribeError
 
@@ -238,7 +239,7 @@ async def test_the_outbox_checks_the_link_before_each_call() -> None:
         return link["ok"]
 
     outbox = _Outbox(client(recorder), 5, allowed)
-    reply = _Reply(outbox, None, interval_s=1000)
+    reply = Reply(outbox, None, interval_s=1000)
     await reply.add("first")  # the first text shows at once
     await reply.add(" and buffered")  # waits for the edit interval
     assert [method for method, _ in recorder.calls] == ["sendMessage"]

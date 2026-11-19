@@ -165,7 +165,7 @@ Five rules shape the design:
 | D8 | **Postgres is the job queue** (`FOR UPDATE SKIP LOCKED` with leases) for runs, cron fires, workflow steps, and deliveries. No separate workflow engine in v1. | Fewer moving parts. vorflux made the same choice. The queue sits behind an interface. |
 | D9 | The **prompt prefix is frozen per session**: SOUL, context files, tool list, memory snapshot, skill index. New memory and skills apply from the next session. A short note on the next user message tells the agent about new skills. | Hermes rule. It keeps prompt caching valid on both SDKs and makes runs reproducible (`RunConfig.fingerprint()`). |
 | D10 | **Connectors use one model for all kinds**: Composio toolkits, remote MCP servers, hosted stdio MCP servers, databases, HTTP APIs, and plugins. Connections are per user or per workspace, with credentials in the sama vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
-| D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Bolt, Events API), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
+| D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Events API over HTTP, Web API with `httpx`), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
 | D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless a human approved a pre-approval for that tool in that job version. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
 | D14 | **Self-improvement writes are versioned data.** Memory, skills, cron jobs, workflows, and SOUL changes are rows with history and provenance. Changes to sama's own code are pull requests that a human merges. | The agent can learn and change its stack, but every change can be reviewed and reverted. |
@@ -1073,7 +1073,7 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 | Channel | Transport | Notes |
 |---|---|---|
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
-| Slack | Slack Bolt for Python, Events API over HTTP, interactive components | One Slack app per org install (OAuth). DMs and mentions. A thread is a session. Approval buttons through Block Kit. |
+| Slack | Events API, interactivity, and the `/sama` command over HTTP. Web API calls with `httpx` (no Bolt: sama needs only six methods and checks the signature itself) | One Slack app per org. An org admin makes the app from a manifest and connects it as an integration (Section 11.6). Direct messages and mentions in linked channels. A thread in a channel is a session. Approval buttons through Block Kit. |
 | Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
 | Chrome extension | WebSocket from the extension to the gateway | Side panel chat bound to the current tab. Also the `my_chrome` browser target (Section 14). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
@@ -1302,8 +1302,8 @@ the person.
 
 ### 11.6 Integrations
 
-An **integration** connects a chat app to an org: now the Telegram bot of the org, and Slack
-next (M3.1). Any org admin connects one from the web page, without the operator. The secrets
+An **integration** connects a chat app to an org: the Telegram bot of the org or the Slack app
+of the org (M3.1). Any org admin connects one from the web page, without the operator. The secrets
 of an integration are in the vault (Section 16.3). `SAMA_VAULT_KEY` and `SAMA_PUBLIC_URL` turn
 integrations on. Without them the routes answer `409`.
 
@@ -1313,9 +1313,9 @@ integrations on. Without them the routes answer `409`.
 |---|---|
 | `org_id`, `kind` | `telegram` or `slack`. One integration of each kind per org (unique). |
 | `status` | `pending`, `active`, or `failed`. Only an `active` integration makes pairing codes. |
-| `external_id`, `name` | The bot id and username (Telegram). One bot belongs to one org (unique per kind). |
-| `secret_hash` | The SHA-256 digest of the webhook secret, in hex. The row has no clear text secret. |
-| `last_error`, `created_by_user_id`, `settings` | The last connect error, the admin, and options. |
+| `external_id`, `name` | The bot id and username (Telegram), or the team id and name of the Slack workspace (Slack). One bot or Slack workspace belongs to one org (unique per kind). A `pending` Slack row has no `external_id`. |
+| `secret_hash` | The SHA-256 digest of the webhook secret (Telegram) or of the signing secret (Slack), in hex. The row has no clear text secret. |
+| `last_error`, `created_by_user_id`, `settings` | The last connect error, the admin, and options. A Slack row keeps `bot_user_id`, `bot_id`, and `app_id` in `settings`. |
 
 RLS: every member of the org reads the rows. Only the control plane writes them.
 `channel_identities`, `channel_groups`, and `pairing_codes` refer to the integration with a
@@ -1328,7 +1328,10 @@ again with the bot of their org.
 |---|---|---|
 | `GET /orgs/{org_id}/integrations` | A member of the org | Lists the integrations, without secrets. |
 | `POST /orgs/{org_id}/integrations/telegram` with `bot_token` | An org owner or admin | Connects or replaces the bot of the org. |
+| `POST /orgs/{org_id}/integrations/slack/setup` | An org owner or admin | Makes the `pending` Slack row (or keeps the row) and returns its request URLs, the app manifest, and a link that makes the app from the manifest. |
+| `POST /orgs/{org_id}/integrations/slack` with `bot_token`, `signing_secret` | An org owner or admin | Connects the Slack app of the row. |
 | `DELETE /orgs/{org_id}/integrations/{kind}` | An org owner or admin | Disconnects the integration. |
+| `POST /channels/{channel}/pairing-codes`, `GET /channels/{channel}/identities`, `DELETE /channels/{channel}/identities/{id}` | A user of the workspace | Pairing for `telegram` or `slack` (Section 11.3). The answer has `link` and `command`: for Slack, a link that opens the app in Slack and `/sama pair CODE`. |
 
 A user who is not a member gets `404`. A member who is not an admin gets `403`.
 
@@ -1370,8 +1373,70 @@ makes a new secret, so a gateway with an old digest is built again. The process 
 integration also drops the gateway at once. An old gateway ends its open work in the background.
 All gateways share one pairing lockout and one limit of 200 followed runs.
 
-**Not in this step.** Slack (M3.1), integrations for each workspace, more than one bot of a kind
-per org, and a check that the webhook still works after the connect.
+**Connect Slack.** A Slack app needs the request URLs of sama before Slack installs it, so the
+connect has two steps:
+
+1. the admin clicks "Start Slack setup". `setup_slack` makes a `pending` row (audit
+   `integration.created`) and returns `<SAMA_PUBLIC_URL>/slack/<integration id>/events`,
+   `.../interactions`, and `.../commands`, and a manifest with these URLs, the bot scopes
+   (`app_mentions:read`, `chat:write`, `commands`, `im:history`, `im:read`, `im:write`,
+   `users:read`), the events `app_mention` and `message.im`, and the `/sama` command. The link
+   opens `https://api.slack.com/apps?new_app=1&manifest_json=...`. The admin picks the Slack
+   workspace, makes the app, and installs it. When Slack checks the events URL, the `pending`
+   row answers the `url_verification` challenge;
+2. the admin pastes the bot token (`xoxb-`) and the signing secret. `connect_slack` checks their
+   shape and asks Slack for the workspace and the bot of the token (`auth.test`, then
+   `bots.info` for the app id). In one transaction it refuses (`409`) a Slack workspace that
+   another org connected and a connect without a setup, deletes the links and codes of the row
+   when the token is of another Slack workspace, sets the row `active` with the team, the
+   digest of the signing secret, and `settings`, stores both secrets in the vault
+   (`slack_bot_token`, `slack_signing_secret`), and writes `integration.connected`. The row keeps
+   its id, because the URLs in the Slack app hold it. When the new bot token is not the old
+   one, sama then revokes the old token (`auth.revoke`, best effort).
+
+A connect holds the advisory locks of the org and kind and of the Slack workspace. A disconnect
+deletes the row, its links, and the vault entries, and then revokes the bot token
+(`auth.revoke`, best effort).
+
+**Slack hub.** `sama.integrations.SlackHub` serves the three request URLs. For each request it
+reads the row. An unknown id gets `401`. A row that is not `active` answers only the
+`url_verification` challenge. For an `active` row the hub builds one `SlackGateway` with the
+secrets from the vault (not from the cache), and keeps it while `updated_at` of the row stays
+the same. A signing secret with a digest that is not `secret_hash` gets `503`. The hub checks
+`X-Slack-Signature` (HMAC-SHA256 of `v0:<timestamp>:<raw body>`) in constant time, and refuses a
+timestamp more than 5 minutes from now (`401`). The hub reads the body in chunks and stops at
+1 MB (`413`), also when the request has no `Content-Length`. A request
+of another Slack workspace than the row is dropped. Events and button clicks run in the
+background, so Slack gets its answer at once. A repeated event (same integration and
+`event_id` in the last 10 minutes) is dropped. The hub keeps this log for all its gateways, so a
+gateway that is built again after a reconnect also drops a repeat. A `/sama` command gets an
+answer that only the sender sees.
+
+**Slack gateway.** `sama.gateway.slack.SlackGateway`:
+
+- a direct message with the app is a `private` session of the linked user. An unknown user
+  gets a pairing prompt. A pairing code in a direct message links the Slack account;
+- in a channel the app answers only a mention. A linked channel (`/sama pair CODE` with a group
+  code, from a linked user) maps each thread to a `shared` session of the channel workspace,
+  and the app answers in the thread. An unknown user or a channel that is not linked gets a
+  message that only the sender sees;
+- `/sama new` (direct messages; it takes the lock of the direct message, so a message at the
+  same time cannot bind another session), `/sama stop` (the direct message, or all threads of the
+  channel), `/sama pair CODE`, and `/sama help`;
+- the gateway escapes `&`, `<`, and `>` in all text that it sends, so the text of a model
+  cannot mention people or channels. Approval cards use `plain_text` blocks;
+- before each send it checks the link again, as the Telegram gateway does (Section 11.3).
+
+The Telegram and Slack gateways share the session, follow, and approval code
+(`sama.gateway.sessions`).
+
+**Limits.** Slack has no voice notes and no `/model` command. In a channel thread, each message
+to the app needs a mention. The pairing lockout and the limit of 200 followed runs are for each
+hub: the Telegram hub and the Slack hub each have their own.
+
+**Not in this step.** Integrations for each workspace, more than one app of a kind per org,
+Slack OAuth distribution (one app for many Slack workspaces), and a check that the webhook still
+works after the connect.
 
 ---
 
@@ -2303,7 +2368,7 @@ message. A new alert comes only 30 minutes or more after the last alert.
 | Sandboxes | E2B (custom template), Docker for local development |
 | Browser | Browserbase plus Playwright; Chrome extension (TypeScript, MV3) |
 | Connectors | Composio, remote MCP servers, hosted stdio MCP servers (E2B), database drivers (`asyncpg`, `aiomysql`, and others) with `sqlglot`, OpenAPI |
-| Channels | Slack Bolt for Python, Telegram Bot API |
+| Channels | Slack Events API and Web API (`httpx`), Telegram Bot API |
 | Web UI | Next.js on Vercel |
 | Observability | Langfuse, OpenTelemetry |
 

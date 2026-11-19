@@ -118,12 +118,23 @@ class NewPairingCode(_Body):
     workspace_id: uuid.UUID
     agent_profile_id: uuid.UUID
     kind: Literal["user", "group"] = "user"
-    """``user`` links the Telegram account of the user. ``group`` links a group chat."""
+    """``user`` links the chat account of the user. ``group`` links a group chat (Telegram)
+    or a channel (Slack)."""
 
 
 class TelegramConnect(_Body):
     bot_token: SecretStr = Field(min_length=1, max_length=200)
     """The token of the bot from @BotFather."""
+
+
+class SlackConnect(_Body):
+    bot_token: SecretStr = Field(min_length=1, max_length=300)
+    """The bot token of the Slack app (``xoxb-``), from OAuth & Permissions."""
+    signing_secret: SecretStr = Field(min_length=1, max_length=100)
+    """The signing secret of the Slack app, from Basic Information."""
+
+
+Channel = Literal["telegram", "slack"]
 
 
 class Answers(_Body):
@@ -473,10 +484,30 @@ class SamaApi:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             return view.public()
 
+        @app.post("/orgs/{org_id}/integrations/slack/setup")
+        async def setup_slack(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                setup = await self._require_integrations().setup_slack(org_id, grants.user_id)
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return setup.public()
+
+        @app.post("/orgs/{org_id}/integrations/slack", status_code=201)
+        async def connect_slack(
+            principal: Me, org_id: uuid.UUID, body: SlackConnect
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                view = await self._require_integrations().connect_slack(
+                    org_id, grants.user_id, body.bot_token, body.signing_secret
+                )
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return view.public()
+
         @app.delete("/orgs/{org_id}/integrations/{kind}", status_code=204)
-        async def disconnect(
-            principal: Me, org_id: uuid.UUID, kind: Literal["telegram", "slack"]
-        ) -> Response:
+        async def disconnect(principal: Me, org_id: uuid.UUID, kind: Channel) -> Response:
             grants = await self._org_admin(principal, org_id)
             try:
                 gone = await self._require_integrations().disconnect(org_id, kind, grants.user_id)
@@ -486,17 +517,19 @@ class SamaApi:
                 raise _not_found("the org has no such integration")
             return Response(status_code=204)
 
-        @app.post("/channels/telegram/pairing-codes", status_code=201)
-        async def pairing_code(principal: Me, body: NewPairingCode) -> dict[str, Any]:
-            return await self._pairing_code(principal, body)
+        @app.post("/channels/{channel}/pairing-codes", status_code=201)
+        async def pairing_code(
+            principal: Me, channel: Channel, body: NewPairingCode
+        ) -> dict[str, Any]:
+            return await self._pairing_code(principal, channel, body)
 
-        @app.get("/channels/telegram/identities")
-        async def identities(principal: Me) -> list[dict[str, Any]]:
-            return await self._identities(principal)
+        @app.get("/channels/{channel}/identities")
+        async def identities(principal: Me, channel: Channel) -> list[dict[str, Any]]:
+            return await self._identities(principal, channel)
 
-        @app.delete("/channels/telegram/identities/{identity_id}", status_code=204)
-        async def unlink(principal: Me, identity_id: uuid.UUID) -> Response:
-            await self._unlink(principal, identity_id)
+        @app.delete("/channels/{channel}/identities/{identity_id}", status_code=204)
+        async def unlink(principal: Me, channel: Channel, identity_id: uuid.UUID) -> Response:
+            await self._unlink(principal, channel, identity_id)
             return Response(status_code=204)
 
         return app
@@ -776,24 +809,32 @@ class SamaApi:
             )
         return _session_out(row)
 
-    async def _pairing_code(self, principal: Principal, body: NewPairingCode) -> dict[str, Any]:
+    async def _pairing_code(
+        self, principal: Principal, channel: Channel, body: NewPairingCode
+    ) -> dict[str, Any]:
         org_id, user_id = await self._workspace_access(
             principal, body.workspace_id, body.agent_profile_id
         )
         async with self._engine.connect() as connection:
             bot = (
                 await connection.execute(
-                    select(Integration.id, Integration.name).where(
+                    select(
+                        Integration.id,
+                        Integration.name,
+                        Integration.external_id,
+                        Integration.settings,
+                    ).where(
                         Integration.org_id == org_id,
-                        Integration.kind == "telegram",
+                        Integration.kind == channel,
                         Integration.status == "active",
                     )
                 )
             ).one_or_none()
         if bot is None:
+            app_name = "Telegram bot" if channel == "telegram" else "Slack app"
             raise HTTPException(
                 status_code=409,
-                detail="the org has no Telegram bot. An org admin connects one under Integrations.",
+                detail=f"the org has no {app_name}. An org admin connects one under Integrations.",
             )
         try:
             async with self._engine.begin() as connection:
@@ -802,22 +843,35 @@ class SamaApi:
                     org_id=org_id,
                     user_id=user_id,
                     integration_id=bot.id,
-                    channel="telegram",
+                    channel=channel,
                     kind=body.kind,
                     workspace_id=body.workspace_id,
                     agent_profile_id=body.agent_profile_id,
                 )
         except PairingError as error:
             raise HTTPException(status_code=429, detail=str(error)) from None
+        if channel == "slack":
+            # The link opens the direct messages with the app. The code goes in by hand.
+            app_id = (bot.settings or {}).get("app_id")
+            link = (
+                f"https://slack.com/app_redirect?app={app_id}&team={bot.external_id}"
+                if app_id
+                else None
+            )
+            command = f"/sama pair {code}"
+        else:
+            # The link opens the bot and sends the code with /start. A group link adds the bot
+            # to a group first.
+            start = "start" if body.kind == "user" else "startgroup"
+            link = f"https://t.me/{bot.name}?{start}={code}"
+            command = f"/pair {code}"
         return {
             "code": code,
             "kind": body.kind,
             "expires_at": expires_at.isoformat(),
             "bot_username": bot.name,
-            # The link opens the bot and sends the code with /start. A group link adds the bot
-            # to a group first.
-            "link": f"https://t.me/{bot.name}?{'start' if body.kind == 'user' else 'startgroup'}"
-            f"={code}",
+            "link": link,
+            "command": command,
         }
 
     def _require_integrations(self) -> Integrations:
@@ -842,8 +896,8 @@ class SamaApi:
             raise HTTPException(status_code=403, detail="only an org owner or admin can do this")
         return grants
 
-    async def _identities(self, principal: Principal) -> list[dict[str, Any]]:
-        """The Telegram accounts that are linked to the user, in all orgs."""
+    async def _identities(self, principal: Principal, channel: Channel) -> list[dict[str, Any]]:
+        """The chat accounts of ``channel`` that are linked to the user, in all orgs."""
         async with as_user(self._engine, principal.auth_user_id) as connection:
             rows = await connection.execute(
                 select(
@@ -854,7 +908,7 @@ class SamaApi:
                     ChannelIdentity.integration_id,
                     ChannelIdentity.created_at,
                 )
-                .where(ChannelIdentity.channel == "telegram")
+                .where(ChannelIdentity.channel == channel)
                 .order_by(ChannelIdentity.created_at)
             )
             return [
@@ -869,7 +923,7 @@ class SamaApi:
                 for row in rows
             ]
 
-    async def _unlink(self, principal: Principal, identity_id: uuid.UUID) -> None:
+    async def _unlink(self, principal: Principal, channel: Channel, identity_id: uuid.UUID) -> None:
         async with as_user(self._engine, principal.auth_user_id) as connection:
             row = (
                 await connection.execute(
@@ -879,7 +933,7 @@ class SamaApi:
                         ChannelIdentity.workspace_id,
                         ChannelIdentity.channel,
                         ChannelIdentity.external_id,
-                    ).where(ChannelIdentity.id == identity_id)
+                    ).where(ChannelIdentity.id == identity_id, ChannelIdentity.channel == channel)
                 )
             ).one_or_none()
         if row is None:

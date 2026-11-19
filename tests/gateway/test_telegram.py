@@ -630,4 +630,4 @@ async def test_updates_of_one_chat_run_one_at_a_time(
     await asyncio.gather(*(gateway.handle_update(message(text)) for text in ("a", "b", "c")))
     assert most == 1
     assert sorted(order) == ["a", "b", "c"]
-    assert gateway._chat_locks == {}, "the lock goes away when no update waits"
+    assert len(gateway._chat_locks) == 0, "the lock goes away when no update waits"
