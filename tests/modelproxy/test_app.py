@@ -33,6 +33,7 @@ from sama.modelproxy.prices import Provider
 from sama.modelproxy.store import CallRecord
 from sama.modelproxy.usage import Endpoint
 from sama.runtime import Budget
+from sama.tenancy.authority import Authority
 from sama.tenancy.run_token import RunTokenSigner
 from sama.vault.crypto import VaultError
 from sama.vault.store import OrgKeys, SecretName
@@ -473,6 +474,32 @@ async def test_the_run_token_budget_refuses_the_next_call(harness: Harness) -> N
     refused = await harness.messages(token=token)
     assert refused.status_code == 402
     assert "max_tokens" in refused.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("problem", ["the run ended", "the user of the run lost access"])
+async def test_a_run_without_authority_is_refused(harness: Harness, problem: str) -> None:
+    assert (await harness.messages()).status_code == 200
+    harness.store.authorities["run-1"] = Authority(problem=problem)
+    refused = await harness.messages()
+    assert refused.status_code == 403
+    assert refused.json()["error"] == {"type": "permission_error", "message": problem}
+    assert len(harness.upstream.requests) == 1
+
+
+async def test_a_lower_live_budget_applies_at_the_next_call(harness: Harness) -> None:
+    token = harness.token(Budget(max_tokens=1_000))
+    assert (await harness.messages(token=token)).status_code == 200  # 110 tokens
+    harness.store.authorities["run-1"] = Authority(max_tokens=100)
+    refused = await harness.messages(token=token)
+    assert refused.status_code == 402
+    assert "max_tokens" in refused.json()["error"]["message"]
+
+
+async def test_a_higher_live_budget_does_not_raise_the_token_budget(harness: Harness) -> None:
+    token = harness.token(Budget(max_tokens=110))
+    harness.store.authorities["run-1"] = Authority(max_tokens=10_000)
+    assert (await harness.messages(token=token)).status_code == 200
+    assert (await harness.messages(token=token)).status_code == 402
 
 
 async def test_the_org_monthly_limit(harness: Harness) -> None:

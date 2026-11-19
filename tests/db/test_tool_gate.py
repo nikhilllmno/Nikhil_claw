@@ -22,6 +22,7 @@ from sama.db.models import (
     Approval,
     AuditEntry,
     Membership,
+    ModelCall,
     Org,
     Run,
     Session,
@@ -329,7 +330,6 @@ async def test_the_token_user_is_the_fallback_for_user_rules(
 async def test_screen_audits_only_a_deny(engine: AsyncEngine, org: Org1) -> None:
     gate = GateService(engine)
     assert (await gate.screen(org.claims(), "mcp__sama__web_search", {})).action == "allow"
-    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "ask"
     assert (await gate.screen(org.claims("night"), "clarify", {})).action == "deny"
     [(action, target, details)] = await audit(engine, org)
     assert (action, target, details["tool"]) == ("tool_gate.screen", None, "clarify")
@@ -604,3 +604,223 @@ async def test_expire_times_out_due_approvals(engine: AsyncEngine, org: Org1) ->
 def test_the_ttl_must_be_positive(engine: AsyncEngine) -> None:
     with pytest.raises(ValueError, match="approval_ttl"):
         GateService(engine, approval_ttl=timedelta(0))
+
+
+# -- live authority (M1.18) ---------------------------------------------------------------------
+
+
+async def approve(gate: GateService, org: Org1, call_id: str = "c1") -> None:
+    await ask(gate, org, call_id)
+    await gate.decide_approval(
+        org_id=org.ids["org"],
+        run_id=org.ids["run"],
+        call_id=call_id,
+        user_id=org.ids["max"],
+        approve=True,
+    )
+
+
+async def reconfirm(gate: GateService, org: Org1, call_id: str = "c1") -> Any:
+    return await gate.reconfirm(org_id=org.ids["org"], run_id=org.ids["run"], call_id=call_id)
+
+
+async def spend(engine: AsyncEngine, org: Org1, *, tokens: int, cost: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(ModelCall).values(
+                call_id=uuid.uuid4(),
+                org_id=org.ids["org"],
+                workspace_id=org.ids["ws"],
+                session_id=org.ids["shared"],
+                run_id=org.ids["run"],
+                provider="anthropic",
+                model="claude-sonnet-5-5",
+                endpoint="messages",
+                status_code=200,
+                input_tokens=tokens,
+                cost_usd=cost,
+                duration_ms=1,
+            )
+        )
+
+
+async def test_screen_without_a_ticket_denies_an_ask_tool(engine: AsyncEngine, org: Org1) -> None:
+    verdict = await GateService(engine).screen(org.claims(), "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.RECORDED)
+    assert "approval" in verdict.reason
+    [(action, _, details)] = await audit(engine, org)
+    assert (action, details["tool"]) == ("tool_gate.screen", "Bash")
+
+
+async def test_an_approved_call_gives_one_ticket(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await approve(gate, org)
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"  # no reconfirm yet
+    verdict = await reconfirm(gate, org)
+    assert verdict.action == "allow"
+    assert (await gate.screen(org.claims(), "Bash", {"command": "rm -rf ~"})).action == "deny"
+    used = await gate.screen(org.claims(), "Bash", ARGS)
+    assert (used.action, used.reason) == ("allow", "the call has an approved ticket")
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"
+    row = await call_row(engine, org, "c1")
+    assert row.status == "finished"
+    # A check of the same call again does not make a new ticket.
+    assert (await gate.check(org.claims(), "c1", "Bash", ARGS)).action == "allow"
+    assert (await reconfirm(gate, org)).action == "allow"
+    assert (await call_row(engine, org, "c1")).status == "finished"
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"
+    actions = [action for action, _, _ in await audit(engine, org)]
+    assert actions.count("tool_gate.ticket") == 1
+    assert actions.count("tool_gate.reconfirm") == 2
+
+
+async def test_a_ticket_is_only_for_its_run(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await approve(gate, org)
+    assert (await reconfirm(gate, org)).action == "allow"
+    other = await gate.screen(org.claims("night"), "Bash", ARGS)
+    assert other.action == "deny"
+    assert (await call_row(engine, org, "c1")).status == "started"
+
+
+async def test_reconfirm_makes_the_row_of_a_runtime_approval(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """The fake runtime and the queue record an approval without a gate check."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Approval).values(
+                org_id=org.ids["org"],
+                session_id=org.ids["shared"],
+                run_id=org.ids["run"],
+                call_id="c9",
+                tool_name="mcp__sama__web_search",
+                arguments={"query": "x"},
+                arguments_digest=arguments_digest({"query": "x"}),
+                status="approved",
+                decided_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+    gate = GateService(engine)
+    assert (await reconfirm(gate, org, "c9")).action == "allow"
+    row = await call_row(engine, org, "c9")
+    assert (row.tool_name, row.arguments, row.decision, row.status) == (
+        "web_search",
+        {"query": "x"},
+        "allow",
+        "started",
+    )
+
+
+async def test_reconfirm_needs_an_approved_call(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    none = await reconfirm(gate, org, "c-none")
+    assert (none.action, none.reason) == ("deny", "the call has no approval")
+    await ask(gate, org)
+    pending = await reconfirm(gate, org)
+    assert (pending.action, pending.reason) == ("deny", "the approval is pending")
+    unknown = await gate.reconfirm(org_id=org.ids["org"], run_id=uuid.uuid4(), call_id="c1")
+    assert (unknown.action, unknown.step) == ("deny", GateStep.AUTHORITY)
+
+
+async def test_a_revoked_tool_is_denied_in_the_session(engine: AsyncEngine, org: Org1) -> None:
+    """The acceptance test of M1.18: a deny rule during a session applies at the next call."""
+    gate = GateService(engine)
+    assert (await gate.check(org.claims(), "c1", "WebFetch", {"url": "u"})).action != "deny"
+    await add_rule(engine, org, "WebFetch", "deny")
+    verdict = await gate.check(org.claims(), "c2", "WebFetch", {"url": "u"})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+
+
+async def test_a_deny_rule_wins_over_an_approval(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await approve(gate, org)
+    await add_rule(engine, org, "Bash", "deny")
+    assert (await gate.check(org.claims(), "c1", "Bash", ARGS)).action == "deny"
+    verdict = await reconfirm(gate, org)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+    row = await call_row(engine, org, "c1")
+    assert (row.decision, row.status) == ("deny", "denied")
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"
+
+
+async def test_a_removed_membership_stops_the_run(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await approve(gate, org)
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(Membership).where(
+                Membership.org_id == org.ids["org"],
+                Membership.user_id == org.ids["mia"],
+                Membership.workspace_id == org.ids["ws"],
+            )
+        )
+    for verdict in (
+        await gate.check(org.claims(), "c2", "Read", {}),
+        await gate.screen(org.claims(), "mcp__sama__web_search", {}),
+        await reconfirm(gate, org),
+    ):
+        assert (verdict.action, verdict.step) == ("deny", GateStep.AUTHORITY)
+        assert verdict.reason == "the user of the run can no longer see the session"
+
+
+async def test_a_cancelled_run_cannot_resume_an_approved_call(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await approve(gate, org)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["run"]).values(status="cancelled")
+        )
+    verdict = await reconfirm(gate, org)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.AUTHORITY)
+
+
+@pytest.mark.parametrize(
+    ("run_budget", "profile_budget", "reason"),
+    [
+        ({"max_tokens": 100}, {}, "the run reached max_tokens"),
+        ({}, {"max_cost_usd": "0.5"}, "the run reached max_cost_usd"),
+        ({"max_tokens": 10_000}, {"max_tokens": 100}, "the run reached max_tokens"),
+    ],
+)
+async def test_a_spent_budget_denies_the_next_tool(
+    engine: AsyncEngine,
+    org: Org1,
+    run_budget: dict[str, Any],
+    profile_budget: dict[str, Any],
+    reason: str,
+) -> None:
+    gate = GateService(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["run"]).values(budget=run_budget)
+        )
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == org.ids["profile"])
+            .values(budget=profile_budget)
+        )
+    assert (await gate.check(org.claims(), "c1", "Read", {})).action == "allow"
+    await spend(engine, org, tokens=100, cost="0.5")
+    verdict = await gate.check(org.claims(), "c2", "Read", {})
+    assert (verdict.action, verdict.step, verdict.reason) == ("deny", GateStep.AUTHORITY, reason)
+
+
+async def test_a_private_run_without_a_user_uses_the_owner(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["secret-run"]).values(triggered_by_user_id=None)
+        )
+    claims = org.claims("secret-run", session_id=str(org.ids["secret"]))
+    assert (await gate.check(claims, "c1", "Read", {})).action == "allow"
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(Membership).where(
+                Membership.user_id == org.ids["mia"], Membership.workspace_id == org.ids["ws"]
+            )
+        )
+    assert (await gate.check(claims, "c2", "Read", {})).step is GateStep.AUTHORITY

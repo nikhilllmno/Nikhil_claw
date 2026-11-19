@@ -29,15 +29,16 @@ import socket
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from sama.gate.service import GateService
 from sama.observability.logs import log_context
-from sama.orchestrator.queue import ClaimedRun, Lease, RunQueue
+from sama.orchestrator.queue import ClaimedRun, Lease, Resume, RunQueue
 from sama.prompt import PromptAssembler
 from sama.runtime.contract import (
     AgentRuntime,
+    ApprovalDecision,
     ApprovalRequired,
     Audience,
     Budget,
@@ -233,6 +234,7 @@ class Worker:
         if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
+        run = await self._reconfirm(run)
         stream = _stream(runtime, run, scope, config, budget)
         watch = _Watch()
         writer = _Writer(self._queue, run, self.owner, watch, self._flush_s)
@@ -262,6 +264,31 @@ class Worker:
             log.warning("the worker lost the lease; it writes no result run=%s", run.run_id)
             return
         await self._finish(run, terminal, usage, watch)
+
+    async def _reconfirm(self, run: ClaimedRun) -> ClaimedRun:
+        """Checks an approved call again before the resume (Section 5.1). Authority is live,
+        so a newer deny rule, a lost membership, or a spent budget turns the approve into a
+        reject. A failed check also rejects."""
+        resume = run.resume
+        if resume is None or resume.decision is not ApprovalDecision.APPROVE:
+            return run
+        try:
+            verdict = await self._gate.reconfirm(
+                org_id=run.org_id, run_id=run.run_id, call_id=resume.approval_id
+            )
+            action, reason = verdict.action, verdict.reason
+        except Exception as error:
+            log.warning("the check before the resume failed run=%s: %r", run.run_id, error)
+            action, reason = "deny", "the tool gate failed"
+        if action == "allow":
+            return run
+        log.warning("the approved call is denied now run=%s: %s", run.run_id, reason)
+        reject = Resume(
+            resume.approval_id,
+            ApprovalDecision.REJECT,
+            f"the tool gate denies the approved call now: {reason}",
+        )
+        return replace(run, resume=reject)
 
     async def _finish(
         self, run: ClaimedRun, terminal: RunEvent | None, usage: Usage, watch: _Watch

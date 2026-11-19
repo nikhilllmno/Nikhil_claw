@@ -8,6 +8,12 @@ A call id is bound to one tool name and one arguments digest: the first check wr
 the ``tool_calls`` row. A later check of the same call id with another tool or other arguments
 gets ``deny`` and does not change the row. A transaction-level advisory lock on the run and the
 call id puts concurrent checks of one call id in a sequence.
+
+Authority is live (Section 5.1). Each check reads the run status, the access of the run user,
+the run budget, and the policy rules again. ``reconfirm`` checks an approved call again before
+the run resumes. An ``allow`` of an approved call makes its ``tool_calls`` row a ticket: when
+``screen`` gives ``ask`` for a sama MCP tool call, the tool server runs the call only if it
+takes one unused ticket for the same tool and arguments.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, cast
 
-from sqlalchemy import and_, func, insert, or_, select, update
+from sqlalchemy import and_, case, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import ColumnElement
@@ -46,9 +52,11 @@ from sama.gate.decide import (
     arguments_digest,
     canonical_name,
     decide,
+    decide_recorded,
     json_default,
 )
 from sama.tenancy.access import load_grants
+from sama.tenancy.authority import budget_problem, load_authority, load_run_spend
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import default_redactor, redact
 
@@ -96,6 +104,22 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _ref_of(claims: RunTokenClaims) -> _Ref | None:
+    try:
+        return _Ref(
+            uuid.UUID(claims.org_id),
+            uuid.UUID(claims.workspace_id),
+            uuid.UUID(claims.session_id),
+            uuid.UUID(claims.run_id),
+        )
+    except ValueError:
+        return None
+
+
+def _token_user(claims: RunTokenClaims) -> uuid.UUID | None:
+    return uuid.UUID(claims.user_id) if claims.user_id else None
+
+
 def stored_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
     """The arguments to store, with secrets redacted (Section 16.3). Long arguments are cut,
     so one call cannot fill the table. The digest is of the full arguments, not of these."""
@@ -137,8 +161,9 @@ class GateService:
             return Verdict("deny", GateStep.TOOLSET, "the tool call has no id")
         name = canonical_name(tool_name)
         digest = arguments_digest(arguments)
+        ref = _ref_of(claims)
         async with self._engine.begin() as connection:
-            run = await self._load(connection, claims, call_id)
+            run = None if ref is None else await self._load(connection, ref, claims, call_id)
             if run is None:
                 log.warning("gate: unknown run org=%s run=%s", claims.org_id, claims.run_id)
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
@@ -165,34 +190,170 @@ class GateService:
         self, claims: RunTokenClaims, tool_name: str, arguments: Mapping[str, Any]
     ) -> Verdict:
         """The verdict without a call id, for the sama MCP server. The server refuses
-        ``deny``. A ``deny`` is in the audit log."""
+        ``deny``. A ``deny`` is in the audit log.
+
+        ``ask`` becomes ``allow`` only with a ticket: an approved call of this run with the same
+        tool and arguments that ``reconfirm`` allowed and no server call used. The ticket is
+        used up. Without a ticket, ``ask`` becomes ``deny``, so a process in the sandbox cannot
+        call an ``ask`` tool with the run token alone."""
         name = canonical_name(tool_name)
+        ref = _ref_of(claims)
         async with self._engine.begin() as connection:
-            run = await self._load(connection, claims, None)
+            run = None if ref is None else await self._load(connection, ref, claims, None)
             if run is None:
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
             verdict = decide(run.context, name, arguments)
+            if verdict.action == "ask":
+                digest = arguments_digest(arguments)
+                if await self._take_ticket(connection, run.ref, name, digest):
+                    verdict = Verdict("allow", GateStep.RECORDED, "the call has an approved ticket")
+                else:
+                    verdict = Verdict(
+                        "deny", GateStep.RECORDED, "the call needs an approval of the tool gate"
+                    )
             if verdict.action == "deny":
                 await self._audit(
                     connection, run.ref, "tool_gate.screen", None, _details(name, verdict)
                 )
         return verdict
 
+    async def reconfirm(self, *, org_id: uuid.UUID, run_id: uuid.UUID, call_id: str) -> Verdict:
+        """The verdict again for an approved call, before the run resumes (Section 16.1). The
+        worker calls it. A newer deny rule, a lost membership, a spent budget, or an ended run
+        gives ``deny``. On ``allow`` the ``tool_calls`` row of the call is the ticket of the call
+        for the tool server."""
+        async with self._engine.begin() as connection:
+            found = (
+                await connection.execute(
+                    select(Run.session_id, Session.workspace_id)
+                    .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
+                    .where(Run.org_id == org_id, Run.id == run_id)
+                )
+            ).one_or_none()
+            if found is None:
+                return Verdict("deny", GateStep.AUTHORITY, "the run is unknown")
+            ref = _Ref(org_id, found.workspace_id, found.session_id, run_id)
+            run = await self._load(connection, ref, None, call_id)
+            if run is None:
+                return Verdict("deny", GateStep.AUTHORITY, "the run is unknown or ended")
+            recorded = run.context.recorded
+            if recorded is None:
+                verdict = Verdict("deny", GateStep.RECORDED, "the call has no approval")
+                name = ""
+            else:
+                name = canonical_name(recorded.tool_name)
+                if recorded.status == "approved":
+                    verdict = decide_recorded(run.context, name, recorded.arguments_digest)
+                else:
+                    verdict = Verdict(
+                        "deny", GateStep.RECORDED, f"the approval is {recorded.status}"
+                    )
+                await self._ticket(connection, ref, call_id, name, recorded, verdict)
+            await self._audit(
+                connection, ref, "tool_gate.reconfirm", call_id, _details(name, verdict)
+            )
+        log.info(
+            "gate reconfirm org=%s run=%s call=%s action=%s step=%s",
+            org_id,
+            run_id,
+            call_id,
+            verdict.action,
+            verdict.step,
+        )
+        return verdict
+
+    async def _ticket(
+        self,
+        connection: AsyncConnection,
+        ref: _Ref,
+        call_id: str,
+        name: str,
+        recorded: Recorded,
+        verdict: Verdict,
+    ) -> None:
+        """Writes the verdict to the ``tool_calls`` row of the call. The runtime can report an
+        approval that the gate did not check, so the row is made if it is not there."""
+        status = "denied" if verdict.action == "deny" else "started"
+        stored = (
+            await connection.execute(
+                select(Approval.arguments).where(
+                    Approval.org_id == ref.org_id,
+                    Approval.run_id == ref.run_id,
+                    Approval.call_id == call_id,
+                )
+            )
+        ).scalar_one()
+        statement = pg_insert(ToolCall).values(
+            org_id=ref.org_id,
+            session_id=ref.session_id,
+            run_id=ref.run_id,
+            call_id=call_id,
+            tool_name=name,
+            arguments=stored,
+            arguments_digest=recorded.arguments_digest,
+            decision=verdict.action,
+            status=status,
+        )
+        await connection.execute(
+            statement.on_conflict_do_update(
+                index_elements=[ToolCall.run_id, ToolCall.call_id],
+                set_={"decision": verdict.action, "status": _keep_used(status)},
+            )
+        )
+
+    async def _take_ticket(
+        self, connection: AsyncConnection, ref: _Ref, name: str, digest: str
+    ) -> bool:
+        """Uses up one ticket for the call, if the run has one."""
+        ticket = (
+            select(ToolCall.id)
+            .join(
+                Approval,
+                and_(
+                    Approval.org_id == ToolCall.org_id,
+                    Approval.run_id == ToolCall.run_id,
+                    Approval.call_id == ToolCall.call_id,
+                ),
+            )
+            .where(
+                ToolCall.org_id == ref.org_id,
+                ToolCall.run_id == ref.run_id,
+                ToolCall.tool_name == name,
+                ToolCall.arguments_digest == digest,
+                ToolCall.decision == "allow",
+                ToolCall.status == "started",
+                Approval.status == "approved",
+            )
+            .order_by(ToolCall.created_at)
+            .limit(1)
+            .with_for_update(of=ToolCall, skip_locked=True)
+            .scalar_subquery()
+        )
+        used = await connection.execute(
+            update(ToolCall)
+            .where(ToolCall.id == ticket)
+            .values(status="finished", finished_at=func.now())
+            .returning(ToolCall.call_id)
+        )
+        call_id = used.scalar_one_or_none()
+        if call_id is None:
+            return False
+        await self._audit(connection, ref, "tool_gate.ticket", call_id, {"tool": name})
+        return True
+
     async def _load(
         self,
         connection: AsyncConnection,
-        claims: RunTokenClaims,
+        ref: _Ref,
+        claims: RunTokenClaims | None,
         call_id: str | None,
     ) -> _Run | None:
-        try:
-            org_id, workspace_id, session_id, run_id = (
-                uuid.UUID(claims.org_id),
-                uuid.UUID(claims.workspace_id),
-                uuid.UUID(claims.session_id),
-                uuid.UUID(claims.run_id),
-            )
-        except ValueError:
-            return None
+        org_id, workspace_id, session_id, run_id = (
+            ref.org_id,
+            ref.workspace_id,
+            ref.session_id,
+            ref.run_id,
+        )
         if call_id:
             key = f"sama.gate:{run_id}:{call_id}"
             await connection.execute(
@@ -226,15 +387,15 @@ class GateService:
         if row is None:
             return None
         user_id = row.triggered_by_user_id
-        if user_id is None and claims.user_id:
-            user_id = uuid.UUID(claims.user_id)
+        if user_id is None and claims is not None:
+            user_id = _token_user(claims)
         toolsets = row.toolsets if isinstance(row.toolsets, list) else []
-        ref = _Ref(org_id, workspace_id, session_id, run_id)
         context = GateContext(
             toolsets=frozenset(str(item) for item in toolsets),
             rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
             unattended=bool(row.unattended),
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
+            revoked=await self._revoked(connection, org_id, run_id),
         )
         call = None
         if call_id:
@@ -250,6 +411,20 @@ class GateService:
             if found is not None:
                 call = _Call(found.tool_name, found.arguments_digest)
         return _Run(ref, context, call)
+
+    async def _revoked(
+        self, connection: AsyncConnection, org_id: uuid.UUID, run_id: uuid.UUID
+    ) -> str | None:
+        """Why the run has no authority now: its user lost access, or it spent its budget."""
+        authority = await load_authority(connection, org_id, run_id)
+        if authority.problem is not None:
+            return authority.problem
+        if authority.max_tokens is None and authority.max_cost_usd is None:
+            return None
+        spend = await load_run_spend(connection, org_id, run_id)
+        return budget_problem(
+            spend.tokens, spend.cost_usd, authority.max_tokens, authority.max_cost_usd
+        )
 
     async def _rules(
         self,
@@ -346,7 +521,11 @@ class GateService:
         await connection.execute(
             statement.on_conflict_do_update(
                 index_elements=[ToolCall.run_id, ToolCall.call_id],
-                set_={"decision": verdict.action, "status": status},
+                # A used ticket stays used, so a check again cannot make a new ticket.
+                set_={
+                    "decision": verdict.action,
+                    "status": _keep_used(status),
+                },
             )
         )
         await self._audit(connection, ref, "tool_gate.verdict", call_id, _details(name, verdict))
@@ -570,6 +749,11 @@ class GateService:
                 details=default_redactor().json({"session_id": str(run.session_id), **details}),
             )
         )
+
+
+def _keep_used(status: str) -> Any:
+    """The new status of a ``tool_calls`` row. A used ticket stays used."""
+    return case((ToolCall.status == "finished", "finished"), else_=status)
 
 
 def _details(name: str, verdict: Verdict) -> dict[str, Any]:

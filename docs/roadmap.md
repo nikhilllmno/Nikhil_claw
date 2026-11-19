@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.17.
+Done: M1.1 to M1.18.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -124,6 +124,15 @@ Done: M1.1 to M1.17.
   output. A test plants a secret and checks every stored table, the trace, and the logs. Not in
   M1.17: an HTTP API for secrets (M3), key rotation, org keys for the shared Telegram bot and
   for voice notes (M6), and redaction of native tool output in the sandbox.
+- M1.18: live authority in `src/sama/tenancy/authority.py` (architecture Sections 5.1 and
+  16.1). The tool gate and the model proxy read the run status, the access of the run user,
+  and the run budget again at each call. The live budget is the lower of the run budget and
+  the profile budget. A deny rule wins over an approval. Before a resume, the worker checks
+  the approved call again (`GateService.reconfirm`), and a deny turns the resume into a
+  reject. The allowed call becomes a ticket, and the tool server runs an `ask` sama tool only
+  with an unused ticket for the same tool and arguments. No migration. Not in M1.18: live
+  checks of connection access (connections come in M3.4) and a live check of the worker
+  limits `max_turns` and `max_wall_time_s`, which stay frozen for the run.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
