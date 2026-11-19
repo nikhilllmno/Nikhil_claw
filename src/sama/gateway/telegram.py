@@ -22,36 +22,35 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import re
 import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, insert, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import (
-    ENDED_RUN_STATUSES,
-    AgentProfile,
-    Approval,
-    AuditEntry,
-    ChannelGroup,
-    ChannelIdentity,
-    Message,
-    Run,
-    RunEvent,
-    Session,
-    SessionBinding,
-)
-from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
+from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
+from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
-from sama.gateway.telegram_client import MAX_TEXT, TelegramClient, TelegramError
+from sama.gateway.sessions import (
+    Bound,
+    FollowSettings,
+    KeyedLocks,
+    Reply,
+    Target,
+    approval_text,
+    decide,
+    find_session,
+    follow_run,
+    new_session,
+    send_ending,
+    stop_runs,
+)
+from sama.gateway.telegram_client import TelegramClient, TelegramError
 from sama.gateway.transcribe import TranscribeError, Transcriber
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.tenancy.access import Grants, load_grants
@@ -63,8 +62,6 @@ MAX_INPUT_CHARS: Final = 32_000
 """The same cap as ``POST /sessions/{id}/messages``."""
 MAX_VOICE_BYTES: Final = 10 * 1024 * 1024
 MAX_VOICE_S: Final = 300
-SPLIT_AT: Final = 4000
-"""A reply longer than this goes on in a new message (Telegram accepts 4,096 characters)."""
 
 BUSY: Final = "sama is busy now. Send the message again in a few minutes."
 PAIR_PROMPT: Final = (
@@ -92,51 +89,8 @@ class TelegramBot:
     """The Telegram user id of the bot. A reply to a message of the bot addresses it."""
 
 
-class TelegramSettings(BaseModel):
-    """The settings that all bots share."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    poll_s: float = Field(default=0.5, gt=0)
-    paused_poll_s: float = Field(default=5.0, gt=0)
-    """The poll interval while a run waits for an approval."""
-    edit_interval_s: float = Field(default=1.5, ge=0)
-    """The shortest time between two edits of one reply (Telegram limits edits)."""
-    max_follow_s: float = Field(default=6 * 3600, gt=0)
-    max_followers: int = Field(default=200, ge=1)
-    """The most runs that this process follows at one time. When all places are in use, the
-    gateway does not queue a new run and tells the chat to try again later."""
-
-
-@dataclass(frozen=True, slots=True)
-class Target:
-    """Where the messages of one chat go."""
-
-    org_id: uuid.UUID
-    user_id: uuid.UUID
-    workspace_id: uuid.UUID
-    agent_profile_id: uuid.UUID
-    audience: str
-    """``private`` for a direct chat, ``shared`` for a group."""
-
-    @property
-    def owner_user_id(self) -> uuid.UUID | None:
-        return self.user_id if self.audience == "private" else None
-
-
-@dataclass(frozen=True, slots=True)
-class _Bound:
-    session_id: uuid.UUID
-    agent_profile_id: uuid.UUID
-
-
-def split_point(text: str, limit: int = SPLIT_AT) -> int:
-    """Where to cut ``text`` that is longer than ``limit``: a line end, else a space."""
-    for mark in ("\n", " "):
-        cut = text.rfind(mark, limit // 2, limit)
-        if cut > 0:
-            return cut + 1
-    return limit
+TelegramSettings = FollowSettings
+"""The settings that all bots share."""
 
 
 class _Unlinked(Exception):
@@ -195,58 +149,8 @@ class _Outbox:
         raise AssertionError("unreachable")
 
 
-class _Reply:
-    """One reply that grows as text arrives. It edits its message at most once in
-    ``interval_s`` and goes on in a new message after ``SPLIT_AT`` characters."""
-
-    def __init__(self, outbox: _Outbox, reply_to: int | None, interval_s: float) -> None:
-        self._outbox = outbox
-        self._reply_to = reply_to
-        self._interval_s = interval_s
-        self._text = ""
-        self._shown = ""
-        self._message_id: int | None = None
-        self._last: float | None = None
-        """Loop time of the last shown text. ``None`` until the first text shows."""
-        self.sent_any = False
-        """True when text was shown since the start or the last ``restart``."""
-
-    async def add(self, text: str) -> None:
-        self._text += text
-        while len(self._text) > SPLIT_AT:
-            cut = split_point(self._text)
-            await self._show(self._text[:cut])
-            self._text = self._text[cut:]
-            self._message_id, self._shown = None, ""
-        await self.flush(final=False)
-
-    async def flush(self, *, final: bool) -> None:
-        loop = asyncio.get_running_loop()
-        if final or self._last is None or loop.time() - self._last >= self._interval_s:
-            await self._show(self._text)
-
-    def restart(self) -> None:
-        """The next text goes in a new message, for example after an approval card."""
-        self._text, self._shown, self._message_id = "", "", None
-        self.sent_any = False
-
-    async def _show(self, text: str) -> None:
-        if not text.strip() or text == self._shown:
-            return
-        if self._message_id is None:
-            self._message_id = await self._outbox.send_message(text, reply_to=self._reply_to)
-        else:
-            await self._outbox.edit_message(self._message_id, text)
-        self._shown = text
-        self._last = asyncio.get_running_loop().time()
-        self.sent_any = True
-
-
 def _approval_card(row: Any) -> tuple[str, list[list[dict[str, str]]]]:
-    arguments = json.dumps(row.arguments, ensure_ascii=False, indent=1)
-    if len(arguments) > 1500:
-        arguments = arguments[:1500] + "\n..."
-    text = f"Approval needed: {row.tool_name}\n{row.reason}\n\n{arguments}".strip()
+    text = approval_text(row)
     buttons = [
         [
             {"text": "Approve", "callback_data": f"ap:{row.id.hex}:y"},
@@ -287,7 +191,7 @@ class TelegramGateway:
         self._tasks: set[asyncio.Task[None]] = set()
         self._followers: set[object] = set() if followers is None else followers
         """One place per followed run. A message takes its place before it queues the run."""
-        self._chat_locks: dict[int, _ChatLock] = {}
+        self._chat_locks = KeyedLocks()
         mention = re.escape(bot.username)
         self._mention = re.compile(rf"(?<!\w)@{mention}\b", re.IGNORECASE)
 
@@ -335,16 +239,8 @@ class TelegramGateway:
             if isinstance(update.get("message"), dict):
                 message = update["message"]
                 chat_id = int(message["chat"]["id"])
-                entry = self._chat_locks.setdefault(chat_id, _ChatLock())
-                entry.users += 1
-                try:
-                    async with entry.lock:
-                        await self._on_message(message)
-                finally:
-                    # Remove the lock only when no update holds it or waits for it.
-                    entry.users -= 1
-                    if entry.users == 0:
-                        self._chat_locks.pop(chat_id, None)
+                async with self._chat_locks.hold(chat_id):
+                    await self._on_message(message)
             elif isinstance(update.get("callback_query"), dict):
                 await self._on_callback(update["callback_query"])
         except Exception:
@@ -594,19 +490,7 @@ class TelegramGateway:
             await self._say(chat_id, HELP, reply_to=message_id)
 
     async def _stop(self, org_id: uuid.UUID, session_id: uuid.UUID) -> int:
-        async with self._engine.connect() as connection:
-            run_ids = (
-                await connection.scalars(
-                    select(Run.id).where(
-                        Run.org_id == org_id,
-                        Run.session_id == session_id,
-                        Run.status.not_in(ENDED_RUN_STATUSES),
-                    )
-                )
-            ).all()
-        for run_id in run_ids:
-            await self._queue.cancel(org_id=org_id, run_id=run_id)
-        return len(run_ids)
+        return await stop_runs(self._engine, self._queue, org_id, [session_id])
 
     async def _model(
         self, chat_id: int, message_id: int, name: str, target: Target, grants: Grants
@@ -657,42 +541,12 @@ class TelegramGateway:
 
     async def _session(
         self, chat_id: int, target: Target, grants: Grants, *, create: bool
-    ) -> _Bound | None:
+    ) -> Bound | None:
         """The session of the chat. A session that the user cannot use now is not reused."""
-        async with self._engine.connect() as connection:
-            row = (
-                await connection.execute(
-                    select(
-                        Session.id,
-                        Session.org_id,
-                        Session.workspace_id,
-                        Session.audience,
-                        Session.owner_user_id,
-                        Session.status,
-                        Session.agent_profile_id,
-                    )
-                    .join(
-                        SessionBinding,
-                        (SessionBinding.org_id == Session.org_id)
-                        & (SessionBinding.session_id == Session.id),
-                    )
-                    .where(
-                        SessionBinding.channel == CHANNEL,
-                        SessionBinding.external_key == self._binding_key(chat_id),
-                    )
-                )
-            ).one_or_none()
-        if (
-            row is not None
-            and row.status == "active"
-            and row.org_id == target.org_id
-            and row.workspace_id == target.workspace_id
-            and row.audience == target.audience
-            and grants.sees_session(row.workspace_id, row.audience, row.owner_user_id)
-        ):
-            return _Bound(row.id, row.agent_profile_id)
-        if not create:
-            return None
+        key = self._binding_key(chat_id)
+        bound = await find_session(self._engine, CHANNEL, key, target, grants)
+        if bound is not None or not create:
+            return bound
         return await self._new_session(chat_id, target, target.agent_profile_id, parent=None)
 
     async def _new_session(
@@ -702,35 +556,15 @@ class TelegramGateway:
         agent_profile_id: uuid.UUID,
         *,
         parent: uuid.UUID | None,
-    ) -> _Bound:
-        session_id = uuid.uuid4()
-        async with self._engine.begin() as connection:
-            await connection.execute(
-                insert(Session).values(
-                    id=session_id,
-                    org_id=target.org_id,
-                    workspace_id=target.workspace_id,
-                    agent_profile_id=agent_profile_id,
-                    audience=target.audience,
-                    owner_user_id=target.owner_user_id,
-                    parent_session_id=parent,
-                    lineage=None if parent is None else "branch",
-                )
-            )
-            await _bind(connection, self._binding_key(chat_id), target, session_id)
-            await connection.execute(
-                insert(AuditEntry).values(
-                    org_id=target.org_id,
-                    workspace_id=target.workspace_id,
-                    actor_kind="user",
-                    actor_user_id=target.user_id,
-                    action="session.created",
-                    target_type="session",
-                    target_id=str(session_id),
-                    details={"audience": target.audience, "channel": CHANNEL},
-                )
-            )
-        return _Bound(session_id, agent_profile_id)
+    ) -> Bound:
+        return await new_session(
+            self._engine,
+            CHANNEL,
+            self._binding_key(chat_id),
+            target,
+            agent_profile_id,
+            parent=parent,
+        )
 
     # -- outbound -------------------------------------------------------------------------
 
@@ -780,110 +614,23 @@ class TelegramGateway:
                 return await self._may_deliver(connection, chat_id, target)
 
         outbox = _Outbox(self._client, chat_id, allowed)
-        reply = _Reply(outbox, reply_to, settings.edit_interval_s)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + settings.max_follow_s
-        seq = -1
-        carded: set[uuid.UUID] = set()
-        status = "queued"
+        reply = Reply(outbox, reply_to, settings.edit_interval_s)
+
+        async def send_card(row: Any) -> None:
+            text, buttons = _approval_card(row)
+            await outbox.send_message(text, buttons=buttons)
+
         try:
             with contextlib.suppress(TelegramError):
                 await self._client.typing(chat_id)
-            while loop.time() < deadline:
-                async with self._engine.connect() as connection:
-                    # The status first: the events of an ended run are all stored before it.
-                    status = (
-                        await connection.execute(
-                            select(Run.status).where(Run.org_id == org_id, Run.id == run_id)
-                        )
-                    ).scalar_one()
-                    events = (
-                        await connection.execute(
-                            select(RunEvent.seq, RunEvent.type, RunEvent.payload)
-                            .where(
-                                RunEvent.org_id == org_id,
-                                RunEvent.run_id == run_id,
-                                RunEvent.seq > seq,
-                            )
-                            .order_by(RunEvent.seq)
-                            .limit(500)
-                        )
-                    ).all()
-                    pending = (
-                        []
-                        if status != "paused"
-                        else (
-                            await connection.execute(
-                                select(
-                                    Approval.id,
-                                    Approval.tool_name,
-                                    Approval.reason,
-                                    Approval.arguments,
-                                ).where(
-                                    Approval.org_id == org_id,
-                                    Approval.run_id == run_id,
-                                    Approval.status == "pending",
-                                )
-                            )
-                        ).all()
-                    )
-                for event in events:
-                    seq = event.seq
-                    if event.type == "text_delta":
-                        await reply.add(str(event.payload.get("text", "")))
-                new = [row for row in pending if row.id not in carded]
-                if new:
-                    await reply.flush(final=True)
-                    reply.restart()
-                    for row in new:
-                        text, buttons = _approval_card(row)
-                        await outbox.send_message(text, buttons=buttons)
-                        carded.add(row.id)
-                if status in ENDED_RUN_STATUSES and len(events) < 500:
-                    break
-                await reply.flush(final=False)
-                paused = status == "paused"
-                await asyncio.sleep(settings.paused_poll_s if paused else settings.poll_s)
-            await reply.flush(final=True)
-            await self._ending(outbox, org_id, run_id, status, reply)
+            status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
+            await send_ending(self._engine, outbox, org_id, run_id, status, reply)
         except _Unlinked:
             log.warning("the chat lost its link; run=%s is not delivered", run_id)
         except TelegramError as error:
             log.warning("a Telegram reply failed run=%s error=%s", run_id, error)
         finally:
             self._followers.discard(place)
-
-    async def _ending(
-        self, outbox: _Outbox, org_id: uuid.UUID, run_id: uuid.UUID, status: str, reply: _Reply
-    ) -> None:
-        if status == "completed" and not reply.sent_any:
-            # A runtime that sends no text deltas: show the stored answer.
-            async with self._engine.connect() as connection:
-                output = (
-                    await connection.execute(
-                        select(Message.content)
-                        .where(
-                            Message.org_id == org_id,
-                            Message.run_id == run_id,
-                            Message.role == "assistant",
-                        )
-                        .order_by(Message.seq.desc())
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-            text = str((output or {}).get("text") or "")
-            for start in range(0, min(len(text), 4 * MAX_TEXT), SPLIT_AT):
-                await outbox.send_message(text[start : start + SPLIT_AT])
-        elif status == "failed":
-            async with self._engine.connect() as connection:
-                message = (
-                    await connection.execute(
-                        select(Run.failure_message).where(Run.org_id == org_id, Run.id == run_id)
-                    )
-                ).scalar_one_or_none()
-            await outbox.send_message(f"The run failed: {message or 'unknown'}")
-        elif status == "cancelled":
-            await outbox.send_message("The run stopped.")
 
     # -- approvals ------------------------------------------------------------------------
 
@@ -900,45 +647,20 @@ class TelegramGateway:
         if identity is None:
             await self._answer(callback_id, "Link your Telegram account to sama first.")
             return
-        async with self._engine.connect() as connection:
-            row = (
-                await connection.execute(
-                    select(
-                        Approval.run_id,
-                        Approval.call_id,
-                        Approval.tool_name,
-                        Session.workspace_id,
-                        Session.audience,
-                        Session.owner_user_id,
-                    )
-                    .join(
-                        Session,
-                        (Session.org_id == Approval.org_id) & (Session.id == Approval.session_id),
-                    )
-                    .where(Approval.org_id == identity.org_id, Approval.id == approval_id)
-                )
-            ).one_or_none()
-            grants = await load_grants(connection, identity.org_id, identity.user_id)
-        if row is None or not grants.sees_session(
-            row.workspace_id, row.audience, row.owner_user_id
-        ):
-            await self._answer(callback_id, "You cannot decide this approval.")
-            return
         try:
-            await self._gate.decide_approval(
+            decided = await decide(
+                self._engine,
+                self._gate,
+                self._queue,
                 org_id=identity.org_id,
-                run_id=row.run_id,
-                call_id=row.call_id,
                 user_id=identity.user_id,
+                approval_id=approval_id,
                 approve=approve,
             )
-            outcome = "Approved" if approve else "Denied"
-        except ApprovalExpiredError:
-            outcome = "Expired"
         except ApprovalError as error:
             await self._answer(callback_id, str(error))
             return
-        await self._queue.release_decided(org_id=identity.org_id, run_id=row.run_id)
+        outcome = decided.outcome
         await self._answer(callback_id, outcome)
         if "message_id" in message and "chat" in message:
             name = sender.get("first_name") or sender.get("username") or "a user"
@@ -946,7 +668,7 @@ class TelegramGateway:
                 await self._client.edit_message(
                     int(message["chat"]["id"]),
                     int(message["message_id"]),
-                    f"{message.get('text', row.tool_name)}\n\n{outcome} by {name}.",
+                    f"{message.get('text', decided.tool_name)}\n\n{outcome} by {name}.",
                 )
             except TelegramError as error:
                 log.warning("an approval card edit failed error=%s", error)
@@ -956,36 +678,3 @@ class TelegramGateway:
             await self._client.answer_callback(callback_id, text)
         except TelegramError as error:
             log.warning("a callback answer failed error=%s", error)
-
-
-@dataclass(slots=True)
-class _ChatLock:
-    """The lock of one chat and the count of updates that hold it or wait for it."""
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
-
-
-async def _bind(
-    connection: AsyncConnection, key: str, target: Target, session_id: uuid.UUID
-) -> None:
-    statement = pg_insert(SessionBinding).values(
-        org_id=target.org_id,
-        workspace_id=target.workspace_id,
-        session_id=session_id,
-        channel=CHANNEL,
-        external_key=key,
-        created_by_user_id=target.user_id,
-    )
-    await connection.execute(
-        statement.on_conflict_do_update(
-            index_elements=["channel", "external_key"],
-            set_={
-                "org_id": statement.excluded.org_id,
-                "workspace_id": statement.excluded.workspace_id,
-                "session_id": statement.excluded.session_id,
-                "created_by_user_id": statement.excluded.created_by_user_id,
-                "updated_at": func.now(),
-            },
-        )
-    )
