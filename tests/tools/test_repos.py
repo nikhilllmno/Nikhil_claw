@@ -10,14 +10,15 @@ from __future__ import annotations
 import asyncio
 import secrets
 import subprocess
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from sama.gate.decide import GateContext, GateStep, decide
-from sama.sandbox import Sandbox, SandboxSpec
+from sama.sandbox import ExecResult, Sandbox, SandboxSpec
 from sama.sandbox.local import LocalProvider
 from sama.tenancy import RunTokenClaims, RunTokenSigner
 from sama.tools import MemoryTodoStore, RepoCloner, RepoError, ToolServer
@@ -238,6 +239,27 @@ async def test_of_two_clones_into_one_folder_only_one_runs(world: World) -> None
     assert isinstance(errors[0], RepoError)
     assert "exists" in str(errors[0])
     assert (Path(world.sandbox.workdir) / "demo" / "app.py").is_file()
+
+
+async def test_a_clone_keeps_the_files_of_another_writer(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another writer fills the folder after ``_reserve`` made it. The clone must fail with
+    # "exists" and keep the files, because they are not from this call.
+    sandbox = world.sandbox
+    exec_ = sandbox.exec
+    marker = Path(sandbox.workdir) / "demo" / "other.txt"
+
+    async def exec_then_fill(argv: Sequence[str], **kwargs: Any) -> ExecResult:
+        result = await exec_(argv, **kwargs)
+        if list(argv[:1]) == ["mkdir"]:
+            marker.write_text("keep")
+        return result
+
+    monkeypatch.setattr(sandbox, "exec", exec_then_fill)
+    with pytest.raises(RepoError, match="exists"):
+        await world.cloner.clone(world.claims, "acme/demo")
+    assert marker.read_text() == "keep"
 
 
 async def test_instruction_files_that_are_symlinks_are_not_read(
