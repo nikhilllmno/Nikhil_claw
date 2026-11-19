@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import Approval, Message, Run, RunEvent, ToolPolicy
 from sama.gate.service import GateService
+from sama.orchestrator import worker as worker_module
 from sama.orchestrator.queue import RunQueue
 from sama.orchestrator.worker import MAX_FAILURE_CHARS, Worker
 from sama.runtime.contract import (
@@ -225,6 +226,50 @@ async def test_a_failed_reconfirm_rejects_the_resume(
     assert resume.decision is ApprovalDecision.REJECT
     assert resume.reason is not None
     assert "the tool gate failed" in resume.reason
+
+
+async def test_a_slow_reconfirm_rejects_the_resume(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    await GateService(engine).decide_approval(
+        org_id=tenant.org, run_id=run_id, call_id="call-9", user_id=tenant.ids["mia"], approve=True
+    )
+
+    async def slow(**_: Any) -> Any:
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(worker_module, "RECONFIRM_TIMEOUT_S", 0.05)
+    harness.worker._gate.reconfirm = slow  # type: ignore[method-assign]
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    resume = harness.runtime.requests[-1]
+    assert isinstance(resume, ResumeRequest)
+    assert resume.decision is ApprovalDecision.REJECT
+
+
+async def test_a_lease_lost_during_reconfirm_starts_no_resume(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    gate = GateService(engine)
+    await gate.decide_approval(
+        org_id=tenant.org, run_id=run_id, call_id="call-9", user_id=tenant.ids["mia"], approve=True
+    )
+
+    async def taken(**kwargs: Any) -> Any:
+        async with engine.begin() as connection:
+            await connection.execute(update(Run).where(Run.id == run_id).values(lease_owner="w2"))
+        return await gate.reconfirm(**kwargs)
+
+    harness.worker._gate.reconfirm = taken  # type: ignore[method-assign]
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    assert len(harness.runtime.requests) == 1, "the worker started a run it does not own"
 
 
 async def test_a_user_cancels_a_running_run(engine: AsyncEngine, tenant: Tenant) -> None:

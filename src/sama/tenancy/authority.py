@@ -60,6 +60,15 @@ def lower(first: Any, second: Any) -> Any:
     return min(first, second)
 
 
+def run_user(
+    triggered_by: uuid.UUID | None, audience: str, owner: uuid.UUID | None
+) -> uuid.UUID | None:
+    """The user of a run: the user who started it, else the owner of a private session."""
+    if triggered_by is None and audience == "private":
+        return owner
+    return triggered_by
+
+
 def _tokens(budget: Any) -> int | None:
     value = budget.get("max_tokens") if isinstance(budget, dict) else None
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -105,9 +114,7 @@ async def load_authority(
         return Authority(problem=UNKNOWN_RUN)
     if row.status in ENDED_RUN_STATUSES:
         return Authority(problem=ENDED_RUN)
-    user_id = row.triggered_by_user_id
-    if user_id is None and row.audience == "private":
-        user_id = row.owner_user_id
+    user_id = run_user(row.triggered_by_user_id, row.audience, row.owner_user_id)
     if user_id is not None:
         grants = await load_grants(connection, org_id, user_id)
         if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
@@ -154,4 +161,5 @@ __all__ = [
     "load_authority",
     "load_run_spend",
     "lower",
+    "run_user",
 ]

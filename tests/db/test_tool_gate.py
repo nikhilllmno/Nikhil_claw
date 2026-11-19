@@ -824,3 +824,27 @@ async def test_a_private_run_without_a_user_uses_the_owner(engine: AsyncEngine, 
             )
         )
     assert (await gate.check(claims, "c2", "Read", {})).step is GateStep.AUTHORITY
+
+
+async def test_reconfirm_loads_the_rules_of_the_private_session_owner(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """A private run without a starting user has the owner as its user, also in reconfirm."""
+    gate = GateService(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["secret-run"]).values(triggered_by_user_id=None)
+        )
+    await ask(gate, org, run="secret-run")
+    await gate.decide_approval(
+        org_id=org.ids["org"],
+        run_id=org.ids["secret-run"],
+        call_id="c1",
+        user_id=org.ids["mia"],
+        approve=True,
+    )
+    await add_rule(engine, org, "Bash", "deny", user="mia")
+    verdict = await gate.reconfirm(
+        org_id=org.ids["org"], run_id=org.ids["secret-run"], call_id="c1"
+    )
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)

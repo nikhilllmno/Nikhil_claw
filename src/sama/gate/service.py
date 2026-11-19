@@ -56,7 +56,7 @@ from sama.gate.decide import (
     json_default,
 )
 from sama.tenancy.access import load_grants
-from sama.tenancy.authority import budget_problem, load_authority, load_run_spend
+from sama.tenancy.authority import budget_problem, load_authority, load_run_spend, run_user
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import default_redactor, redact
 
@@ -114,10 +114,6 @@ def _ref_of(claims: RunTokenClaims) -> _Ref | None:
         )
     except ValueError:
         return None
-
-
-def _token_user(claims: RunTokenClaims) -> uuid.UUID | None:
-    return uuid.UUID(claims.user_id) if claims.user_id else None
 
 
 def stored_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -348,12 +344,7 @@ class GateService:
         claims: RunTokenClaims | None,
         call_id: str | None,
     ) -> _Run | None:
-        org_id, workspace_id, session_id, run_id = (
-            ref.org_id,
-            ref.workspace_id,
-            ref.session_id,
-            ref.run_id,
-        )
+        org_id, run_id = ref.org_id, ref.run_id
         if call_id:
             key = f"sama.gate:{run_id}:{call_id}"
             await connection.execute(
@@ -366,6 +357,8 @@ class GateService:
                     Run.triggered_by_user_id,
                     Run.unattended,
                     AgentProfile.toolsets,
+                    Session.audience,
+                    Session.owner_user_id,
                 )
                 .join(
                     AgentProfile,
@@ -377,8 +370,8 @@ class GateService:
                 .where(
                     Run.org_id == org_id,
                     Run.id == run_id,
-                    Run.session_id == session_id,
-                    Session.workspace_id == workspace_id,
+                    Run.session_id == ref.session_id,
+                    Session.workspace_id == ref.workspace_id,
                     # A runner of an ended run (for example after a worker crash) gets no tool.
                     Run.status.not_in(ENDED_RUN_STATUSES),
                 )
@@ -386,9 +379,11 @@ class GateService:
         ).one_or_none()
         if row is None:
             return None
-        user_id = row.triggered_by_user_id
-        if user_id is None and claims is not None:
-            user_id = _token_user(claims)
+        # The same run user as the live authority, so `reconfirm` (with no token) loads the
+        # same user rules as `check`. The token user is the last fallback.
+        user_id = run_user(row.triggered_by_user_id, row.audience, row.owner_user_id)
+        if user_id is None and claims is not None and claims.user_id:
+            user_id = uuid.UUID(claims.user_id)
         toolsets = row.toolsets if isinstance(row.toolsets, list) else []
         context = GateContext(
             toolsets=frozenset(str(item) for item in toolsets),
@@ -522,10 +517,7 @@ class GateService:
             statement.on_conflict_do_update(
                 index_elements=[ToolCall.run_id, ToolCall.call_id],
                 # A used ticket stays used, so a check again cannot make a new ticket.
-                set_={
-                    "decision": verdict.action,
-                    "status": _keep_used(status),
-                },
+                set_={"decision": verdict.action, "status": _keep_used(status)},
             )
         )
         await self._audit(connection, ref, "tool_gate.verdict", call_id, _details(name, verdict))

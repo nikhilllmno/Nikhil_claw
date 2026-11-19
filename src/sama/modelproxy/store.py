@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.db.models import ModelCall, Org
 from sama.modelproxy.prices import Provider, TokenCounts
 from sama.modelproxy.usage import Endpoint
-from sama.tenancy.authority import Authority, load_authority, load_run_spend
+from sama.tenancy.authority import Authority, RunSpend, load_authority, load_run_spend
 
 
 class CallRecord(BaseModel):
@@ -47,13 +47,6 @@ class CallRecord(BaseModel):
     created_at: datetime
 
 
-class Spend(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    tokens: int = 0
-    cost_usd: Decimal = Decimal(0)
-
-
 class OrgLimits(BaseModel):
     """The model limits of an org, from ``orgs.limits``. ``None`` means no limit."""
 
@@ -66,7 +59,7 @@ class OrgLimits(BaseModel):
 class UsageStore(Protocol):
     async def record(self, call: CallRecord) -> None: ...
 
-    async def run_spend(self, org_id: str, run_id: str) -> Spend: ...
+    async def run_spend(self, org_id: str, run_id: str) -> RunSpend: ...
 
     async def org_cost(self, org_id: str, since: datetime) -> Decimal: ...
 
@@ -92,9 +85,9 @@ class MemoryUsageStore:
         if all(c.call_id != call.call_id for c in self.calls):
             self.calls.append(call)
 
-    async def run_spend(self, org_id: str, run_id: str) -> Spend:
+    async def run_spend(self, org_id: str, run_id: str) -> RunSpend:
         calls = [c for c in self.calls if c.org_id == org_id and c.run_id == run_id]
-        return Spend(
+        return RunSpend(
             tokens=sum(c.counts.total_tokens for c in calls),
             cost_usd=sum((c.cost_usd for c in calls), Decimal(0)),
         )
@@ -154,10 +147,9 @@ class PostgresUsageStore:
                 .on_conflict_do_nothing(index_elements=[ModelCall.call_id])
             )
 
-    async def run_spend(self, org_id: str, run_id: str) -> Spend:
+    async def run_spend(self, org_id: str, run_id: str) -> RunSpend:
         async with self._engine.connect() as connection:
-            spend = await load_run_spend(connection, uuid.UUID(org_id), uuid.UUID(run_id))
-        return Spend(tokens=spend.tokens, cost_usd=spend.cost_usd)
+            return await load_run_spend(connection, uuid.UUID(org_id), uuid.UUID(run_id))
 
     async def org_cost(self, org_id: str, since: datetime) -> Decimal:
         return await self._cost(

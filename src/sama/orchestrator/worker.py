@@ -67,6 +67,9 @@ RunEndHook = Callable[[str, str], None]
 
 MAX_FAILURE_CHARS: Final = 2_000
 FLUSH_EVENTS: Final = 50
+RECONFIRM_TIMEOUT_S: Final = 10.0
+"""The longest wait for the check of an approved call before a resume. It is shorter than
+the default lease, and a slow check rejects the call."""
 
 
 def default_owner() -> str:
@@ -231,10 +234,12 @@ class Worker:
             message = redact(f"the run cannot start: {error}")[:MAX_FAILURE_CHARS]
             await self._fail(run, FailureCode.INVALID_REQUEST, message, Usage())
             return
+        # The check comes before the dispatch: the dispatch then checks the lease just before
+        # the start, so a slow check cannot start a run that another attempt owns now.
+        run = await self._reconfirm(run)
         if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
-        run = await self._reconfirm(run)
         stream = _stream(runtime, run, scope, config, budget)
         watch = _Watch()
         writer = _Writer(self._queue, run, self.owner, watch, self._flush_s)
@@ -268,14 +273,15 @@ class Worker:
     async def _reconfirm(self, run: ClaimedRun) -> ClaimedRun:
         """Checks an approved call again before the resume (Section 5.1). Authority is live,
         so a newer deny rule, a lost membership, or a spent budget turns the approve into a
-        reject. A failed check also rejects."""
+        reject. A failed or slow check (``RECONFIRM_TIMEOUT_S``) also rejects."""
         resume = run.resume
         if resume is None or resume.decision is not ApprovalDecision.APPROVE:
             return run
         try:
-            verdict = await self._gate.reconfirm(
-                org_id=run.org_id, run_id=run.run_id, call_id=resume.approval_id
-            )
+            async with asyncio.timeout(RECONFIRM_TIMEOUT_S):
+                verdict = await self._gate.reconfirm(
+                    org_id=run.org_id, run_id=run.run_id, call_id=resume.approval_id
+                )
             action, reason = verdict.action, verdict.reason
         except Exception as error:
             log.warning("the check before the resume failed run=%s: %r", run.run_id, error)

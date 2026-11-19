@@ -486,6 +486,35 @@ async def test_a_run_without_authority_is_refused(harness: Harness, problem: str
     assert len(harness.upstream.requests) == 1
 
 
+async def test_count_tokens_needs_live_authority(harness: Harness) -> None:
+    """Token counting is free, so it skips the budget, but not the authority check."""
+    harness.store.authorities["run-1"] = Authority(problem="the run ended")
+    response = await harness.client.post(
+        "/anthropic/v1/messages/count_tokens",
+        json={"model": MODEL, "messages": []},
+        headers={"x-api-key": harness.token()},
+    )
+    assert response.status_code == 403
+    assert harness.upstream.requests == []
+
+
+async def test_a_store_that_cannot_read_the_authority_refuses_every_route() -> None:
+    upstream, store, signer = Upstream(), FailingStore(), RunTokenSigner(KEY)
+    store.broken, store.authority_fails = False, True
+    proxy = make_proxy(upstream, store, signer)
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+        for path in ("/anthropic/v1/messages", "/anthropic/v1/messages/count_tokens"):
+            response = await client.post(
+                path, json={"model": MODEL, "messages": []}, headers={"x-api-key": token}
+            )
+            assert response.status_code == 503
+    await proxy.aclose()
+    assert upstream.requests == []
+
+
 async def test_a_lower_live_budget_applies_at_the_next_call(harness: Harness) -> None:
     token = harness.token(Budget(max_tokens=1_000))
     assert (await harness.messages(token=token)).status_code == 200  # 110 tokens
@@ -606,6 +635,12 @@ class FailingStore(MemoryUsageStore):
         super().__init__()
         self.broken = True
         self.reads_fail = False
+        self.authority_fails = False
+
+    async def authority(self, org_id: str, run_id: str) -> Authority:
+        if self.authority_fails:
+            raise RuntimeError("the database is down")
+        return await super().authority(org_id, run_id)
 
     async def record(self, call: CallRecord) -> None:
         if self.broken:

@@ -1628,12 +1628,15 @@ of `runs.budget` and the budget of the agent profile, for `max_tokens` and `max_
 - `GateService.check` and `screen` give `deny` at the authority step when the run ended, the
   run user lost access, or the recorded model calls of the run reached the live budget.
 - The model proxy refuses a call with `403` (`permission_error`) when the run ended or the
-  run user lost access. It uses the lower of the token budget and the live budget, so a lower
+  run user lost access. This applies to every route, also to the free `count_tokens` route.
+  A store that cannot read the authority gives `503`. It uses the lower of the token budget and the live budget, so a lower
   budget applies at the next call.
 - Before an approve resume, the worker calls `GateService.reconfirm(org_id, run_id,
   call_id)`. It runs `decide_recorded`: all steps except the hardline step, which ran at the
-  first check. A `deny` (for example a newer deny rule, or a lost membership) turns the
-  resume into a `reject` with the reason. A failed check also rejects. An audit row
+  first check. The user rules are the rules of the run user, as for the live authority. A
+  `deny` (for example a newer deny rule, or a lost membership) turns the resume into a
+  `reject` with the reason. A failed check, or a check longer than 10 seconds, also rejects.
+  The check runs before the dispatch, so the dispatch checks the lease just before the start. An audit row
   `tool_gate.reconfirm` records the verdict.
 - **Tickets.** On `allow`, `reconfirm` writes `decision = allow` and `status = started` to
   the `tool_calls` row of the call (it makes the row if the runtime reported an approval that
@@ -1932,7 +1935,7 @@ environment second (Section 16.3). The Langfuse traces (M1.14, Section 18.2) rea
 
 **Live authority (M1.18).** Before each call, the proxy reads the live authority of the run
 (Section 16.1). A run that ended (a cancel ends the run) or a run user who lost access gets
-`403`. The run limits are the lower of the token claims and the live budget. The proxy prices only the costs that the table lists. For example, OpenAI
+`403` on every route, also on `count_tokens`. The run limits are the lower of the token claims and the live budget. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 
 ### 16.7 Sama MCP tool server (M1.8)
