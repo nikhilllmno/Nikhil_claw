@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.db.models import ModelCall, Org
 from sama.modelproxy.prices import Provider, TokenCounts
 from sama.modelproxy.usage import Endpoint
+from sama.tenancy.authority import Authority, RunSpend, load_authority, load_run_spend
 
 
 class CallRecord(BaseModel):
@@ -46,13 +47,6 @@ class CallRecord(BaseModel):
     created_at: datetime
 
 
-class Spend(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    tokens: int = 0
-    cost_usd: Decimal = Decimal(0)
-
-
 class OrgLimits(BaseModel):
     """The model limits of an org, from ``orgs.limits``. ``None`` means no limit."""
 
@@ -65,7 +59,7 @@ class OrgLimits(BaseModel):
 class UsageStore(Protocol):
     async def record(self, call: CallRecord) -> None: ...
 
-    async def run_spend(self, org_id: str, run_id: str) -> Spend: ...
+    async def run_spend(self, org_id: str, run_id: str) -> RunSpend: ...
 
     async def org_cost(self, org_id: str, since: datetime) -> Decimal: ...
 
@@ -73,21 +67,27 @@ class UsageStore(Protocol):
 
     async def org_limits(self, org_id: str) -> OrgLimits: ...
 
+    async def authority(self, org_id: str, run_id: str) -> Authority:
+        """The live authority of the run (Section 5.1)."""
+        ...
+
 
 class MemoryUsageStore:
-    """Keeps the records in memory. ``limits`` maps an org id to its limits."""
+    """Keeps the records in memory. ``limits`` maps an org id to its limits. ``authorities``
+    maps a run id to its live authority. A run that is not in the map has full authority."""
 
     def __init__(self, limits: dict[str, OrgLimits] | None = None) -> None:
         self.calls: list[CallRecord] = []
         self.limits = limits if limits is not None else {}
+        self.authorities: dict[str, Authority] = {}
 
     async def record(self, call: CallRecord) -> None:
         if all(c.call_id != call.call_id for c in self.calls):
             self.calls.append(call)
 
-    async def run_spend(self, org_id: str, run_id: str) -> Spend:
+    async def run_spend(self, org_id: str, run_id: str) -> RunSpend:
         calls = [c for c in self.calls if c.org_id == org_id and c.run_id == run_id]
-        return Spend(
+        return RunSpend(
             tokens=sum(c.counts.total_tokens for c in calls),
             cost_usd=sum((c.cost_usd for c in calls), Decimal(0)),
         )
@@ -107,14 +107,8 @@ class MemoryUsageStore:
     async def org_limits(self, org_id: str) -> OrgLimits:
         return self.limits.get(org_id, OrgLimits())
 
-
-_TOKENS = (
-    ModelCall.input_tokens
-    + ModelCall.output_tokens
-    + ModelCall.cache_read_tokens
-    + ModelCall.cache_write_tokens
-    + ModelCall.cache_write_long_tokens
-)
+    async def authority(self, org_id: str, run_id: str) -> Authority:
+        return self.authorities.get(run_id, Authority())
 
 
 class PostgresUsageStore:
@@ -153,13 +147,9 @@ class PostgresUsageStore:
                 .on_conflict_do_nothing(index_elements=[ModelCall.call_id])
             )
 
-    async def run_spend(self, org_id: str, run_id: str) -> Spend:
-        query = select(
-            func.coalesce(func.sum(_TOKENS), 0), func.coalesce(func.sum(ModelCall.cost_usd), 0)
-        ).where(ModelCall.org_id == uuid.UUID(org_id), ModelCall.run_id == uuid.UUID(run_id))
+    async def run_spend(self, org_id: str, run_id: str) -> RunSpend:
         async with self._engine.connect() as connection:
-            tokens, cost = (await connection.execute(query)).one()
-        return Spend(tokens=int(tokens), cost_usd=Decimal(cost))
+            return await load_run_spend(connection, uuid.UUID(org_id), uuid.UUID(run_id))
 
     async def org_cost(self, org_id: str, since: datetime) -> Decimal:
         return await self._cost(
@@ -178,6 +168,10 @@ class PostgresUsageStore:
         async with self._engine.connect() as connection:
             limits = (await connection.execute(query)).scalar_one_or_none()
         return OrgLimits.model_validate(limits or {})
+
+    async def authority(self, org_id: str, run_id: str) -> Authority:
+        async with self._engine.connect() as connection:
+            return await load_authority(connection, uuid.UUID(org_id), uuid.UUID(run_id))
 
     async def _cost(self, *where: ColumnElement[bool]) -> Decimal:
         query = select(func.coalesce(func.sum(ModelCall.cost_usd), 0)).where(*where)

@@ -30,6 +30,7 @@ from starlette.types import Receive, Scope, Send
 from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
 from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
 from sama.modelproxy.usage import Endpoint, UsageReader, estimate_counts
+from sama.tenancy.authority import Authority, budget_problem, lower
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
 from sama.vault.store import OrgKeys, SecretName
 
@@ -37,6 +38,8 @@ log = logging.getLogger("sama.modelproxy")
 
 MAX_REQUEST_BYTES: Final = 32 * 1024 * 1024
 BUDGET_STATUS: Final = 402
+REVOKED_STATUS: Final = 403
+"""The status of a call when the run has no authority now: it ended, or its user lost access."""
 QUEUE_CHUNKS: Final = 16
 """The pump holds at most this many response chunks for a slow client. Then it waits."""
 CLOSE_WAIT_S: Final = 5.0
@@ -296,8 +299,10 @@ class ModelProxy:
         claims = self._verify(request)
         body, request_bytes = await self._body(request)
         model = self._check(route, body)
+        # Every route needs live authority. Only the recorded routes spend the budget.
+        authority = await self._check_authority(claims)
         if route.recorded:
-            await self._check_budget(claims)
+            await self._check_budget(claims, authority)
         stream = body.get("stream") is True
         if route.provider is Provider.OPENAI:
             # `auto` can use a tier of the project with other prices, so the proxy asks for the
@@ -444,27 +449,41 @@ class ModelProxy:
             _allowed(body, "service_tier", _OPENAI_TIERS)
         return model
 
-    async def _check_budget(self, claims: RunTokenClaims) -> None:
+    async def _check_authority(self, claims: RunTokenClaims) -> Authority:
+        """Live authority (Section 5.1): a cancel or a lost membership stops the next call.
+        Fails closed: a store that cannot read refuses the call."""
+        try:
+            authority = await self._store.authority(claims.org_id, claims.run_id)
+        except Exception:
+            log.exception("the authority check failed run=%s", claims.run_id)
+            raise ProxyError(503, "api_error", "the proxy cannot check the run now") from None
+        if authority.problem is not None:
+            raise ProxyError(REVOKED_STATUS, "permission_error", authority.problem)
+        return authority
+
+    async def _check_budget(self, claims: RunTokenClaims, authority: Authority) -> None:
         """Fails closed: a store that cannot read, or a record that the store did not take,
         refuses the call."""
         await self._flush()
         if any(call.org_id == claims.org_id for call in self.unrecorded):
             raise ProxyError(503, "api_error", "the proxy cannot record usage now")
         try:
-            await self._check_limits(claims)
+            await self._check_limits(claims, authority)
         except ProxyError:
             raise
         except Exception:
             log.exception("the budget check failed run=%s", claims.run_id)
             raise ProxyError(503, "api_error", "the proxy cannot check the budget now") from None
 
-    async def _check_limits(self, claims: RunTokenClaims) -> None:
-        if claims.max_tokens is not None or claims.max_cost_usd is not None:
+    async def _check_limits(self, claims: RunTokenClaims, authority: Authority) -> None:
+        # A lower live budget applies at once (Section 5.1).
+        max_tokens = lower(claims.max_tokens, authority.max_tokens)
+        max_cost_usd = lower(claims.max_cost_usd, authority.max_cost_usd)
+        if max_tokens is not None or max_cost_usd is not None:
             spend = await self._store.run_spend(claims.org_id, claims.run_id)
-            if claims.max_tokens is not None and spend.tokens >= claims.max_tokens:
-                raise _budget("the run reached max_tokens")
-            if claims.max_cost_usd is not None and spend.cost_usd >= claims.max_cost_usd:
-                raise _budget("the run reached max_cost_usd")
+            problem = budget_problem(spend.tokens, spend.cost_usd, max_tokens, max_cost_usd)
+            if problem is not None:
+                raise _budget(problem)
         limits = await self._store.org_limits(claims.org_id)
         now = self._clock()
         monthly, daily, user = (

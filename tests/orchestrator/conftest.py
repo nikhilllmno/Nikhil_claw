@@ -92,6 +92,7 @@ async def add_tenant(engine: AsyncEngine, *, budget: dict[str, Any] | None = Non
                 "runtime": "fake",
                 "model": "fake-model",
                 "soul": "You are a test agent.",
+                "toolsets": ["core", "todo", "web", "clarify"],
                 "budget": budget or {},
             },
         ),

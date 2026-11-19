@@ -53,6 +53,7 @@ NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 
 
 class GateStep(StrEnum):
+    AUTHORITY = "authority"
     TOOLSET = "toolset"
     HARDLINE = "hardline"
     RECORDED = "recorded"
@@ -109,6 +110,9 @@ class GateContext:
     """Tools that a human pre-approved for this job version (Section 12.1). Jobs come in M3,
     so today the set is always empty."""
     recorded: Recorded | None = None
+    revoked: str | None = None
+    """Why the run has no authority now (Section 5.1), or ``None``. See
+    ``sama.tenancy.authority``."""
 
 
 def canonical_name(tool_name: str) -> str:
@@ -142,19 +146,44 @@ def arguments_digest(arguments: Mapping[str, Any]) -> str:
 def decide(context: GateContext, tool_name: str, arguments: Mapping[str, Any]) -> Verdict:
     """The verdict for one call. The steps run in the order of Section 16.1."""
     name = canonical_name(tool_name)
-    if name not in tools_of(context.toolsets):
-        return Verdict("deny", GateStep.TOOLSET, f"{name} is not in the toolsets of this run")
+    early = _authority_and_toolset(context, name)
+    if early is not None:
+        return early
     problem = hardline_problem(name, arguments)
     if problem is not None:
         return Verdict("deny", GateStep.HARDLINE, f"the command is on the hardline list: {problem}")
-    verdict = _recorded(context.recorded, name, arguments) or policy_verdict(context.rules, name)
+    return _after_hardline(context, name, arguments_digest(arguments))
+
+
+def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdict:
+    """The verdict again for a call that a human decided, before the run resumes. It has
+    all the steps of ``decide`` except the hardline step. That step ran at the first check of
+    the call, and its result depends only on the tool name and the arguments."""
+    name = canonical_name(tool_name)
+    return _authority_and_toolset(context, name) or _after_hardline(context, name, digest)
+
+
+def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
+    if context.revoked is not None:
+        return Verdict("deny", GateStep.AUTHORITY, context.revoked)
+    if name not in tools_of(context.toolsets):
+        return Verdict("deny", GateStep.TOOLSET, f"{name} is not in the toolsets of this run")
+    return None
+
+
+def _after_hardline(context: GateContext, name: str, digest: str) -> Verdict:
+    # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
+    policy = policy_verdict(context.rules, name)
+    if policy.action == "deny":
+        return policy
+    verdict = _recorded(context.recorded, name, digest) or policy
     return _in_context(context, name, verdict)
 
 
-def _recorded(recorded: Recorded | None, name: str, arguments: Mapping[str, Any]) -> Verdict | None:
+def _recorded(recorded: Recorded | None, name: str, digest: str) -> Verdict | None:
     if recorded is None:
         return None
-    if recorded.tool_name != name or recorded.arguments_digest != arguments_digest(arguments):
+    if canonical_name(recorded.tool_name) != name or recorded.arguments_digest != digest:
         return Verdict("deny", GateStep.RECORDED, "the approval is for another call")
     match recorded.status:
         case "approved":

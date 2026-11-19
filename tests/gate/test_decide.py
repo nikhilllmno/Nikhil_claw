@@ -17,6 +17,7 @@ from sama.gate import (
     canonical_name,
     command_problem,
     decide,
+    decide_recorded,
     policy_verdict,
 )
 from sama.gate.hardline import MAX_COMMAND_CHARS
@@ -242,10 +243,54 @@ def test_a_recorded_decision_gives_the_verdict(status: str, action: str) -> None
     assert (verdict.action, verdict.step) == (action, GateStep.RECORDED)
 
 
-def test_a_recorded_decision_beats_a_policy_deny() -> None:
+def test_a_policy_deny_beats_a_recorded_approval() -> None:
+    """A newer deny rule applies at once, also to an approved call (Section 5.1)."""
     recorded = Recorded("approved", "Bash", arguments_digest(ARGS))
     verdict = decide(context(rules=(rule("Bash", "deny"),), recorded=recorded), "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+
+
+def test_a_recorded_approval_beats_a_policy_ask() -> None:
+    recorded = Recorded("approved", "Bash", arguments_digest(ARGS))
+    verdict = decide(context(rules=(rule("Bash", "ask"),), recorded=recorded), "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("allow", GateStep.RECORDED)
+
+
+def test_the_recorded_tool_name_is_compared_in_canonical_form() -> None:
+    recorded = Recorded("approved", "mcp__sama__web_search", arguments_digest({"query": "q"}))
+    verdict = decide(context(recorded=recorded), "web_search", {"query": "q"})
     assert verdict.action == "allow"
+
+
+# -- step 0: authority ------------------------------------------------------------------------
+
+
+def test_a_revoked_run_is_denied_before_any_other_step() -> None:
+    recorded = Recorded("approved", "Bash", arguments_digest({"command": "rm -rf /"}))
+    revoked = context(revoked="the run ended", recorded=recorded)
+    verdict = decide(revoked, "Bash", {"command": "rm -rf /"})
+    assert (verdict.action, verdict.step, verdict.reason) == (
+        "deny",
+        GateStep.AUTHORITY,
+        "the run ended",
+    )
+    assert next(iter(GateStep)) is GateStep.AUTHORITY
+
+
+def test_decide_recorded_uses_the_digest_and_skips_the_hardline_step() -> None:
+    digest = arguments_digest(ARGS)
+    recorded = Recorded("approved", "Bash", digest)
+    assert decide_recorded(context(recorded=recorded), "Bash", digest).action == "allow"
+    other = decide_recorded(context(recorded=recorded), "Bash", arguments_digest({}))
+    assert (other.action, other.step) == ("deny", GateStep.RECORDED)
+    denied = decide_recorded(
+        context(recorded=recorded, rules=(rule("Bash", "deny"),)), "Bash", digest
+    )
+    assert denied.step is GateStep.POLICY
+    outside = decide_recorded(context(recorded=recorded, toolsets=frozenset()), "Bash", digest)
+    assert outside.step is GateStep.TOOLSET
+    revoked = decide_recorded(context(recorded=recorded, revoked="no"), "Bash", digest)
+    assert revoked.step is GateStep.AUTHORITY
 
 
 @pytest.mark.parametrize(

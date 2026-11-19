@@ -98,6 +98,18 @@ def verify_bearer(signer: RunTokenSigner, headers: Mapping[str, str] | None) -> 
     return signer.verify(token)
 
 
+def _raw_arguments(ctx: Context, parsed: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The arguments of the MCP request as the client sent them. The runner hook checked
+    these, so the ticket digest matches them (Section 16.1). The parsed arguments have
+    defaults filled in, so they are only the fallback."""
+    try:
+        params = ctx.request_context.params
+    except ValueError:
+        return parsed
+    raw = params.get("arguments") if params is not None else None
+    return raw if isinstance(raw, Mapping) else parsed
+
+
 def quiet_dependency_logs() -> None:
     """HTTPX logs full URLs (search queries and page URLs), and the MCP SDK logs tool error
     messages. Both can hold user data, so the server keeps only their warnings."""
@@ -190,7 +202,7 @@ class ToolServer:
         size = 0
         try:
             if self.gate is not None:
-                verdict = await self.gate.screen(claims, tool, arguments)
+                verdict = await self.gate.screen(claims, tool, _raw_arguments(ctx, arguments))
                 if verdict.action == "deny":
                     raise ToolError(f"the tool gate denied the call: {verdict.reason}")
             # Redact first, so a secret never reaches the model, the spill file, or a log.

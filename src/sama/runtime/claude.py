@@ -928,7 +928,8 @@ class ClaudeRuntime:
             arguments = raw.get("tool_input") or {}
             call_id = str(raw.get("tool_use_id") or tool_use_id or "")
             if call_id and call_id == phase.approved_call:
-                # A human approved this call. The orchestrator checked authority again.
+                # A human approved this call. The worker checked it again before the resume
+                # (GateService.reconfirm), and that check made the ticket of the call.
                 decision = GateDecision("allow", "approved by the user")
             else:
                 try:

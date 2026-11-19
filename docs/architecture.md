@@ -439,7 +439,8 @@ RunEvent = (
 - **Authority is not frozen.** The control plane checks membership, connection access,
   approval policy, budgets, and revocations again at every tool call, model call, and
   approval resume. A newer `deny` or a lower budget applies at once, also to long-lived
-  sessions. A tool that is still in the frozen schema but is no longer allowed gets `deny`
+  sessions. Section 16.1 has the code (M1.18). Connection access comes with connections
+  (M3.4). A tool that is still in the frozen schema but is no longer allowed gets `deny`
   from the tool gate.
 - Every event carries running `Usage` for the whole run. The stream ends with exactly one of
   `ApprovalRequired`, `RunCompleted`, or `RunFailed` (with a `FailureCode`). Usage never goes
@@ -1505,10 +1506,13 @@ back the user's view of its own work.
 
 Every tool call passes one gate, in this order. Each tool call id gets exactly one verdict.
 
+0. **Authority** (M1.18): the run must not be ended, the run user must still see the
+   session, and the run must not have spent its live budget. Otherwise `deny`.
 1. **Toolset**: the tool must be in the run's toolsets. Otherwise `deny`.
 2. **Hardline**: a fixed deny list that nothing overrides (for example `rm -rf /`, fork
    bombs, disk wipes, piping a remote script to a shell as root).
-3. **Recorded decision**: a one-time human decision for this call id, if any.
+3. **Recorded decision**: a one-time human decision for this call id, if any. A `deny`
+   policy rule wins over a recorded approval, so a newer deny applies at once (Section 5.1).
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
    mode. The default for unknown tools is `ask`.
@@ -1523,9 +1527,9 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 
 | Part | Where | What it does |
 |---|---|---|
-| Verdict | `src/sama/gate/decide.py` | `decide(context, tool_name, arguments)` is a pure function. It runs the five steps and returns a `Verdict` (`action`, `step`, `reason`). |
+| Verdict | `src/sama/gate/decide.py` | `decide(context, tool_name, arguments)` is a pure function. It runs the steps 0 to 5 and returns a `Verdict` (`action`, `step`, `reason`). `decide_recorded` is the same without the hardline step. |
 | Hardline | `src/sama/gate/hardline.py` | The fixed deny list for shell commands (`Bash`). |
-| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals. A run that is unknown or ended (`completed`, `failed`, `cancelled`) gets `deny` with no audit row (Section 4.3). |
+| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals, checks approved calls again before a resume (`reconfirm`), and keeps the tickets of the tool server. A run that is unknown or ended (`completed`, `failed`, `cancelled`) gets `deny` with no audit row (Section 4.3). |
 | Wire | `src/sama/gate/wire.py` | `GateRequest` and `GateAnswer`, the body of `POST /gate`. |
 | Endpoint | `src/sama/tools/server.py` | `POST /gate` on the sama tool server. The runner sends the run token. |
 | Runner | `src/sama/runtime/remote_gate.py` | `RemoteGate` is the `ToolGate` of the runner. It posts each call to `/gate`. |
@@ -1612,12 +1616,37 @@ Approvals:
 
 **Tool server check.** Before each sama MCP tool call, the tool server calls
 `GateService.screen`, which runs the same steps without a call id. The server refuses
-`deny`. It lets `ask` through, because the hook of the runner asked already.
+`deny`. On `ask`, the server needs a ticket (M1.18, below). The digest of the ticket uses the
+arguments of the MCP request as the client sent them, not the parsed arguments with defaults.
 
-**Known gaps (M1.18).** A process in the sandbox has the run token, so it can call an `ask`
-tool of the sama MCP server directly in an attended run. On resume the Claude adapter allows
-the approved call without a new gate check, so the server has no ticket for that call. Live
-authority checks and per-call tickets close both gaps in M1.18.
+**Live authority (M1.18).** `sama.tenancy.authority.load_authority` reads the live
+authority of a run: the run status, the access of the run user (the rule of
+`session_visible`, with `load_grants`), and the live budget. The run user is
+`runs.triggered_by_user_id`, or the owner of a private session. The live budget is the lower
+of `runs.budget` and the budget of the agent profile, for `max_tokens` and `max_cost_usd`.
+
+- `GateService.check` and `screen` give `deny` at the authority step when the run ended, the
+  run user lost access, or the recorded model calls of the run reached the live budget.
+- The model proxy refuses a call with `403` (`permission_error`) when the run ended or the
+  run user lost access. This applies to every route, also to the free `count_tokens` route.
+  A store that cannot read the authority gives `503`. It uses the lower of the token budget and the live budget, so a lower
+  budget applies at the next call.
+- Before an approve resume, the worker calls `GateService.reconfirm(org_id, run_id,
+  call_id)`. It runs `decide_recorded`: all steps except the hardline step, which ran at the
+  first check. The user rules are the rules of the run user, as for the live authority. A
+  `deny` (for example a newer deny rule, or a lost membership) turns the resume into a
+  `reject` with the reason. A failed check, or a check longer than 10 seconds, also rejects.
+  The check runs before the dispatch, so the dispatch checks the lease just before the start. An audit row
+  `tool_gate.reconfirm` records the verdict.
+- **Tickets.** On `allow`, `reconfirm` writes `decision = allow` and `status = started` to
+  the `tool_calls` row of the call (it makes the row if the runtime reported an approval that
+  the gate did not check). That row is the ticket of the call. When `screen` gives `ask`, the
+  tool server takes one ticket of the run with the same tool name and arguments digest and an
+  `approved` approval, and sets the row to `finished`. Without a ticket, `ask` becomes `deny`.
+  So a process in the sandbox cannot call an `ask` sama tool with the run token alone. A used
+  ticket stays `finished`: a check of the same call id again does not make a new ticket. A
+  process in the sandbox can use the ticket before the model does, but only for the same tool
+  and arguments that the human approved.
 
 ### 16.2 Sandbox and runner (M1.6)
 
@@ -1902,8 +1931,11 @@ queue writes the `runs` rows (Section 4.3). Local runs and tests without a datab
 in-memory store.
 
 **Keys (M1.17).** The proxy uses the org key from the vault first and the key from its
-environment second (Section 16.3). The Langfuse traces (M1.14, Section 18.2) read these rows. The live checks of membership and revocations
-come in M1.18. The proxy prices only the costs that the table lists. For example, OpenAI
+environment second (Section 16.3). The Langfuse traces (M1.14, Section 18.2) read these rows.
+
+**Live authority (M1.18).** Before each call, the proxy reads the live authority of the run
+(Section 16.1). A run that ended (a cancel ends the run) or a run user who lost access gets
+`403` on every route, also on `count_tokens`. The run limits are the lower of the token claims and the live budget. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 
 ### 16.7 Sama MCP tool server (M1.8)

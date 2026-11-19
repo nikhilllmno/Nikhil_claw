@@ -29,15 +29,16 @@ import socket
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from sama.gate.service import GateService
 from sama.observability.logs import log_context
-from sama.orchestrator.queue import ClaimedRun, Lease, RunQueue
+from sama.orchestrator.queue import ClaimedRun, Lease, Resume, RunQueue
 from sama.prompt import PromptAssembler
 from sama.runtime.contract import (
     AgentRuntime,
+    ApprovalDecision,
     ApprovalRequired,
     Audience,
     Budget,
@@ -66,6 +67,9 @@ RunEndHook = Callable[[str, str], None]
 
 MAX_FAILURE_CHARS: Final = 2_000
 FLUSH_EVENTS: Final = 50
+RECONFIRM_TIMEOUT_S: Final = 10.0
+"""The longest wait for the check of an approved call before a resume. It is shorter than
+the default lease, and a slow check rejects the call."""
 
 
 def default_owner() -> str:
@@ -230,6 +234,9 @@ class Worker:
             message = redact(f"the run cannot start: {error}")[:MAX_FAILURE_CHARS]
             await self._fail(run, FailureCode.INVALID_REQUEST, message, Usage())
             return
+        # The check comes before the dispatch: the dispatch then checks the lease just before
+        # the start, so a slow check cannot start a run that another attempt owns now.
+        run = await self._reconfirm(run)
         if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
@@ -262,6 +269,32 @@ class Worker:
             log.warning("the worker lost the lease; it writes no result run=%s", run.run_id)
             return
         await self._finish(run, terminal, usage, watch)
+
+    async def _reconfirm(self, run: ClaimedRun) -> ClaimedRun:
+        """Checks an approved call again before the resume (Section 5.1). Authority is live,
+        so a newer deny rule, a lost membership, or a spent budget turns the approve into a
+        reject. A failed or slow check (``RECONFIRM_TIMEOUT_S``) also rejects."""
+        resume = run.resume
+        if resume is None or resume.decision is not ApprovalDecision.APPROVE:
+            return run
+        try:
+            async with asyncio.timeout(RECONFIRM_TIMEOUT_S):
+                verdict = await self._gate.reconfirm(
+                    org_id=run.org_id, run_id=run.run_id, call_id=resume.approval_id
+                )
+            action, reason = verdict.action, verdict.reason
+        except Exception as error:
+            log.warning("the check before the resume failed run=%s: %r", run.run_id, error)
+            action, reason = "deny", "the tool gate failed"
+        if action == "allow":
+            return run
+        log.warning("the approved call is denied now run=%s: %s", run.run_id, reason)
+        reject = Resume(
+            resume.approval_id,
+            ApprovalDecision.REJECT,
+            f"the tool gate denies the approved call now: {reason}",
+        )
+        return replace(run, resume=reject)
 
     async def _finish(
         self, run: ClaimedRun, terminal: RunEvent | None, usage: Usage, watch: _Watch

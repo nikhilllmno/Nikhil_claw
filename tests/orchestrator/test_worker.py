@@ -10,11 +10,12 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Approval, Message, Run, RunEvent
+from sama.db.models import Approval, Message, Run, RunEvent, ToolPolicy
 from sama.gate.service import GateService
+from sama.orchestrator import worker as worker_module
 from sama.orchestrator.queue import RunQueue
 from sama.orchestrator.worker import MAX_FAILURE_CHARS, Worker
 from sama.runtime.contract import (
@@ -169,12 +170,106 @@ async def test_an_approval_pauses_and_resumes_the_run(
     resume = harness.runtime.requests[1]
     assert isinstance(resume, ResumeRequest)
     assert (resume.approval_id, resume.runtime_state) == ("call-9", b"at-the-pause")
+    expected = ApprovalDecision.APPROVE if approve else ApprovalDecision.REJECT
+    assert resume.decision is expected
     row = await harness.run(run_id)
     assert (row.status, row.pending_approval_id) == ("completed", None)
     assert [seq for seq, _ in await harness.events(run_id)] == [0, 1, 2]
     assert harness.ended == [(str(tenant.org), str(run_id))]
     assert await harness.worker.run_once()
     assert harness.runtime.requests[2].input == "next"  # type: ignore[union-attr]
+
+
+async def test_a_deny_rule_after_the_approval_turns_the_resume_into_a_reject(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    """Live authority (Section 5.1): the worker checks the approved call again."""
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    gate = GateService(engine)
+    await gate.decide_approval(
+        org_id=tenant.org, run_id=run_id, call_id="call-9", user_id=tenant.ids["mia"], approve=True
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(ToolPolicy).values(org_id=tenant.org, tool="Bash", action="deny")
+        )
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    resume = harness.runtime.requests[-1]
+    assert isinstance(resume, ResumeRequest)
+    assert resume.decision is ApprovalDecision.REJECT
+    assert resume.reason is not None
+    assert "a policy rule denies Bash" in resume.reason
+    assert (await harness.run(run_id)).status == "completed"
+
+
+async def test_a_failed_reconfirm_rejects_the_resume(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    await GateService(engine).decide_approval(
+        org_id=tenant.org, run_id=run_id, call_id="call-9", user_id=tenant.ids["mia"], approve=True
+    )
+
+    async def broken(**_: Any) -> Any:
+        raise RuntimeError("the database is down")
+
+    harness.worker._gate.reconfirm = broken  # type: ignore[method-assign]
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    resume = harness.runtime.requests[-1]
+    assert isinstance(resume, ResumeRequest)
+    assert resume.decision is ApprovalDecision.REJECT
+    assert resume.reason is not None
+    assert "the tool gate failed" in resume.reason
+
+
+async def test_a_slow_reconfirm_rejects_the_resume(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    await GateService(engine).decide_approval(
+        org_id=tenant.org, run_id=run_id, call_id="call-9", user_id=tenant.ids["mia"], approve=True
+    )
+
+    async def slow(**_: Any) -> Any:
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(worker_module, "RECONFIRM_TIMEOUT_S", 0.05)
+    harness.worker._gate.reconfirm = slow  # type: ignore[method-assign]
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    resume = harness.runtime.requests[-1]
+    assert isinstance(resume, ResumeRequest)
+    assert resume.decision is ApprovalDecision.REJECT
+
+
+async def test_a_lease_lost_during_reconfirm_starts_no_resume(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    gate = GateService(engine)
+    await gate.decide_approval(
+        org_id=tenant.org, run_id=run_id, call_id="call-9", user_id=tenant.ids["mia"], approve=True
+    )
+
+    async def taken(**kwargs: Any) -> Any:
+        async with engine.begin() as connection:
+            await connection.execute(update(Run).where(Run.id == run_id).values(lease_owner="w2"))
+        return await gate.reconfirm(**kwargs)
+
+    harness.worker._gate.reconfirm = taken  # type: ignore[method-assign]
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    assert len(harness.runtime.requests) == 1, "the worker started a run it does not own"
 
 
 async def test_a_user_cancels_a_running_run(engine: AsyncEngine, tenant: Tenant) -> None:

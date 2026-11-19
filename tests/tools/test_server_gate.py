@@ -129,7 +129,9 @@ async def test_the_server_refuses_a_tool_call_that_the_gate_denies(server: Serve
         result = await client.call_tool("todo", {})
     assert result.is_error
     assert "the tool gate denied the call: an unattended run cannot ask" in text_of(result)
-    assert server.gate.screens == [("todo", {"todos": None, "merge": False})]
+    # The gate gets the arguments as the client sent them, without the defaults of the tool,
+    # so the digest is the digest of the hook (and of the ticket).
+    assert server.gate.screens == [("todo", {})]
 
 
 async def test_the_server_runs_a_tool_call_on_ask_or_allow(server: Server) -> None:
