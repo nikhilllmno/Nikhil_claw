@@ -114,10 +114,16 @@ def tools_of(toolsets: Iterable[str]) -> frozenset[str]:
     return frozenset(tools)
 
 
+def json_default(value: Any) -> Any:
+    """The ``default`` of ``json.dumps`` for arguments. A read-only mapping (the arguments of a
+    runtime event) becomes a dict, so it gives the same JSON as a plain dict."""
+    return dict(value) if isinstance(value, Mapping) else str(value)
+
+
 def arguments_digest(arguments: Mapping[str, Any]) -> str:
     """A stable SHA-256 hex digest of the arguments."""
     canonical = json.dumps(
-        arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=json_default
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

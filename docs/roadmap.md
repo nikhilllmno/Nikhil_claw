@@ -39,12 +39,12 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.11.
+Done: M1.1 to M1.12.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
-  Supabase Data API is in `tests/db/test_supabase_live.py`. The sama HTTP API repeats it in
-  M1.12.
+  Supabase Data API is in `tests/db/test_supabase_live.py`. The sama HTTP API repeats it
+  (M1.12, `tests/api/`).
 - M1.3: contract in `src/sama/runtime/contract.py`, fake runtime in `src/sama/runtime/fake.py`.
 - M1.4: Claude adapter in `src/sama/runtime/claude.py` (architecture Section 5.3). Live tests
   of the adapter run with `SAMA_LIVE_TESTS=1 uv run --all-groups pytest -m live`.
@@ -74,13 +74,20 @@ Done: M1.1 to M1.11.
   `src/sama/orchestrator/worker.py` (architecture Section 4.3), with the queue columns of
   `runs` and `sessions.sandbox_id` (migration `0005`). `PostgresSandboxDirectory` stores the
   sandbox of each session. A crashed run starts again only if the worker did not start the
-  runner (`runs.dispatched_at`). Per-org concurrency and rate limits come with the API (M1.12). The
-  deploy (M1.15) applies migrations `0004` to `0006` to Supabase.
+  runner (`runs.dispatched_at`). The deploy (M1.15) applies migrations `0004` to `0007` to
+  Supabase.
 - M1.11: prompt assembly in `src/sama/prompt/` (architecture Section 6.1). The first run of a
   session builds the `RunConfig` and stores it in `sessions.run_config` (migration `0006`).
   Later runs reuse it. Context files come from the table `context_files`, with the injection
   scan and the 20,000-character cap. Channel hints come with M1.13, repo `AGENTS.md` files
   with M1.16, and memory and skills later.
+- M1.12: the HTTP API and the minimal web page in `src/sama/api/` (architecture Section 11.4).
+  It checks Supabase Auth tokens (legacy secret or JWKS), reads with RLS and checks access in
+  code (`src/sama/tenancy/access.py`), streams run events as server-sent events, and decides
+  approvals. The per-org running and message limits are in `orgs.limits` (Section 4.3,
+  migration `0007`). The page at `/` has no build step. The Next.js app replaces it in M3.
+  The deploy (M1.15) runs the API, the worker, and the tool server in one process, so that the
+  API answers `clarify` questions.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

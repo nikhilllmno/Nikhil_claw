@@ -358,8 +358,25 @@ approval id. No worker can continue such a run, so the upgrade ends each one as 
 `sessions.sandbox_id`. With it, `SandboxedRuntime` in a new process finds the sandbox of the
 session and does not create a new one (Section 16.2).
 
-**Not in M1.10.** Per-org concurrency limits and rate limits come with the API (M1.12). The
-clarify broker stays in memory (Section 16.7). Since M1.11, the worker gets the `RunConfig`
+**Per-org limits (M1.12).** `orgs.limits` (JSON) sets three limits. A missing or bad value
+uses the default (`sama.orchestrator.limits.QueueLimits`):
+
+| Key | Default | Rule |
+|---|---|---|
+| `max_running_runs` | 5 | At most this many runs of the org are `running` at the same time. |
+| `user_messages_per_minute` | 20 | At most this many runs of one user start in 60 seconds. |
+| `org_messages_per_minute` | 120 | At most this many runs of the org start in 60 seconds, also from jobs. |
+
+- `enqueue` counts the runs of the last 60 seconds under an advisory lock per org, so two
+  messages at the same time cannot both take the last place. Over a limit it raises
+  `RateLimitedError` with the seconds to wait. The API answers `429` with `Retry-After`.
+- `claim` skips the orgs that are at `max_running_runs`. It takes an advisory lock per org and
+  counts again before it starts the run, so two workers cannot both take the last place. A
+  `paused` run does not count, because it holds no worker.
+- Migration `0007` adds the index `runs (org_id, created_at)` for the rate count and the
+  partial index `ix_runs_running_per_org` for the running count.
+
+**Not in M1.10.** The clarify broker stays in memory (Section 16.7). Since M1.11, the worker gets the `RunConfig`
 from the prompt assembler (Section 6.1). The worker stores the config fingerprint on the run
 when it dispatches the run.
 
@@ -1068,6 +1085,73 @@ One gateway service hosts all channel adapters. Each adapter does five things:
   A user finds only sessions whose audience includes the user. A job delivers to a shared
   target only output from a shared-audience run.
 
+### 11.4 HTTP API and minimal web page (M1.12)
+
+`sama.api.SamaApi` is the FastAPI app of the control plane. `python -m sama.api` starts it.
+
+**Auth.** Each request except `/`, `/static/*`, `/config`, and `/healthz` needs a Supabase Auth
+access token in `Authorization: Bearer`. `JwtVerifier` checks it:
+
+- `HS256` only with the legacy JWT secret of the project (`SAMA_SUPABASE_JWT_SECRET`). `ES256`
+  and `RS256` only with a key of the project JWKS
+  (`<supabase>/auth/v1/.well-known/jwks.json`), found by `kid`. Thus a token cannot choose an
+  HMAC check with a public key. Other algorithms, also `none`, are refused.
+- The token needs `exp`, `sub` (a UUID), `aud = authenticated`, `role = authenticated`, and the
+  issuer `<supabase>/auth/v1`. An anonymous user (`is_anonymous`) is refused.
+- The JWKS is cached for 10 minutes. An unknown `kid` fetches it again, at most every 30
+  seconds, so a key rotation works without a restart. If a fetch fails, the old keys stay.
+
+**Two guards.** For each session the API reads as the user (`sama.db.as_user`), so RLS applies.
+In the same transaction it finds the user row of the token in the org of the session and
+checks the memberships with `sama.tenancy.access.Grants`, the code copy of the RLS helpers.
+A session that the user cannot read gets `404`, the same answer as a session that does not
+exist. Writes go through `RunQueue` and `GateService`, after both checks. The tests repeat the
+cross-org check of Section 17.1 through the API.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /config` | The Supabase URL and the public anon key, for the web page. |
+| `GET /me` | The orgs, workspaces, and agent profiles that the user can see. |
+| `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
+| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. |
+| `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
+| `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id`). At most 32,000 characters. `429` over a rate limit. `409` for an archived session. |
+| `GET /sessions/{id}/events` | Server-sent events (below). |
+| `POST /runs/{id}/cancel` | `RunQueue.cancel`. |
+| `GET /sessions/{id}/approvals` | The pending approvals. |
+| `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_approval`, then `RunQueue.release_decided`. `always_allow` writes the user rule. `409` if the approval is decided or expired. |
+| `GET /sessions/{id}/questions`, `POST .../questions/{request_id}/answer` | The open `clarify` questions of the session, when the process has a `ClarifyBroker` (Section 16.7). |
+
+**Event stream.** `GET /sessions/{id}/events` sends `text/event-stream`:
+
+- `run_event`: one row of `run_events` (`run_id`, `seq`, `type`, `payload`). The SSE `id` is
+  `run_events.id`. One worker writes the events of a session at a time, so the ids of a session
+  grow in the order of the commits. A client continues with `Last-Event-ID` or `?after=`.
+  Without a cursor the stream starts after the last stored event.
+- `run`: the status of a run changed (`status`, `failure_code`, `failure_message`). The first
+  poll sends the open runs.
+- `end`: the user cannot read the session any more. The stream ends.
+
+The stream reads new rows every 0.5 seconds, sends `: ping` every 15 seconds, checks the access
+again at each read, and ends after one hour. The client then connects again.
+
+**Web page.** The API serves a minimal page at `/` (`src/sama/api/static/`): sign-in, a session
+list, new session, chat with streamed text, approval cards (Approve, Always allow, Deny),
+`clarify` answers, and a stop button. It has no build step and no third-party code:
+
+- Sign-in uses the Supabase Auth REST API: email and password
+  (`/auth/v1/token?grant_type=password`), a sign-in link (`/auth/v1/otp`), and token refresh.
+  A form for an access token helps in development. The tokens stay in `sessionStorage`.
+- The stream uses `fetch`, because `EventSource` cannot send the `Authorization` header.
+- The page sets text with `textContent` only. The Content Security Policy allows scripts only
+  from the API origin and connections only to the API and the Supabase project.
+
+The Next.js app in `web/` replaces this page in M3. The web app keeps the same API.
+
+**Not in M1.12.** `python -m sama.api` runs only the API. The deploy (M1.15) puts the API, the
+worker, and the tool server in one control plane process, so that the API answers the
+`clarify` questions of the tool server. API keys for services come later.
+
 ---
 
 ## 12. Scheduler, cron jobs, and workflows
@@ -1351,8 +1435,9 @@ Approvals:
   the audit row `tool_policy.set`.
 - `GateService.expire()` times out due approvals in batches of 500. The worker maintenance
   calls it (Section 4.3). The gate also times out an approval when it reads it.
-- The API (M1.12) and the channels (M1.13) call `decide_approval` and then
-  `RunQueue.release_decided(org_id, run_id)`, which queues the run for its resume. The worker
+- The API (M1.12, Section 11.4) and the channels (M1.13) call `decide_approval` and then
+  `RunQueue.release_decided(org_id, run_id)`, which queues the run for its resume. The API
+  also calls it after `ApprovalExpiredError`, so the run resumes as `reject` at once. The worker
   maintenance also queues decided runs, so a missed call only delays the resume.
 
 **Tool server check.** Before each sama MCP tool call, the tool server calls
@@ -1642,8 +1727,8 @@ the write fails, the note says that the full output was not kept. The spill uses
 itself, for example for arguments that are not valid. The server cuts each error text to
 2,000 characters.
 
-**Clarify broker.** `ClarifyBroker` keeps the open questions in memory. The API (M1.12) and the
-channels (M1.13) list them with `pending(org_id, session_id)` and answer them with
+**Clarify broker.** `ClarifyBroker` keeps the open questions in memory. The API (M1.12, Section
+11.4) and the channels (M1.13) list them with `pending(org_id, session_id)` and answer them with
 `answer(request_id, answers)`. A cancel of the run or a timeout ends the wait. A run waits on
 one `clarify` call at a time: a new call of the same run ends the open call of that run, and
 the old call returns "no answer". When a run ends, the orchestrator calls
@@ -1771,7 +1856,7 @@ Row-level security:
 - Tests: `tests/db/` runs the migration and the RLS tests on a local Postgres with a small
   Supabase Auth shim (`tests/db/supabase_shim.sql`). CI runs them with a Postgres service.
   A live test (`-m live`) checks isolation on the Supabase project through the Data API and
-  through SQL. The sama HTTP API repeats the check when it exists (M1.12).
+  through SQL. The sama HTTP API repeats the check in code and reads with RLS (Section 11.4).
 
 ---
 
@@ -1811,14 +1896,14 @@ Repository layout (planned):
 
 ```text
 src/sama/
-  api/            # FastAPI routers
+  api/            # HTTP API, Supabase Auth tokens, minimal web page (M1.12)
   gateway/        # channel adapters: web, slack, telegram, extension
   orchestrator/   # run queue, sandbox lifecycle, events (M1.6: sandboxed.py)
   sandbox/        # sandbox providers: base, e2b, docker, local, template build
   runtime/        # contract, claude adapter, openai adapter, fake, runner entry point
   tools/          # sama MCP server and tool packs (M1.8: server, web, todo, clarify, outbound)
   memory/  skills/  sessions/  scheduler/  workflows/  browser/  approvals/
-  modelproxy/  vault/  tenancy/ (run tokens)  observability/
+  modelproxy/  vault/  tenancy/ (run tokens, access rules)  observability/
 skills/           # builtin skills (SKILL.md folders)
 extension/        # Chrome extension (TypeScript)
 web/              # Next.js app

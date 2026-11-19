@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sama</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <strong>sama</strong>
+    <span id="who"></span>
+    <button id="sign-out" type="button" hidden>Sign out</button>
+  </header>
+
+  <main id="login" hidden>
+    <h1>Sign in</h1>
+    <form id="password-form">
+      <label>Email <input id="email" type="email" autocomplete="username" required></label>
+      <label>Password <input id="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+      <button id="magic-link" type="button">Send a sign-in link</button>
+    </form>
+    <details>
+      <summary>Use an access token (development)</summary>
+      <form id="token-form">
+        <label>Access token <input id="token" type="password" autocomplete="off" required></label>
+        <button type="submit">Use token</button>
+      </form>
+    </details>
+    <p id="login-status" role="status"></p>
+  </main>
+
+  <div id="app" hidden>
+    <aside>
+      <form id="new-session">
+        <label>Workspace <select id="workspace" required></select></label>
+        <label>Agent <select id="profile" required></select></label>
+        <label>Audience
+          <select id="audience">
+            <option value="private">Only me</option>
+            <option value="shared">Workspace</option>
+          </select>
+        </label>
+        <label>Title <input id="title" maxlength="200"></label>
+        <button type="submit">New session</button>
+      </form>
+      <ul id="sessions"></ul>
+    </aside>
+    <section id="chat">
+      <p id="empty">Select or create a session.</p>
+      <div id="session" hidden>
+        <h2 id="session-title"></h2>
+        <ol id="messages"></ol>
+        <div id="live" class="msg assistant" hidden></div>
+        <div id="approvals"></div>
+        <div id="questions"></div>
+        <p id="run-status" role="status"></p>
+        <form id="send">
+          <textarea id="text" rows="3" maxlength="32000" required placeholder="Write a message"></textarea>
+          <div class="row">
+            <button type="submit">Send</button>
+            <button id="cancel" type="button" hidden>Stop</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  </div>
+  <p id="error" role="alert"></p>
+</body>
+</html>

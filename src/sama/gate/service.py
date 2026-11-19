@@ -30,7 +30,6 @@ from sama.db.models import (
     AgentProfile,
     Approval,
     AuditEntry,
-    Membership,
     Run,
     Session,
     ToolCall,
@@ -47,7 +46,9 @@ from sama.gate.decide import (
     arguments_digest,
     canonical_name,
     decide,
+    json_default,
 )
+from sama.tenancy.access import load_grants
 from sama.tenancy.run_token import RunTokenClaims
 
 log = logging.getLogger("sama.gate")
@@ -56,7 +57,6 @@ APPROVAL_TTL: Final = timedelta(hours=24)
 MAX_STORED_ARGUMENT_CHARS: Final = 8_000
 """Longer arguments are stored cut. The approval keeps the digest of the full arguments."""
 EXPIRE_BATCH: Final = 500
-_ADMIN_ROLES: Final = ("owner", "admin")
 _POLICY_KEY: Final = "uq_tool_policies_org_id_agent_profile_id_user_id_tool"
 
 
@@ -97,7 +97,7 @@ def _utcnow() -> datetime:
 
 def stored_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
     """The arguments to store. Long arguments are cut, so one call cannot fill the table."""
-    text = json.dumps(arguments, ensure_ascii=False, default=str)
+    text = json.dumps(arguments, ensure_ascii=False, default=json_default)
     if len(text) <= MAX_STORED_ARGUMENT_CHARS:
         return cast(dict[str, Any], json.loads(text))
     return {"_cut": True, "preview": text[:MAX_STORED_ARGUMENT_CHARS]}
@@ -423,9 +423,8 @@ class GateService:
             ).one_or_none()
             if row is None:
                 raise ApprovalError("the approval does not exist")
-            if not await self._may_decide(
-                connection, org_id, user_id, row.workspace_id, row.audience, row.owner_user_id
-            ):
+            grants = await load_grants(connection, org_id, user_id)
+            if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
                 raise ApprovalError("this user cannot decide the approval")
             if row.status != "pending":
                 raise ApprovalError(f"the approval is already {row.status}")
@@ -460,30 +459,6 @@ class GateService:
         if status == "expired":
             raise ApprovalExpiredError("the approval timed out, so it counts as deny")
         return status
-
-    async def _may_decide(
-        self,
-        connection: AsyncConnection,
-        org_id: uuid.UUID,
-        user_id: uuid.UUID,
-        workspace_id: uuid.UUID,
-        audience: str,
-        owner_user_id: uuid.UUID | None,
-    ) -> bool:
-        """The rule of ``sama_private.session_visible`` for one user."""
-        rows = (
-            await connection.execute(
-                select(Membership.workspace_id, Membership.role).where(
-                    Membership.org_id == org_id, Membership.user_id == user_id
-                )
-            )
-        ).all()
-        org_member = any(ws is None for ws, _ in rows)
-        admin = any(ws is None and role in _ADMIN_ROLES for ws, role in rows)
-        sees = admin or (org_member and any(ws == workspace_id for ws, _ in rows))
-        if audience == "private":
-            return sees and owner_user_id == user_id
-        return sees and audience == "shared"
 
     async def _always_allow(
         self,

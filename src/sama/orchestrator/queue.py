@@ -26,6 +26,7 @@ orgs. Every other method is scoped by ``org_id``.
 from __future__ import annotations
 
 import base64
+import math
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -53,12 +54,14 @@ from sama.db.models import (
     Approval,
     AuditEntry,
     Message,
+    Org,
     Run,
     RunEvent,
     Session,
 )
 from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
+from sama.orchestrator.limits import QueueLimits
 from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
 
 DEFAULT_LEASE: Final = timedelta(seconds=30)
@@ -66,10 +69,26 @@ DEFAULT_MAX_ATTEMPTS: Final = 3
 REAP_BATCH: Final = 100
 ACTIVE_STATUSES: Final = ("running", "paused")
 EXPIRED_REASON: Final = "the approval timed out"
+RATE_WINDOW: Final = timedelta(seconds=60)
+CLAIM_TRIES: Final = 5
+"""How many candidate runs one ``claim`` tries before it gives up for this call."""
 
 
 class QueueError(Exception):
     """The queue cannot do the operation. The message is safe to show to the user."""
+
+
+class RateLimitedError(QueueError):
+    """The user or the org sent too many messages in the last 60 seconds."""
+
+    def __init__(self, message: str, retry_after_s: int) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
+def _lock(name: str, org_id: uuid.UUID) -> Any:
+    """A transaction-level advisory lock for one org and one purpose."""
+    return select(func.pg_advisory_xact_lock(func.hashtextextended(f"{name}:{org_id}", 0)))
 
 
 class Lease(StrEnum):
@@ -185,6 +204,9 @@ class RunQueue:
         The run uses the budget of the session profile. It uses the runtime of the frozen
         session config, or the runtime of the profile before the first run builds the config
         (Section 6.1). If the session has an active run, the new run waits in the queue.
+
+        Raises ``RateLimitedError`` when the user or the org is over its message rate
+        (``QueueLimits``).
         """
         async with self._engine.begin() as connection:
             session = (
@@ -211,6 +233,7 @@ class RunQueue:
                 raise QueueError("the session does not exist")
             if session.status != "active":
                 raise QueueError("the session is not active")
+            await self._check_rate(connection, org_id, user_id)
             run_id = uuid.uuid4()
             await connection.execute(
                 insert(Run).values(
@@ -235,6 +258,42 @@ class RunQueue:
                 )
             )
         return run_id
+
+    async def _check_rate(
+        self, connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID | None
+    ) -> None:
+        """Counts the runs of the last 60 seconds. The lock puts the enqueues of one org in a
+        sequence, so two messages at the same time cannot both take the last place."""
+        await connection.execute(_lock("sama.queue.rate", org_id))
+        limits = QueueLimits.from_json(
+            (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
+        )
+        checks: list[tuple[Any, int, str]] = [
+            (Run.org_id == org_id, limits.org_messages_per_minute, "the org")
+        ]
+        if user_id is not None:
+            checks.append(
+                (
+                    and_(Run.org_id == org_id, Run.triggered_by_user_id == user_id),
+                    limits.user_messages_per_minute,
+                    "you",
+                )
+            )
+        for scope, limit, who in checks:
+            row = (
+                await connection.execute(
+                    select(
+                        func.count(),
+                        func.extract("epoch", func.min(Run.created_at) + RATE_WINDOW - func.now()),
+                    ).where(scope, Run.created_at > func.now() - RATE_WINDOW)
+                )
+            ).one()
+            if row[0] >= limit:
+                retry = max(1, math.ceil(float(row[1] or 1)))
+                raise RateLimitedError(
+                    f"{who} sent {limit} messages in the last minute. Try again in {retry} s.",
+                    retry,
+                )
 
     async def cancel(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
         """Cancels a run and returns its status after the call.
@@ -306,33 +365,26 @@ class RunQueue:
     # -- workers ----------------------------------------------------------------------------
 
     async def claim(self, owner: str) -> ClaimedRun | None:
-        """Claims the next run for ``owner``, or returns None if no run is ready."""
-        other = aliased(Run)
-        older = aliased(Run)
-        candidate = (
-            select(Run.id)
-            .where(
-                Run.status == "queued",
-                ~exists().where(
-                    other.session_id == Run.session_id, other.status.in_(ACTIVE_STATUSES)
-                ),
-                ~exists().where(
-                    older.session_id == Run.session_id,
-                    older.status == "queued",
-                    tuple_(older.created_at, older.id) < tuple_(Run.created_at, Run.id),
-                ),
-            )
-            .order_by(Run.created_at, Run.id)
-            .limit(1)
-            .with_for_update(of=Run, skip_locked=True)
-            .scalar_subquery()
-        )
-        try:
-            async with self._engine.begin() as connection:
-                row = (
+        """Claims the next run for ``owner``, or returns None if no run is ready.
+
+        A run of an org that has ``max_running_runs`` running runs waits (``QueueLimits``). An
+        advisory lock per org puts the claims of one org in a sequence, so two workers cannot
+        both take the last place.
+        """
+        full = await self._full_orgs()
+        for _ in range(CLAIM_TRIES):
+            try:
+                async with self._engine.begin() as connection:
+                    row = (await connection.execute(self._candidate(full))).one_or_none()
+                    if row is None:
+                        return None
+                    await connection.execute(_lock("sama.queue.running", row.org_id))
+                    if await self._at_limit(connection, row.org_id):
+                        full.add(row.org_id)
+                        continue
                     await connection.execute(
                         update(Run)
-                        .where(Run.id == candidate)
+                        .where(Run.id == row.id)
                         .values(
                             status="running",
                             lease_owner=owner,
@@ -341,16 +393,65 @@ class RunQueue:
                             dispatched_at=None,
                             started_at=func.coalesce(Run.started_at, func.now()),
                         )
-                        .returning(Run.id)
                     )
-                ).one_or_none()
-                if row is None:
-                    return None
-                return await self._claimed(connection, row.id)
-        except IntegrityError:
-            # Another worker started a run of the same session at the same time. The partial
-            # unique index refused this claim. The run stays queued for a later claim.
-            return None
+                    return await self._claimed(connection, row.id)
+            except IntegrityError:
+                # Another worker started a run of the same session at the same time. The
+                # partial unique index refused this claim. The run stays queued for a later
+                # claim.
+                return None
+        return None
+
+    @staticmethod
+    def _candidate(full: set[uuid.UUID]) -> Any:
+        """The oldest ready run: queued, its session has no active run and no older queued
+        run, and its org is not in ``full``."""
+        other = aliased(Run)
+        older = aliased(Run)
+        conditions = [
+            Run.status == "queued",
+            ~exists().where(other.session_id == Run.session_id, other.status.in_(ACTIVE_STATUSES)),
+            ~exists().where(
+                older.session_id == Run.session_id,
+                older.status == "queued",
+                tuple_(older.created_at, older.id) < tuple_(Run.created_at, Run.id),
+            ),
+        ]
+        if full:
+            conditions.append(Run.org_id.not_in(full))
+        return (
+            select(Run.id, Run.org_id)
+            .where(*conditions)
+            .order_by(Run.created_at, Run.id)
+            .limit(1)
+            .with_for_update(of=Run, skip_locked=True)
+        )
+
+    async def _full_orgs(self) -> set[uuid.UUID]:
+        """The orgs that have ``max_running_runs`` running runs. Only orgs with a running run
+        are read, so the query stays small."""
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(Run.org_id, func.count().label("running"), Org.limits)
+                .join(Org, Org.id == Run.org_id)
+                .where(Run.status == "running")
+                .group_by(Run.org_id, Org.limits)
+            )
+            return {
+                row.org_id
+                for row in rows
+                if row.running >= QueueLimits.from_json(row.limits).max_running_runs
+            }
+
+    @staticmethod
+    async def _at_limit(connection: AsyncConnection, org_id: uuid.UUID) -> bool:
+        limits = (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
+        running = (
+            await connection.execute(
+                select(func.count()).where(Run.org_id == org_id, Run.status == "running")
+            )
+        ).scalar_one()
+        return bool(running >= QueueLimits.from_json(limits).max_running_runs)
 
     async def _claimed(self, connection: AsyncConnection, run_id: uuid.UUID) -> ClaimedRun:
         row = (
