@@ -194,11 +194,21 @@ class ErrorRateAlerter:
                 await _sleep(stop, interval_s)
         finally:
             if held:
-                with contextlib.suppress(Exception):
-                    await connection.execute(
-                        text("SELECT pg_advisory_unlock(:key)"), {"key": LOCK_KEY}
-                    )
-                    await connection.commit()
+                await _unlock(connection)
+
+
+async def _unlock(connection: AsyncConnection) -> None:
+    """Gives the leader lock back. A rollback does not free a session lock, and a pool keeps
+    the database session. So when the unlock fails, the connection is closed for good."""
+    try:
+        # A failed statement leaves the transaction aborted. The unlock needs a new one.
+        await connection.rollback()
+        await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": LOCK_KEY})
+        await connection.commit()
+    except Exception:
+        log.warning("the leader lock is not given back, so the connection is closed")
+        with contextlib.suppress(Exception):
+            await connection.invalidate()
 
 
 async def _sleep(stop: asyncio.Event, seconds: float) -> None:

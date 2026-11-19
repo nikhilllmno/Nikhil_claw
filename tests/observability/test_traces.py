@@ -214,30 +214,53 @@ async def test_nothing_is_sent_for_no_spans() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "permanent"),
-    [(400, True), (413, True), (422, True), (401, False), (429, False), (503, False)],
+    ("status", "retry"),
+    [
+        (400, False),
+        (413, False),
+        (422, False),
+        (500, False),
+        (502, False),
+        (504, False),
+        (401, True),
+        (403, True),
+        (408, True),
+        (429, True),
+        (503, True),
+    ],
 )
-async def test_an_http_error_says_if_a_retry_can_help(status: int, permanent: bool) -> None:
+async def test_only_a_sure_miss_can_be_sent_again(status: int, retry: bool) -> None:
     client = _client(lambda request: httpx.Response(status, text="no"))
     with pytest.raises(LangfuseError) as caught:
         await client.send(build_trace(RunRecord(run=_run())))
-    assert caught.value.permanent is permanent
+    assert caught.value.retry is retry
     assert "sk-lf" not in str(caught.value)
 
 
-async def test_rejected_spans_are_a_permanent_error() -> None:
+async def test_rejected_spans_are_not_sent_again() -> None:
     client = _client(
         lambda request: httpx.Response(200, json={"partialSuccess": {"rejectedSpans": "2"}})
     )
     with pytest.raises(LangfuseError) as caught:
         await client.send(build_trace(RunRecord(run=_run())))
-    assert caught.value.permanent
+    assert not caught.value.retry
 
 
-async def test_a_network_error_can_be_retried() -> None:
+@pytest.mark.parametrize(
+    ("error", "retry"),
+    [
+        (httpx.ConnectError, True),
+        (httpx.ConnectTimeout, True),
+        (httpx.ReadTimeout, False),
+        (httpx.RemoteProtocolError, False),
+    ],
+)
+async def test_a_transport_error_is_sent_again_only_before_the_request_left(
+    error: type[httpx.TransportError], retry: bool
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("down", request=request)
+        raise error("down", request=request)
 
     with pytest.raises(LangfuseError) as caught:
         await _client(handler).send(build_trace(RunRecord(run=_run())))
-    assert not caught.value.permanent
+    assert caught.value.retry is retry

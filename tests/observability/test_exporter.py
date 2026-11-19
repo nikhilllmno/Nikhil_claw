@@ -23,9 +23,12 @@ class Langfuse:
 
     def __init__(self) -> None:
         self.status = 200
+        self.error: type[httpx.TransportError] | None = None
         self.traces: list[dict[str, Any]] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        if self.error is not None:
+            raise self.error("no answer", request=request)
         if self.status == 200:
             self.traces.append(json.loads(request.content))
         return httpx.Response(self.status, json={})
@@ -38,10 +41,16 @@ class Langfuse:
             transport=httpx.MockTransport(self.handler),
         )
 
+    def exporter(self, engine: AsyncEngine, **options: Any) -> TraceExporter:
+        """An exporter that sends a run as soon as it ends, unless ``options`` say other."""
+        settle = {"settle": timedelta(0), "late_settle": timedelta(0)}
+        return TraceExporter(engine, self.client(), **(settle | options))
+
+    def roots(self) -> list[dict[str, Any]]:
+        return [body["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for body in self.traces]
+
     def trace_ids(self) -> list[str]:
-        return [
-            body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"] for body in self.traces
-        ]
+        return [root["traceId"] for root in self.roots()]
 
 
 async def _exported(engine: AsyncEngine, run_id: uuid.UUID) -> bool:
@@ -54,7 +63,7 @@ async def test_an_ended_run_is_sent_one_time_with_its_details(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:
     langfuse = Langfuse()
-    exporter = TraceExporter(engine, langfuse.client(), environment="test")
+    exporter = langfuse.exporter(engine, environment="test")
     run_id = await add_run(engine, tenant)
     async with engine.connect() as connection:
         now = await connection.scalar(text("SELECT now()"))
@@ -77,7 +86,7 @@ async def test_open_runs_and_old_runs_wait_or_are_skipped(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:
     langfuse = Langfuse()
-    exporter = TraceExporter(engine, langfuse.client(), max_age=timedelta(hours=1))
+    exporter = langfuse.exporter(engine, max_age=timedelta(hours=1))
     await add_run(engine, tenant, status="running")
     await add_run(engine, tenant, status="paused", session_id=tenant.ids["s2"])
     await add_run(engine, tenant, status="queued", session_id=tenant.ids["s3"])
@@ -89,17 +98,12 @@ async def test_open_runs_and_old_runs_wait_or_are_skipped(
 
 async def test_failed_and_cancelled_runs_are_sent(engine: AsyncEngine, tenant: Tenant) -> None:
     langfuse = Langfuse()
-    exporter = TraceExporter(engine, langfuse.client())
+    exporter = langfuse.exporter(engine)
     failed = await add_run(engine, tenant, status="failed", failure_code="model_error")
     cancelled = await add_run(engine, tenant, status="cancelled", failure_code="cancelled")
     assert await exporter.export_pending() == 2
     assert set(langfuse.trace_ids()) == {failed.hex, cancelled.hex}
-    status = {
-        body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"]: body["resourceSpans"][0][
-            "scopeSpans"
-        ][0]["spans"][0]["status"]
-        for body in langfuse.traces
-    }
+    status = {root["traceId"]: root["status"] for root in langfuse.roots()}
     assert status[failed.hex] == {"code": 2, "message": "model_error: it broke"}
 
 
@@ -107,7 +111,7 @@ async def test_a_down_langfuse_keeps_the_run_for_the_next_pass(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:
     langfuse = Langfuse()
-    exporter = TraceExporter(engine, langfuse.client())
+    exporter = langfuse.exporter(engine)
     run_id = await add_run(engine, tenant)
     langfuse.status = 503
     assert await exporter.export_pending() == 0
@@ -121,7 +125,7 @@ async def test_a_rejected_trace_is_marked_and_not_sent_again(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:
     langfuse = Langfuse()
-    exporter = TraceExporter(engine, langfuse.client())
+    exporter = langfuse.exporter(engine)
     rejected = await add_run(engine, tenant, ended_ago=timedelta(seconds=5))
     good = await add_run(engine, tenant)
     langfuse.status = 400
@@ -134,8 +138,8 @@ async def test_a_rejected_trace_is_marked_and_not_sent_again(
 async def test_two_exporters_send_each_run_one_time(engine: AsyncEngine, tenant: Tenant) -> None:
     langfuse = Langfuse()
     runs = [await add_run(engine, tenant) for _ in range(6)]
-    first = TraceExporter(engine, langfuse.client(), batch=10)
-    second = TraceExporter(engine, langfuse.client(), batch=10)
+    first = langfuse.exporter(engine, batch=10)
+    second = langfuse.exporter(engine, batch=10)
     sent = await asyncio.gather(first.export_pending(), second.export_pending())
     assert sum(sent) == 6
     assert sorted(langfuse.trace_ids()) == sorted(run.hex for run in runs)
@@ -145,9 +149,7 @@ async def test_serve_stops_on_the_event(engine: AsyncEngine, tenant: Tenant) -> 
     langfuse = Langfuse()
     run_id = await add_run(engine, tenant)
     stop = asyncio.Event()
-    task = asyncio.create_task(
-        TraceExporter(engine, langfuse.client()).serve(stop, interval_s=0.05)
-    )
+    task = asyncio.create_task(langfuse.exporter(engine).serve(stop, interval_s=0.05))
     for _ in range(100):
         if langfuse.traces:
             break
@@ -155,3 +157,40 @@ async def test_serve_stops_on_the_event(engine: AsyncEngine, tenant: Tenant) -> 
     stop.set()
     await asyncio.wait_for(task, timeout=5)
     assert langfuse.trace_ids() == [run_id.hex]
+
+
+async def test_an_unclear_send_is_not_sent_again(engine: AsyncEngine, tenant: Tenant) -> None:
+    langfuse = Langfuse()
+    exporter = langfuse.exporter(engine)
+    run_id = await add_run(engine, tenant)
+    langfuse.error = httpx.ReadTimeout
+    assert await exporter.export_pending() == 0
+    assert await _exported(engine, run_id)
+    langfuse.error = None
+    assert await exporter.export_pending() == 0
+    assert langfuse.traces == []
+
+
+async def test_a_run_waits_until_its_usage_is_stored(engine: AsyncEngine, tenant: Tenant) -> None:
+    langfuse = Langfuse()
+    exporter = TraceExporter(engine, langfuse.client())
+    await add_run(engine, tenant)
+    await add_run(
+        engine,
+        tenant,
+        status="failed",
+        failure_code="timeout",
+        ended_ago=timedelta(minutes=2),
+        session_id=tenant.ids["s2"],
+    )
+    assert await exporter.export_pending() == 0
+    ready = await add_run(
+        engine,
+        tenant,
+        status="cancelled",
+        failure_code="cancelled",
+        ended_ago=timedelta(minutes=12),
+        session_id=tenant.ids["s3"],
+    )
+    assert await exporter.export_pending() == 1
+    assert langfuse.trace_ids() == [ready.hex]

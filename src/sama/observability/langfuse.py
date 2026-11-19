@@ -39,13 +39,22 @@ class Span:
     """When set, the span has the OTLP status ``ERROR`` with this message."""
 
 
-class LangfuseError(Exception):
-    """Langfuse did not take the spans. ``permanent`` is True when the same request can never
-    succeed, for example a payload that Langfuse rejects. The message holds no key."""
+RETRY_STATUSES: Final = frozenset({401, 403, 408, 429, 503})
+"""Answers that tell that Langfuse did not store the spans and can store them later: a wrong
+or revoked key, a request timeout, a rate limit, or a short outage."""
 
-    def __init__(self, message: str, *, permanent: bool) -> None:
+_NOT_SENT: Final = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+"""Transport errors before the request left sama."""
+
+
+class LangfuseError(Exception):
+    """Langfuse did not confirm the spans. ``retry`` is True only when Langfuse surely did not
+    store them, so a second send makes no duplicate. Langfuse does not remove a span that is
+    sent two times. The message holds no key."""
+
+    def __init__(self, message: str, *, retry: bool) -> None:
         super().__init__(message)
-        self.permanent = permanent
+        self.retry = retry
 
 
 class LangfuseClient:
@@ -95,35 +104,25 @@ class LangfuseClient:
         try:
             response = await self._http.post(self._url, json=self.payload(spans))
         except httpx.HTTPError as error:
+            # After a read timeout or a broken answer, Langfuse can have the spans already.
             raise LangfuseError(
-                f"Langfuse is not reachable: {type(error).__name__}", permanent=False
+                f"Langfuse did not answer: {type(error).__name__}",
+                retry=isinstance(error, _NOT_SENT),
             ) from None
         if response.is_success:
             rejected = _rejected(response)
             if rejected:
-                raise LangfuseError(f"Langfuse rejected {rejected} spans", permanent=True)
+                raise LangfuseError(f"Langfuse rejected {rejected} spans", retry=False)
             return
         status = response.status_code
-        # 400, 404 for a bad path, 413 and 422 do not get better with time. A wrong key (401,
-        # 403), 408, 429, and 5xx can.
-        permanent = status in (400, 404, 413, 415, 422)
-        raise LangfuseError(f"Langfuse answered HTTP {status}", permanent=permanent)
+        raise LangfuseError(f"Langfuse answered HTTP {status}", retry=status in RETRY_STATUSES)
 
 
 def _rejected(response: httpx.Response) -> int:
     """The ``partialSuccess.rejectedSpans`` count of an OTLP answer, or 0."""
     try:
-        body = response.json()
-    except ValueError:
-        return 0
-    if not isinstance(body, dict):
-        return 0
-    partial = body.get("partialSuccess")
-    if not isinstance(partial, dict):
-        return 0
-    try:
-        return int(partial.get("rejectedSpans") or 0)
-    except (TypeError, ValueError):
+        return int(response.json()["partialSuccess"]["rejectedSpans"] or 0)
+    except (KeyError, TypeError, ValueError):
         return 0
 
 

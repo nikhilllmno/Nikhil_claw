@@ -70,7 +70,7 @@ class JsonFormatter(logging.Formatter):
             entry.setdefault(key, value)
         for key, value in record.__dict__.items():
             if key not in _RESERVED and not key.startswith("_"):
-                entry.setdefault(key, value if _is_plain(value) else str(value))
+                entry.setdefault(key, value)
         if record.exc_info:
             entry["exc"] = self.formatException(record.exc_info)
         elif record.exc_text:
@@ -83,10 +83,6 @@ class _TextFormatter(logging.Formatter):
         line = super().format(record)
         fields = " ".join(f"{key}={value}" for key, value in current_context().items())
         return f"{line} {fields}" if fields else line
-
-
-def _is_plain(value: object) -> bool:
-    return value is None or isinstance(value, str | int | float | bool | list | dict)
 
 
 def configure_logging(service: str, *, stream: TextIO | None = None) -> None:
@@ -104,8 +100,3 @@ def configure_logging(service: str, *, stream: TextIO | None = None) -> None:
     root.setLevel(os.environ.get("SAMA_LOG_LEVEL", "INFO").upper())
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
-    # uvicorn adds its own handlers unless ``log_config=None``. Its records go to the root.
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logger = logging.getLogger(name)
-        logger.handlers.clear()
-        logger.propagate = True

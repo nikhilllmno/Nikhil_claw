@@ -2039,14 +2039,22 @@ runtimes.
   auth (public key, secret key) and the header `x-langfuse-ingestion-version: 4`. Langfuse
   Cloud closed the old `/api/public/ingestion` endpoint for traces on 2026-11-16. Sama does not
   use the OpenTelemetry SDK, because each span is sent one time when it is complete.
-- Export: `TraceExporter` takes one ended run with `trace_exported_at IS NULL` that ended in
-  the last day, and locks it (`FOR UPDATE SKIP LOCKED`). It sends the trace and sets
-  `trace_exported_at`. Two monitors never send the same run. Migration `0009` adds the column
-  and a partial index, and marks the runs that ended before it as sent.
-- Errors: when Langfuse is down or the key is wrong (network error, 401, 403, 429, 5xx), the
-  run waits for the next pass. When Langfuse rejects the trace (400, 404, 413, 415, 422, or
-  rejected spans), the run is marked and an error is logged. A run that waits for more than
-  one day is not sent. An error never holds a key.
+- Export: `TraceExporter` takes the oldest ready run with `trace_exported_at IS NULL` and
+  locks it (`FOR UPDATE SKIP LOCKED`). In the same transaction it sets `trace_exported_at`
+  and loads the rows. It commits, and then it sends the trace. Two monitors never send the
+  same run. Migration `0009` adds the column and a partial index, and marks the runs that
+  ended before it as sent.
+- Ready: a completed run is ready 30 seconds after its end. A failed or cancelled run is
+  ready 11 minutes after its end, because the model proxy can store the usage of a call up to
+  600 seconds after the client goes away (`drain_s`, Section 16.6). A run that ended more
+  than one day ago is not sent.
+- At most one send: Langfuse keeps each copy of a span that it gets, so a second send of a
+  trace doubles its usage and cost. The exporter removes the mark and tries again at the next
+  pass only when Langfuse surely did not store the trace: a connection error before the
+  request left, or HTTP 401, 403, 408, 429, or 503. For all other errors (a read timeout, a
+  broken answer, other HTTP errors, or rejected spans) the trace is lost and an error is
+  logged. If the monitor stops between the commit and the send, the trace is lost. An error
+  never holds a key.
 
 ### 18.3 Error rate alerts (M1.14)
 
@@ -2058,7 +2066,9 @@ failure codes. When the rate goes below the threshold, the monitor posts one rec
 message. A new alert comes only 30 minutes or more after the last alert.
 
 - Only one monitor checks the rate. It holds the Postgres advisory lock `0x53414D41414C5254`
-  on one connection. When the connection breaks, the monitors try to get the lock again. A
+  on one connection. When a check fails, the leader rolls back and gives the lock back. If it
+  cannot give the lock back, it closes the database session, so that the pool does not keep
+  the lock. Then the monitors try to get the lock again. A
   new leader does not know the state of the old leader, so it can post the same alert again.
 - When Slack does not take the message, the monitor tries again at the next check.
 - The webhook URL is a secret. It is never logged.

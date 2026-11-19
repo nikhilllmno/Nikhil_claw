@@ -7,9 +7,11 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.observability.alerts import AlertError, ErrorRateAlerter, SlackWebhook
+from sama.db import create_engine
+from sama.observability.alerts import LOCK_KEY, AlertError, ErrorRateAlerter, SlackWebhook
 from tests.observability.conftest import add_run
 from tests.orchestrator.conftest import Tenant
 
@@ -168,3 +170,36 @@ async def test_the_slack_webhook_posts_text_and_hides_the_url() -> None:
     assert "secret-part" not in str(caught.value)
     assert "404" in str(caught.value)
     await slack.aclose()
+
+
+async def test_a_failed_query_gives_the_lock_back_in_a_pool(
+    engine: AsyncEngine, queue_database_url: str
+) -> None:
+    pooled = create_engine(queue_database_url, pool_size=1, max_overflow=0)
+    alerter = ErrorRateAlerter(pooled, Channel(), min_runs=1)
+    tries = 0
+
+    async def broken(connection: AsyncConnection) -> None:
+        nonlocal tries
+        tries += 1
+        await connection.execute(text("SELECT 1 / 0"))
+
+    alerter.check = broken  # type: ignore[method-assign,assignment]
+    stop = asyncio.Event()
+    task = asyncio.create_task(alerter.serve(stop, interval_s=0.02))
+    for _ in range(200):
+        if tries >= 3:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+    try:
+        assert tries >= 3
+        async with engine.connect() as connection:
+            free = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:key)"), {"key": LOCK_KEY}
+            )
+            await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": LOCK_KEY})
+        assert free
+    finally:
+        await pooled.dispose()

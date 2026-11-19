@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Final
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import (
@@ -218,9 +218,15 @@ def _cut(text: str) -> str:
 class TraceExporter:
     """Sends the traces of ended runs to Langfuse, one run at a time.
 
-    A run is sent when it ended less than ``max_age`` ago and has no ``trace_exported_at``.
-    When Langfuse rejects a trace for good (``LangfuseError.permanent``), the run is marked
-    and skipped. When Langfuse is down, the run waits for the next pass.
+    Each trace is sent at most one time, because Langfuse keeps each copy of a span. The
+    exporter marks the run (``trace_exported_at``) and commits before it sends. It removes the
+    mark only when Langfuse surely did not store the trace (``LangfuseError.retry``). If the
+    process stops between the mark and the send, the trace is lost.
+
+    A run is ready ``settle`` after a completed end, and ``late_settle`` after a failed or
+    cancelled end. The model proxy can write the usage of a call up to ``drain_s`` (600 s)
+    after the client goes away, so ``late_settle`` is longer than that. A run that ended more
+    than ``max_age`` ago is not sent.
     """
 
     def __init__(
@@ -230,6 +236,8 @@ class TraceExporter:
         *,
         environment: str | None = None,
         include_content: bool = True,
+        settle: timedelta = timedelta(seconds=30),
+        late_settle: timedelta = timedelta(minutes=11),
         max_age: timedelta = timedelta(days=1),
         batch: int = 50,
     ) -> None:
@@ -237,11 +245,13 @@ class TraceExporter:
         self._client = client
         self._environment = environment
         self._include_content = include_content
+        self._settle = settle
+        self._late_settle = late_settle
         self._max_age = max_age
         self._batch = batch
 
     async def export_pending(self) -> int:
-        """Sends up to ``batch`` traces. Returns how many runs it marked as sent."""
+        """Sends up to ``batch`` traces. Returns how many Langfuse took."""
         sent = 0
         for _ in range(self._batch):
             outcome = await self._export_one()
@@ -259,9 +269,9 @@ class TraceExporter:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=interval_s)
 
-    async def _export_one(self) -> int | None:
-        """Sends one trace. Returns 1 when sent, 0 when skipped for good, or None when no run
-        is ready or Langfuse is down."""
+    async def _claim(self) -> RunRecord | None:
+        """Marks the oldest ready run as sent and loads its rows, in one transaction."""
+        now = func.now()
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
@@ -274,7 +284,17 @@ class TraceExporter:
                     .where(
                         Run.status.in_(ENDED_RUN_STATUSES),
                         Run.trace_exported_at.is_(None),
-                        Run.finished_at > func.now() - self._max_age,
+                        Run.finished_at > now - self._max_age,
+                        or_(
+                            and_(
+                                Run.status == "completed",
+                                Run.finished_at <= now - self._settle,
+                            ),
+                            and_(
+                                Run.status != "completed",
+                                Run.finished_at <= now - self._late_settle,
+                            ),
+                        ),
                     )
                     .order_by(Run.finished_at)
                     .limit(1)
@@ -283,27 +303,35 @@ class TraceExporter:
             ).one_or_none()
             if row is None:
                 return None
-            with log_context(org_id=row.org_id, session_id=row.session_id, run_id=row.id):
-                record = await _load(connection, row)
-                spans = build_trace(
-                    record,
-                    environment=self._environment,
-                    include_content=self._include_content,
-                )
-                try:
-                    await self._client.send(spans)
-                except LangfuseError as error:
-                    if not error.permanent:
-                        log.warning("the trace waits for the next pass: %s", error)
-                        return None
-                    log.error("the trace is skipped: %s", error)
-                    outcome = 0
-                else:
-                    outcome = 1
-                await connection.execute(
-                    update(Run).where(Run.id == row.id).values(trace_exported_at=func.now())
-                )
-                return outcome
+            await connection.execute(
+                update(Run).where(Run.id == row.id).values(trace_exported_at=now)
+            )
+            return await _load(connection, row)
+
+    async def _export_one(self) -> int | None:
+        """Sends one trace. Returns 1 when Langfuse took it, 0 when it is lost, or None when no
+        run is ready or Langfuse can take the trace later."""
+        record = await self._claim()
+        if record is None:
+            return None
+        run = record.run
+        with log_context(org_id=run.org_id, session_id=run.session_id, run_id=run.id):
+            spans = build_trace(
+                record, environment=self._environment, include_content=self._include_content
+            )
+            try:
+                await self._client.send(spans)
+            except LangfuseError as error:
+                if not error.retry:
+                    log.error("the trace is lost: %s", error)
+                    return 0
+                log.warning("the trace waits for the next pass: %s", error)
+                async with self._engine.begin() as connection:
+                    await connection.execute(
+                        update(Run).where(Run.id == run.id).values(trace_exported_at=None)
+                    )
+                return None
+            return 1
 
 
 async def _load(connection: AsyncConnection, run: Any) -> RunRecord:

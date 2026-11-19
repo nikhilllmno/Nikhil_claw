@@ -42,6 +42,10 @@ def _required(name: str) -> str:
 
 
 async def run() -> None:
+    langfuse_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+    webhook = os.environ.get("SAMA_ALERT_SLACK_WEBHOOK_URL", "")
+    if not langfuse_key and not webhook:
+        raise SystemExit("set LANGFUSE_PUBLIC_KEY or SAMA_ALERT_SLACK_WEBHOOK_URL")
     engine = create_engine(_required("SAMA_DATABASE_URL"))
     environment = os.environ.get("SAMA_ENVIRONMENT") or None
     stop = asyncio.Event()
@@ -49,47 +53,33 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    langfuse: LangfuseClient | None = None
-    slack: SlackWebhook | None = None
-    tasks: list[asyncio.Task[None]] = []
-    if os.environ.get("LANGFUSE_PUBLIC_KEY"):
-        langfuse = LangfuseClient(
-            _required("LANGFUSE_BASE_URL"),
-            _required("LANGFUSE_PUBLIC_KEY"),
-            SecretStr(_required("LANGFUSE_SECRET_KEY")),
-            environment=environment,
+    # The task group ends first, then the stack closes the clients and the engine.
+    async with contextlib.AsyncExitStack() as stack, asyncio.TaskGroup() as tasks:
+        stack.push_async_callback(engine.dispose)
+        if langfuse_key:
+            langfuse = LangfuseClient(
+                _required("LANGFUSE_BASE_URL"),
+                langfuse_key,
+                SecretStr(_required("LANGFUSE_SECRET_KEY")),
+                environment=environment,
+            )
+            stack.push_async_callback(langfuse.aclose)
+            exporter = TraceExporter(
+                engine,
+                langfuse,
+                environment=environment,
+                include_content=os.environ.get("SAMA_TRACE_CONTENT", "on").lower() != "off",
+            )
+            tasks.create_task(exporter.serve(stop))
+        if webhook:
+            slack = SlackWebhook(SecretStr(webhook))
+            stack.push_async_callback(slack.aclose)
+            alerter = ErrorRateAlerter(engine, slack, environment=environment)
+            tasks.create_task(alerter.serve(stop))
+        log.info(
+            "the monitor started",
+            extra={"traces": bool(langfuse_key), "alerts": bool(webhook)},
         )
-        exporter = TraceExporter(
-            engine,
-            langfuse,
-            environment=environment,
-            include_content=os.environ.get("SAMA_TRACE_CONTENT", "on").lower() != "off",
-        )
-        tasks.append(asyncio.create_task(exporter.serve(stop)))
-    webhook = os.environ.get("SAMA_ALERT_SLACK_WEBHOOK_URL", "")
-    if webhook:
-        slack = SlackWebhook(SecretStr(webhook))
-        alerter = ErrorRateAlerter(engine, slack, environment=environment)
-        tasks.append(asyncio.create_task(alerter.serve(stop)))
-    if not tasks:
-        await engine.dispose()
-        raise SystemExit("set LANGFUSE_PUBLIC_KEY or SAMA_ALERT_SLACK_WEBHOOK_URL")
-    log.info(
-        "the monitor started",
-        extra={"traces": langfuse is not None, "alerts": slack is not None},
-    )
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(*tasks, return_exceptions=True)
-        if langfuse is not None:
-            await langfuse.aclose()
-        if slack is not None:
-            await slack.aclose()
-        await engine.dispose()
 
 
 def main() -> None:
