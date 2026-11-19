@@ -241,7 +241,7 @@ flowchart LR
 |---|---|
 | **API** | Auth (Supabase JWT, API keys for services), REST and streaming endpoints, admin endpoints for profiles, skills, memory, jobs, workflows, and connections. The only holder of the database service key. |
 | **Channel gateway** | Receives Slack, Telegram, and extension events. Checks pairing and access. Maps each chat or thread to a user, an agent profile, and a session. Streams replies, renders approval cards, and handles slash commands. Also routes `my_chrome` browser actions to the right extension connection. |
-| **Run orchestrator** | Queues runs. Enforces per-org concurrency, budgets, and rate limits. Creates or resumes the session sandbox, starts the runner, streams events, and handles cancel, timeout, and resume after approval. |
+| **Run orchestrator** | Queues runs in Postgres with leases, one active run per session (Section 4.3). Enforces per-org concurrency, budgets, and rate limits. Creates or resumes the session sandbox, starts the runner, streams events, and handles cancel, timeout, crashed workers, and resume after approval. |
 | **Scheduler** | Fires cron jobs and one-time jobs. Receives webhooks and Composio triggers. Creates runs or workflow instances. One leader at a time through a Postgres lease. |
 | **Workflow engine** | Runs workflow instances step by step as queue items. Stores each step result. Pauses on approval steps. |
 | **Sama MCP tool server** | The sama tools for both runtimes: memory, skills, session search, cron, workflows, delegation, browser, connectors (Composio and MCP proxy), todo, clarify, approvals, and change proposals. Each call carries the run token. |
@@ -273,6 +273,94 @@ flowchart LR
 9. **Learn.** A background review may propose memory or skill updates (Section 9.4).
 10. **Record.** Transcript, tool calls, usage, cost, and approvals are in Postgres. The trace
     is in Langfuse.
+
+### 4.3 Run queue (M1.10)
+
+The run orchestrator is a Postgres queue (`sama.orchestrator.queue.RunQueue`) and a worker
+(`sama.orchestrator.worker.Worker`). Migration `0005` adds the queue columns to `runs` and
+`sandbox_id` to `sessions`. It adds no table.
+
+**Enqueue.** `RunQueue.enqueue` checks that the session is in the org and is `active`. In one
+transaction it stores a `queued` run, with the runtime and the budget of the agent profile, and
+the user message with the `run_id`.
+
+**Claim.** `claim(owner)` takes the oldest `queued` run whose session has no active run and no
+older queued run, with `FOR UPDATE SKIP LOCKED`. The run becomes `running` with a lease:
+`lease_owner` and `lease_expires_at` (30 seconds). `attempts` goes up by 1. Thus:
+
+- One session has at most one active run (`running` or `paused`). The partial unique index
+  `ix_runs_one_active_per_session` makes this a database rule too.
+- The messages of a session run in order. A new message during a run waits in the queue.
+- Sessions run in parallel, and two workers never take the same run.
+
+A new run gets the runtime state of the last completed run of the session with the same
+runtime, so the adapter continues the session (Section 5.1).
+
+**Lease.** While the run streams, the worker extends the lease every third of the lease time.
+Each write (events, the result) checks that the worker still holds the lease of this attempt:
+the same `lease_owner`, the same `attempts` value, and a lease that did not expire. Thus an old
+attempt cannot write after a reap, also when the same worker claims the run again. A worker that
+lost the lease cancels the runtime at once, reads no more events, and writes nothing more. Check constraints keep the state valid:
+a `running` run has a lease and other runs have none, and a `paused` run has its approval id.
+
+**Events.** The worker stores each event in `run_events` with an increasing `seq`, without the
+runtime state. It writes text deltas in batches (at most 50 events or 0.25 seconds) and other
+events at once. A resumed run continues the `seq` of the run.
+
+**End.** `RunCompleted` stores the reply as an assistant message and the runtime state.
+`RunFailed` stores the failure code and message; the code `cancelled` gives the status
+`cancelled`. A stream with no terminal event fails with `internal`. When a run ends (not when it
+pauses), the worker calls the run-end hooks, for example `ClarifyBroker.cancel_run`.
+
+**Cancel.** `cancel(org_id, run_id)` ends a `queued` or `paused` run at once. For a `running`
+run it sets `cancel_requested_at`. The worker sees it at the next lease extension and cancels
+the runtime. If the runtime asks for an approval after a cancel request, `pause` locks the row,
+sees the request, and ends the run as `cancelled`. `release_decided` never queues a run with a
+cancel request. Thus a cancel always wins over an approval.
+
+**Wall time.** The worker cancels the runtime when the run is longer than
+`Budget.max_wall_time_s`. The run fails with `timeout`.
+
+**Approvals.** `ApprovalRequired` pauses the run: the status is `paused`, `pending_approval_id`
+is the approval id, and the runtime state is stored. If the tool gate did not store the
+approval, the queue stores it with the same rules as the gate (Section 16.1). When the approval
+is decided or expired, `release_decided` queues the run again with `resume_decision` and
+`resume_reason`. An expired approval resumes as `reject`. The next claim takes the paused run
+before the newer runs of the session and sends a `ResumeRequest`. Each approval resumes once,
+because `release_decided` acts only on a `paused` run, and the run is not `paused` after it.
+
+**Dispatch.** After the setup and before the worker starts the runtime, `dispatch` sets
+`runs.dispatched_at`. From this point a runner can execute tools, also when no event or tool
+call is stored yet.
+
+**Crashed workers.** `reap()` handles a `running` run whose lease expired:
+
+- If a cancel was requested, the run becomes `cancelled`.
+- If the run is not dispatched and `attempts` is less than 3, the run goes back to the queue.
+  No runner started, so a new attempt is safe.
+- Otherwise the run fails with `internal`. A tool can have run, so the run does not start
+  again.
+
+A runner of an ended run can still be alive (for example, the worker process stopped but the
+sandbox did not). The tool gate denies every call of a `completed`, `failed`, or `cancelled`
+run, so such a runner cannot use a tool (Section 16.1).
+
+**Maintenance.** Every 30 seconds each worker times out approvals (`GateService.expire`),
+queues the decided runs, and reaps runs. The worker makes a `GateService` on the queue engine
+when the caller gives none. `Worker.serve(stop, concurrency=n)` runs `n` runs at
+the same time and the maintenance loop. When `stop` is set, the current runs end first.
+
+**Migration.** Before migration `0005`, a `running` or `paused` run had no lease and no
+approval id. No worker can continue such a run, so the upgrade ends each one as `failed` with
+`internal`.
+
+**Sandbox directory.** `PostgresSandboxDirectory` stores the sandbox of a session in
+`sessions.sandbox_id`. With it, `SandboxedRuntime` in a new process finds the sandbox of the
+session and does not create a new one (Section 16.2).
+
+**Not in M1.10.** Per-org concurrency limits and rate limits come with the API (M1.12). The
+prompt assembly (M1.11) replaces the minimal `RunConfig` (runtime, model, SOUL). The clarify
+broker stays in memory (Section 16.7).
 
 ---
 
@@ -1141,7 +1229,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 |---|---|---|
 | Verdict | `src/sama/gate/decide.py` | `decide(context, tool_name, arguments)` is a pure function. It runs the five steps and returns a `Verdict` (`action`, `step`, `reason`). |
 | Hardline | `src/sama/gate/hardline.py` | The fixed deny list for shell commands (`Bash`). |
-| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals. |
+| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals. A run that is unknown or ended (`completed`, `failed`, `cancelled`) gets `deny` with no audit row (Section 4.3). |
 | Wire | `src/sama/gate/wire.py` | `GateRequest` and `GateAnswer`, the body of `POST /gate`. |
 | Endpoint | `src/sama/tools/server.py` | `POST /gate` on the sama tool server. The runner sends the run token. |
 | Runner | `src/sama/runtime/remote_gate.py` | `RemoteGate` is the `ToolGate` of the runner. It posts each call to `/gate`. |
@@ -1218,9 +1306,11 @@ Approvals:
   `ApprovalExpiredError` and the approval becomes `expired`.
 - With "always allow", it writes a user rule (`allow`) for the tool and the run profile, and
   the audit row `tool_policy.set`.
-- `GateService.expire()` times out due approvals in batches of 500. The worker calls it
-  (M1.10). The gate also times out an approval when it reads it.
-- The API (M1.12) and the channels (M1.13) call `decide_approval` and then resume the run.
+- `GateService.expire()` times out due approvals in batches of 500. The worker maintenance
+  calls it (Section 4.3). The gate also times out an approval when it reads it.
+- The API (M1.12) and the channels (M1.13) call `decide_approval` and then
+  `RunQueue.release_decided(org_id, run_id)`, which queues the run for its resume. The worker
+  maintenance also queues decided runs, so a missed call only delays the resume.
 
 **Tool server check.** Before each sama MCP tool call, the tool server calls
 `GateService.screen`, which runs the same steps without a call id. The server refuses
@@ -1275,7 +1365,10 @@ authority checks and per-call tickets close both gaps in M1.18.
 each approval resumes once, and a cancelled run cannot resume. The runtime state of the
 adapter (for Claude, the session id and the transcript) goes back to the caller in the
 terminal event, as in Section 5.1, so the next runner continues the session. For now the
-session-to-sandbox map and these rules are in memory. M1.10 moves them to Postgres.
+session-to-sandbox map and these rules are in memory. The run queue (Section 4.3) enforces
+the same rules across processes: one active run per session, one resume per approval, and no
+resume after a cancel. With `PostgresSandboxDirectory`, the session-to-sandbox map is in
+`sessions.sandbox_id`.
 
 If a resume fails before the orchestrator writes the job (for example, the sandbox does not
 start), the approval is not used. The run waits for approval again, and the caller can retry.
@@ -1441,8 +1534,8 @@ in the block list until its write succeeds.
 reading and writes its record, with an estimate if the usage is not final. The proxy builds
 each record before it closes the provider stream, so a cancel during the cleanup or the
 write keeps the record in the block list. The last writes have 10 seconds. A record that
-still is not written goes to the log as JSON, for a manual fix. M1.10 moves records that
-wait to a durable queue.
+still is not written goes to the log as JSON, for a manual fix. A durable queue for records
+that wait is in the backlog.
 
 **Price table.** `src/sama/modelproxy/prices.toml` has USD per million tokens for input,
 output, cache reads, short cache writes (Anthropic 5 minutes, OpenAI 30 minutes), and long
@@ -1461,8 +1554,9 @@ proxy record.
 **`model_calls`** (migration `0002`): `call_id` (unique), `org_id`, `workspace_id`, `session_id`, `run_id`,
 `user_id`, `provider`, `model`, `endpoint`, `status_code`, the five token counts,
 `web_search_requests`, `usage_estimated`, `cost_usd`, `duration_ms`, and `created_at`. The row points to its run
-with `(org_id, session_id, run_id)`. RLS follows the session, as for `run_events`. Until the
-run queue writes `runs` rows (M1.10), local runs and tests use the in-memory store.
+with `(org_id, session_id, run_id)`. RLS follows the session, as for `run_events`. The run
+queue writes the `runs` rows (Section 4.3). Local runs and tests without a database use the
+in-memory store.
 
 **Not in M1.7.** The keys come from the environment of the proxy process. The vault replaces
 this in M1.17. Langfuse traces come in M1.14. The live checks of membership and revocations
@@ -1510,16 +1604,16 @@ channels (M1.13) list them with `pending(org_id, session_id)` and answer them wi
 `answer(request_id, answers)`. A cancel of the run or a timeout ends the wait. A run waits on
 one `clarify` call at a time: a new call of the same run ends the open call of that run, and
 the old call returns "no answer". When a run ends, the orchestrator calls
-`cancel_run(org_id, run_id)` (M1.10). At most 5 questions of one session can be open. The broker is in
-the process of the tool server, so the API must run in the same process until the run queue
-(M1.10) moves the questions to Postgres. In unattended runs the tool gate denies `clarify`
-(Section 16.1).
+`cancel_run(org_id, run_id)` as a run-end hook (Section 4.3). At most 5 questions of one
+session can be open. The broker is in the process of the tool server, so the API, the tool
+server, and the worker run in one process for now. A move of the questions to Postgres is in
+the backlog. In unattended runs the tool gate denies `clarify` (Section 16.1).
 
 **Task list storage.** `session_todos` (migration `0003`) has one row per session: `org_id`,
 `workspace_id`, `session_id`, `items` (JSON), `run_id` of the last change, and `updated_at`. A
 change runs in one transaction with a row lock, so two changes at the same time do not lose an
-item. RLS follows the session, as for `model_calls`. Until the run queue writes `sessions` rows
-(M1.10), local runs and tests use the in-memory store.
+item. RLS follows the session, as for `model_calls`. Local runs and tests without a database
+use the in-memory store.
 
 **Audit.** The server logs each tool call with the org, session, run, tool, result size, and
 time (`sama.tools`). Arguments and results are not in the log, because they can contain
@@ -1569,9 +1663,9 @@ migrated schema.
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
-| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status` |
+| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content` |
-| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`) |
+| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
 | `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
 | `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |

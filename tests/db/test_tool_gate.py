@@ -275,8 +275,18 @@ async def test_an_unknown_run_is_denied(
     gate = GateService(engine)
     verdict = await gate.check(org.claims(**changes), "c1", "Read", {})
     assert verdict.action == "deny"
-    assert verdict.reason == "the run is unknown"
+    assert verdict.reason == "the run is unknown or ended"
     assert await audit(engine, org) == []
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+async def test_an_ended_run_gets_no_tool(engine: AsyncEngine, org: Org1, status: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(update(Run).where(Run.id == org.ids["run"]).values(status=status))
+    gate = GateService(engine)
+    verdict = await gate.check(org.claims(), "c1", "Read", {})
+    assert (verdict.action, verdict.reason) == ("deny", "the run is unknown or ended")
+    assert (await gate.screen(org.claims(), "mcp__sama__todo", {})).action == "deny"
 
 
 async def test_a_call_needs_an_id(engine: AsyncEngine, org: Org1) -> None:

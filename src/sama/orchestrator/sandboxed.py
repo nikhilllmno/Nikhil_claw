@@ -19,8 +19,9 @@ cancel ends the stream within ``CANCEL_DEADLINE_S`` even if a provider call hang
 
 The runner is a new process for each invocation, so the rules that span invocations are
 enforced here: one stream per run id, each approval resumes once, and a cancelled run cannot
-resume. The session-to-sandbox map and these rules are in memory for now. The run orchestrator
-(M1.10) moves them to Postgres.
+resume. These rules are in memory. The run queue (``sama.orchestrator.queue``) enforces the
+same rules in Postgres across processes. With a ``SandboxDirectory``, the session-to-sandbox map
+is in Postgres too, so a new process finds the sandbox of a session.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, Protocol
 
 from pydantic import ValidationError
 
@@ -167,6 +168,14 @@ class SandboxSettings:
     """More variables for the runner. Never a secret."""
 
 
+class SandboxDirectory(Protocol):
+    """Stores the sandbox id of each session, so that every process uses the same sandbox."""
+
+    async def get(self, org_id: str, session_id: str) -> str | None: ...
+
+    async def put(self, org_id: str, session_id: str, sandbox_id: str) -> None: ...
+
+
 class SandboxedRuntime:
     """An ``AgentRuntime`` that runs another runtime kind in the session sandbox."""
 
@@ -178,6 +187,7 @@ class SandboxedRuntime:
         signer: RunTokenSigner,
         settings: SandboxSettings,
         gate: GatePolicy | None = None,
+        directory: SandboxDirectory | None = None,
     ) -> None:
         if kind not in CAPABILITIES:
             raise ValueError(f"the runner does not support runtime {kind}")
@@ -188,6 +198,7 @@ class SandboxedRuntime:
         self._signer = signer
         self._settings = settings
         self._gate = gate or GatePolicy()
+        self._directory = directory
         self._sandbox_ids: dict[tuple[str, str], str] = {}
         self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._session_runs: dict[tuple[str, str], int] = {}
@@ -271,7 +282,7 @@ class SandboxedRuntime:
 
     async def session_sandbox(self, org_id: str, session_id: str) -> Sandbox | None:
         """The sandbox of a session, resumed, or None if the session has none."""
-        sandbox_id = self._sandbox_ids.get((org_id, session_id))
+        sandbox_id = await self._known_sandbox((org_id, session_id))
         if sandbox_id is None:
             return None
         try:
@@ -321,7 +332,7 @@ class SandboxedRuntime:
         async with self._session_locks.setdefault(key, asyncio.Lock()):
             spec = self._spec(*key)
             sandbox: Sandbox | None = None
-            known = self._sandbox_ids.get(key)
+            known = await self._known_sandbox(key)
             if known is not None:
                 try:
                     sandbox = await self._provider.resume(known, spec)
@@ -330,9 +341,24 @@ class SandboxedRuntime:
             if sandbox is None:
                 sandbox = await self._provider.create(spec)
                 self._sandbox_ids[key] = sandbox.id
+                if self._directory is not None:
+                    try:
+                        await self._directory.put(*key, sandbox.id)
+                    except Exception:
+                        # This process still knows the sandbox. Another process creates a
+                        # new one, so the run goes on.
+                        log.exception("could not store the session sandbox=%s", sandbox.id)
             await sandbox.keep_alive(int(_wall_time_s(budget) + TOKEN_MARGIN_S))
             self._session_runs[key] = self._session_runs.get(key, 0) + 1
             return sandbox
+
+    async def _known_sandbox(self, key: tuple[str, str]) -> str | None:
+        known = self._sandbox_ids.get(key)
+        if known is None and self._directory is not None:
+            known = await self._directory.get(*key)
+            if known is not None:
+                self._sandbox_ids[key] = known
+        return known
 
     async def _end_session_run(self, key: tuple[str, str], sandbox: Sandbox) -> None:
         """After the last run of the session, sets the idle timeout back. It holds the session

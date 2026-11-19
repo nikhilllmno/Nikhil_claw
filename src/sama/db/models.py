@@ -50,6 +50,8 @@ SESSION_STATUSES: Final = ("active", "archived")
 LINEAGES: Final = ("compaction", "branch", "retry", "delegation")
 MESSAGE_ROLES: Final = ("user", "assistant", "system", "tool")
 RUN_STATUSES: Final = ("queued", "running", "paused", "completed", "failed", "cancelled")
+ENDED_RUN_STATUSES: Final = ("completed", "failed", "cancelled")
+RESUME_DECISIONS: Final = ("approve", "reject")
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
 APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
@@ -215,6 +217,8 @@ class Session(Base):
     lineage: Mapped[str | None] = mapped_column(Text)
     title: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    sandbox_id: Mapped[str | None] = mapped_column(Text)
+    """The provider id of the session sandbox (docs/architecture.md, Section 16.2)."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -234,7 +238,26 @@ class Run(Base):
         ForeignKeyConstraint(["org_id", "triggered_by_user_id"], ["users.org_id", "users.id"]),
         CheckConstraint(_one_of("status", RUN_STATUSES), name="status"),
         CheckConstraint(_one_of("runtime", RUNTIMES), name="runtime"),
+        CheckConstraint(
+            f"resume_decision IS NULL OR {_one_of('resume_decision', RESUME_DECISIONS)}",
+            name="resume_decision",
+        ),
+        CheckConstraint(
+            "(status = 'running') = (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="lease",
+        ),
+        CheckConstraint(
+            "status <> 'paused' OR pending_approval_id IS NOT NULL", name="paused_has_approval"
+        ),
         Index(None, "org_id", "session_id"),
+        Index(None, "status", "created_at"),
+        # One active run per session (docs/architecture.md, Section 4.3).
+        Index(
+            "ix_runs_one_active_per_session",
+            "session_id",
+            unique=True,
+            postgresql_where=text("status IN ('running', 'paused')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -253,6 +276,20 @@ class Run(Base):
     gate turns ``ask`` into ``deny`` in these runs (docs/architecture.md, Section 16.1)."""
     failure_code: Mapped[str | None] = mapped_column(Text)
     failure_message: Mapped[str | None] = mapped_column(Text)
+    lease_owner: Mapped[str | None] = mapped_column(Text)
+    """The worker that runs the run. Set only while the status is ``running``."""
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """How many times a worker claimed the run."""
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the worker gave this attempt to the runtime. A reap starts the run again only if
+    this is null."""
+    pending_approval_id: Mapped[str | None] = mapped_column(Text)
+    """The approval that a paused run waits for. It is the ``call_id`` of the approval row."""
+    resume_decision: Mapped[str | None] = mapped_column(Text)
+    """Set when the approval is decided. The next claim resumes the run with it."""
+    resume_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

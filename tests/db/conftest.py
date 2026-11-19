@@ -12,6 +12,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -49,9 +50,10 @@ async def _execute(url: str, sql: str) -> None:
         await connection.close()
 
 
-@pytest.fixture(scope="session")
-def database_url() -> Iterator[str]:
-    """A new database with the shim and all migrations."""
+@contextmanager
+def migrated_database() -> Iterator[str]:
+    """Creates a new database with the shim and all migrations, and drops it at the end.
+    Skips the test without ``SAMA_TEST_DATABASE_URL``."""
     admin_url = os.environ.get(ENV)
     if not admin_url:
         pytest.skip(f"set {ENV} to run the database tests")
@@ -68,6 +70,13 @@ def database_url() -> Iterator[str]:
         yield url
     finally:
         asyncio.run(_execute(admin_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+
+
+@pytest.fixture(scope="session")
+def database_url() -> Iterator[str]:
+    """A new database with the shim and all migrations."""
+    with migrated_database() as url:
+        yield url
 
 
 @pytest.fixture(scope="session")

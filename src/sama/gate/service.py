@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import ColumnElement
 
 from sama.db.models import (
+    ENDED_RUN_STATUSES,
     AgentProfile,
     Approval,
     AuditEntry,
@@ -137,7 +138,7 @@ class GateService:
             run = await self._load(connection, claims, call_id)
             if run is None:
                 log.warning("gate: unknown run org=%s run=%s", claims.org_id, claims.run_id)
-                return Verdict("deny", GateStep.TOOLSET, "the run is unknown")
+                return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
             if run.call is not None and run.call != _Call(name, digest):
                 verdict = Verdict("deny", GateStep.RECORDED, "the call id belongs to another call")
                 await self._audit(
@@ -166,7 +167,7 @@ class GateService:
         async with self._engine.begin() as connection:
             run = await self._load(connection, claims, None)
             if run is None:
-                return Verdict("deny", GateStep.TOOLSET, "the run is unknown")
+                return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
             verdict = decide(run.context, name, arguments)
             if verdict.action == "deny":
                 await self._audit(
@@ -214,6 +215,8 @@ class GateService:
                     Run.id == run_id,
                     Run.session_id == session_id,
                     Session.workspace_id == workspace_id,
+                    # A runner of an ended run (for example after a worker crash) gets no tool.
+                    Run.status.not_in(ENDED_RUN_STATUSES),
                 )
             )
         ).one_or_none()

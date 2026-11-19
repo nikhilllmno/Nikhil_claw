@@ -175,6 +175,62 @@ async def test_a_lost_sandbox_is_created_again(
     assert runtime.sandbox_id("org-1", "sess-1") != sandbox.id
 
 
+class DictDirectory:
+    """A ``SandboxDirectory`` in memory. ``broken`` makes ``put`` fail."""
+
+    def __init__(self, *, broken: bool = False) -> None:
+        self.ids: dict[tuple[str, str], str] = {}
+        self.broken = broken
+
+    async def get(self, org_id: str, session_id: str) -> str | None:
+        return self.ids.get((org_id, session_id))
+
+    async def put(self, org_id: str, session_id: str, sandbox_id: str) -> None:
+        if self.broken:
+            raise RuntimeError("the database is down")
+        self.ids[(org_id, session_id)] = sandbox_id
+
+
+async def test_another_worker_finds_the_sandbox_in_the_directory(
+    provider: CountingProvider,
+) -> None:
+    directory = DictDirectory()
+    settings = SandboxSettings(template="local", runner_argv=RUNNER)
+    first, second = (
+        SandboxedRuntime(
+            kind=RuntimeKind.FAKE,
+            provider=provider,
+            signer=RunTokenSigner(KEY),
+            settings=settings,
+            directory=directory,
+        )
+        for _ in range(2)
+    )
+    first.fake_scripts.append(_reply("ok"))
+    await collect(first.run(_request(make_scope("run-1"))))
+    assert directory.ids == {("org-1", "sess-1"): first.sandbox_id("org-1", "sess-1")}
+    assert await second.session_sandbox("org-1", "sess-1") is not None
+    second.fake_scripts.append(_reply("ok"))
+    events = await collect(second.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    assert provider.creates == 1
+    await first.close_sandboxes(kill=True)
+
+
+async def test_a_directory_error_does_not_fail_the_run(provider: CountingProvider) -> None:
+    runtime = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=provider,
+        signer=RunTokenSigner(KEY),
+        settings=SandboxSettings(template="local", runner_argv=RUNNER),
+        directory=DictDirectory(broken=True),
+    )
+    runtime.fake_scripts.append(_reply("ok"))
+    events = await collect(runtime.run(_request(make_scope("run-1"))))
+    assert isinstance(events[-1], RunCompleted)
+    await runtime.close_sandboxes(kill=True)
+
+
 async def test_the_wrong_runtime_kind_is_refused(runtime: SandboxedRuntime) -> None:
     config = RunConfig(runtime=RuntimeKind.CLAUDE_AGENT_SDK, model="m")
     events = await collect(runtime.run(_request(make_scope(), config)))
