@@ -38,9 +38,10 @@ MAX_INSTRUCTION_BYTES: Final = 100_000
 """Sama reads at most this many bytes of an instruction file, as for a stored context file."""
 MAX_GIT_ERROR_CHARS: Final = 500
 
-_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 _NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+_REGULAR_MODES: Final = frozenset({"100644", "100755"})
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -65,16 +66,15 @@ def parse_repo(text: str) -> RepoRef:
     if "://" not in raw:
         raw = f"https://{raw}" if raw.lower().startswith("github.com/") else f"{GITHUB_URL}/{raw}"
     parts = urlsplit(raw)
+    segments = parts.path.strip("/").split("/")
+    # The netloc check also refuses a user name, a password, and a port.
     if (
         parts.scheme != "https"
-        or parts.hostname != "github.com"
         or parts.netloc.lower() != "github.com"
         or parts.query
         or parts.fragment
+        or len(segments) != 2
     ):
-        raise RepoError("give a public GitHub repository as https://github.com/<owner>/<name>")
-    segments = parts.path.strip("/").split("/")
-    if len(segments) != 2:
         raise RepoError("give a public GitHub repository as https://github.com/<owner>/<name>")
     owner, name = segments
     name = name.removesuffix(".git")
@@ -141,10 +141,7 @@ class RepoCloner:
             raise RepoError("the session has no sandbox yet")
         path = f"{sandbox.workdir.rstrip('/')}/{folder}"
         try:
-            if (await sandbox.exec(["test", "-e", path], timeout_s=GIT_TIMEOUT_S)).exit_code == 0:
-                raise RepoError(
-                    f"{path} exists. Use git in that folder, or give another folder name"
-                )
+            await _reserve(sandbox, path)
             await self._clone(sandbox, target, ref, path)
             commit, branch = await _head(sandbox, path)
             instructions = await _instructions(sandbox, path, claims)
@@ -176,9 +173,32 @@ class RepoCloner:
         result = await sandbox.exec(argv, env=env, timeout_s=CLONE_TIMEOUT_S)
         if result.exit_code == 0:
             return
-        # A failed clone can leave a part of the folder.
+        # A failed clone can leave a part of the folder. This call made the folder, so it can
+        # remove it.
         await sandbox.exec(["rm", "-rf", "--", path], timeout_s=GIT_TIMEOUT_S)
         raise RepoError(_clone_problem(target, ref, result.stderr))
+
+
+async def _reserve(sandbox: Sandbox, path: str) -> None:
+    """Make the empty target folder, or fail if the path exists.
+
+    ``mkdir`` without ``-p`` is atomic: of two calls with the same folder, only one makes it.
+    So the cleanup after a failed clone removes only a folder that this call made.
+    """
+    made = await sandbox.exec(["mkdir", "--", path], timeout_s=GIT_TIMEOUT_S)
+    if made.exit_code == 0:
+        return
+    if "exists" in made.stderr.lower():
+        raise RepoError(f"{path} exists. Use git in that folder, or give another folder name")
+    raise RepoError(f"cannot make {path}: {_last_line(made.stderr)}")
+
+
+def _last_line(stderr: str) -> str:
+    lines = [line for line in stderr.strip().splitlines() if line.strip()]
+    detail = lines[-1] if lines else "no output"
+    if len(detail) > MAX_GIT_ERROR_CHARS:
+        detail = detail[:MAX_GIT_ERROR_CHARS] + " [cut]"
+    return detail
 
 
 def _clone_problem(target: RepoRef, ref: str | None, stderr: str) -> str:
@@ -192,11 +212,7 @@ def _clone_problem(target: RepoRef, ref: str | None, stderr: str) -> str:
         or "terminal prompts disabled" in lowered
     ):
         return f"{target.url} does not exist or is not public. Only public repositories clone"
-    lines = [line for line in stderr.strip().splitlines() if line.strip()]
-    detail = lines[-1] if lines else "no output"
-    if len(detail) > MAX_GIT_ERROR_CHARS:
-        detail = detail[:MAX_GIT_ERROR_CHARS] + " [cut]"
-    return f"git clone failed: {detail}"
+    return f"git clone failed: {_last_line(stderr)}"
 
 
 async def _head(sandbox: Sandbox, path: str) -> tuple[str, str | None]:
@@ -212,10 +228,29 @@ async def _head(sandbox: Sandbox, path: str) -> tuple[str, str | None]:
 async def _instructions(
     sandbox: Sandbox, path: str, claims: RunTokenClaims
 ) -> tuple[tuple[str, str], ...]:
+    # Read the files from the commit, not from the work tree. A symlink in the repo (mode
+    # 120000) could point to a file outside the clone, so only regular files count.
+    listed = await sandbox.exec(
+        ["git", "ls-tree", "HEAD", "--", *INSTRUCTION_FILES], cwd=path, timeout_s=GIT_TIMEOUT_S
+    )
+    blobs: dict[str, str] = {}
+    for line in listed.stdout.splitlines() if listed.exit_code == 0 else ():
+        meta, _, name = line.partition("\t")
+        fields = meta.split()
+        if (
+            len(fields) == 3
+            and fields[0] in _REGULAR_MODES
+            and fields[1] == "blob"
+            and _SHA.fullmatch(fields[2])
+        ):
+            blobs[name] = fields[2]
     found: list[tuple[str, str]] = []
     for name in INSTRUCTION_FILES:
-        # ``head`` reads a bounded part. ``test -f`` skips a folder with the same name.
-        script = f"test -f {name} && head -c {MAX_INSTRUCTION_BYTES} -- {name}"
+        blob = blobs.get(name)
+        if blob is None:
+            continue
+        # ``head`` reads a bounded part. The blob id is 40 hex characters, so the script is safe.
+        script = f"git cat-file blob {blob} | head -c {MAX_INSTRUCTION_BYTES}"
         result = await sandbox.exec(["sh", "-c", script], cwd=path, timeout_s=GIT_TIMEOUT_S)
         if result.exit_code != 0 or not result.stdout.strip():
             continue

@@ -1454,9 +1454,14 @@ in the sandbox with native tools. It cannot push yet.
 - **Ref.** `ref` is a branch or a tag. A tag gives a detached HEAD. A ref with `..`, `//`, a
   space, a start other than a letter or a digit, or an end of `/`, `.`, or `.lock` is refused.
 - **Folder.** One segment of letters, digits, `.`, `_`, or `-`. Not `.` or `..`. If the folder
-  exists, the tool tells the agent to use git in that folder or give another name.
+  exists, the tool tells the agent to use git in that folder or give another name. The tool
+  makes the empty folder with `mkdir` before the clone. `mkdir` is atomic, so of two calls
+  with one folder only one clones, and a failed clone removes only a folder that its call
+  made.
 - **Instruction files.** The result gives the URL, the branch (or "a tag"), the commit, the
-  path, and the text of `AGENTS.md` and `CLAUDE.md` at the repo root, if they exist. Each
+  path, and the text of `AGENTS.md` and `CLAUDE.md` at the repo root, if they exist. The tool
+  reads them from the commit (`git ls-tree`, `git cat-file`), and only regular files. A
+  symlink could point to a file outside the clone, so the tool ignores it. Each
   file goes through the injection scan and the 20,000-character cap of Section 6.1 (it
   reads at most 100,000 bytes). A blocked file gets the placeholder text and a warning log.
   Each file is in an `<untrusted_content>` block with the file URL at that commit, and the

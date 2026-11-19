@@ -7,6 +7,7 @@ clones from GitHub in an E2B sandbox.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import subprocess
 from collections.abc import AsyncIterator, Iterator
@@ -73,6 +74,15 @@ def source(tmp_path: Path) -> Source:
     root = tmp_path / "github"
     (root / "acme").mkdir(parents=True)
     git(root / "acme", "clone", "-q", "--bare", str(work), "demo.git")
+    # ``acme/linked``: the instruction files are symlinks to files outside the clone.
+    linked = tmp_path / "work-linked"
+    linked.mkdir()
+    git(linked, "init", "-q")
+    (linked / "AGENTS.md").symlink_to("../secret.txt")
+    (linked / "CLAUDE.md").symlink_to(tmp_path / "absolute-secret.txt")
+    git(linked, "add", ".")
+    git(linked, "commit", "-q", "-m", "links")
+    git(root / "acme", "clone", "-q", "--bare", str(linked), "linked.git")
     return Source(f"file://{root}", main, dev)
 
 
@@ -206,6 +216,38 @@ async def test_a_folder_that_exists_is_not_replaced(world: World) -> None:
     with pytest.raises(RepoError, match="exists"):
         await world.cloner.clone(world.claims, "acme/demo")
     assert marker.read_text() == "keep"
+
+
+async def test_a_failed_clone_keeps_a_folder_that_existed(world: World) -> None:
+    marker = Path(world.sandbox.workdir) / "demo" / "mine.txt"
+    marker.parent.mkdir()
+    marker.write_text("keep")
+    with pytest.raises(RepoError, match="exists"):
+        await world.cloner.clone(world.claims, "acme/demo", ref="nope")
+    assert marker.read_text() == "keep"
+
+
+async def test_of_two_clones_into_one_folder_only_one_runs(world: World) -> None:
+    results = await asyncio.gather(
+        world.cloner.clone(world.claims, "acme/demo"),
+        world.cloner.clone(world.claims, "acme/demo"),
+        return_exceptions=True,
+    )
+    errors = [result for result in results if isinstance(result, BaseException)]
+    assert len(errors) == 1
+    assert isinstance(errors[0], RepoError)
+    assert "exists" in str(errors[0])
+    assert (Path(world.sandbox.workdir) / "demo" / "app.py").is_file()
+
+
+async def test_instruction_files_that_are_symlinks_are_not_read(
+    world: World, tmp_path: Path
+) -> None:
+    (Path(world.sandbox.workdir) / "secret.txt").write_text("relative secret")
+    (tmp_path / "absolute-secret.txt").write_text("absolute secret")
+    cloned = await world.cloner.clone(world.claims, "acme/linked")
+    assert cloned.instructions == ()
+    assert "secret" not in render(cloned)
 
 
 async def test_an_unknown_ref_fails_and_leaves_no_folder(world: World) -> None:
