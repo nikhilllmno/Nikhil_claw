@@ -85,6 +85,13 @@ def test_tool_search_is_in_every_run_and_allowed() -> None:
     assert verdict.action == "allow"
 
 
+def test_tool_search_does_not_open_the_tool_it_loads() -> None:
+    only_todo = context(toolsets=frozenset({"todo"}))
+    assert decide(only_todo, "ToolSearch", {"query": "select:Bash"}).action == "allow"
+    verdict = decide(only_todo, "Bash", {"command": "ls"})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+
+
 def test_a_deny_rule_and_a_revoke_still_stop_tool_search() -> None:
     denied = decide(context(rules=(rule("ToolSearch", "deny"),)), "ToolSearch", {})
     assert (denied.action, denied.step) == ("deny", GateStep.POLICY)
