@@ -138,6 +138,23 @@ async def test_context_files_come_in_scope_order(engine: AsyncEngine, tenant: Te
     ]
 
 
+async def test_files_with_the_same_path_get_their_scope(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    ws, profile = tenant.ids["ws"], tenant.ids["profile"]
+    await add_file(engine, tenant, "AGENTS.md", "org")
+    await add_file(engine, tenant, "AGENTS.md", "ws", workspace_id=ws)
+    await add_file(engine, tenant, "AGENTS.md", "profile", agent_profile_id=profile)
+    await add_file(engine, tenant, "AGENTS.md", "both", workspace_id=ws, agent_profile_id=profile)
+    config = await PromptAssembler(engine)(await claimed(engine, tenant))
+    assert [(f.path, f.content) for f in config.context_files] == [
+        ("AGENTS.md", "org"),
+        ("AGENTS.md (workspace)", "ws"),
+        ("AGENTS.md (profile)", "profile"),
+        ("AGENTS.md (workspace profile)", "both"),
+    ]
+
+
 async def test_the_prompt_gets_at_most_the_file_limit(engine: AsyncEngine, tenant: Tenant) -> None:
     for i in range(MAX_CONTEXT_FILES + 3):
         await add_file(engine, tenant, f"f{i:02}.md", "x")

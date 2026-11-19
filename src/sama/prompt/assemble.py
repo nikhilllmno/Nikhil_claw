@@ -9,6 +9,7 @@ session.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import uuid
 from collections.abc import Sequence
@@ -22,6 +23,7 @@ from sama.db.models import AuditEntry, Session, StoredContextFile
 from sama.prompt.scan import scan
 from sama.runtime.contract import (
     CONTEXT_FILE_MAX_CHARS,
+    CONTEXT_FILE_PATH_MAX_CHARS,
     ContextFile,
     McpServerConfig,
     RunConfig,
@@ -101,13 +103,12 @@ class PromptAssembler:
         self._system = system
 
     async def __call__(self, run: ClaimedRun) -> RunConfig:
+        session = (Session.org_id == run.org_id, Session.id == run.session_id)
         async with self._engine.begin() as connection:
             # The lock makes concurrent first runs of a session build one config.
             stored = (
                 await connection.execute(
-                    select(Session.run_config, Session.created_at)
-                    .where(Session.org_id == run.org_id, Session.id == run.session_id)
-                    .with_for_update()
+                    select(Session.run_config, Session.created_at).where(*session).with_for_update()
                 )
             ).one_or_none()
             if stored is None:
@@ -118,7 +119,7 @@ class PromptAssembler:
                 config = await self._build(connection, run, stored.created_at)
                 await connection.execute(
                     update(Session)
-                    .where(Session.org_id == run.org_id, Session.id == run.session_id)
+                    .where(*session)
                     .values(
                         run_config=config.model_dump(mode="json"),
                         config_fingerprint=config.fingerprint(),
@@ -132,9 +133,12 @@ class PromptAssembler:
         self, connection: AsyncConnection, run: ClaimedRun, started: datetime
     ) -> RunConfig:
         files: list[ContextFile] = []
+        taken: set[str] = set()
         for row in await _load(connection, run):
             file, findings = prepare(row.path, row.content)
-            files.append(file)
+            name = unique_path(row.path, _scope(row), taken)
+            taken.add(name)
+            files.append(file.model_copy(update={"path": name}))
             if findings:
                 log.warning(
                     "a context file is blocked file=%s session=%s findings=%s",
@@ -162,8 +166,8 @@ async def _load(connection: AsyncConnection, run: ClaimedRun) -> Sequence[Any]:
             StoredContextFile.id,
             StoredContextFile.path,
             StoredContextFile.content,
-            StoredContextFile.workspace_id,
-            StoredContextFile.agent_profile_id,
+            StoredContextFile.workspace_id.is_not(None).label("for_workspace"),
+            StoredContextFile.agent_profile_id.is_not(None).label("for_profile"),
         )
         .where(
             StoredContextFile.org_id == run.org_id,
@@ -192,6 +196,28 @@ async def _load(connection: AsyncConnection, run: ClaimedRun) -> Sequence[Any]:
             MAX_CONTEXT_FILES,
         )
     return rows[:MAX_CONTEXT_FILES]
+
+
+def _scope(row: Any) -> str:
+    parts = [
+        name
+        for name, used in (("workspace", row.for_workspace), ("profile", row.for_profile))
+        if used
+    ]
+    return " ".join(parts) or "org"
+
+
+def unique_path(path: str, scope: str, taken: set[str]) -> str:
+    """The path in the prompt. Files of different scopes can have the same path, so a later
+    file gets its scope after the path, for example ``AGENTS.md (workspace)``."""
+    if path not in taken:
+        return path
+    for n in itertools.count(1):
+        suffix = f" ({scope})" if n == 1 else f" ({scope} {n})"
+        name = path[: CONTEXT_FILE_PATH_MAX_CHARS - len(suffix)] + suffix
+        if name not in taken:
+            return name
+    raise AssertionError("unreachable")
 
 
 async def _audit(

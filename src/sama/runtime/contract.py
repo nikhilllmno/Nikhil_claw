@@ -148,7 +148,8 @@ CONTEXT_FILE_MAX_CHARS: Final = 20_000
 """Cap for one context file, as in Hermes (docs/architecture.md, Section 6.1)."""
 
 
-CONTEXT_FILE_PATH_PATTERN: Final = r'^[^"<>\r\n]{1,200}$'
+CONTEXT_FILE_PATH_MAX_CHARS: Final = 200
+CONTEXT_FILE_PATH_PATTERN: Final = rf'^[^"<>\r\n]{{1,{CONTEXT_FILE_PATH_MAX_CHARS}}}$'
 """A path is the attribute of a ``<context_file>`` tag, so it cannot close the tag."""
 
 

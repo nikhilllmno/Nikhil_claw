@@ -50,7 +50,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workspaces": {"a1", "a2"},
         "agent_profiles": {"profile-a", "profile-a2"},
         "sessions": {"a1-shared", "a2-shared"},
-        "context_files": {"file:org-a", "file:a2"},
+        "context_files": {"file:org-a", "file:a2", "file:profile-a2"},
     },
     "dave": {
         "orgs": {"org-a"},

@@ -632,14 +632,20 @@ Rules:
   or one workspace, and no profile (all profiles) or one profile. The order is: org files,
   workspace files, profile files, profile files of the workspace, and by path in each group.
   The prompt gets at most 20 files (`MAX_CONTEXT_FILES`). The table stores at most 100,000
-  characters per file.
+  characters per file. Files of different scopes can have the same path. The first file
+  keeps the path, and a later file gets its scope after the path, for example
+  `AGENTS.md (workspace)`.
+- RLS on `context_files`: a member reads a file if the member can see its workspace (if it
+  has one) and its profile (if it has one). So a profile file without a workspace stays
+  hidden when its profile is in a workspace that the member cannot see.
 - `sama.prompt.scan` checks the path and the full text for these patterns: instructions that
   override earlier instructions, a new identity, text that hides things from the user,
   instructions in HTML comments, invisible Unicode characters (zero-width, bidi, and tag
   characters), commands that send secrets out (`curl` or `wget` with a key variable, `cat` of
   `.env` or `~/.ssh`), and fake role markers. If a pattern matches, the prompt gets a note in
   place of the file. Sama logs a warning and writes the audit action `context_file.blocked`
-  with the finding ids. The scan is a filter for common attacks. It is not a full defence, so
+  with the finding ids. All checks take linear time, so a file of maximum size cannot block
+  the worker. The scan is a filter for common attacks. It is not a full defence, so
   the system text also tells the model that file text is data.
 - A file longer than 20,000 characters keeps its head (70%) and its tail (30%). A marker
   `[... N characters cut ...]` replaces the middle.

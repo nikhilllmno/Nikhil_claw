@@ -7,10 +7,12 @@ from sama.prompt.assemble import (
     environment,
     prepare,
     truncate,
+    unique_path,
 )
-from sama.prompt.scan import PATTERNS, scan
+from sama.prompt.scan import HIDDEN_COMMENT, PATTERNS, scan
 
 __all__ = [
+    "HIDDEN_COMMENT",
     "MAX_CONTEXT_FILES",
     "PATTERNS",
     "SYSTEM_PROMPT",
@@ -19,4 +21,5 @@ __all__ = [
     "prepare",
     "scan",
     "truncate",
+    "unique_path",
 ]

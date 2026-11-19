@@ -18,10 +18,14 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 # Members read the org files and the files of the workspaces that they can see, as for
-# agent profiles. No policy allows writes: the control plane writes as the table owner.
+# agent profiles. A profile file also needs its profile: the subquery runs with the RLS of
+# agent_profiles, so a file of a profile in a hidden workspace stays hidden. No policy allows
+# writes: the control plane writes as the table owner.
 POLICY = (
-    "sama_private.is_org_member(org_id) AND (workspace_id IS NULL"
-    " OR sama_private.can_see_workspace(org_id, workspace_id))"
+    "sama_private.is_org_member(org_id)"
+    " AND (workspace_id IS NULL OR sama_private.can_see_workspace(org_id, workspace_id))"
+    " AND (agent_profile_id IS NULL OR EXISTS (SELECT 1 FROM public.agent_profiles AS p"
+    " WHERE p.org_id = context_files.org_id AND p.id = context_files.agent_profile_id))"
 )
 
 
