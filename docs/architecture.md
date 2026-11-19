@@ -364,12 +364,14 @@ uses the default (`sama.orchestrator.limits.QueueLimits`):
 | Key | Default | Rule |
 |---|---|---|
 | `max_running_runs` | 5 | At most this many runs of the org are `running` at the same time. |
-| `user_messages_per_minute` | 20 | At most this many runs of one user start in 60 seconds. |
-| `org_messages_per_minute` | 120 | At most this many runs of the org start in 60 seconds, also from jobs. |
+| `user_messages_per_minute` | 20 | At most this many messages of one user go into the queue in a rolling 60-second window. |
+| `org_messages_per_minute` | 120 | At most this many runs of the org go into the queue in a rolling 60-second window, also from jobs. |
 
 - `enqueue` counts the runs of the last 60 seconds under an advisory lock per org, so two
   messages at the same time cannot both take the last place. Over a limit it raises
-  `RateLimitedError` with the seconds to wait. The API answers `429` with `Retry-After`.
+  `RateLimitedError` with the seconds to wait. The API answers `429` with `Retry-After`. The
+  count is of queued runs, not of started runs: a backlog can start faster than this rate. A
+  cancelled run still counts, and a run that resumes after an approval does not count again.
 - `claim` skips the orgs that are at `max_running_runs`. It takes an advisory lock per org and
   counts again before it starts the run, so two workers cannot both take the last place. A
   `paused` run does not count, because it holds no worker.
@@ -1098,8 +1100,10 @@ access token in `Authorization: Bearer`. `JwtVerifier` checks it:
   HMAC check with a public key. Other algorithms, also `none`, are refused.
 - The token needs `exp`, `sub` (a UUID), `aud = authenticated`, `role = authenticated`, and the
   issuer `<supabase>/auth/v1`. An anonymous user (`is_anonymous`) is refused.
-- The JWKS is cached for 10 minutes. An unknown `kid` fetches it again, at most every 30
-  seconds, so a key rotation works without a restart. If a fetch fails, the old keys stay.
+- The JWKS is cached for 10 minutes. An unknown `kid` fetches it again, so a key rotation works
+  without a restart. The verifier fetches at most once in 30 seconds, also after a failed
+  fetch, so forged key ids cannot make a fetch for each request. If a fetch fails, the old keys
+  stay. A token with a known key does not wait for a fetch that runs at that time.
 
 **Two guards.** For each session the API reads as the user (`sama.db.as_user`), so RLS applies.
 In the same transaction it finds the user row of the token in the org of the session and
@@ -1128,20 +1132,31 @@ cross-org check of Section 17.1 through the API.
   `run_events.id`. One worker writes the events of a session at a time, so the ids of a session
   grow in the order of the commits. A client continues with `Last-Event-ID` or `?after=`.
   Without a cursor the stream starts after the last stored event.
-- `run`: the status of a run changed (`status`, `failure_code`, `failure_message`). The first
-  poll sends the open runs.
+- `runs`: the first event of each stream. The status of every open run and of the 20 most
+  recent runs. A client that connects again uses it to correct the runs that it shows as open:
+  a status change while the client was not connected is not lost.
+- `run`: the status of a run changed (`status`, `failure_code`, `failure_message`). A run that
+  the stream saw open stays in the poll until the stream sends its end status, also when more
+  than 20 newer runs are in the session.
 - `end`: the user cannot read the session any more. The stream ends.
 
-The stream reads new rows every 0.5 seconds, sends `: ping` every 15 seconds, checks the access
-again at each read, and ends after one hour. The client then connects again.
+The stream reads new rows every 0.5 seconds, sends `: ping` every 15 seconds, and checks the
+access again at each read. It ends after one hour, or when the access token expires if that is
+earlier. The client then connects again with a fresh token. One process has at most 1,000 open
+streams, and one user at most 8 (`ApiSettings`). One more stream gets `429`. The limits are per
+process.
 
 **Web page.** The API serves a minimal page at `/` (`src/sama/api/static/`): sign-in, a session
 list, new session, chat with streamed text, approval cards (Approve, Always allow, Deny),
 `clarify` answers, and a stop button. It has no build step and no third-party code:
 
 - Sign-in uses the Supabase Auth REST API: email and password
-  (`/auth/v1/token?grant_type=password`), a sign-in link (`/auth/v1/otp`), and token refresh.
-  A form for an access token helps in development. The tokens stay in `sessionStorage`.
+  (`/auth/v1/token?grant_type=password`), a sign-in link, and token refresh. A form for an
+  access token helps in development. The tokens stay in `sessionStorage`.
+- The sign-in link uses PKCE (`/auth/v1/otp` with `code_challenge`, then
+  `/auth/v1/token?grant_type=pkce`). The page that asks for the link keeps the verifier in
+  `localStorage` for at most one hour. A link that another person sends cannot sign this browser
+  in to the account of that person. The page never takes tokens from the URL fragment.
 - The stream uses `fetch`, because `EventSource` cannot send the `Authorization` header.
 - The page sets text with `textContent` only. The Content Security Policy allows scripts only
   from the API origin and connections only to the API and the Supabase project.

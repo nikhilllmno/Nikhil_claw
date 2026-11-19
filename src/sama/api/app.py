@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections import Counter
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import resources
@@ -27,7 +29,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, func, insert, select
+from sqlalchemy import func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.api.auth import AuthError, JwtVerifier, Principal
@@ -71,7 +73,12 @@ class ApiSettings(BaseModel):
     """How often an event stream reads new rows."""
     heartbeat_s: float = Field(default=15.0, gt=0)
     max_stream_s: float = Field(default=3600.0, gt=0)
-    """A stream ends after this time. The client connects again with ``Last-Event-ID``."""
+    """A stream ends after this time, or when the access token expires if that is earlier.
+    The client connects again with a fresh token and ``Last-Event-ID``."""
+    max_streams: int = Field(default=1000, gt=0)
+    """The open event streams of this process. One more stream gets ``429``."""
+    max_streams_per_user: int = Field(default=8, gt=0)
+    """The open event streams of one user in this process."""
 
 
 # -- request and response bodies ------------------------------------------------------------
@@ -145,10 +152,6 @@ class SessionAccess:
     def org_id(self) -> uuid.UUID:
         return self.session.org_id  # type: ignore[no-any-return]
 
-    @property
-    def session_id(self) -> uuid.UUID:
-        return self.session.id  # type: ignore[no-any-return]
-
 
 def _not_found(what: str = NOT_FOUND) -> HTTPException:
     return HTTPException(status_code=404, detail=what)
@@ -199,22 +202,42 @@ async def session_access(
 
 
 def _session_out(row: Any) -> SessionOut:
-    return SessionOut(
-        id=row.id,
-        org_id=row.org_id,
-        workspace_id=row.workspace_id,
-        agent_profile_id=row.agent_profile_id,
-        audience=row.audience,
-        title=row.title,
-        status=row.status,
-        created_at=row.created_at,
-    )
+    return SessionOut.model_validate(row, from_attributes=True)
 
 
 def _sse(event: str, data: Any, event_id: int | None = None) -> str:
     lines = [] if event_id is None else [f"id: {event_id}"]
     lines += [f"event: {event}", f"data: {json.dumps(data, separators=(',', ':'))}"]
     return "\n".join(lines) + "\n\n"
+
+
+class _EventStream(StreamingResponse):
+    """A streaming response that gives back its stream slot when the response ends.
+
+    The slot goes back also when the client goes away before the first chunk, because the
+    release is in the response, not in the generator.
+    """
+
+    def __init__(
+        self, content: AsyncIterator[str], *, release: Callable[[], None], **kwargs: Any
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
+
+
+def _run_out(run: Any) -> dict[str, Any]:
+    return {
+        "run_id": str(run.id),
+        "status": run.status,
+        "failure_code": run.failure_code,
+        "failure_message": run.failure_message,
+    }
 
 
 def _cursor(after: int | None, last_event_id: str | None) -> int | None:
@@ -257,6 +280,7 @@ class SamaApi:
         self._gate = gate or GateService(engine)
         self._clarify = clarify
         self._settings = settings or ApiSettings()
+        self._streams: Counter[uuid.UUID] = Counter()
 
     async def principal(self, request: Request) -> Principal:
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
@@ -356,8 +380,10 @@ class SamaApi:
                 await session_access(connection, principal, session_id)
                 if cursor is None:
                     cursor = await self._last_event_id(connection, session_id)
-            return StreamingResponse(
+            release = self._open_stream(principal.auth_user_id)
+            return _EventStream(
                 self._stream(principal, session_id, cursor),
+                release=release,
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -740,22 +766,53 @@ class SamaApi:
 
     # -- the event stream -------------------------------------------------------------------
 
+    def _open_stream(self, user: uuid.UUID) -> Callable[[], None]:
+        """Takes one stream slot of the user, or raises ``429``. Returns the release."""
+        settings = self._settings
+        if (
+            self._streams.total() >= settings.max_streams
+            or self._streams[user] >= settings.max_streams_per_user
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="too many open event streams. Close a page and try again.",
+                headers={"Retry-After": "5"},
+            )
+        self._streams[user] += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._streams[user] -= 1
+                if self._streams[user] <= 0:
+                    del self._streams[user]
+
+        return release
+
     async def _stream(
         self, principal: Principal, session_id: uuid.UUID, cursor: int
     ) -> AsyncIterator[str]:
         """Server-sent events of a session.
 
+        - ``runs``: the first event. The status of each open run and of the recent runs. A
+          client that connects again uses it to correct the runs that it shows as open.
         - ``run_event``: one stored run event. The SSE id is the ``run_events.id``. One worker
           writes the events of a session at a time, so the ids of a session grow in the order
           of the commits.
-        - ``run``: the status of a run changed. The first poll sends the open runs.
+        - ``run``: the status of a run changed.
         - ``end``: the user cannot read the session any more. The stream ends.
 
-        Each poll checks the access again, with both guards.
+        Each poll checks the access again, with both guards. The stream ends when the access
+        token expires, so that a stream does not live longer than its token.
         """
         settings = self._settings
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + settings.max_stream_s
+        lifetime = settings.max_stream_s
+        if principal.expires_at is not None:
+            lifetime = min(lifetime, principal.expires_at - time.time())
+        deadline = loop.time() + lifetime
         next_ping = loop.time() + settings.heartbeat_s
         statuses: dict[uuid.UUID, str] = {}
         first = True
@@ -798,28 +855,13 @@ class SamaApi:
                             event.id,
                         )
                     )
-                runs = await connection.execute(
-                    select(Run.id, Run.status, Run.failure_code, Run.failure_message)
-                    .where(and_(Run.org_id == access.org_id, Run.session_id == session_id))
-                    .order_by(Run.created_at.desc(), Run.id.desc())
-                    .limit(RECENT_RUNS)
-                )
-                for run in runs:
-                    known = statuses.get(run.id)
-                    statuses[run.id] = run.status
-                    if known == run.status or (first and run.status not in OPEN_RUN_STATUSES):
-                        continue
-                    out.append(
-                        _sse(
-                            "run",
-                            {
-                                "run_id": str(run.id),
-                                "status": run.status,
-                                "failure_code": run.failure_code,
-                                "failure_message": run.failure_message,
-                            },
-                        )
-                    )
+                runs = await self._stream_runs(connection, access.org_id, session_id, statuses)
+                if first:
+                    out.insert(0, _sse("runs", {"runs": [_run_out(run) for run in runs]}))
+                changed = [run for run in runs if statuses.get(run.id) != run.status]
+                statuses.update((run.id, run.status) for run in runs)
+                if not first:
+                    out += [_sse("run", _run_out(run)) for run in changed]
             first = False
             for chunk in out:
                 yield chunk
@@ -827,4 +869,36 @@ class SamaApi:
                 next_ping = loop.time() + settings.heartbeat_s
                 yield ": ping\n\n"
             if len(out) < STREAM_BATCH:
-                await asyncio.sleep(settings.poll_s)
+                await asyncio.sleep(max(0.0, min(settings.poll_s, deadline - loop.time())))
+
+    @staticmethod
+    async def _stream_runs(
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        statuses: dict[uuid.UUID, str],
+    ) -> list[Any]:
+        """The recent runs, every open run, and each run that the stream last saw open.
+
+        A run that the stream saw open stays in the poll until the stream sends its end
+        status, also when more than ``RECENT_RUNS`` newer runs are in the session.
+        """
+        columns = (Run.id, Run.status, Run.failure_code, Run.failure_message)
+        scope = (Run.org_id == org_id, Run.session_id == session_id)
+        recent = await connection.execute(
+            select(*columns)
+            .where(*scope)
+            .order_by(Run.created_at.desc(), Run.id.desc())
+            .limit(RECENT_RUNS)
+        )
+        watched = [run_id for run_id, status in statuses.items() if status in OPEN_RUN_STATUSES]
+        rows = {run.id: run for run in recent}
+        older = await connection.execute(
+            select(*columns).where(
+                *scope,
+                or_(Run.status.in_(OPEN_RUN_STATUSES), Run.id.in_(watched)),
+                Run.id.not_in(list(rows)),
+            )
+        )
+        rows.update((run.id, run) for run in older)
+        return list(rows.values())

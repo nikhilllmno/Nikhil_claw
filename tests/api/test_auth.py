@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -195,6 +196,68 @@ async def test_no_jwks_at_the_start_refuses_the_token() -> None:
     verifier = jwks_verifier(jwks, clock)
     with pytest.raises(AuthError, match="cannot check"):
         await verifier.verify(jwks.sign("k1"))
+
+
+async def test_a_failed_first_fetch_waits_for_the_refresh_gap() -> None:
+    jwks, clock = Jwks(), Clock()
+    jwks.add("k1")
+    jwks.down = True
+    verifier = jwks_verifier(jwks, clock)
+    for _ in range(3):
+        with pytest.raises(AuthError, match="cannot check"):
+            await verifier.verify(jwks.sign("k1"))
+    assert jwks.calls == 1, "a failed fetch also starts the refresh gap"
+    jwks.down = False
+    clock.now += 31
+    assert (await verifier.verify(jwks.sign("k1"))).auth_user_id == USER
+    assert jwks.calls == 2
+
+
+async def test_forged_key_ids_in_an_outage_fetch_once_per_gap() -> None:
+    jwks, clock = Jwks(), Clock()
+    jwks.add("k1")
+    verifier = jwks_verifier(jwks, clock)
+    await verifier.verify(jwks.sign("k1"))
+    jwks.down = True
+    clock.now += 31
+    for _ in range(5):
+        with pytest.raises(AuthError, match="unknown key"):
+            await verifier.verify(_forged_kid(jwks))
+    assert jwks.calls == 2
+
+
+async def test_a_known_key_does_not_wait_for_a_slow_fetch() -> None:
+    jwks, clock = Jwks(), Clock()
+    jwks.add("k1")
+    release = asyncio.Event()
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        if jwks.calls >= 1:
+            jwks.calls += 1
+            await release.wait()
+            return httpx.Response(503)
+        return jwks.handler(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+    verifier = JwtVerifier(jwks_url=JWKS, issuer=ISSUER, http=http, clock=clock)
+    await verifier.verify(jwks.sign("k1"))
+    clock.now += 601  # the keys are stale, so the next request fetches them again
+    fetching = asyncio.create_task(verifier.verify(_forged_kid(jwks)))
+    await asyncio.sleep(0.01)
+    assert jwks.calls == 2, "the forged token holds the fetch"
+    principal = await asyncio.wait_for(verifier.verify(jwks.sign("k1")), timeout=1)
+    assert principal.auth_user_id == USER
+    release.set()
+    with pytest.raises(AuthError, match="unknown key"):
+        await fetching
+
+
+async def test_the_principal_has_the_expiry() -> None:
+    verifier = JwtVerifier(secret=SecretStr(SECRET), issuer=ISSUER)
+    before = time.time()
+    principal = await verifier.verify(token(USER, expires_in=120))
+    assert principal.expires_at is not None
+    assert before + 110 < principal.expires_at < before + 130
 
 
 async def test_a_token_without_a_key_id_is_refused() -> None:

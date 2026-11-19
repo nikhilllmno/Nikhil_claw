@@ -11,12 +11,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import Org, Run
-from sama.orchestrator.limits import (
-    DEFAULT_MAX_RUNNING_RUNS,
-    DEFAULT_ORG_MESSAGES_PER_MINUTE,
-    DEFAULT_USER_MESSAGES_PER_MINUTE,
-    QueueLimits,
-)
+from sama.orchestrator.limits import QueueLimits
 from sama.orchestrator.queue import RateLimitedError, RunQueue
 from tests.orchestrator.conftest import Tenant, add_tenant
 
@@ -46,10 +41,8 @@ def test_limits_come_from_the_org_json(raw: Any, expected: QueueLimits) -> None:
     assert QueueLimits.from_json(raw) == expected
 
 
-def test_the_defaults() -> None:
-    assert QueueLimits() == QueueLimits(
-        DEFAULT_MAX_RUNNING_RUNS, DEFAULT_USER_MESSAGES_PER_MINUTE, DEFAULT_ORG_MESSAGES_PER_MINUTE
-    )
+def test_the_defaults_match_the_docs() -> None:
+    assert QueueLimits() == QueueLimits(5, 20, 120)
 
 
 async def set_limits(engine: AsyncEngine, tenant: Tenant, **limits: int) -> None:

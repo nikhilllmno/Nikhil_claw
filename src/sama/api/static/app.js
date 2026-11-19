@@ -13,6 +13,11 @@ const state = {
   openRuns: new Set(),
 };
 const AUTH_KEY = "sama.auth";
+// The sign-in link uses PKCE. The page that asks for the link keeps the verifier, so only this
+// browser can use the code in the link. A link from another person cannot sign this browser in.
+const PKCE_KEY = "sama.pkce";
+const PKCE_MAX_AGE_MS = 60 * 60 * 1000;
+const OPEN_STATUSES = new Set(["queued", "running", "paused"]);
 
 function showError(message) {
   $("error").textContent = message || "";
@@ -248,7 +253,7 @@ async function openSession(id) {
   const detail = await api(`/sessions/${id}`);
   $("session-title").textContent = detail.title || `Session ${id.slice(0, 8)}`;
   for (const run of detail.runs) {
-    if (["queued", "running", "paused"].includes(run.status)) state.openRuns.add(run.id);
+    if (OPEN_STATUSES.has(run.status)) state.openRuns.add(run.id);
   }
   render();
   await Promise.all([loadMessages(), loadApprovals(), loadQuestions(), loadSessions()]);
@@ -316,18 +321,41 @@ function parseEvent(block) {
   return event;
 }
 
-function handleEvent(name, data) {
-  if (name === "run") {
-    if (["queued", "running", "paused"].includes(data.status)) state.openRuns.add(data.run_id);
-    else state.openRuns.delete(data.run_id);
+function applyRun(data) {
+  const open = OPEN_STATUSES.has(data.status);
+  const wasOpen = state.openRuns.has(data.run_id);
+  if (open) state.openRuns.add(data.run_id);
+  else state.openRuns.delete(data.run_id);
+  if (data.status === "paused") {
+    $("run-status").textContent = "The run waits for a decision.";
+    loadApprovals().catch((e) => showError(e.message));
+  } else if (open) {
+    $("run-status").textContent = "";
+  } else if (wasOpen) {
+    // Show the end of a run only once: the end of a run that the page did not show as open
+    // is old news.
     $("run-status").textContent = data.failure_message
       ? `The run ${data.status}: ${data.failure_message}`
-      : data.status === "paused" ? "The run waits for a decision." : "";
-    $("cancel").hidden = state.openRuns.size === 0;
-    if (data.status === "paused") loadApprovals().catch((e) => showError(e.message));
-    if (!["queued", "running", "paused"].includes(data.status)) {
-      loadMessages().catch((e) => showError(e.message));
+      : "";
+    loadMessages().catch((e) => showError(e.message));
+  }
+}
+
+function handleEvent(name, data) {
+  if (name === "runs") {
+    // The first event of each stream. A run that the page shows as open but that is not open
+    // here ended while the page was not connected.
+    const known = new Map(data.runs.map((run) => [run.run_id, run]));
+    for (const runId of [...state.openRuns]) {
+      if (!known.has(runId)) applyRun({ run_id: runId, status: "ended" });
     }
+    for (const run of data.runs) applyRun(run);
+    $("cancel").hidden = state.openRuns.size === 0;
+    return;
+  }
+  if (name === "run") {
+    applyRun(data);
+    $("cancel").hidden = state.openRuns.size === 0;
     return;
   }
   if (name !== "run_event") return;
@@ -374,12 +402,38 @@ async function start() {
   await loadSessions();
 }
 
-function readFragment() {
-  // A sign-in link of Supabase Auth returns the tokens in the URL fragment.
-  if (!location.hash.includes("access_token=")) return false;
-  const params = new URLSearchParams(location.hash.slice(1));
+function base64url(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function newPkce() {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  // localStorage, because the sign-in link can open in a new tab.
+  localStorage.setItem(PKCE_KEY, JSON.stringify({ verifier, created: Date.now() }));
+  return base64url(digest);
+}
+
+async function readSignInLink() {
+  // Never use tokens from the URL fragment: anyone can put tokens into a link.
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  const code = new URLSearchParams(location.search).get("code");
+  if (!code) return false;
   history.replaceState(null, "", location.pathname);
-  saveAuth(Object.fromEntries(params));
+  const saved = JSON.parse(localStorage.getItem(PKCE_KEY) || "null");
+  localStorage.removeItem(PKCE_KEY);
+  if (!saved || Date.now() - saved.created > PKCE_MAX_AGE_MS) {
+    $("login-status").textContent =
+      "This sign-in link is not from this browser, or it is too old. Ask for a new link.";
+    return false;
+  }
+  saveAuth(await supabaseAuth("token?grant_type=pkce", {
+    auth_code: code,
+    code_verifier: saved.verifier,
+  }));
   return true;
 }
 
@@ -403,6 +457,8 @@ function bind() {
       await supabaseAuth(`otp?redirect_to=${redirect}`, {
         email: $("email").value,
         create_user: false,
+        code_challenge: await newPkce(),
+        code_challenge_method: "s256",
       });
       $("login-status").textContent = "Look in your email for the sign-in link.";
     } catch (error) {
@@ -464,7 +520,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   bind();
   try {
     state.config = await (await fetch("/config")).json();
-    const fromLink = readFragment();
+    const fromLink = await readSignInLink().catch((error) => {
+      $("login-status").textContent = error.message;
+      return false;
+    });
     if (!fromLink) {
       const saved = sessionStorage.getItem(AUTH_KEY);
       state.auth = saved ? JSON.parse(saved) : null;

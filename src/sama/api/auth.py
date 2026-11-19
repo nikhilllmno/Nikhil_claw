@@ -28,7 +28,7 @@ ASYMMETRIC_ALGORITHMS: Final = frozenset({"ES256", "RS256"})
 LEEWAY_S: Final = 10.0
 JWKS_TTL_S: Final = 600.0
 JWKS_REFRESH_GAP_S: Final = 30.0
-"""An unknown key id fetches the JWKS again, but at most once in this time."""
+"""The verifier fetches the JWKS at most once in this time, also after a failed fetch."""
 
 
 class AuthError(Exception):
@@ -41,6 +41,8 @@ class Principal:
 
     auth_user_id: uuid.UUID
     email: str | None
+    expires_at: float | None = None
+    """The ``exp`` claim of the token, in seconds since the epoch. A stream ends at this time."""
 
 
 def jwks_url(supabase_url: str) -> str:
@@ -72,6 +74,9 @@ class JwtVerifier:
         self._clock = clock
         self._keys: dict[str, jwt.PyJWK] = {}
         self._fetched_at: float | None = None
+        """The time of the last fetch that worked."""
+        self._attempted_at: float | None = None
+        """The time of the last fetch, also a fetch that failed."""
         self._lock = asyncio.Lock()
 
     async def verify(self, token: str) -> Principal:
@@ -104,20 +109,27 @@ class JwtVerifier:
     async def _public_key(self, kid: Any, algorithm: str) -> Any:
         if not isinstance(kid, str) or not kid:
             raise AuthError("the access token has no key id")
-        async with self._lock:
-            now = self._clock()
-            stale = self._fetched_at is None or now - self._fetched_at > JWKS_TTL_S
-            unknown = kid not in self._keys and (
-                self._fetched_at is None or now - self._fetched_at > JWKS_REFRESH_GAP_S
-            )
-            if (stale or unknown) and self._jwks_url is not None:
-                await self._fetch(self._jwks_url, now)
-            found = self._keys.get(kid)
+        found = self._keys.get(kid)
+        # A known key does not wait behind a fetch that another request does now.
+        if found is None or (self._stale(self._clock()) and not self._lock.locked()):
+            async with self._lock:
+                now = self._clock()
+                found = self._keys.get(kid)
+                due = self._attempted_at is None or now - self._attempted_at > JWKS_REFRESH_GAP_S
+                if (found is None or self._stale(now)) and due and self._jwks_url is not None:
+                    await self._fetch(self._jwks_url, now)
+                    found = self._keys.get(kid)
         if found is None or found.algorithm_name != algorithm:
+            if self._fetched_at is None:
+                raise AuthError("sama cannot check the access token now")
             raise AuthError("the access token is signed with an unknown key")
         return found.key
 
+    def _stale(self, now: float) -> bool:
+        return self._fetched_at is None or now - self._fetched_at > JWKS_TTL_S
+
     async def _fetch(self, url: str, now: float) -> None:
+        self._attempted_at = now
         try:
             if self._http is None:
                 async with httpx.AsyncClient(timeout=10) as http:
@@ -128,11 +140,8 @@ class JwtVerifier:
             data = response.json()
         except (httpx.HTTPError, ValueError) as error:
             # Keep the old keys: a short outage of Supabase must not sign out every user.
+            # The next fetch comes after the refresh gap, not at each request.
             log.warning("cannot read the JWKS: %s", type(error).__name__)
-            if self._fetched_at is None:
-                raise AuthError("sama cannot check the access token now") from error
-            # Try again after the refresh gap, not at each request.
-            self._fetched_at = now - JWKS_TTL_S + JWKS_REFRESH_GAP_S
             return
         keys: dict[str, jwt.PyJWK] = {}
         for entry in data.get("keys", []) if isinstance(data, Mapping) else []:
@@ -156,4 +165,9 @@ def _principal(claims: Mapping[str, Any]) -> Principal:
     except ValueError as error:
         raise AuthError("the access token is not valid") from error
     email = claims.get("email")
-    return Principal(user, email if isinstance(email, str) else None)
+    expires_at = claims.get("exp")
+    return Principal(
+        user,
+        email if isinstance(email, str) else None,
+        float(expires_at) if isinstance(expires_at, int | float) else None,
+    )

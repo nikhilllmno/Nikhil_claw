@@ -296,10 +296,93 @@ async def test_the_stream_reports_run_status_changes(
     stream, _ = await asyncio.gather(
         client.get(f"/sessions/{s2}/events", headers=mia(tenant)), finish()
     )
-    statuses = [e[1]["status"] for e in sse(stream.text) if e[0] == "run"]
-    assert statuses[0] == "queued"
+    events = sse(stream.text)
+    assert events[0][0] == "runs"
+    assert [(r["run_id"], r["status"]) for r in events[0][1]["runs"]] == [(str(run_id), "queued")]
+    statuses = [e[1]["status"] for e in events if e[0] == "run"]
     assert statuses[-1] == "completed"
-    assert all(e[1]["run_id"] == str(run_id) for e in sse(stream.text) if e[0] == "run")
+    assert all(e[1]["run_id"] == str(run_id) for e in events if e[0] == "run")
+
+
+async def test_a_new_stream_shows_a_run_that_ended_while_away(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness = Harness(engine)
+    run_id = await harness.send(tenant, "s2", "hi")
+    s2 = tenant.ids["s2"]
+    first = sse((await client.get(f"/sessions/{s2}/events", headers=mia(tenant))).text)
+    assert first[0][1]["runs"][0]["status"] == "queued"
+    # The run ends while no stream is open. A queued cancel writes no run event.
+    assert await harness.queue.cancel(org_id=tenant.org, run_id=run_id) == "cancelled"
+    again = sse((await client.get(f"/sessions/{s2}/events", headers=mia(tenant))).text)
+    assert again[0][0] == "runs"
+    assert [(r["run_id"], r["status"]) for r in again[0][1]["runs"]] == [(str(run_id), "cancelled")]
+
+
+async def test_the_stream_follows_an_open_run_behind_many_newer_runs(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Org).where(Org.id == tenant.org).values(limits={"user_messages_per_minute": 50})
+        )
+    harness = Harness(engine)
+    oldest = await harness.send(tenant, "s2", "first")
+    for number in range(21):
+        await harness.send(tenant, "s2", f"later {number}")
+    s2 = tenant.ids["s2"]
+
+    async def cancel() -> None:
+        await asyncio.sleep(0.1)
+        response = await client.post(f"/runs/{oldest}/cancel", headers=mia(tenant))
+        assert response.status_code == 200
+
+    stream, _ = await asyncio.gather(
+        client.get(f"/sessions/{s2}/events", headers=mia(tenant)), cancel()
+    )
+    events = sse(stream.text)
+    assert str(oldest) in {r["run_id"] for r in events[0][1]["runs"]}
+    assert ("run", str(oldest), "cancelled") in {
+        (e[0], e[1].get("run_id"), e[1].get("status")) for e in events
+    }
+
+
+async def test_a_stream_ends_when_the_token_expires(
+    api: SamaApi, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    long = SamaApi(
+        engine,
+        verifier=api._verifier,
+        settings=api._settings.model_copy(update={"max_stream_s": 30}),
+    )
+    transport = httpx.ASGITransport(app=long.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        # The verifier accepts a token up to 10 seconds after exp. The stream does not.
+        headers = bearer(tenant.ids["mia_auth"], expires_in=-5)
+        response = await asyncio.wait_for(
+            client.get(f"/sessions/{tenant.ids['s1']}/events", headers=headers), timeout=5
+        )
+    assert response.status_code == 200
+    assert [e for e in sse(response.text) if e[0] == "run_event"] == []
+
+
+async def test_too_many_streams_get_429(api: SamaApi, engine: AsyncEngine, tenant: Tenant) -> None:
+    capped = SamaApi(
+        engine,
+        verifier=api._verifier,
+        settings=api._settings.model_copy(update={"max_streams_per_user": 1}),
+    )
+    transport = httpx.ASGITransport(app=capped.app())
+    path = f"/sessions/{tenant.ids['s1']}/events"
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        first = asyncio.create_task(client.get(path, headers=mia(tenant)))
+        await asyncio.sleep(0.1)
+        second = await client.get(path, headers=mia(tenant))
+        assert second.status_code == 429
+        assert second.headers["retry-after"] == "5"
+        assert (await first).status_code == 200
+        third = await client.get(path, headers=mia(tenant))
+        assert third.status_code == 200, "the first stream gave its slot back"
 
 
 async def test_a_message_too_long_is_refused(client: httpx.AsyncClient, tenant: Tenant) -> None:
