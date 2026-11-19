@@ -27,15 +27,26 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "todo": frozenset({"todo", "TodoWrite"}),
     "web": frozenset({"web_search", "web_extract"}),
     "clarify": frozenset({"clarify"}),
+    "github": frozenset({"repo_clone"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
 
 DEFAULT_ALLOW: Final = frozenset(
-    {"Read", "Glob", "Grep", "todo", "TodoWrite", "web_search", "web_extract", "clarify"}
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "todo",
+        "TodoWrite",
+        "web_search",
+        "web_extract",
+        "clarify",
+        "repo_clone",
+    }
 )
-"""Tools that only read or that ask the user. Without a policy rule, they are allowed. Every
-other tool gets ``ask``."""
+"""Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
+rule, they are allowed. Every other tool gets ``ask``."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""

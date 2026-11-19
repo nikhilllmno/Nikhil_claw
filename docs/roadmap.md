@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.15.
+Done: M1.1 to M1.16.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -80,7 +80,7 @@ Done: M1.1 to M1.15.
   session builds the `RunConfig` and stores it in `sessions.run_config` (migration `0006`).
   Later runs reuse it. Context files come from the table `context_files`, with the injection
   scan and the 20,000-character cap. Channel hints come with M1.13, repo `AGENTS.md` files
-  with M1.16, and memory and skills later.
+  with M1.16 (in the `repo_clone` result, not in the prefix), and memory and skills later.
 - M1.12: the HTTP API and the minimal web page in `src/sama/api/` (architecture Section 11.4).
   It checks Supabase Auth tokens (legacy secret or JWKS), reads with RLS and checks access in
   code (`src/sama/tenancy/access.py`), streams run events as server-sent events, and decides
@@ -109,6 +109,12 @@ Done: M1.1 to M1.15.
   the first org. Not in M1.15: the Telegram bot and the Slack alerts in the deployed apps (no
   valid bot token or Slack webhook exists yet; the settings turn them on when they are set), a
   custom domain, and more than one machine.
+- M1.16: code editing in the sandbox (architecture Section 15.1). The `github` toolset has
+  `repo_clone`, which clones a public GitHub repo into the session sandbox and returns the
+  repo `AGENTS.md` and `CLAUDE.md` as untrusted data. The agent edits and runs tests with
+  native tools. The sandbox can reach GitHub, PyPI, and npm by default. Not in M1.16: private
+  repos, push, `pr_create`, and the git proxy (M2). See the exfiltration risk in architecture
+  Section 16.2.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

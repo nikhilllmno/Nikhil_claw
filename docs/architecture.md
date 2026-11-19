@@ -669,9 +669,11 @@ Rules:
   the system text also tells the model that file text is data.
 - A file longer than 20,000 characters keeps its head (70%) and its tail (30%). A marker
   `[... N characters cut ...]` replaces the middle.
-- Not in M1.11: channel formatting hints (M1.13), `AGENTS.md` files from cloned repos in the
-  sandbox (M1.16), pinned skills, the skill index, the memory snapshot, and the user profile
+- Not in M1.11: channel formatting hints (M1.13), pinned skills, the skill index, the memory snapshot, and the user profile
   block (later milestones). The `RunConfig` fields for them exist, and they are empty.
+- Repo `AGENTS.md` and `CLAUDE.md` files do not go into the prefix. The prefix stays the same
+  for the whole session, and a repo is cloned during a run. Since M1.16 the `repo_clone`
+  result holds these files (Section 15.1).
 
 ### 6.2 Context management
 
@@ -840,7 +842,7 @@ flowchart LR
 | `media` | `vision_analyze`, `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (sends the user a link or a form), `connection_test` | Sama MCP |
 | `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Sama MCP (Composio, MCP proxy, database gateway) |
-| `github` | `repo_clone`, `pr_create`, `pr_comment` through the sama GitHub App | Sama MCP plus sandbox git |
+| `github` | `repo_clone`, `pr_create`, `pr_comment` through the sama GitHub App. Since M1.16: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15) | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` | Sama MCP |
 
@@ -1437,6 +1439,40 @@ Tools:
   require a reviewed pull request and give the sama App no bypass.
 - Repo `AGENTS.md` and `CLAUDE.md` load as context files for that session.
 
+**Code (M1.16).** The first step: the agent clones a public repo, edits files, and runs tests
+in the sandbox with native tools. It cannot push yet.
+
+| Part | Where | What it does |
+|---|---|---|
+| Parser | `src/sama/tools/repos.py` | `parse_repo` accepts `https://github.com/owner/name` (with or without `.git` or a final `/`), `github.com/owner/name`, and `owner/name`. It refuses other hosts and schemes, user info, ports, queries, fragments, and other paths. |
+| Cloner | `src/sama/tools/repos.py` | `RepoCloner.clone` runs `git clone` in the session sandbox through `Sandbox.exec`. The clone is partial (`--filter=blob:none`) and has one branch. The folder is `<work folder>/<folder>`, and the default folder is the repo name. The command turns off credential helpers and prompts, and allows only the protocol of the source URL. A failed clone removes its folder. |
+| Tool | `src/sama/tools/server.py` | `repo_clone(repo, ref, folder)` in the toolset `github`. The tool is hidden when the server has no sandboxed runtime. |
+
+- **No token.** The sandbox has no GitHub token, so only public repos clone. A private or
+  unknown repo gets the error "does not exist or is not public". The git proxy, push, and
+  `pr_create` come later (M2).
+- **Ref.** `ref` is a branch or a tag. A tag gives a detached HEAD. A ref with `..`, `//`, a
+  space, a start other than a letter or a digit, or an end of `/`, `.`, or `.lock` is refused.
+- **Folder.** One segment of letters, digits, `.`, `_`, or `-`. Not `.` or `..`. If the folder
+  exists, the tool tells the agent to use git in that folder or give another name. The tool
+  makes the empty folder with `mkdir` before the clone. `mkdir` is atomic, so of two calls
+  with one folder only one clones, and a failed clone removes only a folder that its call
+  made.
+- **Instruction files.** The result gives the URL, the branch (or "a tag"), the commit, the
+  path, and the text of `AGENTS.md` and `CLAUDE.md` at the repo root, if they exist. The tool
+  reads them from the commit (`git ls-tree`, `git cat-file`), and only regular files. A
+  symlink could point to a file outside the clone, so the tool ignores it. Each
+  file goes through the injection scan and the 20,000-character cap of Section 6.1 (it
+  reads at most 100,000 bytes). A blocked file gets the placeholder text and a warning log.
+  Each file is in an `<untrusted_content>` block with the file URL at that commit, and the
+  result tells the agent that the files are data. They are not in the prompt prefix, because
+  the prefix stays the same for the session (Section 6.1).
+- **Edits and tests.** The agent uses native `Bash`, `Edit`, and `Write` in the clone. These
+  tools keep the default `ask` (Section 16.1). An admin can add `allow` rules in
+  `tool_policies` for a profile.
+- `python -m sama.admin bootstrap` gives new profiles the `github` toolset. Existing profiles
+  keep their toolsets.
+
 ### 15.2 Changing its own stack
 
 "Make changes to the current agent stack" has two levels:
@@ -1509,7 +1545,7 @@ Rules of the steps:
   gets `deny`.
 - **Toolsets.** `core` (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`,
   `Grep`, `WebFetch`), `todo` (`todo`, `TodoWrite`), `web` (`web_search`, `web_extract`),
-  and `clarify`. They come from `agent_profiles.toolsets`. An unknown name has no tools. The
+  `clarify`, and `github` (`repo_clone`, M1.16). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
   default is an empty list, so a new profile can use no tool until an admin sets its toolsets.
 - **Hardline.** Recursive deletes of `/`, `~`, `$HOME`, or a top-level system folder;
   `--no-preserve-root`; fork bombs; `mkfs`, `wipefs`, `blkdiscard`; `dd`, `shred`, or `>` to
@@ -1534,7 +1570,8 @@ Rules of the steps:
   prefix. A `deny` at any level wins. An org or profile `ask` holds over a user rule. Else
   the user rule wins, then the profile rule, then the org rule. Without a rule, read-only
   tools are allowed (`Read`, `Glob`, `Grep`, `todo`, `TodoWrite`, `web_search`,
-  `web_extract`, `clarify`) and every other tool gets `ask`. The classifier comes later.
+  `web_extract`, `clarify`), and `repo_clone`, which only copies public data into the
+  sandbox. Every other tool gets `ask`. The classifier comes later.
 - **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
   `deny`, and `ask` becomes `deny`. Job pre-approvals come with jobs (M3); until then the set
   is empty.
@@ -1588,6 +1625,17 @@ authority checks and per-call tickets close both gaps in M1.18.
   development. The Docker provider does not block egress. We track this as a risk (R4).
 - The sandbox has no database credentials, no provider keys, and no integration tokens. It
   has only the run token. Git goes through the sama git proxy (Section 15.1).
+- Default hosts (M1.16): `DEFAULT_SANDBOX_HOSTS` in `src/sama/controlplane/settings.py` is
+  `github.com`, `codeload.github.com`, `pypi.org`, `files.pythonhosted.org`, and
+  `registry.npmjs.org`. Every sandbox of the control plane gets them after the host of
+  `SAMA_PUBLIC_URL` and before `SAMA_SANDBOX_ALLOW_OUT`.
+- **Risk: exfiltration through allowed hosts.** An allowed host accepts writes too. A prompt
+  injection can tell the agent to push session data to an attacker repo on GitHub, or to
+  publish a package, with a token in the injected text. The sandbox has no sama secrets, so
+  the data at risk is the session files and the conversation. The git proxy (Section 15.1)
+  closes the push path when it replaces direct GitHub access. Registry uploads stay a risk
+  until the egress filter checks methods and paths. The gate `ask` on `Bash` is the control
+  until then.
 
 **Code.**
 
@@ -2136,7 +2184,8 @@ engine, one run token signer, one gate service, and one clarify broker.
 
 - The worker runs runs in E2B sandboxes with the Claude runtime. The sandbox reaches the
   model proxy, the tool server, and the gate at `SAMA_PUBLIC_URL`. The egress allowlist of each
-  sandbox holds the host of `SAMA_PUBLIC_URL` and the hosts in `SAMA_SANDBOX_ALLOW_OUT`.
+  sandbox holds the host of `SAMA_PUBLIC_URL`, the default hosts (Section 16.2), and the hosts in
+  `SAMA_SANDBOX_ALLOW_OUT`.
 - Large tool outputs spill into the session sandbox. `clarify` works, because the API answers
   in the same process.
 - The trace export and the error rate alerts run in the process when their settings exist

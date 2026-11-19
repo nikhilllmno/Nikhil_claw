@@ -48,7 +48,7 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
         ).one()
         grants = await load_grants(connection, first.org_id, first.user_id)
     assert role == "owner"
-    assert profile == (None, "claude-sonnet-5-5", ["core", "todo", "web", "clarify"])
+    assert profile == (None, "claude-sonnet-5-5", ["core", "todo", "web", "clarify", "github"])
     assert grants.sees_workspace(first.workspace_id)
 
 

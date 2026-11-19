@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from sama.controlplane import ControlPlaneSettings, SettingsError
+from sama.controlplane.settings import DEFAULT_SANDBOX_HOSTS
 
 BASE = {
     "SAMA_DATABASE_URL": "postgresql://u:p@db.example.test/postgres",
@@ -29,7 +30,9 @@ def test_the_minimum_gives_the_urls_and_turns_the_options_off() -> None:
     assert s.model_url == "https://sama-staging.fly.dev/model"
     assert s.tools_url == "https://sama-staging.fly.dev/tools"
     assert s.supabase_url == "https://abc.supabase.co"
-    assert s.allow_out == ("sama-staging.fly.dev",)
+    assert s.allow_out == ("sama-staging.fly.dev", *DEFAULT_SANDBOX_HOSTS)
+    assert "github.com" in s.allow_out
+    assert "pypi.org" in s.allow_out
     assert s.sandbox_template == "sama-runner"
     assert s.worker_concurrency == 4
     assert s.trace_content
@@ -74,7 +77,7 @@ def test_a_bad_value_is_refused_without_its_value(changes: dict[str, str], messa
 
 def test_the_options_are_read() -> None:
     s = settings(
-        SAMA_SANDBOX_ALLOW_OUT=" GitHub.com, pypi.org,,github.com,sama-staging.fly.dev ",
+        SAMA_SANDBOX_ALLOW_OUT=" GitHub.com, pypi.org,,example.org,sama-staging.fly.dev ",
         SAMA_SANDBOX_TEMPLATE="sama-runner-next",
         SAMA_TELEGRAM_BOT_TOKEN="1:abc",
         SAMA_TELEGRAM_WEBHOOK_SECRET="hook-secret",
@@ -88,7 +91,7 @@ def test_the_options_are_read() -> None:
         SAMA_WORKER_CONCURRENCY="2",
         BRAVE_API_KEY="brave",
     )
-    assert s.allow_out == ("sama-staging.fly.dev", "github.com", "pypi.org")
+    assert s.allow_out == ("sama-staging.fly.dev", *DEFAULT_SANDBOX_HOSTS, "example.org")
     assert s.sandbox_template == "sama-runner-next"
     assert s.telegram is not None
     assert s.telegram.bot_username == "sama_bot"
