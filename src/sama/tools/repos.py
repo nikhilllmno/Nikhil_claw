@@ -173,10 +173,18 @@ class RepoCloner:
         result = await sandbox.exec(argv, env=env, timeout_s=CLONE_TIMEOUT_S)
         if result.exit_code == 0:
             return
+        if _ALREADY_FILLED in result.stderr.lower():
+            # Another writer filled the folder after ``_reserve`` made it, for example a
+            # second clone. The files are not from this call, so this call keeps them.
+            raise RepoError(f"{path} exists. Use git in that folder, or give another folder name")
         # A failed clone can leave a part of the folder. This call made the folder, so it can
         # remove it.
         await sandbox.exec(["rm", "-rf", "--", path], timeout_s=GIT_TIMEOUT_S)
         raise RepoError(_clone_problem(target, ref, result.stderr))
+
+
+_ALREADY_FILLED = "already exists and is not an empty directory"
+"""The ``git clone`` error when the target folder has files that this call did not write."""
 
 
 async def _reserve(sandbox: Sandbox, path: str) -> None:
