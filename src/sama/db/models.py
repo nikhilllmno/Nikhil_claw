@@ -50,6 +50,7 @@ SESSION_STATUSES: Final = ("active", "archived")
 LINEAGES: Final = ("compaction", "branch", "retry", "delegation")
 MESSAGE_ROLES: Final = ("user", "assistant", "system", "tool")
 RUN_STATUSES: Final = ("queued", "running", "paused", "completed", "failed", "cancelled")
+ENDED_RUN_STATUSES: Final = ("completed", "failed", "cancelled")
 RESUME_DECISIONS: Final = ("approve", "reject")
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
@@ -281,6 +282,9 @@ class Run(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     """How many times a worker claimed the run."""
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the worker gave this attempt to the runtime. A reap starts the run again only if
+    this is null."""
     pending_approval_id: Mapped[str | None] = mapped_column(Text)
     """The approval that a paused run waits for. It is the ``call_id`` of the approval row."""
     resume_decision: Mapped[str | None] = mapped_column(Text)

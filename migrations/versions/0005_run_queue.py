@@ -18,12 +18,21 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # Before the queue no worker held a lease, so an active run cannot continue. End it, so
+    # the new constraints hold. The deploy runs this migration with no worker running.
+    op.execute(
+        "UPDATE runs SET status = 'failed', failure_code = 'internal', "
+        "failure_message = 'the run queue migration ended the run', "
+        "finished_at = coalesce(finished_at, now()) "
+        "WHERE status IN ('running', 'paused')"
+    )
     op.add_column("runs", sa.Column("lease_owner", sa.Text(), nullable=True))
     op.add_column("runs", sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True))
     op.add_column("runs", sa.Column("attempts", sa.Integer(), server_default="0", nullable=False))
     op.add_column(
         "runs", sa.Column("cancel_requested_at", sa.DateTime(timezone=True), nullable=True)
     )
+    op.add_column("runs", sa.Column("dispatched_at", sa.DateTime(timezone=True), nullable=True))
     op.add_column("runs", sa.Column("pending_approval_id", sa.Text(), nullable=True))
     op.add_column("runs", sa.Column("resume_decision", sa.Text(), nullable=True))
     op.add_column("runs", sa.Column("resume_reason", sa.Text(), nullable=True))
@@ -64,6 +73,7 @@ def downgrade() -> None:
         "resume_reason",
         "resume_decision",
         "pending_approval_id",
+        "dispatched_at",
         "cancel_requested_at",
         "attempts",
         "lease_expires_at",

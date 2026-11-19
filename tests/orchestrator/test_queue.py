@@ -12,7 +12,7 @@ from sqlalchemy import insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Approval, AuditEntry, Message, Run, RunEvent, Session, ToolCall
+from sama.db.models import Approval, AuditEntry, Message, Run, RunEvent, Session
 from sama.gate.service import GateService
 from sama.orchestrator.directory import PostgresSandboxDirectory
 from sama.orchestrator.queue import (
@@ -23,7 +23,7 @@ from sama.orchestrator.queue import (
     RunQueue,
     RunRef,
 )
-from sama.runtime.contract import ApprovalDecision, Usage
+from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
 from tests.orchestrator.conftest import Tenant, add_tenant
 
 OWNER = "worker-a"
@@ -56,15 +56,18 @@ async def expire_lease(engine: AsyncEngine, run_id: uuid.UUID) -> None:
 
 
 async def pause(queue: RunQueue, run: ClaimedRun, approval_id: str = "call-1") -> None:
-    assert await queue.pause(
-        run,
-        OWNER,
-        approval_id=approval_id,
-        tool_name="Bash",
-        arguments={"command": "make deploy"},
-        reason="deploys",
-        runtime_state=b"paused-state",
-        usage=Usage(input_tokens=3),
+    assert (
+        await queue.pause(
+            run,
+            OWNER,
+            approval_id=approval_id,
+            tool_name="Bash",
+            arguments={"command": "make deploy"},
+            reason="deploys",
+            runtime_state=b"paused-state",
+            usage=Usage(input_tokens=3),
+        )
+        == "paused"
     )
 
 
@@ -195,7 +198,7 @@ async def test_a_new_run_gets_the_state_of_the_last_completed_run(
     await enqueue(queue, tenant, "s1")
     run = await claim(queue)
     assert run.runtime_state == b"\x00state-1"
-    assert await queue.fail(run, OWNER, code="model_error", message="boom", usage=Usage())
+    assert await queue.fail(run, OWNER, code=FailureCode.MODEL_ERROR, message="boom", usage=Usage())
     await enqueue(queue, tenant, "s1")
     assert (await claim(queue)).runtime_state == b"\x00state-1"
 
@@ -234,7 +237,7 @@ async def test_fail_with_cancelled_ends_as_cancelled(engine: AsyncEngine, tenant
     second = await enqueue(queue, tenant, "s2")
     for _ in range(2):
         run = await claim(queue)
-        code = "cancelled" if run.run_id == first else "tool_error"
+        code = FailureCode.CANCELLED if run.run_id == first else FailureCode.TOOL_ERROR
         assert await queue.fail(run, OWNER, code=code, message="m", usage=Usage())
     assert (await run_row(engine, first)).status == "cancelled"
     row = await run_row(engine, second)
@@ -347,6 +350,29 @@ async def test_pause_creates_the_approval_if_the_gate_did_not(
         assert list(actions) == ["approval.requested"]
 
 
+async def test_a_cancel_before_the_pause_ends_the_run(engine: AsyncEngine, tenant: Tenant) -> None:
+    queue = RunQueue(engine)
+    run_id = await enqueue(queue, tenant, "s1")
+    run = await claim(queue)
+    assert await queue.cancel(org_id=tenant.org, run_id=run_id) == "running"
+    status = await queue.pause(
+        run,
+        OWNER,
+        approval_id="call-1",
+        tool_name="Bash",
+        arguments={},
+        reason="",
+        runtime_state=b"s",
+        usage=Usage(),
+    )
+    assert status == "cancelled"
+    row = await run_row(engine, run_id)
+    assert (row.status, row.pending_approval_id, row.lease_owner) == ("cancelled", None, None)
+    assert await GateService(engine).expire() >= 0
+    assert await queue.release_decided() == []
+    assert await queue.claim(OWNER) is None
+
+
 async def test_pause_keeps_the_approval_of_the_gate(engine: AsyncEngine, tenant: Tenant) -> None:
     queue = RunQueue(engine)
     run_id = await enqueue(queue, tenant, "s1")
@@ -454,11 +480,11 @@ async def test_reap_queues_a_run_that_left_no_trace(engine: AsyncEngine, tenant:
     )
 
 
-async def test_reap_fails_a_run_that_streamed_events(engine: AsyncEngine, tenant: Tenant) -> None:
+async def test_reap_fails_a_dispatched_run(engine: AsyncEngine, tenant: Tenant) -> None:
     queue = RunQueue(engine)
     run_id = await enqueue(queue, tenant, "s1")
     run = await claim(queue)
-    await queue.add_events(run, OWNER, [(0, "text_delta", {"text": "a"})])
+    assert await queue.dispatch(run, OWNER)
     await expire_lease(engine, run_id)
     assert await queue.reap() == ([], [RunRef(tenant.org, run_id)])
     row = await run_row(engine, run_id)
@@ -466,23 +492,36 @@ async def test_reap_fails_a_run_that_streamed_events(engine: AsyncEngine, tenant
     assert "tool can have run" in row.failure_message
 
 
-async def test_reap_fails_a_run_with_a_tool_call(engine: AsyncEngine, tenant: Tenant) -> None:
+async def test_an_old_attempt_cannot_write_after_a_new_claim(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
     queue = RunQueue(engine)
     run_id = await enqueue(queue, tenant, "s1")
-    await claim(queue)
-    async with engine.begin() as connection:
-        await connection.execute(
-            insert(ToolCall).values(
-                org_id=tenant.org,
-                session_id=tenant.ids["s1"],
-                run_id=run_id,
-                call_id="c1",
-                tool_name="Bash",
-            )
-        )
+    old = await claim(queue)
     await expire_lease(engine, run_id)
-    assert await queue.reap() == ([], [RunRef(tenant.org, run_id)])
-    assert (await run_row(engine, run_id)).status == "failed"
+    assert await queue.heartbeat(old, OWNER) is Lease.LOST, "an expired lease is lost"
+    assert not await queue.dispatch(old, OWNER)
+    await queue.reap()
+    new = await claim(queue)  # the same owner, as two slots of one worker
+    assert new.attempt == old.attempt + 1
+    assert await queue.heartbeat(old, OWNER) is Lease.LOST
+    assert not await queue.add_events(old, OWNER, [(0, "text_delta", {})])
+    assert not await queue.complete(old, OWNER, output="x", runtime_state=None, usage=Usage())
+    assert (
+        await queue.pause(
+            old,
+            OWNER,
+            approval_id="c",
+            tool_name="Bash",
+            arguments={},
+            reason="",
+            runtime_state=None,
+            usage=Usage(),
+        )
+        is None
+    )
+    assert await queue.complete(new, OWNER, output="y", runtime_state=None, usage=Usage())
+    assert (await run_row(engine, run_id)).status == "completed"
 
 
 async def test_reap_stops_after_max_attempts(engine: AsyncEngine, tenant: Tenant) -> None:

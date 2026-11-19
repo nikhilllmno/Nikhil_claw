@@ -12,6 +12,9 @@ For each run it:
 5. calls the run-end hooks (for example ``ClarifyBroker.cancel_run``) when the run ends and is
    not paused.
 
+Before it starts the runtime it marks the run as dispatched, so a reap does not start the run a
+second time. When a write shows that the lease is lost, it stops the runtime at once.
+
 From time to time it also times out approvals (``GateService.expire``), queues the paused runs
 whose approval is decided, and reaps the runs whose lease expired.
 """
@@ -137,7 +140,7 @@ class Worker:
         self._queue = queue
         self._runtimes = runtimes
         self._config = config
-        self._gate = gate
+        self._gate = gate or GateService(queue.engine)
         self._on_run_end = tuple(on_run_end)
         self._heartbeat_s = heartbeat_s or queue.lease.total_seconds() / 3
         self._poll_s = poll_s
@@ -175,10 +178,9 @@ class Worker:
 
     async def maintain(self) -> None:
         """Times out approvals, queues decided runs, and reaps runs with an expired lease."""
-        if self._gate is not None:
-            expired = await self._gate.expire()
-            if expired:
-                log.info("approvals timed out count=%s", expired)
+        expired = await self._gate.expire()
+        if expired:
+            log.info("approvals timed out count=%s", expired)
         released = await self._queue.release_decided()
         requeued, ended = await self._queue.reap()
         for run_id in released:
@@ -187,7 +189,7 @@ class Worker:
             log.warning("run queued again after a lost lease run=%s", ref.run_id)
         for ref in ended:
             log.warning("run ended after a lost lease run=%s", ref.run_id)
-            self._call_hooks(str(ref.org_id), str(ref.run_id))
+            self._ended(ref.org_id, ref.run_id)
 
     async def run_once(self) -> bool:
         """Claims one run and executes it. Returns False if no run was ready."""
@@ -219,6 +221,9 @@ class Worker:
             message = f"the run cannot start: {error}"[:MAX_FAILURE_CHARS]
             await self._fail(run, FailureCode.INVALID_REQUEST, message, Usage())
             return
+        if not await self._queue.dispatch(run, self.owner):
+            log.warning("the worker lost the lease before the start run=%s", run.run_id)
+            return
         stream = _stream(runtime, run, scope, config, budget)
         watch = _Watch()
         writer = _Writer(self._queue, run, self.owner, watch, self._flush_s)
@@ -230,6 +235,10 @@ class Worker:
                 async for event in stream:
                     usage = event.usage
                     await writer.add(event)
+                    if watch.lost:
+                        # Stop at once. The run belongs to another attempt now.
+                        await _cancel(runtime, str(run.run_id))
+                        break
                     if is_terminal(event):
                         terminal = event
                         break
@@ -256,10 +265,10 @@ class Worker:
                 runtime_state=terminal.runtime_state,
                 usage=terminal.usage,
             ):
-                self._ended(run)
+                self._ended(run.org_id, run.run_id)
             return
         if isinstance(terminal, ApprovalRequired):
-            paused = await self._queue.pause(
+            status = await self._queue.pause(
                 run,
                 self.owner,
                 approval_id=terminal.approval_id,
@@ -269,14 +278,11 @@ class Worker:
                 runtime_state=terminal.runtime_state,
                 usage=terminal.usage,
             )
-            if not paused:
-                return
-            if watch.cancel:
-                await self._queue.cancel(org_id=run.org_id, run_id=run.run_id)
-                self._ended(run)
-                return
-            # The approval can be decided before the pause is stored.
-            await self._queue.release_decided(org_id=run.org_id, run_id=run.run_id)
+            if status == "cancelled":
+                self._ended(run.org_id, run.run_id)
+            elif status == "paused":
+                # The approval can be decided before the pause is stored.
+                await self._queue.release_decided(org_id=run.org_id, run_id=run.run_id)
             return
         if isinstance(terminal, RunFailed):
             code, message = terminal.code, terminal.message
@@ -287,29 +293,22 @@ class Worker:
         await self._fail(run, FailureCode.INTERNAL, "the runtime ended without a result", usage)
 
     async def _fail(self, run: ClaimedRun, code: FailureCode, message: str, usage: Usage) -> None:
-        if await self._queue.fail(run, self.owner, code=code.value, message=message, usage=usage):
-            self._ended(run)
+        if await self._queue.fail(run, self.owner, code=code, message=message, usage=usage):
+            self._ended(run.org_id, run.run_id)
 
     async def _watch(
         self, run: ClaimedRun, runtime: AgentRuntime, budget: Budget, watch: _Watch
     ) -> None:
         """Extends the lease, and stops the run on a cancel, a timeout, or a lost lease."""
-        run_id = str(run.run_id)
-        deadline = None
+        timers = [self._beat(run, runtime, watch)]
         if budget.max_wall_time_s is not None:
-            deadline = time.monotonic() + budget.max_wall_time_s
-        next_beat = time.monotonic() + self._heartbeat_s
+            timers.append(_deadline(runtime, str(run.run_id), budget.max_wall_time_s, watch))
+        await asyncio.gather(*timers)
+
+    async def _beat(self, run: ClaimedRun, runtime: AgentRuntime, watch: _Watch) -> None:
+        run_id = str(run.run_id)
         while True:
-            wake = next_beat if deadline is None or watch.timed_out else min(next_beat, deadline)
-            await asyncio.sleep(max(0.0, wake - time.monotonic()))
-            now = time.monotonic()
-            if deadline is not None and now >= deadline and not watch.timed_out:
-                watch.timed_out = True
-                log.info("the run reached its wall-time limit run=%s", run_id)
-                await _cancel(runtime, run_id)
-            if now < next_beat:
-                continue
-            next_beat = now + self._heartbeat_s
+            await asyncio.sleep(self._heartbeat_s)
             try:
                 lease = await self._queue.heartbeat(run, self.owner)
             except Exception:
@@ -324,15 +323,19 @@ class Worker:
                 log.info("cancel requested run=%s", run_id)
                 await _cancel(runtime, run_id)
 
-    def _ended(self, run: ClaimedRun) -> None:
-        self._call_hooks(str(run.org_id), str(run.run_id))
-
-    def _call_hooks(self, org_id: str, run_id: str) -> None:
+    def _ended(self, org_id: uuid.UUID, run_id: uuid.UUID) -> None:
         for hook in self._on_run_end:
             try:
-                hook(org_id, run_id)
+                hook(str(org_id), str(run_id))
             except Exception:
                 log.exception("a run-end hook failed run=%s", run_id)
+
+
+async def _deadline(runtime: AgentRuntime, run_id: str, seconds: float, watch: _Watch) -> None:
+    await asyncio.sleep(seconds)
+    watch.timed_out = True
+    log.info("the run reached its wall-time limit run=%s", run_id)
+    await _cancel(runtime, run_id)
 
 
 def _scope(run: ClaimedRun) -> RunScope:

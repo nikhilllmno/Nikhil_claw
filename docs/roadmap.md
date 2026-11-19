@@ -73,7 +73,8 @@ Done: M1.1 to M1.10.
 - M1.10: the run queue and the worker in `src/sama/orchestrator/queue.py` and
   `src/sama/orchestrator/worker.py` (architecture Section 4.3), with the queue columns of
   `runs` and `sessions.sandbox_id` (migration `0005`). `PostgresSandboxDirectory` stores the
-  sandbox of each session. Per-org concurrency and rate limits come with the API (M1.12). The
+  sandbox of each session. A crashed run starts again only if the worker did not start the
+  runner (`runs.dispatched_at`). Per-org concurrency and rate limits come with the API (M1.12). The
   deploy (M1.15) applies migrations `0004` and `0005` to Supabase.
 
 | # | Item | Acceptance criteria |

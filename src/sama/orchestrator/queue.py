@@ -2,7 +2,7 @@
 
 Each run is one ``runs`` row. A worker claims the oldest ``queued`` run with
 ``FOR UPDATE SKIP LOCKED`` and holds a lease. It extends the lease with ``heartbeat`` and
-ends the run with ``complete``, ``fail``, ``cancelled``, or ``pause``. Only the lease owner
+ends the run with ``complete``, ``fail``, or ``pause``. Only the lease owner
 can end a running run.
 
 Rules:
@@ -13,8 +13,11 @@ Rules:
 - A paused run waits for its approval. When the approval is decided or times out,
   ``release_decided`` queues the run again with the decision, and the next claim resumes it.
 - ``reap`` handles runs whose lease expired, for example after a worker crash. A run that
-  wrote no event and no tool call goes back to the queue, up to ``max_attempts`` claims. Any
-  other run is marked ``failed``: a tool can have run, so a second try is not safe.
+  the worker did not give to its runtime (``dispatch``) goes back to the queue, up to
+  ``max_attempts`` claims. Any other run is marked ``failed``: a tool can have run, so a
+  second try is not safe.
+- Each write of a worker checks the owner, the attempt, and the lease expiry, so an old
+  attempt cannot write after a reap.
 
 The worker is a system process, so ``claim``, ``reap``, and ``release_decided`` read all
 orgs. Every other method is scoped by ``org_id``.
@@ -53,11 +56,10 @@ from sama.db.models import (
     Run,
     RunEvent,
     Session,
-    ToolCall,
 )
 from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
-from sama.runtime.contract import ApprovalDecision, Usage
+from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
 
 DEFAULT_LEASE: Final = timedelta(seconds=30)
 DEFAULT_MAX_ATTEMPTS: Final = 3
@@ -121,16 +123,22 @@ class ClaimedRun:
     """The ``seq`` of the next run event."""
 
 
-def encode_state(state: bytes | None) -> str | None:
+def _encode_state(state: bytes | None) -> str | None:
     return None if state is None else base64.b64encode(state).decode("ascii")
 
 
-def decode_state(text: str | None) -> bytes | None:
+def _decode_state(text: str | None) -> bytes | None:
     return None if text is None else base64.b64decode(text)
 
 
-def _usage(usage: Usage) -> dict[str, Any]:
-    return usage.model_dump(mode="json")
+_CANCELLED: Final = {
+    "status": "cancelled",
+    "failure_code": "cancelled",
+    "failure_message": "cancelled",
+}
+CRASH_MESSAGE: Final = (
+    "the worker stopped during the run; a tool can have run, so the run does not start again"
+)
 
 
 class RunQueue:
@@ -156,6 +164,10 @@ class RunQueue:
     @property
     def lease(self) -> timedelta:
         return self._lease
+
+    @property
+    def engine(self) -> AsyncEngine:
+        return self._engine
 
     # -- producers --------------------------------------------------------------------------
 
@@ -205,7 +217,7 @@ class RunQueue:
                     agent_profile_id=session.agent_profile_id,
                     triggered_by_user_id=user_id,
                     runtime=session.runtime,
-                    budget=session.budget or {},
+                    budget=session.budget,
                     unattended=unattended,
                 )
             )
@@ -242,13 +254,7 @@ class RunQueue:
                 await connection.execute(
                     update(Run)
                     .where(Run.id == run_id)
-                    .values(
-                        status="cancelled",
-                        cancel_requested_at=func.now(),
-                        failure_code="cancelled",
-                        failure_message="cancelled",
-                        finished_at=func.now(),
-                    )
+                    .values(**_CANCELLED, cancel_requested_at=func.now(), finished_at=func.now())
                 )
                 return "cancelled"
             if status == "running":
@@ -275,6 +281,7 @@ class RunQueue:
         )
         conditions = [
             Run.status == "paused",
+            Run.cancel_requested_at.is_(None),
             Approval.org_id == Run.org_id,
             Approval.run_id == Run.id,
             Approval.call_id == Run.pending_approval_id,
@@ -328,6 +335,7 @@ class RunQueue:
                             lease_owner=owner,
                             lease_expires_at=func.now() + self._lease,
                             attempts=Run.attempts + 1,
+                            dispatched_at=None,
                             started_at=func.coalesce(Run.started_at, func.now()),
                         )
                         .returning(Run.id)
@@ -391,13 +399,13 @@ class RunQueue:
                 )
             )
         ).scalar_one()
-        resume = None
-        state = decode_state(row.runtime_state)
         if row.resume_decision is not None and row.pending_approval_id is not None:
-            resume = Resume(
+            resume: Resume | None = Resume(
                 row.pending_approval_id, ApprovalDecision(row.resume_decision), row.resume_reason
             )
+            state = _decode_state(row.runtime_state)
         else:
+            resume = None
             state = await self._session_state(connection, row.org_id, row.session_id, row.runtime)
         return ClaimedRun(
             org_id=row.org_id,
@@ -411,7 +419,7 @@ class RunQueue:
             runtime=row.runtime,
             model=row.model,
             soul=row.soul,
-            budget=row.budget or {},
+            budget=row.budget,
             input=str((text or {}).get("text", "")),
             runtime_state=state,
             resume=resume,
@@ -437,7 +445,21 @@ class RunQueue:
                 .limit(1)
             )
         ).scalar_one_or_none()
-        return decode_state(state)
+        return _decode_state(state)
+
+    async def dispatch(self, run: ClaimedRun, owner: str) -> bool:
+        """Records that the worker gives the run to its runtime. Returns False if the lease is
+        lost. After this mark, ``reap`` does not start the run again, because a tool can run."""
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    update(Run)
+                    .where(*self._owned(run, owner))
+                    .values(dispatched_at=func.now())
+                    .returning(Run.id)
+                )
+            ).one_or_none()
+        return row is not None
 
     async def heartbeat(self, run: ClaimedRun, owner: str) -> Lease:
         """Extends the lease. Tells the worker if a user asked to cancel the run."""
@@ -500,8 +522,8 @@ class RunQueue:
                 run,
                 owner,
                 status="completed",
-                usage=_usage(usage),
-                runtime_state=encode_state(runtime_state),
+                usage=usage,
+                runtime_state=_encode_state(runtime_state),
             )
             if ended:
                 await connection.execute(
@@ -516,7 +538,7 @@ class RunQueue:
             return ended
 
     async def fail(
-        self, run: ClaimedRun, owner: str, *, code: str, message: str, usage: Usage
+        self, run: ClaimedRun, owner: str, *, code: FailureCode, message: str, usage: Usage
     ) -> bool:
         """Ends the run as ``failed``, or as ``cancelled`` for the code ``cancelled``."""
         async with self._engine.begin() as connection:
@@ -524,9 +546,9 @@ class RunQueue:
                 connection,
                 run,
                 owner,
-                status="cancelled" if code == "cancelled" else "failed",
-                usage=_usage(usage),
-                failure_code=code,
+                status="cancelled" if code is FailureCode.CANCELLED else "failed",
+                usage=usage,
+                failure_code=code.value,
                 failure_message=message,
             )
 
@@ -541,25 +563,45 @@ class RunQueue:
         reason: str,
         runtime_state: bytes | None,
         usage: Usage,
-    ) -> bool:
-        """Pauses the run until its approval is decided.
+    ) -> str | None:
+        """Pauses the run until its approval is decided. Returns ``paused``, or ``cancelled``
+        if a user asked to cancel the run, or None if the lease is lost.
 
         The tool gate creates the approval row when it answers ``ask``. If no row exists (for
         example, a runtime with a static gate), this call creates it, so every paused run can
         be decided and can time out.
         """
         async with self._engine.begin() as connection:
-            ended = await self._end(
+            cancel = (
+                await connection.execute(
+                    select(Run.cancel_requested_at.is_not(None))
+                    .where(*self._owned(run, owner))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if cancel is None:
+                return None
+            if cancel:
+                # The cancel came after the last heartbeat. The run must not wait to resume.
+                await self._end(
+                    connection,
+                    run,
+                    owner,
+                    status="cancelled",
+                    usage=usage,
+                    failure_code="cancelled",
+                    failure_message="cancelled",
+                )
+                return "cancelled"
+            await self._end(
                 connection,
                 run,
                 owner,
                 status="paused",
-                usage=_usage(usage),
-                runtime_state=encode_state(runtime_state),
+                usage=usage,
+                runtime_state=_encode_state(runtime_state),
                 pending_approval_id=approval_id,
             )
-            if not ended:
-                return False
             created = (
                 await connection.execute(
                     pg_insert(Approval)
@@ -591,7 +633,7 @@ class RunQueue:
                         details={"session_id": str(run.session_id), "tool": tool_name},
                     )
                 )
-            return True
+            return "paused"
 
     async def _end(
         self,
@@ -600,7 +642,7 @@ class RunQueue:
         owner: str,
         *,
         status: str,
-        usage: dict[str, Any],
+        usage: Usage,
         **values: Any,
     ) -> bool:
         finished = func.now() if status != "paused" else None
@@ -612,7 +654,7 @@ class RunQueue:
                 .where(*self._owned(run, owner))
                 .values(
                     status=status,
-                    usage=usage,
+                    usage=usage.model_dump(mode="json"),
                     lease_owner=None,
                     lease_expires_at=None,
                     resume_decision=None,
@@ -627,20 +669,27 @@ class RunQueue:
 
     @staticmethod
     def _owned(run: ClaimedRun, owner: str) -> tuple[Any, ...]:
+        """The run is ``running``, in this attempt, for this owner, and the lease is valid.
+
+        The attempt fences an old attempt of the same owner after a reap and a new claim. The
+        expiry check refuses writes after the lease ended, even before a reap.
+        """
         return (
             Run.org_id == run.org_id,
             Run.id == run.run_id,
             Run.status == "running",
             Run.lease_owner == owner,
+            Run.attempts == run.attempt,
+            Run.lease_expires_at > func.now(),
         )
 
     async def reap(self) -> tuple[list[RunRef], list[RunRef]]:
         """Handles running runs whose lease expired. Returns the runs that went back to the
-        queue and the runs that ended."""
-        no_trace = and_(
-            ~exists().where(ToolCall.org_id == Run.org_id, ToolCall.run_id == Run.id),
-            ~exists().where(RunEvent.org_id == Run.org_id, RunEvent.run_id == Run.id),
-        )
+        queue and the runs that ended.
+
+        A run goes back to the queue only if the worker did not give it to the runtime
+        (``dispatched_at`` is null), so no tool of the run can have run.
+        """
         async with self._engine.begin() as connection:
             due = (
                 await connection.execute(
@@ -648,7 +697,9 @@ class RunQueue:
                         Run.org_id,
                         Run.id,
                         Run.cancel_requested_at.is_not(None).label("cancel"),
-                        and_(Run.attempts < self._max_attempts, no_trace).label("retry"),
+                        and_(Run.attempts < self._max_attempts, Run.dispatched_at.is_(None)).label(
+                            "retry"
+                        ),
                     )
                     .where(Run.status == "running", Run.lease_expires_at < func.now())
                     .order_by(Run.lease_expires_at)
@@ -659,30 +710,23 @@ class RunQueue:
             requeued: list[RunRef] = []
             ended: list[RunRef] = []
             for row in due:
-                lease = {"lease_owner": None, "lease_expires_at": None}
-                if row.retry and not row.cancel:
-                    values: dict[str, Any] = {"status": "queued", **lease}
-                    requeued.append(RunRef(row.org_id, row.id))
-                elif row.cancel:
-                    values = {
-                        "status": "cancelled",
-                        "failure_code": "cancelled",
-                        "failure_message": "cancelled",
-                        "finished_at": func.now(),
-                        **lease,
-                    }
-                    ended.append(RunRef(row.org_id, row.id))
+                if row.cancel:
+                    values: dict[str, Any] = {**_CANCELLED, "finished_at": func.now()}
+                elif row.retry:
+                    values = {"status": "queued"}
                 else:
                     values = {
                         "status": "failed",
                         "failure_code": "internal",
-                        "failure_message": (
-                            "the worker stopped during the run; a tool can have run, "
-                            "so the run does not start again"
-                        ),
+                        "failure_message": CRASH_MESSAGE,
                         "finished_at": func.now(),
-                        **lease,
                     }
-                    ended.append(RunRef(row.org_id, row.id))
-                await connection.execute(update(Run).where(Run.id == row.id).values(**values))
+                (requeued if values["status"] == "queued" else ended).append(
+                    RunRef(row.org_id, row.id)
+                )
+                await connection.execute(
+                    update(Run)
+                    .where(Run.id == row.id)
+                    .values(lease_owner=None, lease_expires_at=None, **values)
+                )
         return requeued, ended

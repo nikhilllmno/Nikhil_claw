@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 from typing import Any
 
@@ -13,11 +13,12 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Message, Run, RunEvent
+from sama.db.models import Approval, Message, Run, RunEvent
 from sama.gate.service import GateService
 from sama.orchestrator.queue import RunQueue
 from sama.orchestrator.worker import Worker
 from sama.runtime.contract import (
+    ApprovalDecision,
     ApprovalRequired,
     ResumeRequest,
     RunCompleted,
@@ -26,6 +27,7 @@ from sama.runtime.contract import (
     TextDelta,
     Usage,
 )
+from sama.runtime.contract import RunEvent as Event
 from sama.runtime.fake import FakeRuntime, FakeScript
 from tests.orchestrator.conftest import Tenant, add_tenant
 
@@ -245,7 +247,7 @@ async def test_maintain_reaps_runs_and_calls_the_hooks(harness: Harness, tenant:
     run_id = await harness.send(tenant, "s1", "x")
     run = await harness.queue.claim("dead-worker")
     assert run is not None
-    await harness.queue.add_events(run, "dead-worker", [(0, "text_delta", {"text": "a"})])
+    assert await harness.queue.dispatch(run, "dead-worker")
     async with harness.engine.begin() as connection:
         await connection.execute(
             update(Run)
@@ -274,3 +276,63 @@ async def test_serve_runs_sessions_in_parallel_until_stopped(
 async def test_serve_needs_a_slot(harness: Harness) -> None:
     with pytest.raises(ValueError, match="concurrency"):
         await harness.worker.serve(asyncio.Event(), concurrency=0)
+
+
+class StopWatch(FakeRuntime):
+    """Records how many events the worker read, to show that it stops at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.read = 0
+
+    async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        async for event in super().run(request):
+            self.read += 1
+            yield event
+
+
+async def test_a_rejected_write_stops_the_run_at_once(engine: AsyncEngine, tenant: Tenant) -> None:
+    harness = Harness(engine)
+    runtime = StopWatch()
+    registry = RuntimeRegistry()
+    registry.register(runtime)
+    harness.worker = Worker(harness.queue, registry, owner="w1", flush_s=0.0)
+    words = [TextDelta(text="w ", usage=Usage(output_tokens=n)) for n in range(1, 10)]
+    runtime.add_script(FakeScript(events=(*words, RunCompleted(output="x", usage=words[-1].usage))))
+    run_id = await harness.send(tenant, "s1", "x")
+    run = await harness.queue.claim("w1")
+    assert run is not None
+
+    real_add = harness.queue.add_events
+
+    async def add_then_steal(*args: Any) -> bool:
+        stored = await real_add(*args)
+        async with engine.begin() as connection:
+            await connection.execute(update(Run).where(Run.id == run_id).values(lease_owner="w2"))
+        return stored
+
+    harness.queue.add_events = add_then_steal  # type: ignore[method-assign,assignment]
+    await harness.worker.execute(run)
+    assert runtime.read <= 2, "the worker read on after the lease was lost"
+    assert (await harness.run(run_id)).status == "running"
+
+
+async def test_the_default_worker_times_out_approvals(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Approval)
+            .where(Approval.run_id == run_id)
+            .values(expires_at=Approval.created_at - timedelta(seconds=1))
+        )
+    await harness.worker.maintain()
+    assert await harness.worker.run_once()
+    row = await harness.run(run_id)
+    assert row.status == "completed"
+    resume = harness.runtime.requests[-1]
+    assert isinstance(resume, ResumeRequest)
+    assert resume.decision is ApprovalDecision.REJECT

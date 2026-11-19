@@ -297,8 +297,10 @@ A new run gets the runtime state of the last completed run of the session with t
 runtime, so the adapter continues the session (Section 5.1).
 
 **Lease.** While the run streams, the worker extends the lease every third of the lease time.
-Each write (events, the result) checks that the worker still holds the lease. A worker that
-lost the lease stops the run and writes nothing more. Check constraints keep the state valid:
+Each write (events, the result) checks that the worker still holds the lease of this attempt:
+the same `lease_owner`, the same `attempts` value, and a lease that did not expire. Thus an old
+attempt cannot write after a reap, also when the same worker claims the run again. A worker that
+lost the lease cancels the runtime at once, reads no more events, and writes nothing more. Check constraints keep the state valid:
 a `running` run has a lease and other runs have none, and a `paused` run has its approval id.
 
 **Events.** The worker stores each event in `run_events` with an increasing `seq`, without the
@@ -312,7 +314,9 @@ pauses), the worker calls the run-end hooks, for example `ClarifyBroker.cancel_r
 
 **Cancel.** `cancel(org_id, run_id)` ends a `queued` or `paused` run at once. For a `running`
 run it sets `cancel_requested_at`. The worker sees it at the next lease extension and cancels
-the runtime.
+the runtime. If the runtime asks for an approval after a cancel request, `pause` locks the row,
+sees the request, and ends the run as `cancelled`. `release_decided` never queues a run with a
+cancel request. Thus a cancel always wins over an approval.
 
 **Wall time.** The worker cancels the runtime when the run is longer than
 `Budget.max_wall_time_s`. The run fails with `timeout`.
@@ -325,17 +329,30 @@ is decided or expired, `release_decided` queues the run again with `resume_decis
 before the newer runs of the session and sends a `ResumeRequest`. Each approval resumes once,
 because `release_decided` acts only on a `paused` run, and the run is not `paused` after it.
 
+**Dispatch.** After the setup and before the worker starts the runtime, `dispatch` sets
+`runs.dispatched_at`. From this point a runner can execute tools, also when no event or tool
+call is stored yet.
+
 **Crashed workers.** `reap()` handles a `running` run whose lease expired:
 
 - If a cancel was requested, the run becomes `cancelled`.
-- If the run has no run events and no tool calls, and `attempts` is less than 3, the run goes
-  back to the queue. No tool ran, so a new attempt is safe.
+- If the run is not dispatched and `attempts` is less than 3, the run goes back to the queue.
+  No runner started, so a new attempt is safe.
 - Otherwise the run fails with `internal`. A tool can have run, so the run does not start
   again.
 
+A runner of an ended run can still be alive (for example, the worker process stopped but the
+sandbox did not). The tool gate denies every call of a `completed`, `failed`, or `cancelled`
+run, so such a runner cannot use a tool (Section 16.1).
+
 **Maintenance.** Every 30 seconds each worker times out approvals (`GateService.expire`),
-queues the decided runs, and reaps runs. `Worker.serve(stop, concurrency=n)` runs `n` runs at
+queues the decided runs, and reaps runs. The worker makes a `GateService` on the queue engine
+when the caller gives none. `Worker.serve(stop, concurrency=n)` runs `n` runs at
 the same time and the maintenance loop. When `stop` is set, the current runs end first.
+
+**Migration.** Before migration `0005`, a `running` or `paused` run had no lease and no
+approval id. No worker can continue such a run, so the upgrade ends each one as `failed` with
+`internal`.
 
 **Sandbox directory.** `PostgresSandboxDirectory` stores the sandbox of a session in
 `sessions.sandbox_id`. With it, `SandboxedRuntime` in a new process finds the sandbox of the
@@ -1212,7 +1229,7 @@ the audit log. A user can choose "always allow this tool for me", which writes a
 |---|---|---|
 | Verdict | `src/sama/gate/decide.py` | `decide(context, tool_name, arguments)` is a pure function. It runs the five steps and returns a `Verdict` (`action`, `step`, `reason`). |
 | Hardline | `src/sama/gate/hardline.py` | The fixed deny list for shell commands (`Bash`). |
-| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals. |
+| Service | `src/sama/gate/service.py` | `GateService` loads the gate context of a run from Postgres, calls `decide`, and records each verdict. It also decides and times out approvals. A run that is unknown or ended (`completed`, `failed`, `cancelled`) gets `deny` with no audit row (Section 4.3). |
 | Wire | `src/sama/gate/wire.py` | `GateRequest` and `GateAnswer`, the body of `POST /gate`. |
 | Endpoint | `src/sama/tools/server.py` | `POST /gate` on the sama tool server. The runner sends the run token. |
 | Runner | `src/sama/runtime/remote_gate.py` | `RemoteGate` is the `ToolGate` of the runner. It posts each call to `/gate`. |
