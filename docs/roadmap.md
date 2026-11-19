@@ -139,6 +139,14 @@ Done: M1.1 to M1.19.
   the token, and the hub serves one webhook for each bot. The shared bot and its
   `SAMA_TELEGRAM_*` settings are gone, and migration `0011` deletes its links. Voice notes use
   the OpenAI key of the org. Not in M1.19: Slack (M3.1).
+- M3.1 (moved ahead of M2): the Slack integration in `src/sama/gateway/slack.py` and
+  `src/sama/integrations/slack_hub.py` (architecture Section 11.6). An org admin starts the
+  setup on the web page, makes the Slack app from the manifest link, and pastes the bot token
+  and the signing secret. Direct messages are private sessions; each thread of a linked channel
+  is a shared session. Streaming edits, Block Kit approval buttons, and `/sama new|stop|pair|help`
+  work. The Telegram and Slack gateways share `src/sama/gateway/sessions.py`. Not in M3.1:
+  Slack OAuth distribution, voice notes, and `/model` in Slack. Approver rules per role stay in
+  M3.2.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
@@ -179,7 +187,7 @@ Done: M1.1 to M1.19.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
-| M3.1 | Slack channel | A Slack integration per org (architecture §11.6): an org admin installs a Slack app from a manifest and pastes its tokens. DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. |
+| M3.1 | Slack channel | A Slack integration per org (architecture §11.6): an org admin installs a Slack app from a manifest and pastes its tokens. DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. Each request is checked with the signing secret of the app. A Slack workspace belongs to one org. Done (ahead of M2). |
 | M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
 | M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. |
 | M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. |

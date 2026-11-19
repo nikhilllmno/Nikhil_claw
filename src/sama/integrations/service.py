@@ -7,8 +7,18 @@ An org admin connects the Telegram bot of the org with its BotFather token. ``In
    new random webhook secret. Only the SHA-256 digest of the secret is stored;
 3. registers ``<public_url>/telegram/<integration id>/webhook`` with the secret at Telegram.
 
-A disconnect deletes the row (with its linked chats and pairing codes), the vault entry, and
-the webhook at Telegram. Each change writes an audit entry without secrets.
+An org admin connects a Slack app in two steps:
+
+1. ``setup_slack`` makes a ``pending`` row and returns the request URLs of the row and an app
+   manifest. The admin makes the Slack app from the manifest and installs it;
+2. ``connect_slack`` takes the bot token and the signing secret of the app. It asks Slack for
+   the workspace and the bot of the token (``auth.test``), stores both secrets in the vault and
+   the SHA-256 digest of the signing secret in the row, and sets the row ``active``. The row
+   keeps its id, because the URLs in the Slack app hold it.
+
+A disconnect deletes the row (with its linked chats and pairing codes) and the vault entries.
+For Telegram it deletes the webhook, and for Slack it revokes the bot token. Each change
+writes an audit entry without secrets.
 
 A connect or a disconnect holds Postgres advisory locks for the org (and the kind) and for the
 bot from the start of its database work to the end of its Telegram calls. Thus two changes of
@@ -20,6 +30,7 @@ pooled connection that the change with the lock needs.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -29,13 +40,15 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
+from urllib.parse import quote
 
 from pydantic import SecretStr
 from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AuditEntry, Integration
+from sama.db.models import AuditEntry, ChannelGroup, ChannelIdentity, Integration, PairingCode
+from sama.gateway.slack_client import BOT_TOKEN, SIGNING_SECRET, SlackClient, SlackError
 from sama.gateway.telegram_client import TelegramClient, TelegramError
 from sama.vault.store import SecretName, Vault
 
@@ -45,6 +58,17 @@ TELEGRAM_TOKEN: Final = re.compile(r"[0-9]{1,20}:[A-Za-z0-9_-]{30,100}")
 MAX_ERROR_CHARS: Final = 500
 
 TelegramClientFactory = Callable[[SecretStr], TelegramClient]
+SlackClientFactory = Callable[[SecretStr], SlackClient]
+
+SLACK_SCOPES: Final = (
+    "app_mentions:read",
+    "chat:write",
+    "commands",
+    "im:history",
+    "im:read",
+    "im:write",
+    "users:read",
+)
 
 
 class IntegrationError(Exception):
@@ -53,6 +77,71 @@ class IntegrationError(Exception):
     def __init__(self, message: str, *, status_code: int = 400) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+@dataclass(frozen=True, slots=True)
+class SlackSetup:
+    """What an admin needs to make the Slack app of a pending (or active) integration."""
+
+    integration: IntegrationView
+    events_url: str
+    interactions_url: str
+    commands_url: str
+    manifest: dict[str, Any]
+
+    @property
+    def manifest_link(self) -> str:
+        """Opens the Slack page that makes a new app from the manifest."""
+        text = json.dumps(self.manifest, separators=(",", ":"))
+        return f"https://api.slack.com/apps?new_app=1&manifest_json={quote(text, safe='')}"
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "integration": self.integration.public(),
+            "events_url": self.events_url,
+            "interactions_url": self.interactions_url,
+            "commands_url": self.commands_url,
+            "manifest": self.manifest,
+            "manifest_link": self.manifest_link,
+        }
+
+
+def slack_manifest(events_url: str, interactions_url: str, commands_url: str) -> dict[str, Any]:
+    """The app manifest of a sama Slack app (https://docs.slack.dev/reference/app-manifest)."""
+    return {
+        "display_information": {
+            "name": "sama",
+            "description": "Talk to the sama agents of your org.",
+        },
+        "features": {
+            "app_home": {
+                "home_tab_enabled": False,
+                "messages_tab_enabled": True,
+                "messages_tab_read_only_enabled": False,
+            },
+            "bot_user": {"display_name": "sama", "always_online": True},
+            "slash_commands": [
+                {
+                    "command": "/sama",
+                    "url": commands_url,
+                    "description": "Control sama: new, stop, pair, help",
+                    "usage_hint": "new | stop | pair CODE | help",
+                    "should_escape": False,
+                }
+            ],
+        },
+        "oauth_config": {"scopes": {"bot": list(SLACK_SCOPES)}},
+        "settings": {
+            "event_subscriptions": {
+                "request_url": events_url,
+                "bot_events": ["app_mention", "message.im"],
+            },
+            "interactivity": {"is_enabled": True, "request_url": interactions_url},
+            "org_deploy_enabled": False,
+            "socket_mode_enabled": False,
+            "token_rotation_enabled": False,
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +195,7 @@ class Integrations:
         *,
         public_url: str | None,
         telegram_client: TelegramClientFactory = TelegramClient,
+        slack_client: SlackClientFactory = SlackClient,
         on_change: Callable[[uuid.UUID], None] | None = None,
     ) -> None:
         """``on_change`` gets the id of each integration that changed or went, so that a
@@ -114,6 +204,7 @@ class Integrations:
         self._vault = vault
         self._public_url = (public_url or "").rstrip("/") or None
         self._telegram_client = telegram_client
+        self._slack_client = slack_client
         self._on_change = on_change
 
     @property
@@ -277,31 +368,187 @@ class Integrations:
             ) from None
         return integration_id
 
+    # -- Slack ------------------------------------------------------------------------------
+
+    async def setup_slack(self, org_id: uuid.UUID, user_id: uuid.UUID) -> SlackSetup:
+        """Makes the ``pending`` Slack row of the org, or keeps the row that it has, and
+        returns the URLs and the manifest of the Slack app."""
+        _, public_url = self._require()
+        async with _locked(self._engine, _org_key(org_id, "slack")) as connection:
+            row = (
+                await connection.execute(
+                    select(*_VIEW).where(Integration.org_id == org_id, Integration.kind == "slack")
+                )
+            ).one_or_none()
+            if row is None:
+                row = (
+                    await connection.execute(
+                        insert(Integration)
+                        .values(
+                            org_id=org_id,
+                            kind="slack",
+                            status="pending",
+                            created_by_user_id=user_id,
+                        )
+                        .returning(*_VIEW)
+                    )
+                ).one()
+                await _audit(
+                    connection, org_id, user_id, "integration.created", row.id, {"kind": "slack"}
+                )
+        view = IntegrationView(**row._asdict())
+        base = f"{public_url}/slack/{view.id}"
+        urls = (f"{base}/events", f"{base}/interactions", f"{base}/commands")
+        return SlackSetup(view, *urls, manifest=slack_manifest(*urls))
+
+    async def connect_slack(
+        self,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID,
+        bot_token: SecretStr,
+        signing_secret: SecretStr,
+    ) -> IntegrationView:
+        """Connects the Slack app of the pending (or active) row of the org. Raises
+        ``IntegrationError``."""
+        vault, _ = self._require()
+        token = bot_token.get_secret_value().strip()
+        signing = signing_secret.get_secret_value().strip()
+        if BOT_TOKEN.fullmatch(token) is None:
+            raise IntegrationError(
+                "this is not a Slack bot token. Copy the token that starts with xoxb- from"
+                " OAuth & Permissions."
+            )
+        if SIGNING_SECRET.fullmatch(signing) is None:
+            raise IntegrationError(
+                "this is not a Slack signing secret. Copy it from Basic Information."
+            )
+        client = self._slack_client(SecretStr(token))
+        try:
+            try:
+                auth = await client.auth_test()
+            except SlackError:
+                raise IntegrationError(
+                    "Slack did not accept the token. Install the app and copy the bot token."
+                ) from None
+            team_id, team = str(auth["team_id"]), str(auth.get("team") or auth["team_id"])
+            settings = {
+                "bot_user_id": str(auth["user_id"]),
+                "bot_id": str(auth["bot_id"]),
+                "app_id": await client.app_id(str(auth["bot_id"])),
+            }
+        finally:
+            await client.aclose()
+        async with _locked(self._engine, _org_key(org_id, "slack"), _team_key(team_id)):
+            try:
+                async with self._engine.begin() as connection:
+                    view = await self._store_slack(
+                        connection, vault, org_id, user_id, team_id, team, settings, token, signing
+                    )
+            except IntegrityError:
+                raise IntegrationError(
+                    "another connect is in progress. Try again.", status_code=409
+                ) from None
+        self._changed(view.id)
+        return view
+
+    async def _store_slack(
+        self,
+        connection: AsyncConnection,
+        vault: Vault,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID,
+        team_id: str,
+        team: str,
+        settings: dict[str, Any],
+        token: str,
+        signing: str,
+    ) -> IntegrationView:
+        elsewhere = await connection.scalar(
+            select(Integration.id).where(
+                Integration.kind == "slack",
+                Integration.external_id == team_id,
+                Integration.org_id != org_id,
+            )
+        )
+        if elsewhere is not None:
+            raise IntegrationError(
+                "this Slack workspace is connected to another org.", status_code=409
+            )
+        current = (
+            await connection.execute(
+                select(Integration.id, Integration.external_id)
+                .where(Integration.org_id == org_id, Integration.kind == "slack")
+                .with_for_update()
+            )
+        ).one_or_none()
+        if current is None:
+            raise IntegrationError(
+                "start the Slack setup first: the Slack app needs the URLs of the setup.",
+                status_code=409,
+            )
+        if current.external_id is not None and current.external_id != team_id:
+            # Another Slack workspace: the links of the old workspace do not work with it.
+            for table in (ChannelIdentity, ChannelGroup, PairingCode):
+                await connection.execute(
+                    delete(table).where(table.org_id == org_id, table.integration_id == current.id)
+                )
+        row = (
+            await connection.execute(
+                update(Integration)
+                .where(Integration.org_id == org_id, Integration.id == current.id)
+                .values(
+                    status="active",
+                    external_id=team_id,
+                    name=team,
+                    settings=settings,
+                    secret_hash=secret_hash(signing),
+                    last_error=None,
+                    updated_at=func.now(),
+                )
+                .returning(*_VIEW)
+            )
+        ).one()
+        for name, value in (
+            (SecretName.SLACK_BOT_TOKEN, token),
+            (SecretName.SLACK_SIGNING_SECRET, signing),
+        ):
+            await vault.put(org_id, name, value, actor_user_id=user_id, connection=connection)
+        await _audit(
+            connection,
+            org_id,
+            user_id,
+            "integration.connected",
+            current.id,
+            {"kind": "slack", "name": team, "team_id": team_id},
+        )
+        return IntegrationView(**row._asdict())
+
     # -- all kinds --------------------------------------------------------------------------
 
     async def disconnect(self, org_id: uuid.UUID, kind: str, user_id: uuid.UUID) -> bool:
         """Removes the integration of ``kind``. False when the org has none."""
         vault, _ = self._require()
         async with _locked(self._engine, _org_key(org_id, kind)) as lock:
-            bot = await lock.scalar(
-                select(Integration.external_id).where(
-                    Integration.org_id == org_id, Integration.kind == kind
+            row = (
+                await lock.execute(
+                    select(Integration.external_id).where(
+                        Integration.org_id == org_id, Integration.kind == kind
+                    )
                 )
-            )
-            if bot is None:
+            ).one_or_none()
+            if row is None:
                 return False
-            if kind == "telegram":
-                # A connect of the same bot in another org cannot start before the webhook is
-                # gone.
-                await _lock(lock, _bot_key(bot))
+            if row.external_id is not None:
+                # A connect of the same bot or workspace in another org cannot start before
+                # the webhook is gone or the token is revoked.
+                key = _bot_key if kind == "telegram" else _team_key
+                await _lock(lock, key(row.external_id))
             return await self._disconnect(vault, org_id, kind, user_id)
 
     async def _disconnect(
         self, vault: Vault, org_id: uuid.UUID, kind: str, user_id: uuid.UUID
     ) -> bool:
-        token = None
-        if kind == "telegram":
-            token = await vault.get(org_id, SecretName.TELEGRAM_BOT_TOKEN, fresh=True)
+        token = await vault.get(org_id, _SECRETS[kind][0], fresh=True)
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
@@ -324,14 +571,29 @@ class Integrations:
             )
         self._changed(row.id)
         if token is not None:
-            client = self._telegram_client(token)
-            try:
-                await client.delete_webhook()
-            except TelegramError as error:
-                log.warning("a Telegram webhook delete failed org=%s: %s", org_id, error)
-            finally:
-                await client.aclose()
+            await (self._forget_telegram if kind == "telegram" else self._forget_slack)(
+                org_id, token
+            )
         return True
+
+    async def _forget_telegram(self, org_id: uuid.UUID, token: SecretStr) -> None:
+        client = self._telegram_client(token)
+        try:
+            await client.delete_webhook()
+        except TelegramError as error:
+            log.warning("a Telegram webhook delete failed org=%s: %s", org_id, error)
+        finally:
+            await client.aclose()
+
+    async def _forget_slack(self, org_id: uuid.UUID, token: SecretStr) -> None:
+        """Revokes the bot token, so that the app cannot post with it again."""
+        client = self._slack_client(token)
+        try:
+            await client.revoke()
+        except SlackError as error:
+            log.warning("a Slack token revoke failed org=%s: %s", org_id, error)
+        finally:
+            await client.aclose()
 
     def _require(self) -> tuple[Vault, str]:
         if self._vault is None:
@@ -362,6 +624,10 @@ def _org_key(org_id: uuid.UUID, kind: str) -> str:
 
 def _bot_key(bot_id: str) -> str:
     return f"sama.integration:telegram:{bot_id}"
+
+
+def _team_key(team_id: str) -> str:
+    return f"sama.integration:slack:{team_id}"
 
 
 # Longer than the Telegram calls in a lock (timeouts and 429 waits), and an upper limit for a

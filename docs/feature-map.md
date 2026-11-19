@@ -154,7 +154,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | Telegram adapter | `plugins/platforms/telegram/` | Bot API webhook adapter, inline keyboards, voice notes (§11.2). | Adapt | M1 |
-| Slack adapter | `plugins/platforms/slack/` | Slack Bolt, Events API, Block Kit approvals, thread = session (§11.2). | Adapt | M3 |
+| Slack adapter | `plugins/platforms/slack/` | Events API and Web API with `httpx` (no Bolt), one Slack app per org as an integration, Block Kit approvals, thread = session (§11.2, §11.6). | Adapt | M3 (M3.1 done) |
 | 24 other platforms (Discord, WhatsApp, Signal, Email, Teams, ...) | `plugins/platforms/` | Same adapter shape. Email and WhatsApp first, on request. | Defer | — |
 | API server (OpenAI-compatible) | `gateway/platforms/api_server*.py` | Sama HTTP API with streaming events (§4.1). OpenAI-compatible endpoint later. | Adapt | M1 |
 | Authorization ladder, default deny | `gateway/authz_mixin.py` | Paired identities only. Group policy per binding. Private and shared session audiences (§11.3). | Adapt | M1 |

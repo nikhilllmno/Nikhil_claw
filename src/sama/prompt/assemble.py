@@ -84,6 +84,10 @@ CHANNEL_HINTS: Final = {
         "Channel: Telegram. Telegram shows plain text: do not use Markdown tables or headings."
         " Keep answers short. A long answer arrives as several messages."
     ),
+    "slack": (
+        "Channel: Slack. Slack shows plain text: do not use Markdown tables or headings."
+        " Keep answers short. A long answer arrives as several messages."
+    ),
 }
 """Hints for sessions that a chat channel made (Section 11). A web session gets no hint."""
 

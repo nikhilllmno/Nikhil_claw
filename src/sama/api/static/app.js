@@ -100,9 +100,12 @@ function signOut() {
   state.sessionId = null;
   // A pairing code is a secret of this user: the next user must not see it.
   state.signOuts += 1;
-  $("tg-code").replaceChildren();
-  $("tg-links").replaceChildren();
+  for (const channel of Object.values(CHANNELS)) {
+    $(`${channel.prefix}-code`).replaceChildren();
+    $(`${channel.prefix}-links`).replaceChildren();
+  }
   $("int-orgs").replaceChildren();
+  slackSetups.clear();
   render();
 }
 
@@ -138,7 +141,7 @@ async function loadMe() {
     o.workspaces.map((w) => ({ id: w.id, name: state.orgs.length > 1 ? `${o.name} / ${w.name}` : w.name })));
   fill($("workspace"), workspaces);
   fillProfiles();
-  showTelegram();
+  showPairing();
 }
 
 // The org of the workspace that is selected.
@@ -148,11 +151,20 @@ function selectedOrg() {
 }
 
 // Pairing needs an active Telegram bot in the org of the selected workspace.
-function showTelegram() {
+// The chat channels that have a pairing panel. The panel shows when the org of the selected
+// workspace has an active integration of the channel.
+const CHANNELS = {
+  telegram: { prefix: "tg", panel: "telegram" },
+  slack: { prefix: "sl", panel: "slack" },
+};
+
+function showPairing() {
   const org = selectedOrg();
-  $("telegram").hidden =
-    !org || !(org.integrations || []).some((i) => i.kind === "telegram" && i.status === "active");
-  $("tg-code").replaceChildren();
+  for (const [kind, channel] of Object.entries(CHANNELS)) {
+    $(channel.panel).hidden =
+      !org || !(org.integrations || []).some((i) => i.kind === kind && i.status === "active");
+    $(`${channel.prefix}-code`).replaceChildren();
+  }
 }
 
 async function loadSessions() {
@@ -421,7 +433,7 @@ async function start() {
   if (!state.auth) return;
   await loadMe();
   await loadSessions();
-  await loadTelegram();
+  await loadLinks();
   await loadIntegrations();
 }
 
@@ -462,26 +474,149 @@ function orgIntegrations(org, items) {
     block.append(element("p", `Telegram: @${telegram.name || "bot"} is ${telegram.status}.${error}`,
       telegram.status === "failed" ? "failed" : undefined));
   }
+  const slack = items.find((i) => i.kind === "slack") || null;
+  if (slack === null) {
+    block.append(element("p", "Slack: not connected."));
+  } else if (slack.status === "active") {
+    block.append(element("p", `Slack: the workspace ${slack.name} is connected.`));
+  } else {
+    block.append(element("p", "Slack: the setup is not complete."));
+  }
   if (!org.admin) {
     block.append(element("p", "Ask an admin of the org to connect integrations.", "hint"));
     return block;
   }
-  block.append(telegramForm(org, telegram !== null));
+  const telegramPart = element("div");
+  telegramPart.append(element("h4", "Telegram"), telegramForm(org, telegram !== null));
   if (telegram !== null) {
-    const remove = element("button", "Disconnect Telegram");
-    remove.type = "button";
-    remove.addEventListener("click", async () => {
-      if (!confirm(`Disconnect @${telegram.name || "bot"}? All Telegram links of the org stop.`)) return;
-      try {
-        await api(`/orgs/${org.id}/integrations/telegram`, { method: "DELETE" });
-        await refreshIntegrations();
-      } catch (error) {
-        showError(error.message);
-      }
-    });
-    block.append(remove);
+    telegramPart.append(disconnectButton(org, "telegram", "Disconnect Telegram",
+      `Disconnect @${telegram.name || "bot"}? All Telegram links of the org stop.`));
   }
+  const slackPart = element("div");
+  slackPart.append(element("h4", "Slack"), slackSetup(org, slack));
+  if (slack !== null) {
+    slackPart.append(disconnectButton(org, "slack", "Disconnect Slack",
+      "Disconnect the Slack app? sama revokes its token, and all Slack links of the org stop."));
+  }
+  block.append(telegramPart, slackPart);
   return block;
+}
+
+function disconnectButton(org, kind, label, question) {
+  const remove = element("button", label);
+  remove.type = "button";
+  remove.addEventListener("click", async () => {
+    if (!confirm(question)) return;
+    try {
+      await api(`/orgs/${org.id}/integrations/${kind}`, { method: "DELETE" });
+      await refreshIntegrations();
+    } catch (error) {
+      showError(error.message);
+    }
+  });
+  return remove;
+}
+
+// Step 1 makes the Slack app from a manifest with the request URLs of the org. Step 2 takes
+// the bot token and the signing secret of the installed app.
+// The last Slack setup of each org, so that the steps stay after the panel renders again.
+const slackSetups = new Map();
+
+function slackSetup(org, slack) {
+  const part = element("div");
+  const urls = element("div");
+  if (slackSetups.has(org.id)) urls.replaceChildren(slackSteps(slackSetups.get(org.id)));
+  const start = element("button", slack === null ? "Start Slack setup" : "Show the app setup");
+  start.type = "button";
+  start.addEventListener("click", async () => {
+    start.disabled = true;
+    try {
+      const signOut0 = state.signOuts;
+      const setup = await api(`/orgs/${org.id}/integrations/slack/setup`, { method: "POST" });
+      if (signOut0 !== state.signOuts) return;
+      slackSetups.set(org.id, setup);
+      urls.replaceChildren(slackSteps(setup));
+      if (slack === null) await refreshIntegrations();
+    } catch (error) {
+      showError(error.message);
+    } finally {
+      start.disabled = false;
+    }
+  });
+  part.append(start, urls);
+  if (slack !== null) part.append(slackForm(org, slack.status === "active"));
+  return part;
+}
+
+function slackSteps(setup) {
+  const steps = element("ol");
+  const create = element("li", "Open ");
+  const link = element("a", "this link to make the Slack app");
+  link.href = setup.manifest_link;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  create.append(link, element("span",
+    ". Pick your Slack workspace. The manifest has the sama request URLs."));
+  steps.append(create);
+  for (const step of [
+    "Click Install to Workspace and allow the app.",
+    "In OAuth & Permissions, copy the Bot User OAuth Token (xoxb-...).",
+    "In Basic Information, copy the Signing Secret.",
+    "Paste both values below and click Connect Slack.",
+  ]) steps.append(element("li", step));
+  const list = element("ul", undefined, "hint");
+  for (const [name, url] of [
+    ["Events", setup.events_url],
+    ["Interactivity", setup.interactions_url],
+    ["/sama command", setup.commands_url],
+  ]) list.append(element("li", `${name}: ${url}`));
+  const box = element("div");
+  box.append(steps, element("p", "The request URLs, if you make the app by hand:", "hint"), list);
+  return box;
+}
+
+function slackForm(org, connected) {
+  const form = element("form");
+  const fields = [];
+  for (const [name, text, hint] of [
+    ["bot_token", connected ? "New bot token " : "Bot token ", "xoxb-..."],
+    ["signing_secret", "Signing secret ", "32 characters"],
+  ]) {
+    const label = element("label", text);
+    const input = element("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.required = true;
+    input.placeholder = hint;
+    input.name = name;
+    label.append(input);
+    fields.push([name, input]);
+    form.append(label);
+  }
+  const submit = element("button", connected ? "Replace Slack app" : "Connect Slack");
+  submit.type = "submit";
+  const status = element("p", "", "hint");
+  status.setAttribute("role", "status");
+  form.append(submit, status);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (connected && !confirm("Replace the Slack app? If it is a different Slack workspace, all"
+      + " Slack links of the org stop, and users must pair again.")) return;
+    submit.disabled = true;
+    status.textContent = "Connecting...";
+    try {
+      const body = Object.fromEntries(fields.map(([name, input]) => [name, input.value.trim()]));
+      const result = await api(`/orgs/${org.id}/integrations/slack`, { method: "POST", body });
+      for (const [, input] of fields) input.value = "";
+      status.textContent = `The workspace ${result.name} is connected.`;
+      await refreshIntegrations();
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  return form;
 }
 
 function telegramForm(org, connected) {
@@ -536,19 +671,23 @@ async function refreshIntegrations() {
   if ([...$("workspace").options].some((o) => o.value === workspace)) {
     $("workspace").value = workspace;
     fillProfiles();
-    showTelegram();
+    showPairing();
   }
-  await loadTelegram();
+  await loadLinks();
   await loadIntegrations();
 }
 
-// -- Telegram -----------------------------------------------------------------------------------
+// -- pairing ------------------------------------------------------------------------------------
 
-async function loadTelegram() {
+async function loadLinks() {
+  for (const kind of Object.keys(CHANNELS)) await loadChannelLinks(kind);
+}
+
+async function loadChannelLinks(kind) {
   const signOut0 = state.signOuts;
-  const links = await api("/channels/telegram/identities");
+  const links = await api(`/channels/${kind}/identities`);
   if (signOut0 !== state.signOuts) return;
-  $("tg-links").replaceChildren(...links.map((link) => {
+  $(`${CHANNELS[kind].prefix}-links`).replaceChildren(...links.map((link) => {
     const item = document.createElement("li");
     const org = state.orgs.find((o) => o.id === link.org_id);
     item.textContent = `Linked account (${org ? org.name : "org"}) `;
@@ -557,8 +696,8 @@ async function loadTelegram() {
     unlink.textContent = "Unlink";
     unlink.addEventListener("click", async () => {
       try {
-        await api(`/channels/telegram/identities/${link.id}`, { method: "DELETE" });
-        await loadTelegram();
+        await api(`/channels/${kind}/identities/${link.id}`, { method: "DELETE" });
+        await loadChannelLinks(kind);
       } catch (error) {
         showError(error.message);
       }
@@ -568,26 +707,43 @@ async function loadTelegram() {
   }));
 }
 
-async function pairingCode(kind) {
+function pairingText(kind, codeKind, result) {
+  if (kind === "slack") {
+    return codeKind === "user"
+      ? `Open the sama app in Slack and send ${result.code} in a direct message`
+        + ` (or ${result.command}). `
+      : `Invite the sama app to the channel and send ${result.command} in the channel. `;
+  }
+  return codeKind === "user"
+    ? `Open the link, or send /start ${result.code} to @${result.bot_username}. `
+    : `Open the link and pick the group, or add @${result.bot_username} to the group and send`
+      + ` /pair ${result.code} in the group. `;
+}
+
+async function pairingCode(kind, codeKind) {
   const signOut0 = state.signOuts;
   try {
-    const result = await api("/channels/telegram/pairing-codes", {
+    const result = await api(`/channels/${kind}/pairing-codes`, {
       method: "POST",
-      body: { workspace_id: $("workspace").value, agent_profile_id: $("profile").value, kind },
+      body: {
+        workspace_id: $("workspace").value,
+        agent_profile_id: $("profile").value,
+        kind: codeKind,
+      },
     });
     // The user signed out while the request ran: do not show the code.
     if (signOut0 !== state.signOuts) return;
     const until = new Date(result.expires_at).toLocaleTimeString();
-    const link = element("a", result.link);
-    link.href = result.link;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    const text = kind === "user"
-      ? `Open the link, or send /start ${result.code} to @${result.bot_username}. `
-      : `Open the link and pick the group, or add @${result.bot_username} to the group and send`
-        + ` /pair ${result.code} in the group. `;
-    $("tg-code").replaceChildren(
-      element("span", text), link, element("span", ` The code expires at ${until}.`));
+    const parts = [element("span", pairingText(kind, codeKind, result))];
+    if (result.link) {
+      const link = element("a", result.link);
+      link.href = result.link;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      parts.push(link);
+    }
+    parts.push(element("span", ` The code expires at ${until}.`));
+    $(`${CHANNELS[kind].prefix}-code`).replaceChildren(...parts);
   } catch (error) {
     showError(error.message);
   }
@@ -663,11 +819,13 @@ function bind() {
     await start().catch((e) => showError(e.message));
   });
   $("sign-out").addEventListener("click", signOut);
-  $("tg-user").addEventListener("click", () => pairingCode("user"));
-  $("tg-group").addEventListener("click", () => pairingCode("group"));
+  $("tg-user").addEventListener("click", () => pairingCode("telegram", "user"));
+  $("tg-group").addEventListener("click", () => pairingCode("telegram", "group"));
+  $("sl-user").addEventListener("click", () => pairingCode("slack", "user"));
+  $("sl-group").addEventListener("click", () => pairingCode("slack", "group"));
   $("workspace").addEventListener("change", () => {
     fillProfiles();
-    showTelegram();
+    showPairing();
   });
   $("new-session").addEventListener("submit", async (event) => {
     event.preventDefault();
