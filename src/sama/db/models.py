@@ -24,6 +24,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     Numeric,
     Text,
@@ -59,6 +60,12 @@ CHANNELS: Final = ("web", "slack", "telegram", "extension")
 ACTOR_KINDS: Final = ("user", "agent", "system")
 PROVIDERS: Final = ("anthropic", "openai")
 MODEL_ENDPOINTS: Final = ("messages", "count_tokens", "responses", "chat_completions")
+VAULT_NAMES: Final = (
+    "anthropic_api_key",
+    "openai_api_key",
+    "brave_api_key",
+    "telegram_bot_token",
+)
 
 
 def _one_of(column: str, values: tuple[str, ...]) -> str:
@@ -761,3 +768,25 @@ class PairingCode(Base):
     created_at: Mapped[datetime] = _created_at()
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class VaultSecret(Base):
+    """One encrypted secret of an org (Section 16.3). The value is sealed with a data key, and
+    the vault key wraps the data key. Only org admins can read the row through RLS, and the row
+    has no clear text."""
+
+    __tablename__ = "vault_secrets"
+    __table_args__ = (
+        UniqueConstraint("org_id", "name"),
+        CheckConstraint(_one_of("name", VAULT_NAMES), name="name"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    key_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """The id of the vault key that wraps the data key."""
+    wrapped_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()

@@ -34,6 +34,8 @@ from sama.modelproxy.store import CallRecord
 from sama.modelproxy.usage import Endpoint
 from sama.runtime import Budget
 from sama.tenancy.run_token import RunTokenSigner
+from sama.vault.crypto import VaultError
+from sama.vault.store import OrgKeys, SecretName
 from tests.conformance.scripted_model import serve
 from tests.support import make_scope
 
@@ -127,8 +129,28 @@ class Harness:
         return await self.client.post("/anthropic/v1/messages", json=payload, headers=sent)
 
 
+class FakeKeys(OrgKeys):
+    """Org keys without a database: ``values`` by (org, name), or an error."""
+
+    def __init__(self, values: dict[tuple[str, SecretName], str], *, fail: bool = False) -> None:
+        super().__init__(None, {})
+        self.values = values
+        self.fail = fail
+
+    async def get(self, org_id: Any, name: SecretName) -> SecretStr | None:
+        if self.fail:
+            raise VaultError("the entry does not decrypt")
+        value = self.values.get((str(org_id), name))
+        return SecretStr(value) if value is not None else None
+
+
 def make_proxy(
-    upstream: Upstream, store: MemoryUsageStore, signer: RunTokenSigner, **settings: Any
+    upstream: Upstream,
+    store: MemoryUsageStore,
+    signer: RunTokenSigner,
+    *,
+    keys: OrgKeys | None = None,
+    **settings: Any,
 ) -> ModelProxy:
     defaults: dict[str, Any] = {
         "anthropic_url": "https://anthropic.test",
@@ -143,6 +165,7 @@ def make_proxy(
         settings=ProxySettings(**(defaults | settings)),
         clock=lambda: NOW,
         transport=httpx.MockTransport(upstream.handler),
+        keys=keys,
     )
 
 
@@ -371,6 +394,48 @@ async def test_a_provider_without_a_key_gives_503() -> None:
         )
     await proxy.aclose()
     assert response.status_code == 503
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    ("values", "sent_key"),
+    [
+        ({("org-1", SecretName.ANTHROPIC_API_KEY): "sk-ant-of-org-1"}, "sk-ant-of-org-1"),
+        ({("org-2", SecretName.ANTHROPIC_API_KEY): "sk-ant-of-org-2"}, ANTHROPIC_KEY),
+    ],
+)
+async def test_the_call_uses_the_key_of_the_org_first(
+    values: dict[tuple[str, SecretName], str], sent_key: str
+) -> None:
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, keys=FakeKeys(values))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/anthropic/v1/messages",
+            json={"model": MODEL, "max_tokens": 10, "messages": []},
+            headers={"x-api-key": signer.issue(make_scope("r"), ttl_s=60)},
+        )
+    await proxy.aclose()
+    assert response.status_code == 200
+    assert upstream.requests[0].headers["x-api-key"] == sent_key
+
+
+async def test_a_key_that_cannot_be_read_gives_503() -> None:
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, keys=FakeKeys({}, fail=True))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/openai/v1/responses",
+            json={"model": "gpt-6-luna", "input": "hi"},
+            headers={"authorization": f"Bearer {signer.issue(make_scope('r'), ttl_s=60)}"},
+        )
+    await proxy.aclose()
+    assert response.status_code == 503
+    assert "cannot read the provider key" in response.text
     assert upstream.requests == []
 
 

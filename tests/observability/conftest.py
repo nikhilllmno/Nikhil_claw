@@ -65,7 +65,7 @@ async def add_run(
 
 
 async def add_details(db: AsyncEngine, org: Tenant, run_id: uuid.UUID, at: datetime) -> uuid.UUID:
-    """Adds two messages, a model call, a tool call, and two events to the run. Returns the
+    """Adds two messages, a model call, a tool call, and three events to the run. Returns the
     model call id."""
     keys = {"org_id": org.org, "session_id": org.ids["s1"], "run_id": run_id}
     call_id = uuid.uuid4()
@@ -111,6 +111,7 @@ async def add_details(db: AsyncEngine, org: Tenant, run_id: uuid.UUID, at: datet
             [
                 ("text_delta", {"text": "Hello!"}),
                 ("compacted", {"tokens_before": 100, "tokens_after": 40}),
+                ("tool_call_finished", {"call_id": "t1", "output_preview": "the result"}),
             ],
             start=1,
         ):

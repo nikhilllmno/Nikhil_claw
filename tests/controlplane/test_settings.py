@@ -109,3 +109,41 @@ def test_secrets_stay_out_of_the_repr() -> None:
     text = repr(s)
     for value in ("u:p@db", "k" * 32, "e2b-key", "sk-secret"):
         assert value not in text
+
+
+def test_the_vault_key_is_read_and_checked() -> None:
+    from sama.vault.crypto import VaultKey
+
+    assert settings().vault_key is None
+    text = VaultKey.generate()
+    key = settings(SAMA_VAULT_KEY=text).vault_key
+    assert key is not None
+    assert key.secret == VaultKey.from_text(text).secret
+    for bad in ("not base64!", "c2hvcnQ="):
+        with pytest.raises(SettingsError, match="SAMA_VAULT_KEY must be 32 bytes in base64"):
+            settings(SAMA_VAULT_KEY=bad)
+
+
+def test_the_secret_values_cover_every_secret() -> None:
+    from sama.vault.crypto import VaultKey
+
+    vault_text = VaultKey.generate()
+    s = settings(
+        SAMA_VAULT_KEY=vault_text,
+        ANTHROPIC_API_KEY="anthropic-value",
+        SAMA_TELEGRAM_BOT_TOKEN="telegram-token",
+        SAMA_TELEGRAM_WEBHOOK_SECRET="telegram-hook",
+        SAMA_TELEGRAM_BOT_USERNAME="bot",
+    )
+    values = s.secret_values()
+    for expected in (
+        BASE["SAMA_DATABASE_URL"],
+        "p",
+        BASE["SAMA_RUN_TOKEN_KEY"],
+        BASE["E2B_API_KEY"],
+        "anthropic-value",
+        "telegram-token",
+        "telegram-hook",
+        vault_text,
+    ):
+        assert expected in values

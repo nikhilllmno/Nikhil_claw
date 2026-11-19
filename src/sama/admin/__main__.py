@@ -1,7 +1,12 @@
-"""Admin commands: ``python -m sama.admin bootstrap ...`` (docs/architecture.md, Section 19.4).
+"""Admin commands (docs/architecture.md, Sections 16.3 and 19.4):
 
-It uses ``SAMA_DATABASE_URL``. Run it on a control plane machine, for example with
-``fly ssh console -C "python -m sama.admin bootstrap ..."``.
+- ``python -m sama.admin bootstrap ...``: the first org, owner, workspace, and agent profile.
+- ``python -m sama.admin secret set|list|delete --org <id> [--name <name>]``: the vault
+  entries of an org. ``set`` reads the value from stdin, so the value is not in the shell
+  history or the process list.
+
+It uses ``SAMA_DATABASE_URL``, and ``SAMA_VAULT_KEY`` for ``secret``. Run it on a control
+plane machine, for example with ``fly ssh console -C "python -m sama.admin bootstrap ..."``.
 """
 
 from __future__ import annotations
@@ -9,20 +14,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import getpass
 import json
 import os
 import sys
 import uuid
+from typing import Any
 
 from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Owner, bootstrap
 from sama.db.engine import create_engine
+from sama.vault.crypto import VaultKey
+from sama.vault.store import SecretName, Vault
 
 
-async def _bootstrap(args: argparse.Namespace) -> Bootstrapped:
+def _database_url() -> str:
     url = os.environ.get("SAMA_DATABASE_URL", "")
     if not url:
         raise SystemExit("set SAMA_DATABASE_URL")
-    engine = create_engine(url)
+    return url
+
+
+async def _bootstrap(args: argparse.Namespace) -> Bootstrapped:
+    engine = create_engine(_database_url())
     try:
         return await bootstrap(
             engine,
@@ -38,6 +51,36 @@ async def _bootstrap(args: argparse.Namespace) -> Bootstrapped:
             profile_name=args.profile_name,
             model=args.model,
         )
+    finally:
+        await engine.dispose()
+
+
+def _read_value() -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass("value: ")
+    return sys.stdin.read()
+
+
+async def _secret(args: argparse.Namespace) -> dict[str, Any]:
+    text = os.environ.get("SAMA_VAULT_KEY", "")
+    if not text:
+        raise SystemExit("set SAMA_VAULT_KEY")
+    try:
+        key = VaultKey.from_text(text)
+    except ValueError as error:
+        raise SystemExit(f"SAMA_VAULT_KEY: {error}") from None
+    engine = create_engine(_database_url())
+    vault = Vault(engine, key)
+    org_id: uuid.UUID = args.org
+    try:
+        if args.action == "list":
+            return {"org_id": str(org_id), "names": [n.value for n in await vault.names(org_id)]}
+        name = SecretName(args.name)
+        result: dict[str, Any] = {"org_id": str(org_id), "name": name.value}
+        if args.action == "set":
+            await vault.put(org_id, name, _read_value())
+            return result | {"set": True}
+        return result | {"deleted": await vault.delete(org_id, name)}
     finally:
         await engine.dispose()
 
@@ -61,7 +104,20 @@ def main(argv: list[str] | None = None) -> int:
     boot.add_argument("--workspace-name", default="Main")
     boot.add_argument("--profile-name", default="sama")
     boot.add_argument("--model", default=DEFAULT_MODEL)
+    secret = commands.add_parser("secret", help="Set, list, or delete the vault entries of an org.")
+    secret.add_argument("action", choices=("set", "list", "delete"))
+    secret.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
+    secret.add_argument("--name", choices=[name.value for name in SecretName])
     args = parser.parse_args(argv)
+    if args.command == "secret":
+        if args.action != "list" and args.name is None:
+            parser.error(f"secret {args.action} needs --name")
+        try:
+            print(json.dumps(asyncio.run(_secret(args))))
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        return 0
     try:
         result = asyncio.run(_bootstrap(args))
     except BootstrapError as error:

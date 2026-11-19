@@ -38,7 +38,7 @@ async def test_brave_request_and_hits() -> None:
             },
         )
 
-    hits = await brave(handler).search("sama", 2)
+    hits = await brave(handler).search("sama", 2, org_id="org-1")
     assert hits == [
         SearchHit(title="A", url="https://a.test", snippet="first"),
         SearchHit(title="B", url="https://b.test", snippet=""),
@@ -60,12 +60,12 @@ async def test_brave_request_and_hits() -> None:
 )
 async def test_brave_errors(response: httpx.Response, message: str) -> None:
     with pytest.raises(SearchError, match=message):
-        await brave(lambda r: response).search("q", 3)
+        await brave(lambda r: response).search("q", 3, org_id="org-1")
 
 
 async def test_brave_reply_without_results() -> None:
-    assert await brave(lambda r: httpx.Response(200, json=[1])).search("q", 3) == []
-    assert await brave(lambda r: httpx.Response(200, json={})).search("q", 3) == []
+    assert await brave(lambda r: httpx.Response(200, json=[1])).search("q", 3, org_id="org-1") == []
+    assert await brave(lambda r: httpx.Response(200, json={})).search("q", 3, org_id="org-1") == []
 
 
 async def test_brave_key_is_not_in_errors() -> None:
@@ -73,7 +73,7 @@ async def test_brave_key_is_not_in_errors() -> None:
         raise httpx.ConnectError("refused")
 
     with pytest.raises(SearchError) as caught:
-        await brave(handler).search("q", 3)
+        await brave(handler).search("q", 3, org_id="org-1")
     assert "key-1" not in str(caught.value)
 
 
@@ -151,3 +151,33 @@ async def test_an_unexpected_error_fails_only_its_own_url(
     assert "secret detail" not in text
     assert "secret detail" not in caplog.text
     assert "error=RuntimeError" in caplog.text
+
+
+async def test_brave_uses_the_key_of_the_org() -> None:
+    seen: list[str] = []
+    asked: list[str] = []
+
+    async def lookup(org_id: str) -> SecretStr | None:
+        asked.append(org_id)
+        return SecretStr(f"key-of-{org_id}") if org_id == "org-1" else None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["x-subscription-token"])
+        return httpx.Response(200, json={})
+
+    search = BraveSearch(lookup, transport=httpx.MockTransport(handler))
+    assert await search.search("q", 3, org_id="org-1") == []
+    assert seen == ["key-of-org-1"]
+    with pytest.raises(SearchError, match="no API key for this org"):
+        await search.search("q", 3, org_id="org-2")
+    assert asked == ["org-1", "org-2"]
+    assert seen == ["key-of-org-1"]
+
+
+async def test_brave_reports_a_key_that_cannot_be_read() -> None:
+    async def lookup(org_id: str) -> SecretStr | None:
+        raise RuntimeError("database is down")
+
+    search = BraveSearch(lookup, transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    with pytest.raises(SearchError, match="cannot be read now"):
+        await search.search("q", 3, org_id="org-1")

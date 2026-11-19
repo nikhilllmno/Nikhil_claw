@@ -13,7 +13,9 @@ The same code works for both runtimes. ``TraceExporter`` sends one trace per end
 marks the run with ``trace_exported_at``. Two exporters never send the same run, because
 each one locks the run row with ``SKIP LOCKED``.
 
-Tool arguments and tool output stay out of the trace until redaction exists (M1.17).
+With ``include_content``, a ``tool`` span has the stored arguments of the call and the
+preview of its output (the ``tool_call_finished`` event). All text of a trace goes through the
+redactor before it leaves the process (Section 16.3).
 """
 
 from __future__ import annotations
@@ -48,12 +50,16 @@ from sama.observability.langfuse import (
     json_attribute,
 )
 from sama.observability.logs import log_context
+from sama.vault.redact import default_redactor, redact
 
 log: Final = logging.getLogger("sama.observability.traces")
 
 MAX_TEXT_CHARS: Final = 20_000
 """The input and the output of a trace are cut at this length."""
+MAX_TOOL_CHARS: Final = 4_000
+"""The arguments and the output of a tool span are cut at this length."""
 EVENT_TYPES: Final = ("approval_required", "compacted")
+TOOL_FINISHED: Final = "tool_call_finished"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +73,8 @@ class RunRecord:
     model_calls: Sequence[Any] = field(default_factory=tuple)
     tool_calls: Sequence[Any] = field(default_factory=tuple)
     events: Sequence[Any] = field(default_factory=tuple)
+    tool_outputs: Mapping[str, str] = field(default_factory=dict)
+    """The output preview of each tool call, by ``call_id``."""
 
 
 def span_id(run_id: uuid.UUID, *parts: object) -> str:
@@ -104,12 +112,12 @@ def build_trace(
         "langfuse.observation.metadata.attempts": str(run.attempts),
     }
     if include_content and record.input_text is not None:
-        root["langfuse.observation.input"] = _cut(record.input_text)
+        root["langfuse.observation.input"] = _cut(redact(record.input_text))
     if include_content and record.output_text is not None:
-        root["langfuse.observation.output"] = _cut(record.output_text)
+        root["langfuse.observation.output"] = _cut(redact(record.output_text))
     error = None
     if run.status == "failed":
-        error = f"{run.failure_code}: {run.failure_message or ''}".strip()
+        error = redact(f"{run.failure_code}: {run.failure_message or ''}".strip())
         root["langfuse.observation.level"] = "ERROR"
         root["langfuse.observation.status_message"] = error
         root["langfuse.observation.metadata.failure_code"] = run.failure_code or ""
@@ -165,6 +173,12 @@ def build_trace(
             "langfuse.observation.metadata.status": tool.status,
             "langfuse.observation.metadata.decision": tool.decision or "",
         }
+        if include_content:
+            arguments = json_attribute(default_redactor().json(tool.arguments or {}))
+            attributes["langfuse.observation.input"] = _cut(arguments, MAX_TOOL_CHARS)
+            output = record.tool_outputs.get(tool.call_id)
+            if output is not None:
+                attributes["langfuse.observation.output"] = _cut(redact(output), MAX_TOOL_CHARS)
         tool_error = None
         if tool.status == "failed":
             tool_error = "the tool failed"
@@ -211,8 +225,8 @@ def build_trace(
     return spans
 
 
-def _cut(text: str) -> str:
-    return text if len(text) <= MAX_TEXT_CHARS else text[:MAX_TEXT_CHARS] + " [cut]"
+def _cut(text: str, limit: int = MAX_TEXT_CHARS) -> str:
+    return text if len(text) <= limit else text[:limit] + " [cut]"
 
 
 class TraceExporter:
@@ -361,18 +375,26 @@ async def _load(connection: AsyncConnection, run: Any) -> RunRecord:
             .where(
                 RunEvent.org_id == run.org_id,
                 RunEvent.run_id == run.id,
-                RunEvent.type.in_(EVENT_TYPES),
+                RunEvent.type.in_((*EVENT_TYPES, TOOL_FINISHED)),
             )
             .order_by(RunEvent.seq)
         )
     ).all()
+    tool_outputs = {
+        str(event.payload["call_id"]): str(event.payload.get("output_preview", ""))
+        for event in events
+        if event.type == TOOL_FINISHED
+        and isinstance(event.payload, Mapping)
+        and "call_id" in event.payload
+    }
     return RunRecord(
         run=run,
         input_text=_text(messages, "user"),
         output_text=_text(messages, "assistant"),
         model_calls=model_calls,
         tool_calls=tool_calls,
-        events=events,
+        events=[event for event in events if event.type != TOOL_FINISHED],
+        tool_outputs=tool_outputs,
     )
 
 

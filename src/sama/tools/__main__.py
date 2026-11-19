@@ -28,6 +28,7 @@ from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.server import ToolServer, quiet_dependency_logs
 from sama.tools.todo import MemoryTodoStore, PostgresTodoStore, TodoStore
 from sama.tools.web import BraveSearch
+from sama.vault.redact import default_redactor, env_secrets
 
 log = logging.getLogger("sama.tools")
 
@@ -68,6 +69,7 @@ def main() -> None:
     parser.add_argument("--store", choices=("memory", "postgres"), default="memory")
     args = parser.parse_args()
     configure_logging("tools")
+    default_redactor().add(*env_secrets("SAMA_RUN_TOKEN_KEY", "SAMA_DATABASE_URL", "BRAVE_API_KEY"))
     quiet_dependency_logs()
     uvicorn.run(build_app(args.store), host=args.host, port=args.port, log_config=None)
 

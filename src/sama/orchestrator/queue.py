@@ -19,6 +19,9 @@ Rules:
 - Each write of a worker checks the owner, the attempt, and the lease expiry, so an old
   attempt cannot write after a reap.
 
+The queue writes the transcript: the user message, the run events, the reply, the failure
+message, and the approval request. It redacts each of them first (Section 16.3).
+
 The worker is a system process, so ``claim``, ``reap``, and ``release_decided`` read all
 orgs. Every other method is scoped by ``org_id``.
 """
@@ -63,6 +66,7 @@ from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
 from sama.orchestrator.limits import QueueLimits
 from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
+from sama.vault.redact import default_redactor, redact
 
 DEFAULT_LEASE: Final = timedelta(seconds=30)
 DEFAULT_MAX_ATTEMPTS: Final = 3
@@ -254,7 +258,7 @@ class RunQueue:
                     run_id=run_id,
                     role="user",
                     author_user_id=user_id,
-                    content={"text": text},
+                    content={"text": redact(text)},
                 )
             )
         return run_id
@@ -607,7 +611,7 @@ class RunQueue:
                         "run_id": run.run_id,
                         "seq": seq,
                         "type": kind,
-                        "payload": payload,
+                        "payload": default_redactor().json(payload),
                     }
                     for seq, kind, payload in events
                 ],
@@ -640,7 +644,7 @@ class RunQueue:
                         session_id=run.session_id,
                         run_id=run.run_id,
                         role="assistant",
-                        content={"text": output},
+                        content={"text": redact(output)},
                     )
                 )
             return ended
@@ -657,7 +661,7 @@ class RunQueue:
                 status="cancelled" if code is FailureCode.CANCELLED else "failed",
                 usage=usage,
                 failure_code=code.value,
-                failure_message=message,
+                failure_message=redact(message),
             )
 
     async def pause(
@@ -721,7 +725,7 @@ class RunQueue:
                         tool_name=tool_name,
                         arguments=stored_arguments(arguments),
                         arguments_digest=arguments_digest(arguments),
-                        reason=reason,
+                        reason=redact(reason),
                         expires_at=func.now() + self._approval_ttl,
                     )
                     .on_conflict_do_nothing(index_elements=["run_id", "call_id"])

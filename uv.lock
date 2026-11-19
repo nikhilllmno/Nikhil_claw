@@ -1372,6 +1372,7 @@ default-groups = ["dev", "runtime-claude", "sandbox-e2b"]
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "mcp" },
@@ -1406,6 +1407,7 @@ sandbox-e2b = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.20.1,<2" },
     { name = "asyncpg", specifier = ">=0.32.0,<0.33" },
+    { name = "cryptography", specifier = ">=50.0.2,<51" },
     { name = "fastapi", specifier = ">=0.120,<1" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "mcp", specifier = ">=2.3.0,<3" },

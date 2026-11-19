@@ -50,6 +50,7 @@ from sama.gate.decide import (
 )
 from sama.tenancy.access import load_grants
 from sama.tenancy.run_token import RunTokenClaims
+from sama.vault.redact import default_redactor, redact
 
 log = logging.getLogger("sama.gate")
 
@@ -96,10 +97,12 @@ def _utcnow() -> datetime:
 
 
 def stored_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """The arguments to store. Long arguments are cut, so one call cannot fill the table."""
-    text = json.dumps(arguments, ensure_ascii=False, default=json_default)
+    """The arguments to store, with secrets redacted (Section 16.3). Long arguments are cut,
+    so one call cannot fill the table. The digest is of the full arguments, not of these."""
+    value = default_redactor().json(json.loads(json.dumps(arguments, default=json_default)))
+    text = json.dumps(value, ensure_ascii=False)
     if len(text) <= MAX_STORED_ARGUMENT_CHARS:
-        return cast(dict[str, Any], json.loads(text))
+        return cast(dict[str, Any], value)
     return {"_cut": True, "preview": text[:MAX_STORED_ARGUMENT_CHARS]}
 
 
@@ -393,6 +396,7 @@ class GateService:
         Only a user who can read the session decides. ``always_allow`` with ``approve`` also
         writes a user policy rule for this tool and the profile of the run.
         """
+        reason = redact(reason) if reason else reason
         status = "expired"
         async with self._engine.begin() as connection:
             row = (
@@ -563,7 +567,7 @@ class GateService:
                 target_type="tool_call" if call_id is not None else None,
                 target_id=call_id,
                 run_id=run.run_id,
-                details={"session_id": str(run.session_id), **details},
+                details=default_redactor().json({"session_id": str(run.session_id), **details}),
             )
         )
 

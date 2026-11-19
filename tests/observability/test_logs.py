@@ -100,3 +100,36 @@ def test_the_text_format_and_the_level_come_from_the_environment(
         logging.getLogger("sama.test").warning("shown")
     assert "hidden" not in out.getvalue()
     assert out.getvalue().rstrip().endswith("shown run_id=r1")
+
+
+def test_secrets_are_redacted_in_the_logs(stream: io.StringIO) -> None:
+    from sama.vault.redact import default_redactor
+
+    default_redactor().add("planted-log-secret-1")
+    try:
+        token = "ghp_" + "z9" * 18
+        logging.getLogger("sama.test").warning(
+            "key %s and %s", "planted-log-secret-1", token, extra={"url": "planted-log-secret-1"}
+        )
+    finally:
+        default_redactor().forget("planted-log-secret-1")
+    text = stream.getvalue()
+    assert "planted-log-secret-1" not in text
+    assert token not in text
+    [line] = _lines(stream)
+    assert line["msg"] == "key [REDACTED] and [REDACTED]"
+    assert line["url"] == "[REDACTED]"
+
+
+def test_a_secret_that_json_escapes_is_redacted(stream: io.StringIO) -> None:
+    from sama.vault.redact import default_redactor
+
+    secret = 'planted"log\\secret'
+    default_redactor().add(secret)
+    try:
+        logging.getLogger("sama.test").warning("key %s", secret, extra={"field": [secret]})
+    finally:
+        default_redactor().forget(secret)
+    [line] = _lines(stream)
+    assert line["msg"] == "key [REDACTED]"
+    assert line["field"] == ["[REDACTED]"]

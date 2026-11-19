@@ -137,6 +137,8 @@ async def test_each_user_reads_only_the_rows_they_may_see(
             assert seen == expected["sessions"], table
         assert await count(connection, "memberships") == MEMBERSHIP_ROWS[user]
         assert await count(connection, "audit_log") == AUDIT_ROWS[user]
+        # Only org admins see which vault secrets exist, like the audit log.
+        assert await count(connection, "vault_secrets") == AUDIT_ROWS[user]
         assert await labels(connection, world, "tool_policies", "id") == TOOL_POLICIES[user]
 
 
@@ -264,6 +266,7 @@ async def read_after(
         }
         seen["messages"] = await labels(connection, world, "messages", "session_id")
         seen["audit_log"] = await count(connection, "audit_log")
+        seen["vault_secrets"] = await count(connection, "vault_secrets")
         await transaction.rollback()
     return seen
 
@@ -295,6 +298,7 @@ async def test_losing_the_org_hides_everything(engine: AsyncEngine, world: World
         "sessions": set(),
         "messages": set(),
         "audit_log": 0,
+        "vault_secrets": 0,
     }
 
 
@@ -307,6 +311,7 @@ async def test_losing_the_admin_role_hides_other_workspaces_and_the_audit_log(
     assert seen["workspaces"] == set()
     assert seen["sessions"] == set()
     assert seen["audit_log"] == 0
+    assert seen["vault_secrets"] == 0
 
 
 async def test_a_pooled_connection_does_not_keep_the_user(database_url: str, world: World) -> None:

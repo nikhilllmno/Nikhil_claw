@@ -55,6 +55,7 @@ from sama.runtime.contract import (
     Usage,
     is_terminal,
 )
+from sama.vault.redact import redact
 
 log: Final = logging.getLogger("sama.orchestrator")
 
@@ -226,7 +227,7 @@ class Worker:
             scope = _scope(run)
         except Exception as error:
             log.warning("the run cannot start run=%s: %r", run.run_id, error)
-            message = f"the run cannot start: {error}"[:MAX_FAILURE_CHARS]
+            message = redact(f"the run cannot start: {error}")[:MAX_FAILURE_CHARS]
             await self._fail(run, FailureCode.INVALID_REQUEST, message, Usage())
             return
         if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
@@ -296,7 +297,8 @@ class Worker:
             code, message = terminal.code, terminal.message
             if code is FailureCode.CANCELLED and watch.timed_out and not watch.cancel:
                 code, message = FailureCode.TIMEOUT, "the run took longer than its wall-time limit"
-            await self._fail(run, code, message[:MAX_FAILURE_CHARS], terminal.usage)
+            # Redact before the cut: a cut secret no longer matches.
+            await self._fail(run, code, redact(message)[:MAX_FAILURE_CHARS], terminal.usage)
             return
         await self._fail(run, FailureCode.INTERNAL, "the runtime ended without a result", usage)
 

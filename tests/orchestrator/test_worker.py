@@ -16,12 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.db.models import Approval, Message, Run, RunEvent
 from sama.gate.service import GateService
 from sama.orchestrator.queue import RunQueue
-from sama.orchestrator.worker import Worker
+from sama.orchestrator.worker import MAX_FAILURE_CHARS, Worker
 from sama.runtime.contract import (
     ApprovalDecision,
     ApprovalRequired,
+    FailureCode,
     ResumeRequest,
     RunCompleted,
+    RunFailed,
     RunRequest,
     RuntimeRegistry,
     TextDelta,
@@ -29,6 +31,7 @@ from sama.runtime.contract import (
 )
 from sama.runtime.contract import RunEvent as Event
 from sama.runtime.fake import FakeRuntime, FakeScript
+from sama.vault.redact import default_redactor
 from tests.orchestrator.conftest import Tenant, add_tenant
 
 
@@ -214,6 +217,25 @@ async def test_a_bad_budget_fails_the_run(engine: AsyncEngine) -> None:
     row = await harness.run(run_id)
     assert (row.status, row.failure_code) == ("failed", "invalid_request")
     assert harness.runtime.requests == []
+
+
+async def test_a_secret_on_the_cut_of_a_failure_message_is_redacted(
+    harness: Harness, tenant: Tenant
+) -> None:
+    secret = "known-secret-on-the-cut"
+    message = "x" * (MAX_FAILURE_CHARS - 10) + secret
+    harness.runtime.add_script(
+        FakeScript(events=(RunFailed(code=FailureCode.MODEL_ERROR, message=message),))
+    )
+    default_redactor().add(secret)
+    try:
+        run_id = await harness.send(tenant, "s1", "x")
+        assert await harness.worker.run_once()
+    finally:
+        default_redactor().forget(secret)
+    row = await harness.run(run_id)
+    assert row.failure_message.endswith("[REDACTED]")
+    assert secret[:10] not in row.failure_message
 
 
 async def test_an_unknown_runtime_fails_the_run(harness: Harness, tenant: Tenant) -> None:

@@ -50,6 +50,7 @@ from sama.tools.web import (
     extract,
     format_hits,
 )
+from sama.vault.redact import redact
 
 log = logging.getLogger("sama.tools")
 
@@ -105,7 +106,8 @@ def quiet_dependency_logs() -> None:
 
 
 async def _cap_errors(ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
-    """Cuts long error results, which ``cap`` does not see, for example argument errors."""
+    """Redacts and cuts error results, which ``cap`` does not see, for example argument
+    errors."""
     result = await call_next(ctx)
     if ctx.method != "tools/call":
         return result
@@ -113,11 +115,11 @@ async def _cap_errors(ctx: ServerRequestContext[Any, Any], call_next: CallNext) 
     if isinstance(result, CallToolResult) and result.is_error:
         for item in result.content:
             if isinstance(item, TextContent):
-                item.text = _cut(item.text)
+                item.text = _cut(redact(item.text))
     elif isinstance(result, dict) and result.get("isError") is True:
         for item in result.get("content") or ():
             if isinstance(item, dict) and isinstance(item.get("text"), str):
-                item["text"] = _cut(item["text"])
+                item["text"] = _cut(redact(item["text"]))
     return result
 
 
@@ -126,7 +128,8 @@ def _cut(text: str) -> str:
 
 
 class ToolServer:
-    """Builds the MCP server and its ASGI app.
+    """Builds the MCP server and its ASGI app. Every tool output and tool error goes through
+    the redactor (Section 16.3).
 
     - ``search``: the search provider. Without it, ``web_search`` is hidden.
     - ``clarify``: the clarify broker. Without it, ``clarify`` is hidden.
@@ -190,12 +193,13 @@ class ToolServer:
                 verdict = await self.gate.screen(claims, tool, arguments)
                 if verdict.action == "deny":
                     raise ToolError(f"the tool gate denied the call: {verdict.reason}")
-            text = await cap(await body(claims), tool=tool, claims=claims, spill=self.spill)
+            # Redact first, so a secret never reaches the model, the spill file, or a log.
+            text = await cap(redact(await body(claims)), tool=tool, claims=claims, spill=self.spill)
             size = len(text.encode("utf-8"))
             ok = True
             return text
         except _EXPECTED as error:
-            raise ToolError(str(error)) from None
+            raise ToolError(redact(str(error))) from None
         finally:
             log.info(
                 "tool=%s org=%s session=%s run=%s ok=%s bytes=%d ms=%d",
@@ -229,8 +233,9 @@ class ToolServer:
                 ctx: Context,
                 limit: Annotated[int, Field(ge=1, le=MAX_SEARCH_RESULTS)] = 5,
             ) -> str:
-                async def body(_claims: RunTokenClaims) -> str:
-                    return format_hits(query, await search.search(query, limit))
+                async def body(claims: RunTokenClaims) -> str:
+                    hits = await search.search(query, limit, org_id=claims.org_id)
+                    return format_hits(query, hits)
 
                 return await self._call(ctx, WEB_SEARCH, {"query": query, "limit": limit}, body)
 

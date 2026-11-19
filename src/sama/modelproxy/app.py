@@ -1,8 +1,9 @@
 """The model proxy service (docs/architecture.md, Section 16.6, decision D6).
 
 The proxy is the only path from a sandbox to a model provider. It accepts only a run token,
-checks the model and the budgets, forwards the call with the provider key, passes the
-response through unchanged, and records the usage and the cost of the call.
+checks the model and the budgets, forwards the call with the provider key of the org (from the
+vault, or the default key of the process), passes the response through unchanged, and records
+the usage and the cost of the call.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
 from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
 from sama.modelproxy.usage import Endpoint, UsageReader, estimate_counts
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
+from sama.vault.store import OrgKeys, SecretName
 
 log = logging.getLogger("sama.modelproxy")
 
@@ -215,8 +217,12 @@ class ModelProxy:
         settings: ProxySettings,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         transport: httpx.AsyncBaseTransport | None = None,
+        keys: OrgKeys | None = None,
     ) -> None:
+        """``keys`` gives the provider key of each org (the vault, Section 16.3). Without
+        it, or when an org has no key, the proxy uses the keys of ``settings``."""
         self._signer = signer
+        self._keys = keys
         self._store = store
         self._prices = prices
         self._settings = settings
@@ -304,7 +310,7 @@ class ModelProxy:
                 "include_usage": True,
             }
         started = time.monotonic()
-        upstream = await self._send(route, request, body)
+        upstream = await self._send(route, request, body, claims.org_id)
         reader = UsageReader(route.provider, stream=stream)
 
         pump = _Pump(
@@ -475,23 +481,39 @@ class ModelProxy:
             if spent >= daily:
                 raise _budget("the user reached the daily model limit")
 
-    async def _send(self, route: _Route, request: Request, body: dict[str, Any]) -> httpx.Response:
+    async def _key(self, provider: Provider, org_id: str) -> SecretStr | None:
+        if provider is Provider.ANTHROPIC:
+            name, default = SecretName.ANTHROPIC_API_KEY, self._settings.anthropic_key
+        else:
+            name, default = SecretName.OPENAI_API_KEY, self._settings.openai_key
+        if self._keys is None:
+            return default
+        try:
+            return await self._keys.get(org_id, name) or default
+        except Exception:
+            log.exception("the provider key of an org cannot be read org=%s", org_id)
+            raise ProxyError(
+                503, "api_error", "the proxy cannot read the provider key now"
+            ) from None
+
+    async def _send(
+        self, route: _Route, request: Request, body: dict[str, Any], org_id: str
+    ) -> httpx.Response:
         headers = {
             name: value for name, value in request.headers.items() if name in _REQUEST_HEADERS
         }
         headers["content-type"] = "application/json"
         # Identity encoding: the usage reader parses the bytes that the client gets.
         headers["accept-encoding"] = "identity"
-        if route.provider is Provider.ANTHROPIC:
-            key, base = self._settings.anthropic_key, self._settings.anthropic_url
-            if key is not None:
-                headers["x-api-key"] = key.get_secret_value()
-        else:
-            key, base = self._settings.openai_key, self._settings.openai_url
-            if key is not None:
-                headers["authorization"] = f"Bearer {key.get_secret_value()}"
+        key = await self._key(route.provider, org_id)
         if key is None:
             raise ProxyError(503, "api_error", f"the proxy has no {route.provider} key")
+        if route.provider is Provider.ANTHROPIC:
+            base = self._settings.anthropic_url
+            headers["x-api-key"] = key.get_secret_value()
+        else:
+            base = self._settings.openai_url
+            headers["authorization"] = f"Bearer {key.get_secret_value()}"
         upstream = self._client.build_request(
             "POST",
             base.rstrip("/") + route.upstream_path,

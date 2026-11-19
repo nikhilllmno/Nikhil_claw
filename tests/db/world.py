@@ -42,6 +42,7 @@ from sama.db.models import (
     ToolCall,
     ToolPolicy,
     User,
+    VaultSecret,
     Workspace,
 )
 
@@ -284,6 +285,14 @@ def plan(
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")
+        add(
+            VaultSecret,
+            org_id=ids[org],
+            name="brave_api_key",
+            key_id="seed",
+            wrapped_key=b"wrapped",
+            ciphertext=b"sealed",
+        )
     return rows
 
 

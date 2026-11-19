@@ -130,7 +130,8 @@ async def test_the_data_api_shows_each_user_only_their_org(live: Live) -> None:
             assert status == 200, (user, table, status)
             seen = {uuid.UUID(next(iter(row.values()))) for row in rows}
             assert ids[other] not in seen, (user, table)
-            if table != "audit_log":  # Only org admins read the audit log.
+            # Only org admins read the audit log and the vault entries.
+            if table not in ("audit_log", "vault_secrets"):
                 assert ids[own] in seen, (user, table)
 
 
