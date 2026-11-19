@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from sama.gate.service import GateService
+from sama.observability.logs import log_context
 from sama.orchestrator.queue import ClaimedRun, Lease, RunQueue
 from sama.prompt import PromptAssembler
 from sama.runtime.contract import (
@@ -206,7 +207,18 @@ class Worker:
     # -- one run ----------------------------------------------------------------------------
 
     async def execute(self, run: ClaimedRun) -> None:
-        """Streams a claimed run through its runtime and ends it."""
+        """Streams a claimed run through its runtime and ends it. Each log line of the run
+        carries the ids of the run (Section 18.1)."""
+        with log_context(
+            org_id=run.org_id,
+            workspace_id=run.workspace_id,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            runtime=run.runtime,
+        ):
+            await self._execute(run)
+
+    async def _execute(self, run: ClaimedRun) -> None:
         try:
             runtime = self._runtimes.get(RuntimeKind(run.runtime))
             budget = Budget.model_validate(dict(run.budget))

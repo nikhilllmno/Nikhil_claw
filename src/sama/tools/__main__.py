@@ -23,6 +23,7 @@ import uvicorn
 from pydantic import SecretStr
 from starlette.applications import Starlette
 
+from sama.observability.logs import configure_logging
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.server import ToolServer, quiet_dependency_logs
 from sama.tools.todo import MemoryTodoStore, PostgresTodoStore, TodoStore
@@ -66,9 +67,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--store", choices=("memory", "postgres"), default="memory")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+    configure_logging("tools")
     quiet_dependency_logs()
-    uvicorn.run(build_app(args.store), host=args.host, port=args.port)
+    uvicorn.run(build_app(args.store), host=args.host, port=args.port, log_config=None)
 
 
 if __name__ == "__main__":

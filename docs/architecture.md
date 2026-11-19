@@ -169,7 +169,7 @@ Five rules shape the design:
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
 | D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless a human approved a pre-approval for that tool in that job version. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
 | D14 | **Self-improvement writes are versioned data.** Memory, skills, cron jobs, workflows, and SOUL changes are rows with history and provenance. Changes to sama's own code are pull requests that a human merges. | The agent can learn and change its stack, but every change can be reviewed and reverted. |
-| D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. | One trace view for both SDKs. Both SDKs have Langfuse integrations. The proxy is the source of truth for cost. |
+| D15 | **Langfuse** traces both runtimes. The model proxy records tokens and cost per run. The control plane sends the traces from its stored rows after each run (Section 18.2). | One trace view for both SDKs. The proxy is the source of truth for cost. The sandbox has no Langfuse key (D6). |
 | D16 | **Sama is a library plus services.** Products import `sama` and register extra tools, skills, toolsets, channels, and policies through extension points. They do not patch sama code. | vorflux and later products build on the engine without a fork (Hermes rule: plugins never touch core). |
 | D17 | **Databases use a sama database gateway, and stdio MCP servers run in connector hosts.** The gateway enforces read-only transactions, one statement per call, timeouts, row limits, and hidden columns at the driver. A connector host is a separate sandbox per connection that holds only that connection's secrets. | A prompt cannot remove a limit that the driver enforces. Many SQL MCP servers give full rights through one tool. Running stdio servers outside the agent sandbox keeps credentials out of the sandbox (D6) and still supports the Hermes MCP ecosystem. |
 
@@ -480,7 +480,7 @@ RunEvent = (
 | Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
 | Limits | `max_turns`, `max_budget_usd`, `task_budget` | `max_turns`; sama budget in the model proxy |
 | Checkpoints | `enable_file_checkpointing` and `rewind_files()` | Sama git snapshot of the workspace (Section 15.3) |
-| Tracing | Langfuse integration plus proxy usage | Agents SDK tracing processor to Langfuse plus proxy usage |
+| Tracing | Control-plane trace from the stored rows (Section 18.2) | Control-plane trace from the stored rows (Section 18.2) |
 | Main risks | CLI subprocess and Node in the image. Fast option changes. Claude models only. | Fast-moving API surface (`SandboxAgent` is new). OpenAI models only. |
 
 #### Claude adapter notes (M1.4)
@@ -1813,7 +1813,7 @@ queue writes the `runs` rows (Section 4.3). Local runs and tests without a datab
 in-memory store.
 
 **Not in M1.7.** The keys come from the environment of the proxy process. The vault replaces
-this in M1.17. Langfuse traces come in M1.14. The live checks of membership and revocations
+this in M1.17. The Langfuse traces (M1.14, Section 18.2) read these rows. The live checks of membership and revocations
 come in M1.18. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 
@@ -1919,7 +1919,7 @@ migrated schema.
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
 | `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content` |
-| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3) |
+| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
 | `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
 | `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |
@@ -1999,6 +1999,84 @@ Row-level security:
   changes, logins, and admin actions.
 - **Health**: structured logs, metrics (queue depth, run latency, sandbox start time, error
   rate), and alerts to a Slack channel.
+
+The code is in `src/sama/observability/`. The process `python -m sama.observability` (the
+monitor) sends the traces and the alerts. More than one monitor can run.
+
+### 18.1 Structured logs (M1.14)
+
+Each service (`api`, `gateway`, `modelproxy`, `tools`, `monitor`) calls
+`configure_logging(service)` at start. Each record is one JSON line on stderr with `ts` (UTC),
+`level`, `logger`, `msg`, `service`, and `exc` for an exception. `log_context(...)` adds fields
+to each record in its block, also in tasks that start in the block. The worker adds
+`org_id`, `workspace_id`, `session_id`, `run_id`, and `runtime` for each run. `extra=` fields
+also become keys. A field never replaces `ts`, `level`, `logger`, or `msg`.
+
+- `SAMA_LOG_FORMAT=text` gives plain lines for a terminal. `SAMA_LOG_LEVEL` sets the level.
+- `httpx` and `httpcore` log only warnings, because a Telegram URL holds the bot token.
+- Uvicorn uses the same handler (`log_config=None`).
+
+### 18.2 Langfuse traces (M1.14)
+
+The runner in the sandbox has no Langfuse key (D6). So the control plane builds the trace of
+a run after the run ends, from rows that it already stores. The same code serves both
+runtimes.
+
+| Langfuse observation | Source | Content |
+|---|---|---|
+| Root, type `agent`, name `run` | `runs`, the profile name | Input: the user message. Output: the answer. Level `ERROR` and the failure code for a failed run, `WARNING` for a cancelled run. |
+| `generation`, name = model | `model_calls` (Section 16.6) | Model, tokens (`input`, `output`, cache read, cache write), cost in USD, provider, endpoint, status. Start = end minus `duration_ms`. `ERROR` for a status of 400 or more. |
+| `tool`, name = tool | `tool_calls` | Gate decision and status. `ERROR` when failed, `WARNING` when denied. No arguments and no result until redaction (M1.17). |
+| `event` | `run_events` | `approval` (the tool name) and `compaction` (tokens before and after). |
+
+- The trace id is the run id. The span ids come from a hash of the run id and the row, so the
+  same run always gives the same ids. The trace name is the profile name. The session id and
+  the user id are the sama ids. The tags are the runtime and the status. `SAMA_ENVIRONMENT`
+  sets the Langfuse environment.
+- The input and the output are cut at 20,000 characters. `SAMA_TRACE_CONTENT=off` keeps them
+  out.
+- Transport: OTLP/HTTP JSON to `{LANGFUSE_BASE_URL}/api/public/otel/v1/traces` with basic
+  auth (public key, secret key) and the header `x-langfuse-ingestion-version: 4`. Langfuse
+  Cloud closed the old `/api/public/ingestion` endpoint for traces on 2026-11-16. Sama does not
+  use the OpenTelemetry SDK, because each span is sent one time when it is complete.
+- Export: `TraceExporter` takes the oldest ready run with `trace_exported_at IS NULL` and
+  locks it (`FOR UPDATE SKIP LOCKED`). In the same transaction it sets `trace_exported_at`
+  and loads the rows. It commits, and then it sends the trace. Two monitors never send the
+  same run. Migration `0009` adds the column and a partial index, and marks the runs that
+  ended before it as sent.
+- Ready: a completed run is ready 30 seconds after its end. A failed or cancelled run is
+  ready 11 minutes after its end, because the model proxy can store the usage of a call up to
+  600 seconds after the client goes away (`drain_s`, Section 16.6). A run that ended more
+  than one day ago is not sent.
+  These delays cover the normal path only. When all write attempts of a call record fail,
+  the proxy keeps the record in memory, blocks the org, and writes it at a later request or at
+  shutdown (Section 16.6). Such a record can arrive after the trace is sent. The trace then
+  does not show that call. The `model_calls` table stays the source of truth for usage and
+  cost. Langfuse traces are best effort.
+- At most one send: Langfuse keeps each copy of a span that it gets, so a second send of a
+  trace doubles its usage and cost. The exporter removes the mark and tries again at the next
+  pass only when Langfuse surely did not store the trace: a connection error before the
+  request left, or HTTP 401, 403, 408, 429, or 503. For all other errors (a read timeout, a
+  broken answer, other HTTP errors, or rejected spans) the trace is lost and an error is
+  logged. If the monitor stops between the commit and the send, the trace is lost. An error
+  never holds a key.
+
+### 18.3 Error rate alerts (M1.14)
+
+The monitor checks the runs of all orgs that ended in the last 15 minutes. The rate is
+`failed / (completed + failed)`. A cancelled run does not count. When at least 5 runs ended
+and the rate is 25% or more, the monitor posts one alert to the Slack incoming webhook in
+`SAMA_ALERT_SLACK_WEBHOOK_URL`. The alert has the environment, the counts, and the top three
+failure codes. When the rate goes below the threshold, the monitor posts one recovery
+message. A new alert comes only 30 minutes or more after the last alert.
+
+- Only one monitor checks the rate. It holds the Postgres advisory lock `0x53414D41414C5254`
+  on one connection. When a check fails, the leader rolls back and gives the lock back. If it
+  cannot give the lock back, it closes the database session, so that the pool does not keep
+  the lock. Then the monitors try to get the lock again. A
+  new leader does not know the state of the old leader, so it can post the same alert again.
+- When Slack does not take the message, the monitor tries again at the next check.
+- The webhook URL is a secret. It is never logged.
 
 ---
 

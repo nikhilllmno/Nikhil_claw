@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -32,6 +31,7 @@ from sama.db.engine import create_engine
 from sama.gateway.telegram import TelegramGateway, TelegramSettings
 from sama.gateway.telegram_client import TelegramClient, bot_id
 from sama.gateway.transcribe import OpenAITranscriber
+from sama.observability.logs import configure_logging
 
 
 def _required(name: str) -> str:
@@ -97,10 +97,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
-    # httpx logs each request URL, and a Telegram URL holds the bot token.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    uvicorn.run(build_app(), host=args.host, port=args.port)
+    configure_logging("gateway")
+    uvicorn.run(build_app(), host=args.host, port=args.port, log_config=None)
 
 
 if __name__ == "__main__":

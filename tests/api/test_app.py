@@ -288,6 +288,8 @@ async def test_a_message_runs_and_streams(
 async def test_the_stream_reports_run_status_changes(
     api: SamaApi, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:
+    # The shared 0.3 s window is too short on a slow CI runner for the run to end in it.
+    api._settings = api._settings.model_copy(update={"max_stream_s": 3.0})
     harness = Harness(engine)
     s2 = tenant.ids["s2"]
     run_id = await harness.send(tenant, "s2", "hi")

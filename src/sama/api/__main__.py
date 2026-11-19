@@ -17,7 +17,6 @@ process, so that the API can answer the clarify questions of the tool server.
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 
 import uvicorn
@@ -27,6 +26,7 @@ from pydantic import SecretStr
 from sama.api.app import ApiSettings, SamaApi
 from sama.api.auth import JwtVerifier, issuer, jwks_url
 from sama.db.engine import create_engine
+from sama.observability.logs import configure_logging
 
 
 def _required(name: str) -> str:
@@ -62,8 +62,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
-    uvicorn.run(build_app(), host=args.host, port=args.port)
+    configure_logging("api")
+    uvicorn.run(build_app(), host=args.host, port=args.port, log_config=None)
 
 
 if __name__ == "__main__":
