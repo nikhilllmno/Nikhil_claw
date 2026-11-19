@@ -48,8 +48,9 @@ async def engine(queue_database_url: str) -> AsyncIterator[AsyncEngine]:
 
 @dataclass
 class Tenant:
-    """One org with a workspace ``ws``, the user ``mia`` (member of ``ws``), a ``fake``
-    profile, the shared sessions ``s1`` to ``s3``, and mia's private session ``mine``."""
+    """One org with a workspace ``ws``, the user ``mia`` (member of ``ws``, Supabase Auth id
+    ``mia_auth``), a ``fake`` profile, the shared sessions ``s1`` to ``s3``, and mia's private
+    session ``mine``."""
 
     ids: dict[str, uuid.UUID] = field(default_factory=dict)
 
@@ -61,7 +62,7 @@ class Tenant:
 async def add_tenant(engine: AsyncEngine, *, budget: dict[str, Any] | None = None) -> Tenant:
     tenant = Tenant()
     ids = tenant.ids
-    for label in ("org", "ws", "profile", "mia", "s1", "s2", "s3", "mine"):
+    for label in ("org", "ws", "profile", "mia", "mia_auth", "s1", "s2", "s3", "mine"):
         ids[label] = uuid.uuid4()
     org_id = ids["org"]
     rows: list[tuple[Any, dict[str, Any]]] = [
@@ -72,7 +73,7 @@ async def add_tenant(engine: AsyncEngine, *, budget: dict[str, Any] | None = Non
             {
                 "id": ids["mia"],
                 "org_id": org_id,
-                "auth_user_id": uuid.uuid4(),
+                "auth_user_id": ids["mia_auth"],
                 "email": "mia@example.test",
                 "display_name": "mia",
             },

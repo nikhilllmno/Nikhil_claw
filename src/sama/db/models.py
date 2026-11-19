@@ -258,6 +258,13 @@ class Run(Base):
         ),
         Index(None, "org_id", "session_id"),
         Index(None, "status", "created_at"),
+        # The per-org message rate and concurrency limit (migration 0007, Section 4.3).
+        Index(None, "org_id", "created_at"),
+        Index(
+            "ix_runs_running_per_org",
+            "org_id",
+            postgresql_where=text("status = 'running'"),
+        ),
         # One active run per session (docs/architecture.md, Section 4.3).
         Index(
             "ix_runs_one_active_per_session",

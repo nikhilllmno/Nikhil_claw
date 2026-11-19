@@ -20,6 +20,8 @@ from sama.gate import (
     policy_verdict,
 )
 from sama.gate.hardline import MAX_COMMAND_CHARS
+from sama.gate.service import stored_arguments
+from sama.runtime.contract import ApprovalRequired
 
 ALL = frozenset({"core", "todo", "web", "clarify"})
 
@@ -46,6 +48,16 @@ def test_sama_mcp_names_become_sama_names() -> None:
 def test_the_digest_ignores_key_order() -> None:
     assert arguments_digest({"a": 1, "b": [1, 2]}) == arguments_digest({"b": [1, 2], "a": 1})
     assert arguments_digest({"a": 1}) != arguments_digest({"a": 2})
+
+
+def test_frozen_arguments_give_the_same_digest_and_json() -> None:
+    """A runtime event freezes its arguments. The digest and the stored JSON stay the same."""
+    plain = {"command": "ls", "env": {"A": [1, {"b": 2}]}}
+    frozen = ApprovalRequired(
+        approval_id="a", call_id="a", tool_name="Bash", arguments=plain
+    ).arguments
+    assert arguments_digest(frozen) == arguments_digest(plain)
+    assert stored_arguments(frozen) == plain
 
 
 # -- step 1: toolset --------------------------------------------------------------------------

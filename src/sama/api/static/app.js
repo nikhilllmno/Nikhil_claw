@@ -1,0 +1,535 @@
+// The minimal sama web page (docs/architecture.md, Section 11.4).
+// No build step and no third-party code. Sign-in uses the Supabase Auth REST API.
+// The event stream uses fetch, because EventSource cannot send the Authorization header.
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const state = {
+  config: null,
+  auth: null, // {access_token, refresh_token, expires_at}
+  orgs: [],
+  sessionId: null,
+  stream: null, // AbortController of the event stream
+  openRuns: new Set(),
+};
+const AUTH_KEY = "sama.auth";
+// The sign-in link uses PKCE. The page that asks for the link keeps the verifier, so only this
+// browser can use the code in the link. A link from another person cannot sign this browser in.
+const PKCE_KEY = "sama.pkce";
+const PKCE_MAX_AGE_MS = 60 * 60 * 1000;
+const OPEN_STATUSES = new Set(["queued", "running", "paused"]);
+
+function showError(message) {
+  $("error").textContent = message || "";
+}
+
+// -- sign-in ----------------------------------------------------------------------------------
+
+function saveAuth(data) {
+  const expiresIn = Number(data.expires_in || 3600);
+  state.auth = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || null,
+    expires_at: Date.now() + expiresIn * 1000,
+  };
+  sessionStorage.setItem(AUTH_KEY, JSON.stringify(state.auth));
+}
+
+function clearAuth() {
+  state.auth = null;
+  sessionStorage.removeItem(AUTH_KEY);
+}
+
+async function supabaseAuth(path, body) {
+  const { supabase_url: url, supabase_anon_key: key } = state.config;
+  if (!url || !key) throw new Error("Supabase sign-in is not configured. Use an access token.");
+  const response = await fetch(`${url}/auth/v1/${path}`, {
+    method: "POST",
+    headers: { apikey: key, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error_description || data.msg || data.message || "Sign-in failed.");
+  }
+  return data;
+}
+
+async function freshToken() {
+  const auth = state.auth;
+  if (!auth) throw new Error("Sign in first.");
+  if (auth.refresh_token && Date.now() > auth.expires_at - 60_000) {
+    try {
+      saveAuth(await supabaseAuth("token?grant_type=refresh_token", {
+        refresh_token: auth.refresh_token,
+      }));
+    } catch (error) {
+      signOut();
+      throw error;
+    }
+  }
+  return state.auth.access_token;
+}
+
+async function api(path, options = {}) {
+  const headers = { Authorization: `Bearer ${await freshToken()}` };
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, {
+    method: options.method || "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: options.signal,
+  });
+  if (response.status === 401) {
+    signOut();
+    throw new Error("Your sign-in ended. Sign in again.");
+  }
+  if (options.raw) return response;
+  const data = response.status === 204 ? null : await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = data && data.detail;
+    throw new Error(typeof detail === "string" ? detail : `The request failed (${response.status}).`);
+  }
+  return data;
+}
+
+function signOut() {
+  stopStream();
+  clearAuth();
+  state.sessionId = null;
+  render();
+}
+
+// -- sessions and messages ----------------------------------------------------------------------
+
+function fill(select, items) {
+  select.replaceChildren(...items.map((item) => {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item.name;
+    return option;
+  }));
+}
+
+function fillProfiles() {
+  const workspace = $("workspace").value;
+  const profiles = [];
+  for (const org of state.orgs) {
+    if (!org.workspaces.some((w) => w.id === workspace)) continue;
+    for (const p of org.agent_profiles) {
+      if (p.workspace_id === null || p.workspace_id === workspace) profiles.push(p);
+    }
+  }
+  fill($("profile"), profiles);
+}
+
+async function loadMe() {
+  const me = await api("/me");
+  state.orgs = me.orgs;
+  const names = state.orgs.map((o) => `${o.display_name || ""} (${o.name})`);
+  $("who").textContent = names.join(", ");
+  const workspaces = state.orgs.flatMap((o) =>
+    o.workspaces.map((w) => ({ id: w.id, name: state.orgs.length > 1 ? `${o.name} / ${w.name}` : w.name })));
+  fill($("workspace"), workspaces);
+  fillProfiles();
+}
+
+async function loadSessions() {
+  const sessions = await api("/sessions");
+  $("sessions").replaceChildren(...sessions.map((s) => {
+    const item = document.createElement("li");
+    item.textContent = s.title || `Session ${s.id.slice(0, 8)}`;
+    item.setAttribute("aria-current", String(s.id === state.sessionId));
+    item.addEventListener("click", () => openSession(s.id).catch((e) => showError(e.message)));
+    return item;
+  }));
+}
+
+function messageItem(role, text) {
+  const item = document.createElement("li");
+  item.className = `msg ${role}`;
+  item.textContent = text;
+  return item;
+}
+
+async function loadMessages() {
+  const messages = await api(`/sessions/${state.sessionId}/messages`);
+  $("messages").replaceChildren(...messages.map((m) => messageItem(m.role, m.text)));
+  $("live").textContent = "";
+  $("live").hidden = true;
+}
+
+async function loadApprovals() {
+  const approvals = await api(`/sessions/${state.sessionId}/approvals`);
+  $("approvals").replaceChildren(...approvals.map(approvalCard));
+}
+
+function approvalCard(approval) {
+  const card = document.createElement("div");
+  card.className = "card";
+  const title = document.createElement("strong");
+  title.textContent = `The agent wants to use ${approval.tool_name}`;
+  const reason = document.createElement("p");
+  reason.textContent = approval.reason || "";
+  const args = document.createElement("pre");
+  args.textContent = JSON.stringify(approval.arguments, null, 2);
+  const row = document.createElement("div");
+  row.className = "row";
+  const decide = (action, body) => async () => {
+    row.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+    try {
+      await api(`/approvals/${approval.id}/${action}`, { method: "POST", body });
+      card.remove();
+    } catch (error) {
+      showError(error.message);
+      await loadApprovals();
+    }
+  };
+  for (const [label, action, body] of [
+    ["Approve", "approve", { always_allow: false }],
+    ["Always allow", "approve", { always_allow: true }],
+    ["Deny", "deny", {}],
+  ]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", decide(action, body));
+    row.append(button);
+  }
+  card.append(title, reason, args, row);
+  return card;
+}
+
+async function loadQuestions() {
+  const requests = await api(`/sessions/${state.sessionId}/questions`);
+  $("questions").replaceChildren(...requests.map(questionCard));
+}
+
+function questionCard(request) {
+  const form = document.createElement("form");
+  form.className = "card";
+  const inputs = request.questions.map((q) => {
+    const label = document.createElement("label");
+    label.textContent = q.question;
+    let input;
+    if (q.choices.length) {
+      input = document.createElement("select");
+      for (const choice of q.choices) {
+        const option = document.createElement("option");
+        option.textContent = choice;
+        input.append(option);
+      }
+    } else {
+      input = document.createElement("input");
+      input.required = true;
+    }
+    label.append(input);
+    form.append(label);
+    return input;
+  });
+  const button = document.createElement("button");
+  button.type = "submit";
+  button.textContent = "Answer";
+  form.append(button);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await api(`/sessions/${state.sessionId}/questions/${encodeURIComponent(request.id)}/answer`, {
+        method: "POST",
+        body: { answers: inputs.map((i) => i.value) },
+      });
+      form.remove();
+    } catch (error) {
+      showError(error.message);
+    }
+  });
+  return form;
+}
+
+async function openSession(id) {
+  stopStream();
+  state.sessionId = id;
+  state.openRuns.clear();
+  const detail = await api(`/sessions/${id}`);
+  $("session-title").textContent = detail.title || `Session ${id.slice(0, 8)}`;
+  for (const run of detail.runs) {
+    if (OPEN_STATUSES.has(run.status)) state.openRuns.add(run.id);
+  }
+  render();
+  await Promise.all([loadMessages(), loadApprovals(), loadQuestions(), loadSessions()]);
+  startStream(detail.last_event_id);
+}
+
+// -- the event stream --------------------------------------------------------------------------
+
+function stopStream() {
+  if (state.stream) state.stream.abort();
+  state.stream = null;
+}
+
+function startStream(after) {
+  const controller = new AbortController();
+  state.stream = controller;
+  const sessionId = state.sessionId;
+  let cursor = after;
+  (async () => {
+    while (!controller.signal.aborted && state.sessionId === sessionId) {
+      try {
+        const response = await api(`/sessions/${sessionId}/events?after=${cursor}`, {
+          raw: true,
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`The event stream failed (${response.status}).`);
+        const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+        let buffer = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += value;
+          let end;
+          while ((end = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, end);
+            buffer = buffer.slice(end + 2);
+            const event = parseEvent(block);
+            if (event.id !== null) cursor = event.id;
+            if (event.name === "end") return;
+            if (event.data !== null) handleEvent(event.name, event.data);
+          }
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        showError(error.message);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  })();
+}
+
+function parseEvent(block) {
+  const event = { id: null, name: "message", data: null };
+  const data = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith(":")) continue;
+    const at = line.indexOf(":");
+    const field = at < 0 ? line : line.slice(0, at);
+    const value = at < 0 ? "" : line.slice(at + 1).replace(/^ /, "");
+    if (field === "id") event.id = Number(value);
+    else if (field === "event") event.name = value;
+    else if (field === "data") data.push(value);
+  }
+  if (data.length) event.data = JSON.parse(data.join("\n"));
+  return event;
+}
+
+function applyRun(data) {
+  const open = OPEN_STATUSES.has(data.status);
+  const wasOpen = state.openRuns.has(data.run_id);
+  if (open) state.openRuns.add(data.run_id);
+  else state.openRuns.delete(data.run_id);
+  if (data.status === "paused") {
+    $("run-status").textContent = "The run waits for a decision.";
+    loadApprovals().catch((e) => showError(e.message));
+  } else if (open) {
+    $("run-status").textContent = "";
+  } else if (wasOpen) {
+    // Show the end of a run only once: the end of a run that the page did not show as open
+    // is old news.
+    $("run-status").textContent = data.failure_message
+      ? `The run ${data.status}: ${data.failure_message}`
+      : "";
+    loadMessages().catch((e) => showError(e.message));
+  }
+}
+
+function handleEvent(name, data) {
+  if (name === "runs") {
+    // The first event of each stream. A run that the page shows as open but that is not open
+    // here ended while the page was not connected.
+    const known = new Map(data.runs.map((run) => [run.run_id, run]));
+    for (const runId of [...state.openRuns]) {
+      if (!known.has(runId)) applyRun({ run_id: runId, status: "ended" });
+    }
+    for (const run of data.runs) applyRun(run);
+    $("cancel").hidden = state.openRuns.size === 0;
+    return;
+  }
+  if (name === "run") {
+    applyRun(data);
+    $("cancel").hidden = state.openRuns.size === 0;
+    return;
+  }
+  if (name !== "run_event") return;
+  const live = $("live");
+  const payload = data.payload || {};
+  switch (data.type) {
+    case "text_delta":
+      live.hidden = false;
+      live.textContent += payload.text || "";
+      break;
+    case "tool_call_started":
+      $("messages").append(messageItem("tool", `Tool: ${payload.name}`));
+      break;
+    case "approval_required":
+      loadApprovals().catch((e) => showError(e.message));
+      break;
+    case "run_completed":
+    case "run_failed":
+      loadMessages().catch((e) => showError(e.message));
+      break;
+    default:
+      break;
+  }
+}
+
+// -- page --------------------------------------------------------------------------------------
+
+function render() {
+  const signedIn = state.auth !== null;
+  $("login").hidden = signedIn;
+  $("app").hidden = !signedIn;
+  $("sign-out").hidden = !signedIn;
+  if (!signedIn) $("who").textContent = "";
+  $("empty").hidden = state.sessionId !== null;
+  $("session").hidden = state.sessionId === null;
+  $("cancel").hidden = state.openRuns.size === 0;
+}
+
+async function start() {
+  showError("");
+  render();
+  if (!state.auth) return;
+  await loadMe();
+  await loadSessions();
+}
+
+function base64url(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function newPkce() {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  // localStorage, because the sign-in link can open in a new tab.
+  localStorage.setItem(PKCE_KEY, JSON.stringify({ verifier, created: Date.now() }));
+  return base64url(digest);
+}
+
+async function readSignInLink() {
+  // Never use tokens from the URL fragment: anyone can put tokens into a link.
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  const code = new URLSearchParams(location.search).get("code");
+  if (!code) return false;
+  history.replaceState(null, "", location.pathname);
+  const saved = JSON.parse(localStorage.getItem(PKCE_KEY) || "null");
+  localStorage.removeItem(PKCE_KEY);
+  if (!saved || Date.now() - saved.created > PKCE_MAX_AGE_MS) {
+    $("login-status").textContent =
+      "This sign-in link is not from this browser, or it is too old. Ask for a new link.";
+    return false;
+  }
+  saveAuth(await supabaseAuth("token?grant_type=pkce", {
+    auth_code: code,
+    code_verifier: saved.verifier,
+  }));
+  return true;
+}
+
+function bind() {
+  $("password-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      saveAuth(await supabaseAuth("token?grant_type=password", {
+        email: $("email").value,
+        password: $("password").value,
+      }));
+      $("password").value = "";
+      await start();
+    } catch (error) {
+      $("login-status").textContent = error.message;
+    }
+  });
+  $("magic-link").addEventListener("click", async () => {
+    try {
+      const redirect = encodeURIComponent(location.origin + location.pathname);
+      await supabaseAuth(`otp?redirect_to=${redirect}`, {
+        email: $("email").value,
+        create_user: false,
+        code_challenge: await newPkce(),
+        code_challenge_method: "s256",
+      });
+      $("login-status").textContent = "Look in your email for the sign-in link.";
+    } catch (error) {
+      $("login-status").textContent = error.message;
+    }
+  });
+  $("token-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    saveAuth({ access_token: $("token").value.trim(), expires_in: 3600 });
+    $("token").value = "";
+    await start().catch((e) => showError(e.message));
+  });
+  $("sign-out").addEventListener("click", signOut);
+  $("workspace").addEventListener("change", fillProfiles);
+  $("new-session").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const session = await api("/sessions", {
+        method: "POST",
+        body: {
+          workspace_id: $("workspace").value,
+          agent_profile_id: $("profile").value,
+          audience: $("audience").value,
+          title: $("title").value.trim() || null,
+        },
+      });
+      $("title").value = "";
+      await openSession(session.id);
+    } catch (error) {
+      showError(error.message);
+    }
+  });
+  $("send").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = $("text").value;
+    if (!text.trim()) return;
+    try {
+      const { run_id: runId } = await api(`/sessions/${state.sessionId}/messages`, {
+        method: "POST",
+        body: { text },
+      });
+      $("text").value = "";
+      state.openRuns.add(runId);
+      $("messages").append(messageItem("user", text));
+      $("live").textContent = "";
+      render();
+    } catch (error) {
+      showError(error.message);
+    }
+  });
+  $("cancel").addEventListener("click", async () => {
+    for (const runId of [...state.openRuns]) {
+      await api(`/runs/${runId}/cancel`, { method: "POST" }).catch((e) => showError(e.message));
+    }
+  });
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  bind();
+  try {
+    state.config = await (await fetch("/config")).json();
+    const fromLink = await readSignInLink().catch((error) => {
+      $("login-status").textContent = error.message;
+      return false;
+    });
+    if (!fromLink) {
+      const saved = sessionStorage.getItem(AUTH_KEY);
+      state.auth = saved ? JSON.parse(saved) : null;
+    }
+    await start();
+  } catch (error) {
+    showError(error.message);
+  }
+});
