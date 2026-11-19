@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Final
 from sqlalchemy import case, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AuditEntry, Session, StoredContextFile
+from sama.db.models import AuditEntry, Session, SessionBinding, StoredContextFile
 from sama.prompt.scan import scan
 from sama.runtime.contract import (
     CONTEXT_FILE_MAX_CHARS,
@@ -79,13 +79,24 @@ def prepare(path: str, content: str) -> tuple[ContextFile, tuple[str, ...]]:
     return ContextFile(path=path, content=truncate(content)), findings
 
 
-def environment(run: ClaimedRun, now: datetime) -> str:
+CHANNEL_HINTS: Final = {
+    "telegram": (
+        "Channel: Telegram. Telegram shows plain text: do not use Markdown tables or headings."
+        " Keep answers short. A long answer arrives as several messages."
+    ),
+}
+"""Hints for sessions that a chat channel made (Section 11). A web session gets no hint."""
+
+
+def environment(run: ClaimedRun, now: datetime, channel: str | None = None) -> str:
     """The volatile tier: facts at the start of the session."""
-    return (
+    text = (
         f"Session start: {now.astimezone(UTC):%Y-%m-%d %H:%M} UTC. The time does not update"
         " during the session.\n"
         f"Audience: {run.audience}."
     )
+    hint = CHANNEL_HINTS.get(channel or "")
+    return f"{text}\n{hint}" if hint else text
 
 
 class PromptAssembler:
@@ -147,13 +158,24 @@ class PromptAssembler:
                     findings,
                 )
                 await _audit(connection, run, row.id, {"path": row.path, "findings": findings})
+        channel = (
+            await connection.execute(
+                select(SessionBinding.channel)
+                .where(
+                    SessionBinding.org_id == run.org_id,
+                    SessionBinding.session_id == run.session_id,
+                )
+                .order_by(SessionBinding.created_at)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
         return RunConfig(
             runtime=RuntimeKind(run.runtime),
             model=run.model,
             system=self._system,
             soul=run.soul,
             context_files=tuple(files),
-            environment=environment(run, started),
+            environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
         )
 

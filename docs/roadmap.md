@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.12.
+Done: M1.1 to M1.13.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -74,7 +74,7 @@ Done: M1.1 to M1.12.
   `src/sama/orchestrator/worker.py` (architecture Section 4.3), with the queue columns of
   `runs` and `sessions.sandbox_id` (migration `0005`). `PostgresSandboxDirectory` stores the
   sandbox of each session. A crashed run starts again only if the worker did not start the
-  runner (`runs.dispatched_at`). The deploy (M1.15) applies migrations `0004` to `0007` to
+  runner (`runs.dispatched_at`). The deploy (M1.15) applies migrations `0004` to `0008` to
   Supabase.
 - M1.11: prompt assembly in `src/sama/prompt/` (architecture Section 6.1). The first run of a
   session builds the `RunConfig` and stores it in `sessions.run_config` (migration `0006`).
@@ -88,6 +88,11 @@ Done: M1.1 to M1.12.
   migration `0007`). The page at `/` has no build step. The Next.js app replaces it in M3.
   The deploy (M1.15) runs the API, the worker, and the tool server in one process, so that the
   API answers `clarify` questions.
+- M1.13: the Telegram gateway in `src/sama/gateway/` (architecture Section 11.5), with the
+  tables `channel_identities`, `channel_groups`, and `pairing_codes` (migration `0008`).
+  `python -m sama.gateway` runs it. The web page makes pairing codes. Not in M1.13: the group
+  toolset (Section 11.3), `clarify` buttons in Telegram, and followers that survive a restart.
+  The deploy (M1.15) runs the gateway and sets the webhook.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

@@ -640,3 +640,114 @@ class StoredContextFile(Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
+
+
+PAIRING_KINDS: Final = ("user", "group")
+"""A ``user`` code links a chat account to a user. A ``group`` code links a group chat."""
+
+
+class ChannelIdentity(Base):
+    """A chat account that is linked to a sama user (docs/architecture.md, Section 11.3).
+
+    A direct chat with this account uses the workspace and the agent profile of the row.
+    """
+
+    __tablename__ = "channel_identities"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("channel", "external_id"),
+        CheckConstraint(_one_of("channel", CHANNELS), name="channel"),
+        Index(None, "org_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """The account id in the channel, for example the Telegram user id."""
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class ChannelGroup(Base):
+    """A group chat that is linked to a workspace and an agent profile (Section 11.3)."""
+
+    __tablename__ = "channel_groups"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("channel", "external_id"),
+        CheckConstraint(_one_of("channel", CHANNELS), name="channel"),
+        Index(None, "org_id", "workspace_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """The chat id in the channel."""
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class PairingCode(Base):
+    """A single-use code that links a chat account or a group chat (Section 11.3).
+
+    Only the SHA-256 digest of the code is stored.
+    """
+
+    __tablename__ = "pairing_codes"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("code_hash"),
+        CheckConstraint(_one_of("channel", CHANNELS), name="channel"),
+        CheckConstraint(_one_of("kind", PAIRING_KINDS), name="kind"),
+        Index(None, "org_id", "user_id"),
+        Index(None, "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The user who made the code. Only this user can use it."""
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    code_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

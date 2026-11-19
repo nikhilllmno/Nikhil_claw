@@ -85,6 +85,7 @@ async def test_the_page_and_the_config_are_public(client: httpx.AsyncClient) -> 
     assert (await client.get("/config")).json() == {
         "supabase_url": "https://project.example.test",
         "supabase_anon_key": "anon-key",
+        "telegram_bot_username": None,
     }
 
 

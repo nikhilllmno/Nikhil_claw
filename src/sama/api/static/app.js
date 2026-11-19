@@ -11,6 +11,7 @@ const state = {
   sessionId: null,
   stream: null, // AbortController of the event stream
   openRuns: new Set(),
+  signOuts: 0, // grows at each sign-out, so that late answers for the old user are dropped
 };
 const AUTH_KEY = "sama.auth";
 // The sign-in link uses PKCE. The page that asks for the link keeps the verifier, so only this
@@ -97,6 +98,10 @@ function signOut() {
   stopStream();
   clearAuth();
   state.sessionId = null;
+  // A pairing code is a secret of this user: the next user must not see it.
+  state.signOuts += 1;
+  $("tg-code").textContent = "";
+  $("tg-links").replaceChildren();
   render();
 }
 
@@ -400,6 +405,53 @@ async function start() {
   if (!state.auth) return;
   await loadMe();
   await loadSessions();
+  $("telegram").hidden = !state.config.telegram_bot_username;
+  if (state.config.telegram_bot_username) await loadTelegram();
+}
+
+// -- Telegram -----------------------------------------------------------------------------------
+
+async function loadTelegram() {
+  const signOut0 = state.signOuts;
+  const links = await api("/channels/telegram/identities");
+  if (signOut0 !== state.signOuts) return;
+  $("tg-links").replaceChildren(...links.map((link) => {
+    const item = document.createElement("li");
+    const org = state.orgs.find((o) => o.id === link.org_id);
+    item.textContent = `Linked account (${org ? org.name : "org"}) `;
+    const unlink = document.createElement("button");
+    unlink.type = "button";
+    unlink.textContent = "Unlink";
+    unlink.addEventListener("click", async () => {
+      try {
+        await api(`/channels/telegram/identities/${link.id}`, { method: "DELETE" });
+        await loadTelegram();
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+    item.append(unlink);
+    return item;
+  }));
+}
+
+async function pairingCode(kind) {
+  const signOut0 = state.signOuts;
+  try {
+    const result = await api("/channels/telegram/pairing-codes", {
+      method: "POST",
+      body: { workspace_id: $("workspace").value, agent_profile_id: $("profile").value, kind },
+    });
+    // The user signed out while the request ran: do not show the code.
+    if (signOut0 !== state.signOuts) return;
+    const until = new Date(result.expires_at).toLocaleTimeString();
+    $("tg-code").textContent = kind === "user"
+      ? `Send /start ${result.code} to @${result.bot_username}. The code expires at ${until}.`
+      : `Add @${result.bot_username} to the group, then send /pair ${result.code} in the group.`
+        + ` The code expires at ${until}.`;
+  } catch (error) {
+    showError(error.message);
+  }
 }
 
 function base64url(bytes) {
@@ -472,6 +524,8 @@ function bind() {
     await start().catch((e) => showError(e.message));
   });
   $("sign-out").addEventListener("click", signOut);
+  $("tg-user").addEventListener("click", () => pairingCode("user"));
+  $("tg-group").addEventListener("click", () => pairingCode("group"));
   $("workspace").addEventListener("change", fillProfiles);
   $("new-session").addEventListener("submit", async (event) => {
     event.preventDefault();

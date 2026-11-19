@@ -43,6 +43,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "agent_profiles": {"profile-a"},
         "sessions": {"a1-shared", "a1-alice"},
         "context_files": {"file:org-a"},
+        "channel_identities": {"tg:alice"},
+        "channel_groups": {"group:a1"},
+        "pairing_codes": {"code:alice"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -51,6 +54,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "agent_profiles": {"profile-a", "profile-a2"},
         "sessions": {"a1-shared", "a2-shared"},
         "context_files": {"file:org-a", "file:a2", "file:profile-a2"},
+        "channel_identities": set(),
+        "channel_groups": {"group:a1"},
+        "pairing_codes": set(),
     },
     "dave": {
         "orgs": {"org-a"},
@@ -59,6 +65,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "agent_profiles": {"profile-a"},
         "sessions": set(),
         "context_files": {"file:org-a"},
+        "channel_identities": set(),
+        "channel_groups": set(),
+        "pairing_codes": set(),
     },
     "bob": {
         "orgs": {"org-b"},
@@ -67,6 +76,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "agent_profiles": {"profile-b"},
         "sessions": {"b1-shared", "b1-bob"},
         "context_files": {"file:org-b"},
+        "channel_identities": {"tg:bob"},
+        "channel_groups": {"group:b1"},
+        "pairing_codes": {"code:bob"},
     },
     "stranger": {
         "orgs": set(),
@@ -75,6 +87,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "agent_profiles": set(),
         "sessions": set(),
         "context_files": set(),
+        "channel_identities": set(),
+        "channel_groups": set(),
+        "pairing_codes": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

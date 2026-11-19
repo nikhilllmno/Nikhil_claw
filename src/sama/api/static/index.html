@@ -47,6 +47,16 @@
         <button type="submit">New session</button>
       </form>
       <ul id="sessions"></ul>
+      <details id="telegram" hidden>
+        <summary>Telegram</summary>
+        <p>The code uses the workspace and the agent above.</p>
+        <div class="row">
+          <button id="tg-user" type="button">Link my account</button>
+          <button id="tg-group" type="button">Link a group</button>
+        </div>
+        <p id="tg-code" role="status"></p>
+        <ul id="tg-links"></ul>
+      </details>
     </aside>
     <section id="chat">
       <p id="empty">Select or create a session.</p>

@@ -1076,7 +1076,9 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 - A Slack workspace or Telegram group can bind to a workspace and an agent profile. Only
   paired members can start runs there.
 - Group messages are untrusted input. In groups the agent uses the profile's group toolset
-  (default: no shell, no code edits, no outbound writes).
+  (default: no shell, no code edits, no outbound writes). M1.13 does not apply the group
+  toolset yet. Until it does, the tool gate asks for approval as in a private session, and a
+  group shares the session and the approvals of its workspace (Section 11.5).
 - **Audience and principal.** Each session has an audience: `private` (one user, for
   example a DM) or `shared` (a Slack channel or thread, a Telegram group). A private session
   runs as its user. A shared session runs as the workspace and uses only shared context:
@@ -1165,9 +1167,116 @@ list, new session, chat with streamed text, approval cards (Approve, Always allo
 
 The Next.js app in `web/` replaces this page in M3. The web app keeps the same API.
 
+**Telegram pairing.** `POST /channels/telegram/pairing-codes` with `workspace_id`,
+`agent_profile_id`, and `kind` (`user` or `group`) makes a pairing code (Section 11.5). It does
+the same access checks as `POST /sessions`. It returns `409` when `SAMA_TELEGRAM_BOT_USERNAME`
+is not set and `429` when the user has 5 open codes. `GET /channels/telegram/identities` lists
+the Telegram accounts of the user, and `DELETE /channels/telegram/identities/{id}` unlinks
+one. `/config` gives `telegram_bot_username` to the page.
+
 **Not in M1.12.** `python -m sama.api` runs only the API. The deploy (M1.15) puts the API, the
 worker, and the tool server in one control plane process, so that the API answers the
 `clarify` questions of the tool server. API keys for services come later.
+
+### 11.5 Telegram gateway (M1.13)
+
+`sama.gateway.telegram.TelegramGateway` is the Telegram adapter. `python -m sama.gateway`
+starts it on port 8081. It needs `SAMA_DATABASE_URL`, `SAMA_TELEGRAM_BOT_TOKEN`, and
+`SAMA_TELEGRAM_WEBHOOK_SECRET`. `SAMA_PUBLIC_URL` registers the webhook at start, and
+`OPENAI_API_KEY` turns on voice notes. A worker must run too: the gateway only queues runs and
+reads their events.
+
+**Tables (migration `0008`).**
+
+| Table | Key columns |
+|---|---|
+| `channel_identities` | `org_id`, `user_id`, `channel`, `external_id` (the Telegram user id, unique per channel), `workspace_id`, `agent_profile_id` |
+| `channel_groups` | `org_id`, `channel`, `external_id` (the chat id, unique per channel), `workspace_id`, `agent_profile_id`, `created_by_user_id` |
+| `pairing_codes` | `org_id`, `user_id`, `channel`, `kind` (`user` or `group`), `code_hash` (SHA-256, unique), `workspace_id`, `agent_profile_id`, `expires_at`, `used_at` |
+
+RLS: a user reads only their own identities and codes. A member of the workspace reads its
+groups. Only the control plane writes these tables.
+
+**Pairing.**
+
+1. The user picks a workspace and an agent profile on the web page and makes a code. The code
+   has 8 characters without `0`, `O`, `1`, and `I`. It expires after 10 minutes and works once.
+   The table keeps only the SHA-256 digest. A user has at most 5 open codes. A row lock on
+   the user keeps this cap when two requests come at the same time.
+2. A `user` code: the user sends `/start <code>` (or only the code) to the bot in a direct chat.
+   The Telegram account then links to the user, the workspace, and the profile. One Telegram
+   account links to one org. A new code moves the link.
+3. A `group` code: the user adds the bot to a group and sends `/pair <code>` there. Only the
+   linked Telegram account of the user who made the code can use it. The group then links to
+   the workspace and the profile of the code.
+4. Each use checks again that the user sees the workspace and that the profile is in it.
+   Links and unlinks write `channel_identity.linked`, `channel_group.linked`, and
+   `channel_identity.unlinked` to the audit log.
+5. Five wrong codes from one Telegram account lock it for one hour. All accounts together get
+   at most 60 tries a minute. The gateway counts each try as wrong before it checks the code,
+   and clears the count of the account when the code is right. Thus tries at the same time
+   cannot pass the limit. The counts are in memory, per gateway process.
+
+**Inbound.** Telegram sends each update to `POST /telegram/webhook` with the secret in
+`X-Telegram-Bot-Api-Secret-Token`. The gateway compares it in constant time, drops a repeated
+`update_id`, answers at once, and handles the update in the background. Updates of one chat
+run one at a time. Messages from bots and from other chat types are dropped. In a group the
+bot reacts only to a command, an `@` mention of the bot, or a reply to a bot message. A voice
+note of at most 5 minutes and 10 MB is downloaded and transcribed (OpenAI `whisper-1`).
+
+**Access.** An unknown sender gets a pairing prompt in a direct chat and nothing in a group.
+For each message the gateway loads the grants of the user again. A user who lost the workspace
+gets a refusal. In a group, the sender must be linked in the org of the group.
+
+**Sessions.** A direct chat is a `private` session of the user. A group is a `shared` session
+of the group workspace. The binding is `session_bindings` with `channel = telegram` and
+`external_key = chat:<chat id>`. The gateway reuses the bound session only when it is active,
+in the same org, workspace, and audience, and visible to the user. Otherwise it makes a new
+session (audit `session.created` with `channel: telegram`). Sessions that Telegram made get a
+channel hint in the volatile prompt tier (Section 6.1).
+
+**Commands.** `/new` starts a new session with the same profile. `/stop` cancels the open runs
+of the session. `/model` lists the profiles of the workspace. `/model <name>` starts a child
+session (`lineage = branch`) with that profile and binds the chat to it. `/help` lists the
+commands.
+
+**Outbound.** For each run the gateway reads the run status and then the new `run_events`.
+Text deltas go into one reply message that the gateway edits at most once in 1.5 seconds.
+After 4,000 characters the reply goes on in a new message, cut at a line end or a space.
+Replies are plain text, without `parse_mode`. When the run pauses, the gateway sends one
+approval card per pending approval, with the tool name, the reason, the arguments (cut at
+1,500 characters), and the buttons Approve and Deny. A failed run gets its failure message.
+A stopped run gets a notice. A run without text deltas gets its stored answer.
+
+Before each Bot API call that sends or edits output of a run, the gateway checks the chat
+again. A direct chat must still
+link to the user and org of the run, and the user must still see the workspace. A group must
+still link to the org and workspace of the run. If a check fails, the gateway stops the
+delivery. Thus an unlink or a new group link stops the output of runs that are open.
+
+When Telegram answers `429 Too Many Requests`, the gateway waits `retry_after` seconds and
+tries again, at most 3 times and only for waits of 30 seconds or less. For run output, the
+gateway checks the chat again after each wait.
+
+One gateway process follows at most 200 runs. When all places are in use, the gateway does not
+queue the message and asks the chat to send it again later. A message takes its place before
+it queues the run.
+
+**Approval buttons.** The callback data is `ap:<approval id>:y` or `ap:<approval id>:n`. The
+gateway finds the linked user of the presser, checks that the user can see the session, calls
+`GateService.decide_approval`, releases the run, and edits the card to show the decision and
+the person.
+
+**Limits of M1.13.**
+
+- The lockout, the repeat filter, and the run followers are in memory. A restart of the gateway
+  loses the followers: the runs go on, but their replies do not reach Telegram.
+- The group toolset (Section 11.3) is not applied yet.
+- `clarify` questions do not show in Telegram yet.
+- The OpenAI key for voice notes is an environment variable of the gateway until the vault
+  (M1.17). It never goes to a sandbox.
+- `httpx` logs request URLs, and a Telegram URL holds the bot token. `python -m sama.gateway`
+  sets the `httpx` logger to `WARNING`.
 
 ---
 
@@ -1783,7 +1892,7 @@ this in M1.17.
 | `workspaces` | Units inside an org |
 | `users`, `memberships` | Users and their role per org and workspace (`owner`, `admin`, `member`) |
 | `agent_profiles` | SOUL, runtime, model, toolsets, skills, policy, budgets |
-| `channel_identities`, `session_bindings` | Paired Slack and Telegram identities, chat-to-session bindings |
+| `channel_identities`, `channel_groups`, `pairing_codes`, `session_bindings` | Paired Slack and Telegram identities and groups, pairing codes, chat-to-session bindings |
 | `vault_secrets`, `connections`, `connector_hosts` | Encrypted secrets, connections of all kinds (Section 10.3), connector host state (Section 10.5) |
 
 - Every table has `org_id`, and most have `workspace_id`. RLS policies check membership from
@@ -1820,6 +1929,7 @@ migrated schema.
 | `approvals` | One row per tool call that asks a human (migration `0004`, Section 16.1) |
 | `tool_policies` | Tool gate rules per org, profile, and user (migration `0004`, Section 16.1) |
 | `context_files` | Context files per org, workspace, and profile (migration `0006`, Section 6.1) |
+| `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
 
 Rules:
 
