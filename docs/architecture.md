@@ -1248,13 +1248,15 @@ approval card per pending approval, with the tool name, the reason, the argument
 1,500 characters), and the buttons Approve and Deny. A failed run gets its failure message.
 A stopped run gets a notice. A run without text deltas gets its stored answer.
 
-Before the gateway sends output of a run, it checks the chat again. A direct chat must still
+Before each Bot API call that sends or edits output of a run, the gateway checks the chat
+again. A direct chat must still
 link to the user and org of the run, and the user must still see the workspace. A group must
 still link to the org and workspace of the run. If a check fails, the gateway stops the
 delivery. Thus an unlink or a new group link stops the output of runs that are open.
 
-When Telegram answers `429 Too Many Requests`, the client waits `retry_after` seconds and
-tries again, at most 3 times and only for waits of 30 seconds or less.
+When Telegram answers `429 Too Many Requests`, the gateway waits `retry_after` seconds and
+tries again, at most 3 times and only for waits of 30 seconds or less. For run output, the
+gateway checks the chat again after each wait.
 
 One gateway process follows at most 200 runs. When all places are in use, the gateway does not
 queue the message and asks the chat to send it again later. A message takes its place before

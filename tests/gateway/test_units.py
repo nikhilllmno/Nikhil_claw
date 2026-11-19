@@ -20,7 +20,7 @@ from sama.gateway.pairing import (
     new_code,
     normalize,
 )
-from sama.gateway.telegram import SPLIT_AT, split_point
+from sama.gateway.telegram import SPLIT_AT, _Outbox, _Reply, _Unlinked, split_point
 from sama.gateway.telegram_client import TelegramClient, TelegramError, bot_id
 from sama.gateway.transcribe import OpenAITranscriber, TranscribeError
 
@@ -228,3 +228,46 @@ async def test_the_transcriber_posts_audio() -> None:
     with pytest.raises(TranscribeError) as caught:
         await broken.transcribe(b"OGG", filename="v.ogg", mime_type="audio/ogg")
     assert "sk-test" not in str(caught.value)
+
+
+async def test_the_outbox_checks_the_link_before_each_call() -> None:
+    recorder = Recorder()
+    link = {"ok": True}
+
+    async def allowed() -> bool:
+        return link["ok"]
+
+    outbox = _Outbox(client(recorder), 5, allowed)
+    reply = _Reply(outbox, None, interval_s=1000)
+    await reply.add("first")  # the first text shows at once
+    await reply.add(" and buffered")  # waits for the edit interval
+    assert [method for method, _ in recorder.calls] == ["sendMessage"]
+    link["ok"] = False  # the user unlinks
+    with pytest.raises(_Unlinked):
+        await reply.flush(final=True)
+    assert [method for method, _ in recorder.calls] == ["sendMessage"], "no edit after unlink"
+
+
+async def test_the_outbox_checks_the_link_again_after_a_wait() -> None:
+    limited = {"ok": False, "description": "Too Many Requests", "parameters": {"retry_after": 0}}
+    recorder = Recorder({"sendMessage": limited})
+    checks = 0
+
+    async def allowed() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks == 1  # the link goes away during the wait
+
+    outbox = _Outbox(client(recorder), 5, allowed)
+    with pytest.raises(_Unlinked):
+        await outbox.send_message("secret output")
+    assert len(recorder.calls) == 1, "the client did not retry by itself"
+
+    always = Recorder({"sendMessage": limited})
+
+    async def linked() -> bool:
+        return True
+
+    with pytest.raises(TelegramError):
+        await _Outbox(client(always), 5, linked, max_tries=3).send_message("x")
+    assert len(always.calls) == 3

@@ -27,7 +27,7 @@ import logging
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Final
 
@@ -132,15 +132,68 @@ def split_point(text: str, limit: int = SPLIT_AT) -> int:
     return limit
 
 
+class _Unlinked(Exception):
+    """The chat lost the link that it had when the run started."""
+
+
+class _Outbox:
+    """Sends the output of one run to one chat.
+
+    Each Bot API call first asks ``allowed``, so that an unlink stops the output at once. When
+    Telegram asks the bot to wait, the outbox waits and asks ``allowed`` again before it tries
+    again.
+    """
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        chat_id: int,
+        allowed: Callable[[], Awaitable[bool]],
+        *,
+        max_tries: int = 4,
+    ) -> None:
+        self._client = client.without_retries()
+        self._max_wait_s = client.max_wait_s
+        self._chat_id = chat_id
+        self._allowed = allowed
+        self._max_tries = max_tries
+
+    async def send_message(
+        self,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        buttons: list[list[dict[str, str]]] | None = None,
+    ) -> int:
+        return await self._call(
+            lambda: self._client.send_message(
+                self._chat_id, text, reply_to=reply_to, buttons=buttons
+            )
+        )
+
+    async def edit_message(self, message_id: int, text: str) -> None:
+        await self._call(lambda: self._client.edit_message(self._chat_id, message_id, text))
+
+    async def _call[T](self, send: Callable[[], Awaitable[T]]) -> T:
+        for attempt in range(1, self._max_tries + 1):
+            if not await self._allowed():
+                raise _Unlinked
+            try:
+                return await send()
+            except TelegramError as error:
+                wait = error.retry_after
+                if wait is None or wait > self._max_wait_s or attempt == self._max_tries:
+                    raise
+                await asyncio.sleep(wait)
+        raise AssertionError("unreachable")
+
+
 class _Reply:
     """One reply that grows as text arrives. It edits its message at most once in
     ``interval_s`` and goes on in a new message after ``SPLIT_AT`` characters."""
 
-    def __init__(
-        self, client: TelegramClient, chat_id: int, reply_to: int | None, interval_s: float
-    ) -> None:
-        self._client = client
-        self._chat_id = chat_id
+    def __init__(self, outbox: _Outbox, reply_to: int | None, interval_s: float) -> None:
+        self._outbox = outbox
         self._reply_to = reply_to
         self._interval_s = interval_s
         self._text = ""
@@ -154,8 +207,8 @@ class _Reply:
         self._text += text
         while len(self._text) > SPLIT_AT:
             cut = split_point(self._text)
-            head, self._text = self._text[:cut], self._text[cut:]
-            await self._show(head)
+            await self._show(self._text[:cut])
+            self._text = self._text[cut:]
             self._message_id, self._shown = None, ""
         await self.flush(final=False)
 
@@ -173,11 +226,9 @@ class _Reply:
         if not text.strip() or text == self._shown:
             return
         if self._message_id is None:
-            self._message_id = await self._client.send_message(
-                self._chat_id, text, reply_to=self._reply_to
-            )
+            self._message_id = await self._outbox.send_message(text, reply_to=self._reply_to)
         else:
-            await self._client.edit_message(self._chat_id, self._message_id, text)
+            await self._outbox.edit_message(self._message_id, text)
         self._shown = text
         self._last = asyncio.get_running_loop().time()
         self.sent_any = True
@@ -725,7 +776,13 @@ class TelegramGateway:
     ) -> None:
         settings = self._settings
         org_id = target.org_id
-        reply = _Reply(self._client, chat_id, reply_to, settings.edit_interval_s)
+
+        async def allowed() -> bool:
+            async with self._engine.connect() as connection:
+                return await self._may_deliver(connection, chat_id, target)
+
+        outbox = _Outbox(self._client, chat_id, allowed)
+        reply = _Reply(outbox, reply_to, settings.edit_interval_s)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settings.max_follow_s
         seq = -1
@@ -772,38 +829,34 @@ class TelegramGateway:
                             )
                         ).all()
                     )
-                    new = [row for row in pending if row.id not in carded]
-                    ended = status in ENDED_RUN_STATUSES and len(events) < 500
-                    if (events or new or ended) and not await self._may_deliver(
-                        connection, chat_id, target
-                    ):
-                        log.warning("the chat lost its link; run=%s is not delivered", run_id)
-                        return
                 for event in events:
                     seq = event.seq
                     if event.type == "text_delta":
                         await reply.add(str(event.payload.get("text", "")))
+                new = [row for row in pending if row.id not in carded]
                 if new:
                     await reply.flush(final=True)
                     reply.restart()
                     for row in new:
-                        carded.add(row.id)
                         text, buttons = _approval_card(row)
-                        await self._client.send_message(chat_id, text, buttons=buttons)
-                if ended:
+                        await outbox.send_message(text, buttons=buttons)
+                        carded.add(row.id)
+                if status in ENDED_RUN_STATUSES and len(events) < 500:
                     break
                 await reply.flush(final=False)
                 paused = status == "paused"
                 await asyncio.sleep(settings.paused_poll_s if paused else settings.poll_s)
             await reply.flush(final=True)
-            await self._ending(chat_id, org_id, run_id, status, reply)
+            await self._ending(outbox, org_id, run_id, status, reply)
+        except _Unlinked:
+            log.warning("the chat lost its link; run=%s is not delivered", run_id)
         except TelegramError as error:
             log.warning("a Telegram reply failed run=%s error=%s", run_id, error)
         finally:
             self._followers.discard(place)
 
     async def _ending(
-        self, chat_id: int, org_id: uuid.UUID, run_id: uuid.UUID, status: str, reply: _Reply
+        self, outbox: _Outbox, org_id: uuid.UUID, run_id: uuid.UUID, status: str, reply: _Reply
     ) -> None:
         if status == "completed" and not reply.sent_any:
             # A runtime that sends no text deltas: show the stored answer.
@@ -822,7 +875,7 @@ class TelegramGateway:
                 ).scalar_one_or_none()
             text = str((output or {}).get("text") or "")
             for start in range(0, min(len(text), 4 * MAX_TEXT), SPLIT_AT):
-                await self._client.send_message(chat_id, text[start : start + SPLIT_AT])
+                await outbox.send_message(text[start : start + SPLIT_AT])
         elif status == "failed":
             async with self._engine.connect() as connection:
                 message = (
@@ -830,9 +883,9 @@ class TelegramGateway:
                         select(Run.failure_message).where(Run.org_id == org_id, Run.id == run_id)
                     )
                 ).scalar_one_or_none()
-            await self._client.send_message(chat_id, f"The run failed: {message or 'unknown'}")
+            await outbox.send_message(f"The run failed: {message or 'unknown'}")
         elif status == "cancelled":
-            await self._client.send_message(chat_id, "The run stopped.")
+            await outbox.send_message("The run stopped.")
 
     # -- approvals ------------------------------------------------------------------------
 

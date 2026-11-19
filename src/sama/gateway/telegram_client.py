@@ -8,6 +8,7 @@ request URLs are not logged.
 from __future__ import annotations
 
 import asyncio
+import copy
 from typing import Any, Final
 
 import httpx
@@ -19,7 +20,11 @@ MAX_TEXT: Final = 4096
 
 
 class TelegramError(Exception):
-    """A failed Bot API call."""
+    """A failed Bot API call. ``retry_after`` is set when Telegram asks the bot to wait."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def bot_id(token: SecretStr) -> int | None:
@@ -50,6 +55,17 @@ class TelegramClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
+    @property
+    def max_wait_s(self) -> float:
+        return self._max_wait_s
+
+    def without_retries(self) -> TelegramClient:
+        """The same client, but a ``429`` answer raises at once. The caller then decides
+        whether to wait and try again. Close only the first client."""
+        view = copy.copy(self)
+        view._max_retries = 0
+        return view
+
     async def call(self, method: str, **params: Any) -> Any:
         url = f"{self._base_url}/bot{self._token.get_secret_value()}/{method}"
         body = {name: value for name, value in params.items() if value is not None}
@@ -63,14 +79,13 @@ class TelegramClient:
                 return data.get("result")
             data = data if isinstance(data, dict) else {}
             wait = (data.get("parameters") or {}).get("retry_after")
-            if (
-                not isinstance(wait, int | float)
-                or wait > self._max_wait_s
-                or attempt == self._max_retries
-            ):
+            wait = wait if isinstance(wait, int | float) else None
+            if wait is None or wait > self._max_wait_s or attempt == self._max_retries:
                 break
             await asyncio.sleep(wait)
-        raise TelegramError(f"{method} failed: {data.get('description', response.status_code)}")
+        raise TelegramError(
+            f"{method} failed: {data.get('description', response.status_code)}", retry_after=wait
+        )
 
     async def send_message(
         self,
