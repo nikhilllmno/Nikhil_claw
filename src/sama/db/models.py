@@ -272,6 +272,14 @@ class Run(Base):
             unique=True,
             postgresql_where=text("status IN ('running', 'paused')"),
         ),
+        # The runs that wait for the trace export (migration 0009, Section 18.2).
+        Index(
+            "ix_runs_trace_pending",
+            "finished_at",
+            postgresql_where=text(
+                "trace_exported_at IS NULL AND status IN ('completed', 'failed', 'cancelled')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -307,6 +315,8 @@ class Run(Base):
     created_at: Mapped[datetime] = _created_at()
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    trace_exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the control plane sent the trace of the ended run to Langfuse (Section 18.2)."""
 
 
 class Message(Base):

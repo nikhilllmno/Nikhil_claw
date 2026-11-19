@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.13.
+Done: M1.1 to M1.14.
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -74,7 +74,7 @@ Done: M1.1 to M1.13.
   `src/sama/orchestrator/worker.py` (architecture Section 4.3), with the queue columns of
   `runs` and `sessions.sandbox_id` (migration `0005`). `PostgresSandboxDirectory` stores the
   sandbox of each session. A crashed run starts again only if the worker did not start the
-  runner (`runs.dispatched_at`). The deploy (M1.15) applies migrations `0004` to `0008` to
+  runner (`runs.dispatched_at`). The deploy (M1.15) applies migrations `0004` to `0009` to
   Supabase.
 - M1.11: prompt assembly in `src/sama/prompt/` (architecture Section 6.1). The first run of a
   session builds the `RunConfig` and stores it in `sessions.run_config` (migration `0006`).
@@ -93,6 +93,13 @@ Done: M1.1 to M1.13.
   `python -m sama.gateway` runs it. The web page makes pairing codes. Not in M1.13: the group
   toolset (Section 11.3), `clarify` buttons in Telegram, and followers that survive a restart.
   The deploy (M1.15) runs the gateway and sets the webhook.
+- M1.14: observability in `src/sama/observability/` (architecture Section 18.1 to 18.3).
+  Each service writes JSON logs with the run ids. `python -m sama.observability` (the
+  monitor) sends one Langfuse trace per ended run over OTLP and posts error rate alerts to
+  Slack. Migration `0009` adds `runs.trace_exported_at`. The traces come from the stored
+  rows, so they work for both runtimes. Not in M1.14: tool arguments and results in traces
+  (they wait for redaction, M1.17), metrics such as queue depth, and a dashboard. The deploy
+  (M1.15) runs the monitor next to the worker and sets the Langfuse and Slack secrets.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
