@@ -170,15 +170,18 @@ class GitHubClient:
 
     async def user_installation_ids(self, code: str) -> set[int]:
         """The installations of the App that the person who gave the OAuth code can see."""
-        response = await self._http.post(
-            f"{self.config.web_url}/login/oauth/access_token",
-            data={
-                "client_id": self.config.client_id,
-                "client_secret": self.config.client_secret.get_secret_value(),
-                "code": code,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            response = await self._http.post(
+                f"{self.config.web_url}/login/oauth/access_token",
+                data={
+                    "client_id": self.config.client_id,
+                    "client_secret": self.config.client_secret.get_secret_value(),
+                    "code": code,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as error:
+            raise GitHubError(f"GitHub cannot be reached: {type(error).__name__}") from None
         body = _body(response)
         token = str(body.get("access_token") or "") if response.status_code == 200 else ""
         if not token:

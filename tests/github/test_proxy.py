@@ -21,14 +21,13 @@ from sama.github.push import git_env
 from sama.github.service import AllowedRepo
 from sama.runtime.contract import Audience, RunScope
 from sama.tenancy import RunTokenSigner
+from sama.tools.repos import PROXY_CREDENTIAL_HELPER
 from tests.conformance.scripted_model import serve
 from tests.github.support import GIT, Grant, LocalUpstream, MemoryStore, git
 
 ORG = uuid.uuid4()
 OTHER_ORG = uuid.uuid4()
-HELPER = (
-    '!f() { test "$1" = get || exit 0; echo username=sama; echo "password=${SAMA_RUN_TOKEN}"; }; f'
-)
+HELPER = PROXY_CREDENTIAL_HELPER
 
 
 @dataclass
@@ -45,7 +44,9 @@ class World:
     def env(self, token: str | None = None) -> dict[str, str]:
         return git_env({"SAMA_RUN_TOKEN": self.token if token is None else token})
 
-    def clone(self, folder: str = "work", token: str | None = None, repo: str = "acme/demo") -> Path:
+    def clone(
+        self, folder: str = "work", token: str | None = None, repo: str = "acme/demo"
+    ) -> Path:
         target = self.tmp / folder
         run(
             self.tmp,
@@ -74,7 +75,7 @@ class World:
 
     def upstream_ref(self, ref: str) -> str | None:
         done = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", ref],
+            [*GIT, "rev-parse", "--verify", "--quiet", ref],
             cwd=self.bare,
             capture_output=True,
             text=True,

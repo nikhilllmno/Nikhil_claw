@@ -754,8 +754,6 @@ class ToolServer:
         return frozenset()
 
     def _github_tools(self, server: MCPServer, github: GitHubTools) -> None:
-        repo_field = Field(min_length=1, max_length=300)
-
         @server.tool(
             name=PR_CREATE,
             description=(
@@ -768,7 +766,7 @@ class ToolServer:
             structured_output=False,
         )
         async def pr_create(
-            repo: Annotated[str, repo_field],
+            repo: Annotated[str, Field(min_length=1, max_length=300)],
             head: Annotated[str, Field(min_length=1, max_length=200)],
             base: Annotated[str, Field(min_length=1, max_length=200)],
             title: Annotated[str, Field(min_length=1, max_length=256)],
@@ -802,7 +800,7 @@ class ToolServer:
             structured_output=False,
         )
         async def pr_comment(
-            repo: Annotated[str, repo_field],
+            repo: Annotated[str, Field(min_length=1, max_length=300)],
             number: Annotated[int, Field(gt=0)],
             body: Annotated[str, Field(min_length=1, max_length=60_000)],
             ctx: Context,
@@ -825,7 +823,7 @@ class ToolServer:
             structured_output=False,
         )
         async def repo_push_approval(
-            repo: Annotated[str, repo_field],
+            repo: Annotated[str, Field(min_length=1, max_length=300)],
             branch: Annotated[str, Field(min_length=1, max_length=200)],
             commit: Annotated[str, Field(min_length=40, max_length=40)],
             ctx: Context,
