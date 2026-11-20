@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiClient, type Connection, type Connector, type TokenSource } from "./api";
 import {
   EMPTY_SERVER,
+  canCheck,
   connectionOf,
   connectorFor,
   customServers,
@@ -321,6 +322,17 @@ describe("remote MCP servers", () => {
     expect(connectorFor(card, mine).mcp?.url).toBe("https://b.example.com/mcp");
     expect(connectorFor(NOTION, connection())).toBe(NOTION);
     expect(connectorFor(card, null)).toBe(card);
+    // A pending server with a form waits for the form. An OAuth server can be checked.
+    expect(canCheck(card, { ...team, state: "pending" })).toBe(false);
+    expect(canCheck(card, { ...team, state: "connected" })).toBe(true);
+    const oauth = connection({
+      connector: "docs",
+      kind: "mcp_remote",
+      state: "pending",
+      mcp: { ...base, custom: { title: "Docs", url: "https://a.example.com/mcp", auth: "oauth", header: null } },
+    });
+    expect(canCheck(card, oauth)).toBe(true);
+    expect(canCheck(NOTION, connection({ state: "pending" }))).toBe(false);
   });
 
   it("sums up the tools and checks the filters", () => {

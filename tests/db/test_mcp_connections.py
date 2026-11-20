@@ -429,3 +429,39 @@ async def test_two_callbacks_at_once_connect_once(org: Org1, world: World, fake:
     final = await service.get(org.ids["org"], view.id)
     assert final is not None
     assert final.state == "connected"
+
+
+async def test_a_check_finishes_an_oauth_sign_in_after_a_server_outage(
+    org: Org1, world: World, fake: FakeMcp
+) -> None:
+    service, _ = world
+    fake.auth = "oauth"
+    fake.tokens = set()
+    mia = member(org, "mia", admin=True)
+    started = await service.add_mcp(
+        org.ids["org"],
+        org.ids["ws"],
+        mia,
+        name="tracker",
+        url=URL,
+        auth="oauth",
+        header=None,
+        oauth_scope=None,
+        title=None,
+        scope="personal",
+    )
+    assert started.redirect_url is not None
+    code, state = fake.approve(started.redirect_url)
+    view = started.connection
+    fake.mcp_down = True
+    waiting = await service.finish_oauth(
+        org.ids["org"], view.id, state=state, code=code, error=None, actor=mia.user_id
+    )
+    assert waiting.state == "pending"
+    assert waiting.last_error
+    fake.mcp_down = False
+    # A check uses the stored tokens: no second sign-in and no second code exchange.
+    done = await service.check(org.ids["org"], view.id, actor=mia.user_id)
+    assert done.state == "connected"
+    exchanges = [r for r in fake.token_requests if r.get("grant_type") == "authorization_code"]
+    assert len(exchanges) == 1

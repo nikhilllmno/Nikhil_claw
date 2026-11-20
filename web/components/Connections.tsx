@@ -18,6 +18,7 @@ import {
   EMPTY_SERVER,
   type ServerDraft,
   connectionOf,
+  canCheck,
   connectorFor,
   customServers,
   hasOAuthAnswer,
@@ -507,7 +508,7 @@ function ScopeRow({
               {busy === "connect" ? "Connecting" : connection === null ? "Connect" : "Connect again"}
             </button>
           ) : null}
-          {connection !== null && connection.state !== "pending" ? (
+          {connection !== null && canCheck(connector, connection) ? (
             <button
               type="button"
               className="btn btn-small"

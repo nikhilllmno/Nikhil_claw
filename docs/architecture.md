@@ -2280,7 +2280,9 @@ gets one notice per change.
   one, and uses the state and the PKCE verifier once. Before the code exchange, the callback
   claims the row: it moves the row from `initiated` to `pending` only if the row did not change
   since the API read it. A second callback at the same time loses the claim and gets a `400`,
-  so one code is exchanged once. The tokens, the client secret, the state, and the verifier are
+  so one code is exchanged once. If the server does not answer after the exchange, the row
+  stays `pending` with the error, and a check (the page shows **Check**) finishes it with the
+  stored tokens. The tokens, the client secret, the state, and the verifier are
   in the vault entry `connection:<id>`. The tokens carry `bound`, a hash of the server URL and
   the OAuth client id. sama does not use tokens whose `bound` is not that of the current
   connection, so a late refresh or exchange for an old server or an old client cannot give a

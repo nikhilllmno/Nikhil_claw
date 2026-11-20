@@ -56,6 +56,8 @@ class FakeMcp:
     def __init__(self, auth: str = "bearer", *, stream: bool = False) -> None:
         self.auth = auth
         self.stream = stream
+        self.mcp_down = False
+        """The MCP endpoint answers 503; the OAuth endpoints still work."""
         self.crlf = False
         """The event stream ends its lines with CRLF."""
         self.stay_open = False
@@ -102,6 +104,8 @@ class FakeMcp:
             return httpx.Response(503)
         path = request.url.path
         if path == "/mcp" and request.method == "POST":
+            if self.mcp_down:
+                return httpx.Response(503)
             return self._mcp(request)
         if path == "/.well-known/oauth-protected-resource/mcp" and self.auth == "oauth":
             return httpx.Response(

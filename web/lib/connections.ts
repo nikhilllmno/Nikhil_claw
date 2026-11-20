@@ -316,6 +316,16 @@ export function connectorFor(connector: Connector, connection: Connection | null
   };
 }
 
+/**
+ * True if the page offers a check of the connection. A `pending` connection waits for its form,
+ * so a check does not help. A remote MCP server without a form (OAuth, or no auth) is `pending`
+ * after its sign-in if the server did not answer; a check then finishes it.
+ */
+export function canCheck(connector: Connector, connection: Connection): boolean {
+  if (connection.state !== "pending") return true;
+  return connection.mcp != null && connectorFor(connector, connection).fields.length === 0;
+}
+
 /** The form of a server: the same field as `mcp_fields` of the API. */
 export function mcpFields(auth: McpAuth, header: string | null): ConnectorField[] {
   if (auth === "bearer") {
