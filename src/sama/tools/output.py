@@ -25,6 +25,7 @@ MAX_OUTPUT_BYTES: Final = 50_000
 HEAD_BYTES: Final = 30_000
 TAIL_BYTES: Final = 10_000
 SPILL_DIR: Final = ".sama/spill"
+EXPORT_DIR: Final = ".sama/exports"
 SPILL_TIMEOUT_S: Final = 30.0
 
 _CLOSE_TAG = re.compile(r"</(\s*untrusted_content)", re.IGNORECASE)
@@ -43,16 +44,18 @@ SessionSandbox = Callable[[str, str], Awaitable[Sandbox | None]]
 
 
 class SandboxSpill:
-    """Writes spill files to ``<workdir>/.sama/spill/`` in the session sandbox."""
+    """Writes spill files to ``<workdir>/.sama/spill/`` in the session sandbox. ``folder``
+    gives another folder below the workdir (for example ``EXPORT_DIR``)."""
 
-    def __init__(self, session_sandbox: SessionSandbox) -> None:
+    def __init__(self, session_sandbox: SessionSandbox, *, folder: str = SPILL_DIR) -> None:
         self._session_sandbox = session_sandbox
+        self._folder = folder.strip("/")
 
     async def save(self, claims: RunTokenClaims, name: str, data: bytes) -> str | None:
         sandbox = await self._session_sandbox(claims.org_id, claims.session_id)
         if sandbox is None:
             return None
-        path = f"{sandbox.workdir.rstrip('/')}/{SPILL_DIR}/{name}"
+        path = f"{sandbox.workdir.rstrip('/')}/{self._folder}/{name}"
         await sandbox.write_file(path, data)
         return path
 

@@ -1,0 +1,19 @@
+# The PostgreSQL connector (docs/architecture.md, Section 10.4). The database gateway runs the
+# tools: db_postgres_schema, sample, query, export, and execute. The form and the tools are
+# standard for each database connector, so this file does not list them.
+name: postgres
+title: PostgreSQL
+description: Read the schema and the rows of a PostgreSQL database with read-only SQL. Change
+  rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: postgres
+  sslmode: require
+  hints:
+    host: The host name of the server, for example db.example.com. sama connects only to
+      public addresses. Allow the sama egress addresses in the firewall of the database.
+    user: Use a user with only the grants that the agent needs. For read only, grant SELECT
+      only. The grants of the user are the strongest control.

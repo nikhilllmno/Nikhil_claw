@@ -33,6 +33,7 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.connectors.database import DatabaseGateway
 from sama.connectors.manifest import Catalog
 from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
@@ -85,7 +86,7 @@ from sama.tools.code import CodeRunner
 from sama.tools.deferred import DeferredCatalog
 from sama.tools.github import GitHubTools
 from sama.tools.outbound import OutboundClient
-from sama.tools.output import SandboxSpill
+from sama.tools.output import EXPORT_DIR, SandboxSpill
 from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
 from sama.tools.todo import PostgresTodoStore
@@ -171,12 +172,16 @@ def build(
     # server runs them (Section 10.3). The connector tools of the catalog in
     # ``connectors/catalog/`` are deferred tools of the toolset ``integrations``.
     deferred = DeferredCatalog()
+    # The database gateway runs the tools of the database connectors (Section 10.4). It
+    # writes large results and exports to the session sandbox, set below.
+    database = DatabaseGateway()
     connections = ConnectionService(
         engine,
         Catalog.load(),
         keys=keys,
         vault=vault,
         web_base=settings.web_base,
+        database=database,
     )
     connections.register_tools(deferred)
     gate = GateService(engine, extra_toolsets=deferred)
@@ -215,6 +220,8 @@ def build(
         )
         # The OpenAI runtime runs in the same session sandbox (M3.6). A profile selects it.
         runtimes = (sandboxed, sandboxed.for_kind(RuntimeKind.OPENAI_AGENTS_SDK))
+        database.spill = SandboxSpill(sandboxed.session_sandbox)
+        database.exports = SandboxSpill(sandboxed.session_sandbox, folder=EXPORT_DIR)
     for runtime in runtimes:
         registry.register(runtime)
 

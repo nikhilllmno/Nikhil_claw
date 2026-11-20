@@ -1,0 +1,20 @@
+# The Neon connector (docs/architecture.md, Section 10.4). Neon is PostgreSQL: the database
+# gateway connects to it as to any PostgreSQL server.
+name: neon
+title: Neon
+description: Read the schema and the rows of a Neon Postgres database with read-only SQL.
+  Change rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: postgres
+  # Neon uses a public CA. The gateway checks the certificate and the host name.
+  sslmode: verify-full
+  hints:
+    host: In the Neon console, select Connect. Copy the host, for example
+      ep-<name>.<region>.aws.neon.tech. The host with -pooler uses the connection pooler.
+    database: The database name, for example neondb.
+    user: The role name, for example neondb_owner. A role with fewer grants is safer.
+    password: The password of the role.

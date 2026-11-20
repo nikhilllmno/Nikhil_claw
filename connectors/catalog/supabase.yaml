@@ -1,0 +1,25 @@
+# The Supabase connector (docs/architecture.md, Section 10.4). Supabase is PostgreSQL: the
+# database gateway connects to it as to any PostgreSQL server.
+name: supabase
+title: Supabase
+description: Read the schema and the rows of a Supabase Postgres database with read-only SQL.
+  Change rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: postgres
+  # The Supabase server certificate comes from the Supabase CA, which is not in the public
+  # trust store. The connection is encrypted but the certificate is not checked.
+  sslmode: require
+  hints:
+    host: In the Supabase dashboard, select Connect. Copy the host of the Session pooler
+      (aws-0-<region>.pooler.supabase.com), or of the direct connection
+      (db.<project-ref>.supabase.co, IPv6 only).
+    port: 5432 for the session pooler and the direct connection. 6543 is the transaction
+      pooler.
+    database: Usually postgres.
+    user: For the pooler, postgres.<project-ref>. For the direct connection, postgres. A
+      user with fewer grants is safer.
+    password: The database password of the project, not an API key.
