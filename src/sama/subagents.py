@@ -278,6 +278,7 @@ class LockedProfile(NamedTuple):
     toolsets: list[str]
     subagents: Any
     workspace_id: uuid.UUID | None
+    review_model: str | None = None
 
 
 async def lock_profile(
@@ -297,6 +298,7 @@ async def lock_profile(
                 AgentProfile.toolsets,
                 AgentProfile.subagents,
                 AgentProfile.workspace_id,
+                AgentProfile.review_model,
             )
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .with_for_update()
@@ -312,6 +314,7 @@ async def lock_profile(
         toolsets=[str(t) for t in row.toolsets] if isinstance(row.toolsets, list) else [],
         subagents=row.subagents,
         workspace_id=row.workspace_id,
+        review_model=row.review_model,
     )
 
 

@@ -30,7 +30,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | Agent loop | `run_agent.py`, `agent/` | The SDK runs the loop. Sama wraps it in the `AgentRuntime` contract (§5). | SDK | M1 |
-| Provider abstraction (many providers) | `agent/transports/`, `providers/` | Only Anthropic and OpenAI models. Claude adapter (default) and OpenAI Agents adapter. | Adapt | M1, M3 |
+| Provider abstraction (many providers) | `agent/transports/`, `providers/` | Only Anthropic and OpenAI models. Claude adapter (default) and OpenAI Agents adapter (M3.6 done). An admin switches the runtime of a profile. | Adapt | M1, M3 (M3.6 done) |
 | Three-tier prompt (stable, context, volatile) | `agent/prompt_builder*.py` | Frozen prefix per session: SOUL, context files, memory snapshot, skill index. Volatile notes on the user message (§6.1, D9). | Adapt | M1 |
 | `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). | Adapt | M1 |
 | Context files (`AGENTS.md`, `CLAUDE.md`, `.hermes.md`) | `agent/context_files*.py` | Loaded from the repo in the sandbox and from workspace settings, 20,000-char cap, injection scan (§6). | Adapt | M1 |
@@ -47,7 +47,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | `terminal`, `process_manage` | `tools/terminal_tool.py`, `tools/process_registry.py` | Native shell tool of the SDK, in the E2B sandbox. Background processes through the sandbox. | SDK | M1 |
-| `read_file`, `write_file`, `patch`, `search_files` | `tools/file_tools.py` | Native file tools (Claude `Read`, `Write`, `Edit`, `Grep`; OpenAI sandbox filesystem and `apply_patch`). | SDK | M1 |
+| `read_file`, `write_file`, `patch`, `search_files` | `tools/file_tools.py` | Native file tools (Claude `Read`, `Write`, `Edit`, `Grep`; OpenAI sandbox shell in M3.6, the filesystem capability and `apply_patch` later). | SDK | M1 |
 | Terminal backends (local, Docker, SSH, Modal, Daytona, ...) | `tools/environments/` | One `SandboxProvider`: E2B in the cloud, Docker for development and CI (D5). | Adapt | M1 |
 | `web_search`, `web_extract` | `tools/web_tools.py` | Sama tools, search provider key on the control plane (§10.2). | Adapt | M1 |
 | `x_search` | `tools/x_search_tool.py` | Through an integration if needed. | Defer | — |
@@ -172,7 +172,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `delegate_task` (single and batch) | `tools/delegate_tool.py` | Child session and run in its own sandbox. Summary returns to the parent (§13). | Adapt | M4 |
 | Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget. | Adapt | M4 |
 | Cheaper model for children | `delegation.model` | Child model per profile. | Adapt | M4 |
-| Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents`, OpenAI agents as tools and handoffs (§13). | SDK | M2 (done) |
+| Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents` (M2.7 done). OpenAI agents as tools and handoffs later: the OpenAI adapter (M3.6) has no native sub-agents (§13). | SDK | M2 (Claude done) |
 | Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for running children. | Adapt | M4 |
 | Kanban board and dispatcher | `hermes kanban` | Task board with `task_*` tools (§12.4). | Adapt | M4 |
 | Worker bots in Slack channels | `gateway/bot_*` | An agent profile bound to a Slack channel with a budget. | Adapt | M3 |
@@ -244,7 +244,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Feature | Sama design | Milestone |
 |---|---|---|
-| Two runtimes behind one contract with a conformance suite | §5 | M1, M3 |
+| Two runtimes behind one contract with a conformance suite | §5 | M1, M3 (M3.6 done) |
 | Multi-user orgs, workspaces, roles, RLS | §17 | M1 |
 | Model proxy with budgets and no keys in the sandbox | D6, §18 | M1 |
 | Workflows with approval steps | §12.3 | M4 |

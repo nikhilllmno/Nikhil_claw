@@ -380,3 +380,36 @@ def test_subagent_text_is_redacted_and_content_can_be_off() -> None:
 def test_subagent_events_do_not_become_compaction_events() -> None:
     record = RunRecord(run=_run(), events=[_subagent_event(1, "a", call_id="toolu_1")])
     assert [span.name for span in build_trace(record)] == ["run", "subagent:researcher"]
+
+
+def test_an_openai_run_has_the_same_trace_shape() -> None:
+    """M3.6: the trace comes from the rows, so a run of the OpenAI runtime needs no other code."""
+    run = _run(runtime="openai_agents_sdk")
+    calls = [
+        _model_call(
+            provider="openai",
+            model="gpt-6.2-sol",
+            endpoint="responses",
+            cache_write_tokens=0,
+            cache_write_long_tokens=0,
+        ),
+        _model_call(
+            provider="openai",
+            model="gpt-6.2-sol",
+            endpoint="responses/compact",
+            cache_write_tokens=0,
+            cache_write_long_tokens=0,
+        ),
+    ]
+    record = RunRecord(run=run, model_calls=calls, tool_calls=[_tool(tool_name="Bash")])
+    root, first, second, tool = build_trace(record)
+    assert root.attributes["langfuse.trace.tags"] == ["openai_agents_sdk", "completed"]
+    assert root.attributes["langfuse.trace.metadata.runtime"] == "openai_agents_sdk"
+    for generation in (first, second):
+        assert generation.name == "gpt-6.2-sol"
+        assert generation.attributes["langfuse.observation.metadata.provider"] == "openai"
+        assert (
+            json.loads(str(generation.attributes["langfuse.observation.usage_details"]))["input"]
+            == 10
+        )
+    assert tool.name == "Bash"

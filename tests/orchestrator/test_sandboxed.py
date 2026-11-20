@@ -833,16 +833,23 @@ def test_the_capabilities_match_the_adapters() -> None:
     assert CAPABILITIES[RuntimeKind.FAKE] == FakeRuntime().capabilities()
     claude = pytest.importorskip("sama.runtime.claude")
     assert CAPABILITIES[RuntimeKind.CLAUDE_AGENT_SDK] == claude.ClaudeRuntime().capabilities()
+    openai = pytest.importorskip("sama.runtime.openai_agents")
+    from sama.runtime.session_items import MemorySessionItems
+
+    adapter = openai.OpenAIRuntime(items=MemorySessionItems())
+    assert CAPABILITIES[RuntimeKind.OPENAI_AGENTS_SDK] == adapter.capabilities()
 
 
-def test_an_unsupported_kind_is_refused(provider: CountingProvider) -> None:
-    with pytest.raises(ValueError, match="does not support"):
-        SandboxedRuntime(
-            kind=RuntimeKind.OPENAI_AGENTS_SDK,
-            provider=provider,
-            signer=RunTokenSigner(KEY),
-            settings=SandboxSettings(template="local"),
-        )
+def test_another_kind_shares_the_sandboxes_and_the_runs(runtime: SandboxedRuntime) -> None:
+    other = runtime.for_kind(RuntimeKind.OPENAI_AGENTS_SDK)
+    assert other.kind is RuntimeKind.OPENAI_AGENTS_SDK
+    assert runtime.kind is RuntimeKind.FAKE
+    assert other.capabilities() == CAPABILITIES[RuntimeKind.OPENAI_AGENTS_SDK]
+    # One state: a session keeps its sandbox when its runtime changes, and a cancel finds the
+    # run in either object.
+    assert other._sandbox_ids is runtime._sandbox_ids
+    assert other._active is runtime._active
+    assert other._used_approvals is runtime._used_approvals
 
 
 async def test_a_compact_request_reaches_the_runner(runtime: SandboxedRuntime) -> None:

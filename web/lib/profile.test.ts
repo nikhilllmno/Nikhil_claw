@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentProfile } from "./api";
-import { diffDraft, newSubagent, toDraft, validateDraft } from "./profile";
+import { diffDraft, newSubagent, runtimeOption, toDraft, validateDraft, withRuntime } from "./profile";
 
 const profile: AgentProfile = {
   id: "p",
@@ -28,6 +28,10 @@ const profile: AgentProfile = {
     toolsets: [],
     models: ["claude-sonnet-5-5"],
     subagents: true,
+    runtimes: [
+      { name: "claude_agent_sdk", models: ["claude-opus-5-5", "claude-sonnet-5-5"], subagents: true },
+      { name: "openai_agents_sdk", models: ["gpt-6.2-astra", "gpt-6.2-sol"], subagents: false },
+    ],
     limits: {
       name_max_chars: 80,
       soul_max_chars: 20000,
@@ -82,5 +86,45 @@ describe("validateDraft", () => {
     draft.subagents[0]!.name = "ok";
     draft.subagents[0]!.maxTurns = "99";
     expect(validateDraft(draft, profile.options.limits)).toMatch(/1 to 50/);
+  });
+});
+
+describe("the runtime", () => {
+  it("takes a model of the new runtime and sends both fields", () => {
+    const draft = withRuntime(toDraft(profile), profile, "openai_agents_sdk");
+    expect(draft.model).toBe("gpt-6.2-astra");
+    draft.subagents = [];
+    expect(diffDraft(profile, draft)).toMatchObject({
+      runtime: "openai_agents_sdk",
+      model: "gpt-6.2-astra",
+      subagents: [],
+    });
+  });
+
+  it("keeps a model that the new runtime has, and goes back to the saved model", () => {
+    const draft = withRuntime({ ...toDraft(profile), model: "gpt-6.2-sol" }, profile, "openai_agents_sdk");
+    expect(draft.model).toBe("gpt-6.2-sol");
+    const back = withRuntime(draft, profile, "claude_agent_sdk");
+    expect(back.model).toBe(profile.model);
+    expect(diffDraft(profile, back)).toEqual({});
+  });
+
+  it("refuses sub-agents on a runtime without them", () => {
+    const draft = withRuntime(toDraft(profile), profile, "openai_agents_sdk");
+    const option = runtimeOption(profile.options, profile.runtime, draft.runtime);
+    expect(option.subagents).toBe(false);
+    expect(validateDraft(draft, profile.options.limits, option)).toMatch(/has no sub-agents/);
+    draft.subagents = [];
+    expect(validateDraft(draft, profile.options.limits, option)).toBeNull();
+  });
+
+  it("uses the profile options when the list does not have the saved runtime", () => {
+    const old = { ...profile.options, runtimes: [] };
+    expect(runtimeOption(old, "claude_agent_sdk", "claude_agent_sdk")).toEqual({
+      name: "claude_agent_sdk",
+      models: ["claude-sonnet-5-5"],
+      subagents: true,
+    });
+    expect(runtimeOption(old, "claude_agent_sdk", "other").models).toEqual([]);
   });
 });

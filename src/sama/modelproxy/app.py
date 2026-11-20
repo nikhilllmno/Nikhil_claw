@@ -90,6 +90,10 @@ ROUTES: Final = {
         Provider.ANTHROPIC, Endpoint.COUNT_TOKENS, "/v1/messages/count_tokens"
     ),
     "/openai/v1/responses": _Route(Provider.OPENAI, Endpoint.RESPONSES, "/v1/responses"),
+    # The compaction of the OpenAI adapter (M3.6). The answer is JSON with Responses usage.
+    "/openai/v1/responses/compact": _Route(
+        Provider.OPENAI, Endpoint.RESPONSES, "/v1/responses/compact"
+    ),
     "/openai/v1/chat/completions": _Route(
         Provider.OPENAI, Endpoint.CHAT_COMPLETIONS, "/v1/chat/completions"
     ),

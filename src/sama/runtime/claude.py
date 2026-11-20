@@ -88,6 +88,9 @@ from sama.runtime.contract import (
     bound_subagent_text,
     is_terminal,
 )
+from sama.runtime.gating import AllowAllGate as AllowAllGate
+from sama.runtime.gating import GateDecision as GateDecision
+from sama.runtime.gating import ToolGate as ToolGate
 
 log: Final = logging.getLogger("sama.runtime.claude")
 
@@ -129,49 +132,6 @@ _MEMORY_SIZE: Final = 10_000
 # ---------------------------------------------------------------------------------------------
 # Seams: the tool gate and the SDK client
 # ---------------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class GateDecision:
-    """The answer of the tool gate for one tool call."""
-
-    action: Literal["allow", "deny", "ask"]
-    reason: str = ""
-
-
-class ToolGate(Protocol):
-    """Decides each tool call (architecture Section 16.1). ``call_id`` is the tool use id. In
-    the sandbox the runner uses ``RemoteGate``, which asks the ``GateService`` of the control
-    plane.
-
-    ``child`` is true for a call of a sub-agent. A sub-agent cannot pause the run, so the gate
-    must not answer ``ask`` for it, and it must not record an approval for it: it gives ``deny``
-    instead."""
-
-    async def check(
-        self,
-        scope: RunScope,
-        tool_name: str,
-        arguments: Mapping[str, Any],
-        *,
-        call_id: str,
-        child: bool = False,
-    ) -> GateDecision: ...
-
-
-class AllowAllGate:
-    """Allows every tool call. Only for tests and local development."""
-
-    async def check(
-        self,
-        scope: RunScope,
-        tool_name: str,
-        arguments: Mapping[str, Any],
-        *,
-        call_id: str,
-        child: bool = False,
-    ) -> GateDecision:
-        return GateDecision("allow")
 
 
 class ClaudeClient(Protocol):

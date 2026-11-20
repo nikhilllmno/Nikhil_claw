@@ -43,6 +43,7 @@ from sama.db.models import (
     ReviewProposal,
     Run,
     RunEvent,
+    RuntimeSessionItem,
     Session,
     SessionBinding,
     SessionCompaction,
@@ -270,6 +271,14 @@ def plan(
             org_id=org_id,
             session_id=ids[session],
             text=f"pin of {session}",
+        )
+        add(
+            RuntimeSessionItem,
+            org_id=org_id,
+            session_id=ids[session],
+            conversation="c-world",
+            seq=0,
+            item={"role": "user", "content": f"item of {session}"},
         )
     policies: tuple[tuple[str, str, str | None], ...] = (
         ("rule:org-a", "org-a", None),

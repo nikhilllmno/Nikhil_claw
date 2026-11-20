@@ -58,6 +58,14 @@ from sama.runtime.archive import (
     TranscriptArchive,
     parse_archive,
 )
+from sama.runtime.session_items import (
+    MAX_SESSION_ITEMS_BODY_BYTES,
+    SESSION_ITEMS_PATH,
+    SessionItemsAnswer,
+    SessionItemsError,
+    SessionItemsRequest,
+    parse_session_items,
+)
 from sama.search import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -114,6 +122,8 @@ SERVER_NAME: Final = "sama"
 MCP_PATH: Final = "/mcp"
 MAX_CONCURRENT_ARCHIVES: Final = 2
 """The most archive bodies that the server reads and stores at one time."""
+MAX_CONCURRENT_SESSION_ITEMS: Final = 8
+"""The most session item operations that the server runs at one time. More wait."""
 
 WEB_SEARCH: Final = "web_search"
 WEB_EXTRACT: Final = "web_extract"
@@ -179,6 +189,19 @@ class ArchiveBackend(Protocol):
     async def authorize(self, claims: RunTokenClaims) -> None: ...
 
     async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer: ...
+
+
+class SessionItemsBackend(Protocol):
+    """Stores the conversation items of the OpenAI runtime, normally
+    ``sama.context.session_items.PostgresSessionItems``. ``authorize`` raises
+    ``SessionItemsError`` if the run cannot use the items now. The server calls it before it
+    reads the body."""
+
+    async def authorize(self, claims: RunTokenClaims) -> None: ...
+
+    async def call(
+        self, claims: RunTokenClaims, request: SessionItemsRequest
+    ) -> SessionItemsAnswer: ...
 
 
 def bearer_of(headers: Mapping[str, str] | None) -> str | None:
@@ -260,6 +283,9 @@ class ToolServer:
     - ``archive``: stores the transcript before a compaction (Section 6.3). With it, the
       server answers ``POST /archive`` for the runner. Without it, ``/archive`` answers
       ``503`` and the runtime compacts without an archive.
+    - ``session_items``: the conversation items of the OpenAI runtime (Section 5.3). With it,
+      the server answers ``POST /session-items`` for the runner. Without it, the endpoint
+      answers ``503`` and an OpenAI run fails.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -282,8 +308,11 @@ class ToolServer:
         deferred: DeferredCatalog | None = None,
         archive: ArchiveBackend | None = None,
         gate: GateBackend | None = None,
+        session_items: SessionItemsBackend | None = None,
     ) -> None:
         self.signer = signer
+        self.session_items = session_items
+        self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
         self.deferred = deferred
         self.archive = archive
         self._archive_slots = asyncio.Semaphore(MAX_CONCURRENT_ARCHIVES)
@@ -841,6 +870,7 @@ class ToolServer:
                 Route("/healthz", healthz, methods=["GET"]),
                 Route(GATE_PATH, self._gate_endpoint, methods=["POST"]),
                 Route(ARCHIVE_PATH, self._archive_endpoint, methods=["POST"]),
+                Route(SESSION_ITEMS_PATH, self._session_items_endpoint, methods=["POST"]),
                 Mount("", app=_RunTokenGate(inner, self.signer)),
             ],
             lifespan=lifespan,
@@ -917,6 +947,50 @@ class ToolServer:
                 log.error("archive failed run=%s error=%s", claims.run_id, type(error).__name__)
                 return JSONResponse({"error": "the archive failed"}, status_code=503)
         return JSONResponse(answer.model_dump())
+
+    async def _session_items_endpoint(self, request: Request) -> Response:
+        """``POST /session-items``: one operation on the conversation items of the session of
+        the token."""
+        try:
+            claims = verify_bearer(self.signer, request.headers)
+        except InvalidRunTokenError as error:
+            return _unauthorized(error)
+        if self.session_items is None:
+            return JSONResponse({"error": "the session items are not configured"}, status_code=503)
+        declared = request.headers.get("content-length", "")
+        if declared.isdecimal() and int(declared) > MAX_SESSION_ITEMS_BODY_BYTES:
+            return JSONResponse({"error": "the request is too large"}, status_code=413)
+        async with self._session_item_slots:
+            try:
+                # The run must be able to use the items before the server reads the body.
+                await self.session_items.authorize(claims)
+            except SessionItemsError as error:
+                return JSONResponse({"error": str(error)}, status_code=409)
+            except Exception as error:
+                log.error(
+                    "session items failed run=%s error=%s", claims.run_id, type(error).__name__
+                )
+                return JSONResponse({"error": "the session items failed"}, status_code=503)
+            raw = bytearray()
+            async for chunk in request.stream():
+                raw += chunk
+                if len(raw) > MAX_SESSION_ITEMS_BODY_BYTES:
+                    return JSONResponse({"error": "the request is too large"}, status_code=413)
+            try:
+                body = parse_session_items(bytes(raw))
+            except ValueError:
+                return JSONResponse({"error": "the request is not valid"}, status_code=422)
+            del raw
+            try:
+                answer = await self.session_items.call(claims, body)
+            except SessionItemsError as error:
+                return JSONResponse({"error": str(error)}, status_code=409)
+            except Exception as error:
+                log.error(
+                    "session items failed run=%s error=%s", claims.run_id, type(error).__name__
+                )
+                return JSONResponse({"error": "the session items failed"}, status_code=503)
+        return Response(answer.model_dump_json(), media_type="application/json")
 
 
 def _unauthorized(error: InvalidRunTokenError) -> Response:

@@ -13,8 +13,8 @@ from typing import Any, Final
 import httpx
 
 from sama.gate.wire import GateAnswer, GateRequest
-from sama.runtime.claude import GateDecision
 from sama.runtime.contract import RunScope
+from sama.runtime.gating import GateDecision
 
 GATE_TIMEOUT_S: Final = 30.0
 

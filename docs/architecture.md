@@ -523,15 +523,15 @@ RunEvent = (
 |---|---|---|
 | Package | `claude-agent-sdk` (Python). It drives the bundled Claude Code CLI as a subprocess, so the sandbox image needs the CLI. | `openai-agents` (Python), in process. |
 | Turn API | `ClaudeSDKClient.query()` and `receive_response()` | `Runner.run_streamed()` |
-| Model routing | `ANTHROPIC_BASE_URL` points at the sama model proxy; the run token is the API key. | `AsyncOpenAI(base_url=<proxy>, api_key=<run token>)` |
+| Model routing | `ANTHROPIC_BASE_URL` points at the sama model proxy; the run token is the API key. | `AsyncOpenAI(base_url=<proxy>/openai/v1, api_key=<run token>)` and the Responses API |
 | System prompt | `system_prompt` preset `claude_code` with the sama prefix appended, or a full custom prompt for non-coding profiles | `Agent.instructions` |
 | Sama tools | `mcp_servers` with the sama MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the sama tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
 | Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to sama. | Serialised `RunState` plus a sama `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
-| Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers). Sama sets it from the agent profile (Section 13.1). | Agents as tools and handoffs |
-| Skills | Native: sama writes the session's skills to `.claude/skills/` and sets the `skills` option. | `SandboxAgent` `Skills` capability with a sama skill source, or the sama `skill_view` tool. |
-| Compaction | Native auto-compaction. The `PreCompact` hook gives the full transcript to the sama archive first. `/compact [focus]` is a CLI slash command that the adapter sends for a compact request (M2.6, Section 6.3). | `Compaction` capability or `OpenAIResponsesCompactionSession`. The adapter sets `manual_compaction` and `compaction_archive` when it supports them (M3.6). |
-| Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
+| Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers). Sama sets it from the agent profile (Section 13.1). | None in M3.6 (`native_subagents` is false). Agents as tools and handoffs are later work. |
+| Skills | Native: sama writes the session's skills to `.claude/skills/` and sets the `skills` option. | The sama `skill_view` tool over MCP (`native_skills` is false). |
+| Compaction | Native auto-compaction. The `PreCompact` hook gives the full transcript to the sama archive first. `/compact [focus]` is a CLI slash command that the adapter sends for a compact request (M2.6, Section 6.3). | The `Compaction` capability turns on server-side compaction. A manual compaction calls `POST /responses/compact` and replaces the items. The adapter archives the dropped items first, so it sets `manual_compaction` and `compaction_archive` (M3.6). |
+| Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with the `Shell` capability (`exec_command`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
 | Limits | `max_turns`, `max_budget_usd`, `task_budget` | `max_turns`; sama budget in the model proxy |
 | Checkpoints | `enable_file_checkpointing` and `rewind_files()` | Sama git snapshot of the workspace (Section 15.3) |
 | Tracing | Control-plane trace from the stored rows (Section 18.2) | Control-plane trace from the stored rows (Section 18.2) |
@@ -631,13 +631,81 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   does not use the CLI hook `SessionStart` with the source `compact`, because the Python SDK
   does not expose it: sama injects the pins itself (Section 6.3).
 
+#### OpenAI adapter notes (M3.6)
+
+The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25.0`.
+
+- **Agent.** Each run builds one `SandboxAgent` with the sama prefix as `instructions`, the
+  `Shell` and `Compaction` capabilities, and one `MCPServerStreamableHttp` for each MCP
+  server of the config, with the run token in an `Authorization` header. The SDK sandbox
+  client is `UnixLocalSandboxClient` in the work folder, with no snapshot. The model is
+  `OpenAIResponsesModel` over an `AsyncOpenAI` client with the proxy URL and the run token.
+- **Session items.** The SDK `Session` of the run is a sama store (`_Store`) over
+  `SessionItems` (`src/sama/runtime/session_items.py`). In the sandbox it is
+  `RemoteSessionItems`: each operation is one `POST /session-items` to the tool server with
+  the run token. The tool server takes the org, the session, and the run from the claims of the
+  token. `PostgresSessionItems` (`src/sama/context/session_items.py`) checks that the run is
+  `running`, that its user still has the authority of the run (Section 5.1), and that the
+  session is `active`. Then it applies the operation in one transaction under an advisory lock
+  for the conversation. The rows are in `runtime_session_items` (Section 17.1). The operations
+  are `get` (with a `limit`), `add`, `pop`, `clear`, `replace`, and `trim`. `seq` starts at 0
+  and has no gaps, because every operation removes items only from the end or removes all of
+  them. Limits: a body has at most 8 MB and 5,000 items, and a conversation has at most
+  20,000 items. A store refusal is `409`, and the run fails with `internal`, not retryable.
+  A store fault fails the run with `internal`, retryable.
+- **Conversations.** `runtime_state` names the conversation of the session. A run with no
+  `runtime_state` (the first chat run, or a background review run, Section 9.4) starts a new
+  conversation, so a review run never changes the items of the chat. `item_count` in
+  `runtime_state` is the count that the next run keeps. A run that failed or was cancelled
+  keeps the count of the run before it, so the next run first trims the items of the failed
+  run.
+- **Tool gate.** The adapter wraps each tool with `needs_approval`, which asks the sama
+  `ToolGate` (Section 16.1). The shell call `exec_command` goes to the gate as a `Bash` call
+  with a `command`, so one policy fits both runtimes. The adapter removes the SDK tool
+  `write_stdin`, because it lets a call go on after the gate allowed it. MCP tools keep the sama name. `ask`
+  makes the SDK stop with an interruption: the adapter saves the SDK `RunState` in
+  `runtime_state` and yields `ApprovalRequired`. The approval id is the call id. A `deny`
+  becomes a tool input guardrail that gives the model the reason in place of the result.
+- **Approve and reject.** A resume loads the `RunState` and calls `approve()` or
+  `reject()` with a fixed text and the reason of the user. The SDK asks `needs_approval` only
+  for a call with no decision, so the approved call does not go to the gate again. An approval
+  id is used once. A new run while an approval is open gives the paused call an output
+  (`The call did not run: the run ended before it.`), because the Responses API needs an output for each call.
+- **Compaction.** The `Compaction` capability turns on the server-side compaction of the
+  Responses API. After a run, the adapter archives the items before the last `compaction`
+  item, drops them from the store, and yields `Compacted` with the trigger `auto`. A compact
+  request (`RunRequest.compact`, or the input `/compact [focus]`) calls
+  `POST /responses/compact` through the proxy, archives the items, replaces them with the
+  answer, and yields `Compacted` with the trigger `manual`. A compact request with no
+  earlier state fails with `invalid_request`. Archive entries come from the message, function
+  call, and function call output items. Reasoning and compaction items have no readable text,
+  so they stay out.
+- **Usage.** Token counts come from the SDK usage. The SDK counts cached tokens in
+  `input_tokens`, so the adapter moves them to `cache_read_tokens`, as the proxy does. The
+  cost stays zero: the model proxy record is the source of truth for cost.
+- **Limits.** `max_turns` maps to the SDK `max_turns` (200 when the budget has none).
+  `max_wall_time_s` is a timer in the adapter, and `runtime_state` keeps the wall time that
+  the run used before a pause. The model proxy enforces `max_tokens` and `max_cost_usd`
+  (`402` becomes `budget_exceeded`).
+- **Cancel.** `cancel` cancels the SDK stream at once. The stream ends with
+  `RunFailed(cancelled)` within `cancel_grace_s`.
+- **Errors.** Failure messages are fixed text. A model HTTP error gives `model_error` with the
+  status, retryable for 408, 409, 429, 500, 502, 503, 504, and 529.
+- **Runner.** `build_runtime` builds `OpenAIRuntime` when the job has `session_url` and the
+  env has `SAMA_MODEL_URL`. Else the job fails with `invalid_request`. The orchestrator sets
+  `session_url` to `<tools_url>/session-items` (`SandboxSettings.session_url`). The control
+  plane has one `SandboxedRuntime` for each kind (`for_kind`). The two share the sandboxes and
+  the run state, so a cancel or an approval finds the run in either one.
+
 Versions at the time of writing: `claude-agent-sdk==0.2.184` and `openai-agents==0.25.0`.
 Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
 `runtime-openai`). Exact option names are checked again when each adapter is built.
 
 ### 5.4 Choosing a runtime
 
-- Each agent profile has a default runtime. The org default is `claude_agent_sdk`.
+- Each agent profile has a default runtime. The org default is `claude_agent_sdk`. An admin
+  can switch the runtime of a profile to `openai_agents_sdk` in the profile editor
+  (Section 11.4).
 - A session keeps one runtime for its life (prompt cache rule). A different runtime means a
   new session or a delegated child run.
 - Use the OpenAI Agents SDK when a task needs an OpenAI model, OpenAI hosted tools, or
@@ -669,6 +737,8 @@ The suite is `tests/conformance/`. Each test runs once per **target**:
 | `fake` | `FakeRuntime` with one script per scenario | none | CI |
 | `claude-scripted` | `ClaudeRuntime` and the real Claude CLI | scripted Messages API | CI |
 | `claude-live` | `ClaudeRuntime` and the real Claude CLI | `claude-haiku-4-5` | nightly, `-m live` |
+| `openai-scripted` | `OpenAIRuntime` in the test process, with `MemorySessionItems` | scripted Responses API | CI |
+| `openai-runner` | `OpenAIRuntime` in the runner, through the model proxy and `POST /session-items` | scripted Responses API | CI |
 
 - **Scripted model.** A small local server copies the Anthropic Messages API, also its
   streaming events. The CLI uses it through `ANTHROPIC_BASE_URL`, the same way as the model
@@ -698,8 +768,9 @@ The suite is `tests/conformance/`. Each test runs once per **target**:
   rest of the cap as its budget, and a test fails before it calls the model when the cap is
   used up. The CLI checks the budget after each model turn, so the total can pass the cap by
   one turn.
-- **New adapters.** A new runtime adds a target (for example `openai-scripted` in M3.6) and
-  must pass the suite.
+- **New adapters.** A new runtime adds a target and must pass the suite. M3.6 added
+  `openai-scripted` and `openai-runner`. The scripted Responses API
+  (`tests/conformance/scripted_openai.py`) uses the same rules as the scripted Messages API.
 
 ---
 
@@ -809,8 +880,8 @@ an adapter that does not know them keeps working.
 
 The worker fails a compact run with `INVALID_REQUEST` when the runtime has no
 `manual_compaction`. So an adapter that does not support `/compact` gives a clear failure and
-does not answer with a wrong text. The Claude adapter and the fake runtime have the flag. The
-fake runtime has no archive.
+does not answer with a wrong text. The Claude adapter, the OpenAI adapter (M3.6), and the fake
+runtime have the flag. The fake runtime has no archive.
 
 **Compaction record.** A `Compacted` event is stored twice, in one transaction:
 
@@ -1045,7 +1116,7 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 | # | Assumption |
 |---|---|
 | A1 | The archive is a child session of the live session, with lineage `compaction`. The live session is not replaced. The alternative (a new live session after each compaction) moves the chat binding, the pins, and the runtime state. |
-| A2 | The archive belongs to the runtime adapter: the adapter knows its transcript format, and the control plane stores plain entries. The OpenAI adapter (M3.6) sets `compaction_archive` and gives entries to the same `Archiver`. |
+| A2 | The archive belongs to the runtime adapter: the adapter knows its transcript format, and the control plane stores plain entries. The OpenAI adapter (M3.6) sets `compaction_archive` and gives entries to the same `Archiver`: before a manual compaction it archives the items of the context, and after a server-side compaction it archives the items before the compaction item (Section 5.3). |
 | A3 | A failed archive does not block compaction. |
 | A4 | `/compact` refuses a busy session. A message waits in the queue, but a compaction must not wait behind a run that waits for a human. |
 | A5 | A compact run is a chat run with a flag, not a new run kind. It reuses the claim, lease, event, follow, and rate code. A new kind would need new code in each of them. |
@@ -1106,6 +1177,11 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
   Summaries are not in M2.4: the review reads the transcript (Section 9.4).
 - **Retention**: per-org setting. Default: keep everything. Delete removes rows and sandbox
   data.
+- **Runtime state**: the canonical transcript is `messages`. The runtime keeps its own state
+  as a blob: the Claude adapter keeps the SDK session id in `runs.runtime_state`. The OpenAI
+  adapter keeps its conversation items in `runtime_session_items`, through
+  `POST /session-items` of the tool server (M3.6, Section 5.3). A session delete removes these
+  rows (cascade).
 
 ### 7.1 Session search (M2.5)
 
@@ -2186,11 +2262,12 @@ settings page of the web app uses two more routes:
   for an org owner or admin. `options` has the data for the form:
   `toolsets` (each name of the fixed toolset table with its sorted tools), `models` (the models
   that have a price for the provider of the runtime), `subagents` (true if the runtime has
-  native sub-agents), and `limits` (`name_max_chars`, `soul_max_chars`, `max_subagents`, and the
+  native sub-agents), `runtimes` (each runtime that an admin can choose, with its `name`, its
+  `models`, and its `subagents` flag, M3.6), and `limits` (`name_max_chars`, `soul_max_chars`, `max_subagents`, and the
   limits of the sub-agent spec).
 - `PATCH /orgs/{org_id}/agent-profiles/{profile_id}` changes the profile. Only an org owner or
-  admin can do it (`403` for another member). The body has `name`, `soul`, `model`, `toolsets`,
-  and `subagents`. Each field is optional, an unknown field is an error, and the body has at
+  admin can do it (`403` for another member). The body has `name`, `soul`, `runtime`, `model`,
+  `toolsets`, and `subagents`. Each field is optional, an unknown field is an error, and the body has at
   least one field. The answer has the same body as the `GET`.
 
 The rules of an update:
@@ -2198,7 +2275,13 @@ The rules of an update:
 - `name` has 1 to 80 characters after the spaces at both ends are removed. `soul` has at most
   20,000 characters. The API refuses a soul that has a secret (`422`). It does not run the
   injection scan on the soul: the soul is the instruction of the admin.
-- `model` must be one of `options.models`. `toolsets` have no duplicates, and each one is in the
+- `runtime` must be `claude_agent_sdk` or `openai_agents_sdk` (M3.6). On a switch, the model
+  (the new `model`, or the stored model when the body has none) must be a model of the new
+  runtime, else the API gives `422` ("choose a model of the new runtime"). The stored
+  sub-agents must fit the new runtime: the OpenAI runtime has no native sub-agents, so an admin
+  removes the sub-agents first. A review model that the new runtime does not know goes back to
+  the default (null).
+- `model` must be one of the models of the runtime (the new runtime on a switch). `toolsets` have no duplicates, and each one is in the
   fixed toolset table. `subagents` replaces the whole list. The same code as `python -m
   sama.admin subagents set` checks it (`sama.subagents.validate_subagents`), and its error text
   is safe to show.
@@ -2212,8 +2295,9 @@ The rules of an update:
   writes nothing.
 - The read goes through the same guards as the session routes (code and RLS). The write uses
   the table owner, as the other writes do, after the code checked the role.
-- A session keeps the soul, the model, and the sub-agents that it froze. A change to them
-  applies from the next session. The gate reads the toolsets of the profile on every tool call,
+- A session keeps the soul, the runtime, the model, and the sub-agents that it froze. A change
+  to them applies from the next session. A run uses the runtime of `sessions.run_config` when
+  it has one, and else the runtime of the profile. The gate reads the toolsets of the profile on every tool call,
   so a change to the toolsets applies at the next tool call, also in a session that is running.
   This keeps a revoked toolset immediate (Section 5.1). The web app shows this note.
 - A change to the soul or to the sub-agents needs a redactor that knows every secret of the org,
@@ -3434,6 +3518,7 @@ forwards the call, and records the usage and the cost of each call. The code is 
 | `POST /anthropic/v1/messages` | Anthropic Messages API, streaming or not | yes |
 | `POST /anthropic/v1/messages/count_tokens` | Anthropic token count (free) | no |
 | `POST /openai/v1/responses` | OpenAI Responses API, streaming or not | yes |
+| `POST /openai/v1/responses/compact` | OpenAI Responses compaction (M3.6), JSON with usage | yes |
 | `POST /openai/v1/chat/completions` | OpenAI Chat Completions, streaming or not | yes |
 | `GET /healthz` | none | no |
 
@@ -3680,6 +3765,7 @@ migrated schema.
 | `message_embeddings` | One embedding for each embedded message: `org_id`, `session_id`, `message_id`, `embedding` (`vector(1536)`, HNSW index), `model` (migration `0014`, Section 7.1) |
 | `memory_revisions` | One row per memory write: `org_id`, `memory_id`, `seq`, `action`, `entries`, `session_id`, `run_id`, `author_kind`, `author_user_id`, `reason`, `reverted_to` (migration `0012`, Section 8.1) |
 | `session_compactions` | One row for each compaction of a session: `org_id`, `session_id`, `run_id`, `trigger` (`auto` or `manual`), `tokens_before`, `tokens_after`, `archive_session_id` (unique), `archive_entries`, `archive_truncated`, `completed_at` (null while the compaction is open) (migration `0018`, Section 6.3). |
+| `runtime_session_items` | The items of an OpenAI runtime conversation: `org_id`, `session_id`, `conversation`, `seq` (from 0, no gaps), `item` (JSON). The key is `(session_id, conversation, seq)` (migration `0021`, Section 5.3). |
 | `context_pins` | The pins of a session: `org_id`, `session_id`, `created_by_user_id`, `text` (1 to 2,000 characters), `source` (`user` or `message`), `injected_at`, `injected_run_id` (migration `0018`, Section 6.3). |
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 
@@ -3716,7 +3802,7 @@ Row-level security:
   - the orgs, users, and memberships of the orgs where the user is a member;
   - the workspaces and agent profiles that the user can see;
   - the sessions whose audience includes the user, and the messages, runs, run events, tool
-    calls, bindings, compactions, and pins of those sessions;
+    calls, bindings, compactions, pins, and runtime session items of those sessions;
   - the audit log only as an org `owner` or `admin`;
   - the `agent` and `workspace` memory (and its revisions) of the workspaces that the user can
     see, and the `user` memory of the user's own user rows (Section 8.1).
@@ -3902,7 +3988,7 @@ engine, one run token signer, one gate service, and one clarify broker.
 | Path | Service |
 |---|---|
 | `/` | The API and the web page (Section 11.4), and `/telegram/<integration id>/webhook` when the vault is on (Section 11.6) |
-| `/tools` | The sama MCP tool server: `/tools/mcp` and `/tools/gate` (Sections 16.1 and 16.7) |
+| `/tools` | The sama MCP tool server: `/tools/mcp`, `/tools/gate`, `/tools/archive`, and `/tools/session-items` (Sections 5.3, 6.3, 16.1, and 16.7) |
 | `/model` | The model proxy: `/model/anthropic` and `/model/openai` (Section 16.6) |
 
 - The worker runs runs in E2B sandboxes with the Claude runtime. The sandbox reaches the
