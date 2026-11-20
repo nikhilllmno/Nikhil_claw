@@ -194,6 +194,13 @@ SUBAGENT_DESCRIPTION_MAX_CHARS: Final = 300
 SUBAGENT_PROMPT_MAX_CHARS: Final = 8_000
 SUBAGENT_MAX_TOOLS: Final = 64
 SUBAGENT_MAX_TURNS: Final = 50
+SUBAGENT_WIRE_MAX_CHARS: Final = 100_000
+"""The longest text of a ``SubagentEvent`` on the wire. The runner has no redactor, so it never
+cuts a text: a cut could split a secret. A longer text stays out whole, and a fixed marker takes
+its place (``bound_subagent_text``). The control plane redacts the whole text and then cuts it
+to ``SUBAGENT_STORED_MAX_CHARS``."""
+SUBAGENT_STORED_MAX_CHARS: Final = 2_000
+"""The longest text of a stored sub-agent event. The control plane cuts after the redaction."""
 """The limits of a sub-agent definition (docs/architecture.md, Section 13.1)."""
 
 
@@ -442,12 +449,27 @@ class Compacted(_Event):
     """``manual`` after a ``compact`` request, ``auto`` when the runtime decided itself."""
 
 
+def bound_subagent_text(text: str) -> str:
+    """The text for a ``SubagentEvent``: the text itself, or, when it is over the limit of the
+    wire, a marker that has nothing of it. It never cuts, so a secret cannot lose a part."""
+    if len(text) <= SUBAGENT_WIRE_MAX_CHARS:
+        return text
+    return f"[a text of {len(text)} characters is not in this event]"
+
+
+def clip_subagent_text(text: str) -> str:
+    """The text of a stored sub-agent event. Call it after the redaction."""
+    if len(text) <= SUBAGENT_STORED_MAX_CHARS:
+        return text
+    return text[:SUBAGENT_STORED_MAX_CHARS]
+
+
 class SubagentEvent(_Event):
     """Progress from a native sub-agent of the runtime, as one line of text."""
 
     type: Literal["subagent_event"] = "subagent_event"
     subagent: str = Field(min_length=1)
-    text: str
+    text: str = Field(max_length=SUBAGENT_WIRE_MAX_CHARS)
     call_id: str | None = None
     """The id of the tool call that started the sub-agent. It groups the events of one
     invocation. ``None``: the runtime did not tell it."""

@@ -412,3 +412,20 @@ def test_a_subagent_event_has_defaults_and_a_limit() -> None:
     assert (event.call_id, event.done, event.tokens) == (None, False, None)
     with pytest.raises(ValidationError):
         SubagentEvent(subagent="researcher", text="x", tokens=-1)
+
+
+def test_a_subagent_text_is_bounded_without_a_cut() -> None:
+    from sama.runtime.contract import (
+        SUBAGENT_STORED_MAX_CHARS,
+        SUBAGENT_WIRE_MAX_CHARS,
+        bound_subagent_text,
+        clip_subagent_text,
+    )
+
+    assert bound_subagent_text("abc") == "abc"
+    assert bound_subagent_text("a" * SUBAGENT_WIRE_MAX_CHARS) == "a" * SUBAGENT_WIRE_MAX_CHARS
+    marker = bound_subagent_text("a" * (SUBAGENT_WIRE_MAX_CHARS + 1))
+    assert "a" not in marker.replace("characters", "").replace("a text", "")
+    assert clip_subagent_text("a" * 5_000) == "a" * SUBAGENT_STORED_MAX_CHARS
+    with pytest.raises(ValidationError):
+        SubagentEvent(subagent="r", text="a" * (SUBAGENT_WIRE_MAX_CHARS + 1))

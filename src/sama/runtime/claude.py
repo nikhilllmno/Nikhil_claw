@@ -85,6 +85,7 @@ from sama.runtime.contract import (
     ToolCallFinished,
     ToolCallStarted,
     Usage,
+    bound_subagent_text,
     is_terminal,
 )
 
@@ -357,9 +358,9 @@ class _Translator:
             name = self._subagents.get(parent, "subagent")
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text:
-                    text = block.text
+                    text = bound_subagent_text(block.text)
                 elif isinstance(block, ToolUseBlock):
-                    text = f"calls {block.name}"
+                    text = bound_subagent_text(f"calls {block.name}")
                 else:
                     continue
                 events.append(
@@ -423,10 +424,10 @@ class _Translator:
             return []  # Not a sub-agent of the Agent tool, for example a background command.
         name = self._subagents[call_id]
         if isinstance(message, TaskStartedMessage):
-            text = f"started: {message.description[:_PREVIEW_CHARS]}"
+            text = bound_subagent_text(f"started: {message.description}")
             return [SubagentEvent(subagent=name, text=text, call_id=call_id, usage=self.usage)]
         tokens = message.usage["total_tokens"] if message.usage else None
-        text = f"{message.status}: {message.summary[:_PREVIEW_CHARS]}"
+        text = bound_subagent_text(f"{message.status}: {message.summary}")
         return [
             SubagentEvent(
                 subagent=name,

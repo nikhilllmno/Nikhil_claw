@@ -24,6 +24,7 @@ from sama.orchestrator.queue import (
     RunRef,
 )
 from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
+from sama.vault.redact import default_redactor
 from tests.orchestrator.conftest import Tenant, add_tenant
 
 OWNER = "worker-a"
@@ -270,6 +271,46 @@ async def test_add_events_stores_rows_in_order(engine: AsyncEngine, tenant: Tena
             )
         ).all()
     assert [tuple(r) for r in rows] == [(0, {"text": "a"}), (1, {"text": "b"})]
+
+
+async def test_a_subagent_event_is_redacted_whole_and_then_cut(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The runner sends the whole text. A secret that crosses the cut mark is redacted before
+    the cut, so no prefix of it stays in the stored text."""
+    secret = "opaque-signing-0123456789abcdef"
+    text = "x" * 1_990 + secret + "y" * 3_000
+    default_redactor().add(secret)
+    try:
+        queue = RunQueue(engine)
+        await enqueue(queue, tenant, "s1")
+        run = await claim(queue)
+        payload = {"type": "subagent_event", "subagent": "researcher", "text": text}
+        assert await queue.add_events(run, OWNER, [(0, "subagent_event", payload)])
+        async with engine.connect() as connection:
+            stored = (
+                await connection.execute(
+                    select(RunEvent.payload).where(RunEvent.run_id == run.run_id)
+                )
+            ).scalar_one()
+    finally:
+        default_redactor().forget(secret)
+    assert secret not in stored["text"]
+    assert "opaque-sign" not in stored["text"]
+    assert stored["text"].startswith("x" * 1_990 + "[REDACTED]")
+    assert len(stored["text"]) == 2_000
+
+
+async def test_the_other_events_are_not_cut(engine: AsyncEngine, tenant: Tenant) -> None:
+    queue = RunQueue(engine)
+    await enqueue(queue, tenant, "s1")
+    run = await claim(queue)
+    assert await queue.add_events(run, OWNER, [(0, "text_delta", {"text": "a" * 5_000})])
+    async with engine.connect() as connection:
+        stored = (
+            await connection.execute(select(RunEvent.payload).where(RunEvent.run_id == run.run_id))
+        ).scalar_one()
+    assert len(stored["text"]) == 5_000
 
 
 async def test_heartbeat_extends_the_lease_and_reports_a_cancel(

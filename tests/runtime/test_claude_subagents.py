@@ -19,6 +19,7 @@ from sama.runtime.claude import (
     ClaudeRuntime,
     GateDecision,
 )
+from sama.runtime.contract import SUBAGENT_WIRE_MAX_CHARS
 from tests.runtime.test_claude import (
     Factory,
     ScriptedGate,
@@ -161,7 +162,10 @@ def started(call_id: str | None, description: str = "look") -> TaskStartedMessag
 
 
 def notified(
-    call_id: str | None, status: str = "completed", usage: dict[str, int] | None = None
+    call_id: str | None,
+    status: str = "completed",
+    usage: dict[str, int] | None = None,
+    summary: str = "found it",
 ) -> TaskNotificationMessage:
     return TaskNotificationMessage(
         subtype="task_notification",
@@ -169,7 +173,7 @@ def notified(
         task_id="task-1",
         status=status,  # type: ignore[arg-type]
         output_file="/x",
-        summary="found it",
+        summary=summary,
         uuid="u2",
         session_id="s1",
         tool_use_id=call_id,
@@ -225,3 +229,54 @@ async def test_a_task_that_is_not_a_subagent_gives_no_event() -> None:
     )
     events = await collect(ClaudeRuntime(client_factory=factory).run(with_subagents(RESEARCHER)))
     assert not [e for e in events if isinstance(e, SubagentEvent)]
+
+
+# A known secret that crosses the 2,000-character mark of the stored text. The runner has no
+# redactor, so it must send the whole text. The control plane redacts it and then cuts it.
+SECRET = "opaque-secret-0123456789abcdef"
+
+
+def around_the_mark(secret: str = SECRET) -> str:
+    return "x" * (2_000 - 10) + secret + "y" * 3_000
+
+
+async def test_the_runner_sends_the_whole_text_of_a_start_and_an_end() -> None:
+    text = around_the_mark()
+    factory = Factory(
+        [
+            assistant(
+                ToolUseBlock(id="task-1", name="Agent", input={"subagent_type": "researcher"})
+            ),
+            started("task-1", description=text),
+            assistant(TextBlock(text=text), parent="task-1"),
+            notified("task-1", summary=text),
+            result(),
+        ]
+    )
+    events = await collect(ClaudeRuntime(client_factory=factory).run(with_subagents(RESEARCHER)))
+    lines = [e.text for e in events if isinstance(e, SubagentEvent)]
+    assert lines == [f"started: {text}", text, f"completed: {text}"]
+    assert all(SECRET in line for line in lines), "no part of the secret is cut"
+
+
+async def test_a_text_over_the_wire_limit_is_left_out_whole_and_not_cut() -> None:
+    text = "z" * (SUBAGENT_WIRE_MAX_CHARS + 1) + SECRET
+    factory = Factory(
+        [
+            assistant(
+                ToolUseBlock(id="task-1", name="Agent", input={"subagent_type": "researcher"})
+            ),
+            started("task-1", description=text),
+            assistant(TextBlock(text=text), parent="task-1"),
+            notified("task-1", summary=text),
+            result(),
+        ]
+    )
+    events = await collect(ClaudeRuntime(client_factory=factory).run(with_subagents(RESEARCHER)))
+    lines = [e.text for e in events if isinstance(e, SubagentEvent)]
+    assert len(lines) == 3
+    for line in lines:
+        assert "is not in this event" in line
+        assert "z" not in line
+        assert SECRET not in line
+        assert len(line) < 200
