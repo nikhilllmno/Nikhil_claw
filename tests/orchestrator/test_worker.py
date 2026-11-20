@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
@@ -132,6 +133,20 @@ async def test_a_run_streams_events_and_stores_the_reply(harness: Harness, tenan
         "shared",
         None,
     )
+
+
+async def test_a_run_logs_its_step_times(
+    harness: Harness, tenant: Tenant, caplog: pytest.LogCaptureFixture
+) -> None:
+    run_id = await harness.send(tenant, "s1", "hi")
+    with caplog.at_level(logging.INFO, logger="sama.orchestrator"):
+        assert await harness.worker.run_once()
+    assert "claim_s=" in caplog.text
+    steps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("worker steps")]
+    assert len(steps) == 1
+    names = [pair.split("=")[0] for pair in steps[0].split()[3:]]
+    assert steps[0].split()[2] == f"run={run_id}"
+    assert names == ["config_s", "dispatch_s", "first_event_s", "stream_s", "finish_s"]
 
 
 async def test_the_next_run_continues_the_session(harness: Harness, tenant: Tenant) -> None:

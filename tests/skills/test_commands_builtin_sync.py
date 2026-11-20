@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-from sama.runtime.contract import RunScope
 from sama.sandbox.base import ExecResult
 from sama.sandbox.local import LocalSandbox
 from sama.skills import BuiltinSkills, ManageRequest, MemorySkillStore, SkillError, commands
@@ -21,12 +20,16 @@ from sama.skills.lint import MAX_DESCRIPTION_CHARS
 from sama.skills.render import render_list, render_view
 from sama.skills.sync import (
     _CHECK,
+    CHECK_CHANGED,
+    CHECK_SAME,
     MAX_SYNC_FILES,
     ROOT,
     _run,
+    checked_start,
     digest,
+    publish,
     sync_files,
-    sync_skills,
+    wanted_files,
 )
 from sama.tenancy import RunTokenClaims
 from tests.skills.helpers import actor, doc, md
@@ -346,25 +349,48 @@ async def test_too_many_files_are_refused(tmp_path: Path) -> None:
         await sync_files(box, files)
 
 
-class _Source:
-    def __init__(self, files: Mapping[str, str] | Exception) -> None:
-        self._files = files
+async def _started(box: LocalSandbox, files: Mapping[str, str]) -> tuple[list[str], int]:
+    """Runs ``checked_start`` with a runner that prints the job line, and sends one job line."""
+    argv = checked_start(box, wanted_files(files), ["sh", "-c", 'read -r job; echo "ran $job"'])
+    process = await box.start(argv)
+    await process.write("job-1\n")
+    await process.close_stdin()
+    lines = [line async for line in process.lines()]
+    return lines, await process.wait()
 
-    async def files(self, scope: RunScope) -> Mapping[str, str]:
-        if isinstance(self._files, Exception):
-            raise self._files
-        return self._files
 
-
-async def test_a_failed_sync_is_only_a_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+async def test_the_checked_start_runs_the_runner_only_when_the_skills_are_the_same(
+    tmp_path: Path,
 ) -> None:
     box = _sandbox(tmp_path)
-    with caplog.at_level(logging.WARNING):
-        await sync_skills(box, _Source(RuntimeError("db is down")), make_scope())
-    assert "skill sync failed" in caplog.text
-    await sync_skills(box, _Source({"a/SKILL.md": "A"}), make_scope())
-    assert (Path(box.workdir) / ROOT / "a/SKILL.md").read_text() == "A"
+    files = {"a/SKILL.md": "A", "a/scripts/x.py": "x", "../bad": "no"}
+    # No folder yet: the command says changed and reads the job line without running it.
+    assert await _started(box, files) == ([CHECK_CHANGED], 0)
+    assert await publish(box, wanted_files(files)) == 2
+    assert await _started(box, files) == ([CHECK_SAME, "ran job-1"], 0)
+    # A changed library, or a changed folder, makes the command say changed again.
+    assert (await _started(box, {"a/SKILL.md": "B"}))[0] == [CHECK_CHANGED]
+    (Path(box.workdir) / ROOT / "a/scripts/x.py").write_text("tampered")
+    assert (await _started(box, files))[0] == [CHECK_CHANGED]
+
+
+async def test_the_checked_start_says_changed_for_a_link_in_place_of_the_folder(
+    tmp_path: Path,
+) -> None:
+    box = _sandbox(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "skills" / "a").mkdir(parents=True)
+    (outside / "skills" / "a" / "SKILL.md").write_text("A")
+    (Path(box.workdir) / ".sama").symlink_to(outside)
+    assert (await _started(box, {"a/SKILL.md": "A"}))[0] == [CHECK_CHANGED]
+
+
+def test_wanted_files_keeps_safe_paths_and_refuses_too_many() -> None:
+    assert wanted_files({"a/SKILL.md": "A", "a/../x": "x", "/etc/passwd": "p"}) == {
+        "a/SKILL.md": "A"
+    }
+    with pytest.raises(ValueError, match="too large"):
+        wanted_files({f"a/references/{n}.md": "x" for n in range(MAX_SYNC_FILES + 1)})
 
 
 def _claims() -> RunTokenClaims:

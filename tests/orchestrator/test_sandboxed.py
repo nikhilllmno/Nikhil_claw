@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -33,7 +33,7 @@ from sama.runtime import (
 )
 from sama.runtime.contract import CompactRequest
 from sama.runtime.fake import FakeRuntime, FakeScript
-from sama.sandbox import ExecResult, SandboxError, SandboxSpec
+from sama.sandbox import ExecResult, SandboxError, SandboxProcess, SandboxSpec
 from sama.sandbox.local import LocalProvider, LocalSandbox
 from sama.sandbox.process import SubprocessProcess
 from sama.tenancy import RunTokenSigner
@@ -46,16 +46,33 @@ CONFIG = RunConfig(runtime=RuntimeKind.FAKE, model="fake")
 
 @dataclass
 class RecordingSandbox(LocalSandbox):
-    """Records each ``keep_alive`` call."""
+    """Records each ``keep_alive`` call, and each provider call in ``calls``: ``start``,
+    ``exec``, and ``write_file``."""
 
     keep_alives: list[int] = field(default_factory=list)
+    calls: list[str] = field(default_factory=list)
 
     async def keep_alive(self, seconds: int) -> None:
         self.keep_alives.append(seconds)
 
+    async def start(
+        self, argv: Sequence[str], *, env: Mapping[str, str] | None = None, cwd: str | None = None
+    ) -> SandboxProcess:
+        self.calls.append("start")
+        return await super().start(argv, env=env, cwd=cwd)
+
+    async def exec(self, argv: Sequence[str], **kwargs: Any) -> ExecResult:
+        self.calls.append("exec")
+        return await super().exec(argv, **kwargs)
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        self.calls.append("write_file")
+        await super().write_file(path, data)
+
 
 class CountingProvider(LocalProvider):
-    """Counts creates and resumes, and records ``keep_alive`` calls. ``create_gate`` holds
+    """Counts creates and resumes, and records ``keep_alive`` calls and the idle timeouts of
+    the specs of creates and resumes (``spec_timeouts``). ``create_gate`` holds
     each create until it is set, to test a slow start. ``fail_resumes`` fails that many
     resumes."""
 
@@ -66,14 +83,17 @@ class CountingProvider(LocalProvider):
     def __init__(self, root: Path) -> None:
         super().__init__(root)
         self.keep_alives: list[int] = []
+        self.spec_timeouts: list[int] = []
+        self.calls: list[str] = []
         self.create_gate: asyncio.Event | None = None
         self.create_entered = asyncio.Event()
 
     def _record(self, sandbox: LocalSandbox) -> LocalSandbox:
-        return RecordingSandbox(sandbox.root, keep_alives=self.keep_alives)
+        return RecordingSandbox(sandbox.root, keep_alives=self.keep_alives, calls=self.calls)
 
     async def create(self, spec: SandboxSpec) -> LocalSandbox:
         self.creates += 1
+        self.spec_timeouts.append(spec.idle_timeout_s)
         self.create_entered.set()
         if self.create_gate is not None:
             await self.create_gate.wait()
@@ -81,6 +101,7 @@ class CountingProvider(LocalProvider):
 
     async def resume(self, sandbox_id: str, spec: SandboxSpec) -> LocalSandbox:
         self.resumes += 1
+        self.spec_timeouts.append(spec.idle_timeout_s)
         if self.fail_resumes:
             self.fail_resumes -= 1
             raise SandboxError("the provider is down")
@@ -202,6 +223,72 @@ async def test_the_skills_of_the_session_are_written_before_the_run(
         with pytest.raises(FileNotFoundError):
             await sandbox.read_file(f"{base}/notes/scripts/a.py")
         assert [c.run_id for c in skills.calls] == ["run-1", "run-2"]
+    finally:
+        await runtime.close_sandboxes(kill=True)
+
+
+async def test_unchanged_skills_cost_no_sandbox_call_before_the_runner(
+    provider: CountingProvider, caplog: pytest.LogCaptureFixture
+) -> None:
+    skills = FakeSkills({"notes/SKILL.md": "---\nname: notes\n---\n"})
+    runtime = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=provider,
+        signer=RunTokenSigner(KEY),
+        settings=SandboxSettings(template="local", runner_argv=RUNNER),
+        skills=skills,
+    )
+    caplog.set_level("INFO", logger="sama.orchestrator")
+    try:
+        # The first run finds no skills folder: the check command does not run the job, the
+        # control plane writes the files, and it starts the runner again. The job runs once.
+        runtime.fake_scripts.append(_reply("first"))
+        events = await collect(runtime.run(_request(make_scope("run-1"))))
+        assert isinstance(events[-1], RunCompleted)
+        assert events[-1].output == "first"
+        assert provider.calls == ["start", "write_file", "exec", "start"]
+        assert "skills=changed" in caplog.text
+        # The next run has the same skills: one command checks them and starts the runner.
+        provider.calls.clear()
+        caplog.clear()
+        runtime.fake_scripts.append(_reply("second"))
+        events = await collect(runtime.run(_request(make_scope("run-2"))))
+        assert isinstance(events[-1], RunCompleted)
+        assert events[-1].output == "second"
+        assert provider.calls == ["start"]
+        assert "skills=same" in caplog.text
+        assert "acquire_s=" in caplog.text
+        assert "first_event_s=" in caplog.text
+    finally:
+        await runtime.close_sandboxes(kill=True)
+
+
+async def test_a_link_in_place_of_the_skills_parent_does_not_fail_the_run(
+    provider: CountingProvider,
+) -> None:
+    runtime = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=provider,
+        signer=RunTokenSigner(KEY),
+        settings=SandboxSettings(template="local", runner_argv=RUNNER),
+        skills=FakeSkills({"notes/SKILL.md": "x"}),
+    )
+    try:
+        runtime.fake_scripts.append(_reply("ok"))
+        await collect(runtime.run(_request(make_scope("run-1"))))
+        sandbox = await runtime.session_sandbox("org-1", "sess-1")
+        assert sandbox is not None
+        outside = provider.root / "outside"
+        outside.mkdir()
+        sama = Path(sandbox.workdir) / ".sama"
+        await sandbox.exec(["rm", "-rf", str(sama)])
+        sama.symlink_to(outside)
+        # The check refuses the link, and the sync fails, but the run goes on.
+        runtime.fake_scripts.append(_reply("again"))
+        events = await collect(runtime.run(_request(make_scope("run-2"))))
+        assert isinstance(events[-1], RunCompleted)
+        assert events[-1].output == "again"
+        assert not (outside / "skills").exists()
     finally:
         await runtime.close_sandboxes(kill=True)
 
@@ -562,9 +649,10 @@ async def test_the_idle_timeout_is_set_back_after_the_run(
     await collect(runtime.run(_request(make_scope("run-1"))))
     await runtime.wait_for_cleanup()
     idle = SandboxSpec(org_id="o", session_id="s", template="local").idle_timeout_s
-    assert len(provider.keep_alives) == 2
-    assert provider.keep_alives[0] > idle  # long enough for the run
-    assert provider.keep_alives[1] == idle
+    # The create sets a timeout long enough for the run, so no keep_alive comes before it.
+    assert provider.spec_timeouts == [int(sandboxed_module.DEFAULT_RUN_WALL_TIME_S + 600)]
+    assert provider.spec_timeouts[0] > idle
+    assert provider.keep_alives == [idle]
 
 
 async def test_cancel_during_a_slow_start_ends_the_stream(
@@ -809,10 +897,10 @@ async def test_the_terminal_event_does_not_wait_for_the_runner_to_exit(
     assert isinstance(events[-1], RunCompleted)
     assert asyncio.get_running_loop().time() - started < 0.9
     # The runner still stops, and the idle timeout is set back only after that.
-    assert provider.keep_alives == [int(sandboxed_module.DEFAULT_RUN_WALL_TIME_S + 600)]
+    assert provider.keep_alives == []
     await sandboxed.wait_for_cleanup()
     assert asyncio.get_running_loop().time() - started >= 1.0
-    assert len(provider.keep_alives) == 2
+    assert len(provider.keep_alives) == 1
     await sandboxed.close_sandboxes(kill=True)
 
 

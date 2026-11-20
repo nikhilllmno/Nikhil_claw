@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Final
 from sqlalchemy import case, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.db.engine import autocommit
 from sama.db.models import AgentProfile, AuditEntry, Session, SessionBinding, StoredContextFile
 from sama.gate.decide import effective_toolsets
 from sama.prompt.scan import scan
@@ -121,6 +122,12 @@ def environment(run: ClaimedRun, now: datetime, channel: str | None = None) -> s
     return "\n".join([text, *(hint for hint in hints if hint)])
 
 
+def _checked(config: RunConfig, run: ClaimedRun) -> RunConfig:
+    if config.runtime != RuntimeKind(run.runtime):
+        raise ValueError("the run runtime is not the runtime of the session")
+    return config
+
+
 class PromptAssembler:
     """A ``ConfigBuilder`` for the worker: ``await assembler(run)`` returns the config."""
 
@@ -141,6 +148,13 @@ class PromptAssembler:
         if run.kind == "review":
             return await self._review(run)
         session = (Session.org_id == run.org_id, Session.id == run.session_id)
+        # Most runs find a frozen config. One read without a transaction is one round trip.
+        async with autocommit(self._engine) as connection:
+            frozen = (
+                await connection.execute(select(Session.run_config).where(*session))
+            ).scalar_one_or_none()
+        if frozen is not None:
+            return _checked(RunConfig.model_validate(frozen), run)
         async with self._engine.begin() as connection:
             # The lock makes concurrent first runs of a session build one config.
             stored = (
@@ -162,9 +176,7 @@ class PromptAssembler:
                         config_fingerprint=config.fingerprint(),
                     )
                 )
-        if config.runtime != RuntimeKind(run.runtime):
-            raise ValueError("the run runtime is not the runtime of the session")
-        return config
+        return _checked(config, run)
 
     async def _review(self, run: ClaimedRun) -> RunConfig:
         """The config of a background review (Section 9.4). It is built for this run and not

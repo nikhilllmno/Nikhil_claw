@@ -216,8 +216,11 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   worker on a new run (architecture Section 4.3). The skill sync checks a digest first and
   writes one archive only when the skills changed (Section 9.3). The warm runner
   (`sama.warm`), the runner lock, and the early `RunCompleted` cut the start and the stop of
-  the runner (Section 16.2). The run timing lines are in Section 18.1. The target is 4 to 5
-  seconds.
+  the runner (Section 16.2). After these changes, a warm follow-up run on staging took about
+  9 seconds. The queue uses fewer database round trips (Section 4.3), one command checks the
+  skills and starts the runner (Section 9.3), and the create or the resume sets the run timeout
+  of the sandbox (Section 16.2). The run timing lines, with the step lines of the worker and
+  the sandbox, are in Section 18.1. The target is 4 to 5 seconds.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
