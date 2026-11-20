@@ -48,6 +48,16 @@ from starlette.types import ASGIApp, Lifespan
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.origins import check_origins
+from sama.api.tasks import (
+    CommentOut,
+    NewComment,
+    NewTaskIn,
+    TaskBoard,
+    TaskEdit,
+    TaskList,
+    TaskOut,
+    TaskStatus,
+)
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
@@ -580,6 +590,7 @@ class SamaApi:
         self._pins = pins or PinStore(engine)
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
+        self._board = TaskBoard(engine, self._queue)
         self._gate = gate or GateService(engine)
         self._clarify = clarify
         self._settings = settings or ApiSettings()
@@ -1002,6 +1013,36 @@ class SamaApi:
             return await self._memory_write(
                 principal, workspace_id, target, body.agent_profile_id, body.reason, seq, None
             )
+
+        @app.get("/workspaces/{workspace_id}/tasks")
+        async def list_tasks(
+            principal: Me,
+            workspace_id: uuid.UUID,
+            status: Annotated[list[TaskStatus] | None, Query()] = None,
+        ) -> TaskList:
+            return await self._board.list(principal, workspace_id, status or [])
+
+        @app.post("/workspaces/{workspace_id}/tasks", status_code=201)
+        async def create_task(principal: Me, workspace_id: uuid.UUID, body: NewTaskIn) -> TaskOut:
+            return await self._board.create(principal, workspace_id, body)
+
+        @app.get("/workspaces/{workspace_id}/tasks/{task_id}")
+        async def get_task(
+            principal: Me, workspace_id: uuid.UUID, task_id: uuid.UUID
+        ) -> dict[str, Any]:
+            return await self._board.get(principal, workspace_id, task_id)
+
+        @app.patch("/workspaces/{workspace_id}/tasks/{task_id}")
+        async def edit_task(
+            principal: Me, workspace_id: uuid.UUID, task_id: uuid.UUID, body: TaskEdit
+        ) -> TaskOut:
+            return await self._board.edit(principal, workspace_id, task_id, body)
+
+        @app.post("/workspaces/{workspace_id}/tasks/{task_id}/comments", status_code=201)
+        async def comment_task(
+            principal: Me, workspace_id: uuid.UUID, task_id: uuid.UUID, body: NewComment
+        ) -> CommentOut:
+            return await self._board.comment(principal, workspace_id, task_id, body)
 
         return app
 
