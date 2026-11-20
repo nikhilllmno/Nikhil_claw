@@ -1,5 +1,7 @@
 """The SQL check of the database gateway (docs/architecture.md, Section 10.4)."""
 
+# ruff: noqa: S608  (the tests build SQL text for the check; nothing runs it)
+
 from __future__ import annotations
 
 import pytest
@@ -216,3 +218,165 @@ def test_the_policy_parses_the_form_lists() -> None:
 def test_a_long_or_empty_statement_is_rejected(mode: Mode) -> None:
     with pytest.raises(SqlRejectedError):
         check("   ", mode, OPEN)
+
+
+# -- review round 2: names follow PostgreSQL scopes and quoting ------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select * from users u(id, contact)",
+        "select * from users as u (id, name, contact)",
+        "select contact from (select * from users) s(id, name, contact)",
+        "with s(id, contact) as (select * from users) select * from s",
+    ],
+)
+def test_column_names_after_an_alias_cannot_rename_a_hidden_column(sql: str) -> None:
+    with pytest.raises(SqlRejectedError, match="column names after an alias"):
+        check(sql, "query", HIDDEN)
+
+
+def test_a_function_alias_can_name_its_columns_when_columns_are_hidden() -> None:
+    check("select n from generate_series(1, 3) g(n)", "query", HIDDEN)
+
+
+@pytest.mark.parametrize(
+    ("sql", "allowed"),
+    [
+        # A CTE is visible only in its own WITH query: the outer name is the real table.
+        (
+            "select * from secret where exists (with secret as (select 1) select * from secret)",
+            False,
+        ),
+        ("with secret as (select 1) select * from secret", True),
+        ("select * from (with secret as (select 1) select * from secret) s", True),
+        # A CTE that is not RECURSIVE does not see itself or the CTEs after it.
+        ("with secret as (select * from secret) select * from secret", False),
+        ("with a as (select * from b), b as (select * from orders) select * from a", False),
+        ("with b as (select * from orders), a as (select * from b) select * from a", True),
+        ("with recursive r as (select 1 union all select 1 from r) select * from r", True),
+        ("with x as (select 1) select * from orders where exists (select * from x)", True),
+    ],
+)
+def test_a_cte_name_is_a_cte_only_where_it_is_visible(sql: str, allowed: bool) -> None:
+    policy = policy_of(tables=["orders"])
+    if allowed:
+        check(sql, "query", policy)
+    else:
+        with pytest.raises(SqlRejectedError, match="allowed"):
+            check(sql, "query", policy)
+
+
+def test_an_alias_in_an_inner_query_does_not_hide_the_outer_table() -> None:
+    sql = "select * from users where exists (select 1 from orders users)"
+    assert "email" in check(sql, "query", HIDDEN).drop_columns
+    with pytest.raises(SqlRejectedError, match="hidden"):
+        check(
+            "select users.email from users where exists (select 1 from orders users)",
+            "query",
+            HIDDEN,
+        )
+
+
+@pytest.mark.parametrize(
+    ("sql", "allowed"),
+    [
+        ('select * from "USERS"', False),
+        ('select * from "Users"', False),
+        ('select * from "users"', True),
+        ("select * from USERS", True),
+        ('select * from "PUBLIC".users', False),
+    ],
+)
+def test_a_quoted_name_keeps_its_case(sql: str, allowed: bool) -> None:
+    policy = policy_of(schemas=["public"], tables=["users"])
+    if allowed:
+        check(sql, "query", policy)
+    else:
+        with pytest.raises(SqlRejectedError, match="allowed"):
+            check(sql, "query", policy)
+
+
+@pytest.mark.parametrize(
+    ("policy", "sql", "allowed"),
+    [
+        # The search path is a, b: "orders" can be b.orders, which is not allowed.
+        (policy_of(schemas=["a", "b"], tables=["a.orders", "b.users"]), "orders", False),
+        (policy_of(schemas=["a", "b"], tables=["a.orders", "b.users"]), "a.orders", True),
+        (policy_of(schemas=["a", "b"], tables=["a.orders", "b.orders"]), "orders", True),
+        (policy_of(schemas=["a", "b"], tables=["orders"]), "orders", True),
+        (policy_of(tables=["a.orders", "b.users"]), "orders", False),
+        (policy_of(tables=["public.orders"]), "orders", True),
+        # Some tables have no schema: the search path is the default one.
+        (policy_of(tables=["public.orders", "users"]), "orders", False),
+        (policy_of(tables=["public.orders", "users"]), "public.orders", True),
+    ],
+)
+def test_a_name_without_a_schema_must_be_allowed_in_each_schema_of_the_path(
+    policy: Policy, sql: str, allowed: bool
+) -> None:
+    if allowed:
+        check(f"select * from {sql}", "query", policy)
+    else:
+        with pytest.raises(SqlRejectedError, match="schema of orders"):
+            check(f"select * from {sql}", "query", policy)
+
+
+@pytest.mark.parametrize("mode", ["query", "execute"])
+@pytest.mark.parametrize(
+    "function",
+    [
+        "pg_stat_reset()",
+        "pg_stat_reset_shared('bgwriter')",
+        "pg_stat_reset_single_table_counters(1)",
+        "pg_backup_start('x')",
+        "pg_start_backup('x')",
+        "pg_wal_replay_pause()",
+        "pg_log_backend_memory_contexts(1)",
+        "pg_restore_relation_stats('relation', 'x')",
+        "pg_clear_relation_stats('public', 'x')",
+    ],
+)
+def test_functions_that_change_the_server_are_rejected(mode: Mode, function: str) -> None:
+    sql = f"select {function}" if mode == "query" else f"delete from t where 1 = {function}"
+    with pytest.raises(SqlRejectedError, match="is not allowed"):
+        check(sql, mode, OPEN)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select x.contact from lateral (select * from users) as x(id, name, contact)",
+        "select 1 from orders o join lateral (select * from users) x(id, name, contact) on true",
+    ],
+)
+def test_a_lateral_alias_cannot_rename_a_hidden_column(sql: str) -> None:
+    with pytest.raises(SqlRejectedError, match="column names after an alias"):
+        check(sql, "query", HIDDEN)
+
+
+@pytest.mark.parametrize(
+    ("sql", "allowed"),
+    [
+        # The inner u is orders: PostgreSQL looks in the nearest FROM first.
+        (
+            "select u.id from users u where exists (select 1 from orders u where u.email = 'a')",
+            True,
+        ),
+        ("select u.email from orders u where exists (select 1 from users u)", True),
+        ("select u.email from users u where exists (select 1 from orders u)", False),
+        ("select o.email from orders o join users u on u.id = o.id", True),
+        ("with c as (select * from users) select c.email from c", False),
+        ("with users as (select * from users) select users.email from users", False),
+        ("select n from lateral generate_series(1, 3) g(n)", True),
+        ("select x from unnest(array[1]) t(x)", True),
+        ("select a from (values (1)) v(a)", True),
+    ],
+)
+def test_a_qualifier_is_found_in_the_nearest_from(sql: str, allowed: bool) -> None:
+    if allowed:
+        check(sql, "query", HIDDEN)
+    else:
+        with pytest.raises(SqlRejectedError, match="hidden"):
+            check(sql, "query", HIDDEN)

@@ -8,6 +8,7 @@ allows a private address and no TLS. The gateway of the app does not.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import time
@@ -23,10 +24,12 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.connectors import database
 from sama.connectors.composio import ComposioClient
-from sama.connectors.database import MAX_ROWS, DatabaseGateway
+from sama.connectors.database import MAX_ROWS, POOL_IDLE_S, DatabaseGateway
 from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import Catalog, Manifest
+from sama.connectors.postgres import DbSettings
 from sama.connectors.service import ConnectionService, ConnectorError
 from sama.gate import GateStep
 from sama.gate.service import GateService
@@ -317,6 +320,164 @@ async def test_only_the_allowed_tables_show(outside: dict[str, str], gateway: An
             await run(gw, values, "query", sql=sql)
     with pytest.raises(DriverError, match="allowed"):
         await run(gw, values, "sample", table=f"{schema}.users")
+
+
+async def test_names_follow_the_scopes_and_quoting_of_postgres(
+    outside: dict[str, str], gateway: Any
+) -> None:
+    """Review round 2: aliases, CTEs, and quoted or unqualified names cannot reach a table or
+    a hidden column that the connection does not allow."""
+    gw, _, _ = gateway
+    schema = outside["schemas"]
+    hidden = {**outside, "hidden_columns": "users.email, ssn"}
+    for sql in (
+        f"select * from {schema}.users u(id, name, contact)",
+        f"select * from {schema}.users u(id, name, contact, bio_alias, other)",
+        f"select x.contact from lateral (select * from {schema}.users) as x(id, name, contact)",
+    ):
+        with pytest.raises(DriverError, match="column names after an alias"):
+            await run(gw, hidden, "query", sql=sql)
+        with pytest.raises(DriverError, match="column names after an alias"):
+            await run(gw, hidden, "export", sql=sql)
+    shadow = await run(
+        gw,
+        hidden,
+        "query",
+        sql=(
+            f"select * from {schema}.users where id < 3 and exists "
+            f"(select 1 from {schema}.orders users)"
+        ),
+    )
+    assert "hidden.example" not in shadow
+    assert "ssn-" not in shadow
+    only_orders = {**outside, "tables": f"{schema}.orders"}
+    with pytest.raises(DriverError, match="allowed"):
+        await run(
+            gw,
+            only_orders,
+            "query",
+            sql=(
+                f"select * from {schema}.users where exists "
+                f"(with users as (select 1) select * from users)"
+            ),
+        )
+    with pytest.raises(DriverError, match="allowed"):
+        await run(
+            gw, {**outside, "tables": f"{schema}.users"}, "query", sql='select * from "USERS"'
+        )
+    connection = await asyncpg.connect(
+        f"postgresql://{outside['user']}:{outside['password']}@{outside['host']}:"
+        f"{outside['port']}/{outside['database']}"
+    )
+    other = f"{schema}_b"
+    try:
+        await connection.execute(
+            f"CREATE SCHEMA {other}; CREATE TABLE {other}.orders (secret text);"
+            f"INSERT INTO {other}.orders VALUES ('other-schema-row');"
+            f"CREATE TABLE {other}.users (id int);"
+        )
+        two = {
+            **outside,
+            "schemas": f"{other}, {schema}",
+            "tables": f"{schema}.orders, {other}.users",
+        }
+        with pytest.raises(DriverError, match="schema of orders"):
+            await run(gw, two, "query", sql="select * from orders")
+        assert "[1]" in await run(gw, two, "query", sql=f"select id from {schema}.orders")
+    finally:
+        await connection.execute(f"DROP SCHEMA {other} CASCADE")
+        await connection.close()
+
+
+async def test_a_cut_value_keeps_the_full_value_in_a_file(
+    outside: dict[str, str], gateway: Any
+) -> None:
+    gw, spill, _ = gateway
+    answer = await run(gw, outside, "query", sql="select repeat('x', 5000) as long")
+    assert "...[cut]" in answer
+    ((path, text),) = spill.files.items()
+    assert path in answer
+    assert "full values" in answer
+    assert list(csv.reader(io.StringIO(text))) == [["long"], ["x" * 5000]]
+
+
+async def test_the_files_stay_in_their_byte_limits(
+    outside: dict[str, str], gateway: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gw, spill, exports = gateway
+    monkeypatch.setattr(database, "SPILL_MAX_BYTES", 200)
+    monkeypatch.setattr(database, "EXPORT_MAX_BYTES", 200)
+    # Multibyte text: 3 bytes for each character.
+    sql = "select i, repeat('\u20ac', 20) as euro from generate_series(1, 50) as i"
+    answer = await run(gw, outside, "query", sql=f"{sql} union all select 51, repeat('x', 50000)")
+    ((_, spilled),) = spill.files.items()
+    assert len(spilled.encode()) <= 200
+    assert "+ row(s)" in answer
+    exported = await run(gw, outside, "export", sql=sql)
+    ((_, text),) = exports.files.items()
+    assert len(text.encode()) <= 200
+    assert "The export stopped at" in exported
+    one_big = await run(gw, outside, "export", sql="select repeat('x', 5000) as big")
+    assert "Exported 0 rows" in one_big
+
+
+async def test_an_idle_pool_closes_and_a_new_one_opens(outside: dict[str, str]) -> None:
+    now = [1_000.0]
+    gw = DatabaseGateway(allow_private=True, require_tls=False, clock=lambda: now[0])
+    connection_id = uuid.uuid4()
+    try:
+        await run(gw, outside, "query", connection_id, sql="select 1")
+        first = gw._pools[str(connection_id)].pool
+        now[0] += POOL_IDLE_S - 1
+        await run(gw, outside, "query", connection_id, sql="select 1")
+        assert gw._pools[str(connection_id)].pool is first
+        now[0] += POOL_IDLE_S + 1
+        await run(gw, outside, "query", connection_id, sql="select 1")
+        assert gw._pools[str(connection_id)].pool is not first
+        assert first.is_closing()
+        # Other settings: a new pool. The old pool closes when its last call ends.
+        settings = DbSettings.parse(postgres(), outside)
+        borrowed = await gw._borrow(connection_id, settings)
+        changed = DbSettings.parse(postgres(), {**outside, "hidden_columns": "ssn"})
+        replaced = await gw._borrow(connection_id, changed)
+        assert replaced.pool is not borrowed.pool
+        assert borrowed.retired
+        assert not borrowed.pool.is_closing()
+        await gw._give_back(borrowed)
+        assert borrowed.pool.is_closing()
+        await gw._give_back(replaced)
+    finally:
+        await gw.aclose()
+
+
+async def test_a_cancel_while_an_old_pool_closes_gives_the_pool_back(
+    outside: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gw = DatabaseGateway(allow_private=True, require_tls=False)
+    connection_id = uuid.uuid4()
+    started, release = asyncio.Event(), asyncio.Event()
+    real_close = database._close
+
+    async def slow_close(pool: asyncpg.Pool) -> None:
+        started.set()
+        await release.wait()
+        await real_close(pool)
+
+    try:
+        await run(gw, outside, "query", connection_id, sql="select 1")
+        monkeypatch.setattr(database, "_close", slow_close)
+        changed = DbSettings.parse(postgres(), {**outside, "hidden_columns": "ssn"})
+        task = asyncio.create_task(gw._borrow(connection_id, changed))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert gw._pools[str(connection_id)].borrowers == 0
+        release.set()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        await gw.aclose()
 
 
 async def test_export_writes_a_csv_file(outside: dict[str, str], gateway: Any) -> None:

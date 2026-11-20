@@ -55,8 +55,10 @@ from sama.connectors.manifest import (
 from sama.connectors.postgres import (
     COLUMNS_SQL,
     CONSTRAINTS_SQL,
+    CUT_MARK,
     INDEXES_SQL,
     KINDS,
+    MAX_CELL_CHARS,
     RELATION_SQL,
     SAMPLE_COLUMNS_SQL,
     DbSettings,
@@ -112,6 +114,10 @@ class _Pool:
     fingerprint: str
     pool: asyncpg.Pool
     used_at: float
+    borrowers: int = 0
+    """The calls that use the pool now. A pool with borrowers is not closed."""
+    retired: bool = False
+    """The pool is out of the map (other settings); its last borrower closes it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +134,8 @@ class _Rows:
     csv: str | None
     """All rows that were read, as CSV, if they do not all fit in the model text."""
     status: str
+    cut: bool = False
+    """A shown value was cut to ``MAX_CELL_CHARS``; the CSV has the full value."""
 
 
 class DatabaseGateway:
@@ -163,6 +171,7 @@ class DatabaseGateway:
         self._pools: dict[str, _Pool] = {}
         self._lock = asyncio.Lock()
         self._limits: dict[str, asyncio.Semaphore] = {}
+        self._closing: set[asyncio.Future[None]] = set()
         self._schemas: dict[tuple[str, str, str, str, bool], tuple[float, str]] = {}
 
     async def aclose(self) -> None:
@@ -304,8 +313,8 @@ class DatabaseGateway:
             if rows.complete
             else (
                 f" The export stopped at {rows.count:,} rows (the limit is "
-                f"{EXPORT_MAX_ROWS:,} rows or {EXPORT_MAX_BYTES // 1_000_000} MB). Use a narrower "
-                "query."
+                f"{EXPORT_MAX_ROWS:,} rows or {EXPORT_MAX_BYTES // 1_000_000} MB). Use a "
+                "narrower query."
             )
         )
         hidden = f" {rows.dropped} hidden column(s) are not in the file." if rows.dropped else ""
@@ -338,29 +347,33 @@ class DatabaseGateway:
             if not attributes:
                 await statement.fetch(*args)
                 return _Rows([], 0, [], 0, True, None, statement.get_statusmsg() or "")
-            out = io.StringIO()
-            writer = csv.writer(out, lineterminator="\n")
-            writer.writerow(columns)
+            parts: list[str] = [_csv_line(columns)]
+            written = len(parts[0].encode())
             shown: list[str] = []
             used = len(json.dumps(columns, ensure_ascii=False)) + 1
             fits = True
+            cut = False
             count = 0
             complete = True
             async for record in statement.cursor(*args, prefetch=PREFETCH):
-                if count >= max_rows or out.tell() >= max_bytes:
+                values = [record[i] for i in keep]
+                line_csv = _csv_line([to_csv(v) for v in values])
+                size_csv = len(line_csv.encode())
+                if count >= max_rows or written + size_csv > max_bytes:
+                    # The file stays in its limits: the row that does not fit is not in it.
                     complete = False
                     break
                 count += 1
-                values = [record[i] for i in keep]
-                writer.writerow([to_csv(v) for v in values])
+                parts.append(line_csv)
+                written += size_csv
                 if fits and len(shown) < show:
-                    line = json.dumps(
-                        [model_cell(v) for v in values], ensure_ascii=False, separators=(",", ":")
-                    )
+                    cells = [model_cell(v) for v in values]
+                    line = json.dumps(cells, ensure_ascii=False, separators=(",", ":"))
                     size = len(line.encode()) + 1
                     if used + size <= MAX_MODEL_BYTES:
                         shown.append(line)
                         used += size
+                        cut = cut or any(_is_cut(c) for c in cells)
                     else:
                         fits = False  # The rows after a row that does not fit are not shown.
             status = statement.get_statusmsg() or ""
@@ -373,15 +386,16 @@ class DatabaseGateway:
             raise DriverError(f"the database answered: {_message(error)}") from None
         except asyncpg.InterfaceError as error:
             raise DriverError(f"the statement was not run: {error}") from None
-        everything = complete and len(shown) == count
+        everything = complete and len(shown) == count and not cut
         return _Rows(
             columns=columns,
             dropped=len(names) - len(keep),
             shown=shown,
             count=count,
             complete=complete,
-            csv=out.getvalue() if keep_csv or not everything else None,
+            csv="".join(parts) if keep_csv or not everything else None,
             status=status,
+            cut=cut,
         )
 
     async def _schema(
@@ -502,72 +516,84 @@ class DatabaseGateway:
         transaction is read only and always rolled back."""
         limit = self._limits.setdefault(claims.org_id, asyncio.Semaphore(self._per_org))
         async with limit:
-            pool = await self._pool(connection_id, settings)
+            entry = await self._borrow(connection_id, settings)
             try:
-                connection = await asyncio.wait_for(pool.acquire(), CONNECT_TIMEOUT_S)
-            except asyncpg.InvalidAuthorizationSpecificationError as error:
-                raise DriverError(f"the database refused the login: {_message(error)}") from None
-            except asyncpg.PostgresError as error:
-                raise DriverError(f"the database answered: {_message(error)}") from None
-            except (OSError, ssl.SSLError, TimeoutError, asyncpg.InterfaceError) as error:
-                raise DriverError(_network(error, settings)) from None
-            broken = False
-            try:
-                async with asyncio.timeout(self.timeout_s + 5):
-                    transaction = connection.transaction(readonly=not write)
-                    await transaction.start()
-                    try:
-                        await connection.execute(
-                            f"SET LOCAL statement_timeout = {int(self.timeout_s * 1000)}"
-                        )
-                        await connection.execute("SET LOCAL lock_timeout = 5000")
-                        path = settings.policy.search_path()
-                        if path:
-                            await connection.execute(
-                                "SET LOCAL search_path = " + ", ".join(map(quote_ident, path))
-                            )
-                        yield connection
-                    except BaseException as error:
-                        # After a cancel, the connection is ended below, not rolled back.
-                        if not isinstance(error, asyncio.CancelledError) and (
-                            not connection.is_closed()
-                        ):
-                            with contextlib.suppress(Exception):
-                                await asyncio.wait_for(transaction.rollback(), 5)
-                        raise
-                    if write:
-                        await transaction.commit()
-                    else:
-                        await transaction.rollback()
-            except TimeoutError:
-                broken = True
-                raise DriverError(
-                    f"the statement stopped after {self.timeout_s:g} seconds"
-                ) from None
-            except asyncio.CancelledError:
-                broken = True
-                raise
-            except asyncpg.PostgresError as error:
-                raise DriverError(f"the database answered: {_message(error)}") from None
+                async with self._in_transaction(entry.pool, settings, write=write) as connection:
+                    yield connection
             finally:
-                if broken and not connection.is_closed():
-                    connection.terminate()
-                await pool.release(connection)
+                await self._give_back(entry)
 
-    async def _pool(self, connection_id: uuid.UUID, settings: DbSettings) -> asyncpg.Pool:
+    @contextlib.asynccontextmanager
+    async def _in_transaction(
+        self, pool: asyncpg.Pool, settings: DbSettings, *, write: bool
+    ) -> AsyncIterator[_Connection]:
+        try:
+            connection = await asyncio.wait_for(pool.acquire(), CONNECT_TIMEOUT_S)
+        except asyncpg.InvalidAuthorizationSpecificationError as error:
+            raise DriverError(f"the database refused the login: {_message(error)}") from None
+        except asyncpg.PostgresError as error:
+            raise DriverError(f"the database answered: {_message(error)}") from None
+        except (OSError, ssl.SSLError, TimeoutError, asyncpg.InterfaceError) as error:
+            raise DriverError(_network(error, settings)) from None
+        broken = False
+        try:
+            async with asyncio.timeout(self.timeout_s + 5):
+                transaction = connection.transaction(readonly=not write)
+                await transaction.start()
+                try:
+                    await connection.execute(
+                        f"SET LOCAL statement_timeout = {int(self.timeout_s * 1000)}"
+                    )
+                    await connection.execute("SET LOCAL lock_timeout = 5000")
+                    path = settings.policy.search_path()
+                    if path:
+                        await connection.execute(
+                            "SET LOCAL search_path = " + ", ".join(map(quote_ident, path))
+                        )
+                    yield connection
+                except BaseException as error:
+                    # After a cancel, the connection is ended below, not rolled back.
+                    if not isinstance(error, asyncio.CancelledError) and (
+                        not connection.is_closed()
+                    ):
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(transaction.rollback(), 5)
+                    raise
+                if write:
+                    await transaction.commit()
+                else:
+                    await transaction.rollback()
+        except TimeoutError:
+            broken = True
+            raise DriverError(f"the statement stopped after {self.timeout_s:g} seconds") from None
+        except asyncio.CancelledError:
+            broken = True
+            raise
+        except asyncpg.PostgresError as error:
+            raise DriverError(f"the database answered: {_message(error)}") from None
+        finally:
+            if broken and not connection.is_closed():
+                connection.terminate()
+            await pool.release(connection)
+
+    async def _borrow(self, connection_id: uuid.UUID, settings: DbSettings) -> _Pool:
+        """The pool of the connection, marked as in use. A pool that is idle for more than
+        ``POOL_IDLE_S``, or that has other settings, is retired: it closes when its last
+        borrower gives it back. Give the pool back with ``_give_back``."""
         key = str(connection_id)
         fingerprint = settings.fingerprint()
         now = self._clock()
         stale: list[asyncpg.Pool] = []
         async with self._lock:
             for other, idle in list(self._pools.items()):
-                if other != key and now - idle.used_at > POOL_IDLE_S:
-                    stale.append(self._pools.pop(other).pool)
-            entry = self._pools.get(key)
-            if entry is not None and entry.fingerprint != fingerprint:
-                stale.append(self._pools.pop(key).pool)
-                entry = None
-            if entry is None:
+                expired = now - idle.used_at > POOL_IDLE_S and idle.borrowers == 0
+                if expired or (other == key and idle.fingerprint != fingerprint):
+                    entry = self._pools.pop(other)
+                    entry.retired = True
+                    if entry.borrowers == 0:
+                        stale.append(entry.pool)
+            found = self._pools.get(key)
+            if found is None:
                 address = await self._address(settings)
                 pool = asyncpg.create_pool(
                     **self._connect_args(settings, address),
@@ -576,12 +602,29 @@ class DatabaseGateway:
                     max_inactive_connection_lifetime=60.0,
                 )
                 await pool  # min_size 0: this opens no connection.
-                entry = _Pool(fingerprint, pool, now)
-                self._pools[key] = entry
-            entry.used_at = now
-        for old in stale:
-            await _close(old)
-        return entry.pool
+                found = _Pool(fingerprint, pool, now)
+                self._pools[key] = found
+            found.used_at = now
+            found.borrowers += 1
+        try:
+            for old in stale:
+                # The close goes on after a cancel; the pool is not in the map any more.
+                closing = asyncio.ensure_future(_close(old))
+                self._closing.add(closing)
+                closing.add_done_callback(self._closing.discard)
+                await asyncio.shield(closing)
+        except BaseException:
+            await asyncio.shield(self._give_back(found))
+            raise
+        return found
+
+    async def _give_back(self, entry: _Pool) -> None:
+        async with self._lock:
+            entry.borrowers -= 1
+            entry.used_at = self._clock()
+            close = entry.retired and entry.borrowers == 0
+        if close:
+            await _close(entry.pool)
 
     async def _address(self, settings: DbSettings) -> IPAddress:
         """The checked address to connect to. Every address of the host must be public."""
@@ -678,6 +721,12 @@ def _render(
                 f"The result has more rows than were read. Use db_{conn}_export for a large result."
             )
         notes[-1] += "]"
+    if rows.cut:
+        where = f"the file {path}" if path is not None else "no file (the file was not written)"
+        notes.append(
+            f"[Values longer than {MAX_CELL_CHARS:,} characters end with '...[cut]'. The full "
+            f"values are in {where}.]"
+        )
     if rows.dropped or note_hidden:
         notes.append("[Hidden columns of this connection are not shown.]")
     return "\n".join(lines + notes)
@@ -763,6 +812,16 @@ def _network(error: BaseException, settings: DbSettings) -> str:
         return f"the TLS connection to {settings.host} failed ({name})"
     text = " ".join(str(error).split())[:200]
     return f"the database at {settings.host}:{settings.port} cannot be reached: {name} {text}"
+
+
+def _csv_line(cells: Sequence[str]) -> str:
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerow(cells)
+    return out.getvalue()
+
+
+def _is_cut(cell: Any) -> bool:
+    return isinstance(cell, str) and cell.endswith(CUT_MARK)
 
 
 async def _close(pool: asyncpg.Pool) -> None:

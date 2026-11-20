@@ -44,11 +44,14 @@ _DENIED_FUNCTIONS: Final = re.compile(
     r"^(?:pg_read|pg_ls|pg_stat_file|pg_file|lo_|dblink|pg_terminate_backend|pg_cancel_backend"
     r"|pg_reload_conf|pg_rotate_logfile|pg_promote|pg_switch_wal|pg_create|pg_drop"
     r"|pg_replication|pg_logical|pg_import|pg_advisory|pg_try_advisory|pg_notify|set_config"
+    r"|pg_stat_reset|pg_backup|pg_start_backup|pg_stop_backup|pg_wal_replay|pg_log_"
+    r"|pg_signal|pg_restore_|pg_clear_|pg_sync_|pg_copy_|pg_set_|pg_stat_force"
     r"|ts_stat$|.*_to_xml|.*_to_xmlschema)",
     re.IGNORECASE,
 )
 """Functions that read server files, run SQL from a string (``query_to_xml``, ``ts_stat``),
-signal or end sessions, hold session locks on a pooled connection, or change the server."""
+signal or end sessions, hold session locks on a pooled connection, or change the server
+(statistics resets, backup and WAL control, stored statistics)."""
 _STATISTICS: Final = re.compile(r"^(?:pg_stats|pg_statistic|pg_stats_ext.*)$", re.IGNORECASE)
 """Views of column statistics. Their sample values can show hidden or other data."""
 _DDL_COMMANDS: Final = frozenset(
@@ -114,20 +117,19 @@ class Policy:
         return bool(self.schemas or self.tables)
 
     def table_allowed(self, schema: str | None, table: str) -> bool:
-        """Is the table allowed? ``schema`` is ``None`` for a name without a schema; the
-        search path of the transaction is then the allowed schemas."""
-        schema = None if schema is None else schema.lower()
-        table = table.lower()
-        if self.schemas and schema is not None and schema not in self.schemas:
-            return False
-        if not self.tables:
+        """Is the table allowed? Names are as PostgreSQL sees them (a quoted name keeps its
+        case). ``schema`` is ``None`` for a name without a schema: PostgreSQL finds it
+        through the search path of the transaction, so the name must be allowed in each
+        schema of that path."""
+        if schema is not None:
+            if self.schemas and schema not in self.schemas:
+                return False
+            return not self.tables or bool({(None, table), (schema, table)} & self.tables)
+        if not self.tables or (None, table) in self.tables:
+            # The search path is the allowed schemas, or all schemas are allowed.
             return True
-        for allowed_schema, allowed_table in self.tables:
-            if allowed_table != table:
-                continue
-            if allowed_schema is None or schema is None or allowed_schema == schema:
-                return True
-        return False
+        path = self.search_path()
+        return bool(path) and all((s, table) in self.tables for s in path)
 
     def search_path(self) -> tuple[str, ...]:
         """The schemas of the search path of the transaction, or ``()`` for the default."""
@@ -262,71 +264,128 @@ def _never_reason(node: exp.Expr) -> str:
 
 def _check_common(statement: exp.Expr, policy: Policy) -> frozenset[str]:
     """The function, table, and hidden-column rules of every mode. Returns the result
-    columns to drop by name."""
-    ctes = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
-    derived: set[str] = set(ctes)
+    columns to drop by name.
+
+    Names follow PostgreSQL: a quoted name keeps its case, other names are lower case. A
+    name without a schema is a CTE only where that CTE is visible (its own WITH and the
+    queries inside it); in all other places it is a table."""
+    derived: set[str] = set()
     """The names of relations that are not tables: CTEs, subqueries, and functions."""
-    aliases: dict[str, str] = {}
-    """Alias (or name) to table name, for the tables of the statement."""
+    aliases: dict[str, set[str]] = {}
+    """Alias (or name) to the table names that it can be, anywhere in the statement."""
+    tables: list[str] = []
+    """The tables of the statement."""
+    for cte in statement.find_all(exp.CTE):
+        derived.add(_alias_name(cte))
     for node in statement.find_all(exp.Func):
         name = _function_name(node)
         if name and _DENIED_FUNCTIONS.match(name):
             raise SqlRejectedError(f"the function {name} is not allowed")
     for table in statement.find_all(exp.Table):
-        alias = table.alias.lower() if table.alias else ""
+        alias = _alias_name(table)
         if not isinstance(table.this, exp.Identifier):
             # A function in FROM, for example generate_series(1, 3).
             if alias:
                 derived.add(alias)
             continue
-        name = table.name.lower()
-        schema = table.db.lower() if table.db else None
+        name = _name(table.this)
+        db = table.args.get("db")
+        schema = _name(db) if isinstance(db, exp.Identifier) else None
         if table.catalog:
             raise SqlRejectedError("a table name with a database part is not allowed")
-        if schema is None and name in ctes:
+        if schema is None and _is_cte(table, name):
             if alias:
                 derived.add(alias)
             continue
-        aliases[alias or name] = name
-        aliases.setdefault(name, name)
-        if _STATISTICS.match(name) and (policy.hidden or policy.restricted):
+        tables.append(name)
+        aliases.setdefault(alias or name, set()).add(name)
+        aliases.setdefault(name, set()).add(name)
+        low = name.lower()
+        if _STATISTICS.match(low) and (policy.hidden or policy.restricted):
             raise SqlRejectedError(f"{name} is not allowed on this connection")
-        if policy.restricted and schema is None and name.startswith("pg_"):
+        if policy.restricted and schema is None and low.startswith("pg_"):
             raise SqlRejectedError(f"{name} is not an allowed table")
-        if policy.restricted and schema in ("pg_catalog", "information_schema"):
+        if (
+            policy.restricted
+            and schema is not None
+            and (schema.lower() in ("pg_catalog", "information_schema"))
+        ):
             raise SqlRejectedError(f"{schema}.{name} is not an allowed table. Use the schema tool")
         if not policy.table_allowed(schema, name):
+            if schema is None and any(t == name for s, t in policy.tables if s is not None):
+                raise SqlRejectedError(
+                    f"give the schema of {name} (for example schema.{name}); the name alone "
+                    "can be a table that is not allowed"
+                )
             shown = f"{schema}.{name}" if schema else name
             raise SqlRejectedError(f"{shown} is not an allowed table on this connection")
-    for subquery in statement.find_all(exp.Subquery):
-        if subquery.alias:
-            derived.add(subquery.alias.lower())
-    drop = policy.hidden_names(aliases.values())
+    for relation in statement.find_all(exp.Subquery, exp.Lateral):
+        if relation.alias:
+            derived.add(_alias_name(relation))
+    drop = policy.hidden_names(tables)
     if drop:
         _check_hidden(statement, policy, aliases, derived, drop)
     return drop
 
 
+def _name(identifier: exp.Identifier) -> str:
+    """A name as PostgreSQL sees it: a quoted name keeps its case."""
+    text = str(identifier.this)
+    return text if identifier.quoted else text.lower()
+
+
+def _alias_name(node: exp.Expr) -> str:
+    alias = node.args.get("alias")
+    if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
+        return _name(alias.this)
+    return node.alias.lower() if node.alias else ""
+
+
+def _is_cte(table: exp.Table, name: str) -> bool:
+    """Is the table name a CTE that is visible at this place? A CTE is visible in the query
+    of its WITH, in the CTEs after it, and in itself and all CTEs of a WITH RECURSIVE. The
+    queries inside these see it too, unless a nearer CTE has the same name (the same
+    answer)."""
+    trail: list[exp.Expr] = [table]
+    node = table.parent
+    while node is not None:
+        with_ = node.args.get("with_")
+        if isinstance(with_, exp.With):
+            ctes = list(with_.expressions)
+            visible = ctes
+            if trail[-1] is with_:
+                inner = trail[-2] if len(trail) >= 2 else None
+                if not with_.args.get("recursive"):
+                    index = next((i for i, c in enumerate(ctes) if c is inner), len(ctes))
+                    visible = ctes[:index]
+            if any(_alias_name(cte) == name for cte in visible):
+                return True
+        trail.append(node)
+        node = node.parent
+    return False
+
+
 def _check_hidden(
     statement: exp.Expr,
     policy: Policy,
-    aliases: dict[str, str],
+    aliases: dict[str, set[str]],
     derived: set[str],
     names: frozenset[str],
 ) -> None:
     """``names``: the hidden column names that apply to the tables of the statement."""
-    relations = set(aliases) | derived
+    relations = {r.lower() for r in set(aliases) | derived}
     for column in statement.find_all(exp.Column):
         if isinstance(column.this, exp.Star):
             _check_star(column, statement)
             continue
         name = column.name.lower()
         if name in names:
-            qualifier = column.table.lower() if column.table else ""
-            table = aliases.get(qualifier) if qualifier else None
-            # Only a column of a named table that does not hide it is safe. A column without
-            # a table name, or of a subquery, can be the hidden column (fail closed).
-            if table is None or policy.column_hidden(table, name):
+            qualifier = column.args.get("table")
+            key = _name(qualifier) if isinstance(qualifier, exp.Identifier) else ""
+            sources = _column_tables(column, key, aliases, derived) if key else None
+            # Only a column of named tables that all do not hide it is safe. A column
+            # without a table name, or of a subquery, can be the hidden column (fail closed).
+            if not sources or any(policy.column_hidden(table, name) for table in sources):
                 raise SqlRejectedError(f"the column {column.name} is hidden on this connection")
         if not column.table and name in relations:
             raise SqlRejectedError(
@@ -339,7 +398,7 @@ def _check_hidden(
             continue  # count(*) gives no column values.
         _check_star(star, statement)
     for alias in statement.find_all(exp.TableAlias):
-        if alias.columns and isinstance(alias.parent, (exp.Subquery, exp.CTE)):
+        if alias.columns and not _function_alias(alias.parent):
             raise SqlRejectedError(
                 "column names after an alias are not allowed when columns are hidden"
             )
@@ -347,6 +406,62 @@ def _check_hidden(
         # (row).column reads a field of a whole row: ``(u).email``.
         if dot.name.lower() in names:
             raise SqlRejectedError(f"the column {dot.name} is hidden on this connection")
+
+
+def _function_alias(node: exp.Expr | None) -> bool:
+    """Is this the alias of a function, ``unnest``, or ``VALUES`` in FROM? Its column names
+    cannot rename a column of a table. All other column names after an alias can (a table,
+    a subquery, a ``LATERAL`` subquery, a CTE)."""
+    if isinstance(node, (exp.Unnest, exp.Values)):
+        return True
+    if isinstance(node, (exp.Table, exp.Lateral)):
+        return isinstance(node.this, exp.Func)
+    return False
+
+
+def _column_tables(
+    column: exp.Column, key: str, aliases: dict[str, set[str]], derived: set[str]
+) -> set[str] | None:
+    """The tables that the qualifier ``key`` of the column can be. PostgreSQL looks for the
+    qualifier in the FROM of the nearest query, then in the queries around it. ``None``: the
+    qualifier is a subquery, a CTE, or a function, so the column can be any value."""
+    node = column.parent
+    while node is not None:
+        if isinstance(node, exp.Select):
+            for source in _sources(node):
+                name = _alias_name(source)
+                if (
+                    not name
+                    and isinstance(source, exp.Table)
+                    and (isinstance(source.this, exp.Identifier))
+                ):
+                    name = _name(source.this)
+                if name != key:
+                    continue
+                if (
+                    isinstance(source, exp.Table)
+                    and isinstance(source.this, exp.Identifier)
+                    and not _is_cte(source, _name(source.this))
+                ):
+                    return {_name(source.this)}
+                return None
+        node = node.parent
+    # Not found in a FROM (for example, the target of an UPDATE): all tables of the name.
+    if key in derived:
+        return None
+    return aliases.get(key)
+
+
+def _sources(select: exp.Select) -> list[exp.Expr]:
+    """The relations in the FROM and the JOINs of one query."""
+    found: list[exp.Expr] = []
+    from_ = select.args.get("from_")
+    if isinstance(from_, exp.From) and isinstance(from_.this, exp.Expr):
+        found.append(from_.this)
+    for join in select.args.get("joins") or []:
+        if isinstance(join, exp.Join) and isinstance(join.this, exp.Expr):
+            found.append(join.this)
+    return found
 
 
 def _check_star(star: exp.Expr, root: exp.Expr) -> None:

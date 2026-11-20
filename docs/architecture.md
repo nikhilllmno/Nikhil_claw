@@ -2318,8 +2318,15 @@ at the driver, so a prompt cannot remove them.
   data-modifying CTE, `SELECT INTO`, a locking clause, and `SET`. `execute` takes exactly one
   `INSERT`, `UPDATE`, `DELETE`, or `MERGE`, and DDL only with `ddl` on. The check rejects all
   other statements (`COPY`, `CALL`, `DO`, `VACUUM`, ...) and, in every mode, functions that
-  read files, run SQL from text, signal sessions, or change the server. The SQL has at most
-  20,000 characters and at most 100 parameters (`$1`, `$2`, ...).
+  read files, run SQL from text, signal sessions, or change the server (for example
+  `pg_stat_reset`, backup and WAL control, and the functions that write statistics). The SQL
+  has at most 20,000 characters and at most 100 parameters (`$1`, `$2`, ...).
+- **Names.** The check reads names as PostgreSQL does: a quoted name keeps its case, and
+  other names are lower case. So `"USERS"` is not the allowed table `users`. A CTE name is a
+  CTE only where PostgreSQL can see it: in the query of its `WITH`, in the CTEs after it (all
+  CTEs for `WITH RECURSIVE`), and in the queries inside these. In all other places the name is
+  a table, and the check applies the table rules to it. An alias in an inner query does not
+  change the table of the same name in an outer query.
 - **Transactions.** `schema`, `sample`, `query`, and `export` run in a `READ ONLY`
   transaction that the gateway always rolls back. So a function that writes, or `nextval`,
   also fails. `execute` runs in a read-write transaction that the gateway commits. Each
@@ -2329,17 +2336,26 @@ at the driver, so a prompt cannot remove them.
 - **Result limits.** The model gets at most 1,000 rows and 48,000 bytes of rows, so the
   result with its notes and the untrusted wrapper stays below the 50 KB of Section 6.2. If a
   result is larger, the full result (at most 100,000 rows or 20 MB) goes to a CSV file in
-  `.sama/spill/` of the session sandbox, and the answer gives the path. `export` writes a CSV
+  `.sama/spill/` of the session sandbox, and the answer gives the path. A value longer than
+  1,000 characters ends with `...[cut]` in the model text; the full values then also go to the
+  file. The byte limits of the files are hard limits in UTF-8 bytes: the gateway does not add a
+  row that does not fit, and the answer says that the result has more rows. `export` writes a CSV
   file (at most 200,000 rows or 50 MB) to `.sama/exports/`. Without a session sandbox,
   `export` fails and `query` gives the rows that fit.
 - **Hidden columns.** An item is `column` (in every table) or `table.column`. The check
   rejects each reference to a hidden column, a whole-row reference (`row_to_json(t)`, `t`),
-  and a `*` where the gateway cannot drop the hidden columns by name. The gateway drops
+  a `*` where the gateway cannot drop the hidden columns by name, and column names after the
+  alias of a table, a subquery, a `LATERAL` subquery, or a CTE (`users u(id, contact)`),
+  because they rename columns. Column names after a function, `unnest`, or `VALUES` are
+  allowed. For `alias.column`, the check finds the alias as PostgreSQL does: in the FROM of
+  the nearest query first, then in the queries around it. The gateway drops
   result columns with a hidden name, and `schema` and `sample` leave them out, also in the
   keys and indexes that use them. A view or a function can still return a hidden value under
   another name, so the grants of the database user are the strongest control.
 - **Allowed schemas and tables.** Each table of a statement must be in an allowed schema and,
-  if `tables` is set, in the list. A name without a schema matches through `search_path`.
+  if `tables` is set, in the list. A name without a schema matches through `search_path`, so
+  it must be allowed in each schema of that path. If it is not (for example, `a.orders` is
+  allowed but `b.orders` is not, and the path is `a, b`), the check asks for the schema.
   The check rejects the system catalogs when a list is set, and the statistics views
   (`pg_stats`) when a list or a hidden column is set.
 - **Approval.** The gate asks a person for each `execute` call (Section 16.1). Like
@@ -2350,8 +2366,10 @@ at the driver, so a prompt cannot remove them.
   connection with `writes` on. Errors give the database message and the SQLSTATE, never the
   detail (it can hold row values).
 - **Pools.** One `asyncpg` pool per connection (at most 2 connections, no prepared statement
-  cache, so transaction poolers such as Supavisor and the Neon pooler work), closed after 5
-  minutes idle. A change of the settings makes a new pool. At most 4 calls run at a time for
+  cache, so transaction poolers such as Supavisor and the Neon pooler work). The next call
+  closes a pool that is idle for more than 5 minutes, also for the same connection, and makes a
+  new one. A change of the settings makes a new pool. A pool with a running call does not
+  close: the last call closes it. Idle sockets close after 60 seconds. At most 4 calls run at a time for
   each org. The `schema` result is cached for 10 minutes.
 - **Tests.** `tests/connectors/test_sql.py` and `tests/connectors/test_database.py` test the
   check, the manifests, the form, TLS, and the limits. `tests/db/test_database_gateway.py`

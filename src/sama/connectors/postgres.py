@@ -213,15 +213,19 @@ def to_json(value: Any) -> Any:
     return str(value)
 
 
+CUT_MARK: Final = "...[cut]"
+
+
 def model_cell(value: Any) -> Any:
-    """``to_json``, with a long value cut to ``MAX_CELL_CHARS``."""
+    """``to_json``, with a long value cut to ``MAX_CELL_CHARS`` and ``CUT_MARK`` at the end.
+    The gateway then keeps the full result in a file."""
     cell = to_json(value)
     if isinstance(cell, str):
-        return cell if len(cell) <= MAX_CELL_CHARS else cell[:MAX_CELL_CHARS] + "...[cut]"
+        return cell if len(cell) <= MAX_CELL_CHARS else cell[:MAX_CELL_CHARS] + CUT_MARK
     if isinstance(cell, (list, dict)):
         text = json.dumps(cell, ensure_ascii=False)
         if len(text) > MAX_CELL_CHARS:
-            return text[:MAX_CELL_CHARS] + "...[cut]"
+            return text[:MAX_CELL_CHARS] + CUT_MARK
     return cell
 
 
