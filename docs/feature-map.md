@@ -51,7 +51,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Terminal backends (local, Docker, SSH, Modal, Daytona, ...) | `tools/environments/` | One `SandboxProvider`: E2B in the cloud, Docker for development and CI (D5). | Adapt | M1 |
 | `web_search`, `web_extract` | `tools/web_tools.py` | Sama tools, search provider key on the control plane (§10.2). | Adapt | M1 |
 | `x_search` | `tools/x_search_tool.py` | Through an integration if needed. | Defer | — |
-| `vision_analyze` | `tools/vision_tools.py` | Sama `media` tool. Both models read images natively. | Adapt | M2 |
+| `vision_analyze` | `tools/vision_tools.py` | Sama `media` tool. Images from Telegram and Slack are stored, and a vision model answers questions about them (§11.7). | Adapt | M2 (done) |
 | `video_analyze`, `video_generate` | `tools/vision_tools.py`, `tools/video_generation_tool.py` | Not planned. | Defer | — |
 | `image_generate` | `tools/image_generation_tool.py` | Sama `media` tool with the OpenAI image model, behind `tool_search`. | Adapt | M4 |
 | `text_to_speech` | `tools/tts_tool.py` | Sama `media` tool. Telegram sends a voice note. | Adapt | M4 |
