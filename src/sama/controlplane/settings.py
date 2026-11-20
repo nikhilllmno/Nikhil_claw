@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr
 
 from sama.api.origins import parse_origins
+from sama.github.client import GitHubAppConfig
 from sama.media.vision import DEFAULT_VISION_MODEL
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
 from sama.vault.crypto import VaultKey
@@ -50,6 +51,26 @@ def _public_url(value: str) -> str:
     if parts.path not in ("", "/") or parts.query or parts.fragment:
         raise SettingsError("SAMA_PUBLIC_URL must have no path, query, or fragment")
     return f"{parts.scheme}://{parts.netloc}"
+
+
+def _github(env: Mapping[str, str]) -> GitHubAppConfig | None:
+    """The sama GitHub App, when ``SAMA_GITHUB_APP_ID`` is set. Then all five variables are
+    required. The private key can have literal ``\\n`` for its line breaks."""
+    if not env.get("SAMA_GITHUB_APP_ID", "").strip():
+        return None
+    app_id = _required(env, "SAMA_GITHUB_APP_ID")
+    if not app_id.isdigit():
+        raise SettingsError("SAMA_GITHUB_APP_ID must be a number")
+    key = _required(env, "SAMA_GITHUB_APP_PRIVATE_KEY").replace("\\n", "\n")
+    if "PRIVATE KEY-----" not in key:
+        raise SettingsError("SAMA_GITHUB_APP_PRIVATE_KEY must be a PEM private key")
+    return GitHubAppConfig(
+        app_id=app_id,
+        slug=_required(env, "SAMA_GITHUB_APP_SLUG"),
+        client_id=_required(env, "SAMA_GITHUB_CLIENT_ID"),
+        private_key=SecretStr(key.strip() + "\n"),
+        client_secret=SecretStr(_required(env, "SAMA_GITHUB_CLIENT_SECRET")),
+    )
 
 
 def _hosts(value: str) -> tuple[str, ...]:
@@ -99,6 +120,9 @@ class ControlPlaneSettings:
     vault_key: VaultKey | None = None
     web_origins: tuple[str, ...] = ()
     """The origins of the web app that may call the API from a browser (``SAMA_WEB_ORIGINS``)."""
+    github: GitHubAppConfig | None = None
+    """The sama GitHub App (``SAMA_GITHUB_*``). Without it, the git proxy and the pull request
+    tools are off."""
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -115,6 +139,8 @@ class ControlPlaneSettings:
         if self.langfuse is not None:
             secrets.append(self.langfuse.secret_key)
         values = [secret.get_secret_value() for secret in secrets if secret is not None]
+        if self.github is not None:
+            values += self.github.secret_values()
         password = urlsplit(self.database_url.get_secret_value()).password
         if password:
             values.append(password)
@@ -132,6 +158,11 @@ class ControlPlaneSettings:
     @property
     def tools_url(self) -> str:
         return f"{self.public_url}/tools"
+
+    @property
+    def git_url(self) -> str:
+        """The git proxy (Section 15.1): ``<git_url>/<owner>/<name>.git``."""
+        return f"{self.public_url}/git"
 
     @property
     def allow_out(self) -> tuple[str, ...]:
@@ -165,6 +196,7 @@ class ControlPlaneSettings:
             raise SettingsError(f"SAMA_WEB_ORIGINS: {error}") from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
+            github=_github(env),
             public_url=_public_url(_required(env, "SAMA_PUBLIC_URL")),
             run_token_key=SecretStr(key),
             supabase_url=_required(env, "SAMA_SUPABASE_URL").rstrip("/"),

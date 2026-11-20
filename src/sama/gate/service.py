@@ -44,6 +44,7 @@ from sama.db.models import (
 )
 from sama.gate.approvers import SHARED_REFUSAL, approvers_of, may_decide_shared
 from sama.gate.decide import (
+    ALWAYS_ASK,
     Action,
     GateContext,
     GateStep,
@@ -733,7 +734,7 @@ class GateService:
                     {"tool": row.tool_name, "reason": reason, "always_allow": always_allow},
                     user_id=user_id,
                 )
-                if approve and always_allow:
+                if approve and always_allow and canonical_name(row.tool_name) not in ALWAYS_ASK:
                     await self._always_allow(
                         connection, run, row.agent_profile_id, user_id, row.tool_name, call_id
                     )
