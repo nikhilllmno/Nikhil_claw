@@ -90,8 +90,9 @@ Done: M1.1 to M1.19, M2.1 to M2.5 (below the list of M1 notes).
   API answers `clarify` questions.
 - M1.13: the Telegram gateway in `src/sama/gateway/` (architecture Section 11.5), with the
   tables `channel_identities`, `channel_groups`, and `pairing_codes` (migration `0008`).
-  `python -m sama.gateway` runs it. The web page makes pairing codes. Not in M1.13: the group
-  toolset (Section 11.3), `clarify` buttons in Telegram, and followers that survive a restart.
+  `python -m sama.gateway` runs it. The web page makes pairing codes. Not in M1.13: `clarify`
+  buttons in Telegram and followers that survive a restart. The group toolset and the approver
+  rule of shared sessions came later (Section 11.3, migration `0017`).
   The deploy (M1.15) runs the gateway and sets the webhook.
 - M1.14: observability in `src/sama/observability/` (architecture Section 18.1 to 18.3).
   Each service writes JSON logs with the run ids. `python -m sama.observability` (the

@@ -10,17 +10,20 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import (
     ChannelGroup,
     ChannelIdentity,
+    Membership,
     Message,
     Run,
     Session,
     SessionBinding,
+    User,
 )
+from sama.gate.approvers import SHARED_REFUSAL
 from sama.gateway.pairing import create_code
 from sama.gateway.sessions import FollowSettings
 from sama.gateway.slack import BUSY, HELP, LINK_FIRST, PAIR_PROMPT, SlackApp, SlackGateway
@@ -422,3 +425,116 @@ async def test_an_unlinked_account_gets_no_more_output(
     assert await harness.worker.run_once()
     await gateway.drain()
     assert "secret answer" not in slack.texts(DM)
+
+
+# -- approvals in a channel (Section 11.3) ------------------------------------------------------
+
+
+async def add_bob(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    *,
+    role: str = "member",
+) -> None:
+    """A second member of the workspace, with a linked Slack account."""
+    bob = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(User).values(
+                id=bob,
+                org_id=tenant.org,
+                auth_user_id=uuid.uuid4(),
+                email="bob@example.test",
+                display_name="bob",
+            )
+        )
+        await connection.execute(
+            insert(Membership).values(org_id=tenant.org, user_id=bob, role="member")
+        )
+        await connection.execute(
+            insert(Membership).values(
+                org_id=tenant.org, user_id=bob, workspace_id=tenant.ids["ws"], role=role
+            )
+        )
+        code, _ = await create_code(
+            connection,
+            org_id=tenant.org,
+            user_id=bob,
+            integration_id=tenant.ids["slack"],
+            channel="slack",
+            kind="user",
+            workspace_id=tenant.ids["ws"],
+            agent_profile_id=tenant.ids["profile"],
+        )
+    await gateway.handle_event(dm(code, user=BOB, channel="DBOB0002"))
+
+
+async def channel_card(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    slack: FakeSlack,
+    harness: Harness,
+) -> tuple[dict[str, Any], str]:
+    """Mia asks in the linked channel. The run pauses for an approval. Gives the card."""
+    await pair(gateway, engine, tenant)
+    await link_channel(gateway, engine, tenant)
+    harness.runtime.add_script(approval_script())
+    await gateway.handle_event(mention("clean up"))
+    assert await harness.worker.run_once()
+
+    async def carded() -> bool:
+        return any("blocks" in body for body in slack.posted(CHANNEL))
+
+    await until(carded)
+    card = next(body for body in slack.posted(CHANNEL) if "blocks" in body)
+    card_ts = next(ts for ts, (_, text) in slack.messages.items() if text == card["text"])
+    return card, card_ts
+
+
+def press(card: dict[str, Any], card_ts: str, user: str) -> dict[str, Any]:
+    return {
+        "type": "block_actions",
+        "team": {"id": TEAM},
+        "user": {"id": user},
+        "channel": {"id": CHANNEL},
+        "message": {"ts": card_ts, "blocks": card["blocks"]},
+        "actions": [
+            {"action_id": "sama_approve", "value": card["blocks"][1]["elements"][0]["value"]}
+        ],
+    }
+
+
+async def test_a_channel_card_names_who_may_decide_and_refuses_another_member(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    slack: FakeSlack,
+) -> None:
+    harness = Harness(engine)
+    card, card_ts = await channel_card(gateway, engine, tenant, slack, harness)
+    assert "mia, who asked, or a workspace admin can decide this." in card["text"]
+    await add_bob(gateway, engine, tenant)
+
+    await gateway.handle_action(press(card, card_ts, BOB))
+    assert slack.whispers(CHANNEL)[-1] == SHARED_REFUSAL
+    assert slack.method_calls("chat.update") == [], "the card does not change"
+    assert not await harness.worker.run_once(), "the run still waits for the approval"
+
+    await gateway.handle_action(press(card, card_ts, MIA))
+    assert slack.method_calls("chat.update")[-1]["text"].endswith(f"Approved by <@{MIA}>.")
+    assert await harness.worker.run_once()
+
+
+async def test_a_workspace_admin_decides_a_channel_card(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    slack: FakeSlack,
+) -> None:
+    harness = Harness(engine)
+    card, card_ts = await channel_card(gateway, engine, tenant, slack, harness)
+    await add_bob(gateway, engine, tenant, role="admin")
+    await gateway.handle_action(press(card, card_ts, BOB))
+    assert slack.method_calls("chat.update")[-1]["text"].endswith(f"Approved by <@{BOB}>.")

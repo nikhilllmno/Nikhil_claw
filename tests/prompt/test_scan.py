@@ -18,6 +18,7 @@ from sama.prompt import (
     truncate,
     unique_path,
 )
+from sama.prompt.assemble import SHARED_HINT
 from sama.runtime.contract import CONTEXT_FILE_MAX_CHARS
 
 ATTACKS = {
@@ -146,7 +147,7 @@ def test_unique_path_adds_the_scope_for_a_second_file() -> None:
 
 
 def test_environment_uses_utc_and_the_audience() -> None:
-    run = cast(Any, SimpleNamespace(audience="private"))
+    run = cast(Any, SimpleNamespace(audience="private", kind="chat"))
     ist = timezone(timedelta(hours=5, minutes=30))
     text = environment(run, datetime(2026, 11, 19, 5, 39, tzinfo=ist))
     assert "Session start: 2026-11-19 00:09 UTC." in text
@@ -155,8 +156,20 @@ def test_environment_uses_utc_and_the_audience() -> None:
     assert "Channel" not in text
 
 
+def test_environment_tells_a_shared_session_about_the_group_toolset() -> None:
+    now = datetime(2026, 11, 19, tzinfo=UTC)
+    shared = cast(Any, SimpleNamespace(audience="shared", kind="chat"))
+    assert SHARED_HINT in environment(shared, now)
+    assert SHARED_HINT in environment(shared, now, "slack")
+    private = cast(Any, SimpleNamespace(audience="private", kind="chat"))
+    assert SHARED_HINT not in environment(private, now, "telegram")
+    # A background review has no person in it, and the group toolsets do not apply to it.
+    review = cast(Any, SimpleNamespace(audience="shared", kind="review"))
+    assert SHARED_HINT not in environment(review, now)
+
+
 def test_environment_adds_the_channel_hint() -> None:
-    run = cast(Any, SimpleNamespace(audience="shared"))
+    run = cast(Any, SimpleNamespace(audience="shared", kind="chat"))
     text = environment(run, datetime(2026, 11, 19, tzinfo=UTC), "telegram")
     assert "Audience: shared.\nChannel: Telegram." in text
     assert environment(run, datetime(2026, 11, 19, tzinfo=UTC), "web") == environment(

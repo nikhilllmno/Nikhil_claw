@@ -42,6 +42,7 @@ from sama.db.models import (
     ToolCall,
     ToolPolicy,
 )
+from sama.gate.approvers import SHARED_REFUSAL, approvers_of, may_decide_shared
 from sama.gate.decide import (
     Action,
     GateContext,
@@ -54,6 +55,7 @@ from sama.gate.decide import (
     canonical_name,
     decide,
     decide_recorded,
+    effective_toolsets,
     json_default,
 )
 from sama.review.policy import REVIEW_TOOLSETS
@@ -100,6 +102,11 @@ class _Run:
     ref: _Ref
     context: GateContext
     call: _Call | None = None
+
+
+def _names(value: Any) -> list[str]:
+    """The toolset names of a JSON column. A value that is not a list has no name."""
+    return [str(item) for item in value] if isinstance(value, list) else []
 
 
 def _utcnow() -> datetime:
@@ -360,6 +367,7 @@ class GateService:
                     Run.unattended,
                     Run.kind,
                     AgentProfile.toolsets,
+                    AgentProfile.group_toolsets,
                     Session.audience,
                     Session.owner_user_id,
                 )
@@ -387,8 +395,11 @@ class GateService:
         user_id = run_user(row.triggered_by_user_id, row.audience, row.owner_user_id)
         if user_id is None and claims is not None and claims.user_id:
             user_id = uuid.UUID(claims.user_id)
-        toolsets = frozenset(
-            str(item) for item in (row.toolsets if isinstance(row.toolsets, list) else [])
+        toolsets = effective_toolsets(
+            _names(row.toolsets),
+            _names(row.group_toolsets),
+            audience=row.audience,
+            kind=row.kind,
         )
         if row.kind == "review":
             # A background review has the memory and skill tools and no other tool (Section 9.4).
@@ -397,6 +408,7 @@ class GateService:
             toolsets=toolsets,
             rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
             unattended=bool(row.unattended),
+            shared=row.audience == "shared" and row.kind != "review",
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
             revoked=await self._revoked(connection, org_id, run_id),
         )
@@ -572,8 +584,10 @@ class GateService:
     ) -> str:
         """Records a human decision and returns the new status. Raises ``ApprovalError``.
 
-        Only a user who can read the session decides. ``always_allow`` with ``approve`` also
-        writes a user policy rule for this tool and the profile of the run.
+        Only a user who can read the session decides. In a shared session, only the user who
+        started the run, a workspace admin, or an approver of the profile decides.
+        ``always_allow`` with ``approve`` also writes a user policy rule for this tool and the
+        profile of the run.
         """
         reason = redact(reason) if reason else reason
         status = "expired"
@@ -590,12 +604,21 @@ class GateService:
                         Session.audience,
                         Session.owner_user_id,
                         Run.agent_profile_id,
+                        Run.triggered_by_user_id,
+                        AgentProfile.policy,
                     )
                     .join(
                         Session,
                         and_(Session.org_id == Approval.org_id, Session.id == Approval.session_id),
                     )
                     .join(Run, and_(Run.org_id == Approval.org_id, Run.id == Approval.run_id))
+                    .join(
+                        AgentProfile,
+                        and_(
+                            AgentProfile.org_id == Run.org_id,
+                            AgentProfile.id == Run.agent_profile_id,
+                        ),
+                    )
                     .where(
                         Approval.org_id == org_id,
                         Approval.run_id == run_id,
@@ -617,6 +640,15 @@ class GateService:
             if proposed is None:
                 if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
                     raise ApprovalError("this user cannot decide the approval")
+                # In a shared session, each member sees the session, but only the requester
+                # and the admins decide, unless the profile widens the set (Section 11.3).
+                if row.audience == "shared" and not may_decide_shared(
+                    grants,
+                    row.workspace_id,
+                    requester=row.triggered_by_user_id,
+                    approvers=approvers_of(row.policy),
+                ):
+                    raise ApprovalError(SHARED_REFUSAL)
             else:
                 # The proposal of a background review changes shared memory or a shared skill
                 # (Section 9.4). The role decides, and the access to the session does not: the

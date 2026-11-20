@@ -18,6 +18,7 @@ from sama.memory.store import Change
 from sama.orchestrator.queue import ClaimedRun, RunQueue
 from sama.orchestrator.worker import Worker
 from sama.prompt import MAX_CONTEXT_FILES, SYSTEM_PROMPT, PromptAssembler
+from sama.prompt.assemble import SHARED_HINT
 from sama.runtime.contract import McpServerConfig, RunConfig, RuntimeKind, RuntimeRegistry
 from sama.runtime.fake import FakeRuntime
 from sama.skills import ManageRequest, PostgresSkillStore, SkillLibrary
@@ -283,7 +284,7 @@ async def give_memory(engine: AsyncEngine, tenant: Tenant) -> None:
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=["core", "todo", "memory"])
+            .values(toolsets=["core", "todo", "memory"], group_toolsets=["core", "todo", "memory"])
         )
 
 
@@ -353,7 +354,7 @@ async def set_toolsets(engine: AsyncEngine, tenant: Tenant, toolsets: list[str])
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=toolsets)
+            .values(toolsets=toolsets, group_toolsets=toolsets)
         )
 
 
@@ -430,3 +431,29 @@ async def test_a_user_skill_is_in_the_index_of_a_private_session_only(
     shared = await claimed(engine, tenant, "s1")
     assert (await assembler(shared)).skill_index == ()
     await end(engine, shared)
+
+
+async def test_the_group_set_decides_the_notes_and_the_index_of_a_shared_session(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The profile has the memory and the skills toolsets, but its group set has not."""
+    await add_notes(engine, tenant)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(toolsets=["core", "memory", "skills"], group_toolsets=["core"])
+        )
+    assembler = PromptAssembler(engine, skills=skill_library(engine))
+    shared = await claimed(engine, tenant, "s1")
+    config = await assembler(shared)
+    await end(engine, shared)
+    assert (config.memory_snapshot, config.skill_index) == ("", ())
+    assert SHARED_HINT in config.render_prefix()
+
+    # The private session of the same profile has them, and no group hint.
+    private = await claimed(engine, tenant, "mine")
+    own = await assembler(private)
+    await end(engine, private)
+    assert [e.name for e in own.skill_index] == ["summarize", "xxx"]
+    assert SHARED_HINT not in own.render_prefix()

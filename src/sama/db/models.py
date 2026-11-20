@@ -236,6 +236,11 @@ class AgentProfile(Base):
     toolsets: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    group_toolsets: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    """The toolsets of a chat run in a shared session: a Telegram group or a Slack channel
+    (Section 11.3). A shared session uses these and not ``toolsets``."""
     skills: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )

@@ -63,6 +63,7 @@ def test_an_approval_card_has_two_buttons_and_plain_text() -> None:
         tool_name="Bash",
         arguments={"command": "x" * 5000},
         reason="deletes files",
+        answerers=None,
     )
     text, blocks = approval_blocks(row)
     assert text.startswith("Approval needed: Bash")
