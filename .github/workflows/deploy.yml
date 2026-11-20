@@ -7,10 +7,11 @@ name: Deploy
 # - Production: run this workflow by hand with the commit to promote. It deploys the image
 #   that staging built for that commit, so production runs the tested image.
 #
-# Each commit gets its own E2B template, sama-runner-<first 12 characters of the SHA>, and the
-# deploy sets SAMA_SANDBOX_TEMPLATE to it. The runner in the sandbox then always has the code of
-# the control plane that starts it, so a change of the runner protocol cannot break an
-# environment that runs an older commit (docs/architecture.md, Section 19.3).
+# Each deploy builds the E2B template sama-runner-<content hash>, and sets SAMA_SANDBOX_TEMPLATE
+# to it. The hash covers the Dockerfile, the dependency files, and the source files that the
+# sandbox can import (`python -m sama.sandbox.template --print-alias`). The runner in the sandbox
+# then always has the runner code of the control plane that starts it, and a deploy that does
+# not change the sandbox keeps the session sandboxes (docs/architecture.md, Section 19.3).
 #
 # Each GitHub environment (staging, production) needs the secret FLY_API_TOKEN. The template
 # build needs the repository secret E2B_API_KEY.
@@ -70,8 +71,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: uv.lock
-      # The build is the same for the same commit, and E2B caches the layers, so the production
-      # job builds again only to be sure that the template exists.
+      # The build is the same for the same content, and E2B caches the layers, so a build of an
+      # alias that exists is fast. It makes sure that the template exists.
       - name: Build the E2B template of the commit
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -81,14 +82,22 @@ jobs:
             exit 1
           fi
           uv sync --locked
-          uv run python -m sama.sandbox.template --alias "sama-runner-${SHA:0:12}"
+          # A commit from before the content alias has no --print-alias. It keeps the alias
+          # of its commit, so a promotion or a rollback to it still works.
+          if uv run python -m sama.sandbox.template --help | grep -q -- --print-alias; then
+            ALIAS="$(uv run python -m sama.sandbox.template --print-alias)"
+          else
+            ALIAS="sama-runner-${SHA:0:12}"
+          fi
+          echo "TEMPLATE_ALIAS=${ALIAS}" >> "$GITHUB_ENV"
+          uv run python -m sama.sandbox.template --alias "${ALIAS}"
       - name: Deploy
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: >-
           ./flyctl deploy --config deploy/fly.staging.toml --remote-only --ha=false
           --image-label "main-${SHA}" --wait-timeout 10m
-          --env "SAMA_SANDBOX_TEMPLATE=sama-runner-${SHA:0:12}"
+          --env "SAMA_SANDBOX_TEMPLATE=${TEMPLATE_ALIAS}"
       - name: Check the health of each part
         run: |
           for path in /healthz /tools/healthz /model/healthz; do
@@ -138,8 +147,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: uv.lock
-      # The build is the same for the same commit, and E2B caches the layers, so the production
-      # job builds again only to be sure that the template exists.
+      # The build is the same for the same content, and E2B caches the layers, so a build of an
+      # alias that exists is fast. It makes sure that the template exists.
       - name: Build the E2B template of the commit
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -149,14 +158,22 @@ jobs:
             exit 1
           fi
           uv sync --locked
-          uv run python -m sama.sandbox.template --alias "sama-runner-${SHA:0:12}"
+          # A commit from before the content alias has no --print-alias. It keeps the alias
+          # of its commit, so a promotion or a rollback to it still works.
+          if uv run python -m sama.sandbox.template --help | grep -q -- --print-alias; then
+            ALIAS="$(uv run python -m sama.sandbox.template --print-alias)"
+          else
+            ALIAS="sama-runner-${SHA:0:12}"
+          fi
+          echo "TEMPLATE_ALIAS=${ALIAS}" >> "$GITHUB_ENV"
+          uv run python -m sama.sandbox.template --alias "${ALIAS}"
       - name: Deploy the staging image of the commit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: >-
           ./flyctl deploy --config deploy/fly.production.toml --ha=false
           --image "registry.fly.io/sama-staging:main-${SHA}" --wait-timeout 10m
-          --env "SAMA_SANDBOX_TEMPLATE=sama-runner-${SHA:0:12}"
+          --env "SAMA_SANDBOX_TEMPLATE=${TEMPLATE_ALIAS}"
       - name: Check the health of each part
         run: |
           for path in /healthz /tools/healthz /model/healthz; do

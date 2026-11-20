@@ -3153,15 +3153,15 @@ gives no deferred tool: the search fails closed (Section 6.3).
 ### 16.2 Sandbox and runner (M1.6)
 
 - One E2B sandbox per session, from the sama template. A deployed environment uses the
-  template of its own commit, `sama-runner-<first 12 characters of the SHA>`
+  template of its own sandbox files, `sama-runner-<content hash>`
   (`SAMA_SANDBOX_TEMPLATE`, Section 19.3). Without the setting, the template is `sama-runner`,
   which the nightly job builds from `main`. It pauses when idle and resumes on the next run,
   and the files stay.
 - **Template change.** Each sandbox has the label `sama.template`. A paused sandbox keeps the
   runner of the commit that made it, and the runner and the control plane refuse unknown job
   and event fields. So the orchestrator does not resume a sandbox whose label is not the
-  template of the control plane (a deploy of a new commit, or a sandbox from before the
-  label). `resume` raises `SandboxOutdatedError` with the running sandbox. The orchestrator
+  template of the control plane (a deploy that changes the sandbox files, or a sandbox from
+  before the label). A deploy that does not change them keeps the template and the sandboxes. `resume` raises `SandboxOutdatedError` with the running sandbox. The orchestrator
   then:
   1. creates a new sandbox from its own template;
   2. moves `SandboxSettings.carry_dirs` from the home folder of the old sandbox to the new
@@ -3971,12 +3971,20 @@ The provider and search keys are the defaults. An org key in the vault comes fir
   `main` and deploys the staging image of that commit, so production runs the tested image.
 - The GitHub environments `staging` and `production` hold the secret `FLY_API_TOKEN`. Only
   `main` can deploy to them.
-- Each deploy builds the E2B template of its commit, `sama-runner-<first 12 characters of the
-  SHA>`, and sets `SAMA_SANDBOX_TEMPLATE` to it. The runner in the sandbox then has the code of
-  the control plane that starts it. The runner and the control plane change their job and
-  event models together, and both refuse unknown fields, so a shared template breaks the
-  environment that runs the older commit. The template build needs the repository secret
-  `E2B_API_KEY`. The nightly job still builds `sama-runner` from `main` for the E2B tests and
+- Each deploy builds the E2B template `sama-runner-<content hash>` and sets
+  `SAMA_SANDBOX_TEMPLATE` to it. `python -m sama.sandbox.template --print-alias` gives the
+  alias. The hash (first 12 characters of a SHA-256) covers the Dockerfile, `pyproject.toml`,
+  `uv.lock`, `README.md`, `.dockerignore`, the CPU, memory, and ignore settings of the build,
+  and the source files that the sandbox entry points can import (`sama.runtime.runner`,
+  `sama.warm`, and the modules in `PRELOAD` of `sama.warm`). The search reads every import
+  statement, also in function bodies, and fails on an import by name outside `sama.warm`. A
+  commit from before the content alias has no `--print-alias`, so the deploy uses
+  `sama-runner-<first 12 characters of the SHA>` for it. The runner in the sandbox then has the
+  runner code of the control plane that starts it. The runner and the control plane change
+  their job and event models together (`sama.runtime.contract`), and both refuse unknown
+  fields, so a different template is necessary when that code changes. A deploy that does not
+  change the sandbox files keeps the alias, so the session sandboxes stay with their files. The
+  template build needs the repository secret `E2B_API_KEY`. The nightly job still builds `sama-runner` from `main` for the E2B tests and
   for local use (Section 16.2).
 - A template stays in E2B after its deploy. Old templates are removed by hand.
 - A paused session sandbox of an older template is replaced on its next run. The CLI
