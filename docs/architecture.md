@@ -3245,7 +3245,7 @@ are untrusted. Event-triggered runs use the `safe` toolset unless the trigger sa
 
 **What M4.4 builds**
 
-- **Tables.** Migration `0026` adds `triggers` (one event source of a workspace) and
+- **Tables.** Migration `0027` adds `triggers` (one event source of a workspace) and
   `trigger_events` (one row for each accepted delivery), both with `org_id` and RLS. A member of
   the workspace or an org admin sees its triggers. An event row shows to the users who can read
   its session. The migration also adds `runs.toolsets` and the vault names `trigger:<uuid>` and
@@ -3282,8 +3282,8 @@ are untrusted. Event-triggered runs use the `safe` toolset unless the trigger sa
   event for a trigger that is gone at that time gets `200` with `ignored`. `runs.toolsets`
   limits the run to the toolsets of the trigger and of the profile, in the gate, the prompt,
   and the skills. The default is `safe`. Only a workspace admin, an org admin, or the org owner
-  can give more than `safe`. A trigger cannot have `delegation` or `tasks`, the toolsets that
-  start other runs. A run that another run starts (a delegated child, a steer, or a task card)
+  can give more than `safe`. A trigger cannot have `delegation`, `tasks`, or `cron`, the
+  toolsets that start other runs. A run that another run starts (a delegated child, a steer, or a task card)
   also keeps the `runs.toolsets` limit of the run that started it. Unattended rules
   apply (Section 12.1): `ask` becomes `deny`, and `clarify` gets no answer. If the owner cannot
   see the workspace now, the event gets `410` and the trigger gets `last_error`.

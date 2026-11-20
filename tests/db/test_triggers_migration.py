@@ -1,4 +1,4 @@
-"""Migration 0026: the trigger tables, the run toolsets, and the vault names of triggers
+"""Migration 0027: the trigger tables, the run toolsets, and the vault names of triggers
 (docs/architecture.md, Section 12.2)."""
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def test_the_upgrade_adds_the_triggers_and_the_downgrade_removes_them() -> None:
         with pytest.raises(asyncpg.CheckViolationError):
             asyncio.run(_put_secret(url, "trigger:not-a-uuid"))
         config = alembic_config(url)
-        command.downgrade(config, "0025")
+        command.downgrade(config, "0026")
         assert asyncio.run(_state(url)) == (False, False, False, 0)
         with pytest.raises(asyncpg.CheckViolationError):
             asyncio.run(_put_secret(url, f"trigger:{uuid.uuid4()}"))

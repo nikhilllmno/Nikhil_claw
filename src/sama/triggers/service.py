@@ -61,9 +61,10 @@ EVENT_MAX_DEPTH: Final = 64
 CONFIG_MAX_CHARS: Final = 4000
 """The largest Composio trigger config, as JSON."""
 SLUG_PATTERN: Final = r"^[A-Z][A-Z0-9_]{0,99}$"
-SPAWNING_TOOLSETS: Final = frozenset({"delegation", "tasks"})
-"""The toolsets that start other runs. A trigger cannot have them, so each run that a trigger
-starts stays in the toolset limit of the trigger (Section 12.2)."""
+SPAWNING_TOOLSETS: Final = frozenset({"delegation", "tasks", "cron"})
+"""The toolsets that start other runs (a child, a task card, or a cron job). A trigger cannot
+have them, so each run that a trigger starts stays in the toolset limit of the trigger
+(Section 12.2)."""
 NOT_SIGNED: Final = "the delivery is not signed for this trigger"
 INSTANCE_USED: Final = "another trigger uses this Composio trigger (the same type and config)"
 INSTANCE_BUSY: Final = "another change of this Composio trigger is in progress; try again"

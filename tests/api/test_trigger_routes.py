@@ -528,9 +528,10 @@ async def test_an_org_with_its_own_composio_project_uses_its_own_secret(
 async def test_a_trigger_cannot_have_a_toolset_that_starts_runs(
     hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:
-    """A child or a task card of a trigger run would not keep the limit of the trigger."""
+    """A child, a task card, or a cron job of a trigger run would not keep the limit of the
+    trigger."""
     admin = await workspace_admin(engine, tenant)
-    for toolsets in (["web", "delegation"], ["tasks"]):
+    for toolsets in (["web", "delegation"], ["tasks"], ["cron"]):
         refused = await hooks.post(
             path(tenant), headers=admin, json=new_hook(tenant, toolsets=toolsets)
         )
