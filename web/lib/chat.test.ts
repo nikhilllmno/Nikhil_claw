@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyStreamEvent, initialLive, isPaused, openRunIds, parseCompact, sessionTitle } from "./chat";
+import { applyStreamEvent, initialLive, isPaused, openRunIds, parseCommand, parseCompact, sessionTitle } from "./chat";
 
 const run = (id: string, status: string, message: string | null = null) => ({
   run_id: id,
@@ -215,5 +215,31 @@ describe("sessionTitle", () => {
   it("falls back to a short id", () => {
     expect(sessionTitle({ id: "12345678-aaaa", title: null })).toBe("Session 12345678");
     expect(sessionTitle({ id: "x", title: "  Plan " })).toBe("Plan");
+  });
+});
+
+describe("parseCommand", () => {
+  it("reads the busy controls and the compact command", () => {
+    expect(parseCommand("/compact keep it")).toEqual({ kind: "compact", focus: "keep it" });
+    expect(parseCommand(" /steer use metric units ")).toEqual({ kind: "steer", note: "use metric units" });
+    expect(parseCommand("/steer two\nlines")).toEqual({ kind: "steer", note: "two\nlines" });
+    expect(parseCommand("/steer")).toEqual({ kind: "steer", note: "" });
+    expect(parseCommand("/stop")).toEqual({ kind: "stop" });
+    expect(parseCommand("/handoff Telegram")).toEqual({ kind: "handoff", to: "telegram" });
+    expect(parseCommand("/handoff slack")).toEqual({ kind: "handoff", to: "slack" });
+    expect(parseCommand("/handoff web")).toEqual({ kind: "handoff", to: "web" });
+  });
+
+  it("gives no place for an unknown or a missing handoff target", () => {
+    expect(parseCommand("/handoff")).toEqual({ kind: "handoff", to: null });
+    expect(parseCommand("/handoff mars")).toEqual({ kind: "handoff", to: null });
+    expect(parseCommand("/handoff slack now")).toBeNull();
+  });
+
+  it("treats other text as a normal message", () => {
+    expect(parseCommand("hello")).toBeNull();
+    expect(parseCommand("/steering wheel")).toBeNull();
+    expect(parseCommand("/stop now")).toBeNull();
+    expect(parseCommand("please /steer")).toBeNull();
   });
 });

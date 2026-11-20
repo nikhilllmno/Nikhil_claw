@@ -647,6 +647,26 @@ async def test_hook_maps_gate_decisions(
     assert gate.calls == [("Bash", {"to": "a@b.c"})]
 
 
+@pytest.mark.parametrize("action", ["allow", "deny"])
+async def test_hook_gives_the_steer_notes_to_the_model(action: str) -> None:
+    factory = Factory([call_hook("Bash", "t1"), call_hook("Bash", "t2"), result()])
+    gate = ScriptedGate(GateDecision(action, "ok", steer="go left"))  # type: ignore[arg-type]
+    await collect(ClaudeRuntime(gate=gate, client_factory=factory).run(request()))
+    output = factory.clients[0].hook_outputs[0]["hookSpecificOutput"]
+    assert output["additionalContext"] == "go left"
+    assert output["permissionDecision"] == action
+
+
+async def test_hook_without_notes_has_no_extra_context() -> None:
+    factory = Factory([call_hook("Bash", "t1"), result()])
+    await collect(
+        ClaudeRuntime(gate=ScriptedGate(GateDecision("allow")), client_factory=factory).run(
+            request()
+        )
+    )
+    assert "additionalContext" not in factory.clients[0].hook_outputs[0]["hookSpecificOutput"]
+
+
 async def test_ask_pauses_the_run_with_approval_required() -> None:
     _, paused = await pause("needs a human")
     assert paused.approval_id == "call-1"

@@ -35,7 +35,13 @@ from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
 from sama.delegation import DelegationError, DelegationService
 from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, Verdict
-from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
+from sama.gate.wire import (
+    GATE_PATH,
+    MAX_GATE_BODY_BYTES,
+    STEER_HEADER,
+    GateAnswer,
+    GateRequest,
+)
 from sama.media.generate import (
     DEFAULT_IMAGE_SIZE,
     DEFAULT_VOICE,
@@ -210,6 +216,12 @@ _EXPECTED = (
     WorkflowError,
 )
 _NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
+
+
+class SteerBackend(Protocol):
+    """The notes of ``/steer`` (Section 4.3), normally ``sama.orchestrator.queue.RunQueue``."""
+
+    async def take_steers(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str: ...
 
 
 class GateBackend(Protocol):
@@ -395,12 +407,14 @@ class ToolServer:
         images: ImageService | None = None,
         speech: SpeechService | None = None,
         importer: SkillImporter | None = None,
+        steers: SteerBackend | None = None,
     ) -> None:
         self.signer = signer
         self.importer = importer
         self.code = code
         self.images = images
         self.speech = speech
+        self.steers = steers
         self.souls = souls
         self.session_items = session_items
         self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
@@ -1388,7 +1402,25 @@ class ToolServer:
         except Exception as error:
             log.error("gate failed run=%s error=%s", claims.run_id, type(error).__name__)
             answer = GateAnswer(action="deny", reason="the tool gate failed")
-        return JSONResponse(answer.model_dump())
+        if (
+            self.steers is not None
+            and not body.child
+            and answer.action != "ask"
+            and request.headers.get(STEER_HEADER) == "1"
+        ):
+            # The notes of ``/steer`` go to the parent run with the verdict (Section 4.3). A
+            # sub-agent does not get them, and a call that pauses the run keeps them for the
+            # resume.
+            try:
+                steer = await self.steers.take_steers(
+                    org_id=uuid.UUID(claims.org_id), run_id=uuid.UUID(claims.run_id)
+                )
+            except Exception as error:
+                log.error("steer failed run=%s error=%s", claims.run_id, type(error).__name__)
+            else:
+                if steer:
+                    answer = answer.model_copy(update={"steer": steer})
+        return JSONResponse(answer.wire())
 
     async def _archive_endpoint(self, request: Request) -> Response:
         """``POST /archive``: the transcript before a compaction of the run of the token."""

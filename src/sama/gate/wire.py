@@ -12,6 +12,11 @@ from sama.gate.decide import Action
 
 GATE_PATH: Final = "/gate"
 MAX_GATE_BODY_BYTES: Final = 1_000_000
+STEER_HEADER: Final = "x-sama-steer"
+"""A runner that sends this header with the value ``1`` can take the notes of ``/steer`` in
+``GateAnswer.steer`` (Section 4.3). The control plane does not send ``steer`` to a runner
+without it, because an old runner refuses an unknown key. A header, not a body key: an old
+control plane refuses an unknown body key (422), but it ignores a header."""
 
 
 class GateRequest(BaseModel):
@@ -31,3 +36,10 @@ class GateAnswer(BaseModel):
     action: Action
     reason: str = ""
     step: str = ""
+    steer: str = ""
+    """The notes of ``/steer`` that the run did not read yet (Section 4.3). The runtime gives
+    them to the model with the verdict. On the wire only when it is not empty."""
+
+    def wire(self) -> dict[str, object]:
+        """The JSON body. ``steer`` is in it only when it is not empty."""
+        return self.model_dump(exclude=None if self.steer else {"steer"})

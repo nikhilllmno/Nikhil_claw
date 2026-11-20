@@ -216,7 +216,9 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
     if job.gate_url is not None:
         from sama.runtime.remote_gate import RemoteGate
 
-        gate = RemoteGate(job.gate_url, token)
+        # Only the Claude runtime takes the notes of ``/steer`` in a run
+        # (``Capabilities.mid_run_steer``, Section 4.3).
+        gate = RemoteGate(job.gate_url, token, steer=kind is RuntimeKind.CLAUDE_AGENT_SDK)
     else:
         gate = StaticGate(job.gate)
 

@@ -168,7 +168,9 @@ async def bound(engine: AsyncEngine, suffix: str) -> list[Any]:  # noqa: F811
 def no_followers(gateway: SlackGateway) -> None:
     """The gateway queues runs but does not follow them."""
 
-    async def skip(place: Any, target: Any, run_id: uuid.UUID, holder: object) -> None:
+    async def skip(
+        place: Any, target: Any, run_id: uuid.UUID, holder: object, *, via: int | None = None
+    ) -> None:
         gateway._followers.discard(holder)
 
     gateway._follow = skip  # type: ignore[method-assign]

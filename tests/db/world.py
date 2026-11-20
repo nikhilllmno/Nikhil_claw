@@ -54,10 +54,12 @@ from sama.db.models import (
     ReviewProposal,
     Run,
     RunEvent,
+    RunSteer,
     RuntimeSessionItem,
     Session,
     SessionBinding,
     SessionCompaction,
+    SessionHandoff,
     SessionTodo,
     StoredContextFile,
     Task,
@@ -331,6 +333,24 @@ def plan(
             conversation="c-world",
             seq=0,
             item={"role": "user", "content": f"item of {session}"},
+        )
+        add(
+            RunSteer,
+            org_id=org_id,
+            session_id=ids[session],
+            run_id=run_id,
+            user_id=ids[owner] if owner else None,
+            text=f"steer of {session}",
+        )
+        add(
+            SessionHandoff,
+            org_id=org_id,
+            workspace_id=ids[workspace],
+            session_id=ids[session],
+            user_id=ids[owner] if owner else None,
+            from_channel="telegram",
+            from_key=f"telegram:{ids[session]}",
+            to_channel="web",
         )
     # One job for each owner, with a fire and a delivery. A job is private to its owner.
     for user, org, workspace, profile in (

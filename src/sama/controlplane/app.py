@@ -44,6 +44,7 @@ from sama.db.engine import create_engine
 from sama.delegation import DelegationService
 from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
+from sama.gateway.handoff import Handoffs
 from sama.github.client import GitHubClient
 from sama.github.proxy import GitHubUpstream, GitProxy
 from sama.github.service import GitHubService
@@ -352,6 +353,7 @@ def build(
         connections=connections,
         importer=SkillImporter(skill_store),
         outbound=outbound,
+        steers=queue,
         archive=ContextArchive(engine),
         session_items=PostgresSessionItems(engine),
         gate=gate,
@@ -370,6 +372,7 @@ def build(
         keys=keys,
         ledger=ledger,
     )
+    handoffs = Handoffs(engine, web_url=settings.web_base)
     hub = (
         TelegramHub(
             engine,
@@ -380,6 +383,7 @@ def build(
             reviews=reviews,
             connections=connections,
             jobs=jobs,
+            handoffs=handoffs,
         )
         if vault is not None
         else None
@@ -393,11 +397,16 @@ def build(
             reviews=reviews,
             connections=connections,
             jobs=jobs,
+            handoffs=handoffs,
         )
         if vault is not None
         else None
     )
     scheduler = _scheduler(settings, engine, vault, sandboxed)
+    if hub is not None:
+        handoffs.register("telegram", hub.door)
+    if slack is not None:
+        handoffs.register("slack", slack.door)
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack):
@@ -442,6 +451,7 @@ def build(
         skill_store=skill_store,
         search=sessions,
         workflows=workflows,
+        handoffs=handoffs,
     )
     api_app = api.app()
     tools_app = tools.app()

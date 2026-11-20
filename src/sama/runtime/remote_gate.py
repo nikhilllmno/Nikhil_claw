@@ -12,7 +12,7 @@ from typing import Any, Final
 
 import httpx
 
-from sama.gate.wire import GateAnswer, GateRequest
+from sama.gate.wire import STEER_HEADER, GateAnswer, GateRequest
 from sama.runtime.contract import RunScope
 from sama.runtime.gating import GateDecision
 
@@ -29,11 +29,16 @@ class RemoteGate:
         *,
         timeout_s: float = GATE_TIMEOUT_S,
         transport: httpx.AsyncBaseTransport | None = None,
+        steer: bool = True,
     ) -> None:
+        """``steer`` asks the control plane for the notes of ``/steer``. Only a runtime with
+        ``Capabilities.mid_run_steer`` sets it: the control plane marks the notes it sends as
+        delivered, so a runtime that cannot give them to the model must not take them."""
         self._url = url
         self._token = token
         self._timeout_s = timeout_s
         self._transport = transport
+        self._steer = steer
 
     def __repr__(self) -> str:
         return f"RemoteGate(url={self._url!r}, token=<hidden>)"
@@ -56,14 +61,13 @@ class RemoteGate:
         async with httpx.AsyncClient(
             timeout=self._timeout_s, transport=self._transport, follow_redirects=False
         ) as client:
-            response = await client.post(
-                self._url,
-                content=content,
-                headers={
-                    "authorization": f"Bearer {self._token}",
-                    "content-type": "application/json",
-                },
-            )
+            headers = {
+                "authorization": f"Bearer {self._token}",
+                "content-type": "application/json",
+            }
+            if self._steer:
+                headers[STEER_HEADER] = "1"
+            response = await client.post(self._url, content=content, headers=headers)
         response.raise_for_status()
         answer = GateAnswer.model_validate_json(response.content)
-        return GateDecision(answer.action, answer.reason)
+        return GateDecision(answer.action, answer.reason, steer=answer.steer)

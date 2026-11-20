@@ -197,8 +197,9 @@ class Worker:
             await _wait(stop, self._maintenance_s)
 
     async def maintain(self) -> None:
-        """Times out approvals, queues decided runs, reaps runs with an expired lease, and
-        applies the decided proposals of background reviews (Section 9.4)."""
+        """Times out approvals, queues decided runs, reaps runs with an expired lease, sends on
+        the ``/steer`` notes of ended runs (Section 4.3), and applies the decided proposals of
+        background reviews (Section 9.4)."""
         expired = await self._gate.expire()
         if expired:
             log.info("approvals timed out count=%s", expired)
@@ -212,6 +213,13 @@ class Worker:
                     log.info("review proposals decided count=%s", applied)
         released = await self._queue.release_decided()
         requeued, ended = await self._queue.reap()
+        try:
+            steered = await self._queue.sweep_steers()
+        except Exception:
+            log.exception("the steer notes could not be swept owner=%s", self.owner)
+        else:
+            if steered:
+                log.info("steer notes handled after their run ended runs=%s", steered)
         for run_id in released:
             log.info("run queued after its approval run=%s", run_id)
         for ref in requeued:

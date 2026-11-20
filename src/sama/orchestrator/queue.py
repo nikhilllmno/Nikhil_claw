@@ -72,6 +72,7 @@ from sama.context.pins import all_pin_texts, compact_focus, pin_block, pins_for_
 from sama.db.engine import autocommit
 from sama.db.models import (
     ENDED_RUN_STATUSES,
+    MAX_STEER_CHARS,
     AgentProfile,
     Approval,
     Attachment,
@@ -80,6 +81,7 @@ from sama.db.models import (
     Org,
     Run,
     RunEvent,
+    RunSteer,
     Session,
     WorkflowInstance,
 )
@@ -107,6 +109,9 @@ REAP_BATCH: Final = 100
 ACTIVE_STATUSES: Final = ("running", "paused")
 EXPIRED_REASON: Final = "the approval timed out"
 RATE_WINDOW: Final = timedelta(seconds=60)
+MAX_PENDING_STEERS: Final = 10
+"""The most notes of ``/steer`` that one run can have before the gate gives them to it."""
+STEER_SWEEP_BATCH: Final = 50
 CLAIM_TRIES: Final = 5
 """How many candidate runs one ``claim`` tries before it gives up for this call."""
 
@@ -166,6 +171,18 @@ def _rate_columns(org_id: uuid.UUID, user_id: uuid.UUID | None) -> list[Any]:
     if user_id is not None:
         columns += recent("user", user=True)
     return columns
+
+
+def steer_block(notes: Sequence[str]) -> str:
+    """The text that the runtime gets for the notes of ``/steer`` (Section 4.3). Empty if
+    there are no notes."""
+    if not notes:
+        return ""
+    body = "\n\n".join(notes)
+    return (
+        "The user sent new guidance while you work (/steer). Use it from now on, and keep"
+        f" the parts of the task that it does not change.\n\n{body}"
+    )
 
 
 def _check_rate(row: Any) -> None:
@@ -413,8 +430,9 @@ class RunQueue:
         its run in one transaction (Section 12.1). ``budget`` can only make the profile budget
         smaller (``narrow_budget``). ``model`` pins the model of the run; without it, the run
         uses the model of the profile. ``check_rate=False`` keeps the lock order but does not
-        apply the message rate: a job fire is not a message of a person. ``toolsets`` limits
-        the toolsets of the run (``runs.toolsets``, Section 12.2)."""
+        apply the message rate: a job fire is not a message of a person, and the notes of
+        ``/steer`` passed the rate check already. ``toolsets`` limits the toolsets of the run
+        (``runs.toolsets``, Section 12.2)."""
         await self._rate_lock(connection, org_id)  # the lock order of all enqueues
         # One statement reads the session, the limits, and the rate counts. It comes
         # after the lock statement, so its snapshot has every enqueue before the lock.
@@ -629,6 +647,220 @@ class RunQueue:
                     .values(cancel_requested_at=func.now())
                 )
             return status
+
+    async def waits(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> bool:
+        """True if an older open run of the same session comes before the run: the new message
+        waits in the queue (Section 4.3)."""
+        mine = aliased(Run)
+        async with self._engine.connect() as connection:
+            return bool(
+                (
+                    await connection.execute(
+                        select(
+                            exists().where(
+                                Run.org_id == mine.org_id,
+                                Run.session_id == mine.session_id,
+                                Run.id != mine.id,
+                                Run.status.in_(("queued", *ACTIVE_STATUSES)),
+                                Run.created_at <= mine.created_at,
+                            )
+                        ).where(mine.org_id == org_id, mine.id == run_id)
+                    )
+                ).scalar_one_or_none()
+            )
+
+    async def steer(
+        self,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None = None,
+    ) -> uuid.UUID | None:
+        """Adds a note of ``/steer`` to the active chat run of the session (Section 4.3).
+        Returns the run id, or None if the session has no active chat run (a run that ``/stop``
+        cancels does not count): then the caller sends the text as a normal message.
+
+        The gate gives the note to the run at its next tool call. If the run completes before
+        that, ``complete`` sends the notes as a new message. A user over the message rate
+        cannot add a note. A note does not count for the rate itself: the limit of pending
+        notes (``MAX_PENDING_STEERS``) bounds it, and the new message of ``complete`` counts.
+
+        Raises ``RateLimitedError`` when the user or the org is over its message rate, and
+        ``QueueError`` when the run has too many pending notes.
+        """
+        text = text.strip()
+        if not text:
+            raise QueueError("the note is empty")
+        if len(text) > MAX_STEER_CHARS:
+            raise QueueError(f"the note is longer than {MAX_STEER_CHARS} characters")
+        async with self._engine.begin() as connection:
+            await self._rate_lock(connection, org_id)
+            # The share lock keeps the run active until the note is in: ``_end`` must wait,
+            # so it sees the note and sends it on.
+            row = (
+                await connection.execute(
+                    select(
+                        Run.id,
+                        select(func.count())
+                        .where(RunSteer.run_id == Run.id, RunSteer.status == "pending")
+                        .scalar_subquery()
+                        .label("pending"),
+                        *_rate_columns(org_id, user_id),
+                    )
+                    .where(
+                        Run.org_id == org_id,
+                        Run.session_id == session_id,
+                        Run.status.in_(ACTIVE_STATUSES),
+                        Run.kind == "chat",
+                        Run.compact.is_(False),
+                        Run.cancel_requested_at.is_(None),
+                    )
+                    .with_for_update(of=Run, read=True)
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            _check_rate(row)
+            if row.pending >= MAX_PENDING_STEERS:
+                raise QueueError(
+                    f"the run has {MAX_PENDING_STEERS} notes that it did not read yet."
+                    " Wait, or use /stop."
+                )
+            await connection.execute(
+                insert(RunSteer).values(
+                    org_id=org_id,
+                    session_id=session_id,
+                    run_id=row.id,
+                    user_id=user_id,
+                    text=redact(text),
+                )
+            )
+            steered: uuid.UUID = row.id
+            return steered
+
+    async def take_steers(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
+        """Marks the pending notes of a running run as delivered and returns their text, oldest
+        first. The tool gate calls it for each tool call of the run. Empty if none."""
+        async with self._engine.begin() as connection:
+            rows = (
+                await connection.execute(
+                    update(RunSteer)
+                    .where(
+                        RunSteer.org_id == org_id,
+                        RunSteer.run_id == run_id,
+                        RunSteer.status == "pending",
+                        exists().where(
+                            Run.org_id == org_id, Run.id == run_id, Run.status == "running"
+                        ),
+                    )
+                    .values(status="delivered", delivered_at=func.now())
+                    .returning(RunSteer.created_at, RunSteer.text)
+                )
+            ).all()
+        return steer_block([text for _created, text in sorted(rows)])
+
+    async def requeued_run(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> uuid.UUID | None:
+        """The run that answers the notes that a completed run did not read, if any."""
+        async with self._engine.connect() as connection:
+            return (
+                await connection.execute(
+                    select(RunSteer.requeued_run_id)
+                    .where(
+                        RunSteer.org_id == org_id,
+                        RunSteer.run_id == run_id,
+                        RunSteer.status == "requeued",
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+    async def sweep_steers(self) -> int:
+        """Handles the notes that no run reads: it drops the pending notes of failed and
+        cancelled runs, and it sends the pending notes of completed runs as new messages
+        (``complete`` leaves them when they came in at the last moment). Returns the count of
+        runs that it handled."""
+        async with self._engine.begin() as connection:
+            dropped = (
+                await connection.execute(
+                    update(RunSteer)
+                    .where(
+                        RunSteer.status == "pending",
+                        exists().where(
+                            Run.org_id == RunSteer.org_id,
+                            Run.id == RunSteer.run_id,
+                            Run.status.in_(("failed", "cancelled")),
+                        ),
+                    )
+                    .values(status="dropped")
+                    .returning(RunSteer.run_id)
+                )
+            ).all()
+            due = (
+                await connection.execute(
+                    select(RunSteer.org_id, RunSteer.session_id, RunSteer.run_id)
+                    .join(Run, and_(Run.org_id == RunSteer.org_id, Run.id == RunSteer.run_id))
+                    .where(RunSteer.status == "pending", Run.status == "completed")
+                    .distinct()
+                    .limit(STEER_SWEEP_BATCH)
+                )
+            ).all()
+        for row in due:
+            async with self._engine.begin() as connection:
+                await self._rate_lock(connection, row.org_id)
+                await self._requeue_steers(
+                    connection, org_id=row.org_id, session_id=row.session_id, run_id=row.run_id
+                )
+        return len({run_id for (run_id,) in dropped}) + len(due)
+
+    async def _requeue_steers(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        run_id: uuid.UUID,
+    ) -> uuid.UUID | None:
+        """Sends the pending notes of an ended run as one new message of the session, and
+        returns the new run. The caller holds the rate lock. The notes passed the rate check
+        when they came in, so the new message does not need the check (it counts for the
+        rate from now on). If the session is not active, the notes are dropped."""
+        notes = (
+            await connection.execute(
+                select(RunSteer.id, RunSteer.user_id, RunSteer.text)
+                .where(
+                    RunSteer.org_id == org_id,
+                    RunSteer.run_id == run_id,
+                    RunSteer.status == "pending",
+                )
+                .order_by(RunSteer.created_at, RunSteer.id)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        if not notes:
+            return None
+        ids = [note.id for note in notes]
+        users = {note.user_id for note in notes}
+        try:
+            new_run: uuid.UUID | None = await self.enqueue_in(
+                connection,
+                org_id=org_id,
+                session_id=session_id,
+                text="\n\n".join(note.text for note in notes),
+                user_id=users.pop() if len(users) == 1 else None,
+                check_rate=False,
+            )
+        except QueueError:
+            new_run = None
+        await connection.execute(
+            update(RunSteer)
+            .where(RunSteer.id.in_(ids))
+            .values(
+                status="requeued" if new_run is not None else "dropped",
+                requeued_run_id=new_run,
+            )
+        )
+        return new_run
 
     async def release_decided(
         self, *, org_id: uuid.UUID | None = None, run_id: uuid.UUID | None = None
@@ -1105,7 +1337,14 @@ class RunQueue:
     ) -> bool:
         """Stores the reply as an assistant message and ends the run as ``completed``. A
         completed chat run counts for the background review (Section 9.4)."""
+        steerable = run.kind == "chat" and not run.compact
         async with self._engine.begin() as connection:
+            # Notes of ``/steer`` that the run did not read become a new message after the
+            # reply. That is an enqueue, so the rate lock comes first, before the message
+            # insert locks the session row. Most runs have no notes: they skip the lock.
+            locked = steerable and await self._has_pending_steers(connection, run)
+            if locked:
+                await self._rate_lock(connection, run.org_id)
             ended = await self._end(
                 connection,
                 run,
@@ -1116,7 +1355,7 @@ class RunQueue:
             )
             # A review run writes no message: nobody reads its reply (Section 9.4). A compact
             # run answers nobody, and it is no user turn.
-            if ended and run.kind == "chat" and not run.compact:
+            if ended and steerable:
                 await connection.execute(
                     insert(Message).values(
                         org_id=run.org_id,
@@ -1128,7 +1367,32 @@ class RunQueue:
                 )
                 # In the same transaction, so a run that completes always counts, once.
                 await after_completed_run(connection, run)
+                # A note that came in after the check waits for ``sweep_steers``: it needs
+                # the rate lock, and this transaction cannot take it now.
+                if locked:
+                    await self._requeue_steers(
+                        connection,
+                        org_id=run.org_id,
+                        session_id=run.session_id,
+                        run_id=run.run_id,
+                    )
             return ended
+
+    @staticmethod
+    async def _has_pending_steers(connection: AsyncConnection, run: ClaimedRun) -> bool:
+        return bool(
+            (
+                await connection.execute(
+                    select(
+                        exists().where(
+                            RunSteer.org_id == run.org_id,
+                            RunSteer.run_id == run.run_id,
+                            RunSteer.status == "pending",
+                        )
+                    )
+                )
+            ).scalar_one()
+        )
 
     async def fail(
         self,

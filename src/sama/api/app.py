@@ -88,6 +88,7 @@ from sama.context import (
 )
 from sama.db.engine import as_user
 from sama.db.models import (
+    MAX_STEER_CHARS,
     AgentProfile,
     Approval,
     AuditEntry,
@@ -106,6 +107,7 @@ from sama.db.models import (
 )
 from sama.db.models import Connection as ConnectionRow
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
+from sama.gateway.handoff import HandoffError, Handoffs
 from sama.gateway.pairing import PairingError, create_code
 from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
@@ -229,6 +231,21 @@ class NewSession(_Body):
 
 class NewMessage(_Body):
     text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+
+class Steer(_Body):
+    text: str = Field(min_length=1, max_length=MAX_STEER_CHARS)
+
+
+class Handoff(_Body):
+    to: Literal["telegram", "slack", "web"]
+    """Where the session goes (Section 11.1)."""
+
+
+class HandoffOut(BaseModel):
+    to_channel: str
+    text: str
+    """The answer for the user."""
 
 
 class Compact(_Body):
@@ -852,11 +869,13 @@ class SamaApi:
         skill_store: PostgresSkillStore | None = None,
         search: SessionSearch | None = None,
         workflows: WorkflowService | None = None,
+        handoffs: Handoffs | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
-        the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
-        ``409``. Without ``jobs``, the job routes answer ``409``, and without ``workflows``, the
-        workflow routes answer ``409``. Without ``skills``,
+        the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
+        ``409``. Without ``connections`` the connection routes answer ``409``. Without
+        ``jobs``, the job routes answer ``409``, and without ``workflows``, the workflow routes
+        answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command. Without ``search``, the session search of the web app uses full-text search
         only."""
@@ -866,6 +885,7 @@ class SamaApi:
         self._github = github
         self._connections = connections
         self._triggers = triggers
+        self._handoffs = handoffs
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -988,6 +1008,14 @@ class SamaApi:
             principal: Me, session_id: uuid.UUID, body: NewMessage
         ) -> JSONResponse:
             return await self._send(principal, session_id, body)
+
+        @app.post("/sessions/{session_id}/steer", status_code=202)
+        async def steer(principal: Me, session_id: uuid.UUID, body: Steer) -> JSONResponse:
+            return await self._steer(principal, session_id, body.text)
+
+        @app.post("/sessions/{session_id}/handoff")
+        async def handoff(principal: Me, session_id: uuid.UUID, body: Handoff) -> HandoffOut:
+            return await self._handoff(principal, session_id, body.to)
 
         @app.post("/sessions/{session_id}/compact", status_code=202)
         async def compact(
@@ -2708,7 +2736,55 @@ class SamaApi:
             )
         except QueueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
-        return JSONResponse(status_code=202, content={"run_id": str(run_id)})
+        queued = await self._queue.waits(org_id=access.org_id, run_id=run_id)
+        return JSONResponse(status_code=202, content={"run_id": str(run_id), "queued": queued})
+
+    async def _steer(self, principal: Principal, session_id: uuid.UUID, text: str) -> JSONResponse:
+        """``POST /sessions/{id}/steer`` (M3.9): a note for the open run of the session. When no
+        run is open, the note is a normal message."""
+        access = await self._access(principal, session_id)
+        try:
+            steer_id = await self._queue.steer(
+                org_id=access.org_id, session_id=session_id, text=text, user_id=access.user_id
+            )
+            if steer_id is not None:
+                return JSONResponse(
+                    status_code=202,
+                    content={"steered": True, "run_id": str(steer_id), "queued": False},
+                )
+            run_id = await self._queue.enqueue(
+                org_id=access.org_id, session_id=session_id, text=text, user_id=access.user_id
+            )
+        except RateLimitedError as error:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": str(error)},
+                headers={"Retry-After": str(error.retry_after_s)},
+            )
+        except QueueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        queued = await self._queue.waits(org_id=access.org_id, run_id=run_id)
+        return JSONResponse(
+            status_code=202, content={"steered": False, "run_id": str(run_id), "queued": queued}
+        )
+
+    async def _handoff(self, principal: Principal, session_id: uuid.UUID, to: str) -> HandoffOut:
+        """``POST /sessions/{id}/handoff`` (M3.9, Section 11.1)."""
+        access = await self._access(principal, session_id)
+        if self._handoffs is None:
+            raise HTTPException(status_code=409, detail="handoffs are not configured")
+        try:
+            moved = await self._handoffs.move(
+                org_id=access.org_id,
+                user_id=access.user_id,
+                session_id=session_id,
+                from_channel="web",
+                from_key=None,
+                to_channel=to,
+            )
+        except HandoffError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return HandoffOut(to_channel=moved.to_channel, text=moved.text)
 
     async def _access(self, principal: Principal, session_id: uuid.UUID) -> SessionAccess:
         async with as_user(self._engine, principal.auth_user_id) as connection:

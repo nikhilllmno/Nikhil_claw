@@ -42,6 +42,8 @@ SESSION_CHILDREN = (
     "context_pins",
     "runtime_session_items",
     "trigger_events",
+    "run_steers",
+    "session_handoffs",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 

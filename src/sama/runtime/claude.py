@@ -52,6 +52,7 @@ from claude_agent_sdk.types import (
     McpHttpServerConfig,
     PermissionResultAllow,
     PermissionResultDeny,
+    PreToolUseHookSpecificOutput,
     SyncHookJSONOutput,
     SystemPromptPreset,
     TaskNotificationMessage,
@@ -667,6 +668,7 @@ class ClaudeRuntime:
             mcp_client=True,
             manual_compaction=True,
             compaction_archive=True,
+            mid_run_steer=True,
         )
 
     # -- the protocol ----------------------------------------------------------------------
@@ -1197,21 +1199,25 @@ class ClaudeRuntime:
                 action = decision.action
             if action == "allow" and call_id:
                 translator.allowed_calls.add(call_id)
-            return _pre_tool_use_output(action, decision.reason or f"sama tool gate: {action}")
+            return _pre_tool_use_output(
+                action, decision.reason or f"sama tool gate: {action}", steer=decision.steer
+            )
 
         return pre_tool_use
 
 
 def _pre_tool_use_output(
-    action: Literal["allow", "deny", "defer"], reason: str
+    action: Literal["allow", "deny", "defer"], reason: str, *, steer: str = ""
 ) -> SyncHookJSONOutput:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": action,
-            "permissionDecisionReason": reason,
-        }
+    output: PreToolUseHookSpecificOutput = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": action,
+        "permissionDecisionReason": reason,
     }
+    if steer:
+        # The notes of ``/steer`` reach the model with this call (Section 4.3).
+        output["additionalContext"] = steer
+    return {"hookSpecificOutput": output}
 
 
 def _deny(reason: str) -> SyncHookJSONOutput:

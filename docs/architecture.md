@@ -332,6 +332,38 @@ cancel request. Thus a cancel always wins over an approval.
 **Wall time.** The worker cancels the runtime when the run is longer than
 `Budget.max_wall_time_s`. The run fails with `timeout`.
 
+**Busy controls (M3.9, migration `0030`).** A user can send input while a run of the session is
+open. Sama has three controls, and they work in Telegram, Slack, and the web app (Section 11.1):
+
+- **Queue.** A new message waits in the queue, as above. `waits(org_id, run_id)` is true when an
+  older open run of the same session comes before the new run. The channels then tell the user
+  that the message is queued and how to steer or stop.
+- **Stop.** `/stop` uses `cancel` (above).
+- **Steer.** `steer(org_id, session_id, text, user_id)` adds a note (at most 4,000 characters,
+  `MAX_STEER_CHARS`) to the active chat run of the session. A `/compact` run, a review run, and
+  a run with a cancel request take no notes. When no run takes the note, `steer` returns
+  `None` and the caller sends the text as a normal message. The note goes into the table
+  `run_steers` with the status `pending`. A run has at most 10 pending notes
+  (`MAX_PENDING_STEERS`). A user over the message rate cannot add a note, but the note itself
+  does not count for the rate. `steer` takes a share lock on the run row, so the end of the run
+  waits for the insert and sees the note.
+
+The tool gate gives the notes to the run. At each tool call of a `running` run, `take_steers`
+marks the pending notes as `delivered` and returns one text block, oldest note first. The gate
+answer has the block in the field `steer`, but only for a runner that sends the header
+`x-sama-steer: 1` (an older runner does not know the field). The runner sends the header only
+for a runtime with `Capabilities.mid_run_steer`. The Claude adapter has it: it puts the block
+in `additionalContext` of the `PreToolUse` hook, so the model reads it with the result of that
+tool call. The OpenAI adapter (M3.6) does not have it, because its tool gate has no way to add
+text for the model. So in an OpenAI run the notes stay pending. A run that calls no more tools
+does not read the note. Then, when the run completes,
+`complete` sends the pending notes as one new user message of the session (status `requeued`,
+with `requeued_run_id`). That message does not need the rate check, because each note passed it.
+`requeued_run(org_id, run_id)` gives the new run, and the chat followers follow it. The worker
+maintenance calls `sweep_steers()`: it sends the pending notes of completed runs (a note that
+came in after `complete`) as a new message, and it drops (status `dropped`) the pending notes of
+failed and cancelled runs. It handles at most 50 runs in one pass (`STEER_SWEEP_BATCH`).
+
 **Approvals.** `ApprovalRequired` pauses the run: the status is `paused`, `pending_approval_id`
 is the approval id, and the runtime state is stored. If the tool gate did not store the
 approval, the queue stores it with the same rules as the gate (Section 16.1). When the approval
@@ -1931,7 +1963,7 @@ Section 15.1) or for `db_<conn>_execute` (Section 10.4) also has Approve and Den
   text, and in the web page and in Slack it is normal text.
 - The names of channel commands are reserved (`new`, `stop`, `model`, `start`, `pair`,
   `help`, `skills`, `approve`, `deny`, `resume`, `memory`, `cron`, `compact`, `learn`,
-  and more). The lint refuses them as skill names, so a skill never hides a command.
+  `steer`, `handoff`, and more). The lint refuses them as skill names, so a skill never hides a command.
 - Telegram: `/name rest`. A skill name can have hyphens, but Telegram menus and the legacy
   parser allow only letters, digits, and `_`. So `/code_review` and `/code-review` both
   mean the skill `code-review`. In a group, the message still needs a mention or a reply,
@@ -2661,9 +2693,48 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 4. **Outbound**: stream the reply (edit one message as text arrives), send files and images,
    and split long text by the channel's limits.
 5. **Controls**: render approval cards and `clarify` questions as buttons, and map slash
-   commands (`/new`, `/stop`, `/resume`, `/model`, `/skills`, `/memory`, `/cron`, `/approve`,
-   `/deny`, `/<skill-name>`). A skill command changes the text of the
+   commands (`/new`, `/stop`, `/steer`, `/handoff`, `/resume`, `/model`, `/skills`, `/memory`,
+   `/cron`, `/approve`, `/deny`, `/<skill-name>`). A skill command changes the text of the
    message (Section 9.5).
+
+**Busy controls and handoff (M3.9).** The queue, `/stop`, and `/steer` are in Section 4.3. Each
+channel shows them in the same way:
+
+| Control | Telegram | Slack | Web app |
+|---|---|---|---|
+| Queue | The reply to a message that waits says "Queued", with the steer and stop commands. When the run starts, the gateway follows it. | The same, in the direct message or the thread. | `POST /sessions/{id}/messages` answers `queued: true`, and the chat shows a notice. |
+| Stop | `/stop` | `/sama stop` | `/stop` in the composer, or the Stop button. |
+| Steer | `/steer TEXT` | `/sama steer TEXT` in a direct message. In a thread, a mention with `/steer TEXT`, because a Slack command has no thread. | `/steer TEXT` in the composer (`POST /sessions/{id}/steer`). |
+| Handoff | `/handoff slack` or `/handoff web` in the direct chat | `/sama handoff telegram` or `/sama handoff web` in a direct message | `/handoff telegram` or `/handoff slack` in the composer (`POST /sessions/{id}/handoff`). |
+
+A chat follower that follows a run also follows the new run when the notes of the run are
+requeued (Section 4.3), so the answer to a late note comes in the same chat.
+
+`/handoff` (`sama.gateway.handoff.Handoffs`) moves a session to the direct chat of the user in
+another channel. The rules:
+
+- Only a `private` session of the user can move, and only when it is `active` and has no worker
+  bot. A shared session belongs to its channel or group.
+- For Telegram and Slack, the user must have a channel identity in the same workspace (Section
+  11.3), and the integration must be active. A Slack handoff opens the direct message with
+  `conversations.open`.
+- In one transaction, `move` locks the session row, binds the session to the target chat,
+  deletes all other chat bindings of the session, writes a row in `session_handoffs`, and writes
+  the audit entry `session.handoff`. The web app shows every session that the user can read, so
+  a handoff to the web app only deletes the chat bindings, and the answer has the link to the
+  session.
+- The `session_handoffs` row keeps the open runs of the session in `run_ids`: the handoff takes
+  them. After the commit, the target gateway follows these runs in the new chat and then sends
+  a short note there. These followers do not check the follower limit of the gateway, because
+  the handoff moves the followers and does not add them.
+- Each run has one owner of its output: the follower that the newest handoff of the run
+  started, or the first follower when no handoff took the run. Every other follower of the run
+  stops at its next send (`moved_away`), and does not go on to the run of the late `/steer`
+  notes of the run: the owner follows that run. Thus the reply of an open run comes only in the new
+  chat, a round trip (Telegram to Slack to Telegram) sends the reply once, and the reply of a
+  run that ended before the handoff still comes in the old chat. A handoff to the web app takes
+  the open runs too, but no chat follows them.
+- Telegram accepts `/handoff` only in a private chat, and Slack only in a direct message.
 
 ### 11.2 Adapters
 
@@ -2785,7 +2856,9 @@ cross-org check of Section 17.1 through the API.
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
 | `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
-| `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id`). At most 32,000 characters. `429` over a rate limit. `409` for an archived session. |
+| `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `409` for an archived session. |
+| `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
+| `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `POST /sessions/{id}/compact` | Queue a `/compact` run (`202` with `run_id`). The body is optional: `focus`, at most 6,000 characters. `409` if the session is busy, not active, or has nothing to compact. `429` over a rate limit (Section 6.3, M2.6). |
 | `GET /sessions/{id}/compactions` | The compactions of the session, newest first: `trigger`, token counts, the archive session, `completed_at`. |
 | `GET /sessions/{id}/lineage` | The ancestors and the children of the session. A linked session that the user cannot read is not in the answer. |
@@ -3057,6 +3130,8 @@ session (`lineage = branch`) with that profile and binds the chat to it. `/help`
 commands. Since M2.6, `/compact [focus]` makes the context of the session shorter (it follows
 the busy rule of Section 6.3 and answers with the token counts), and `/pin <text>`, `/pins`,
 and `/unpin <number>` manage the context pins. They work in direct chats and in linked groups.
+Since M3.9, `/steer <text>` adds a note to the open run, and `/handoff slack` or `/handoff web`
+moves a private session from the direct chat (Section 11.1).
 
 **Outbound.** For each run the gateway reads the run status and then the new `run_events`.
 Text deltas go into one reply message that the gateway edits at most once in 1.5 seconds.
@@ -3225,6 +3300,8 @@ answer that only the sender sees.
   same time cannot bind another session), `/sama stop` (the direct message, or all threads of the
   channel), `/sama pair CODE`, and `/sama help`. Since M2.6, `/sama compact [focus]`,
   `/sama pin TEXT`, `/sama pins`, and `/sama unpin NUMBER` work in direct messages (Section 6.3);
+- since M3.9, `/sama steer TEXT` and `/sama handoff telegram|web` work in direct messages. In a
+  thread, a mention with `/steer TEXT` adds a note to the run of the thread (Section 11.1);
 - the gateway escapes `&`, `<`, and `>` in all text that it sends, so the text of a model
   cannot mention people or channels. Approval cards use `plain_text` blocks;
 - before each send it checks the link again, as the Telegram gateway does (Section 11.3). In a
@@ -5083,6 +5160,8 @@ migrated schema.
 | `runtime_session_items` | The items of an OpenAI runtime conversation: `org_id`, `session_id`, `conversation`, `seq` (from 0, no gaps), `item` (JSON). The key is `(session_id, conversation, seq)` (migration `0025`, Section 5.3). |
 | `context_pins` | The pins of a session: `org_id`, `session_id`, `created_by_user_id`, `text` (1 to 2,000 characters), `source` (`user` or `message`), `injected_at`, `injected_run_id` (migration `0018`, Section 6.3). |
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
+| `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
+| `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
 
 Rules:
 

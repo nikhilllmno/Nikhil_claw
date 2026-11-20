@@ -25,6 +25,9 @@ class GateDecision:
 
     action: Literal["allow", "deny", "ask"]
     reason: str = ""
+    steer: str = ""
+    """The notes of ``/steer`` for the run (architecture Section 4.3). The adapter gives them
+    to the model with the verdict."""
 
 
 class ToolGate(Protocol):

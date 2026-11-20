@@ -145,6 +145,8 @@ TASK_AUTHOR_KINDS: Final = ("user", "agent", "system")
 MAX_TASK_DEPENDENCIES: Final = 20
 COMPACTION_TRIGGERS: Final = ("auto", "manual")
 PIN_SOURCES: Final = ("user", "message")
+STEER_STATUSES: Final = ("pending", "delivered", "requeued", "dropped")
+MAX_STEER_CHARS: Final = 4000
 EMBEDDING_DIMENSIONS: Final = 1536
 """The size of a message embedding: the output of ``text-embedding-3-small``
 (docs/architecture.md, Section 7.1)."""
@@ -2426,3 +2428,81 @@ class WorkflowReceipt(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RunSteer(Base):
+    """A note of ``/steer`` for a running run (docs/architecture.md, Section 4.3).
+
+    The tool gate gives the pending notes of a run to the runtime at the next tool call of the
+    run (``delivered``). When the run completes before that, the notes go to the session as
+    one new message (``requeued``, with the run that answers it). A run that fails or stops
+    drops its pending notes (``dropped``). Only the control plane writes the table."""
+
+    __tablename__ = "run_steers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("status", STEER_STATUSES), name="status"),
+        CheckConstraint(f"char_length(text) BETWEEN 1 AND {MAX_STEER_CHARS}", name="text_length"),
+        CheckConstraint("(status = 'delivered') = (delivered_at IS NOT NULL)", name="delivered"),
+        CheckConstraint("(status = 'requeued') = (requeued_run_id IS NOT NULL)", name="requeued"),
+        Index(None, "org_id", "run_id", "created_at"),
+        Index(None, "run_id", postgresql_where=text("status = 'pending'")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    """The redacted text of the note."""
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requeued_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The run of the message that took the note after its run completed."""
+    created_at: Mapped[datetime] = _created_at()
+
+
+class SessionHandoff(Base):
+    """One ``/handoff`` of a private session to another channel (docs/architecture.md,
+    Section 11.1). Only the follower of the newest handoff of a run sends the output of the
+    run. Only the control plane writes the table."""
+
+    __tablename__ = "session_handoffs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id", "session_id"],
+            ["sessions.org_id", "sessions.workspace_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("from_channel", CHANNELS), name="from_channel"),
+        CheckConstraint(_one_of("to_channel", CHANNELS), name="to_channel"),
+        Index(None, "org_id", "session_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    from_channel: Mapped[str] = mapped_column(Text, nullable=False)
+    from_key: Mapped[str | None] = mapped_column(Text)
+    """The binding key of the source chat. Null for the web app."""
+    to_channel: Mapped[str] = mapped_column(Text, nullable=False)
+    to_key: Mapped[str | None] = mapped_column(Text)
+    """The binding key of the target chat. Null for the web app."""
+    run_ids: Mapped[list[uuid.UUID]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), nullable=False, server_default=text("'{}'::uuid[]")
+    )
+    """The open runs that the handoff gave to the target chat. Only the follower of the newest
+    handoff of a run sends its output (``sama.gateway.handoff.moved_away``)."""
+    created_at: Mapped[datetime] = _created_at()

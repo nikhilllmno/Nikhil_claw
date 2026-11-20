@@ -26,7 +26,7 @@ import logging
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -39,10 +39,19 @@ from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.connect import connect_answer
 from sama.gateway.cron import cron_reply
+from sama.gateway.handoff import (
+    USAGE,
+    Chat,
+    HandoffError,
+    Handoffs,
+    moved_away,
+)
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
     COMPACTING,
+    STEER_EMPTY,
+    STEERED,
     Bound,
     FollowSettings,
     KeyedLocks,
@@ -55,6 +64,7 @@ from sama.gateway.sessions import (
     new_session,
     offers_always,
     pin_reply,
+    queued_text,
     send_ending,
     send_media,
     stop_runs,
@@ -99,6 +109,8 @@ HELP: Final = (
     "Send a message to talk to sama.\n"
     "/new - start a new session\n"
     "/stop - stop the current run\n"
+    "/steer <text> - add a note to the current run\n"
+    "/handoff <telegram|slack|web> - move this session to another channel\n"
     "/model - show the agent profiles. /model <name> starts a new session with that profile\n"
     "/compact [focus] - make the context of this session shorter\n"
     "/pin <text> - keep a text in the context. /pins lists the pins. /unpin <number> removes one\n"
@@ -124,6 +136,8 @@ OWN_COMMANDS: Final = frozenset(
         "/unpin",
         "/connect",
         "/cron",
+        "/steer",
+        "/handoff",
     }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
@@ -292,6 +306,7 @@ class TelegramGateway:
         followers: set[object] | None = None,
         pins: PinStore | None = None,
         jobs: JobService | None = None,
+        handoffs: Handoffs | None = None,
     ) -> None:
         """``lockout`` and ``followers`` can be shared by the gateways of all bots, so that
         the limits hold for the whole process."""
@@ -305,6 +320,7 @@ class TelegramGateway:
         self._skills = skills
         self._reviews = reviews
         self._connections = connections
+        self._handoffs = handoffs
         self._pins = pins or PinStore(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
@@ -427,6 +443,14 @@ class TelegramGateway:
             )
             return
 
+        if command == "/steer":
+            if not rest:
+                await self._say(chat_id, STEER_EMPTY.format(command="/steer"), reply_to=message_id)
+                return
+            if await self._steer(chat_id, message_id, rest, target, grants):
+                return
+            # No run is open: the note is a normal message.
+            command, text = None, rest
         skill_command = (
             command is not None and command not in OWN_COMMANDS and self._skills is not None
         )
@@ -481,6 +505,79 @@ class TelegramGateway:
             self._followers.discard(place)
             raise
         self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
+        if await self._queue.waits(org_id=target.org_id, run_id=run_id):
+            await self._say(chat_id, queued_text("/steer", "/stop"), reply_to=message_id)
+
+    async def _steer(
+        self, chat_id: int, message_id: int, note: str, target: Target, grants: Grants
+    ) -> bool:
+        """Adds ``note`` to the open run of the chat session. False when no run is open."""
+        current = await self._session(chat_id, target, grants, create=False)
+        if current is None:
+            return False
+        try:
+            steered = await self._queue.steer(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                text=note,
+                user_id=target.user_id,
+            )
+        except QueueError as error:
+            await self._say(chat_id, str(error), reply_to=message_id)
+            return True
+        if steered is None:
+            return False
+        await self._say(chat_id, STEERED, reply_to=message_id)
+        return True
+
+    async def _handoff(self, chat_id: int, to: str, target: Target, grants: Grants) -> str:
+        """``/handoff``: moves the session of a direct chat (Section 11.1)."""
+        if not to:
+            return USAGE.format(command="/handoff")
+        if self._handoffs is None:
+            return "sama cannot move sessions now."
+        if target.audience != "private":
+            return "Only a direct chat with sama can move its session."
+        current = await self._session(chat_id, target, grants, create=False)
+        if current is None:
+            return "This chat has no session to move."
+        try:
+            moved = await self._handoffs.move(
+                org_id=target.org_id,
+                user_id=target.user_id,
+                session_id=current.session_id,
+                from_channel=CHANNEL,
+                from_key=self._binding_key(chat_id),
+                to_channel=to,
+            )
+        except HandoffError as error:
+            return str(error)
+        return moved.text
+
+    # -- handoff door ---------------------------------------------------------------------
+
+    async def open_chat(self, identity: Any) -> Chat:
+        """The direct chat of a linked account: its chat id is the user id."""
+        chat_id = int(identity.external_id)
+        return Chat(self._binding_key(chat_id), chat_id)
+
+    async def adopt(
+        self,
+        chat: Chat,
+        target: Target,
+        run_ids: Sequence[uuid.UUID],
+        text: str,
+        *,
+        handoff_id: int,
+    ) -> None:
+        """Takes a session after a handoff: the open runs of the session, then a note. The
+        followers do not check the limit: the handoff moves them, it does not add them."""
+        chat_id = int(chat.address)
+        for run_id in run_ids:
+            place = object()
+            self._followers.add(place)
+            self._spawn(self._follow_run(chat_id, target, run_id, None, place, via=handoff_id))
+        await self._say(chat_id, text)
 
     async def _expand(self, chat_id: int, target: Target, grants: Grants, text: str) -> str | None:
         """The message text for a skill command, or ``None`` if ``text`` is not one."""
@@ -693,6 +790,9 @@ class TelegramGateway:
             await self._say(
                 chat_id, "Stopped." if stopped else "No run is open now.", reply_to=message_id
             )
+        elif command == "/handoff":
+            answer = await self._handoff(chat_id, rest, target, grants)
+            await self._say(chat_id, answer, reply_to=message_id)
         elif command == "/model":
             await self._model(chat_id, message_id, rest, target, grants)
         elif command == "/skills":
@@ -872,17 +972,28 @@ class TelegramGateway:
         return linked is not None
 
     async def _follow_run(
-        self, chat_id: int, target: Target, run_id: uuid.UUID, reply_to: int, place: object
+        self,
+        chat_id: int,
+        target: Target,
+        run_id: uuid.UUID,
+        reply_to: int | None,
+        place: object,
+        *,
+        via: int | None = None,
     ) -> None:
+        """Follows the run, then the run of its late ``/steer`` notes (M3.9). The output stops
+        when the chat loses its link or a handoff gives the run to another follower. ``via`` is
+        the handoff that started this follower."""
         settings = self._settings
         org_id = target.org_id
 
         async def allowed() -> bool:
             async with self._engine.connect() as connection:
-                return await self._may_deliver(connection, chat_id, target)
+                return await self._may_deliver(
+                    connection, chat_id, target
+                ) and not await moved_away(connection, org_id, run_id, via)
 
         outbox = _Outbox(self._client, chat_id, allowed)
-        reply = Reply(outbox, reply_to, settings.edit_interval_s)
 
         async def send_card(row: Any) -> None:
             text, buttons = _approval_card(row)
@@ -891,15 +1002,27 @@ class TelegramGateway:
         try:
             with contextlib.suppress(TelegramError):
                 await self._client.typing(chat_id)
-            status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
-            await send_ending(self._engine, outbox, org_id, run_id, status, reply)
-            await send_media(self._engine, outbox, org_id, run_id, reply_to=reply_to)
+            while True:
+                reply = Reply(outbox, reply_to, settings.edit_interval_s)
+                status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
+                await send_ending(self._engine, outbox, org_id, run_id, status, reply)
+                await send_media(self._engine, outbox, org_id, run_id, reply_to=reply_to)
+                after = await self._queue.requeued_run(org_id=org_id, run_id=run_id)
+                if after is None or await self._handed_off(org_id, run_id, via):
+                    # A handoff gave the run to another follower: that follower takes the run
+                    # of the late notes too.
+                    break
+                run_id, reply_to = after, None
         except _Unlinked:
             log.warning("the chat lost its link; run=%s is not delivered", run_id)
         except TelegramError as error:
             log.warning("a Telegram reply failed run=%s error=%s", run_id, error)
         finally:
             self._followers.discard(place)
+
+    async def _handed_off(self, org_id: uuid.UUID, run_id: uuid.UUID, via: int | None) -> bool:
+        async with self._engine.connect() as connection:
+            return await moved_away(connection, org_id, run_id, via)
 
     # -- approvals ------------------------------------------------------------------------
 
