@@ -4,6 +4,10 @@ Section 7.1).
 The migration needs the ``vector`` extension (pgvector). Supabase offers it. A plain Postgres
 needs a pgvector image, for example ``pgvector/pgvector:pg17``.
 
+Lock: ``messages.search_vector`` is a stored generated column. Adding it rewrites the whole
+``messages`` table under an ACCESS EXCLUSIVE lock, and the GIN index build adds to this time.
+A large deployment must run this migration in a maintenance window.
+
 Revision ID: 0014
 Revises: 0013
 Create Date: 2026-11-20

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 import pytest
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import EMBEDDING_DIMENSIONS
+from sama.db.models import EMBEDDING_DIMENSIONS, Membership, Message
 from sama.search import EmbedError, EmbedWorker, SessionHit, SessionSearch, SessionSearchError
+from sama.search.core import HEADLINE_SOURCE_CHARS
 from sama.vault.redact import default_redactor
 from tests.search.rig import World, say
 
@@ -25,9 +27,14 @@ class Topics:
         self.fail: Exception | None = None
         self.delay = 0.0
         self.calls = 0
+        self.texts: list[str] = []
+        self.before: Callable[[], Awaitable[None]] | None = None
 
     async def embed(self, org_id: uuid.UUID, texts: Sequence[str]) -> list[list[float]] | None:
         self.calls += 1
+        self.texts.extend(texts)
+        if self.before is not None:
+            await self.before()
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.fail is not None:
@@ -238,6 +245,14 @@ async def test_the_current_session_can_be_read(engine: AsyncEngine, talk: World)
 # -- meaning search ---------------------------------------------------------------------------
 
 
+async def first_message(engine: AsyncEngine, session: uuid.UUID) -> uuid.UUID:
+    async with engine.connect() as connection:
+        row = await connection.execute(
+            select(Message.id).where(Message.session_id == session).order_by(Message.seq).limit(1)
+        )
+        return row.scalar_one()
+
+
 async def embed_all(engine: AsyncEngine, topics: Topics) -> None:
     worker = EmbedWorker(engine, topics)
     while await worker.run_once():
@@ -306,3 +321,115 @@ async def test_an_org_without_embeddings_makes_no_embedding_call(
     hits = await SessionSearch(engine, topics).search(talk.claims(), "pgbouncer", 5)
     assert {h.session_id for h in hits} == {talk.ids["s2"], talk.ids["mine"]}
     assert topics.calls == 0
+
+
+# -- redaction order ------------------------------------------------------------------------
+
+SECRET = "zq-redact-me-7781"
+PATTERN_SECRET = "sk-" + "a1B2c3D4e5" * 3
+
+
+@pytest.mark.parametrize(
+    ("secret", "query"),
+    [(SECRET, "redact"), (SECRET, "7781"), (PATTERN_SECRET, "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5")],
+    ids=["known part", "known number", "pattern part"],
+)
+async def test_a_search_for_a_part_of_a_secret_does_not_show_the_secret(
+    engine: AsyncEngine, talk: World, secret: str, query: str
+) -> None:
+    default_redactor().add(SECRET)
+    try:
+        await say(engine, talk.org, talk.ids["s1"], f"the token is {secret} for the deploy")
+        hits = await SessionSearch(engine).search(talk.claims(), query, 5)
+    finally:
+        default_redactor().forget(SECRET)
+    shown = " ".join(s.text for h in hits for s in h.snippets)
+    assert shown, "the message must be found"
+    for part in ("zq-", "me-7781", "redact-me", "sk-", "a1B2c3D4e5"):
+        assert part not in shown
+    assert "[REDACTED]" in shown
+
+
+@pytest.mark.parametrize("secret", [SECRET, PATTERN_SECRET], ids=["known", "pattern"])
+async def test_a_cut_of_the_source_text_does_not_split_a_secret(
+    engine: AsyncEngine, talk: World, secret: str
+) -> None:
+    default_redactor().add(SECRET)
+    try:
+        # The secret starts before character 20,000 and ends after it.
+        body = "a " * 9_990 + "needle " + secret + " tail"
+        assert body.index(secret) < HEADLINE_SOURCE_CHARS < body.index(secret) + len(secret)
+        await say(engine, talk.org, talk.ids["s1"], body)
+        hits = await SessionSearch(engine).search(talk.claims(), "needle", 5)
+    finally:
+        default_redactor().forget(SECRET)
+    shown = " ".join(s.text for h in hits for s in h.snippets)
+    assert shown
+    assert secret[:6] not in shown
+    assert secret[-6:] not in shown
+
+
+async def test_the_query_is_redacted_before_the_embedding(engine: AsyncEngine, talk: World) -> None:
+    topics = Topics()
+    await embed_all(engine, topics)
+    topics.texts.clear()
+    default_redactor().add(SECRET)
+    try:
+        await SessionSearch(engine, topics).search(talk.claims(), f"pgbouncer {SECRET}", 5)
+    finally:
+        default_redactor().forget(SECRET)
+    assert topics.texts == ["pgbouncer [REDACTED]"]
+
+
+# -- fresh grants ---------------------------------------------------------------------------
+
+
+async def test_a_grant_that_ends_during_the_embedding_hides_the_session(
+    engine: AsyncEngine, talk: World
+) -> None:
+    ids = talk.ids
+    topics = Topics()
+    await embed_all(engine, topics)
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Membership).values(
+                org_id=talk.org, user_id=ids["mia"], workspace_id=ids["ws2"], role="member"
+            )
+        )
+    search = SessionSearch(engine, topics)
+    before = await search.search(talk.claims(), "pgbouncer", 10)
+    assert ids["other_ws"] in {h.session_id for h in before}
+
+    async def revoke() -> None:
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(Membership).where(
+                    Membership.user_id == ids["mia"], Membership.workspace_id == ids["ws2"]
+                )
+            )
+
+    topics.before = revoke
+    after = await search.search(talk.claims(), "pgbouncer", 10)
+    shown = " ".join([h.title or "" for h in after] + [s.text for h in after for s in h.snippets])
+    assert ids["other_ws"] not in {h.session_id for h in after}
+    assert "other workspace" not in shown
+    # The access to the own workspace stays.
+    assert {h.session_id for h in after} >= {ids["s2"], ids["mine"]}
+
+
+async def test_hydration_applies_the_rule_to_each_session_and_message(
+    engine: AsyncEngine, talk: World
+) -> None:
+    ids = talk.ids
+    search = SessionSearch(engine)
+    async with engine.connect() as connection:
+        visible = await search.visible(connection, talk.claims())
+        # A private session of another user and a session of another workspace are chosen. The
+        # rule drops them although the ids are in the list.
+        chosen = [
+            (ids["bobs"], [await first_message(engine, ids["bobs"])]),
+            (ids["other_ws"], [await first_message(engine, ids["other_ws"])]),
+            (ids["s2"], [await first_message(engine, ids["s2"])]),
+        ]
+        hits = await search._hits(connection, visible, func.to_tsquery("simple", "x"), chosen)
+    assert [h.session_id for h in hits] == [ids["s2"]]

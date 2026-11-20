@@ -742,12 +742,18 @@ load the messages of a session that the search found. Neither tool calls an LLM.
 - `messages.embedded_at` is null until the embed worker has handled the message. A partial
   index on the null rows keeps the work queue small.
 
+**Migration lock.** `search_vector` is a stored generated column. `ALTER TABLE ... ADD COLUMN`
+with a stored expression rewrites the whole `messages` table, and it holds an `ACCESS
+EXCLUSIVE` lock until the rewrite ends. The GIN index build adds to this time. A large
+deployment must run migration `0014` in a maintenance window, with the control plane and the
+tool servers stopped. A small database needs seconds.
+
 **Embed worker.** `EmbedWorker` (`src/sama/search/embed.py`) is a loop of the control plane.
 It runs only if an OpenAI key is available (the vault or `OPENAI_API_KEY`, as for voice notes
 and the model proxy). It takes the oldest messages with no `embedded_at`, 64 at a time, and
 calls the OpenAI embeddings endpoint (`text-embedding-3-small`, 1,536 dimensions) with the key
-of the org. The input is the first 6,000 characters of the text. The rows and `embedded_at`
-go in one transaction.
+of the org. The input is the first 6,000 characters of the redacted text (see "Redaction
+order"). The rows and `embedded_at` go in one transaction.
 
 - A message with no text, or with the role `system` or `tool`, gets `embedded_at` and no
   embedding.
@@ -756,8 +762,27 @@ go in one transaction.
   messages too, because they still have no `embedded_at`.
 - A request that the provider refuses (a 4xx other than 401, 403, 408, and 429) is tried one
   message at a time. The message that fails gets `embedded_at` and no embedding.
-- A network error, a 401, 403, 408, 429, or a 5xx backs off, 5 seconds doubled up to 5
-  minutes. Nothing is marked.
+- A network error, a 401, 403, 408, 429, or a 5xx puts only the org of the call on a backoff,
+  5 seconds doubled for each failure up to 5 minutes. Nothing is marked. The query for
+  pending messages skips an org that waits, and the worker goes on with the other orgs in
+  the same pass. So the failing key of one org does not stop the embeddings of the others. A
+  success clears the backoff of the org.
+
+**Redaction order.** Secrets must not reach the embedding provider, the snippets, or the
+agent. Redaction runs on the complete text first. A cut, a highlight, or a mark comes after
+that, because each of them can split a secret into parts that the redactor does not know.
+
+- `OpenAIEmbedder` is the only way out of the process for the text of a message or a query.
+  It redacts each complete text, then cuts the redacted text to 6,000 characters. The worker
+  gives it the complete texts. A message that was stored before the redactor learned a
+  secret is redacted when it is embedded, not when it is stored. The search also redacts the
+  query before it calls the embedder.
+- A snippet is made from the redacted text. `ts_headline` runs on that text, and the cut to
+  20,000 characters comes after the redaction. A search for a part of a secret still finds
+  the message through the index, but the snippet shows `[REDACTED]` and not the secret. The
+  last redaction of the output stays as a second guard.
+- A vector that was stored before the redactor learned a secret still encodes that secret.
+  It cannot give the text back, and nothing returns it to the agent.
 
 **Search.** `session_search(query, limit)` runs one or two ranked lists. Each list gives
 50 messages (roles `user` and `assistant`).
@@ -779,6 +804,13 @@ latest sessions, with no snippet. The current session is not in the result.
 messages of one session in order: 20 by default, at most 50. A message is cut to 4,000
 characters, and a page to 20,000 characters. The result says which `offset` starts the next
 page.
+
+**Fresh grants.** The query embedding is a slow call (3 seconds at most). The search makes
+the query vector first, and only then loads the grants of the user. All reads of the search
+use this fresh rule. The last step loads the titles and messages of the chosen sessions with
+the same rule, and not by id alone. So a membership that ends during the embedding call
+removes the session from the result. The ids that the ranked lists chose are never an
+authorization.
 
 **Who sees what.** Every query has the org of the run and this rule (the rule of
 Section 11.3, "Audience and principal", and `sama_private.session_visible`). The control

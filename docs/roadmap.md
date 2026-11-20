@@ -164,7 +164,10 @@ Done: M1.1 to M1.19, M2.1 to M2.3, M2.5 (below the list of M1 notes).
   shared run sees only shared sessions of its workspace. A session that the run may not see gives
   the error of a missing session. The embed worker of the control plane needs an OpenAI key.
   Without one, search uses full text only. The database must have pgvector (CI and the README use
-  `pgvector/pgvector:pg17`). Not in M2.5: embeddings in `model_calls`, a search of titles and
+  `pgvector/pgvector:pg17`). Migration `0014` rewrites `messages` under a lock (a stored generated
+  column), so a large deployment needs a maintenance window. Embedding input and query are
+  redacted before they leave the process, snippets are made from redacted text, and the search
+  loads grants after the query embedding. Not in M2.5: embeddings in `model_calls`, a search of titles and
   summaries (M2.4), and a web UI.
 
 | # | Item | Acceptance criteria |

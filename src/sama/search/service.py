@@ -145,25 +145,25 @@ class SessionSearch:
         limit = max(1, min(limit, MAX_LIMIT))
         org_id = _uuid(claims.org_id)
         current = _uuid(claims.session_id)
+        if not text_query:
+            async with self._engine.connect() as connection:
+                visible = await self.visible(connection, claims)
+                return await self._recent(connection, and_(visible, Session.id != current), limit)
+        tsquery = func.websearch_to_tsquery(_SIMPLE, text_query)
+        # The query embedding is a slow call. It runs before the grants load, so that a grant
+        # that changes during the call counts: every read below uses the fresh rule.
+        vector = await self._query_vector(org_id, text_query)
         async with self._engine.connect() as connection:
             visible = await self.visible(connection, claims)
             others = and_(visible, Session.id != current)
-            if not text_query:
-                return await self._recent(connection, others, limit)
-            tsquery = func.websearch_to_tsquery(_SIMPLE, text_query)
             ranked = [await self._full_text(connection, others, tsquery)]
-            embedder = self._embedder
-            has_vectors = embedder is not None and await self._has_embeddings(connection, org_id)
-        if embedder is not None and has_vectors:
-            vector = await self._query_vector(embedder, org_id, text_query)
             if vector is not None:
-                async with self._engine.connect() as connection:
-                    ranked.append(await self._by_meaning(connection, others, vector))
-        chosen = pick(fuse(ranked), limit)
-        if not chosen:
-            return []
-        async with self._engine.connect() as connection:
-            return await self._hits(connection, org_id, tsquery, chosen)
+                ranked.append(await self._by_meaning(connection, others, vector))
+            chosen = pick(fuse(ranked), limit)
+            if not chosen:
+                return []
+            # The chosen ids are not an authorization. The rule applies again to each row.
+            return await self._hits(connection, others, tsquery, chosen)
 
     async def _recent(
         self, connection: AsyncConnection, visible: ColumnElement[bool], limit: int
@@ -195,14 +195,19 @@ class SessionSearch:
         )
         return row.first() is not None
 
-    async def _query_vector(
-        self, embedder: Embedder, org_id: uuid.UUID, query: str
-    ) -> list[float] | None:
-        """The embedding of the query, or ``None``: no key, a slow call, or a failed call. The
-        search then uses the full-text list alone."""
+    async def _query_vector(self, org_id: uuid.UUID, query: str) -> list[float] | None:
+        """The embedding of the query, or ``None``: no embedder, no embeddings in the org, no
+        key, a slow call, or a failed call. The search then uses the full-text list alone. The
+        query is redacted here and again by the embedder."""
+        embedder = self._embedder
+        if embedder is None:
+            return None
+        async with self._engine.connect() as connection:
+            if not await self._has_embeddings(connection, org_id):
+                return None
         try:
             async with asyncio.timeout(self._embed_timeout_s):
-                vectors = await embedder.embed(org_id, [query])
+                vectors = await embedder.embed(org_id, [redact(query)])
         except (TimeoutError, EmbedError) as error:
             log.warning("session search: no query embedding: %s", type(error).__name__)
             return None
@@ -242,45 +247,60 @@ class SessionSearch:
     async def _hits(
         self,
         connection: AsyncConnection,
-        org_id: uuid.UUID,
+        visible: ColumnElement[bool],
         tsquery: Any,
         chosen: Sequence[tuple[uuid.UUID, list[uuid.UUID]]],
     ) -> list[SessionHit]:
+        """Loads the chosen sessions and messages. ``visible`` applies to both reads."""
         session_ids = [session_id for session_id, _ in chosen]
         message_ids = [message_id for _, ids in chosen for message_id in ids]
         sessions = {
             row.id: row
             for row in await connection.execute(
-                select(*_session_columns()).where(
-                    Session.org_id == org_id, Session.id.in_(session_ids)
-                )
+                select(*_session_columns()).where(visible, Session.id.in_(session_ids))
             )
         }
-        body = func.left(Message.content["text"].astext, HEADLINE_SOURCE_CHARS)
-        snippets = {
-            row.id: Snippet(
-                row.id,
-                row.role,
-                row.created_at,
-                redact(row.snippet.strip()),
+        rows = await connection.execute(
+            select(
+                Message.id,
+                Message.session_id,
+                Message.role,
+                Message.created_at,
+                Message.content["text"].astext.label("body"),
             )
-            for row in await connection.execute(
-                select(
-                    Message.id,
-                    Message.role,
-                    Message.created_at,
-                    func.ts_headline(_SIMPLE, body, tsquery, _HEADLINE_OPTIONS).label("snippet"),
-                ).where(Message.org_id == org_id, Message.id.in_(message_ids))
-            )
-        }
+            .join(Session, and_(Session.org_id == Message.org_id, Session.id == Message.session_id))
+            .where(visible, Message.id.in_(message_ids))
+        )
+        snippets: dict[uuid.UUID, Snippet] = {}
+        for row in rows:
+            if row.session_id not in sessions:
+                continue
+            text = await self._snippet(connection, tsquery, row.body or "")
+            snippets[row.id] = Snippet(row.id, row.role, row.created_at, text)
         hits = []
         for session_id, ids in chosen:
-            row = sessions.get(session_id)
-            if row is None:
+            session = sessions.get(session_id)
+            if session is None:
                 continue
             found = tuple(snippets[i] for i in ids if i in snippets)
-            hits.append(_hit(row, found))
+            hits.append(_hit(session, found))
         return hits
+
+    async def _snippet(self, connection: AsyncConnection, tsquery: Any, body: str) -> str:
+        """The snippet of a message. The complete text is redacted first. Highlight and cut
+        come after that, so that the marks and the cut cannot split a secret into parts that
+        the redactor does not know. The last redaction of the output stays as a second guard."""
+        safe = redact(body)[:HEADLINE_SOURCE_CHARS]
+        highlighted = (
+            await connection.execute(
+                select(
+                    func.ts_headline(
+                        _SIMPLE, bindparam("body", safe, type_=Text), tsquery, _HEADLINE_OPTIONS
+                    )
+                )
+            )
+        ).scalar_one()
+        return redact(highlighted.strip())
 
     # -- read -------------------------------------------------------------------------------
 
