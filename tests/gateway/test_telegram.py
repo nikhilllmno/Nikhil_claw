@@ -23,10 +23,12 @@ from sama.db.models import (
     Run,
     Session,
     SessionBinding,
+    ToolPolicy,
     User,
 )
 from sama.gate.approvers import SHARED_REFUSAL
 from sama.gateway.pairing import create_code
+from sama.gateway.sessions import ALWAYS_LABEL, ALWAYS_OUTCOME
 from sama.gateway.telegram import (
     BUSY,
     PAIR_PROMPT,
@@ -346,6 +348,55 @@ async def test_an_approval_card_is_decided_with_a_button(
     edits = [body for method, body in telegram.calls if method == "editMessageText"]
     assert edits[-1]["text"].endswith("Approved by Mia.")
     assert edits[-1]["reply_markup"] == {"inline_keyboard": []}
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert telegram.texts(DM)[-1] == "deleted"
+
+
+async def test_always_allow_for_me_writes_a_policy_rule(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(approval_script())
+    await gateway.handle_update(message("clean up"))
+    assert await harness.worker.run_once()
+
+    async def carded() -> bool:
+        return any("reply_markup" in body for body in telegram.sent(DM))
+
+    await until(carded)
+    card = next(body for body in telegram.sent(DM) if "reply_markup" in body)
+    always = card["reply_markup"]["inline_keyboard"][1][0]
+    assert always["text"] == ALWAYS_LABEL
+    assert always["callback_data"].endswith(":a")
+    await gateway.handle_update(
+        {
+            "update_id": next(_update_ids),
+            "callback_query": {
+                "id": "cb-always",
+                "from": {"id": MIA_TG, "first_name": "Mia"},
+                "data": always["callback_data"],
+                "message": {"message_id": 101, "chat": {"id": DM}, "text": card["text"]},
+            },
+        }
+    )
+    answers = [body for method, body in telegram.calls if method == "answerCallbackQuery"]
+    assert answers[-1] == {"callback_query_id": "cb-always", "text": ALWAYS_OUTCOME}
+    edits = [body for method, body in telegram.calls if method == "editMessageText"]
+    assert edits[-1]["text"].endswith(f"{ALWAYS_OUTCOME} by Mia.")
+    async with engine.connect() as connection:
+        rules = (
+            await connection.execute(
+                select(ToolPolicy.user_id, ToolPolicy.tool, ToolPolicy.action).where(
+                    ToolPolicy.org_id == tenant.org
+                )
+            )
+        ).all()
+    assert [tuple(rule) for rule in rules] == [(tenant.ids["mia"], "Bash", "allow")]
     assert await harness.worker.run_once()
     await gateway.drain()
     assert telegram.texts(DM)[-1] == "deleted"

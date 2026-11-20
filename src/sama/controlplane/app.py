@@ -55,6 +55,7 @@ from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, Sand
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
 from sama.review.proposals import PostgresProposalStore
+from sama.review.soul import SoulProposer
 from sama.runtime.archive import ARCHIVE_PATH
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.sandbox.base import SandboxProvider
@@ -221,6 +222,7 @@ def build(
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
         memory=MemoryService(memory_store, proposals),
         skills=skill_store,
+        souls=SoulProposer(engine, proposals),
         sessions=SessionSearch(engine, embedder),
         vision=(
             VisionService(
@@ -250,11 +252,15 @@ def build(
         ledger=ledger,
     )
     hub = (
-        TelegramHub(engine, vault, keys=keys, gate=gate, skills=library)
+        TelegramHub(engine, vault, keys=keys, gate=gate, skills=library, reviews=reviews)
         if vault is not None
         else None
     )
-    slack = SlackHub(engine, vault, gate=gate, skills=library) if vault is not None else None
+    slack = (
+        SlackHub(engine, vault, gate=gate, skills=library, reviews=reviews)
+        if vault is not None
+        else None
+    )
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack):

@@ -38,6 +38,7 @@ from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
+    ALWAYS_LABEL,
     COMPACTING,
     Bound,
     FollowSettings,
@@ -70,6 +71,7 @@ from sama.media.images import (
     with_markers,
 )
 from sama.orchestrator.queue import QueueError, RunQueue
+from sama.review.apply import ReviewApplier
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 
@@ -237,6 +239,9 @@ class _Outbox:
 
 
 def _approval_card(row: Any) -> tuple[str, list[list[dict[str, str]]]]:
+    """The text and the buttons of an approval card. A tool call also gets "Always allow for
+    me", which writes a user policy rule (M3.2). A proposal does not: a rule cannot approve
+    a proposal."""
     text = approval_text(row)
     buttons = [
         [
@@ -244,10 +249,12 @@ def _approval_card(row: Any) -> tuple[str, list[list[dict[str, str]]]]:
             {"text": "Deny", "callback_data": f"ap:{row.id.hex}:n"},
         ]
     ]
+    if not getattr(row, "proposal", False):
+        buttons.append([{"text": ALWAYS_LABEL, "callback_data": f"ap:{row.id.hex}:a"}])
     return text, buttons
 
 
-_CALLBACK: Final = re.compile(r"ap:([0-9a-f]{32}):([yn])")
+_CALLBACK: Final = re.compile(r"ap:([0-9a-f]{32}):([yna])")
 
 
 class TelegramGateway:
@@ -261,6 +268,7 @@ class TelegramGateway:
         queue: RunQueue | None = None,
         gate: GateService | None = None,
         skills: SkillLibrary | None = None,
+        reviews: ReviewApplier | None = None,
         transcriber: Transcriber | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
@@ -275,6 +283,7 @@ class TelegramGateway:
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
         self._skills = skills
+        self._reviews = reviews
         self._pins = pins or PinStore(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
@@ -869,7 +878,8 @@ class TelegramGateway:
         if match is None or "id" not in sender:
             await self._answer(callback_id, "This button is not known.")
             return
-        approval_id, approve = uuid.UUID(match.group(1)), match.group(2) == "y"
+        approval_id, choice = uuid.UUID(match.group(1)), match.group(2)
+        approve = choice in "ya"
         identity = await self._identity(str(sender["id"]))
         if identity is None:
             await self._answer(callback_id, "Link your Telegram account to sama first.")
@@ -883,6 +893,8 @@ class TelegramGateway:
                 user_id=identity.user_id,
                 approval_id=approval_id,
                 approve=approve,
+                always_allow=choice == "a",
+                reviews=self._reviews,
             )
         except ApprovalError as error:
             await self._answer(callback_id, str(error))

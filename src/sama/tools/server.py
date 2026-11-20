@@ -51,6 +51,8 @@ from sama.memory.core import (
     Target,
 )
 from sama.memory.service import MemoryService
+from sama.profiles import SOUL_MAX_CHARS
+from sama.review.soul import SUMMARY_MAX_CHARS, SoulError, SoulProposer
 from sama.runtime.archive import (
     ARCHIVE_PATH,
     MAX_ARCHIVE_BODY_BYTES,
@@ -120,6 +122,7 @@ WEB_EXTRACT: Final = "web_extract"
 CLARIFY: Final = "clarify"
 TODO: Final = "todo"
 MEMORY: Final = "memory"
+CHANGE_PROPOSE: Final = "change_propose"
 SESSION_SEARCH: Final = "session_search"
 SESSION_READ: Final = "session_read"
 REPO_CLONE: Final = "repo_clone"
@@ -139,6 +142,7 @@ _EXPECTED = (
     SearchError,
     SessionSearchError,
     SkillError,
+    SoulError,
     TodoError,
     VisionError,
 )
@@ -254,6 +258,8 @@ class ToolServer:
     - ``sessions``: session search. Without it, ``session_search`` and ``session_read`` are
       hidden.
     - ``vision``: image analysis (``vision_analyze``). Without it, the tool is hidden.
+    - ``souls``: proposes a new soul for the profile of the run (``change_propose``, toolset
+      ``self``). Without it, the tool is hidden.
     - ``deferred``: the catalog of deferred tools. With at least one tool in it when the app
       is built, the server has ``tool_search``, ``tool_describe``, and ``tool_call``
       (Section 10.3). Without it, these tools are hidden.
@@ -282,8 +288,10 @@ class ToolServer:
         deferred: DeferredCatalog | None = None,
         archive: ArchiveBackend | None = None,
         gate: GateBackend | None = None,
+        souls: SoulProposer | None = None,
     ) -> None:
         self.signer = signer
+        self.souls = souls
         self.deferred = deferred
         self.archive = archive
         self._archive_slots = asyncio.Semaphore(MAX_CONCURRENT_ARCHIVES)
@@ -512,6 +520,35 @@ class ToolServer:
                     "reason": reason,
                 }
                 return await self._call(ctx, MEMORY, arguments, body)
+
+        if self.souls is not None:
+            souls = self.souls
+
+            @server.tool(
+                name=CHANGE_PROPOSE,
+                description=(
+                    "Propose a change of your own setup. The only target is soul: the "
+                    "instructions that set your persona and the way you work for every user of "
+                    "this agent profile. Give the full new soul in content, not a diff, and a "
+                    "short summary of the change. The change is not saved: a workspace admin "
+                    "or the org owner must approve it on an approval card. After the approval, "
+                    "it applies from the next session. Propose a change only when the user asks "
+                    "for it."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
+                structured_output=False,
+            )
+            async def change_propose_tool(
+                ctx: Context,
+                target: Literal["soul"],
+                content: Annotated[str, Field(max_length=SOUL_MAX_CHARS)],
+                summary: Annotated[str, Field(max_length=SUMMARY_MAX_CHARS)],
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return await souls.propose(claims, content, summary)
+
+                arguments = {"target": target, "content": content, "summary": summary}
+                return await self._call(ctx, CHANGE_PROPOSE, arguments, body)
 
         if self.sessions is not None:
             sessions = self.sessions

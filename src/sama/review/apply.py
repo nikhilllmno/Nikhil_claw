@@ -40,6 +40,7 @@ from sama.memory.core import (
 )
 from sama.memory.service import action_of, scope_of
 from sama.memory.store import MemoryState, MemoryStore, Writer
+from sama.review.soul import SoulError, set_soul
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest
 from sama.skills.store import Expected, PostgresSkillStore
@@ -144,8 +145,31 @@ class ReviewApplier:
             grants = await load_grants(connection, row.org_id, decider)
         if row.kind == "memory":
             await self._apply_memory(row, grants)
+        elif row.kind == "soul":
+            await self._apply_soul(row, grants)
         else:
             await self._apply_skill(row, grants)
+
+    async def _apply_soul(self, row: Any, grants: Grants) -> None:
+        """A new soul of a profile (M3.2). The scope ``org`` needs the org owner, the scope
+        ``workspace`` a workspace admin or the org owner, with the roles of now."""
+        payload = row.payload
+        allowed = (
+            grants.org_owner if row.scope == "org" else grants.admins_workspace(row.workspace_id)
+        )
+        if not allowed:
+            raise SoulError("the person who approved it does not have the role now")
+        async with self._engine.begin() as connection:
+            await set_soul(
+                connection,
+                org_id=row.org_id,
+                profile_id=uuid.UUID(payload["profile_id"]),
+                soul=str(payload["soul"]),
+                base_digest=str(payload["base_digest"]),
+                actor_user_id=grants.user_id,
+                proposal_id=row.id,
+            )
+            await self._mark(connection, row, "applied", None)
 
     async def _apply_memory(self, row: Any, grants: Grants) -> None:
         target = Target(row.payload["target"])

@@ -691,10 +691,11 @@ class GateService:
                 ):
                     raise ApprovalError(SHARED_REFUSAL)
             else:
-                # The proposal of a background review changes shared memory or a shared skill
-                # (Section 9.4). The role decides, and the access to the session does not: the
-                # owner of a private session may lack the role, and an admin may not read the
-                # private session. The admin sees the redacted proposal only.
+                # A proposal of a background review or a chat run changes shared memory, a
+                # shared skill, or a soul (Section 9.4). The role decides, and the access to the
+                # session does not: the owner of a private session may lack the role, and an
+                # admin may not read the private session. The admin sees the redacted proposal
+                # only.
                 allowed = (
                     grants.org_owner
                     if proposed == "org"
@@ -702,9 +703,9 @@ class GateService:
                 )
                 if not allowed:
                     raise ApprovalError(
-                        "only an org owner can decide this proposal"
+                        "only the org owner can decide this proposal"
                         if proposed == "org"
-                        else "only a workspace admin can decide this proposal"
+                        else "only a workspace admin or the org owner can decide this proposal"
                     )
                 always_allow = False
             if row.status != "pending":

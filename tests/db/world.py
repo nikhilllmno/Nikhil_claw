@@ -52,6 +52,7 @@ from sama.db.models import (
     ToolPolicy,
     User,
     VaultSecret,
+    WorkerBot,
     Workspace,
 )
 
@@ -340,6 +341,18 @@ def plan(
             created_by_user_id=ids[user],
             external_id=f"-{uuid.uuid4().int % 10**12}",
             **links,
+        )
+        add(
+            WorkerBot,
+            f"bot:{workspace}",
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            agent_profile_id=ids[profile],
+            integration_id=ids[f"int:{org}"],
+            external_id=f"C{uuid.uuid4().hex[:10].upper()}",
+            name=f"bot {workspace}",
+            daily_budget_usd=5,
+            created_by_user_id=ids[user],
         )
         add(
             PairingCode,
