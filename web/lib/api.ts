@@ -290,15 +290,17 @@ export class ApiClient {
 
   /**
    * A call with the Bearer token. A 401 gives one refresh and one more try. A call whose
-   * account changed while it waited throws and does nothing else.
+   * account changed while it waited throws and does nothing else. `generation` is the
+   * account the whole operation belongs to (the current one if left out). A call that starts
+   * in another one throws without sending anything.
    */
-  async raw(path: string, options: RequestOptions = {}): Promise<Response> {
-    const generation = this.tokens.generation;
-    const current = () => {
-      if (this.tokens.generation !== generation) {
-        throw new ApiError(401, "You signed in as someone else. Try again.");
-      }
-    };
+  async raw(
+    path: string,
+    options: RequestOptions = {},
+    generation: number = this.tokens.generation,
+  ): Promise<Response> {
+    const current = () => this.assertCurrent(generation);
+    current();
     const send = async (token: string): Promise<Response> => {
       const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
       if (options.body !== undefined) headers["Content-Type"] = "application/json";
@@ -324,11 +326,25 @@ export class ApiClient {
     }
   }
 
-  /** A call that returns JSON. A status that is not 2xx throws an `ApiError`. */
-  async json<T>(path: string, options: RequestOptions = {}): Promise<T> {
-    const response = await this.raw(path, options);
+  private assertCurrent(generation: number): void {
+    if (this.tokens.generation !== generation) {
+      throw new ApiError(401, "You signed in as someone else. Try again.");
+    }
+  }
+
+  /**
+   * A call that returns JSON. A status that is not 2xx throws an `ApiError`. The account is
+   * checked again after the body is read, so an answer for the old account is never returned.
+   */
+  async json<T>(
+    path: string,
+    options: RequestOptions = {},
+    generation: number = this.tokens.generation,
+  ): Promise<T> {
+    const response = await this.raw(path, options, generation);
     const data: unknown =
       response.status === 204 ? null : await response.json().catch(() => null);
+    this.assertCurrent(generation);
     if (!response.ok) throw new ApiError(response.status, errorMessage(response.status, data));
     return data as T;
   }
@@ -340,11 +356,15 @@ export class ApiClient {
   getSession = (id: string) => this.json<SessionDetail>(`/sessions/${id}`);
   /** All messages of a session, oldest first, read page by page with the `after` cursor. */
   listMessages = async (id: string): Promise<ChatMessage[]> => {
+    // One account for every page: a switch in between stops the read, it does not go on as B.
+    const generation = this.tokens.generation;
     const all: ChatMessage[] = [];
     for (;;) {
       const after = all.at(-1)?.seq ?? 0;
       const page = await this.json<ChatMessage[]>(
         `/sessions/${id}/messages?after=${after}&limit=${MESSAGE_PAGE}`,
+        {},
+        generation,
       );
       all.push(...page);
       if (page.length < MESSAGE_PAGE) return all;

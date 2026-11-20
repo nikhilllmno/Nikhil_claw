@@ -189,6 +189,44 @@ describe("ApiClient across an account change", () => {
     await rejected;
   });
 
+  it("drops an answer whose body is still downloading when the account changes", async () => {
+    const auth = await signedInAsA(vi.fn());
+    let finish!: () => void;
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"id":"s-a",'));
+        finish = () => {
+          controller.enqueue(encoder.encode('"title":"A"}'));
+          controller.close();
+        };
+      },
+    });
+    const fetcher = vi.fn(async () => new Response(body, { status: 200 }));
+    const client = new ApiClient("https://api.test", auth, fetcher);
+    const rejected = expect(
+      client.createSession({ audience: "owner" } as never),
+    ).rejects.toMatchObject({ status: 401 });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1)); // the headers are in
+    await new Promise((resolve) => setTimeout(resolve, 0)); // the body read has started
+    accountSwitch(auth);
+    finish();
+    await rejected;
+    expect(auth.current?.access_token).toBe("token-b");
+  });
+
+  it("does not send the next page of a read that started as another account", async () => {
+    const auth = await signedInAsA(vi.fn());
+    const page = Array.from({ length: 500 }, (_, i) => ({ seq: i + 1 }));
+    const fetcher = vi.fn(async () => {
+      accountSwitch(auth); // the user switches after the first page is in
+      return json(200, page);
+    });
+    const client = new ApiClient("https://api.test", auth, fetcher);
+    await expect(client.listMessages("s1")).rejects.toMatchObject({ status: 401 });
+    expect(fetcher).toHaveBeenCalledTimes(1); // page 2 is not sent with the token of B
+  });
+
   it("still signs out when the current account gets a 401 twice", async () => {
     const authFetch = vi.fn(async () => json(400, { msg: "no" }));
     const auth = await signedInAsA(authFetch);
