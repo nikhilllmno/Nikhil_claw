@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import sama.runtime.runner as runner_module
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
@@ -29,6 +32,8 @@ from sama.runtime.fake import FakeScript
 from sama.runtime.runner import (
     FORBIDDEN_ENV,
     RUN_TOKEN_ENV,
+    TIMING_PREFIX,
+    WORKDIR_ENV,
     GatePolicy,
     Output,
     RunnerJob,
@@ -283,3 +288,59 @@ def test_the_claude_runtime_gets_an_archiver_when_the_job_has_an_archive_url(
         RunnerJob(op="run", run=request, gate=GatePolicy(), archive_url="http://t/archive"), env
     )
     assert isinstance(static._archiver, RemoteArchiver)  # type: ignore[attr-defined]
+
+
+async def test_a_runner_waits_for_the_runner_lock(tmp_path: Path) -> None:
+    first = await runner_module._take_lock(str(tmp_path))
+    assert first is not None
+    second = asyncio.create_task(runner_module._take_lock(str(tmp_path)))
+    await asyncio.sleep(0.2)
+    assert not second.done()
+    os.close(first)
+    async with asyncio.timeout(2):
+        fd = await second
+    assert fd is not None
+    os.close(fd)
+
+
+async def test_a_runner_fails_when_the_last_runner_does_not_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner_module, "LOCK_WAIT_S", 0.1)
+    first = await runner_module._take_lock(str(tmp_path))
+    assert first is not None
+    built: list[object] = []
+    monkeypatch.setattr(runner_module, "build_runtime", lambda *args: built.append(args))
+    env = {**ENV, WORKDIR_ENV: str(tmp_path)}
+    out = io.StringIO()
+    try:
+        code = await serve(_lines([_job(_reply("hi")).model_dump_json()]), Output(out), env)
+    finally:
+        os.close(first)
+    assert code == 3
+    assert not built  # no second runtime starts while the lock is held
+    [line] = out.getvalue().splitlines()
+    failed = run_event_adapter.validate_json(line)
+    assert isinstance(failed, RunFailed)
+    assert failed.code is FailureCode.SANDBOX_ERROR
+    assert failed.retryable
+
+
+async def test_no_lock_without_a_work_folder(tmp_path: Path) -> None:
+    assert await runner_module._take_lock(str(tmp_path / "missing")) is None
+    assert not (tmp_path / "missing").exists()
+
+
+async def test_the_runner_writes_a_timing_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="sama.runner")
+    env = {**ENV, WORKDIR_ENV: str(tmp_path)}
+    out = io.StringIO()
+    code = await serve(_lines([_job(_reply("hi")).model_dump_json()]), Output(out), env)
+    assert code == 0
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(TIMING_PREFIX)]
+    assert len(lines) == 1
+    for mark in ("job_s=", "lock_s=", "runtime_s=", "first_event_s=", "terminal_s=", "exit_s="):
+        assert mark in lines[0]
+    assert (tmp_path / ".sama" / "runner.lock").exists()

@@ -4,6 +4,8 @@
   its bundled CLI (the default ``runtime-claude`` group).
 - ``claude-runner`` runs in CI. It starts the runner in a local sandbox folder. Its model
   calls go through the model proxy to the scripted model, as in production (Section 16.6).
+- ``claude-warm`` runs in CI. It is ``claude-runner`` with the warm runner (``sama.warm``), as
+  in production. The first run of the suite is cold, and the next runs are warm.
 - ``claude-docker`` runs only with ``SAMA_DOCKER_IMAGE``, the tag of the sama image
   (``sandbox/Dockerfile``). The container uses the host network to reach the test servers.
 - ``claude-live`` runs only with ``SAMA_LIVE_TESTS=1`` and ``ANTHROPIC_API_KEY``. It has the
@@ -29,6 +31,7 @@ from sama.runtime.runner import GatePolicy
 from sama.sandbox import SandboxProvider
 from sama.sandbox.docker import DockerProvider
 from sama.sandbox.local import LocalProvider
+from sama.warm import SOCKET_ENV
 from tests.conformance.scripted_model import ScriptedModel, serve
 from tests.conformance.targets import (
     GATED_TOOL_NAMES,
@@ -45,6 +48,7 @@ from tests.conformance.targets import (
     mcp_config,
 )
 from tests.conformance.tool_server import ToolServer
+from tests.support import warm_socket
 
 if TYPE_CHECKING:
     from sama.runtime.claude import ToolGate
@@ -63,6 +67,11 @@ TARGETS = [
     pytest.param(
         "claude-runner",
         id="claude-runner",
+        marks=pytest.mark.skipif(not HAS_CLAUDE_SDK, reason="claude-agent-sdk is not installed"),
+    ),
+    pytest.param(
+        "claude-warm",
+        id="claude-warm",
         marks=pytest.mark.skipif(not HAS_CLAUDE_SDK, reason="claude-agent-sdk is not installed"),
     ),
     pytest.param(
@@ -136,6 +145,13 @@ def _suite_gate() -> ToolGate:
     return SuiteGate()
 
 
+@pytest.fixture(scope="session")
+def warm_server_socket() -> Iterator[str]:
+    """One warm server for the suite."""
+    with warm_socket() as path:
+        yield path
+
+
 @pytest.fixture(params=TARGETS)
 async def target(
     request: pytest.FixtureRequest,
@@ -149,9 +165,12 @@ async def target(
         yield FakeTarget(tools=tools)
         return
 
-    if request.param in {"claude-runner", "claude-docker"}:
+    if request.param in {"claude-runner", "claude-warm", "claude-docker"}:
         store, proxy_url = request.getfixturevalue("model_proxy")
-        sandboxed = _sandboxed_runtime(request.param, tools, proxy_url, tmp_path)
+        socket = (
+            request.getfixturevalue("warm_server_socket") if request.param == "claude-warm" else ""
+        )
+        sandboxed = _sandboxed_runtime(request.param, tools, proxy_url, tmp_path, socket)
         yield ClaudeTarget(
             name=request.param,
             runtime=sandboxed,
@@ -203,20 +222,27 @@ def _scripted_config(tools: ToolServer, tools_url: str, model: str) -> RunConfig
 
 
 def _sandboxed_runtime(
-    name: str, tools: ToolServer, model_url: str, tmp_path: Path
+    name: str, tools: ToolServer, model_url: str, tmp_path: Path, socket: str = ""
 ) -> SandboxedRuntime:
-    """The orchestrator side. The runner gets only the run token and the model URL."""
+    """The orchestrator side. The runner gets only the run token and the model URL. With a
+    ``socket``, the warm runner on that socket starts it."""
     provider: SandboxProvider
     if name == "claude-docker":
         provider = DockerProvider(image=DOCKER_IMAGE, network="host")
         argv = RUNNER_ARGV
     else:
         provider = LocalProvider(tmp_path / "sandboxes")
-        argv = (sys.executable, "-m", "sama.runtime.runner")
+        module = "sama.warm" if socket else "sama.runtime.runner"
+        argv = (sys.executable, "-m", module)
     return SandboxedRuntime(
         kind=RuntimeKind.CLAUDE_AGENT_SDK,
         provider=provider,
         signer=tools.run_tokens,
-        settings=SandboxSettings(template=name, model_url=model_url, runner_argv=argv),
+        settings=SandboxSettings(
+            template=name,
+            model_url=model_url,
+            runner_argv=argv,
+            extra_env={SOCKET_ENV: socket} if socket else {},
+        ),
         gate=GatePolicy(ask=GATED_TOOL_NAMES),
     )

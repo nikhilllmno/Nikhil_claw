@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+import contextlib
+import os
+import signal
+import tempfile
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 from pydantic import SecretStr
@@ -134,3 +139,28 @@ def wire_transport(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.
         )
 
     return httpx.MockTransport(send)
+
+
+def warm_servers(path: str) -> list[int]:
+    """The process ids of the warm runner servers on the socket ``path`` (``sama.warm``)."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        with contextlib.suppress(OSError):
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            if b"--server" in argv and path.encode() in argv:
+                found.append(int(entry.name))
+    return found
+
+
+@contextlib.contextmanager
+def warm_socket() -> Iterator[str]:
+    """A socket path for a warm server. It stops the warm servers on the path at the end. The
+    folder is short: a Unix socket path has at most 107 bytes."""
+    with tempfile.TemporaryDirectory(prefix="sama-") as folder:
+        path = f"{folder}/w.sock"
+        yield path
+        for pid in warm_servers(path):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)

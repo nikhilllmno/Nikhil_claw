@@ -17,16 +17,23 @@ secret is in its environment (decision D6).
 
 Approval state is in the control plane, not here: each invocation is a new process. The
 orchestrator refuses a second resume of the same approval before it starts a runner.
+
+One runner at a time runs in a sandbox. A runner takes the runner lock before it builds the
+runtime, so it waits until the runner of the last run has stopped. The orchestrator does not
+wait for that stop before it reports the run (Section 16.2). ``sama.warm`` can start this
+module in a process that has the imports already (the warm runner).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import sys
+import time
 from collections.abc import AsyncIterator, Mapping
 from typing import IO, Any, Final, Literal, Self
 
@@ -55,6 +62,13 @@ log: Final = logging.getLogger("sama.runner")
 RUN_TOKEN_ENV: Final = "SAMA_RUN_TOKEN"  # noqa: S105 -- a variable name
 MODEL_URL_ENV: Final = "SAMA_MODEL_URL"
 WORKDIR_ENV: Final = "SAMA_WORKDIR"
+LOCK_FILE: Final = ".sama/runner.lock"
+"""The runner lock, in the work folder."""
+LOCK_WAIT_S: Final = 20.0
+"""The longest wait for the runner of the last run. The orchestrator kills a runner that does
+not stop before this."""
+TIMING_PREFIX: Final = "runner timing"
+"""The start of the timing line on stderr. The orchestrator logs the line (Section 18.1)."""
 CANCEL_GRACE_S: Final = 4.0
 """The Claude adapter waits this long for the CLI after a cancel. The orchestrator waits
 longer before it kills the runner, and both fit in the 10-second cancel limit."""
@@ -252,9 +266,84 @@ async def _watch_control(
         await runtime.cancel(run_id)
 
 
+class _Timing:
+    """The times of one runner, for the timing line on stderr."""
+
+    def __init__(self, started: float, mode: str) -> None:
+        self.mode = mode
+        self.marks: dict[str, float] = {"start": started}
+
+    def mark(self, name: str) -> None:
+        self.marks.setdefault(name, time.time())
+
+    def line(self) -> str:
+        start = self.marks["start"]
+        parts = " ".join(
+            f"{name}_s={at - start:.3f}" for name, at in self.marks.items() if name != "start"
+        )
+        return f"{TIMING_PREFIX} mode={self.mode} {parts}"
+
+
+STARTED_AT: float | None = None
+"""The time that the runner process started. ``sama.warm`` sets it to the start of the client
+process. ``None`` means the import time of this module."""
+MODE: str = "cold"
+"""``warm`` when ``sama.warm`` started the runner in a warm process."""
+_IMPORTED_AT: Final = time.time()
+
+
+def _open_lock(workdir: str) -> int | None:
+    """Opens the runner lock file. A work folder that does not exist had no runner, so there
+    is no lock."""
+    if not os.path.isdir(workdir):
+        return None
+    path = os.path.join(workdir, LOCK_FILE)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        log.warning("the runner lock did not open: %r", error)
+        return None
+
+
+class LockBusyError(Exception):
+    """The runner of the last run of the session did not stop in ``LOCK_WAIT_S``."""
+
+
+async def _take_lock(workdir: str) -> int | None:
+    """Takes the runner lock and returns its file descriptor, or None if the work folder does
+    not exist. It waits up to ``LOCK_WAIT_S`` for the runner of the last run, then raises
+    ``LockBusyError``: two Claude CLIs must never use the files of one session."""
+    fd = _open_lock(workdir)
+    if fd is None:
+        return None
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise LockBusyError from None
+            await asyncio.sleep(0.02)
+
+
 async def serve(lines: AsyncIterator[str], out: Output, env: Mapping[str, str]) -> int:
     """Runs one job. Returns the exit code: 0 if the stream ended with a terminal event."""
+    timing = _Timing(STARTED_AT if STARTED_AT is not None else _IMPORTED_AT, MODE)
+    try:
+        return await _serve(lines, out, env, timing)
+    finally:
+        timing.mark("exit")
+        log.info("%s", timing.line())
+
+
+async def _serve(
+    lines: AsyncIterator[str], out: Output, env: Mapping[str, str], timing: _Timing
+) -> int:
     first = await anext(aiter(lines), None)
+    timing.mark("job")
     if first is None:
         out.event(_failed(FailureCode.INVALID_REQUEST, "no job on stdin"))
         return 2
@@ -277,10 +366,33 @@ async def serve(lines: AsyncIterator[str], out: Output, env: Mapping[str, str]) 
         out.event(_failed(FailureCode.SANDBOX_ERROR, f"{RUN_TOKEN_ENV} is not set"))
         return 3
     try:
+        lock = await _take_lock(env.get(WORKDIR_ENV) or WORKDIR)
+    except LockBusyError:
+        message = "the runner of the last run of this session did not stop"
+        out.event(RunFailed(code=FailureCode.SANDBOX_ERROR, message=message, retryable=True))
+        return 3
+    timing.mark("lock")
+    try:
+        return await _run_job(job, lines, out, env, token, timing)
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+async def _run_job(
+    job: RunnerJob,
+    lines: AsyncIterator[str],
+    out: Output,
+    env: Mapping[str, str],
+    token: str,
+    timing: _Timing,
+) -> int:
+    try:
         runtime = build_runtime(job, env)
     except (ValueError, ImportError, ContractViolation) as error:
         out.event(_failed(FailureCode.INVALID_REQUEST, str(error)))
         return 2
+    timing.mark("runtime")
 
     config = with_run_token(job.request.config, token)
     stream: AsyncIterator[RunEvent]
@@ -303,8 +415,10 @@ async def serve(lines: AsyncIterator[str], out: Output, env: Mapping[str, str]) 
                 await runtime.cancel(run_id)
             usage = event.usage
             ended = is_terminal(event)
+            timing.mark("first_event")
             out.event(event)
             if ended:
+                timing.mark("terminal")
                 break
     except Exception as error:  # the adapter broke the contract; report it, do not crash
         log.exception("the runtime raised")

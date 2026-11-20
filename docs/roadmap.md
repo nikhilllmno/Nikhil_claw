@@ -211,6 +211,13 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   sweep, in one transaction with the write. Not in M2.4: summaries, a web card for the
   proposals (M3.2), and notes to the user after an applied write. The assumptions are in
   architecture Section 9.4.1.
+- Run latency (not a milestone item): a follow-up chat reply on staging took about 11 seconds,
+  and the model calls took about 4 seconds of it. Migration `0020` and `QueueWakeup` wake the
+  worker on a new run (architecture Section 4.3). The skill sync checks a digest first and
+  writes one archive only when the skills changed (Section 9.3). The warm runner
+  (`sama.warm`), the runner lock, and the early `RunCompleted` cut the start and the stop of
+  the runner (Section 16.2). The run timing lines are in Section 18.1. The target is 4 to 5
+  seconds.
 
 | # | Item | Acceptance criteria |
 |---|---|---|

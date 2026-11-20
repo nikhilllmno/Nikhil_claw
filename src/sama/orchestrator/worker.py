@@ -17,6 +17,9 @@ second time. When a write shows that the lease is lost, it stops the runtime at 
 
 From time to time it also times out approvals (``GateService.expire``), queues the paused runs
 whose approval is decided, and reaps the runs whose lease expired.
+
+An idle slot waits for a queue notification (``QueueWakeup``) or for ``poll_s``, whichever
+comes first. So a new run starts at once, and the poll is the fallback.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from typing import Any, Final
 from sama.gate.service import GateService
 from sama.observability.logs import log_context
 from sama.orchestrator.queue import ClaimedRun, Lease, Resume, RunQueue
+from sama.orchestrator.wakeup import QueueWakeup
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
 from sama.runtime.contract import (
@@ -152,6 +156,7 @@ class Worker:
         self._poll_s = poll_s
         self._maintenance_s = maintenance_s
         self._flush_s = flush_s
+        self._wakeup = QueueWakeup(queue.engine)
 
     # -- loops ------------------------------------------------------------------------------
 
@@ -160,19 +165,22 @@ class Worker:
         if concurrency < 1:
             raise ValueError("concurrency must be 1 or more")
         async with asyncio.TaskGroup() as group:
+            group.create_task(self._wakeup.run(stop))
             group.create_task(self._maintenance_loop(stop))
             for _ in range(concurrency):
                 group.create_task(self._slot(stop))
 
     async def _slot(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
+            # The ticket comes first, so a run that is queued during the claim wakes the slot.
+            ticket = self._wakeup.ticket()
             try:
                 worked = await self.run_once()
             except Exception:
                 log.exception("the worker could not handle a run owner=%s", self.owner)
                 worked = False
             if not worked:
-                await _wait(stop, self._poll_s)
+                await ticket.wait(stop, self._poll_s)
 
     async def _maintenance_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

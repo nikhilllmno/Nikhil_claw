@@ -51,7 +51,7 @@ from sama.observability.alerts import ErrorRateAlerter, SlackWebhook
 from sama.observability.langfuse import LangfuseClient
 from sama.observability.traces import TraceExporter
 from sama.orchestrator import PostgresSandboxDirectory, RunQueue, Worker
-from sama.orchestrator.sandboxed import SandboxedRuntime, SandboxSettings
+from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
 from sama.review.proposals import PostgresProposalStore
@@ -173,6 +173,8 @@ def build(
                 gate_url=f"{settings.tools_url}{GATE_PATH}",
                 archive_url=f"{settings.tools_url}{ARCHIVE_PATH}",
                 allow_out=settings.allow_out,
+                # The warm runner saves the Python start of each run (Section 16.2).
+                runner_argv=WARM_RUNNER_ARGV,
             ),
             directory=PostgresSandboxDirectory(engine),
             skills=SessionSkillSource(engine, library),
