@@ -473,7 +473,7 @@ class ModelProxy:
     async def _check_budget(self, claims: RunTokenClaims, authority: Authority) -> None:
         """Fails closed: a store that cannot read, or a record that the store did not take,
         refuses the call."""
-        await self._ledger.flush()
+        await self._ledger.flush(claims.org_id)
         if self._ledger.blocked(claims.org_id):
             raise ProxyError(503, "api_error", "the proxy cannot record usage now")
         try:

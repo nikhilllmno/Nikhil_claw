@@ -59,6 +59,10 @@ IMAGE_TOKENS_ESTIMATE: Final = 8_000
 above what one image costs. The estimate does not use the bytes of the image: they are base64
 text, and one token for each 2 bytes would give millions of tokens."""
 CLOSE_WAIT_S: Final = 5.0
+"""At the stop, the calls that run get this long to end."""
+CLOSE_SETTLE_S: Final = 5.0
+"""At the stop, a cancelled call gets this long to write its estimate. Then it is cancelled
+again, and its record stays in the ledger."""
 
 NO_KEY: Final = "Image analysis is not available: no vision model key is configured."
 NOT_FOUND: Final = (
@@ -132,13 +136,24 @@ class VisionService:
         return self._model
 
     async def aclose(self) -> None:
-        """Waits for the calls that run (they write their records), then closes the client."""
+        """Stops the service within a fixed time. The calls that run get ``CLOSE_WAIT_S`` to end
+        and write their records. The service cancels the rest, and each of them writes an
+        estimate. If a write still stalls after ``CLOSE_SETTLE_S``, the service cancels it
+        again: the record stays in the shared ledger, and the proxy handles it at its stop.
+        Then the http client closes."""
         pending = set(self._tasks)
         if pending:
             _, pending = await asyncio.wait(pending, timeout=CLOSE_WAIT_S)
         for task in pending:
             task.cancel()  # the call writes an estimate when it is cancelled
-        await asyncio.gather(*pending, return_exceptions=True)
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=CLOSE_SETTLE_S)
+        for task in pending:
+            task.cancel()  # a cancel in the write fences the record in the ledger
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=CLOSE_SETTLE_S)
+        if pending:
+            log.error("%d vision calls did not end at the stop", len(pending))
         await self._http.aclose()
 
     async def analyze(self, claims: RunTokenClaims, attachment: str, question: str) -> VisionResult:
@@ -247,7 +262,7 @@ class VisionService:
     async def _check_budget(self, claims: RunTokenClaims) -> None:
         """Fails closed, like the model proxy: a run without authority or without budget, and
         a store that cannot answer, refuse the call."""
-        await self._ledger.flush()
+        await self._ledger.flush(claims.org_id)
         if self._ledger.blocked(claims.org_id):
             raise VisionError("Image analysis cannot record usage now. Try again later.")
         try:

@@ -105,3 +105,73 @@ async def test_a_cancel_during_the_write_fences_the_record() -> None:
     await ledger.flush()
     assert ledger.unrecorded == []
     assert store.calls == [record]
+
+
+async def test_a_record_is_pending_and_blocks_its_org_during_the_write() -> None:
+    hang = asyncio.Event()
+    ledger = UsageLedger(Store(hang=hang), retry_s=0, write_timeout_s=60, wait_s=0.05)
+    task = asyncio.create_task(ledger.settle(call()))
+    await asyncio.sleep(0.01)
+    assert ledger.blocked("org-1")
+    assert not ledger.blocked("org-2")
+    await ledger.flush("org-1")  # waits wait_s, then returns: it does not hang
+    assert ledger.blocked("org-1")
+    hang.set()
+    await task
+    assert not ledger.blocked("org-1")
+
+
+async def test_a_write_attempt_has_a_time_limit_and_is_tried_again_with_the_same_id() -> None:
+    class Stalls(Store):
+        ids: list[uuid.UUID]
+
+        async def record(self, call: CallRecord) -> None:
+            self.ids.append(call.call_id)
+            if len(self.ids) == 1:
+                await asyncio.sleep(3600)
+            await super().record(call)
+
+    store = Stalls()
+    store.ids = []
+    ledger = UsageLedger(store, attempts=3, retry_s=0, write_timeout_s=0.05)
+    record = call()
+    await asyncio.wait_for(ledger.settle(record), 2)
+    assert store.ids == [record.call_id, record.call_id]
+    assert store.calls == [record]
+    assert not ledger.blocked("org-1")
+
+
+async def test_every_attempt_that_stalls_ends_in_a_fence() -> None:
+    ledger = UsageLedger(
+        Store(hang=asyncio.Event()), attempts=2, retry_s=0, write_timeout_s=0.05, wait_s=0.01
+    )
+    record = call()
+    await asyncio.wait_for(ledger.settle(record), 2)
+    assert ledger.unrecorded == [record]
+    await asyncio.wait_for(ledger.flush(), 2)  # the flush write has a time limit too
+    assert ledger.blocked("org-1")
+
+
+async def test_a_flush_waits_for_a_fast_pending_write_and_the_org_is_free_after_it() -> None:
+    class Slow(Store):
+        async def record(self, call: CallRecord) -> None:
+            await asyncio.sleep(0.05)
+            await super().record(call)
+
+    ledger = UsageLedger(Slow(), retry_s=0, wait_s=2)
+    task = asyncio.create_task(ledger.settle(call()))
+    await asyncio.sleep(0.01)
+    assert ledger.blocked("org-1")
+    await ledger.flush("org-1")
+    assert not ledger.blocked("org-1")
+    await task
+
+
+async def test_a_flush_does_not_wait_for_the_pending_write_of_another_org() -> None:
+    ledger = UsageLedger(Store(hang=asyncio.Event()), retry_s=0, write_timeout_s=60, wait_s=30)
+    task = asyncio.create_task(ledger.settle(call("org-1")))
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(ledger.flush("org-2"), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

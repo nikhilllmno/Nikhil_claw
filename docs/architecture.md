@@ -1910,11 +1910,22 @@ provider is always in the untrusted block, also when it is equal to the no-key t
   that would give millions of tokens for a base64 string.
 - A request that never reached the provider (a connect error or a pool time-out) has no record,
   because it cost nothing. A status other than 200 has no record either.
-- The write is tried 3 times with the same `call_id`, so a retry cannot count a call twice. If
-  all tries fail, the ledger fences the org. New calls of that org (of the model proxy and of
-  `vision_analyze`) are refused until a later write succeeds. The budget check fails closed.
-- On `aclose`, the open calls get 5 seconds. The service cancels the rest, and each of them
-  writes an estimate before the http client closes.
+- A record is pending from the start of its settlement (when the provider answers, or when the
+  call is cancelled or fails) until its write succeeds. A pending record blocks new calls of its
+  org, like a fenced record, so a write that stalls without an error cannot open the budget. A
+  budget check first waits for the pending writes of its own org, for at most 2 seconds. A normal
+  write takes milliseconds, so concurrent calls of one org do not refuse each other. A write that
+  still runs after the wait refuses the call. Other orgs do not wait.
+- Each write attempt has a time limit of 5 seconds (an attempt that the limit stops can have
+  reached the database). The write is tried 3 times with the same `call_id`, so a retry cannot
+  count a call twice. If all tries fail, or a cancel stops the write, the ledger fences the
+  record. New calls of that org (of the model proxy and of `vision_analyze`) are refused until a
+  later write succeeds. The retry of fenced records runs under a lock, with the same time limit.
+  The budget check fails closed.
+- `aclose` stops in a fixed time. The open calls get 5 seconds to end. The service cancels the
+  rest, and each of them writes an estimate. A call that still writes after another 5 seconds is
+  cancelled again: the cancel fences the record in the shared ledger, so the final flush and log
+  of the model proxy handle it. Then the http client closes, also if a call did not end.
 
 A failure of the model call becomes a short text without the key, the URL, or the body of the
 provider: busy (`429`), refused key (`401`, `403`), bad image (`400`, `413`), no answer in time,
@@ -1941,9 +1952,8 @@ or not available.
 - A7. The Anthropic key of the org pays for the call. An org with no key has no image analysis.
 - A8. The agent profile of an existing org keeps its own toolset list. Only the default list
   gets `media`. An admin adds `media` to a changed list.
-- A9. The fence is in memory. A restart of the control plane loses the list of records that were
-  not written, the same as for the model proxy. A durable queue is in the backlog (Section
-  16.6).
+- A9. The fence and the list of pending records are in memory. A restart of the control plane
+  loses them, the same as for the model proxy. A durable queue is in the backlog (Section 16.6).
 - A10. A cancelled call is charged with an estimate that is higher than the usual cost of a
   description. We prefer to count too much than too little. The estimate of 8,000 image tokens
   is a fixed allowance for all images.
@@ -1953,6 +1963,9 @@ or not available.
 - A12. The download code reads with the decoder of the http client, but it refuses every encoded
   answer first. So the code cannot decode. A server that sends only compressed files gives a
   failed download, and the sender sees the usual short answer.
+- A13. A call that the provider has not answered yet is not in the budget. Calls of one org that
+  run at the same time can pass the limit together by their cost, as in the model proxy
+  (Section 16.6). The budget limits the calls that start after a record is pending or written.
 
 ---
 
@@ -2572,10 +2585,13 @@ the request (64,000 tokens if the request has none). The seen counts stay if the
 **A lost record blocks the org.** Each record has a `call_id`, and a second write of the
 same record does nothing, so a retry cannot count a call twice. The proxy tries a record
 write 3 times. If all fail, it keeps the record in memory and refuses new calls of that org
-with `503`. The next call of any org tries the write again, under a lock. The record stays
-in the block list until its write succeeds. The model proxy and `vision_analyze` share one
-`UsageLedger` (`sama.modelproxy.ledger`) in the control plane. So a record that one of them
-cannot write blocks new calls of that org in both (Section 11.7).
+with `503`. The next call tries the write again, under a lock. The record stays in the block
+list until its write succeeds. A record also blocks its org while its write runs, and each write
+attempt has a time limit of 5 seconds, so a write that stalls without an error cannot open the
+budget. A budget check waits at most 2 seconds for the pending writes of its own org. The model
+proxy and `vision_analyze` share one `UsageLedger` (`sama.modelproxy.ledger`) in the control
+plane. So a record that one of them cannot write blocks new calls of that org in both (Section
+11.7).
 
 **Stop.** When the proxy stops, open streams get 5 seconds to end. Then each pump stops
 reading and writes its record, with an estimate if the usage is not final. The proxy builds
