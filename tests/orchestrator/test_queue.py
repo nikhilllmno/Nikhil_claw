@@ -278,9 +278,9 @@ async def test_a_subagent_event_is_redacted_whole_and_then_cut(
 ) -> None:
     """The runner sends the whole text. A secret that crosses the cut mark is redacted before
     the cut, so no prefix of it stays in the stored text."""
-    secret = "opaque-signing-0123456789abcdef"
-    text = "x" * 1_990 + secret + "y" * 3_000
-    default_redactor().add(secret)
+    known = "opaque-signing-0123456789abcdef"
+    text = "x" * 1_990 + known + "y" * 3_000
+    default_redactor().add(known)
     try:
         queue = RunQueue(engine)
         await enqueue(queue, tenant, "s1")
@@ -294,8 +294,8 @@ async def test_a_subagent_event_is_redacted_whole_and_then_cut(
                 )
             ).scalar_one()
     finally:
-        default_redactor().forget(secret)
-    assert secret not in stored["text"]
+        default_redactor().forget(known)
+    assert known not in stored["text"]
     assert "opaque-sign" not in stored["text"]
     assert stored["text"].startswith("x" * 1_990 + "[REDACTED]")
     assert len(stored["text"]) == 2_000

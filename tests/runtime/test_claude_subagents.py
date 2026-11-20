@@ -246,10 +246,10 @@ async def test_a_task_that_is_not_a_subagent_gives_no_event() -> None:
 
 # A known secret that crosses the 2,000-character mark of the stored text. The runner has no
 # redactor, so it must send the whole text. The control plane redacts it and then cuts it.
-SECRET = "opaque-secret-0123456789abcdef"
+KNOWN = "opaque-secret-0123456789abcdef"
 
 
-def around_the_mark(secret: str = SECRET) -> str:
+def around_the_mark(secret: str = KNOWN) -> str:
     return "x" * (2_000 - 10) + secret + "y" * 3_000
 
 
@@ -269,11 +269,11 @@ async def test_the_runner_sends_the_whole_text_of_a_start_and_an_end() -> None:
     events = await collect(ClaudeRuntime(client_factory=factory).run(with_subagents(RESEARCHER)))
     lines = [e.text for e in events if isinstance(e, SubagentEvent)]
     assert lines == [f"started: {text}", text, f"completed: {text}"]
-    assert all(SECRET in line for line in lines), "no part of the secret is cut"
+    assert all(KNOWN in line for line in lines), "no part of the secret is cut"
 
 
 async def test_a_text_over_the_wire_limit_is_left_out_whole_and_not_cut() -> None:
-    text = "z" * (SUBAGENT_WIRE_MAX_CHARS + 1) + SECRET
+    text = "z" * (SUBAGENT_WIRE_MAX_CHARS + 1) + KNOWN
     factory = Factory(
         [
             assistant(
@@ -291,5 +291,5 @@ async def test_a_text_over_the_wire_limit_is_left_out_whole_and_not_cut() -> Non
     for line in lines:
         assert "is not in this event" in line
         assert "z" not in line
-        assert SECRET not in line
+        assert KNOWN not in line
         assert len(line) < 200
