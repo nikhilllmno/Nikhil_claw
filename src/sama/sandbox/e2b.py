@@ -50,6 +50,13 @@ if TYPE_CHECKING:
 
 DEFAULT_TEMPLATE: Final = "sama-runner"
 ALL_TRAFFIC: Final = "0.0.0.0/0"
+MAX_TIMEOUT_S: Final = 60 * 60
+"""The longest sandbox timeout that E2B accepts in a create or a connect call. A larger value
+fails with "Timeout cannot be greater than 1 hours", so the provider caps the timeout."""
+
+
+def _timeout_s(spec: SandboxSpec) -> int:
+    return min(spec.idle_timeout_s, MAX_TIMEOUT_S)
 
 
 @dataclass
@@ -224,7 +231,7 @@ class E2BSandbox:
 
     async def keep_alive(self, seconds: int) -> None:
         try:
-            await self.sandbox.set_timeout(seconds)
+            await self.sandbox.set_timeout(min(seconds, MAX_TIMEOUT_S))
         except SandboxException as error:
             raise SandboxError(f"keep_alive failed: {type(error).__name__}") from None
 
@@ -270,7 +277,7 @@ class E2BProvider:
         try:
             sandbox = await AsyncSandbox.create(
                 template=spec.template,
-                timeout=spec.idle_timeout_s,
+                timeout=_timeout_s(spec),
                 metadata=spec.labels(),
                 network=network_options(spec),  # type: ignore[arg-type]
                 lifecycle={"on_timeout": "pause", "auto_resume": False},
@@ -286,7 +293,7 @@ class E2BProvider:
         started = time.monotonic()
         try:
             sandbox = await AsyncSandbox.connect(
-                sandbox_id, timeout=spec.idle_timeout_s, **self._opts()
+                sandbox_id, timeout=_timeout_s(spec), **self._opts()
             )
             info = await sandbox.get_info()
         except (SandboxNotFoundException, NotFoundException):

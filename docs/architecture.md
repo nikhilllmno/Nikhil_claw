@@ -3248,7 +3248,10 @@ wall time of the run plus 10 minutes (`SandboxSpec.idle_timeout_s`), so the sand
 pause during the run. This costs no separate call before the run. A running sandbox that the
 orchestrator connects to again keeps the longer of its timeout and the new one (E2B). After
 the last run of the session, `keep_alive` sets the timeout back to the idle limit (15
-minutes), so an idle sandbox pauses on time.
+minutes), so an idle sandbox pauses on time. E2B refuses a timeout longer than 1 hour in a
+create or a connect call, so the E2B provider caps every timeout at 1 hour
+(`MAX_TIMEOUT_S`). A run with the default wall time (1 hour) can thus pause in its last
+10 minutes.
 
 **Cancel.** A worker task does the sandbox work of each invocation and puts the events in a
 queue. The stream reads only the queue, so a slow provider call cannot hold the stream. The
