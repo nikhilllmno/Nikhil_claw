@@ -129,6 +129,24 @@ async def test_refresh_gives_the_redactor_every_value(
     assert "bot-token-with-old-key" not in caplog.text
 
 
+async def test_a_strict_refresh_raises_on_an_entry_that_does_not_decrypt(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await Vault(engine, KEY, redactor=Redactor()).put(
+        tenant.org, SecretName.ANTHROPIC_API_KEY, "anthropic-key-that-reads"
+    )
+    other = VaultKey(b"o" * KEY_BYTES)
+    await Vault(engine, other, redactor=Redactor()).put(
+        tenant.org, SecretName.TELEGRAM_BOT_TOKEN, "bot-token-with-old-key"
+    )
+    redactor = Redactor()
+    with pytest.raises(VaultError):
+        await Vault(engine, KEY, redactor=redactor).refresh_redactor(strict=True)
+    assert redactor.text("anthropic-key-that-reads") == "anthropic-key-that-reads", (
+        "a failed strict refresh gives the redactor no value"
+    )
+
+
 async def test_org_keys_use_the_vault_first(engine: AsyncEngine, tenant: Tenant) -> None:
     vault = Vault(engine, KEY, redactor=Redactor())
     await vault.put(tenant.org, SecretName.BRAVE_API_KEY, "brave-key-of-org")

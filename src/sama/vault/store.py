@@ -179,10 +179,14 @@ class Vault:
         self._cache[(org_id, name)] = (now + self._cache_s, value)
         return SecretStr(value) if value is not None else None
 
-    async def refresh_redactor(self) -> int:
+    async def refresh_redactor(self, *, strict: bool = False) -> int:
         """Gives the redactor every value in the vault. Returns the count of values. An entry
         that does not decrypt is logged and left out. The redactor keeps the values that it
-        already has, so a value that a cache or a run still uses stays redacted."""
+        already has, so a value that a cache or a run still uses stays redacted.
+
+        With ``strict``, an entry that does not decrypt raises ``VaultError`` and the redactor
+        gets no value. The read is one query, so the check covers the same rows that it reads.
+        A caller that must know every value (a write that checks text for secrets) uses it."""
         async with self._engine.connect() as connection:
             rows = (
                 await connection.execute(select(VaultSecret.org_id, VaultSecret.name, *_SEALED))
@@ -194,6 +198,8 @@ class Vault:
                 values.append(unseal(self._key, sealed, context=_context(org_id, name)))
             except VaultError as error:
                 log.error("a vault entry does not decrypt org=%s name=%s: %s", org_id, name, error)
+                if strict:
+                    raise
         self._redactor.add(*values)
         return len(values)
 

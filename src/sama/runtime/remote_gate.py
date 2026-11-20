@@ -50,12 +50,15 @@ class RemoteGate:
         body = GateRequest(
             call_id=call_id, tool_name=tool_name, arguments=dict(arguments), child=child
         )
+        # ``child`` goes on the wire only when it is true. A control plane from before M2.7
+        # refuses an unknown key (422), so a parent call must keep the old body.
+        content = body.model_dump_json(exclude=None if child else {"child"})
         async with httpx.AsyncClient(
             timeout=self._timeout_s, transport=self._transport, follow_redirects=False
         ) as client:
             response = await client.post(
                 self._url,
-                content=body.model_dump_json(),
+                content=content,
                 headers={
                     "authorization": f"Bearer {self._token}",
                     "content-type": "application/json",

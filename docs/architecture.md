@@ -517,7 +517,9 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   16.1). `allow` and `deny` go to the CLI.
   `ask` becomes `defer`. A sub-agent cannot pause the run, so the hook tells the gate that a
   call is of a sub-agent (`child`, from the `agent_id` of the hook input). The gate gives `deny`
-  for it in place of `ask`, and it records no approval (Section 13.1). If the gate fails, the
+  for it in place of `ask`, and it records no approval (Section 13.1). The runner sends `child` only
+  when it is true, so an older control plane that does not know the key still accepts the body of a
+  call of the main agent. If the gate fails, the
   call gets `deny`.
 - **Pause.** On `defer`, the CLI ends the turn with `stop_reason` `tool_deferred` and
   `deferred_tool_use`. The adapter yields `ApprovalRequired`. The approval id is the tool use
@@ -2633,9 +2635,9 @@ spec, and it never has the name of an unknown key: such a key shows as `unknown 
 `profile.subagents_set` with the names of the sub-agents only. The admin command
 `python -m sama.admin subagents show|set --org <id> --profile <id> [--file <path>]` calls it.
 The command first gives the redactor the secrets of the environment and the vault of
-the org, so a secret that no pattern matches is also found in a spec. It fails closed: it stops
-when the vault cannot be read, and when the org has vault entries but `SAMA_VAULT_KEY` is not
-set. There is no HTTP API for it yet.
+the org, so a secret that no pattern matches is also found in a spec. It fails closed: it reads
+the vault in one strict refresh, and it stops when any entry does not decrypt or the vault cannot
+be read. It also stops when the org has vault entries but `SAMA_VAULT_KEY` is not set. There is no HTTP API for it yet.
 
 **Build.** The prompt assembler (Section 6.1) turns the specs into `SubagentDefinition`
 objects and puts them in `RunConfig.subagents`. The config is frozen with the session (D9),

@@ -136,12 +136,8 @@ async def _know_the_secrets(engine: AsyncEngine, org_id: uuid.UUID) -> None:
             if stored:
                 raise SystemExit("set SAMA_VAULT_KEY: the org has vault entries")
             return
-        async with engine.connect() as connection:
-            total = (
-                await connection.execute(select(func.count()).select_from(VaultSecret))
-            ).scalar_one()
-        if await vault.refresh_redactor() != total:
-            raise SystemExit(VAULT_UNREADABLE)
+        # Strict: one read, and any entry that does not decrypt raises. No count to compare.
+        await vault.refresh_redactor(strict=True)
     except SystemExit:
         raise
     except Exception:

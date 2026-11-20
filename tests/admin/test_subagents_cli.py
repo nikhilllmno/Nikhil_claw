@@ -138,10 +138,16 @@ def _spec_with(text: str) -> str:
     return json.dumps([{**SPEC, "prompt": f"Use {text} when you call the service."}])
 
 
-async def _put_secret(url: str, key: str, org: uuid.UUID, value: str) -> None:
+async def _put_secret(
+    url: str,
+    key: str,
+    org: uuid.UUID,
+    value: str,
+    name: SecretName = SecretName.BRAVE_API_KEY,
+) -> None:
     engine = create_engine(url, poolclass=NullPool)
     try:
-        await Vault(engine, VaultKey.from_text(key)).put(org, SecretName.BRAVE_API_KEY, value)
+        await Vault(engine, VaultKey.from_text(key)).put(org, name, value)
     finally:
         await engine.dispose()
     default_redactor().forget(value)  # the CLI process must learn it from the vault
@@ -229,4 +235,35 @@ def test_the_command_stops_when_the_vault_cannot_be_read(
     finally:
         default_redactor().forget(OPAQUE)
         monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    assert asyncio.run(_stored(queue_database_url, profile)) == []
+
+
+def test_one_unreadable_entry_stops_the_command_even_when_the_others_are_readable(
+    queue_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check does not compare counts: any entry that does not decrypt is an error, with the
+    right key in the environment, and with a readable entry next to it."""
+    org, profile = asyncio.run(_new_profile(queue_database_url))
+    key = VaultKey.generate()
+    old_key = VaultKey.generate()
+    asyncio.run(_put_secret(queue_database_url, key, org, OPAQUE))
+    asyncio.run(
+        _put_secret(
+            queue_database_url,
+            old_key,
+            org,
+            "bot-token-with-an-old-key",
+            SecretName.TELEGRAM_BOT_TOKEN,
+        )
+    )
+    monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    monkeypatch.setenv("SAMA_VAULT_KEY", key)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_spec_with(OPAQUE)))
+    try:
+        with pytest.raises(SystemExit, match="vault cannot be read") as caught:
+            main(["subagents", "set", "--org", str(org), "--profile", str(profile)])
+        assert "bot-token" not in str(caught.value)
+    finally:
+        default_redactor().forget(OPAQUE)
     assert asyncio.run(_stored(queue_database_url, profile)) == []
