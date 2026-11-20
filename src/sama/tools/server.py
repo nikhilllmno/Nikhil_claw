@@ -32,6 +32,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
+from sama.delegation import DelegationError, DelegationService
 from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, Verdict
 from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
 from sama.media.vision import (
@@ -75,7 +76,10 @@ from sama.skills.library import ManageRequest
 from sama.skills.lint import MAX_FILE_CHARS, MAX_SKILL_MD_CHARS
 from sama.skills.render import render_list, render_view, render_written
 from sama.skills.store import SkillStore
+from sama.tasks.runs import TaskTools
+from sama.tasks.service import TaskError
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
+from sama.tools.board import register_delegation, register_tasks
 from sama.tools.clarify import (
     MAX_QUESTIONS,
     ClarifyBroker,
@@ -152,6 +156,7 @@ _EXPECTED = (
     ClarifyError,
     ConnectorError,
     DeferredToolError,
+    DelegationError,
     GitHubToolError,
     MemoryChangeError,
     RepoError,
@@ -159,6 +164,7 @@ _EXPECTED = (
     SessionSearchError,
     SkillError,
     SoulError,
+    TaskError,
     TodoError,
     VisionError,
 )
@@ -288,6 +294,9 @@ class ToolServer:
     - ``archive``: stores the transcript before a compaction (Section 6.3). With it, the
       server answers ``POST /archive`` for the runner. Without it, ``/archive`` answers
       ``503`` and the runtime compacts without an archive.
+    - ``delegation``: child agents (``delegate_task``, ``delegate_status``). Without it,
+      these tools are hidden.
+    - ``tasks``: the task board (``task_*``). Without it, these tools are hidden.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -313,6 +322,8 @@ class ToolServer:
         archive: ArchiveBackend | None = None,
         gate: GateBackend | None = None,
         souls: SoulProposer | None = None,
+        delegation: DelegationService | None = None,
+        tasks: TaskTools | None = None,
     ) -> None:
         self.signer = signer
         self.souls = souls
@@ -332,6 +343,8 @@ class ToolServer:
         self.skills = skills
         self.sessions = sessions
         self.vision = vision
+        self.delegation = delegation
+        self.tasks = tasks
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
@@ -796,6 +809,11 @@ class ToolServer:
 
                 arguments = {k: v for k, v in asdict(request).items() if v is not None}
                 return await self._call(ctx, SKILL_MANAGE, arguments, body)
+
+        if self.delegation is not None:
+            register_delegation(server, self._call, self.delegation)
+        if self.tasks is not None:
+            register_tasks(server, self._call, self.tasks)
 
         return server
 

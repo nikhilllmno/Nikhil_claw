@@ -41,6 +41,8 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "self": frozenset({"change_propose"}),
     "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
     "integrations": frozenset(),
+    "delegation": frozenset({"delegate_task", "delegate_status"}),
+    "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet. ``integrations`` has no fixed tools: the connector tools are deferred tools
@@ -91,6 +93,13 @@ DEFAULT_ALLOW: Final = frozenset(
         "connections_list",
         "connection_request",
         "connection_test",
+        "delegate_task",
+        "delegate_status",
+        "task_create",
+        "task_list",
+        "task_complete",
+        "task_block",
+        "task_comment",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
@@ -98,7 +107,22 @@ rule, they are allowed. Every other tool gets ``ask``. ``skill_manage`` is here 
 skill store checks the role of the user for the scope of each write (Section 9.2), and every
 write is a version that can be reverted. ``change_propose`` is here because it only stores a
 proposal: a person with the role decides it on an approval card (M3.2). ``connection_request``
-only sends a link, and the agent cannot give credentials with it (Section 10.3)."""
+only sends a link, and the agent cannot give credentials with it (Section 10.3).
+The ``delegation`` and ``tasks`` tools are here because they write only sama state of the same
+workspace and audience, and each child run or task run passes the gate again for every tool
+that it calls (Sections 12.4 and 13.2)."""
+
+
+DELEGATION_LINEAGE: Final = "delegation"
+CHILD_BLOCKED_TOOLSETS: Final = frozenset(
+    {"delegation", "tasks", "memory", "clarify", "cron", "connections", "integrations"}
+)
+"""The toolsets that a delegated child never has (Section 13.2). ``delegation`` keeps the depth
+at 1, and ``tasks`` stops a child that makes a task card that delegates again. ``memory``
+keeps the shared notes free of child writes. ``clarify`` waits for a person, and a child has
+none. ``cron`` stops a child that outlives its parent. ``connections`` and ``integrations`` are
+out for the reason of sub-agents (Section 13.1): a connection acts with the authority of the
+user, and only a run that the user watches asks the user to connect (Section 10.3)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify", "repo_push_approval"})
 """Tools that wait for a human. Unattended runs cannot use them."""
@@ -246,16 +270,26 @@ def effective_call(tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, M
 
 
 def effective_toolsets(
-    toolsets: Iterable[str], group_toolsets: Iterable[str], *, audience: str, kind: str = "chat"
+    toolsets: Iterable[str],
+    group_toolsets: Iterable[str],
+    *,
+    audience: str,
+    kind: str = "chat",
+    lineage: str | None = None,
 ) -> frozenset[str]:
     """The toolsets of a run (Section 10.2). A chat run in a shared session has the group
     toolsets of the profile, and not its toolsets. A private session has the toolsets. A
     background review has the toolsets of the profile that the review clamp keeps (Section
     9.4): it has no person in it, and its changes of shared state are proposals that a person
-    decides, so the group toolsets do not apply to it."""
+    decides, so the group toolsets do not apply to it. A delegated child (lineage
+    ``delegation``) loses ``CHILD_BLOCKED_TOOLSETS`` (Section 13.2)."""
     if audience == "shared" and kind != "review":
-        return frozenset(group_toolsets)
-    return frozenset(toolsets)
+        found = frozenset(group_toolsets)
+    else:
+        found = frozenset(toolsets)
+    if lineage == DELEGATION_LINEAGE:
+        return found - CHILD_BLOCKED_TOOLSETS
+    return found
 
 
 def json_default(value: Any) -> Any:

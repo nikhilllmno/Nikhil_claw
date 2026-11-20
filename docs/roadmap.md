@@ -191,7 +191,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   `plugin` connectors, tool discovery and `tool_cache`, `policy_overrides` in the gate,
   Composio triggers, custom connections, and per-tool filters.
 - M3.7: the GitHub App, the git proxy, and pull requests in `src/sama/github/` and
-  `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0023` adds
+  `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0024` adds
   `github_installations`, `github_repos`, and `github_push_grants` with RLS. An org admin
   installs the App with a signed state, a confirm page, and an OAuth check that the person
   owns the GitHub account. The admin puts repos on the allowlist.
@@ -336,8 +336,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
 | M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. |
 | M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. |
 | M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
-| M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. |
-| M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. |
+| M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. Done. |
+| M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. Done. |
 | M4.8 | Code execution | `execute_code` with a stub that calls sama tools over MCP. Only stdout returns to the model. |
 | M4.9 | More media and references | `image_generate`, `text_to_speech` (Telegram voice note), `@file`, `@url`, `@session`. |
 | M4.10 | Skills import and `/learn` | Import a skill from a Git URL with scan and approval. `/learn` creates a draft skill from sources. |

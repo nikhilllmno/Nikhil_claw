@@ -187,6 +187,10 @@ async def test_each_user_reads_only_the_rows_they_may_see(
         # Only org admins see which vault secrets exist, like the audit log.
         assert await count(connection, "vault_secrets") == AUDIT_ROWS[user]
         assert await labels(connection, world, "tool_policies", "id") == TOOL_POLICIES[user]
+        # A task card follows the visibility of a session with the same audience and owner.
+        cards = {f"task:{session}" for session in expected["sessions"]}
+        assert await labels(connection, world, "tasks", "id") == cards
+        assert await labels(connection, world, "task_comments", "task_id") == cards
 
 
 @pytest.mark.parametrize("table", TABLES)

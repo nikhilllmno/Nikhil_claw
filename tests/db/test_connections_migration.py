@@ -81,7 +81,7 @@ def test_the_upgrade_adds_the_toolsets_and_the_downgrade_removes_them() -> None:
         command.downgrade(config, "0021")
         assert asyncio.run(_has_table(url)) is False
         asyncio.run(_set_toolsets(url))
-        command.upgrade(config, "head")
+        command.upgrade(config, "0022")
         assert asyncio.run(_has_table(url)) is True
         after = asyncio.run(_toolsets(url))
         assert after["profile-a"] == [*OLD, "connections", "integrations"]

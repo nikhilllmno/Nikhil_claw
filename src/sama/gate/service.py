@@ -412,6 +412,7 @@ class GateService:
                     AgentProfile.group_toolsets,
                     Session.audience,
                     Session.owner_user_id,
+                    Session.lineage,
                 )
                 .join(
                     AgentProfile,
@@ -442,6 +443,7 @@ class GateService:
             _names(row.group_toolsets),
             audience=row.audience,
             kind=row.kind,
+            lineage=row.lineage,
         )
         if row.kind == "review":
             # A background review has the memory and skill tools and no other tool (Section 9.4).

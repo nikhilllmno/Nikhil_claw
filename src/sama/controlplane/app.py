@@ -37,6 +37,7 @@ from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
 from sama.controlplane.settings import ControlPlaneSettings
 from sama.db.engine import create_engine
+from sama.delegation import DelegationService
 from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
 from sama.github.client import GitHubClient
@@ -66,6 +67,8 @@ from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, Ru
 from sama.sandbox.base import SandboxProvider
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
+from sama.tasks.dispatcher import TaskDispatcher
+from sama.tasks.runs import TaskTools
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
 from sama.tools.deferred import DeferredCatalog
@@ -200,8 +203,9 @@ def build(
     for runtime in runtimes:
         registry.register(runtime)
 
+    queue = RunQueue(engine)
     worker = Worker(
-        RunQueue(engine),
+        queue,
         registry,
         config=PromptAssembler(
             engine,
@@ -278,6 +282,8 @@ def build(
         connections=connections,
         archive=ContextArchive(engine),
         gate=gate,
+        delegation=DelegationService(engine, queue),
+        tasks=TaskTools(engine),
     )
     proxy = ModelProxy(
         signer=signer,
@@ -321,6 +327,7 @@ def build(
     )
     api = SamaApi(
         engine,
+        queue=queue,
         verifier=JwtVerifier(
             secret=settings.supabase_jwt_secret,
             jwks_url=jwks_url(settings.supabase_url),
@@ -368,6 +375,7 @@ def build(
             if slack is not None:
                 stack.push_async_callback(slack.aclose)
             loops = _monitor(settings, engine, stack)
+            loops.append(TaskDispatcher(engine, queue))
             if embedder is not None:
                 stack.push_async_callback(embedder.aclose)
                 loops.append(EmbedWorker(engine, embedder))
