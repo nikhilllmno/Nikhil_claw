@@ -13,6 +13,7 @@ dependencies = [
     "mcp>=2.3.0,<3",
     "pydantic>=2.14.3,<3",
     "pyjwt>=2.10.1,<3",
+    "pyyaml>=6,<7",
     "sqlalchemy[asyncio]>=2.1.9,<2.2",
     "starlette>=1.10.0,<2",
     "uvicorn>=0.54.0,<1",
@@ -30,6 +31,7 @@ dev = [
     "pytest>=9.2.0,<10",
     "pytest-asyncio>=1.5.0,<2",
     "ruff>=0.17.5,<0.18",
+    "types-pyyaml>=6,<7",
     "uvicorn>=0.54.0,<1",
 ]
 # Each runtime adapter pins its SDK (docs/architecture.md, Section 5.3).
