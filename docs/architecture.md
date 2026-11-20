@@ -375,6 +375,30 @@ does not answer cannot hold the stop. A notification only starts a claim, so a l
 queue rules. Before this change the wait from the enqueue to the claim was up to 1 second, on
 average about 0.5 second.
 
+**Round trips.** Each statement is one round trip to the database, and each transaction adds a
+`BEGIN` and a `COMMIT`. The control plane and the database can be in different regions, so
+the hot path of a run uses few statements:
+
+- `enqueue` uses three statements in one transaction: the rate lock, one read of the session,
+  the profile, and the rate counts, and one insert of the message and the run (a CTE). The
+  read comes after the lock, in its own statement, so its counts include every enqueue before
+  the lock.
+- `claim` reads the full orgs without a transaction. In one transaction it reads the
+  candidate, takes the running lock, reads the limit, and claims the run with one
+  `UPDATE ... RETURNING` that also reads the session, the profile, the user message, the next
+  event number, and the runtime state.
+- A read that needs no lock (the full orgs, the frozen run config of the session) and a write
+  of one statement (`dispatch`, `heartbeat`, and `add_events` when no event is `compacted`)
+  run without a transaction (`sama.db.autocommit`). `add_events` inserts the batch only when
+  the worker holds the lease, in one `INSERT ... SELECT` that locks the run row.
+- `as_user` sets the claims and the role of an API request in one statement.
+
+`tests/orchestrator/test_round_trips.py` keeps these counts. With a round trip of 59 ms (the
+staging control plane to its database), the database part of one chat run went from about
+2.6 s (20 statements) to about 1.4 s (14 statements): the enqueue from 0.61 s to 0.31 s, the
+claim from 0.93 s to 0.50 s, the run config from 0.19 s to 0.06 s, and the first event batch
+from 0.25 s to 0.06 s. The end of a run (`complete`) did not change.
+
 **Migration.** Before migration `0005`, a `running` or `paused` run had no lease and no
 approval id. No worker can continue such a run, so the upgrade ends each one as `failed` with
 `internal`.
@@ -1480,9 +1504,17 @@ store, and the sync. The rules:
   `sha256sum`: the path and the content of each file), compares it with the digest of the
   library files, and writes `same` or `changed`. It writes `same` only when `.sama/skills` is a
   real folder that holds only files and folders (no link) and the digests are equal. If `find`
-  cannot read a folder or `sha256sum` cannot read a file, the check writes `changed`. On
-  `same`, the sync stops, so a follow-up run with unchanged skills costs one sandbox call. A
-  false `same` only keeps the files that the agent already had. (2) On `changed`, the sync
+  cannot read a folder or `sha256sum` cannot read a file, the check writes `changed`. The
+  check and the runner start are one command (`sama.skills.sync.checked_start`): the command
+  runs the check, writes `sama-skills: same` or `sama-skills: changed` as its first stdout
+  line, and on `same` replaces itself with the runner (`exec`), which then reads the job line.
+  On `changed`, or when the check fails or times out (30 seconds), the command reads the job
+  line, does not run it, and exits. The orchestrator then does steps (2) and (3) and starts the
+  runner again without the check. Both answers come before the job is read, so the
+  orchestrator always knows whether a runner got the job. So a follow-up run with unchanged
+  skills costs no sandbox call for the skills. The orchestrator reads the skill files from the
+  database while the sandbox starts. A false `same` only keeps the files that the agent
+  already had. (2) On `changed`, the sync
   writes all the library files as one tar archive
   `.sama/.skills-<32 random hex characters>.tar`. (3) One command refuses a link in place of
   `.sama` again, extracts the archive into a new staging folder (made with `mkdir`, which fails
@@ -1491,13 +1523,15 @@ store, and the sync. The rules:
   changed, added, linked, or deleted makes the check say `changed`, and the sync restores the
   folder. A file that left the library is gone, and a link that a process makes at
   `.sama/skills` while the files are written does not redirect a write, because no write goes
-  to that path. A failed sync removes its staging files. The cost is one call when the skills
-  did not change, and three calls (one of them a file write) when they changed. Before this
+  to that path. A failed sync removes its staging files. The cost is no extra call when the
+  skills did not change, and three extra calls (a file write, the publish command, and a
+  second runner start) when they changed. Before this
   change the cost was one write for each skill file in every run (about 1.5 seconds for 15
   files on E2B). The sync refuses more than 2,000 files or 20 million characters, and it only
   writes paths of the form
-  `<name>/SKILL.md` or `<name>/<folder>/<path>` that are canonical. Each sync logs
-  `skill sync run=<id> files=<n> duration_s=<s>`.
+  `<name>/SKILL.md` or `<name>/<folder>/<path>` that are canonical. Each sync that writes
+  files logs `skill sync run=<id> files=<n> duration_s=<s>`. The answer of the check is the
+  `skills=` field of the `sandbox steps` line (Section 18.1).
 - The limit of this protection. The agent can write anywhere in its own sandbox, and it runs
   in the same sandbox as the sync. The staging name and the single publish command protect the
   sync from accident and from simple tampering (a stray link or a script that changes the
@@ -3209,9 +3243,12 @@ If the job write fails, the runner can have the job, so the approved call can ru
 approval is then used, and the error is not retryable. This prevents a second run of the
 approved call.
 
-**Idle timeout.** Before a run, the orchestrator sets the idle timeout of the sandbox to the
-wall time of the run plus 10 minutes. After the last run of the session, it sets the timeout
-back to the idle limit (15 minutes), so an idle sandbox pauses on time.
+**Idle timeout.** The orchestrator creates or resumes the sandbox with an idle timeout of the
+wall time of the run plus 10 minutes (`SandboxSpec.idle_timeout_s`), so the sandbox does not
+pause during the run. This costs no separate call before the run. A running sandbox that the
+orchestrator connects to again keeps the longer of its timeout and the new one (E2B). After
+the last run of the session, `keep_alive` sets the timeout back to the idle limit (15
+minutes), so an idle sandbox pauses on time.
 
 **Cancel.** A worker task does the sandbox work of each invocation and puts the events in a
 queue. The stream reads only the queue, so a slow provider call cannot hold the stream. The
@@ -3739,7 +3776,10 @@ also become keys. A field never replaces `ts`, `level`, `logger`, or `msg`.
 | Line | Logger | What it measures |
 |---|---|---|
 | `sandbox start provider= kind= ... duration_s=` | `sama.sandbox` | The create or the resume of the session sandbox. |
-| `skill sync run= files= duration_s=` | `sama.skills.sync` | The skill sync (Section 9.3). |
+| `run claimed ... claim_s=` | `sama.orchestrator` | The claim of the run, from the queue (Section 4.3). |
+| `worker steps run= config_s= dispatch_s= first_event_s= stream_s= finish_s=` | `sama.orchestrator` | The end of each worker step, in seconds from the start of the run: the run config, the dispatch, the first event, the last stored event, and the result. |
+| `sandbox steps run= skills= acquire_s= files_s= start_s= write_s= check_s= ... first_event_s= terminal_s=` | `sama.orchestrator` | The end of each sandbox step, in seconds from the start of the sandbox work. `skills=` is `same`, `changed`, or `none` (no skills). On `changed`, `sync_s=` and `restart_s=` come after `check_s=` (Section 9.3). |
+| `skill sync run= files= duration_s=` | `sama.orchestrator` | A skill sync that wrote files (Section 9.3). |
 | `first runner event run= after_s=` | `sama.orchestrator` | From the runner start to its first event. |
 | `runner timing mode= ... run=` | `sama.orchestrator` | The phases of the runner, from its stderr (Section 16.2). |
 | `model call ...` | `sama.modelproxy` | Each model call through the proxy. |

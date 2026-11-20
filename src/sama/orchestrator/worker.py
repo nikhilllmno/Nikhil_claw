@@ -37,6 +37,7 @@ from typing import Any, Final
 
 from sama.gate.service import GateService
 from sama.observability.logs import log_context
+from sama.observability.steps import Steps
 from sama.orchestrator.queue import ClaimedRun, Lease, Resume, RunQueue
 from sama.orchestrator.wakeup import QueueWakeup
 from sama.prompt import PromptAssembler
@@ -216,16 +217,18 @@ class Worker:
 
     async def run_once(self) -> bool:
         """Claims one run and executes it. Returns False if no run was ready."""
+        started = time.monotonic()
         run = await self._queue.claim(self.owner)
         if run is None:
             return False
         log.info(
-            "run claimed org=%s session=%s run=%s attempt=%s resume=%s",
+            "run claimed org=%s session=%s run=%s attempt=%s resume=%s claim_s=%.3f",
             run.org_id,
             run.session_id,
             run.run_id,
             run.attempt,
             run.resume is not None,
+            time.monotonic() - started,
         )
         await self.execute(run)
         return True
@@ -245,12 +248,14 @@ class Worker:
             await self._execute(run)
 
     async def _execute(self, run: ClaimedRun) -> None:
+        steps = Steps()
         try:
             runtime = self._runtimes.get(RuntimeKind(run.runtime))
             budget = Budget.model_validate(dict(run.budget))
             if run.compact and not runtime.capabilities().manual_compaction:
                 raise ValueError(f"the runtime {run.runtime} cannot compact on request")
             config = await self._config(run)
+            steps.mark("config")
             scope = _scope(run)
         except Exception as error:
             log.warning("the run cannot start run=%s: %r", run.run_id, error)
@@ -263,6 +268,7 @@ class Worker:
         if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
+        steps.mark("dispatch")
         stream = _stream(runtime, run, scope, config, budget)
         watch = _Watch()
         writer = _Writer(self._queue, run, self.owner, watch, self._flush_s)
@@ -272,6 +278,7 @@ class Worker:
         try:
             async with contextlib.aclosing(stream):
                 async for event in stream:
+                    steps.mark("first_event", once=True)
                     usage = event.usage
                     await writer.add(event)
                     if watch.lost:
@@ -282,6 +289,7 @@ class Worker:
                         terminal = event
                         break
             await writer.flush()
+            steps.mark("stream")
         except Exception:
             log.exception("the run stream failed run=%s", run.run_id)
         finally:
@@ -292,6 +300,9 @@ class Worker:
             log.warning("the worker lost the lease; it writes no result run=%s", run.run_id)
             return
         await self._finish(run, terminal, usage, watch)
+        steps.mark("finish")
+        # One line per run with the end time of each step (Section 18.1).
+        log.info("worker steps run=%s %s", run.run_id, steps)
 
     async def _reconfirm(self, run: ClaimedRun) -> ClaimedRun:
         """Checks an approved call again before the resume (Section 5.1). Authority is live,

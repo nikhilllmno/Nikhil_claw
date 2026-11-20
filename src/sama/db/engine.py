@@ -42,8 +42,26 @@ async def as_user(engine: AsyncEngine, auth_user_id: uuid.UUID) -> AsyncIterator
     """
     claims = json.dumps({"sub": str(auth_user_id), "role": "authenticated"})
     async with engine.begin() as connection:
+        # One statement for both settings: each statement is a round trip to the database.
+        # ``set_config('role', ..., true)`` is ``SET LOCAL ROLE``.
         await connection.execute(
-            text("SELECT set_config('request.jwt.claims', :claims, true)"), {"claims": claims}
+            text(
+                "SELECT set_config('request.jwt.claims', :claims, true),"
+                " set_config('role', 'authenticated', true)"
+            ),
+            {"claims": claims},
         )
-        await connection.execute(text("SET LOCAL ROLE authenticated"))
+        yield connection
+
+
+@asynccontextmanager
+async def autocommit(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
+    """Opens a connection without an explicit transaction: each statement commits alone.
+
+    Use it for work of one statement. A transaction costs two more round trips to the
+    database (``BEGIN`` and ``COMMIT``), and the database can be 60 ms away (Section 4.3).
+    One statement is atomic without a transaction, and its row locks last until it ends.
+    """
+    async with engine.connect() as connection:
+        await connection.execution_options(isolation_level="AUTOCOMMIT")
         yield connection

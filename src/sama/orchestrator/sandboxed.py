@@ -36,6 +36,7 @@ from typing import Final, Protocol
 
 from pydantic import ValidationError
 
+from sama.observability.steps import Steps
 from sama.runtime.contract import (
     ApprovalRequired,
     Budget,
@@ -61,6 +62,7 @@ from sama.runtime.runner import (
     RunnerJob,
 )
 from sama.sandbox.base import (
+    DEFAULT_IDLE_TIMEOUT_S,
     Sandbox,
     SandboxError,
     SandboxNotFoundError,
@@ -69,7 +71,15 @@ from sama.sandbox.base import (
     SandboxProvider,
     SandboxSpec,
 )
-from sama.skills.sync import SkillSource, sync_skills
+from sama.skills.sync import (
+    CHECK_CHANGED,
+    CHECK_SAME,
+    SYNC_TIMEOUT_S,
+    SkillSource,
+    checked_start,
+    publish,
+    wanted_files,
+)
 from sama.tenancy import RUN_TOKEN_MAX_TTL_S, RunTokenSigner
 
 log: Final = logging.getLogger("sama.orchestrator")
@@ -357,21 +367,27 @@ class SandboxedRuntime:
             return f"config is for runtime {runtime}, not {self._kind}"
         return None
 
-    def _spec(self, org_id: str, session_id: str) -> SandboxSpec:
+    def _spec(
+        self, org_id: str, session_id: str, idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
+    ) -> SandboxSpec:
         return SandboxSpec(
             org_id=org_id,
             session_id=session_id,
             template=self._settings.template,
+            idle_timeout_s=idle_timeout_s,
             allow_out=self._settings.allow_out,
             open_egress=self._settings.open_egress,
         )
 
     async def acquire(self, scope: RunScope, budget: Budget) -> Sandbox:
         """Resumes the session sandbox, or creates one, and makes its idle timeout long enough
-        for the run. Each call needs one ``_end_session_run`` later."""
+        for the run. Each call needs one ``_end_session_run`` later.
+
+        The create or the resume sets the long timeout (``SandboxSpec.idle_timeout_s``), so the
+        run needs no separate ``keep_alive`` call: each provider call is a round trip."""
         key = (scope.org_id, scope.session_id)
         async with self._session_locks.setdefault(key, asyncio.Lock()):
-            spec = self._spec(*key)
+            spec = self._spec(*key, idle_timeout_s=int(_wall_time_s(budget) + TOKEN_MARGIN_S))
             sandbox: Sandbox | None = None
             outdated: Sandbox | None = None
             known = await self._known_sandbox(key)
@@ -404,7 +420,6 @@ class SandboxedRuntime:
                         # This process still knows the sandbox. Another process creates a
                         # new one, so the run goes on.
                         log.exception("could not store the session sandbox=%s", sandbox.id)
-            await sandbox.keep_alive(int(_wall_time_s(budget) + TOKEN_MARGIN_S))
             self._session_runs[key] = self._session_runs.get(key, 0) + 1
             return sandbox
 
@@ -542,14 +557,19 @@ class SandboxedRuntime:
         process: SandboxProcess | None = None
         terminal = False
         sent = False  # True when the job write started: the runner can have the job.
+        steps = Steps()
+        skills = "none"
+        # The skill files come from the database while the sandbox starts.
+        files = asyncio.ensure_future(self._skill_files(scope))
         try:
             try:
                 sandbox = await self.acquire(scope, budget)
+                steps.mark("acquire")
                 if active.cancelled.is_set():
                     events.put_nowait(_cancelled(usage))
                     return
-                if self._skills is not None:
-                    await sync_skills(sandbox, self._skills, scope)
+                wanted = await files
+                steps.mark("files")
                 ttl = min(_wall_time_s(budget) + TOKEN_MARGIN_S, RUN_TOKEN_MAX_TTL_S)
                 env = {
                     WORKDIR_ENV: sandbox.workdir,
@@ -558,17 +578,43 @@ class SandboxedRuntime:
                 }
                 if self._settings.model_url:
                     env[MODEL_URL_ENV] = self._settings.model_url
-                process = await sandbox.start(self._settings.runner_argv, env=env)
+                argv = list(self._settings.runner_argv)
+                # One command checks the skills and starts the runner (Section 9.3).
+                start = argv if wanted is None else checked_start(sandbox, wanted, argv)
+                process = await sandbox.start(start, env=env)
+                steps.mark("start")
                 if active.cancelled.is_set():
                     events.put_nowait(_cancelled(usage))
                     return
                 sent = True
-                try:
-                    await asyncio.wait_for(
-                        process.write(job.model_dump_json() + "\n"), timeout=PROVIDER_CALL_S
-                    )
-                except TimeoutError:
-                    raise SandboxError("the job write timed out") from None
+                await _write_job(process, job)
+                steps.mark("write")
+                if wanted is not None:
+                    answer = await _first_line(process)
+                    steps.mark("check")
+                    skills = "same"
+                    if answer == CHECK_CHANGED:
+                        skills = "changed"
+                        # The command read the job line and did not run it.
+                        sent = False
+                        if await _bounded_wait(process) is None:
+                            await _bounded_kill(process)
+                        process = None
+                        if active.cancelled.is_set():
+                            events.put_nowait(_cancelled(usage))
+                            return
+                        await _publish(sandbox, wanted, scope)
+                        steps.mark("sync")
+                        process = await sandbox.start(argv, env=env)
+                        if active.cancelled.is_set():
+                            events.put_nowait(_cancelled(usage))
+                            return
+                        sent = True
+                        await _write_job(process, job)
+                        steps.mark("restart")
+                    elif answer != CHECK_SAME:
+                        tail = process.stderr_tail()[-200:]
+                        raise SandboxError(f"the runner did not start: {tail}")
             except SandboxError as error:
                 if active.cancelled.is_set():
                     events.put_nowait(_cancelled(usage))
@@ -594,8 +640,11 @@ class SandboxedRuntime:
                         continue
                     usage = event.usage
                     events.put_nowait(event)
+                    steps.mark("first_event", once=True)
                     if is_terminal(event):
                         terminal = True
+                        steps.mark("terminal")
+                        log.info("sandbox steps run=%s skills=%s %s", run_id, skills, steps)
                         # The caller gets the terminal event now, and this task stops the
                         # runner after it. The next runner of the session waits for this one
                         # to exit: it takes the runner lock in the sandbox (Section 16.2).
@@ -625,10 +674,24 @@ class SandboxedRuntime:
             log.exception("the sandbox work failed run=%s", run_id)
             events.put_nowait(_sandbox_failed(f"the sandbox work failed: {error!r}", usage))
         finally:
+            if not files.done():
+                files.cancel()
             if process is not None and not terminal:
                 await _bounded_kill(process)
             if sandbox is not None:
                 await self._end_session_run(key, sandbox)
+
+    async def _skill_files(self, scope: RunScope) -> dict[str, str] | None:
+        """The skill files to sync (``wanted_files``), or None: no skill source, or the read
+        failed. A failed read is only a warning, as a failed sync (Section 9.3)."""
+        if self._skills is None:
+            return None
+        try:
+            async with asyncio.timeout(SYNC_TIMEOUT_S):
+                return wanted_files(await self._skills.files(scope))
+        except Exception as error:
+            log.warning("skill sync failed run=%s: %s", scope.run_id, error)
+            return None
 
     def _release(self, run_id: str, owner: _Active) -> None:
         if self._active.get(run_id) is owner:
@@ -669,6 +732,47 @@ async def _halt(process: SandboxProcess, run_id: str) -> None:
     except TimeoutError:
         log.warning("the runner did not stop after cancel; killing it run=%s", run_id)
         await _bounded_kill(process)
+
+
+async def _write_job(process: SandboxProcess, job: RunnerJob) -> None:
+    try:
+        await asyncio.wait_for(process.write(job.model_dump_json() + "\n"), timeout=PROVIDER_CALL_S)
+    except TimeoutError:
+        raise SandboxError("the job write timed out") from None
+
+
+async def _first_line(process: SandboxProcess) -> str | None:
+    """The first stdout line of the command, or None if it ended without one."""
+    lines = process.lines()
+    try:
+        async with asyncio.timeout(SYNC_TIMEOUT_S + PROVIDER_CALL_S):
+            async for line in lines:
+                return line
+    except TimeoutError:
+        raise SandboxError("the skill check timed out") from None
+    finally:
+        close = getattr(lines, "aclose", None)
+        if close is not None:
+            await close()
+    return None
+
+
+async def _publish(sandbox: Sandbox, wanted: Mapping[str, str], scope: RunScope) -> None:
+    """Writes the skill files after a changed check. It never raises, except for a cancel: a
+    skill that cannot sync must not stop the run."""
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(SYNC_TIMEOUT_S):
+            written = await publish(sandbox, wanted)
+    except Exception as error:
+        log.warning("skill sync failed run=%s: %s", scope.run_id, error)
+        return
+    log.info(
+        "skill sync run=%s files=%d duration_s=%.3f",
+        scope.run_id,
+        written,
+        time.monotonic() - started,
+    )
 
 
 async def _bounded_wait(process: SandboxProcess) -> int | None:

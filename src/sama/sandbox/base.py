@@ -183,8 +183,9 @@ class Sandbox(Protocol):
 
     async def keep_alive(self, seconds: int) -> None:
         """Sets the idle timeout: the sandbox pauses ``seconds`` from now. The orchestrator
-        makes it long before a run, so the sandbox does not pause during the run, and sets it
-        back to ``SandboxSpec.idle_timeout_s`` after the last run of the session."""
+        creates or resumes the sandbox with a long ``SandboxSpec.idle_timeout_s``, so the
+        sandbox does not pause during the run, and calls this after the last run of the
+        session to set the timeout back to the idle limit."""
         ...
 
     async def pause(self) -> None:
@@ -200,8 +201,12 @@ class SandboxProvider(Protocol):
     @property
     def name(self) -> str: ...
 
-    async def create(self, spec: SandboxSpec) -> Sandbox: ...
+    async def create(self, spec: SandboxSpec) -> Sandbox:
+        """Creates a sandbox that pauses ``spec.idle_timeout_s`` after the create."""
+        ...
 
     async def resume(self, sandbox_id: str, spec: SandboxSpec) -> Sandbox:
-        """Resumes a paused sandbox. Raises ``SandboxNotFoundError`` if it is gone."""
+        """Resumes a paused sandbox, with the idle timeout ``spec.idle_timeout_s``. A running
+        sandbox keeps the longer of its timeout and this one. Raises ``SandboxNotFoundError``
+        if it is gone."""
         ...

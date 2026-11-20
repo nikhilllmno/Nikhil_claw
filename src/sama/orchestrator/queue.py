@@ -33,6 +33,7 @@ orgs. Every other method is scoped by ``org_id``.
 from __future__ import annotations
 
 import base64
+import json
 import math
 import uuid
 from collections.abc import Mapping, Sequence
@@ -42,15 +43,23 @@ from enum import StrEnum
 from typing import Any, Final
 
 from sqlalchemy import (
+    ARRAY,
+    Integer,
+    Text,
     and_,
+    bindparam,
     case,
+    cast,
+    column,
     exists,
     func,
     insert,
+    literal,
     select,
     tuple_,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -58,6 +67,7 @@ from sqlalchemy.orm import aliased
 
 from sama.context.compaction import record_compacted
 from sama.context.pins import all_pin_texts, compact_focus, pin_block, pins_for_input
+from sama.db.engine import autocommit
 from sama.db.models import (
     ENDED_RUN_STATUSES,
     AgentProfile,
@@ -111,6 +121,68 @@ class RateLimitedError(QueueError):
 def _lock(name: str, org_id: uuid.UUID) -> Any:
     """A transaction-level advisory lock for one org and one purpose."""
     return select(func.pg_advisory_xact_lock(func.hashtextextended(f"{name}:{org_id}", 0)))
+
+
+def _rate_columns(org_id: uuid.UUID, user_id: uuid.UUID | None) -> list[Any]:
+    """The columns that ``_check_rate`` reads: the limits of the org and, for the org and for
+    the user, the count of chat runs in the last 60 seconds and the seconds until the oldest
+    of them leaves the window. Use them in a statement after the rate lock."""
+
+    def window(name: str, *scope: Any) -> list[Any]:
+        recent = (
+            Run.org_id == org_id,
+            Run.kind == "chat",
+            Run.created_at > func.now() - RATE_WINDOW,
+            *scope,
+        )
+        return [
+            select(func.count()).where(*recent).scalar_subquery().label(f"{name}_count"),
+            select(func.extract("epoch", func.min(Run.created_at) + RATE_WINDOW - func.now()))
+            .where(*recent)
+            .scalar_subquery()
+            .label(f"{name}_retry"),
+        ]
+
+    columns = [select(Org.limits).where(Org.id == org_id).scalar_subquery().label("limits")]
+    columns += window("org")
+    if user_id is not None:
+        columns += window("user", Run.triggered_by_user_id == user_id)
+    return columns
+
+
+def _check_rate(row: Any) -> None:
+    """Raises ``RateLimitedError`` if a row with ``_rate_columns`` is over a limit. The rate
+    lock puts the enqueues of one org in a sequence, so two messages at the same time cannot
+    both take the last place."""
+    limits = QueueLimits.from_json(row.limits)
+    checks = [(row.org_count, row.org_retry, limits.org_messages_per_minute, "the org")]
+    if "user_count" in row._fields:
+        checks.append((row.user_count, row.user_retry, limits.user_messages_per_minute, "you"))
+    for count, retry_s, limit, who in checks:
+        if count >= limit:
+            retry = max(1, math.ceil(float(retry_s or 1)))
+            raise RateLimitedError(
+                f"{who} sent {limit} messages in the last minute. Try again in {retry} s.",
+                retry,
+            )
+
+
+def _session_state_query(runs: Any, org_id: Any, session_id: Any, runtime: Any) -> Any:
+    """The runtime state of the newest chat run of a session that saved one (see
+    ``RunQueue._session_state``). ``runs`` is ``Run`` or an alias of it."""
+    return (
+        select(runs.runtime_state)
+        .where(
+            runs.org_id == org_id,
+            runs.session_id == session_id,
+            runs.runtime == runtime,
+            runs.kind == "chat",
+            runs.status.in_(("completed", "failed", "cancelled")),
+            runs.runtime_state.is_not(None),
+        )
+        .order_by(runs.finished_at.desc())
+        .limit(1)
+    )
 
 
 class Lease(StrEnum):
@@ -260,6 +332,8 @@ class RunQueue:
         """
         async with self._engine.begin() as connection:
             await self._rate_lock(connection, org_id)  # the lock order of all enqueues
+            # One statement reads the session, the limits, and the rate counts. It comes
+            # after the lock statement, so its snapshot has every enqueue before the lock.
             session = (
                 await connection.execute(
                     select(
@@ -269,6 +343,7 @@ class RunQueue:
                             Session.run_config["runtime"].astext, AgentProfile.runtime
                         ).label("runtime"),
                         AgentProfile.budget,
+                        *_rate_columns(org_id, user_id),
                     )
                     .join(
                         AgentProfile,
@@ -284,20 +359,9 @@ class RunQueue:
                 raise QueueError("the session does not exist")
             if session.status != "active":
                 raise QueueError("the session is not active")
-            await self._check_rate(connection, org_id, user_id)
+            _check_rate(session)
             run_id = uuid.uuid4()
-            await connection.execute(
-                insert(Run).values(
-                    id=run_id,
-                    org_id=org_id,
-                    session_id=session_id,
-                    agent_profile_id=session.agent_profile_id,
-                    triggered_by_user_id=user_id,
-                    runtime=session.runtime,
-                    budget=session.budget,
-                    unattended=unattended,
-                )
-            )
+            # The run and the message go in one statement: the run insert is a CTE.
             message_id = (
                 await connection.execute(
                     insert(Message)
@@ -310,21 +374,39 @@ class RunQueue:
                         content={"text": redact(text)},
                     )
                     .returning(Message.id)
+                    .add_cte(
+                        insert(Run)
+                        .values(
+                            id=run_id,
+                            org_id=org_id,
+                            session_id=session_id,
+                            agent_profile_id=session.agent_profile_id,
+                            triggered_by_user_id=user_id,
+                            runtime=session.runtime,
+                            budget=session.budget,
+                            unattended=unattended,
+                        )
+                        .cte("new_run")
+                    )
                 )
             ).scalar_one()
-            for image in attachments:
+            if attachments:
                 await connection.execute(
-                    insert(Attachment).values(
-                        id=image.id,
-                        org_id=org_id,
-                        session_id=session_id,
-                        message_id=message_id,
-                        name=image.name,
-                        mime_type=image.mime_type,
-                        size_bytes=len(image.data),
-                        sha256=image.sha256,
-                        data=image.data,
-                    )
+                    insert(Attachment),
+                    [
+                        {
+                            "id": image.id,
+                            "org_id": org_id,
+                            "session_id": session_id,
+                            "message_id": message_id,
+                            "name": image.name,
+                            "mime_type": image.mime_type,
+                            "size_bytes": len(image.data),
+                            "sha256": image.sha256,
+                            "data": image.data,
+                        }
+                        for image in attachments
+                    ],
                 )
         return run_id
 
@@ -396,7 +478,7 @@ class RunQueue:
                 )
             if await self._session_state(connection, org_id, session_id, session.runtime) is None:
                 raise QueueError("There is nothing to compact yet.")
-            await self._check_rate(connection, org_id, user_id)
+            _check_rate((await connection.execute(select(*_rate_columns(org_id, user_id)))).one())
             run_id = uuid.uuid4()
             await connection.execute(
                 insert(Run).values(
@@ -419,50 +501,6 @@ class RunQueue:
         every enqueue, before any lock of a session row (the rows of a run insert take a share
         lock on the session). A transaction can take it again."""
         await connection.execute(_lock("sama.queue.rate", org_id))
-
-    async def _check_rate(
-        self, connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID | None
-    ) -> None:
-        """Counts the runs of the last 60 seconds. The rate lock puts the enqueues of one org
-        in a sequence, so two messages at the same time cannot both take the last place."""
-        await self._rate_lock(connection, org_id)
-        limits = QueueLimits.from_json(
-            (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
-        )
-        checks: list[tuple[Any, int, str]] = [
-            (
-                and_(Run.org_id == org_id, Run.kind == "chat"),
-                limits.org_messages_per_minute,
-                "the org",
-            )
-        ]
-        if user_id is not None:
-            checks.append(
-                (
-                    and_(
-                        Run.org_id == org_id,
-                        Run.kind == "chat",
-                        Run.triggered_by_user_id == user_id,
-                    ),
-                    limits.user_messages_per_minute,
-                    "you",
-                )
-            )
-        for scope, limit, who in checks:
-            row = (
-                await connection.execute(
-                    select(
-                        func.count(),
-                        func.extract("epoch", func.min(Run.created_at) + RATE_WINDOW - func.now()),
-                    ).where(scope, Run.created_at > func.now() - RATE_WINDOW)
-                )
-            ).one()
-            if row[0] >= limit:
-                retry = max(1, math.ceil(float(row[1] or 1)))
-                raise RateLimitedError(
-                    f"{who} sent {limit} messages in the last minute. Try again in {retry} s.",
-                    retry,
-                )
 
     async def cancel(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
         """Cancels a run and returns its status after the call.
@@ -559,19 +597,7 @@ class RunQueue:
                     if await self._at_limit(connection, row.org_id):
                         full.add(row.org_id)
                         continue
-                    await connection.execute(
-                        update(Run)
-                        .where(Run.id == row.id)
-                        .values(
-                            status="running",
-                            lease_owner=owner,
-                            lease_expires_at=func.now() + self._lease,
-                            attempts=Run.attempts + 1,
-                            dispatched_at=None,
-                            started_at=func.coalesce(Run.started_at, func.now()),
-                        )
-                    )
-                    return await self._claimed(connection, row.id)
+                    return await self._claimed(connection, row.id, owner)
             except IntegrityError:
                 # Another worker started a run of the same session at the same time. The
                 # partial unique index refused this claim. The run stays queued for a later
@@ -617,7 +643,7 @@ class RunQueue:
     async def _full_orgs(self) -> set[uuid.UUID]:
         """The orgs that have ``max_running_runs`` running runs. Only orgs with a running run
         are read, so the query stays small."""
-        async with self._engine.connect() as connection:
+        async with autocommit(self._engine) as connection:
             rows = await connection.execute(
                 select(Run.org_id, func.count().label("running"), Org.limits)
                 .join(Org, Org.id == Run.org_id)
@@ -651,18 +677,51 @@ class RunQueue:
 
     @staticmethod
     async def _at_limit(connection: AsyncConnection, org_id: uuid.UUID) -> bool:
-        limits = (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
-        running = (
-            await connection.execute(
-                select(func.count()).where(Run.org_id == org_id, Run.status == "running")
-            )
-        ).scalar_one()
-        return bool(running >= QueueLimits.from_json(limits).max_running_runs)
-
-    async def _claimed(self, connection: AsyncConnection, run_id: uuid.UUID) -> ClaimedRun:
+        """The org has ``max_running_runs`` running runs. Call it after the running lock, in a
+        later statement, so the count has every claim before the lock."""
         row = (
             await connection.execute(
                 select(
+                    Org.limits,
+                    select(func.count())
+                    .where(Run.org_id == org_id, Run.status == "running")
+                    .scalar_subquery()
+                    .label("running"),
+                ).where(Org.id == org_id)
+            )
+        ).one()
+        return bool(row.running >= QueueLimits.from_json(row.limits).max_running_runs)
+
+    async def _claimed(
+        self, connection: AsyncConnection, run_id: uuid.UUID, owner: str
+    ) -> ClaimedRun:
+        """Marks the run as running for ``owner`` and returns it.
+
+        One ``UPDATE ... RETURNING`` statement also reads the session, the profile, the user
+        message, the next event number, and the runtime state to start from. Each statement
+        is a round trip to the database.
+        """
+        prior = aliased(Run)
+        resumes = and_(Run.resume_decision.is_not(None), Run.pending_approval_id.is_not(None))
+        row = (
+            await connection.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Session.org_id == Run.org_id,
+                    Session.id == Run.session_id,
+                    AgentProfile.org_id == Run.org_id,
+                    AgentProfile.id == Run.agent_profile_id,
+                )
+                .values(
+                    status="running",
+                    lease_owner=owner,
+                    lease_expires_at=func.now() + self._lease,
+                    attempts=Run.attempts + 1,
+                    dispatched_at=None,
+                    started_at=func.coalesce(Run.started_at, func.now()),
+                )
+                .returning(
                     Run.org_id,
                     Run.session_id,
                     Run.agent_profile_id,
@@ -685,38 +744,36 @@ class RunQueue:
                     AgentProfile.model,
                     AgentProfile.soul,
                     AgentProfile.review_model,
+                    select(Message.content)
+                    .where(
+                        Message.org_id == Run.org_id,
+                        Message.run_id == run_id,
+                        Message.role == "user",
+                    )
+                    .order_by(Message.seq)
+                    .limit(1)
+                    .scalar_subquery()
+                    .label("text"),
+                    select(func.coalesce(func.max(RunEvent.seq) + 1, 0))
+                    .where(RunEvent.org_id == Run.org_id, RunEvent.run_id == run_id)
+                    .scalar_subquery()
+                    .label("next_seq"),
+                    # Only a chat run that starts (no resume) reads the session state.
+                    case(
+                        (
+                            and_(Run.kind == "chat", ~resumes),
+                            _session_state_query(prior, Run.org_id, Run.session_id, Run.runtime)
+                            .scalar_subquery()
+                            .correlate(Run),
+                        ),
+                        else_=None,
+                    ).label("session_state"),
                 )
-                .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
-                .join(
-                    AgentProfile,
-                    and_(
-                        AgentProfile.org_id == Run.org_id, AgentProfile.id == Run.agent_profile_id
-                    ),
-                )
-                .where(Run.id == run_id)
             )
         ).one()
         if row.kind == "review":
             return await self._claimed_review(connection, run_id, row)
-        text = (
-            await connection.execute(
-                select(Message.content)
-                .where(
-                    Message.org_id == row.org_id,
-                    Message.run_id == run_id,
-                    Message.role == "user",
-                )
-                .order_by(Message.seq)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        next_seq = (
-            await connection.execute(
-                select(func.coalesce(func.max(RunEvent.seq) + 1, 0)).where(
-                    RunEvent.org_id == row.org_id, RunEvent.run_id == run_id
-                )
-            )
-        ).scalar_one()
+        text, next_seq = row.text, row.next_seq
         if row.resume_decision is not None and row.pending_approval_id is not None:
             resume: Resume | None = Resume(
                 row.pending_approval_id, ApprovalDecision(row.resume_decision), row.resume_reason
@@ -725,7 +782,7 @@ class RunQueue:
             message = str((text or {}).get("text", ""))  # not used: a resume has no input
         else:
             resume = None
-            state = await self._session_state(connection, row.org_id, row.session_id, row.runtime)
+            state = _decode_state(row.session_state)
             message = await self._input(connection, row, run_id, text)
         return ClaimedRun(
             org_id=row.org_id,
@@ -775,13 +832,6 @@ class RunQueue:
             from_seq=row.review_from_seq,
             to_seq=row.review_to_seq,
         )
-        next_seq = (
-            await connection.execute(
-                select(func.coalesce(func.max(RunEvent.seq) + 1, 0)).where(
-                    RunEvent.org_id == row.org_id, RunEvent.run_id == run_id
-                )
-            )
-        ).scalar_one()
         return ClaimedRun(
             org_id=row.org_id,
             workspace_id=row.workspace_id,
@@ -799,7 +849,7 @@ class RunQueue:
             runtime_state=None,
             resume=None,
             attempt=row.attempts,
-            next_seq=int(next_seq),
+            next_seq=int(row.next_seq),
             kind="review",
         )
 
@@ -811,19 +861,7 @@ class RunQueue:
         run saves one only to keep a count (``RunFailed.runtime_state``), and it keeps the
         conversation of the last completed run."""
         state = (
-            await connection.execute(
-                select(Run.runtime_state)
-                .where(
-                    Run.org_id == org_id,
-                    Run.session_id == session_id,
-                    Run.runtime == runtime,
-                    Run.kind == "chat",
-                    Run.status.in_(("completed", "failed", "cancelled")),
-                    Run.runtime_state.is_not(None),
-                )
-                .order_by(Run.finished_at.desc())
-                .limit(1)
-            )
+            await connection.execute(_session_state_query(Run, org_id, session_id, runtime))
         ).scalar_one_or_none()
         return _decode_state(state)
 
@@ -834,7 +872,7 @@ class RunQueue:
         lost. After this mark, ``reap`` does not start the run again, because a tool can run.
 
         ``config_fingerprint`` is the fingerprint of the ``RunConfig`` that the run uses."""
-        async with self._engine.begin() as connection:
+        async with autocommit(self._engine) as connection:
             row = (
                 await connection.execute(
                     update(Run)
@@ -847,7 +885,7 @@ class RunQueue:
 
     async def heartbeat(self, run: ClaimedRun, owner: str) -> Lease:
         """Extends the lease. Tells the worker if a user asked to cancel the run."""
-        async with self._engine.begin() as connection:
+        async with autocommit(self._engine) as connection:
             cancel = (
                 await connection.execute(
                     update(Run)
@@ -863,9 +901,48 @@ class RunQueue:
     async def add_events(
         self, run: ClaimedRun, owner: str, events: Sequence[tuple[int, str, dict[str, Any]]]
     ) -> bool:
-        """Stores run events as ``(seq, type, payload)``. Returns False if the lease is lost."""
+        """Stores run events as ``(seq, type, payload)``. Returns False if the lease is lost.
+
+        Usually one statement without a transaction stores the events: the insert takes the
+        run row ``FOR UPDATE`` while it checks the lease, so a reap waits until it ends. A
+        ``compacted`` event writes a second record, so it uses a transaction."""
         if not events:
             return True
+        if all(kind != "compacted" for _seq, kind, _payload in events):
+            rows = (
+                func.unnest(
+                    bindparam("seqs", [seq for seq, _kind, _payload in events], ARRAY(Integer)),
+                    bindparam("types", [kind for _seq, kind, _payload in events], ARRAY(Text)),
+                    bindparam(
+                        "payloads",
+                        [
+                            json.dumps(_stored_payload(kind, payload))
+                            for _seq, kind, payload in events
+                        ],
+                        ARRAY(Text),
+                    ),
+                )
+                .table_valued(column("seq", Integer), column("type", Text), column("payload", Text))
+                .render_derived(name="event")
+            )
+            leased = select(Run.id).where(*self._owned(run, owner)).with_for_update()
+            async with autocommit(self._engine) as connection:
+                stored = await connection.execute(
+                    insert(RunEvent)
+                    .from_select(
+                        ["org_id", "session_id", "run_id", "seq", "type", "payload"],
+                        select(
+                            literal(run.org_id, UUID(as_uuid=True)),
+                            literal(run.session_id, UUID(as_uuid=True)),
+                            literal(run.run_id, UUID(as_uuid=True)),
+                            rows.c.seq,
+                            rows.c.type,
+                            cast(rows.c.payload, JSONB),
+                        ).where(exists(leased)),
+                    )
+                    .returning(RunEvent.seq)
+                )
+                return bool(stored.first())
         async with self._engine.begin() as connection:
             held = (
                 await connection.execute(
