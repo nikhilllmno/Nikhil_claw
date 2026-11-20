@@ -44,6 +44,7 @@ from sama.connectors.composio import (
     ComposioClient,
     ComposioError,
 )
+from sama.connectors.database import DatabaseGateway
 from sama.connectors.errors import ConnectorError
 from sama.connectors.http_api import (
     DriverError,
@@ -52,6 +53,7 @@ from sama.connectors.http_api import (
     HttpApiDriver,
 )
 from sama.connectors.manifest import Catalog, Manifest, Scope, ToolSpec
+from sama.connectors.postgres import writes_on
 from sama.db.models import AuditEntry, Connection, Run, Session
 from sama.tenancy.access import Grants
 from sama.tenancy.authority import run_user
@@ -173,6 +175,8 @@ class ConnectionService:
       connect.
     - ``web_base``: the address of the web app, for the links of ``/connect`` and
       ``connection_request`` and for the Composio callback.
+    - ``database``: the gateway of the ``database`` connectors (Section 10.4). It also tests
+      a database connection.
     """
 
     def __init__(
@@ -185,6 +189,7 @@ class ConnectionService:
         composio: ComposioClient | None = None,
         drivers: Mapping[str, FormDriver] | None = None,
         web_base: str | None = None,
+        database: DatabaseGateway | None = None,
     ) -> None:
         self._engine = engine
         self.catalog = catalog
@@ -194,6 +199,8 @@ class ConnectionService:
         self._drivers: dict[str, FormDriver] = (
             dict(drivers) if drivers is not None else {"http_api": HttpApiDriver()}
         )
+        self._database = database or DatabaseGateway()
+        self._drivers.setdefault("database", self._database)
         self.web_base = web_base.rstrip("/") if web_base else None
 
     async def aclose(self) -> None:
@@ -666,10 +673,22 @@ class ConnectionService:
             scope = await self.run_scope(claims)
         except ConnectorError:
             return frozenset(n for n, found in tools.items() if found is None)
-        connected = {v.connector for v in await self.for_run(scope) if v.state == "connected"}
-        return frozenset(
-            n for n, found in tools.items() if found is None or found[0].name in connected
-        )
+        views = await self.for_run(scope)
+        connected = {v.connector for v in views if v.state == "connected"}
+
+        def usable(found: tuple[Manifest, ToolSpec] | None) -> bool:
+            if found is None:
+                return True
+            manifest, tool = found
+            if manifest.name not in connected:
+                return False
+            if manifest.operation(tool) == "execute":
+                # The write tool of a database shows only when the connection allows writes.
+                used = _pick([v for v in views if v.connector == manifest.name], connected=True)
+                return used is not None and writes_on(used.fields)
+            return True
+
+        return frozenset(n for n, found in tools.items() if usable(found))
 
     async def call(self, claims: RunTokenClaims, name: str, arguments: Mapping[str, Any]) -> str:
         """Runs a connector tool with the connection that the run may use."""
@@ -687,6 +706,8 @@ class ConnectionService:
             )
         if manifest.kind == "composio":
             text = await self._composio_call(scope.org_id, view, tool, arguments)
+        elif manifest.kind == "database":
+            text = await self._database_call(claims, scope, view, manifest, tool, arguments)
         else:
             text = await self._form_call(scope.org_id, view, manifest, tool, arguments)
         if len(text) > MAX_ANSWER_CHARS:
@@ -833,6 +854,23 @@ class ConnectionService:
             raise ConnectorError("the connection is not complete. Use connection_request")
         try:
             return await driver.call(manifest, tool, values, arguments)
+        except DriverError as error:
+            raise ConnectorError(f"{tool.name} failed: {error}") from None
+
+    async def _database_call(
+        self,
+        claims: RunTokenClaims,
+        scope: RunScope,
+        view: ConnectionView,
+        manifest: Manifest,
+        tool: ToolSpec,
+        arguments: Mapping[str, Any],
+    ) -> str:
+        values = await self._form_values(scope.org_id, view)
+        if values is None:
+            raise ConnectorError("the connection is not complete. Use connection_request")
+        try:
+            return await self._database.run(claims, view.id, manifest, tool, values, arguments)
         except DriverError as error:
             raise ConnectorError(f"{tool.name} failed: {error}") from None
 

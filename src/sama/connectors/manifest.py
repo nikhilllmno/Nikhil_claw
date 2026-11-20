@@ -9,6 +9,9 @@ deploy ships them. A manifest gives:
 - for ``composio``: the Composio toolkit. Composio holds the credential;
 - for ``http_api``: the form fields (a secret field goes to the vault, never into chat), the
   base URL, the auth header, and the test request;
+- for ``database``: the database engine (only ``postgres``). The model makes the form fields
+  and the five tools ``db_<conn>_schema``, ``sample``, ``query``, ``export``, and ``execute``
+  (Section 10.4). A manifest of this kind does not list fields or tools;
 - the tools of the connector. Each tool has a name, a description, a JSON schema of its
   arguments, and an ``access``: ``read``, ``write``, or ``destructive``. A ``read`` tool gets
   ``allow`` and the other tools get ``ask`` (Section 10.3).
@@ -23,7 +26,7 @@ import os
 import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -36,8 +39,11 @@ CONNECTOR_NAME: Final = re.compile(r"[a-z][a-z0-9_-]{0,39}")
 _PATH_PARAM: Final = re.compile(r"\{([a-z_][a-z0-9_]{0,63})\}")
 
 Scope = Literal["personal", "workspace"]
-Kind = Literal["composio", "http_api"]
+Kind = Literal["composio", "http_api", "database"]
 """The kinds that this release can connect. The table allows more kinds (Section 10.3)."""
+DatabaseOperation = Literal["schema", "sample", "query", "export", "execute"]
+DATABASE_OPERATIONS: Final[tuple[DatabaseOperation, ...]] = get_args(DatabaseOperation)
+SslMode = Literal["require", "verify-full"]
 
 
 class ManifestError(ValueError):
@@ -83,6 +89,17 @@ class Composio(_Strict):
     toolkit: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 
 
+class Database(_Strict):
+    """The database block of a ``database`` connector (Section 10.4)."""
+
+    engine: Literal["postgres"]
+    sslmode: SslMode = "require"
+    """The TLS mode when the form leaves ``sslmode`` empty."""
+    hints: Mapping[str, Annotated[str, Field(max_length=400)]] = Field(default_factory=dict)
+    """Help texts for the standard form fields, by field name (for example where the
+    provider shows the host)."""
+
+
 class ToolSpec(_Strict):
     """One tool of a connector."""
 
@@ -114,11 +131,47 @@ class Manifest(_Strict):
     scopes: Annotated[tuple[Scope, ...], Field(min_length=1)] = ("personal", "workspace")
     composio: Composio | None = None
     http: HttpApi | None = None
+    database: Database | None = None
     fields: tuple[FormField, ...] = ()
     tools: Annotated[tuple[ToolSpec, ...], Field(min_length=1)]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _database_form_and_tools(cls, data: Any) -> Any:
+        """A ``database`` connector gets the standard form and the five tools."""
+        if not isinstance(data, dict) or data.get("kind") != "database":
+            return data
+        if "fields" in data or "tools" in data:
+            raise ValueError("a database connector does not list fields or tools")
+        block = data.get("database")
+        name = data.get("name")
+        if not isinstance(block, dict) or not isinstance(name, str):
+            return data  # The field checks give the error.
+        hints = block.get("hints") or {}
+        if not isinstance(hints, dict):
+            return data
+        if unknown := sorted(set(hints) - {f["name"] for f in DATABASE_FIELDS}):
+            raise ValueError(f"hints for unknown fields: {', '.join(unknown)}")
+        fields = [
+            {**f, "help": str(hints[f["name"]])} if f["name"] in hints else dict(f)
+            for f in DATABASE_FIELDS
+        ]
+        title = data.get("title") if isinstance(data.get("title"), str) else name
+        return {**data, "fields": fields, "tools": database_tools(name, str(title))}
+
     @model_validator(mode="after")
     def _fits_kind(self) -> Manifest:
+        if self.kind == "database":
+            if self.database is None or self.http is not None or self.composio is not None:
+                raise ValueError("a database connector has a database block only")
+            for tool in self.tools:
+                if tool.request is not None or tool.slug is not None:
+                    raise ValueError("a database tool has no request and no slug")
+                if self.operation(tool) is None:
+                    raise ValueError(f"{tool.name}: not a tool of a database connector")
+            return self
+        if self.database is not None:
+            raise ValueError("only a database connector has a database block")
         if self.kind == "composio":
             if self.composio is None or self.http is not None or self.fields:
                 raise ValueError("a composio connector has a composio block and no form")
@@ -152,6 +205,15 @@ class Manifest(_Strict):
     @property
     def secret_fields(self) -> tuple[FormField, ...]:
         return tuple(f for f in self.fields if f.secret)
+
+    def operation(self, tool: ToolSpec) -> DatabaseOperation | None:
+        """The database operation of a tool of a ``database`` connector, else ``None``."""
+        if self.kind != "database":
+            return None
+        rest = tool.name.removeprefix(database_tool_prefix(self.name))
+        if rest == tool.name:
+            return None
+        return next((op for op in DATABASE_OPERATIONS if op == rest), None)
 
     def public(self) -> dict[str, Any]:
         """The connector for the web app: no schemas, and the fields without values."""
@@ -238,3 +300,195 @@ def parse(text: str, *, source: str = "manifest") -> Manifest:
 
 def path_params(path: str) -> list[str]:
     return _PATH_PARAM.findall(path)
+
+
+# -- database connectors (Section 10.4) -----------------------------------------------------
+
+MAX_SQL_CHARS: Final = 20_000
+MAX_EXECUTE_SQL_CHARS: Final = 1_000
+"""The SQL of ``execute`` must fit on the approval card in full."""
+MAX_PARAMS: Final = 100
+MAX_SAMPLE_ROWS: Final = 20
+
+DATABASE_FIELDS: Final[tuple[dict[str, Any], ...]] = (
+    {"name": "host", "label": "Host", "help": "The host name of the database server."},
+    {
+        "name": "port",
+        "label": "Port",
+        "required": False,
+        "help": "The port of the database server. Empty means 5432.",
+    },
+    {"name": "database", "label": "Database", "help": "The name of the database."},
+    {
+        "name": "user",
+        "label": "User",
+        "help": (
+            "A database user for sama. Give it only the access that the agent needs: a user "
+            "without access to a table or a column is the strongest control."
+        ),
+    },
+    {"name": "password", "label": "Password", "secret": True, "help": "The password."},
+    {
+        "name": "sslmode",
+        "label": "TLS mode",
+        "required": False,
+        "help": (
+            "require (encrypt, do not check the certificate) or verify-full (encrypt and "
+            "check the certificate and the host name). Empty means the connector default."
+        ),
+    },
+    {
+        "name": "schemas",
+        "label": "Allowed schemas",
+        "required": False,
+        "help": "A comma list of the schemas that the agent can read, for example public. "
+        "Empty means all schemas that the user can read.",
+    },
+    {
+        "name": "tables",
+        "label": "Allowed tables",
+        "required": False,
+        "help": "A comma list of the tables that the agent can use, as schema.table or "
+        "table. Empty means all tables of the allowed schemas.",
+    },
+    {
+        "name": "hidden_columns",
+        "label": "Hidden columns",
+        "required": False,
+        "help": "A comma list of columns that never show in a result, as column or "
+        "table.column, for example email, users.password_hash.",
+    },
+    {
+        "name": "writes",
+        "label": "Allow writes (on or off)",
+        "required": False,
+        "help": "on lets the agent change rows with an approved db_<conn>_execute call. "
+        "Empty means off.",
+    },
+    {
+        "name": "ddl",
+        "label": "Allow schema changes (on or off)",
+        "required": False,
+        "help": "on lets an approved db_<conn>_execute call also run DDL (CREATE, ALTER, "
+        "DROP, TRUNCATE). It needs writes on. Empty means off.",
+    },
+)
+"""The form of every ``database`` connector. Only ``password`` is a secret."""
+
+
+def database_tool_prefix(connector: str) -> str:
+    """``db_<conn>_``, where ``<conn>`` is the connector name with ``_`` for ``-``."""
+    return f"db_{connector.replace('-', '_')}_"
+
+
+_PARAMS_SCHEMA: Final[dict[str, Any]] = {
+    "type": "array",
+    "maxItems": MAX_PARAMS,
+    "items": {"type": ["string", "number", "integer", "boolean", "null"]},
+    "description": "The values of $1, $2, ... in the SQL. Use them for values from the user.",
+}
+
+
+def database_tools(connector: str, title: str) -> list[dict[str, Any]]:
+    """The five tools of a ``database`` connector, as manifest data."""
+    prefix = database_tool_prefix(connector)
+    return [
+        {
+            "name": f"{prefix}schema",
+            "access": "read",
+            "description": (
+                f"Show the schemas, tables, columns, types, keys, indexes, and comments of the "
+                f"{title} database. Give schema or table to see less. Use this before you "
+                "write SQL."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "maxLength": 63},
+                    "table": {"type": "string", "maxLength": 63},
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "Read the catalog again (the result is kept 10 min).",
+                    },
+                },
+            },
+        },
+        {
+            "name": f"{prefix}sample",
+            "access": "read",
+            "description": (
+                f"Show some rows of one table of the {title} database (at most {MAX_SAMPLE_ROWS})."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "maxLength": 130,
+                        "description": "schema.table or table.",
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SAMPLE_ROWS},
+                },
+                "required": ["table"],
+            },
+        },
+        {
+            "name": f"{prefix}query",
+            "access": "read",
+            "description": (
+                f"Run one read-only SQL statement (SELECT, WITH, VALUES, or EXPLAIN) on the "
+                f"{title} database (PostgreSQL). The statement runs in a read-only "
+                "transaction and stops after 30 seconds. You get at most 1,000 rows and "
+                "50 KB; the full result goes to a CSV file in the sandbox. Use LIMIT, and "
+                "use export for large results."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARS},
+                    "params": _PARAMS_SCHEMA,
+                },
+                "required": ["sql"],
+            },
+        },
+        {
+            "name": f"{prefix}export",
+            "access": "read",
+            "description": (
+                f"Run one read-only SQL statement on the {title} database and write all "
+                "rows to a CSV file in the sandbox (.sama/exports/). You get the path and "
+                "the row count, not the rows."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARS},
+                    "params": _PARAMS_SCHEMA,
+                    "format": {"type": "string", "enum": ["csv"]},
+                },
+                "required": ["sql"],
+            },
+        },
+        {
+            "name": f"{prefix}execute",
+            "access": "destructive",
+            "description": (
+                f"Run one SQL statement that changes data (INSERT, UPDATE, DELETE, MERGE) on "
+                f"the {title} database. A person must approve each call, and the approval "
+                "shows the SQL. DDL runs only if the connection allows it. The connection "
+                "must allow writes."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_EXECUTE_SQL_CHARS,
+                    },
+                    "params": {**_PARAMS_SCHEMA, "maxItems": 20},
+                },
+                "required": ["sql"],
+            },
+        },
+    ]

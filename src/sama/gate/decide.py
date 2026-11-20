@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -137,7 +138,19 @@ ALWAYS_ASK: Final = frozenset({"repo_push_approval"})
 """Tools that always need the approval of a person for each call. An ``allow`` rule cannot
 remove the ask, and "always allow" writes no rule for them. A ``deny`` rule still wins. The
 approval of ``repo_push_approval`` is the approval of a push that changes a protected path
-(Section 15.1)."""
+(Section 15.1). ``always_asks`` also covers the ``execute`` tool of each database connection."""
+
+_DATABASE_EXECUTE: Final = re.compile(r"^db_[a-z0-9_]+_execute$")
+"""``db_<conn>_execute`` (Section 10.4): each call runs other SQL, so each call needs a person
+who reads that SQL."""
+
+
+def always_asks(tool_name: str) -> bool:
+    """True for a tool that needs the approval of a person for each call: a tool in
+    ``ALWAYS_ASK`` or ``db_<conn>_execute``. ``tool_name`` can have the sama MCP prefix."""
+    name = canonical_name(tool_name)
+    return name in ALWAYS_ASK or _DATABASE_EXECUTE.match(name) is not None
+
 
 SHARED_ASK: Final = frozenset({"memory", "cronjob_manage"})
 """Tools that are in ``DEFAULT_ALLOW`` but get ``ask`` in a shared session (Section 11.3). Every
@@ -478,7 +491,7 @@ def policy_verdict(
     shared: bool = False,
     access: Mapping[str, ToolAccess] | None = None,
 ) -> Verdict:
-    """Step 4. A ``deny`` rule at any level wins. A tool in ``ALWAYS_ASK`` gets ``ask``. An
+    """Step 4. A ``deny`` rule at any level wins. A tool that ``always_asks`` gets ``ask``. An
     org or profile ``ask`` rule cannot be removed by a user rule. Otherwise a user rule wins,
     then the profile rule, then the org rule. At one level an exact name wins over a prefix.
     Without a rule, the built-in default applies, and the default for unknown tools is
@@ -488,7 +501,7 @@ def policy_verdict(
     matching = [rule for rule in rules if rule.matches(name)]
     if any(rule.action == "deny" for rule in matching):
         return Verdict("deny", GateStep.POLICY, f"a policy rule denies {name}")
-    if name in ALWAYS_ASK:
+    if always_asks(name):
         return Verdict("ask", GateStep.POLICY, f"{name} needs an approval for each call")
     admin = _most_specific(r for r in matching if r.level is not RuleLevel.USER)
     user = _most_specific(r for r in matching if r.level is RuleLevel.USER)
