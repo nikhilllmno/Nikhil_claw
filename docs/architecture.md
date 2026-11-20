@@ -3245,7 +3245,7 @@ are untrusted. Event-triggered runs use the `safe` toolset unless the trigger sa
 
 **What M4.4 builds**
 
-- **Tables.** Migration `0025` adds `triggers` (one event source of a workspace) and
+- **Tables.** Migration `0026` adds `triggers` (one event source of a workspace) and
   `trigger_events` (one row for each accepted delivery), both with `org_id` and RLS. A member of
   the workspace or an org admin sees its triggers. An event row shows to the users who can read
   its session. The migration also adds `runs.toolsets` and the vault names `trigger:<uuid>` and
