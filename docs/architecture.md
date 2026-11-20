@@ -2633,8 +2633,9 @@ pages of the web app. They use the same guards as the session routes (code and R
   has the session id, the workspace, the title, the audience, the times, and the snippets.
 - **Export.** `GET /sessions/{id}/export` returns `format=markdown` (`text/markdown`) or
   `format=json` (`application/json`, `"format": "sama.session.v1"`). The file has the session
-  data and the messages by `seq`, at most 5,000. A longer session gets a note in the file and
-  `truncated: true`. The answer has `Content-Disposition: attachment` with the name
+  data and the messages by `seq`. The API reads the messages in batches of 200. It stops after
+  5,000 messages, or after the message that brings the text over 4,000,000 characters. Then
+  the file has a note and `truncated: true`. The answer has `Content-Disposition: attachment` with the name
   `session-<first 8 characters of the id>.md` or `.json`, and `Cache-Control: no-store`. The
   redactor runs again on each message.
 - **Runs and traces.** `GET /sessions/{id}/runs` gives `kind`, `status`, `compact`, the times,
@@ -2642,8 +2643,10 @@ pages of the web app. They use the same guards as the session routes (code and R
   needs read access to the session of the run, else `404`. It gives the run, its `run_events`
   as steps (at most 2,000, then `truncated: true`), its `tool_calls` (at most 500), and its
   `model_calls` (at most 500). Adjacent `text_delta` events become one step with at most 20,000
-  characters. The redactor runs again on each payload and on the joined text, because a secret
-  can span two deltas. The trace never has `runtime_state`.
+  characters. The redactor runs again on each payload and on the whole joined text, because a
+  secret can span two deltas. The cut comes after the redaction and ends at a space. When the
+  events are cut, the last text step also loses its last word. Thus a trace never shows the
+  start of a secret. The trace never has `runtime_state`.
 - **Skill editor.** `GET /workspaces/{id}/skills` lists the skills that the user sees in the
   workspace (Section 9.4) with `can_edit` and `writable_scopes`. `GET .../skills/{name}` gives
   the `SKILL.md`, the files, and the other scopes that have the same name. `POST .../skills`

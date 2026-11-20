@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.api import history
 from sama.api.history import MAX_TRACE_TEXT_CHARS, export_markdown, merge_steps
 from sama.db.models import Message, ModelCall, Run, RunEvent, ToolCall
 from tests.api.conftest import bearer
@@ -150,8 +151,32 @@ def test_merge_steps_cuts_long_text_and_redacts_a_split_secret() -> None:
     )
     assert FAKE_KEY not in steps[0].payload["text"]
     assert "[REDACTED]" in steps[0].payload["text"]
-    long = merge_steps([_Event(i, "text_delta", {"text": "x" * 1000}) for i in range(40)])
-    assert len(long[0].payload["text"]) <= MAX_TRACE_TEXT_CHARS + 50
+    long = merge_steps([_Event(i, "text_delta", {"text": "x " * 500}) for i in range(40)])
+    assert len(long[0].payload["text"]) <= MAX_TRACE_TEXT_CHARS
+
+
+def test_the_text_cut_never_shows_the_start_of_a_split_secret() -> None:
+    # The secret spans two deltas and the character cut: the redaction runs before the cut.
+    head = "x " * ((MAX_TRACE_TEXT_CHARS - 10) // 2)
+    steps = merge_steps(
+        [
+            _Event(1, "text_delta", {"text": head + FAKE_KEY[:20]}),
+            _Event(2, "text_delta", {"text": FAKE_KEY[20:] + " tail"}),
+        ]
+    )
+    text = steps[0].payload["text"]
+    assert len(text) <= MAX_TRACE_TEXT_CHARS
+    assert FAKE_KEY[:8] not in text
+
+
+def test_the_event_cut_drops_the_last_word_of_the_text() -> None:
+    # The run has more events than the trace shows: the rest of the secret is not here.
+    steps = merge_steps(
+        [_Event(1, "text_delta", {"text": "the key is " + FAKE_KEY[:30]})], more=True
+    )
+    assert steps[0].payload["text"] == "the key is "
+    whole = merge_steps([_Event(1, "text_delta", {"text": "done"})])
+    assert whole[0].payload["text"] == "done"
 
 
 def test_export_markdown_has_a_heading_per_message() -> None:
@@ -172,7 +197,7 @@ def test_export_markdown_has_a_heading_per_message() -> None:
     assert body.startswith("# Untitled session\n")
     assert "## User (t1)\n\nHi" in body
     assert "## Assistant (t2)\n\n**Hello**" in body
-    assert "- Note: the export has only the first" in body
+    assert "- Note: the export is cut. It has only the first 2 messages." in body
 
 
 # -- search ----------------------------------------------------------------------------------
@@ -268,6 +293,29 @@ async def test_the_export_gives_markdown_and_json_with_redacted_text(
 
     bad = await client.get(path, headers=mia(tenant), params={"format": "pdf"})
     assert bad.status_code == 422
+
+
+async def test_the_export_reads_in_batches_and_stops_at_the_text_budget(
+    client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(history, "EXPORT_BATCH", 2)
+    for n in range(5):
+        await say(engine, tenant, "mine", f"message {n}")
+    path = f"/sessions/{tenant.ids['mine']}/export"
+    whole = json.loads(
+        (await client.get(path, headers=mia(tenant), params={"format": "json"})).text
+    )
+    assert [m["text"] for m in whole["messages"]] == [f"message {n}" for n in range(5)]
+    assert whole["truncated"] is False
+
+    # The message that goes over the budget is the last one in the file.
+    monkeypatch.setattr(history, "MAX_EXPORT_CHARS", len("message 0") * 2)
+    cut = json.loads((await client.get(path, headers=mia(tenant), params={"format": "json"})).text)
+    assert [m["text"] for m in cut["messages"]] == [f"message {n}" for n in range(3)]
+    assert cut["truncated"] is True
 
 
 async def test_the_export_answers_404_for_a_private_session_of_another_user(

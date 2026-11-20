@@ -107,16 +107,6 @@ def _not_found(what: str = "the skill does not exist") -> HTTPException:
     return HTTPException(status_code=404, detail=what)
 
 
-def writable_scopes(grants: Grants, workspace_id: uuid.UUID) -> list[str]:
-    """The scopes that ``authorize`` lets the person write in a workspace."""
-    scopes = ["user"]
-    if grants.admins_workspace(workspace_id) or grants.org_owner:
-        scopes.append("workspace")
-    if grants.org_owner:
-        scopes.append("org")
-    return scopes
-
-
 class SkillEditor:
     """Reads and writes of skills for the web app."""
 
@@ -195,7 +185,7 @@ class SkillEditor:
                 )
                 for doc in docs
             ],
-            writable_scopes=writable_scopes(grants, workspace_id),
+            writable_scopes=[s for s in WRITABLE_SCOPES if self._can_edit(s, actor)],
         )
 
     async def detail(

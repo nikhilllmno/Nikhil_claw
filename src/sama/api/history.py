@@ -18,13 +18,13 @@ from typing import Any, Final, Literal
 
 from fastapi import HTTPException, Response
 from pydantic import BaseModel
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.api.auth import Principal
 from sama.db.engine import as_user
 from sama.db.models import Message, ModelCall, Run, RunEvent, ToolCall, User
-from sama.search.core import MAX_LIMIT, MAX_QUERY_CHARS, SessionHit, SessionSearchError
+from sama.search.core import MAX_LIMIT, MAX_QUERY_CHARS, SessionSearchError
 from sama.search.service import SessionSearch
 from sama.tenancy.access import load_grants
 from sama.vault.redact import default_redactor, redact
@@ -37,12 +37,18 @@ It returns an object with ``session`` (the row) and ``org_id``."""
 EXPORT_FORMAT: Final = "sama.session.v1"
 MAX_EXPORT_MESSAGES: Final = 5_000
 """An export has at most this many messages. A longer session sets ``truncated``."""
+MAX_EXPORT_CHARS: Final = 4_000_000
+"""An export stops after the message that brings the text over this many characters, so one
+large session cannot fill the memory of the control plane. It then sets ``truncated``."""
+EXPORT_BATCH: Final = 200
+"""The export reads the messages in batches of this size."""
 MAX_RUNS: Final = 200
 DEFAULT_RUNS: Final = 50
 MAX_TRACE_EVENTS: Final = 2_000
 """A trace has at most this many stored events. A longer run sets ``truncated``."""
 MAX_TRACE_TEXT_CHARS: Final = 20_000
-"""The text of one merged text step is cut after this many characters."""
+"""The text of one merged text step is cut after this many characters. The cut is after the
+redaction and at a space, so it never shows the start of a secret."""
 MAX_TRACE_TOOL_CALLS: Final = 500
 MAX_TRACE_MODEL_CALLS: Final = 500
 ROLE_TITLES: Final = {
@@ -146,23 +152,6 @@ def _clean(payload: Any) -> dict[str, Any]:
     return cleaned
 
 
-def _hit(hit: SessionHit) -> SearchHit:
-    return SearchHit(
-        session_id=hit.session_id,
-        workspace_id=hit.workspace_id,
-        title=hit.title,
-        audience=hit.audience,
-        created_at=hit.created_at,
-        updated_at=hit.updated_at,
-        snippets=[
-            SearchSnippet(
-                message_id=s.message_id, role=s.role, created_at=s.created_at, text=s.text
-            )
-            for s in hit.snippets
-        ],
-    )
-
-
 def _text(content: Any) -> str:
     return redact(str((content or {}).get("text", "")))
 
@@ -183,7 +172,7 @@ def export_markdown(
         f"- Messages: {len(messages)}",
     ]
     if truncated:
-        lines.append(f"- Note: the export has only the first {MAX_EXPORT_MESSAGES} messages.")
+        lines.append(f"- Note: the export is cut. It has only the first {len(messages)} messages.")
     for message in messages:
         role = ROLE_TITLES.get(message["role"], message["role"].title())
         lines += ["", f"## {role} ({message['created_at']})", "", message["text"].rstrip()]
@@ -235,7 +224,7 @@ class SessionHistory:
             )
         except SessionSearchError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
-        return [_hit(hit) for hit in hits]
+        return [SearchHit.model_validate(hit, from_attributes=True) for hit in hits]
 
     # -- export -----------------------------------------------------------------------------
 
@@ -243,36 +232,55 @@ class SessionHistory:
         self, principal: Principal, session_id: uuid.UUID, fmt: ExportFormat
     ) -> Response:
         """The transcript of a session as a file to download."""
+        messages: list[dict[str, Any]] = []
+        chars = 0
+        truncated = False
         async with as_user(self._engine, principal.auth_user_id) as connection:
             access = await self._session_access(connection, principal, session_id)
             row = access.session
-            rows = (
-                await connection.execute(
-                    select(
-                        Message.seq,
-                        Message.run_id,
-                        Message.role,
-                        Message.author_user_id,
-                        Message.content,
-                        Message.created_at,
+            after = -1
+            # Batches by ``seq`` keep only one batch of raw rows in memory at a time.
+            while not truncated:
+                batch = (
+                    await connection.execute(
+                        select(
+                            Message.seq,
+                            Message.run_id,
+                            Message.role,
+                            Message.author_user_id,
+                            Message.content,
+                            Message.created_at,
+                        )
+                        .where(
+                            Message.org_id == row.org_id,
+                            Message.session_id == session_id,
+                            Message.seq > after,
+                        )
+                        .order_by(Message.seq)
+                        .limit(EXPORT_BATCH)
                     )
-                    .where(Message.org_id == row.org_id, Message.session_id == session_id)
-                    .order_by(Message.seq)
-                    .limit(MAX_EXPORT_MESSAGES + 1)
-                )
-            ).all()
-        truncated = len(rows) > MAX_EXPORT_MESSAGES
-        messages = [
-            {
-                "seq": m.seq,
-                "run_id": None if m.run_id is None else str(m.run_id),
-                "role": m.role,
-                "author_user_id": None if m.author_user_id is None else str(m.author_user_id),
-                "created_at": m.created_at.isoformat(),
-                "text": _text(m.content),
-            }
-            for m in rows[:MAX_EXPORT_MESSAGES]
-        ]
+                ).all()
+                for m in batch:
+                    if len(messages) >= MAX_EXPORT_MESSAGES or chars > MAX_EXPORT_CHARS:
+                        truncated = True
+                        break
+                    text = _text(m.content)
+                    chars += len(text)
+                    messages.append(
+                        {
+                            "seq": m.seq,
+                            "run_id": None if m.run_id is None else str(m.run_id),
+                            "role": m.role,
+                            "author_user_id": None
+                            if m.author_user_id is None
+                            else str(m.author_user_id),
+                            "created_at": m.created_at.isoformat(),
+                            "text": text,
+                        }
+                    )
+                if len(batch) < EXPORT_BATCH:
+                    break
+                after = batch[-1].seq
         session = {
             "id": str(row.id),
             "org_id": str(row.org_id),
@@ -459,11 +467,9 @@ class SessionHistory:
                     ModelCall.created_at,
                 )
                 .where(
-                    and_(
-                        ModelCall.org_id == org_id,
-                        ModelCall.session_id == row.session_id,
-                        ModelCall.run_id == run_id,
-                    )
+                    ModelCall.org_id == org_id,
+                    ModelCall.session_id == row.session_id,
+                    ModelCall.run_id == run_id,
                 )
                 .order_by(ModelCall.created_at, ModelCall.id)
                 .limit(MAX_TRACE_MODEL_CALLS)
@@ -472,43 +478,58 @@ class SessionHistory:
         truncated = len(events) > MAX_TRACE_EVENTS
         return RunTrace(
             run=self._summary(row),
-            steps=merge_steps(events[:MAX_TRACE_EVENTS]),
+            steps=merge_steps(events[:MAX_TRACE_EVENTS], more=truncated),
             tool_calls=tool_calls,
             model_calls=model_calls,
             truncated=truncated,
         )
 
 
-def merge_steps(events: Sequence[Any]) -> list[TraceStep]:
+def _cut(text: str, limit: int) -> str:
+    """``text`` with at most ``limit`` characters. A cut ends at a space, so the last word,
+    which can be the start of a secret, does not show."""
+    if len(text) <= limit:
+        return text
+    return _drop_last_word(text[:limit])
+
+
+def _drop_last_word(text: str) -> str:
+    """``text`` without the characters after its last space."""
+    end = max(text.rfind(" "), text.rfind("\n"), text.rfind("\t"))
+    return text[: end + 1] if end >= 0 else ""
+
+
+def merge_steps(events: Sequence[Any], *, more: bool = False) -> list[TraceStep]:
     """The stored events as steps. A run of ``text_delta`` events is one ``text`` step, so a
-    long answer is one step, not hundreds."""
+    long answer is one step, not hundreds. ``more`` is true if the run has events after
+    ``events``.
+
+    Each delta was redacted alone, but a secret can span two deltas. Thus the whole joined
+    text is redacted before the cut. If the last step is text and ``more`` is true, the text
+    goes on in an event that is not here, so its last word is dropped too.
+    """
     steps: list[TraceStep] = []
+    parts: dict[int, list[str]] = {}
     for event in events:
         payload = _clean(event.payload)
         if event.type == "text_delta":
             text = str(payload.get("text", ""))
-            last = steps[-1] if steps else None
-            if last is not None and last.type == "text":
-                joined = str(last.payload["text"]) + text
-                last.payload["text"] = joined[:MAX_TRACE_TEXT_CHARS]
+            if steps and steps[-1].type == "text":
+                parts[len(steps) - 1].append(text)
                 continue
+            parts[len(steps)] = [text]
             steps.append(
-                TraceStep(
-                    seq=event.seq,
-                    type="text",
-                    created_at=event.created_at,
-                    payload={"text": text[:MAX_TRACE_TEXT_CHARS]},
-                )
+                TraceStep(seq=event.seq, type="text", created_at=event.created_at, payload={})
             )
             continue
         steps.append(
             TraceStep(seq=event.seq, type=event.type, created_at=event.created_at, payload=payload)
         )
-    # Each delta was redacted alone. A secret can span two deltas, so the joined text is
-    # redacted again.
-    for step in steps:
-        if step.type == "text":
-            step.payload["text"] = redact(str(step.payload["text"]))
+    for index, texts in parts.items():
+        text = redact("".join(texts))
+        if more and index == len(steps) - 1:
+            text = _drop_last_word(text)
+        steps[index].payload["text"] = _cut(text, MAX_TRACE_TEXT_CHARS)
     return steps
 
 
