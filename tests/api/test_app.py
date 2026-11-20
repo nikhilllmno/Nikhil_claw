@@ -89,6 +89,7 @@ async def test_the_page_and_the_config_are_public(client: httpx.AsyncClient) -> 
         "supabase_url": "https://project.example.test",
         "supabase_anon_key": "anon-key",
         "integrations": False,
+        "connections": False,
     }
 
 

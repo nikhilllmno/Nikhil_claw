@@ -17,6 +17,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.connectors.manifest import Catalog
 from sama.controlplane import ControlPlane, ControlPlaneSettings, build
 from sama.controlplane.server import DrainingServer
 from sama.db.models import Run
@@ -120,7 +121,9 @@ async def test_the_runner_reaches_the_process_by_its_public_url(
     assert sandbox.archive_url == "https://sama-staging.fly.dev/tools/archive"
     assert plane.tools.archive is not None
     assert plane.tools.deferred is not None
-    assert len(plane.tools.deferred) == 0, "no product registers a deferred tool yet"
+    # The connector tools are the only deferred tools (Section 10.3).
+    assert len(plane.tools.deferred) == len(Catalog.load().tool_names())
+    assert set(plane.tools.deferred.toolsets()) == {"integrations"}
     assert sandbox.allow_out[0] == "sama-staging.fly.dev"
     assert sandbox.allow_out[-1] == "example.org"
     assert "github.com" in sandbox.allow_out

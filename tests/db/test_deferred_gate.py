@@ -37,7 +37,7 @@ def catalog() -> DeferredCatalog:
     return DeferredCatalog(
         [
             DeferredTool("mail_send", "Send mail.", "mail", nothing),
-            DeferredTool("mail_read", "Read mail.", "mail", nothing, read_only=True),
+            DeferredTool("mail_read", "Read mail.", "mail", nothing, access="read"),
             DeferredTool("clock", "Show the time.", "clock", nothing),
         ]
     )
@@ -145,7 +145,7 @@ async def test_an_approved_deferred_call_gives_one_ticket_for_its_arguments(
     # Other arguments, and another tool, do not match the ticket.
     other = await service.screen(org.claims(), "tool_call", wrapped("mail_send", to="x@y.z"))
     assert other.action == "deny"
-    other_tool = await service.screen(org.claims(), "tool_call", wrapped("mail_read"))
+    other_tool = await service.screen(org.claims(), "tool_call", wrapped("clock"))
     assert other_tool.action == "deny"
     used = await service.screen(org.claims(), "tool_call", arguments)
     assert (used.action, used.reason) == ("allow", "the call has an approved ticket")
@@ -201,3 +201,17 @@ async def test_a_shared_run_sees_the_group_toolsets_only(engine: AsyncEngine, or
     visible = await gate(engine).visible_tools(org.claims())
     assert "mail_read" not in visible
     assert "tool_search" in visible
+
+
+async def test_a_deferred_read_is_allowed_and_a_write_asks(engine: AsyncEngine, org: Org1) -> None:
+    """The connector default (Section 10.3): a tool that only reads gets ``allow``."""
+    await grant(engine, org, "tool_search", "mail")
+    service = gate(engine)
+    read = await service.check(org.claims(), "r1", "tool_call", wrapped("mail_read"))
+    assert (read.action, read.step) == ("allow", GateStep.POLICY)
+    write = await service.check(org.claims(), "w1", "tool_call", wrapped("mail_send", **SEND))
+    assert write.action == "ask"
+    # A rule of the admin still wins over the default.
+    await add_rule(engine, org, "mail_read", "ask")
+    again = await service.check(org.claims(), "r2", "tool_call", wrapped("mail_read"))
+    assert again.action == "ask"

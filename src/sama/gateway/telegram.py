@@ -33,9 +33,11 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
+from sama.gateway.connect import connect_answer
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
@@ -96,7 +98,8 @@ HELP: Final = (
     "/compact [focus] - make the context of this session shorter\n"
     "/pin <text> - keep a text in the context. /pins lists the pins. /unpin <number> removes one\n"
     "/pair <code> - link this account, or link a group with a group code\n"
-    "/skills - list the skills. /<skill> <request> uses a skill"
+    "/skills - list the skills. /<skill> <request> uses a skill\n"
+    "/connect <name> - get a link to connect a tool such as gmail or github"
 )
 
 OWN_COMMANDS: Final = frozenset(
@@ -112,6 +115,7 @@ OWN_COMMANDS: Final = frozenset(
         "/pin",
         "/pins",
         "/unpin",
+        "/connect",
     }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
@@ -269,6 +273,7 @@ class TelegramGateway:
         gate: GateService | None = None,
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
+        connections: ConnectionService | None = None,
         transcriber: Transcriber | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
@@ -284,6 +289,7 @@ class TelegramGateway:
         self._gate = gate or GateService(engine)
         self._skills = skills
         self._reviews = reviews
+        self._connections = connections
         self._pins = pins or PinStore(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
@@ -687,6 +693,9 @@ class TelegramGateway:
                 command[1:],
                 rest,
             )
+            await self._say(chat_id, answer, reply_to=message_id)
+        elif command == "/connect":
+            answer = connect_answer(self._connections, target, grants, rest)
             await self._say(chat_id, answer, reply_to=message_id)
         else:
             await self._say(chat_id, HELP, reply_to=message_id)

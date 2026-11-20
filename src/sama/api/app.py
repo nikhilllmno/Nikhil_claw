@@ -27,6 +27,8 @@ from importlib import resources
 from typing import Annotated, Any, Final, Literal, Self
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +48,7 @@ from starlette.types import ASGIApp, Lifespan
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.origins import check_origins
+from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
     Pin,
@@ -73,6 +76,7 @@ from sama.db.models import (
     User,
     Workspace,
 )
+from sama.db.models import Connection as ConnectionRow
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.gateway.pairing import PairingError, create_code
 from sama.integrations.service import IntegrationError, Integrations
@@ -153,6 +157,9 @@ class ApiSettings(BaseModel):
 # -- request and response bodies ------------------------------------------------------------
 
 
+MAX_FORM_FIELDS: Final = 20
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -213,6 +220,17 @@ class NewPairingCode(_Body):
 class TelegramConnect(_Body):
     bot_token: SecretStr = Field(min_length=1, max_length=200)
     """The token of the bot from @BotFather."""
+
+
+class ConnectionStart(_Body):
+    connector: str = Field(min_length=1, max_length=40)
+    scope: Literal["personal", "workspace"] = "personal"
+
+
+class ConnectionForm(_Body):
+    values: dict[str, SecretStr] = Field(max_length=MAX_FORM_FIELDS)
+    """The fields of the form of the connector. Each value is secret here: the service keeps
+    the non-secret fields in the row and the secret fields in the vault."""
 
 
 class SlackConnect(_Body):
@@ -547,13 +565,16 @@ class SamaApi:
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
         pins: PinStore | None = None,
+        connections: ConnectionService | None = None,
     ) -> None:
-        """Without ``integrations`` the integration routes answer ``409``. Without ``skills``,
+        """Without ``integrations`` the integration routes answer ``409``. Without
+        ``connections`` the connection routes answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
+        self._connections = connections
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -585,6 +606,17 @@ class SamaApi:
         app = _CorsApp(title="sama", docs_url=None, redoc_url=None, lifespan=lifespan)
         app.state.sama_api = self
         settings = self._settings
+
+        @app.exception_handler(RequestValidationError)
+        async def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
+            # The default answer repeats the input of each error. A body can hold a secret (a
+            # bot token, a connection form), so the answer says only where and why.
+            detail = [{k: v for k, v in e.items() if k != "input"} for e in error.errors()]
+            return JSONResponse({"detail": jsonable_encoder(detail)}, status_code=422)
+
+        @app.exception_handler(ConnectorError)
+        async def connector_error(request: Request, error: ConnectorError) -> JSONResponse:
+            return JSONResponse({"detail": str(error)}, status_code=error.status_code)
 
         @app.middleware("http")
         async def security_headers(request: Request, call_next: Any) -> Response:
@@ -618,6 +650,7 @@ class SamaApi:
                 "supabase_url": settings.supabase_url,
                 "supabase_anon_key": settings.supabase_anon_key,
                 "integrations": self._integrations is not None and self._integrations.enabled,
+                "connections": self._connections is not None,
             }
 
         @app.get("/me")
@@ -810,6 +843,57 @@ class SamaApi:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             if not gone:
                 raise _not_found("the org has no such integration")
+            return Response(status_code=204)
+
+        @app.get("/connectors")
+        async def connectors(principal: Me) -> list[dict[str, Any]]:
+            return [m.public() for m in self._require_connections().catalog]
+
+        @app.get("/workspaces/{workspace_id}/connections")
+        async def list_connections(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            views = await self._require_connections().list_connections(
+                org_id, workspace_id, grants.user_id
+            )
+            return [view.public() for view in views]
+
+        @app.post("/workspaces/{workspace_id}/connections", status_code=201)
+        async def start_connection(
+            principal: Me, workspace_id: uuid.UUID, body: ConnectionStart
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            service = self._require_connections()
+            started = await service.start(org_id, workspace_id, grants, body.connector, body.scope)
+            return started.public()
+
+        @app.post("/connections/{connection_id}/check")
+        async def check_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=False)
+            checked = await self._require_connections().check(org_id, view.id, actor=grants.user_id)
+            return checked.public()
+
+        @app.put("/connections/{connection_id}/form")
+        async def connection_form(
+            principal: Me, connection_id: uuid.UUID, body: ConnectionForm
+        ) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            values = {k: v.get_secret_value() for k, v in body.values.items()}
+            saved = await self._require_connections().submit_form(
+                org_id, view.id, values, actor=grants.user_id
+            )
+            return saved.public()
+
+        @app.post("/connections/{connection_id}/disable")
+        async def disable_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            done = await self._require_connections().disable(org_id, view.id, actor=grants.user_id)
+            return done.public()
+
+        @app.delete("/connections/{connection_id}", status_code=204)
+        async def delete_connection(principal: Me, connection_id: uuid.UUID) -> Response:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            if not await self._require_connections().delete(org_id, view.id, actor=grants.user_id):
+                raise _not_found("the connection does not exist")
             return Response(status_code=204)
 
         @app.get("/orgs/{org_id}/skills")
@@ -1524,6 +1608,41 @@ class SamaApi:
             "link": link,
             "command": command,
         }
+
+    def _require_connections(self) -> ConnectionService:
+        if self._connections is None:
+            raise HTTPException(status_code=409, detail="connections are off in this process")
+        return self._connections
+
+    async def _connection(
+        self, principal: Principal, connection_id: uuid.UUID, *, manage: bool
+    ) -> tuple[uuid.UUID, ConnectionView, Grants]:
+        """The connection and the grants of the user. The row is read as the user, so row
+        level security hides the connections of other orgs and the personal connections of
+        other users. Raises ``404`` for a connection that the user cannot see, and ``403``
+        for a change that the user cannot make."""
+        service = self._require_connections()
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            org_id = (
+                await connection.execute(
+                    select(ConnectionRow.org_id).where(ConnectionRow.id == connection_id)
+                )
+            ).scalar_one_or_none()
+            user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+            grants = (
+                None
+                if org_id is None or user_id is None
+                else await load_grants(connection, org_id, user_id)
+            )
+        view = None if org_id is None else await service.get(org_id, connection_id)
+        if org_id is None or grants is None or view is None or not service.can_see(view, grants):
+            raise _not_found("the connection does not exist")
+        if manage and not service.can_manage(view, grants):
+            raise HTTPException(
+                status_code=403,
+                detail="only the owner, a workspace admin, or the org owner can change it",
+            )
+        return org_id, view, grants
 
     def _require_integrations(self) -> Integrations:
         if self._integrations is None:

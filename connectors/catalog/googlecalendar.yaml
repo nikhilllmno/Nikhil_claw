@@ -1,0 +1,449 @@
+# The Google Calendar connector (docs/architecture.md, Section 10.3). Composio holds the
+# credential. The tool schemas are a trimmed copy of the Composio tool schemas.
+name: googlecalendar
+title: Google Calendar
+description: Read and change events in Google Calendar.
+kind: composio
+scopes:
+- personal
+- workspace
+composio:
+  toolkit: googlecalendar
+tools:
+- name: googlecalendar_events_list
+  slug: GOOGLECALENDAR_EVENTS_LIST
+  access: read
+  description: Returns events on the specified calendar.
+  input_schema:
+    type: object
+    properties:
+      q:
+        type: string
+        description: Free text search terms to find events that match these terms in various fields. Optional.
+      iCalUID:
+        type: string
+        description: Specifies an event ID in the iCalendar format to be provided in the response. Optional.
+          Use this if you want to search for an event by its iCalendar ID.
+      orderBy:
+        type: string
+        description: 'The order of the events returned in the result. Optional. The default is an unspecified,
+          stable order. Acceptable values are: "startTime", "updated".'
+      timeMax:
+        type: string
+        description: Upper bound (exclusive) for an event's start time to filter by. Optional. The default
+          is not to filter by start time. Must be an RFC3339 timestamp with mandatory time zone offset,
+          for example, 2011-06-03T10:00:00-07:00, 2011-06-03T10:00:00Z. Milliseconds may be provided but
+          are ignored. If timeMi...
+        default: '2025-09-01T08:20:14.636699Z'
+      timeMin:
+        type: string
+        description: Lower bound (exclusive) for an event's end time to filter by. Optional. The default
+          is not to filter by end time. Must be an RFC3339 timestamp with mandatory time zone offset,
+          for example, 2011-06-03T10:00:00-07:00, 2011-06-03T10:00:00Z. Milliseconds may be provided but
+          are ignored. If timeMax is...
+        default: '2025-08-25T08:20:14.636762Z'
+      timeZone:
+        type: string
+        description: Time zone used in the response. Optional. The default is the user's primary time
+          zone.
+      pageToken:
+        type: string
+        description: Token specifying which result page to return. Optional.
+      syncToken:
+        type: string
+        description: Token obtained from the nextSyncToken field returned on the last page of results
+          from the previous list request. Optional. The default is to return all entries.
+      calendarId:
+        type: string
+        description: Calendar identifier. To retrieve calendar IDs call the calendarList.list method.
+          If you want to access the primary calendar of the currently logged in user, use the "primary"
+          keyword.
+      eventTypes:
+        type: string
+        description: 'Event types to return. Optional. This parameter can be repeated multiple times to
+          return events of different types. If unset, returns all event types. Acceptable values are:
+          "birthday", "default", "focusTime", "fromGmail", "outOfOffice", "workingLocation".'
+      maxResults:
+        type: integer
+        description: Maximum number of events returned on one result page. The number of events in the
+          resulting page may be less than this value, or none at all, even if there are more events matching
+          the query. Incomplete pages can be detected by a non-empty nextPageToken field in the response.
+          By default the value...
+      updatedMin:
+        type: string
+        description: Lower bound for an event's last modification time (as a RFC3339 timestamp) to filter
+          by. When specified, entries deleted since this time will always be included regardless of showDeleted.
+          Optional. The default is not to filter by last modification time.
+      showDeleted:
+        type: boolean
+        description: Whether to include deleted events (with status equals "cancelled") in the result.
+          Optional. The default is False.
+      maxAttendees:
+        type: integer
+        description: The maximum number of attendees to include in the response. If there are more than
+          the specified number of attendees, only the participant is returned. Optional.
+      singleEvents:
+        type: boolean
+        description: Whether to expand recurring events into instances and only return single one-off
+          events and instances of recurring events. Optional. The default is False.
+      alwaysIncludeEmail:
+        type: boolean
+        description: Deprecated and ignored.
+      showHiddenInvitations:
+        type: boolean
+        description: Whether to include hidden invitations in the result. Optional. The default is False.
+      sharedExtendedProperty:
+        type: string
+        description: Extended properties constraint specified as propertyName=value. Matches only shared
+          properties. This parameter might be repeated multiple times to return events that match all
+          given constraints.
+      privateExtendedProperty:
+        type: string
+        description: Extended properties constraint specified as propertyName=value. Matches only private
+          properties. This parameter might be repeated multiple times to return events that match all
+          given constraints.
+    required:
+    - calendarId
+- name: googlecalendar_find_event
+  slug: GOOGLECALENDAR_FIND_EVENT
+  access: read
+  description: Finds events in a specified google calendar using text query, time ranges (event start/end,
+    last modification), and event types; ensure `timemin` is not chronologically after `timemax` if both
+    are provided.
+  input_schema:
+    type: object
+    properties:
+      query:
+        type: string
+        description: Free-text search terms to find events. This query is matched against various event
+          fields including summary, description, location, attendees' details (displayName, email), and
+          organizer's details.
+      timeMax:
+        type: string
+        description: 'Upper bound (exclusive) for an event''s start time to filter by. Only events starting
+          before this time are included. Accepts multiple formats: 1. RFC3339 timestamp (e.g., ''2024-12-06T13:00:00Z'')
+          2. Comma-separated date/time parts (e.g., ''2024,12,06,13,00,00'') 3. Simple datetime string
+          (e.g., ''2024...'
+      timeMin:
+        type: string
+        description: 'Lower bound (exclusive) for an event''s end time to filter by. Only events ending
+          after this time are included. Accepts multiple formats: 1. RFC3339 timestamp (e.g., ''2024-12-06T13:00:00Z'')
+          2. Comma-separated date/time parts (e.g., ''2024,12,06,13,00,00'') 3. Simple datetime string
+          (e.g., ''2024-12-0...'
+      order_by:
+        type: string
+        description: 'Order of events: ''startTime'' (ascending by start time) or ''updated'' (ascending
+          by last modification time).'
+      page_token:
+        type: string
+        description: Token from a previous response's `nextPageToken` to fetch the subsequent page of
+          results.
+      calendar_id:
+        type: string
+        description: Identifier of the Google Calendar to query. Use 'primary' for the primary calendar
+          of the authenticated user, an email address for a specific user's calendar, or a calendar ID
+          for other calendars.
+        default: primary
+      event_types:
+        type: array
+        description: 'Event types to include: ''default'' (regular event), ''focusTime'' (focused work
+          time), ''outOfOffice'' (out-of-office time).'
+        default:
+        - birthday
+        - default
+        - focusTime
+        - outOfOffice
+        - workingLocation
+        items:
+          type: string
+      max_results:
+        type: integer
+        description: Maximum number of events per page (1-2500).
+        default: 10
+      updated_min:
+        type: string
+        description: 'Lower bound (exclusive) for an event''s last modification time to filter by. Only
+          events updated after this time are included. When specified, events deleted since this time
+          are also included, regardless of the `show_deleted` parameter. Accepts multiple formats: 1.
+          RFC3339 timestamp (e.g., ''2024-1...'
+      show_deleted:
+        type: boolean
+        description: Include deleted events (status 'cancelled') in the result.
+      single_events:
+        type: boolean
+        description: Expand recurring events into individual instances. If false, returns master recurring
+          events.
+        default: true
+- name: googlecalendar_find_free_slots
+  slug: GOOGLECALENDAR_FIND_FREE_SLOTS
+  access: read
+  description: Finds free/busy time slots in google calendars for specified calendars within a defined
+    time range (defaults to the current day utc if `time min`/`time max` are omitted), enhancing busy
+    intervals with event details; `time min` must precede `time max` if both are provided.
+  input_schema:
+    type: object
+    properties:
+      items:
+        type: array
+        description: List of calendar identifiers (primary ID 'primary', user/calendar email, or unique
+          calendar ID) to query for free/busy information.
+        default:
+        - primary
+        items:
+          type: string
+      time_max:
+        type: string
+        description: End datetime for the query interval. Accepts ISO, comma-separated, or simple datetime
+          formats.
+      time_min:
+        type: string
+        description: Start datetime for the query interval. Accepts ISO, comma-separated, or simple datetime
+          formats.
+      timezone:
+        type: string
+        description: IANA timezone identifier (e.g., 'America/New_York', 'Europe/London') for interpreting
+          `time_min` and `time_max` if they lack timezone info, and for expanding recurring events.
+        default: UTC
+      group_expansion_max:
+        type: integer
+        description: 'Maximum calendar identifiers to return for a single group; exceeding this causes
+          an error. Max allowed: 100.'
+        default: 100
+      calendar_expansion_max:
+        type: integer
+        description: 'Maximum calendars for which FreeBusy information is provided. Max allowed: 50.'
+        default: 50
+- name: googlecalendar_create_event
+  slug: GOOGLECALENDAR_CREATE_EVENT
+  access: write
+  description: Creates an event on a google calendar, needing rfc3339 utc start/end times (end after start)
+    and write access to the calendar. by default, adds the organizer as an attendee unless exclude organizer
+    is set to true.
+  input_schema:
+    type: object
+    properties:
+      summary:
+        type: string
+        description: Summary (title) of the event.
+      location:
+        type: string
+        description: Geographic location of the event as free-form text.
+      timezone:
+        type: string
+        description: IANA timezone name (e.g., 'America/New_York'). Required if datetime is naive. If
+          datetime includes timezone info (Z or offset), this field is optional and defaults to UTC.
+      attendees:
+        type: array
+        description: List of attendee emails (strings).
+        items:
+          type: string
+      eventType:
+        type: string
+        description: 'Type of the event, immutable post-creation. Supported types: ''birthday'' (all-day
+          with annual recurrence), ''default'' (regular event), ''focusTime'' (focus-time event), ''outOfOffice''
+          (out-of-office event), ''workingLocation'' (working location event). Note: ''fromGmail'' events
+          cannot be created via API.'
+        enum:
+        - birthday
+        - default
+        - focusTime
+        - outOfOffice
+        - workingLocation
+        default: default
+      recurrence:
+        type: array
+        description: List of RRULE, EXRULE, RDATE, EXDATE lines for recurring events. Supported frequencies
+          are DAILY, WEEKLY, MONTHLY, YEARLY.
+        items:
+          type: string
+      visibility:
+        type: string
+        description: 'Event visibility: ''default'', ''public'', ''private'', or ''confidential''.'
+        enum:
+        - default
+        - public
+        - private
+        - confidential
+        default: default
+      calendar_id:
+        type: string
+        description: 'Target calendar: ''primary'' for the user''s main calendar, or the calendar''s email
+          address.'
+        default: primary
+      description:
+        type: string
+        description: Description of the event. Can contain HTML. Optional.
+      send_updates:
+        type: boolean
+        description: Defaults to True. Whether to send updates to the attendees.
+      transparency:
+        type: string
+        description: '''opaque'' (busy) or ''transparent'' (available).'
+        enum:
+        - opaque
+        - transparent
+        default: opaque
+      start_datetime:
+        type: string
+        description: Naive date/time (YYYY-MM-DDTHH:MM:SS) with NO offsets or Z. e.g. '2025-01-16T13:00:00'
+      exclude_organizer:
+        type: boolean
+        description: If True, the organizer will NOT be added as an attendee. Default is False (organizer
+          is included).
+        default: false
+      guests_can_modify:
+        type: boolean
+        description: If True, guests can modify the event.
+        default: false
+      create_meeting_room:
+        type: boolean
+        description: 'If true, a Google Meet link is created and added to the event. CRITICAL: As of 2024,
+          this REQUIRES a paid Google Workspace account ($13+/month). Personal Gmail accounts will fail
+          with ''Invalid conference type value'' error. Solutions: 1) Upgrade to Workspace, 2) Use domain-wide
+          delegation with Wor...'
+      event_duration_hour:
+        type: integer
+        description: Number of hours (0-24). Increase by 1 here rather than passing 60 in `event_duration_minutes`
+        default: 0
+        minimum: 0
+        maximum: 24
+      guestsCanInviteOthers:
+        type: boolean
+        description: Whether attendees other than the organizer can invite others to the event.
+      event_duration_minutes:
+        type: integer
+        description: Duration in minutes (0-59 ONLY). NEVER use 60+ minutes - use event_duration_hour=1
+          instead. Maximum value is 59.
+        default: 30
+        minimum: 0
+        maximum: 59
+      guestsCanSeeOtherGuests:
+        type: boolean
+        description: Whether attendees other than the organizer can see who the event's attendees are.
+    required:
+    - start_datetime
+- name: googlecalendar_update_event
+  slug: GOOGLECALENDAR_UPDATE_EVENT
+  access: write
+  description: Updates an existing event by `event id` in a google calendar; this is a full put replacement,
+    so provide all desired fields as unspecified ones may be cleared or reset.
+  input_schema:
+    type: object
+    properties:
+      summary:
+        type: string
+        description: Summary (title) of the event.
+      event_id:
+        type: string
+        description: The unique identifier of the event to be updated.
+      location:
+        type: string
+        description: Geographic location of the event as free-form text.
+      timezone:
+        type: string
+        description: IANA timezone name (e.g., 'America/New_York'). Required if datetime is naive. If
+          datetime includes timezone info (Z or offset), this field is optional and defaults to UTC.
+      attendees:
+        type: array
+        description: List of attendee emails (strings).
+        items:
+          type: string
+      eventType:
+        type: string
+        description: 'Type of the event, immutable post-creation. Supported types: ''birthday'' (all-day
+          with annual recurrence), ''default'' (regular event), ''focusTime'' (focus-time event), ''outOfOffice''
+          (out-of-office event), ''workingLocation'' (working location event). Note: ''fromGmail'' events
+          cannot be created via API.'
+        enum:
+        - birthday
+        - default
+        - focusTime
+        - outOfOffice
+        - workingLocation
+        default: default
+      recurrence:
+        type: array
+        description: List of RRULE, EXRULE, RDATE, EXDATE lines for recurring events. Supported frequencies
+          are DAILY, WEEKLY, MONTHLY, YEARLY.
+        items:
+          type: string
+      visibility:
+        type: string
+        description: 'Event visibility: ''default'', ''public'', ''private'', or ''confidential''.'
+        enum:
+        - default
+        - public
+        - private
+        - confidential
+        default: default
+      calendar_id:
+        type: string
+        description: Identifier of the Google Calendar where the event resides. The value 'primary' targets
+          the user's primary calendar.
+        default: primary
+      description:
+        type: string
+        description: Description of the event. Can contain HTML. Optional.
+      send_updates:
+        type: boolean
+        description: Defaults to True. Whether to send updates to the attendees.
+      transparency:
+        type: string
+        description: '''opaque'' (busy) or ''transparent'' (available).'
+        enum:
+        - opaque
+        - transparent
+        default: opaque
+      start_datetime:
+        type: string
+        description: Naive date/time (YYYY-MM-DDTHH:MM:SS) with NO offsets or Z. e.g. '2025-01-16T13:00:00'
+      guests_can_modify:
+        type: boolean
+        description: If True, guests can modify the event.
+        default: false
+      create_meeting_room:
+        type: boolean
+        description: 'If true, a Google Meet link is created and added to the event. CRITICAL: As of 2024,
+          this REQUIRES a paid Google Workspace account ($13+/month). Personal Gmail accounts will fail
+          with ''Invalid conference type value'' error. Solutions: 1) Upgrade to Workspace, 2) Use domain-wide
+          delegation with Wor...'
+      event_duration_hour:
+        type: integer
+        description: Number of hours (0-24). Increase by 1 here rather than passing 60 in `event_duration_minutes`
+        default: 0
+        minimum: 0
+        maximum: 24
+      guestsCanInviteOthers:
+        type: boolean
+        description: Whether attendees other than the organizer can invite others to the event.
+      event_duration_minutes:
+        type: integer
+        description: Duration in minutes (0-59 ONLY). NEVER use 60+ minutes - use event_duration_hour=1
+          instead. Maximum value is 59.
+        default: 30
+        minimum: 0
+        maximum: 59
+      guestsCanSeeOtherGuests:
+        type: boolean
+        description: Whether attendees other than the organizer can see who the event's attendees are.
+    required:
+    - start_datetime
+    - event_id
+- name: googlecalendar_delete_event
+  slug: GOOGLECALENDAR_DELETE_EVENT
+  access: destructive
+  description: Deletes a specified event by `event id` from a google calendar (`calendar id`); this action
+    is idempotent and raises a 404 error if the event is not found.
+  input_schema:
+    type: object
+    properties:
+      event_id:
+        type: string
+        description: Unique identifier of the event to delete, typically obtained upon event creation.
+      calendar_id:
+        type: string
+        description: Identifier of the Google Calendar (e.g., email address, specific ID, or 'primary'
+          for the authenticated user's main calendar) from which the event will be deleted.
+        default: primary
+    required:
+    - event_id

@@ -1030,7 +1030,9 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 - **A deferred call never bypasses the gate.** Section 16.1 has the rule: the gate judges a
   `tool_call` as a call of the tool that it names.
 - The tool server shows the three tools only when the catalog has a tool when the app starts.
-  No product registers a deferred tool in M2.6. M3.4 (connections) is the first user. The
+  No product registers a deferred tool in M2.6. M3.4 (connections) is the first user: the
+  connector tools of the catalog are deferred tools in the toolset `integrations`, and the
+  search shows only the tools of a connection that the run can use (Section 10.3). The
   catalog is the only extension point: a tool registers a name, a toolset, a description, a
   JSON schema of the arguments, and an async handler that gets the run token claims. The
   server checks only that the required arguments are present. The handler validates the rest.
@@ -1833,8 +1835,8 @@ policy rule cannot approve a proposal.
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
-| `connections` | `connections_list`, `connection_request` (sends the user a link or a form), `connection_test` | Sama MCP |
-| `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Sama MCP (Composio, MCP proxy, database gateway) |
+| `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
+| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Later: MCP, database, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment` through the sama GitHub App. Since M1.16: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
@@ -1846,8 +1848,10 @@ A profile also has a **group set**: the toolsets that a chat run in a shared ses
 (Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`, and
 `media`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`, `browser`,
 `workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The default
-profile of the first org has `tool_search` since migration `0018` (M2.6) and `subagents`
-since migration `0019` (M2.7). The default group set has no `subagents`.
+profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
+since migration `0019` (M2.7), and `connections` and `integrations` since migration `0022`
+(M3.4). The default group set has no `subagents`, `connections`, or `integrations`. Sub-agents
+(Section 13.1) do not get `connections` or `integrations`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -1941,10 +1945,12 @@ gets one notice per change.
 **Tool naming and exposure**
 
 - Connector tools have a prefix for the kind and the connection name, as in Hermes:
-  `mcp_<connection>_<tool>` for MCP, `db_<connection>_<tool>` for databases, and
-  `api_<connection>_<tool>` for HTTP APIs. Composio tools keep the Composio slug (for
-  example `GMAIL_SEND_EMAIL`). If a name is longer than 64 characters, sama shortens it and
-  adds a short hash. Each connection is also a toolset `conn-<connection>`.
+  `mcp_<connection>_<tool>` for MCP and `db_<connection>_<tool>` for databases. Since M3.4,
+  the tools of a catalog connector start with the connector name, for example
+  `gmail_send_email` and `notion_search`. A Composio tool keeps its Composio slug (for example
+  `GMAIL_SEND_EMAIL`) in the manifest, and the control plane uses the slug for the call. The
+  control plane rejects a tool name that is longer than 64 characters. Each connection is also
+  a toolset `conn-<connection>` (later).
 - Connector tools are deferred behind `tool_search` by default. An agent profile can pin a
   connection so that its tools are always visible. The mechanism is in M2.6: a connector
   registers its tools in the `DeferredCatalog`, each with a toolset (Section 6.3).
@@ -1958,6 +1964,66 @@ gets one notice per change.
   workspace `admin` or the org `owner` can create, change, or remove it.
 - Default policies: read tools `allow`, write tools `ask`, destructive tools `ask` with a
   stronger warning. Admins can change this per tool. Unattended runs follow Section 12.1.
+
+**What M3.4 builds**
+
+- **Table.** Migration `0022` adds `connections` with the fields of the connection record, an
+  RLS policy, and one row per `(org, workspace, connector, owner)` (`NULLS NOT DISTINCT`, so
+  one workspace connection per connector). A member sees the workspace connections and only
+  their own personal connections. The vault takes the names `composio_api_key` and
+  `connection:<uuid>`.
+- **Catalog.** `connectors/catalog/` has `gmail`, `googlecalendar`, `github`, `slack`, and
+  `linear` (kind `composio`), and `notion` (kind `http_api`, a form with an API key). The
+  tool schemas are a trimmed copy of the Composio schemas. Each tool has `access`: `read`,
+  `write`, or `destructive`. The control plane checks each manifest when it starts. It rejects
+  unknown keys, a tool name that does not start with the connector name, an `http_api` base URL
+  that is not `https` or has a path, and two connectors with the same tool name.
+  `SAMA_CONNECTORS_DIR` changes the folder.
+- **Composio.** Sama uses the Composio v3 API. The key is the vault entry
+  `composio_api_key` of the org, else `COMPOSIO_API_KEY` of the control plane. Sama finds or
+  makes one auth config per toolkit (Composio-managed OAuth first) and keeps it in memory.
+  Every auth scheme uses the Composio link flow: the user signs in on a Composio page, never in
+  sama. The Composio user ID (the entity) is `sama-<org>-u-<user>` for a personal connection
+  and `sama-<org>-w-<workspace>` for a workspace connection: one entity per user and one per
+  workspace. `secret_ref` is empty for a Composio connection, because Composio keeps the
+  token. A new link deletes the old Composio account of the connection, and so does a delete.
+- **Forms (`http_api`).** The secret fields go to the vault entry `connection:<id>` as one JSON
+  value. The other fields go to `config.fields`. The API never returns a secret. Sama tests
+  the form with the `test` request of the manifest before it sets `connected`. Sama rejects a
+  path value of `.` or `..`. A form that the API rejects (HTTP 422) does not echo the values
+  in the answer. The `http_api` requests go through the outbound client of Section 16.4: the
+  address must be public, sama does not follow a redirect, and an answer has at most 2 MB.
+- **States.** Only a backend check sets `connected`: the Composio account status `ACTIVE`, or a
+  good test request. An `initiated` connection becomes `expired` after 30 minutes, when sama
+  next reads it. A check does not start an `expired` sign-in again, but a late Composio `ACTIVE`
+  still connects it. A Composio 404 gives `expired`. A network error, a timeout, or an HTTP 408,
+  429, or 5xx keeps the state and stores the error. A check writes its result only if the row
+  did not change during the check, so a `disable` or a remove during a check wins. A check does
+  not change a `disabled` connection. `policy_overrides` is stored but not
+  used yet. Discovery and `tool_cache` come later: the tools come from the manifest.
+- **Web app.** The Connections page (`/connections`) lists the connectors of the catalog with a
+  row per scope. It starts a connection, sends the user to the Composio link, checks the
+  connection when Composio sends the user back (`?connection=<id>`), shows the form of an
+  `http_api` connector, and disables or removes a connection. The page shows only the
+  connections of the current workspace, and it ignores a callback connection of another
+  workspace. It goes only to an `https` sign-in link without a user name or a password. The API routes are
+  `GET /connectors`, `GET` and `POST /workspaces/{id}/connections`,
+  `POST /connections/{id}/check`, `PUT /connections/{id}/form`,
+  `POST /connections/{id}/disable`, and `DELETE /connections/{id}`. A form has at most 20
+  fields. The links of the page and the Composio callback use the first origin of
+  `SAMA_WEB_ORIGINS`, else `SAMA_PUBLIC_URL`. A user who is not signed in signs in and opens
+  the link again.
+- **Channels.** `/connect <name>` in Telegram and `/sama connect <name>` in Slack answer with a
+  link to the Connections page and a warning not to send secrets in chat. In a private chat
+  the link is for a personal connection. In a group chat or a linked channel it is for a
+  workspace connection. They never take a secret.
+- **Agent tools.** `connections_list`, `connection_request`, and `connection_test` are in the
+  default `allow` list. `connection_request` gives a link only. The connector tools are
+  deferred tools in the toolset `integrations`. `tool_search` shows a connector tool only when
+  the run has a connected connection that it can use. A private session uses the personal
+  connection of its user first, then the workspace connection. A shared session uses only the
+  workspace connection. Default policy: `read` is `allow`, `write` is `ask`, and
+  `destructive` is `ask` with a stronger reason. An admin rule wins over the default.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
 start runs or workflows (Section 12).
@@ -3097,7 +3163,9 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
    mode. The default for unknown tools is `ask`. In a shared session, `memory` also has the
-   default `ask` (Section 11.3).
+   default `ask` (Section 11.3). Since M3.4, a deferred tool gets its default from the access
+   of the tool in the catalog: `read` is `allow`, `write` and `destructive` are `ask`
+   (Section 10.3). A policy rule wins over this default.
 5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
    pre-approval for this tool in this job version, and the call fits its connection and
    argument limits (Section 12.1).
@@ -3697,6 +3765,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
 | `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start. Otherwise the three tools are hidden. |
+| `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
@@ -4083,6 +4152,8 @@ the start with a message that names the variable but not its value.
 | `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
+| `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
+| `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |

@@ -30,6 +30,8 @@ DEFAULT_TOOLSETS: Final = (
     "media",
     "tool_search",
     "subagents",
+    "connections",
+    "integrations",
 )
 DEFAULT_GROUP_TOOLSETS: Final = ("todo", "web", "clarify", "memory", "sessions", "media")
 """The toolsets of a shared session (Section 10.2): no shell, no code edit, no outbound write.
