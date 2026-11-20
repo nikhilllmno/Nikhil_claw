@@ -16,6 +16,13 @@ deploy ships them. A manifest gives:
   ``header``, or ``none``), the include and exclude filters of its tools, and the ``access``
   of tools that the server describes wrongly. The tools come from the server (``tools/list``),
   so the manifest has none;
+- for ``mcp_hosted``: a stdio MCP server that sama runs in a connector host (Section 10.3.2):
+  the pinned package (``npm`` or ``pypi``, an exact version), the environment variables that
+  the form fields give, the egress allowlist, the memory limit, and the idle time. A custom
+  connection (not in the catalog) can have a command instead of a package;
+- for a custom ``http_api`` connection (``api``): the base URL and the auth (``api_key``,
+  ``bearer``, ``basic``, ``oauth2`` client credentials, or ``none``) of an API that a workspace
+  admin imported. Its tools are the operations of the import (Section 10.3.3);
 - the tools of the connector. Each tool has a name, a description, a JSON schema of its
   arguments, and an ``access``: ``read``, ``write``, or ``destructive``. A ``read`` tool gets
   ``allow`` and the other tools get ``ask`` (Section 10.3).
@@ -43,7 +50,7 @@ CONNECTOR_NAME: Final = re.compile(r"[a-z][a-z0-9_-]{0,39}")
 _PATH_PARAM: Final = re.compile(r"\{([a-z_][a-z0-9_]{0,63})\}")
 
 Scope = Literal["personal", "workspace"]
-Kind = Literal["composio", "http_api", "database", "mcp_remote"]
+Kind = Literal["composio", "http_api", "database", "mcp_remote", "mcp_hosted"]
 """The kinds that this release can connect. The table allows more kinds (Section 10.3)."""
 DatabaseOperation = Literal["schema", "sample", "query", "export", "execute"]
 DATABASE_OPERATIONS: Final[tuple[DatabaseOperation, ...]] = get_args(DatabaseOperation)
@@ -164,6 +171,240 @@ def mcp_fields(auth: McpAuth, header: str | None) -> tuple[FormField, ...]:
     return (FormField(name=TOKEN_FIELD, label=label, secret=True, help=help_text),)
 
 
+# -- hosted stdio MCP servers (Section 10.3.2) ------------------------------------------------
+
+ENV_NAME: Final = re.compile(r"[A-Z][A-Z0-9_]{0,39}")
+BLOCKED_ENV: Final = frozenset({"PATH", "HOME", "USER", "SHELL", "PWD", "TMPDIR", "IFS"})
+BLOCKED_ENV_PREFIXES: Final = ("LD_", "DYLD_", "NODE_", "NPM_", "PYTHON", "PIP_", "UV_", "SAMA_")
+"""Variables that change how the runtime loads code. A form field cannot set them."""
+EGRESS_HOST: Final = re.compile(
+    r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}"
+)
+MAX_EGRESS: Final = 20
+MAX_ARGS: Final = 32
+MAX_ARG_CHARS: Final = 500
+REGISTRY_HOSTS: Final[Mapping[str, tuple[str, ...]]] = {
+    "npm": ("registry.npmjs.org",),
+    "pypi": ("pypi.org", "files.pythonhosted.org"),
+}
+"""The hosts that the host needs to get the package. They are always in the allowlist."""
+DEFAULT_HOST_MEMORY_MB: Final = 384
+DEFAULT_HOST_IDLE_S: Final = 600
+_NPM_NAME: Final = re.compile(r"(@[a-z0-9][a-z0-9._-]{0,100}/)?[a-z0-9][a-z0-9._-]{0,100}")
+_PYPI_NAME: Final = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]{0,98}[A-Za-z0-9])?")
+_EXACT_VERSION: Final[Mapping[str, re.Pattern[str]]] = {
+    # Full semver: npm reads ``1``, ``1.2``, and ``1.x`` as ranges.
+    "npm": re.compile(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
+    ),
+    # One PEP 440 version (epoch, release, pre, post, dev, local). ``==`` pins it.
+    "pypi": re.compile(
+        r"v?([0-9]+!)?[0-9]+(\.[0-9]+)*"
+        r"([-_.]?(alpha|a|beta|b|preview|pre|c|rc)[-_.]?[0-9]*)?"
+        r"(-[0-9]+|[-_.]?(post|rev|r)[-_.]?[0-9]*)?"
+        r"([-_.]?dev[-_.]?[0-9]*)?"
+        r"(\+[a-z0-9]+([-_.][a-z0-9]+)*)?",
+        re.IGNORECASE,
+    ),
+}
+"""One version for each registry. A range (``^``, ``~``, ``*``, ``>=``, ``x``, a space) or a
+tag does not match."""
+_BIN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def _check_args(args: tuple[str, ...], what: str) -> tuple[str, ...]:
+    if len(args) > MAX_ARGS:
+        raise ValueError(f"{what} has more than {MAX_ARGS} parts")
+    for arg in args:
+        if len(arg) > MAX_ARG_CHARS or "\x00" in arg or "\n" in arg:
+            raise ValueError(f"{what} has a part that is too long or has a control character")
+    return args
+
+
+class McpPackage(_Strict):
+    """The pinned package of a stdio MCP server. The host installs this version only."""
+
+    registry: Literal["npm", "pypi"]
+    name: Annotated[str, Field(min_length=1, max_length=214)]
+    version: Annotated[str, Field(min_length=1, max_length=64)]
+    bin: str | None = None
+    """The program of the package. ``pypi`` default: the package name. ``npm`` default: the
+    program that ``npx`` runs for the package."""
+    args: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _valid(self) -> McpPackage:
+        pattern = _NPM_NAME if self.registry == "npm" else _PYPI_NAME
+        if pattern.fullmatch(self.name) is None:
+            raise ValueError(f"not a valid {self.registry} package name: {self.name!r}")
+        if _EXACT_VERSION[self.registry].fullmatch(self.version) is None:
+            raise ValueError(f"the version must be one exact version, not {self.version!r}")
+        if self.bin is not None and _BIN.fullmatch(self.bin) is None:
+            raise ValueError(f"not a valid program name: {self.bin!r}")
+        _check_args(self.args, "args")
+        return self
+
+    @property
+    def pinned(self) -> str:
+        """``name@version`` (npm) or ``name==version`` (pypi)."""
+        joiner = "@" if self.registry == "npm" else "=="
+        return f"{self.name}{joiner}{self.version}"
+
+
+class McpHosted(_Strict):
+    """A stdio MCP server that sama runs in its own connector host (an E2B sandbox)."""
+
+    package: McpPackage | None = None
+    command: tuple[str, ...] | None = None
+    """A custom command (``argv``). Only a custom connection of the org owner has one."""
+    env: Mapping[str, str] = Field(default_factory=dict)
+    """Environment variable -> form field. The host process gets the value of the field."""
+    egress: tuple[str, ...] = ()
+    """The hosts that the server can reach. The package registry is always allowed."""
+    memory_mb: Annotated[int, Field(ge=64, le=4096)] = DEFAULT_HOST_MEMORY_MB
+    """The memory limit of the server processes. Above it, the host stops the server, and the
+    next call starts it again."""
+    idle_s: Annotated[int, Field(ge=60, le=3600)] = DEFAULT_HOST_IDLE_S
+    """The host pauses after this time without a call."""
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+    access: Mapping[str, ToolAccess] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _valid(self) -> McpHosted:
+        if (self.package is None) == (self.command is None):
+            raise ValueError("a hosted MCP server has a package or a command, not both")
+        if self.command is not None:
+            if not self.command or not self.command[0]:
+                raise ValueError("the command is empty")
+            _check_args(self.command, "the command")
+        for name in self.env:
+            if ENV_NAME.fullmatch(name) is None:
+                raise ValueError(f"not a valid environment variable: {name!r}")
+            if name in BLOCKED_ENV or name.startswith(BLOCKED_ENV_PREFIXES):
+                raise ValueError(f"a form field cannot set {name}")
+        if len(self.egress) > MAX_EGRESS:
+            raise ValueError(f"at most {MAX_EGRESS} egress hosts")
+        for host in self.egress:
+            if EGRESS_HOST.fullmatch(host) is None:
+                raise ValueError(f"not a valid host name: {host!r}")
+        check_patterns(self.include)
+        check_patterns(self.exclude)
+        check_patterns(tuple(self.access))
+        return self
+
+    @property
+    def allow_out(self) -> tuple[str, ...]:
+        """The egress allowlist of the host: the egress hosts and the package registry."""
+        hosts = set(self.egress)
+        if self.package is not None:
+            hosts.update(REGISTRY_HOSTS[self.package.registry])
+        return tuple(sorted(hosts))
+
+
+def hosted_fields(env: tuple[str, ...]) -> tuple[FormField, ...]:
+    """The form of a custom stdio server: one required secret field for each variable."""
+    return tuple(
+        FormField(
+            name=name.lower(),
+            label=name,
+            secret=True,
+            help=f"The server gets the value as the environment variable {name}.",
+        )
+        for name in env
+    )
+
+
+# -- custom HTTP APIs (Section 10.3.3) --------------------------------------------------------
+
+ApiAuthType = Literal["api_key", "bearer", "basic", "oauth2", "none"]
+API_RESERVED_HEADERS: Final = frozenset(
+    {"accept", "accept-encoding", "content-length", "content-type", "host", "transfer-encoding"}
+)
+_HTTPS_URL: Final = r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s#?]*)?$"
+
+
+class ApiAuth(_Strict):
+    """The auth of a custom API. The credential is in the form, so the vault holds it."""
+
+    type: ApiAuthType
+    name: Annotated[str | None, Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")] = None
+    """The header or the query parameter of the API key (``api_key``)."""
+    location: Literal["header", "query"] = "header"
+    token_url: Annotated[str | None, Field(pattern=_HTTPS_URL)] = None
+    """The token endpoint (``oauth2``, the client credentials grant)."""
+    scope: Annotated[str | None, Field(max_length=400)] = None
+    client_auth: Literal["basic", "body"] = "basic"
+    """How the client id and the client secret go to the token endpoint."""
+
+    @model_validator(mode="after")
+    def _valid(self) -> ApiAuth:
+        if (self.type == "api_key") != (self.name is not None):
+            raise ValueError("an API key auth has a name, and only it has one")
+        if (self.type == "oauth2") != (self.token_url is not None):
+            raise ValueError("an oauth2 auth has a token_url, and only it has one")
+        if self.scope is not None and self.type != "oauth2":
+            raise ValueError("only an oauth2 auth has a scope")
+        if (
+            self.name is not None
+            and self.location == "header"
+            and self.name.lower() in API_RESERVED_HEADERS
+        ):
+            raise ValueError(f"sama sets the header {self.name}")
+        return self
+
+
+class ApiSpec(_Strict):
+    """A custom HTTP API: the base URL and the auth. The operations are the tools."""
+
+    base_url: Annotated[str, Field(pattern=_HTTPS_URL, max_length=500)]
+    """Only https. A path is allowed. A tool path goes after it."""
+    auth: ApiAuth
+    test: Annotated[str | None, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")] = None
+    """The operation that the health check calls. Default: the first ``GET`` operation
+    without required arguments."""
+
+
+def api_fields(auth: ApiAuth) -> tuple[FormField, ...]:
+    """The form of a custom API: the fields of its auth."""
+    if auth.type == "api_key":
+        where = "header" if auth.location == "header" else "query parameter"
+        return (
+            FormField(
+                name="api_key",
+                label="API key",
+                secret=True,
+                help=f"The key goes into the {auth.name} {where}.",
+            ),
+        )
+    if auth.type == "bearer":
+        return (
+            FormField(
+                name=TOKEN_FIELD,
+                label="Bearer token",
+                secret=True,
+                help="The token goes into the Authorization header.",
+            ),
+        )
+    if auth.type == "basic":
+        return (
+            FormField(name="username", label="User name"),
+            FormField(name="password", label="Password", secret=True),
+        )
+    if auth.type == "oauth2":
+        return (
+            FormField(name="client_id", label="Client ID"),
+            FormField(
+                name="client_secret",
+                label="Client secret",
+                secret=True,
+                help="sama gets a token from the token URL with the client credentials grant.",
+            ),
+        )
+    return ()
+
+
 class Composio(_Strict):
     toolkit: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 
@@ -212,25 +453,32 @@ class Manifest(_Strict):
     http: HttpApi | None = None
     database: Database | None = None
     mcp: McpRemote | None = None
+    hosted: McpHosted | None = None
+    api: ApiSpec | None = None
     fields: tuple[FormField, ...] = ()
     tools: tuple[ToolSpec, ...] = ()
     custom: bool = False
-    """A connection that a workspace admin added by URL. It is not in the catalog."""
+    """A connection that a workspace admin added (a server by URL, a stdio server, or an API).
+    It is not in the catalog."""
 
     @model_validator(mode="before")
     @classmethod
     def _mcp_form(cls, data: Any) -> Any:
-        """An ``mcp_remote`` manifest does not write its form: it follows from the auth."""
-        if (
-            isinstance(data, dict)
-            and data.get("kind") == "mcp_remote"
-            and "fields" not in data
-            and isinstance(data.get("mcp"), dict)
-        ):
+        """An ``mcp_remote`` manifest and a custom API do not write their form: it follows from
+        the auth."""
+        if not isinstance(data, dict) or "fields" in data:
+            return data
+        if data.get("kind") == "mcp_remote" and isinstance(data.get("mcp"), dict):
             auth = data["mcp"].get("auth")
             header = data["mcp"].get("header")
             if auth in ("bearer", "header"):
                 return {**data, "fields": mcp_fields(auth, header)}
+        if data.get("kind") == "http_api" and isinstance(data.get("api"), dict):
+            auth = data["api"].get("auth")
+            if isinstance(auth, dict):
+                return {**data, "fields": api_fields(ApiAuth.model_validate(auth))}
+            if isinstance(auth, ApiAuth):
+                return {**data, "fields": api_fields(auth)}
         return data
 
     @model_validator(mode="before")
@@ -259,6 +507,10 @@ class Manifest(_Strict):
 
     @model_validator(mode="after")
     def _fits_kind(self) -> Manifest:
+        if self.hosted is not None and self.kind != "mcp_hosted":
+            raise ValueError("only an mcp_hosted connector has a hosted block")
+        if self.api is not None and self.kind != "http_api":
+            raise ValueError("only an http_api connector has an api block")
         if self.kind == "database":
             if (
                 self.database is None
@@ -290,6 +542,10 @@ class Manifest(_Strict):
                     )
                 )
             return self
+        if self.kind == "mcp_hosted":
+            return self._fits_hosted()
+        if self.api is not None:
+            return self._fits_api()
         if self.mcp is not None:
             raise ValueError("only an mcp_remote connector has an mcp block")
         if not self.tools:
@@ -324,6 +580,37 @@ class Manifest(_Strict):
                 raise ValueError(f"{tool.name}: a tool name starts with the connector name")
         return self
 
+    def _fits_hosted(self) -> Manifest:
+        hosted = self.hosted
+        if hosted is None or self.composio or self.http or self.mcp or self.api:
+            raise ValueError("an mcp_hosted connector has a hosted block only")
+        if self.tools:
+            raise ValueError("an mcp_hosted connector gets its tools from the server")
+        if hosted.command is not None and not self.custom:
+            raise ValueError("only a custom connection runs a command; a catalog one has a package")
+        names = [f.name for f in self.fields]
+        if len(set(names)) != len(names):
+            raise ValueError("two form fields have the same name")
+        for variable, field in hosted.env.items():
+            if field not in names:
+                raise ValueError(
+                    f"the variable {variable} names the form field {field}, "
+                    "and the form has no such field"
+                )
+        return self
+
+    def _fits_api(self) -> Manifest:
+        api = self.api
+        if api is None or self.composio or self.http or self.mcp or self.hosted:
+            raise ValueError("a custom API has an api block only")
+        if not self.custom:
+            raise ValueError("only a custom connection has an api block")
+        if self.tools:
+            raise ValueError("the tools of a custom API are the operations of its import")
+        if self.fields != api_fields(api.auth):
+            raise ValueError(f"a custom API with auth {api.auth.type} has the form of that auth")
+        return self
+
     @property
     def secret_fields(self) -> tuple[FormField, ...]:
         return tuple(f for f in self.fields if f.secret)
@@ -355,7 +642,25 @@ class Manifest(_Strict):
                 if self.mcp is None
                 else {"url": self.mcp.url, "auth": self.mcp.auth, "header": self.mcp.header}
             ),
+            "hosted": None if self.hosted is None else _hosted_public(self.hosted),
+            "api": (
+                None
+                if self.api is None
+                else {"base_url": self.api.base_url, "auth": self.api.auth.type}
+            ),
         }
+
+
+def _hosted_public(hosted: McpHosted) -> dict[str, Any]:
+    """The hosted block for the web app: what runs and what it can reach. No values."""
+    return {
+        "package": None if hosted.package is None else hosted.package.model_dump(),
+        "command": None if hosted.command is None else list(hosted.command),
+        "env": sorted(hosted.env),
+        "egress": list(hosted.allow_out),
+        "memory_mb": hosted.memory_mb,
+        "idle_s": hosted.idle_s,
+    }
 
 
 def catalog_directory() -> Path:

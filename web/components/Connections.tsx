@@ -6,17 +6,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
+  type ApiAuthType,
   type Connection,
   type ConnectionScope,
   type Connector,
+  type HostedCustom,
   type McpAuth,
   type StartedConnection,
   errorText,
 } from "@/lib/api";
 import {
+  type ApiDraft,
   type ConnectionList,
+  EMPTY_API,
   EMPTY_SERVER,
+  EMPTY_STDIO,
   type ServerDraft,
+  type StdioDraft,
+  apiBody,
+  apiProblem,
   connectionOf,
   canCheck,
   connectorFor,
@@ -24,6 +32,7 @@ import {
   hasOAuthAnswer,
   formProblem,
   formValues,
+  hostedWhat,
   initialValues,
   isSafeRedirect,
   listFor,
@@ -33,6 +42,8 @@ import {
   patternProblem,
   serverBody,
   serverProblem,
+  stdioBody,
+  stdioProblem,
   stateLabel,
   stateTone,
   toolSummary,
@@ -57,6 +68,26 @@ const AUTH_LABELS: Record<McpAuth, string> = {
   bearer: "Access token",
   header: "Key in a header",
   none: "No sign-in",
+};
+
+const API_AUTH_LABELS: Record<ApiAuthType, string> = {
+  api_key: "API key",
+  bearer: "Bearer token",
+  basic: "User name and password",
+  oauth2: "OAuth 2 client credentials",
+  none: "No sign-in",
+};
+
+const STDIO_SOURCES: Record<StdioDraft["source"], string> = {
+  npm: "npm package",
+  pypi: "PyPI package",
+  command: "Custom command (org owner only)",
+};
+
+const API_SOURCES: Record<ApiDraft["source"], string> = {
+  openapi: "Paste an OpenAPI document",
+  openapi_url: "OpenAPI document at an address",
+  endpoints: "List of endpoints",
 };
 
 const ACCESS_LABELS = { read: "Read", write: "Write (asks first)", destructive: "Can delete (asks first)" };
@@ -255,28 +286,51 @@ export function Connections() {
             </li>
           ))}
         </ul>
-        <AddServer
-          onAdd={async (draft) => {
-            opened(await api.addMcpServer(workspace.id, serverBody(draft)));
-          }}
-        />
+        <div className={styles.actions}>
+          <AddServer
+            onAdd={async (draft) => {
+              opened(await api.addMcpServer(workspace.id, serverBody(draft)));
+            }}
+          />
+          <AddStdio
+            onAdd={async (draft) => {
+              opened(await api.addStdioServer(workspace.id, stdioBody(draft)));
+            }}
+          />
+          <AddApi
+            onAdd={async (draft) => {
+              opened(await api.addApi(workspace.id, apiBody(draft)));
+            }}
+          />
+        </div>
         </>
       )}
     </div>
   );
 }
 
-/** The form to add a remote MCP server by URL. Only a workspace admin can send it. */
-function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) {
+/**
+ * The state of an add form: the draft, the open flag, and the submit that checks the draft
+ * first. The form closes and resets after a good add.
+ */
+function useAddForm<T>(
+  empty: T,
+  problemOf: (draft: T) => string | null,
+  onAdd: (draft: T) => Promise<void>,
+  failed: string,
+) {
   const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState<ServerDraft>(EMPTY_SERVER);
+  const [draft, setDraft] = useState<T>(empty);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const edit = (patch: Partial<ServerDraft>) => setDraft((d) => ({ ...d, ...patch }));
-
+  const edit = (patch: Partial<T>) => setDraft((d) => ({ ...d, ...patch }));
+  const close = () => {
+    setOpen(false);
+    setError(null);
+  };
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    const problem = serverProblem(draft);
+    const problem = problemOf(draft);
     if (problem !== null) {
       setError(problem);
       return;
@@ -285,86 +339,469 @@ function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) 
     setError(null);
     try {
       await onAdd(draft);
-      setDraft(EMPTY_SERVER);
+      setDraft(empty);
       setOpen(false);
     } catch (e) {
-      setError(errorText(e, "The server was not added."));
+      setError(errorText(e, failed));
     } finally {
       setSaving(false);
     }
   };
+  return { open, setOpen, draft, edit, saving, error, close, submit };
+}
+
+/** The frame of an add form: the card, the heading, the error, and the buttons. */
+function AddCard({
+  title,
+  note,
+  error,
+  saving,
+  savingLabel = "Adding",
+  onSubmit,
+  onCancel,
+  children,
+}: {
+  title: string;
+  note: string;
+  error: string | null;
+  saving: boolean;
+  savingLabel?: string;
+  onSubmit: (event: React.FormEvent) => void;
+  onCancel: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className={`card ${styles.card} ${styles.addCard}`} aria-label={title}>
+      <div className={styles.cardHead}>
+        <h2 className={styles.heading}>{title}</h2>
+        <span className={styles.meta}>{note}</span>
+      </div>
+      <form className={styles.form} onSubmit={onSubmit}>
+        {children}
+        {error ? (
+          <p className="alert alert-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <div className={styles.actions}>
+          <button type="submit" className="btn btn-primary btn-small" disabled={saving}>
+            {saving ? savingLabel : "Add and connect"}
+          </button>
+          <button type="button" className="btn btn-quiet btn-small" disabled={saving} onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function ScopeSelect({ value, onChange }: { value: ConnectionScope; onChange: (scope: ConnectionScope) => void }) {
+  return (
+    <label className="field">
+      <span className="label">Who can use it</span>
+      <select className="input" value={value} onChange={(e) => onChange(e.target.value as ConnectionScope)}>
+        {(Object.keys(SCOPE_LABELS) as ConnectionScope[]).map((scope) => (
+          <option key={scope} value={scope}>
+            {SCOPE_LABELS[scope]}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function NameFields({
+  name,
+  title,
+  prefix,
+  onChange,
+}: {
+  name: string;
+  title: string;
+  prefix: string;
+  onChange: (patch: { name?: string; title?: string }) => void;
+}) {
+  return (
+    <>
+      <label className="field">
+        <span className="label">Name</span>
+        <input className="input" value={name} maxLength={40} autoComplete="off" onChange={(e) => onChange({ name: e.target.value })} />
+        <span className="hint">
+          The tools get the names {prefix}_&lt;name&gt;_&lt;tool&gt;.
+        </span>
+      </label>
+      <label className="field">
+        <span className="label">Title (optional)</span>
+        <input className="input" value={title} maxLength={60} onChange={(e) => onChange({ title: e.target.value })} />
+      </label>
+    </>
+  );
+}
+
+/** The form to add a remote MCP server by URL. Only a workspace admin can send it. */
+function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) {
+  const { open, setOpen, draft, edit, saving, error, close, submit } = useAddForm(
+    EMPTY_SERVER,
+    serverProblem,
+    onAdd,
+    "The server was not added.",
+  );
 
   if (!open) {
     return (
-      <div>
-        <button type="button" className="btn btn-small" onClick={() => setOpen(true)}>
-          Add a server by URL
-        </button>
-      </div>
+      <button type="button" className="btn btn-small" onClick={() => setOpen(true)}>
+        Add a server by URL
+      </button>
     );
   }
   return (
-    <section className={`card ${styles.card}`} aria-label="Add a remote MCP server">
-      <div className={styles.cardHead}>
-        <h2 className={styles.heading}>Add a remote MCP server</h2>
-        <span className={styles.meta}>Only a workspace admin can add a server.</span>
-      </div>
-      <form className={styles.form} onSubmit={submit}>
+    <AddCard
+      title="Add a remote MCP server"
+      note="Only a workspace admin can add a server."
+      error={error}
+      saving={saving}
+      onSubmit={submit}
+      onCancel={close}
+    >
+      <NameFields name={draft.name} title={draft.title} prefix="mcp" onChange={edit} />
+      <label className="field">
+        <span className="label">Address</span>
+        <input
+          className="input"
+          type="url"
+          inputMode="url"
+          placeholder="https://mcp.example.com/mcp"
+          value={draft.url}
+          maxLength={2000}
+          autoComplete="off"
+          onChange={(e) => edit({ url: e.target.value })}
+        />
+      </label>
+      <label className="field">
+        <span className="label">Sign-in</span>
+        <select className="input" value={draft.auth} onChange={(e) => edit({ auth: e.target.value as McpAuth })}>
+          {(Object.keys(AUTH_LABELS) as McpAuth[]).map((auth) => (
+            <option key={auth} value={auth}>
+              {AUTH_LABELS[auth]}
+            </option>
+          ))}
+        </select>
+        <span className="hint">You give a token or a key in the next step, not here.</span>
+      </label>
+      {draft.auth === "header" ? (
         <label className="field">
-          <span className="label">Name</span>
+          <span className="label">Header name</span>
           <input
             className="input"
-            value={draft.name}
-            maxLength={40}
+            placeholder="X-Api-Key"
+            value={draft.header}
+            maxLength={64}
             autoComplete="off"
-            onChange={(e) => edit({ name: e.target.value })}
+            onChange={(e) => edit({ header: e.target.value })}
           />
-          <span className="hint">The tools get the names mcp_&lt;name&gt;_&lt;tool&gt;.</span>
         </label>
+      ) : null}
+      {draft.auth === "oauth" ? (
         <label className="field">
-          <span className="label">Title (optional)</span>
-          <input className="input" value={draft.title} maxLength={60} onChange={(e) => edit({ title: e.target.value })} />
+          <span className="label">OAuth scope (optional)</span>
+          <input
+            className="input"
+            value={draft.oauthScope}
+            maxLength={400}
+            autoComplete="off"
+            onChange={(e) => edit({ oauthScope: e.target.value })}
+          />
         </label>
+      ) : null}
+      <ScopeSelect value={draft.scope} onChange={(scope) => edit({ scope })} />
+    </AddCard>
+  );
+}
+
+/**
+ * The form to add a stdio MCP server. sama runs it in a connector host: its own sandbox with
+ * an egress allowlist. A workspace admin can add a pinned package. Only the org owner can add a
+ * custom command.
+ */
+function AddStdio({ onAdd }: { onAdd: (draft: StdioDraft) => Promise<void> }) {
+  const { open, setOpen, draft, edit, saving, error, close, submit } = useAddForm(
+    EMPTY_STDIO,
+    stdioProblem,
+    onAdd,
+    "The server was not added.",
+  );
+
+  if (!open) {
+    return (
+      <button type="button" className="btn btn-small" onClick={() => setOpen(true)}>
+        Add a stdio MCP server
+      </button>
+    );
+  }
+  return (
+    <AddCard
+      title="Add a stdio MCP server"
+      note="sama runs the server in its own connector host. The first start can take some minutes."
+      error={error}
+      saving={saving}
+      savingLabel="Installing and testing"
+      onSubmit={submit}
+      onCancel={close}
+    >
+      <NameFields name={draft.name} title={draft.title} prefix="mcp" onChange={edit} />
+      <label className="field">
+        <span className="label">What to run</span>
+        <select
+          className="input"
+          value={draft.source}
+          onChange={(e) => edit({ source: e.target.value as StdioDraft["source"] })}
+        >
+          {(Object.keys(STDIO_SOURCES) as StdioDraft["source"][]).map((source) => (
+            <option key={source} value={source}>
+              {STDIO_SOURCES[source]}
+            </option>
+          ))}
+        </select>
+      </label>
+      {draft.source === "command" ? (
         <label className="field">
-          <span className="label">Address</span>
+          <span className="label">Command</span>
+          <textarea
+            className="input"
+            rows={3}
+            placeholder={"npx\n-y\n@example/mcp-server@1.2.3"}
+            value={draft.command}
+            onChange={(e) => edit({ command: e.target.value })}
+          />
+          <span className="hint">The program on the first line, then one argument on each line.</span>
+        </label>
+      ) : (
+        <>
+          <label className="field">
+            <span className="label">Package</span>
+            <input
+              className="input"
+              placeholder={draft.source === "npm" ? "@modelcontextprotocol/server-everything" : "mcp-server-fetch"}
+              value={draft.packageName}
+              maxLength={214}
+              autoComplete="off"
+              onChange={(e) => edit({ packageName: e.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span className="label">Version</span>
+            <input
+              className="input"
+              placeholder="1.2.3"
+              value={draft.version}
+              maxLength={64}
+              autoComplete="off"
+              onChange={(e) => edit({ version: e.target.value })}
+            />
+            <span className="hint">One exact version. sama does not accept a range or latest.</span>
+          </label>
+          <label className="field">
+            <span className="label">Program (optional)</span>
+            <input
+              className="input"
+              value={draft.bin}
+              maxLength={100}
+              autoComplete="off"
+              onChange={(e) => edit({ bin: e.target.value })}
+            />
+            <span className="hint">The program of the package to start, if it has more than one.</span>
+          </label>
+          <label className="field">
+            <span className="label">Arguments (optional)</span>
+            <textarea className="input" rows={2} value={draft.args} onChange={(e) => edit({ args: e.target.value })} />
+            <span className="hint">One argument on each line.</span>
+          </label>
+        </>
+      )}
+      <label className="field">
+        <span className="label">Environment variables (optional)</span>
+        <textarea
+          className="input"
+          rows={2}
+          placeholder="GITHUB_TOKEN"
+          value={draft.env}
+          onChange={(e) => edit({ env: e.target.value })}
+        />
+        <span className="hint">Only the names. You give the values in the next step, not here.</span>
+      </label>
+      <label className="field">
+        <span className="label">Hosts that the server can reach (optional)</span>
+        <textarea
+          className="input"
+          rows={2}
+          placeholder="api.github.com"
+          value={draft.egress}
+          onChange={(e) => edit({ egress: e.target.value })}
+        />
+        <span className="hint">The host blocks all other addresses. sama adds the package registry.</span>
+      </label>
+      <label className="field">
+        <span className="label">Memory limit in MB (optional)</span>
+        <input className="input" inputMode="numeric" placeholder="384" value={draft.memoryMb} onChange={(e) => edit({ memoryMb: e.target.value })} />
+      </label>
+      <label className="field">
+        <span className="label">Pause after idle seconds (optional)</span>
+        <input className="input" inputMode="numeric" placeholder="600" value={draft.idleS} onChange={(e) => edit({ idleS: e.target.value })} />
+      </label>
+      <ScopeSelect value={draft.scope} onChange={(scope) => edit({ scope })} />
+    </AddCard>
+  );
+}
+
+/** The form to add an HTTP API from an OpenAPI document or a list of endpoints. */
+function AddApi({ onAdd }: { onAdd: (draft: ApiDraft) => Promise<void> }) {
+  const { open, setOpen, draft, edit, saving, error, close, submit } = useAddForm(
+    EMPTY_API,
+    apiProblem,
+    onAdd,
+    "The API was not added.",
+  );
+
+  if (!open) {
+    return (
+      <button type="button" className="btn btn-small" onClick={() => setOpen(true)}>
+        Add an API
+      </button>
+    );
+  }
+  return (
+    <AddCard
+      title="Add an HTTP API"
+      note="Each operation becomes one tool. A GET tool runs at once. Other methods ask first."
+      error={error}
+      saving={saving}
+      onSubmit={submit}
+      onCancel={close}
+    >
+      <NameFields name={draft.name} title={draft.title} prefix="api" onChange={edit} />
+      <label className="field">
+        <span className="label">Operations</span>
+        <select
+          className="input"
+          value={draft.source}
+          onChange={(e) => edit({ source: e.target.value as ApiDraft["source"] })}
+        >
+          {(Object.keys(API_SOURCES) as ApiDraft["source"][]).map((source) => (
+            <option key={source} value={source}>
+              {API_SOURCES[source]}
+            </option>
+          ))}
+        </select>
+      </label>
+      {draft.source === "openapi" ? (
+        <label className="field">
+          <span className="label">OpenAPI document</span>
+          <textarea
+            className="input"
+            rows={6}
+            placeholder="openapi: 3.0.3"
+            value={draft.openapi}
+            onChange={(e) => edit({ openapi: e.target.value })}
+          />
+          <span className="hint">JSON or YAML, OpenAPI 3.</span>
+        </label>
+      ) : draft.source === "openapi_url" ? (
+        <label className="field">
+          <span className="label">Address of the document</span>
           <input
             className="input"
             type="url"
             inputMode="url"
-            placeholder="https://mcp.example.com/mcp"
-            value={draft.url}
+            placeholder="https://api.example.com/openapi.json"
+            value={draft.openapiUrl}
             maxLength={2000}
             autoComplete="off"
-            onChange={(e) => edit({ url: e.target.value })}
+            onChange={(e) => edit({ openapiUrl: e.target.value })}
           />
         </label>
+      ) : (
         <label className="field">
-          <span className="label">Sign-in</span>
-          <select className="input" value={draft.auth} onChange={(e) => edit({ auth: e.target.value as McpAuth })}>
-            {(Object.keys(AUTH_LABELS) as McpAuth[]).map((auth) => (
-              <option key={auth} value={auth}>
-                {AUTH_LABELS[auth]}
-              </option>
-            ))}
-          </select>
-          <span className="hint">You give a token or a key in the next step, not here.</span>
+          <span className="label">Endpoints</span>
+          <textarea
+            className="input"
+            rows={4}
+            placeholder={"GET /items?limit,cursor list_items\nGET /items/{id}\nPOST /items create_item"}
+            value={draft.endpoints}
+            onChange={(e) => edit({ endpoints: e.target.value })}
+          />
+          <span className="hint">One endpoint on each line: the method, the path, and an optional tool name.</span>
         </label>
-        {draft.auth === "header" ? (
+      )}
+      <label className="field">
+        <span className="label">{draft.source === "endpoints" ? "Base address" : "Base address (optional)"}</span>
+        <input
+          className="input"
+          type="url"
+          inputMode="url"
+          placeholder="https://api.example.com/v1"
+          value={draft.baseUrl}
+          maxLength={500}
+          autoComplete="off"
+          onChange={(e) => edit({ baseUrl: e.target.value })}
+        />
+        {draft.source === "endpoints" ? null : (
+          <span className="hint">Empty: sama uses the first server of the document.</span>
+        )}
+      </label>
+      <label className="field">
+        <span className="label">Sign-in</span>
+        <select className="input" value={draft.auth} onChange={(e) => edit({ auth: e.target.value as ApiAuthType })}>
+          {(Object.keys(API_AUTH_LABELS) as ApiAuthType[]).map((auth) => (
+            <option key={auth} value={auth}>
+              {API_AUTH_LABELS[auth]}
+            </option>
+          ))}
+        </select>
+        <span className="hint">You give the key, token, or password in the next step, not here.</span>
+      </label>
+      {draft.auth === "api_key" ? (
+        <>
           <label className="field">
-            <span className="label">Header name</span>
+            <span className="label">Name of the key</span>
             <input
               className="input"
-              placeholder="X-Api-Key"
-              value={draft.header}
+              value={draft.keyName}
               maxLength={64}
               autoComplete="off"
-              onChange={(e) => edit({ header: e.target.value })}
+              onChange={(e) => edit({ keyName: e.target.value })}
             />
           </label>
-        ) : null}
-        {draft.auth === "oauth" ? (
           <label className="field">
-            <span className="label">OAuth scope (optional)</span>
+            <span className="label">The key goes into</span>
+            <select
+              className="input"
+              value={draft.keyLocation}
+              onChange={(e) => edit({ keyLocation: e.target.value as ApiDraft["keyLocation"] })}
+            >
+              <option value="header">A header</option>
+              <option value="query">A query parameter</option>
+            </select>
+          </label>
+        </>
+      ) : null}
+      {draft.auth === "oauth2" ? (
+        <>
+          <label className="field">
+            <span className="label">Token URL</span>
+            <input
+              className="input"
+              type="url"
+              inputMode="url"
+              placeholder="https://auth.example.com/oauth/token"
+              value={draft.tokenUrl}
+              maxLength={500}
+              autoComplete="off"
+              onChange={(e) => edit({ tokenUrl: e.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span className="label">Scope (optional)</span>
             <input
               className="input"
               value={draft.oauthScope}
@@ -373,40 +810,21 @@ function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) 
               onChange={(e) => edit({ oauthScope: e.target.value })}
             />
           </label>
-        ) : null}
-        <label className="field">
-          <span className="label">Who can use it</span>
-          <select className="input" value={draft.scope} onChange={(e) => edit({ scope: e.target.value as ConnectionScope })}>
-            {(Object.keys(SCOPE_LABELS) as ConnectionScope[]).map((scope) => (
-              <option key={scope} value={scope}>
-                {SCOPE_LABELS[scope]}
-              </option>
-            ))}
-          </select>
-        </label>
-        {error ? (
-          <p className="alert alert-error" role="alert">
-            {error}
-          </p>
-        ) : null}
-        <div className={styles.actions}>
-          <button type="submit" className="btn btn-primary btn-small" disabled={saving}>
-            {saving ? "Adding" : "Add and connect"}
-          </button>
-          <button
-            type="button"
-            className="btn btn-quiet btn-small"
-            disabled={saving}
-            onClick={() => {
-              setOpen(false);
-              setError(null);
-            }}
-          >
-            Cancel
-          </button>
-        </div>
-      </form>
-    </section>
+          <label className="field">
+            <span className="label">The client sends its id and secret in</span>
+            <select
+              className="input"
+              value={draft.clientAuth}
+              onChange={(e) => edit({ clientAuth: e.target.value as ApiDraft["clientAuth"] })}
+            >
+              <option value="basic">Basic auth</option>
+              <option value="body">The body of the token request</option>
+            </select>
+          </label>
+        </>
+      ) : null}
+      <ScopeSelect value={draft.scope} onChange={(scope) => edit({ scope })} />
+    </AddCard>
   );
 }
 
@@ -547,6 +965,9 @@ function ScopeRow({
         </div>
       </div>
       {connection?.last_error ? <p className={styles.error}>{connection.last_error}</p> : null}
+      {connection?.kind === "mcp_hosted" && connection.mcp?.custom ? (
+        <HostedInfo hosted={connection.mcp.custom as HostedCustom} />
+      ) : null}
       {connection?.mcp ? (
         <McpTools
           // A new key when the saved filters change, so the editor shows the filters of another admin.
@@ -646,6 +1067,17 @@ function ConnectForm({
   );
 }
 
+/** What a connector host runs and what it can reach. */
+function HostedInfo({ hosted }: { hosted: HostedCustom }) {
+  const egress = hosted.egress.length === 0 ? "only the package registry" : hosted.egress.join(", ");
+  return (
+    <p className={styles.meta}>
+      Runs {hostedWhat(hosted)}. Can reach {egress}.
+      {hosted.env.length > 0 ? ` Variables: ${hosted.env.join(", ")}.` : ""}
+    </p>
+  );
+}
+
 /** The tools of a remote MCP server, and the filters that turn tools on and off. */
 function McpTools({ connection, onSaved }: { connection: Connection; onSaved: (connection: Connection) => void }) {
   const api = useApi();
@@ -683,7 +1115,7 @@ function McpTools({ connection, onSaved }: { connection: Connection; onSaved: (c
       <ul className={styles.toolList}>
         {mcp.tools.map((tool) => (
           <li key={tool.name} className={tool.enabled ? styles.tool : `${styles.tool} ${styles.toolOff}`}>
-            <span className={styles.toolName}>{tool.remote_name}</span>
+            <span className={styles.toolName}>{tool.method && tool.path ? `${tool.method} ${tool.path}` : tool.remote_name}</span>
             <span className="badge">{tool.enabled ? ACCESS_LABELS[tool.access] : "Off"}</span>
             {tool.description ? <span className={styles.toolText}>{tool.description}</span> : null}
           </li>

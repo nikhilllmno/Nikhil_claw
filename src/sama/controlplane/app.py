@@ -34,6 +34,7 @@ from starlette.routing import Mount
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
 from sama.connectors.database import DatabaseGateway
+from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
 from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
@@ -175,11 +176,19 @@ def build(
     # The database gateway runs the tools of the database connectors (Section 10.4). It
     # writes large results and exports to the session sandbox, set below.
     database = DatabaseGateway()
+    # A stdio MCP server runs in its own E2B sandbox, the connector host (Section 10.3.2).
+    hosts: ConnectorHosts | None = None
+    if runtimes is None:
+        hosts = ConnectorHosts(
+            E2BHostBackend(settings.e2b_api_key.get_secret_value()),
+            template=settings.connector_host_template,
+        )
     connections = ConnectionService(
         engine,
         Catalog.load(),
         keys=keys,
         vault=vault,
+        hosts=hosts,
         web_base=settings.web_base,
         database=database,
     )

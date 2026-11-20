@@ -1,0 +1,273 @@
+"""The import of a custom HTTP API (docs/architecture.md, Section 10.3.3, M4.12)."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pytest
+
+from sama.connectors.mcp_remote import MAX_TOOLS
+from sama.connectors.openapi import (
+    ApiImportError,
+    ApiOperation,
+    load_document,
+    parse_endpoints,
+    parse_openapi,
+    tool_name,
+)
+
+PETS: dict[str, Any] = {
+    "openapi": "3.0.3",
+    "info": {"title": "Pets", "version": "1"},
+    "servers": [
+        {"url": "https://{region}.pets.test/v1/", "variables": {"region": {"default": "eu"}}}
+    ],
+    "paths": {
+        "/pets": {
+            "get": {
+                "operationId": "listPets",
+                "summary": "List the pets.",
+                "parameters": [
+                    {"name": "limit", "in": "query", "schema": {"type": "integer"}},
+                    {"name": "X-Trace", "in": "header", "schema": {"type": "string"}},
+                ],
+            },
+            "post": {
+                "operationId": "createPet",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}
+                    },
+                },
+            },
+        },
+        "/pets/{petId}": {
+            "parameters": [{"$ref": "#/components/parameters/PetId"}],
+            "get": {"description": "One pet."},
+            "delete": {"operationId": "deletePet"},
+        },
+    },
+    "components": {
+        "parameters": {
+            "PetId": {"name": "petId", "in": "path", "required": True, "schema": {"type": "string"}}
+        },
+        "schemas": {
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "owner": {"$ref": "#/components/schemas/Owner"},
+                },
+            },
+            "Owner": {
+                "type": "object",
+                "properties": {
+                    "pets": {"type": "array", "items": {"$ref": "#/components/schemas/Pet"}}
+                },
+            },
+        },
+    },
+}
+
+
+def by_name(text: str) -> dict[str, ApiOperation]:
+    return {op.tool.name: op for op in parse_openapi(text, max_name=50).operations}
+
+
+def test_an_openapi_document_gives_one_tool_for_each_operation() -> None:
+    imported = parse_openapi(json.dumps(PETS), max_name=50)
+    assert imported.base_url == "https://eu.pets.test/v1"
+    assert imported.skipped == 0
+    ops = {op.tool.name: op for op in imported.operations}
+    assert list(ops) == ["list_pets", "create_pet", "get_pets_by_petid", "delete_pet"]
+    listed = ops["list_pets"]
+    assert (listed.method, listed.path, listed.params, listed.body) == (
+        "GET",
+        "/pets",
+        (("limit", "query"),),
+        False,
+    )
+    # A header parameter is not an argument: sama sets the headers.
+    assert set(listed.tool.input_schema["properties"]) == {"limit"}
+    assert listed.tool.read_only is True
+    assert listed.tool.description == "List the pets. (GET /pets)"
+    created = ops["create_pet"]
+    assert created.body is True
+    assert created.tool.input_schema["required"] == ["body"]
+    assert created.tool.read_only is False
+    assert created.tool.destructive is False
+    # The cyclic $ref stops: the inner Pet is an open schema.
+    owner = created.tool.input_schema["properties"]["body"]["properties"]["owner"]
+    assert owner["properties"]["pets"]["items"] == {}
+    one = ops["get_pets_by_petid"]
+    assert one.params == (("petId", "path"),)
+    assert one.tool.input_schema["required"] == ["petId"]
+    assert ops["delete_pet"].tool.destructive is True
+
+
+def test_the_stored_operation_comes_back_the_same() -> None:
+    for op in parse_openapi(json.dumps(PETS), max_name=50).operations:
+        assert ApiOperation.from_stored(json.loads(json.dumps(op.stored()))) == op
+    assert ApiOperation.from_stored({"name": "x", "input_schema": {}}) is None
+
+
+def test_yaml_is_read_and_yaml_aliases_are_refused() -> None:
+    text = "openapi: 3.1.0\npaths:\n  /a:\n    get:\n      operationId: getA\n"
+    assert [op.tool.name for op in parse_openapi(text, max_name=50).operations] == ["get_a"]
+    bomb = 'openapi: 3.0.0\na: &a ["x", "x"]\nb: &b [*a, *a]\npaths: {}\n'
+    with pytest.raises(ApiImportError, match="aliases"):
+        load_document(bomb)
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("not: [valid", "not valid JSON or YAML"),
+        ("[1, 2]", "not an object"),
+        ('{"swagger": "2.0", "paths": {}}', "OpenAPI 3"),
+        ('{"openapi": "3.0.0"}', "no paths"),
+        ("x" * 2_000_001, "larger than 2 MB"),
+    ],
+)
+def test_a_bad_document_is_refused(text: str, message: str) -> None:
+    with pytest.raises(ApiImportError, match=message):
+        load_document(text)
+
+
+def test_a_bad_operation_is_skipped() -> None:
+    document = {
+        "openapi": "3.0.0",
+        "servers": [{"url": "http://plain.test"}],
+        "paths": {
+            "/ok": {"get": {}},
+            "/up/../down": {"get": {}},
+            "/items/{id}": {"get": {}},  # The template has no path parameter.
+            "/same": {
+                "get": {
+                    "parameters": [
+                        {"name": "x", "in": "query"},
+                        {"name": "body", "in": "query"},
+                    ]
+                }
+            },
+            "/remote": {"get": {"$ref": "https://evil.test/op.json"}},
+        },
+    }
+    imported = parse_openapi(json.dumps(document), max_name=50)
+    assert [op.tool.name for op in imported.operations] == ["get_ok"]
+    assert imported.skipped == 3
+    # Only an https server is a base URL.
+    assert imported.base_url is None
+
+
+def test_names_are_snake_case_short_and_unique() -> None:
+    assert tool_name("getUserByID", "get", "/x", 50) == "get_user_by_id"
+    assert tool_name(None, "get", "/users/{id}/posts", 50) == "get_users_by_id_posts"
+    assert tool_name("2fa-check", "post", "/x", 50) == "op_2fa_check"
+    assert tool_name("a" * 80, "get", "/x", 10) == "a" * 10
+    document = {
+        "openapi": "3.0.0",
+        "paths": {f"/p{i}": {"get": {"operationId": "same"}} for i in range(3)},
+    }
+    names = [op.tool.name for op in parse_openapi(json.dumps(document), max_name=50).operations]
+    assert names == ["same", "same_2", "same_3"]
+
+
+def test_at_most_max_tools_operations() -> None:
+    document = {"openapi": "3.0.0", "paths": {f"/p{i}": {"get": {}} for i in range(MAX_TOOLS + 5)}}
+    imported = parse_openapi(json.dumps(document), max_name=50)
+    assert len(imported.operations) == MAX_TOOLS
+    assert imported.skipped == 5
+
+
+def test_a_list_of_endpoints_gives_tools_with_path_query_and_body() -> None:
+    imported = parse_endpoints(
+        [
+            {"name": "getItem", "method": "GET", "path": "/items/{id}", "query": ["fields"]},
+            {"name": "addItem", "method": "post", "path": "/items", "body": True},
+            {"name": "bad", "method": "TRACE", "path": "/x"},
+            {"name": "nopath", "method": "GET"},
+        ],
+        max_name=50,
+    )
+    ops = {op.tool.name: op for op in imported.operations}
+    assert list(ops) == ["get_item", "add_item"]
+    assert imported.skipped == 2
+    assert ops["get_item"].params == (("id", "path"), ("fields", "query"))
+    assert ops["get_item"].tool.input_schema["required"] == ["id"]
+    assert ops["add_item"].body is True
+    assert ops["add_item"].tool.read_only is False
+
+
+def test_an_operation_parameter_replaces_the_path_parameter_also_its_required() -> None:
+    document = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/items": {
+                "parameters": [{"name": "page", "in": "query", "required": True}],
+                "get": {
+                    "operationId": "list",
+                    "parameters": [
+                        {"name": "page", "in": "query", "required": False},
+                        {"name": "tag", "in": "query", "schema": {"type": "array"}},
+                    ],
+                },
+                "post": {"operationId": "add"},
+            }
+        },
+    }
+    imported = parse_openapi(json.dumps(document), max_name=50)
+    by_name = {op.tool.name: op for op in imported.operations}
+    assert "required" not in by_name["list"].tool.input_schema
+    assert by_name["list"].params == (("page", "query"), ("tag", "query"))
+    # The shared parameter stays required where no operation parameter replaces it.
+    assert by_name["add"].tool.input_schema["required"] == ["page"]
+
+
+@pytest.mark.parametrize(
+    "param",
+    [
+        {"schema": {"type": "object", "properties": {"a": {"type": "string"}}}},
+        {"schema": {"type": "array", "items": {"type": "object"}}},
+        {"schema": {"type": "array"}, "explode": False},
+        {"schema": {"type": "array"}, "style": "pipeDelimited"},
+        {"style": "deepObject"},
+        {"content": {"application/json": {"schema": {"type": "object"}}}},
+        # An object or a nested array in a type list, a composition, or an untyped schema.
+        {"schema": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}},
+        {"schema": {"allOf": [{"type": "object", "properties": {"a": {"type": "string"}}}]}},
+        {"schema": {"anyOf": [{"type": "string"}, {"properties": {"a": {}}}]}},
+        {"schema": {"type": "array", "items": {"type": ["array", "null"]}}},
+        {"schema": {"type": "array", "items": {"properties": {"a": {"type": "string"}}}}},
+        {"schema": {"oneOf": [{"type": "array", "items": {"type": "object"}}]}},
+    ],
+)
+def test_a_query_parameter_that_sama_cannot_send_skips_the_operation(
+    param: dict[str, Any],
+) -> None:
+    document = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/ok": {"get": {"parameters": [{"name": "q", "in": "query"}]}},
+            "/bad": {"get": {"parameters": [{"name": "f", "in": "query", **param}]}},
+        },
+    }
+    imported = parse_openapi(json.dumps(document), max_name=50)
+    assert [op.tool.name for op in imported.operations] == ["get_ok"]
+    assert imported.skipped == 1
+
+
+def test_the_base_url_is_the_first_https_server() -> None:
+    document = {
+        "openapi": "3.0.0",
+        "servers": [
+            {"url": "/relative"},
+            {"url": "http://plain.test"},
+            {"url": "https://{host}/v2/", "variables": {"host": {"default": "api.test"}}},
+            {"url": "https://second.test"},
+        ],
+        "paths": {"/ok": {"get": {}}},
+    }
+    assert parse_openapi(json.dumps(document), max_name=50).base_url == "https://api.test/v2"

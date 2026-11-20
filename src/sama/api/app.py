@@ -301,6 +301,62 @@ class McpServerAdd(_Body):
     scope: Literal["personal", "workspace"] = "workspace"
 
 
+class StdioPackage(_Body):
+    registry: Literal["npm", "pypi"]
+    name: str = Field(min_length=1, max_length=214)
+    version: str = Field(min_length=1, max_length=64)
+    bin: str | None = Field(default=None, max_length=100)
+    args: list[str] = Field(default_factory=list, max_length=32)
+
+
+class StdioServerAdd(_Body):
+    """A stdio MCP server that sama runs in a connector host (Section 10.3.2). It has a pinned
+    package, or a custom command (the org owner only)."""
+
+    name: str = Field(min_length=1, max_length=40)
+    title: str | None = Field(default=None, max_length=60)
+    scope: Literal["personal", "workspace"] = "workspace"
+    package: StdioPackage | None = None
+    command: list[str] | None = Field(default=None, min_length=1, max_length=32)
+    env: list[str] = Field(default_factory=list, max_length=MAX_FORM_FIELDS)
+    """The environment variables of the server. Each one is a secret field of the form."""
+    egress: list[str] = Field(default_factory=list, max_length=20)
+    memory_mb: int | None = None
+    idle_s: int | None = None
+
+
+class ApiEndpoint(_Body):
+    name: str | None = Field(default=None, max_length=64)
+    method: Literal["GET", "PUT", "POST", "DELETE", "PATCH", "HEAD"] = "GET"
+    path: str = Field(min_length=1, max_length=500)
+    description: str | None = Field(default=None, max_length=1000)
+    query: list[str] = Field(default_factory=list, max_length=30)
+    body: bool = False
+
+
+class ApiAuthBody(_Body):
+    type: Literal["api_key", "bearer", "basic", "oauth2", "none"]
+    name: str | None = Field(default=None, max_length=64)
+    location: Literal["header", "query"] = "header"
+    token_url: str | None = Field(default=None, max_length=500)
+    scope: str | None = Field(default=None, max_length=400)
+    client_auth: Literal["basic", "body"] = "basic"
+
+
+class ApiAdd(_Body):
+    """An HTTP API from an OpenAPI 3 document or a list of endpoints (Section 10.3.3)."""
+
+    name: str = Field(min_length=1, max_length=40)
+    title: str | None = Field(default=None, max_length=60)
+    scope: Literal["personal", "workspace"] = "workspace"
+    base_url: str | None = Field(default=None, max_length=500)
+    auth: ApiAuthBody
+    openapi: str | None = Field(default=None, max_length=2_000_000)
+    openapi_url: str | None = Field(default=None, max_length=2000)
+    endpoints: list[ApiEndpoint] | None = Field(default=None, max_length=200)
+    test: str | None = Field(default=None, max_length=64)
+
+
 class OAuthCallback(_Body):
     """The query of the redirect of an authorization server to the Connections page."""
 
@@ -1134,6 +1190,48 @@ class SamaApi:
                 oauth_scope=body.oauth_scope,
                 title=body.title,
                 scope=body.scope,
+            )
+            return started.public()
+
+        @app.post("/workspaces/{workspace_id}/connections/stdio", status_code=201)
+        async def add_stdio_server(
+            principal: Me, workspace_id: uuid.UUID, body: StdioServerAdd
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            started = await self._require_connections().add_stdio(
+                org_id,
+                workspace_id,
+                grants,
+                name=body.name,
+                title=body.title,
+                scope=body.scope,
+                package=None if body.package is None else body.package.model_dump(),
+                command=body.command,
+                env=body.env,
+                egress=body.egress,
+                memory_mb=body.memory_mb,
+                idle_s=body.idle_s,
+            )
+            return started.public()
+
+        @app.post("/workspaces/{workspace_id}/connections/api", status_code=201)
+        async def add_api(principal: Me, workspace_id: uuid.UUID, body: ApiAdd) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            started = await self._require_connections().add_api(
+                org_id,
+                workspace_id,
+                grants,
+                name=body.name,
+                title=body.title,
+                scope=body.scope,
+                auth=body.auth.model_dump(exclude_none=True),
+                base_url=body.base_url,
+                openapi=body.openapi,
+                openapi_url=body.openapi_url,
+                endpoints=None
+                if body.endpoints is None
+                else [e.model_dump() for e in body.endpoints],
+                test=body.test,
             )
             return started.public()
 

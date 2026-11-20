@@ -258,7 +258,7 @@ async def test_an_admin_adds_a_server_by_url(engine: AsyncEngine, org: Org1, wor
     )
     again = await service.start(org.ids["org"], org.ids["ws"], admin, "acme", "workspace")
     assert again.connection.id == view.id
-    assert again.connection.custom_mcp() is not None
+    assert again.connection.custom() is not None
     assert again.connection.filters == ((), ("drop_*",))
     # A new URL for the server: the old credential does not go to it.
     moved = await service.add_mcp(

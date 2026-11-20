@@ -256,14 +256,42 @@ export interface Connector {
   name: string;
   title: string;
   description: string;
-  /** `composio`: a sign-in link. `http_api`: a form. `mcp_remote`: a remote MCP server. */
+  /**
+   * `composio`: a sign-in link. `http_api`: a form. `mcp_remote`: a remote MCP server.
+   * `mcp_hosted`: a stdio MCP server that sama runs in a connector host.
+   */
   kind: string;
   scopes: ConnectionScope[];
   fields: ConnectorField[];
   /** Empty for a remote MCP server: the server lists its tools after the connection. */
   tools: ConnectorTool[];
   mcp?: { url: string; auth: McpAuth; header: string | null } | null;
+  hosted?: HostedSpec | null;
+  api?: { base_url: string; auth: ApiAuthType } | null;
 }
+
+/** The package of a stdio MCP server. The version is one exact version. */
+export interface StdioPackage {
+  registry: "npm" | "pypi";
+  name: string;
+  version: string;
+  bin?: string | null;
+  args?: string[];
+}
+
+/** What a connector host runs and what it can reach. It has no secret values. */
+export interface HostedSpec {
+  package: StdioPackage | null;
+  command: string[] | null;
+  /** The names of the environment variables. The vault holds the values. */
+  env: string[];
+  egress: string[];
+  memory_mb: number | null;
+  idle_s: number | null;
+}
+
+/** How sama signs in to an HTTP API. */
+export type ApiAuthType = "api_key" | "bearer" | "basic" | "oauth2" | "none";
 
 /** How sama signs in to a remote MCP server. */
 export type McpAuth = "oauth" | "bearer" | "header" | "none";
@@ -277,16 +305,94 @@ export interface McpTool {
   access: "read" | "write" | "destructive";
   /** False when a filter of the connection or of the connector turns the tool off. */
   enabled: boolean;
+  /** The HTTP method and path of an HTTP API tool, else `null`. */
+  method?: string | null;
+  path?: string | null;
 }
 
-/** The remote MCP part of a connection (`kind` is `mcp_remote`). */
+/** A remote MCP server that an admin added by URL. */
+export interface McpCustom {
+  title: string | null;
+  url: string;
+  auth: McpAuth;
+  header: string | null;
+}
+
+/** A stdio MCP server that an admin added. */
+export interface HostedCustom extends HostedSpec {
+  title: string | null;
+}
+
+/** An HTTP API that an admin added. */
+export interface ApiCustom {
+  title: string | null;
+  base_url: string | null;
+  auth: ApiAuthType | null;
+  auth_name: string | null;
+  auth_location: "header" | "query" | null;
+  token_url: string | null;
+}
+
+/**
+ * The tool part of a connection with a tool list (`kind` is `mcp_remote`, `mcp_hosted`, or
+ * an HTTP API that an admin added).
+ */
 export interface ConnectionMcp {
-  /** The server that an admin added by URL, or `null` for a server of the catalog. */
-  custom: { title: string | null; url: string; auth: McpAuth; header: string | null } | null;
+  /**
+   * The server or API that an admin added, or `null` for a connector of the catalog. The kind
+   * of the connection tells which type it is.
+   */
+  custom: McpCustom | HostedCustom | ApiCustom | null;
   include: string[];
   exclude: string[];
   discovered_at: string | null;
+  /** The operations of an OpenAPI document that sama did not use. */
+  skipped?: number | null;
   tools: McpTool[];
+}
+
+/** A new stdio MCP server (`POST /workspaces/{id}/connections/stdio`). */
+export interface StdioServerAdd {
+  name: string;
+  title?: string | null;
+  scope: ConnectionScope;
+  /** A pinned package, or a custom command (the org owner only). */
+  package?: StdioPackage | null;
+  command?: string[] | null;
+  env: string[];
+  egress: string[];
+  memory_mb?: number | null;
+  idle_s?: number | null;
+}
+
+/** One endpoint of an HTTP API without an OpenAPI document. */
+export interface ApiEndpoint {
+  name?: string | null;
+  method: "GET" | "PUT" | "POST" | "DELETE" | "PATCH" | "HEAD";
+  path: string;
+  description?: string | null;
+  query: string[];
+  body: boolean;
+}
+
+/** A new HTTP API (`POST /workspaces/{id}/connections/api`). Give one source of operations. */
+export interface ApiAdd {
+  name: string;
+  title?: string | null;
+  scope: ConnectionScope;
+  base_url?: string | null;
+  auth: {
+    type: ApiAuthType;
+    name?: string | null;
+    location?: "header" | "query";
+    token_url?: string | null;
+    scope?: string | null;
+    client_auth?: "basic" | "body";
+  };
+  openapi?: string | null;
+  openapi_url?: string | null;
+  endpoints?: ApiEndpoint[] | null;
+  test?: string | null;
 }
 
 /** A new remote MCP server by URL (`POST /workspaces/{id}/connections/mcp`). */
@@ -1064,6 +1170,18 @@ export class ApiClient {
   /** Adds a remote MCP server by URL. Only a workspace admin can do this. */
   addMcpServer = (workspaceId: string, body: McpServerAdd) =>
     this.json<StartedConnection>(`/workspaces/${workspaceId}/connections/mcp`, {
+      method: "POST",
+      body,
+    });
+  /** Adds a stdio MCP server in a connector host. A custom command needs the org owner. */
+  addStdioServer = (workspaceId: string, body: StdioServerAdd) =>
+    this.json<StartedConnection>(`/workspaces/${workspaceId}/connections/stdio`, {
+      method: "POST",
+      body,
+    });
+  /** Adds an HTTP API from an OpenAPI document or a list of endpoints. */
+  addApi = (workspaceId: string, body: ApiAdd) =>
+    this.json<StartedConnection>(`/workspaces/${workspaceId}/connections/api`, {
       method: "POST",
       body,
     });

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr
 
 from sama.api.origins import parse_origins
+from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
 from sama.media.vision import DEFAULT_VISION_MODEL
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
@@ -107,6 +108,8 @@ class ControlPlaneSettings:
     e2b_api_key: SecretStr
     supabase_jwt_secret: SecretStr | None = None
     sandbox_template: str = DEFAULT_TEMPLATE
+    connector_host_template: str = DEFAULT_HOST_TEMPLATE
+    """The E2B template of the connector hosts of stdio MCP servers (Section 10.3.2)."""
     sandbox_allow_out: tuple[str, ...] = ()
     vision_model: str = DEFAULT_VISION_MODEL
     anthropic_key: SecretStr | None = None
@@ -224,6 +227,8 @@ class ControlPlaneSettings:
             e2b_api_key=SecretStr(_required(env, "E2B_API_KEY")),
             supabase_jwt_secret=_secret(env, "SAMA_SUPABASE_JWT_SECRET"),
             sandbox_template=env.get("SAMA_SANDBOX_TEMPLATE", "").strip() or DEFAULT_TEMPLATE,
+            connector_host_template=env.get("SAMA_CONNECTOR_HOST_TEMPLATE", "").strip()
+            or DEFAULT_HOST_TEMPLATE,
             sandbox_allow_out=_hosts(env.get("SAMA_SANDBOX_ALLOW_OUT", "")),
             vision_model=env.get("SAMA_VISION_MODEL", "").strip() or DEFAULT_VISION_MODEL,
             anthropic_key=_secret(env, "ANTHROPIC_API_KEY"),

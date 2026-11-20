@@ -225,7 +225,7 @@ class OutboundClient:
         url: str,
         *,
         headers: Mapping[str, str] | None = None,
-        params: Mapping[str, str] | None = None,
+        params: Mapping[str, str] | Sequence[tuple[str, str]] | None = None,
         json: object = None,
         form: Mapping[str, str] | None = None,
         enough: Callable[[bytes], bool] | None = None,

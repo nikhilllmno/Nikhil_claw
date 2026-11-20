@@ -179,10 +179,11 @@ def parse_tool(data: object) -> RemoteTool | None:
     )
 
 
-def sama_name(connector: str, remote: str) -> str | None:
-    """``mcp_<connector>_<tool>``: a ``-`` of the connector becomes ``_``, and a character
-    that a tool name cannot have becomes ``_``. ``None`` if the name is longer than 64."""
-    name = f"{TOOL_PREFIX}{connector.replace('-', '_')}_{_NAME_CHARS.sub('_', remote)}"
+def sama_name(connector: str, remote: str, *, prefix: str = TOOL_PREFIX) -> str | None:
+    """``mcp_<connector>_<tool>`` (``api_`` for a custom API): a ``-`` of the connector becomes
+    ``_``, and a character that a tool name cannot have becomes ``_``. ``None`` if the name is
+    longer than 64."""
+    name = f"{prefix}{connector.replace('-', '_')}_{_NAME_CHARS.sub('_', remote)}"
     return name if _SAMA_NAME.fullmatch(name) else None
 
 
@@ -217,6 +218,7 @@ def exposed_tools(
     include: Sequence[str] = (),
     exclude: Sequence[str] = (),
     access: Mapping[str, ToolAccess] | None = None,
+    prefix: str = TOOL_PREFIX,
 ) -> list[ExposedTool]:
     """The tools that a run can use, under their sama names. A tool that the filters drop, or
     whose name is too long or the same as a name before it, is not in the list."""
@@ -225,7 +227,7 @@ def exposed_tools(
     for tool in tools:
         if not selected(tool.name, include, exclude):
             continue
-        name = sama_name(connector, tool.name)
+        name = sama_name(connector, tool.name, prefix=prefix)
         if name is None or name in seen:
             continue
         seen.add(name)
