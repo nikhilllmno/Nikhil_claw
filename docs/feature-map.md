@@ -170,7 +170,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | `delegate_task` (single and batch) | `tools/delegate_tool.py` | Child session and run in its own sandbox. Summary returns to the parent (§13.2). | Adapt | M4 (done, M4.6) |
-| Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget, and lose `tasks`, `memory`, `clarify`, and `cron` (§13.2). | Adapt | M4 (done, M4.6) |
+| Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget, and lose `tasks`, `memory`, `clarify`, `cron`, `connections`, and `integrations` (§13.2). | Adapt | M4 (done, M4.6) |
 | Cheaper model for children | `delegation.model` | Child model per profile. M4.6 children use the model of the parent profile. | Adapt | Later |
 | Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents`, OpenAI agents as tools and handoffs (§13). | SDK | M2 (done) |
 | Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for children. Steer is a message after the current child run (§13.2). | Adapt | M4 (done, M4.6) |

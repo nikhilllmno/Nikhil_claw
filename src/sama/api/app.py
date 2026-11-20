@@ -48,7 +48,6 @@ from starlette.types import ASGIApp, Lifespan
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.origins import check_origins
-from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.api.tasks import (
     CommentOut,
     NewComment,
@@ -59,6 +58,7 @@ from sama.api.tasks import (
     TaskOut,
     TaskStatus,
 )
+from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
     Pin,

@@ -114,11 +114,15 @@ that it calls (Sections 12.4 and 13.2)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"
-CHILD_BLOCKED_TOOLSETS: Final = frozenset({"delegation", "tasks", "memory", "clarify", "cron"})
+CHILD_BLOCKED_TOOLSETS: Final = frozenset(
+    {"delegation", "tasks", "memory", "clarify", "cron", "connections", "integrations"}
+)
 """The toolsets that a delegated child never has (Section 13.2). ``delegation`` keeps the depth
 at 1, and ``tasks`` stops a child that makes a task card that delegates again. ``memory``
 keeps the shared notes free of child writes. ``clarify`` waits for a person, and a child has
-none. ``cron`` stops a child that outlives its parent."""
+none. ``cron`` stops a child that outlives its parent. ``connections`` and ``integrations`` are
+out for the reason of sub-agents (Section 13.1): a connection acts with the authority of the
+user, and only a run that the user watches asks the user to connect (Section 10.3)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""

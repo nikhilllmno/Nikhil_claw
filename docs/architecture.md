@@ -3110,7 +3110,7 @@ makes a child session and a queued child run in one transaction:
 |---|---|
 | Depth | 1. A child has no `delegation` toolset, so it cannot delegate. |
 | Children | At most 10 per call and at most 10 per parent run in total. |
-| Blocked toolsets | `delegation`, `tasks`, `memory`, `clarify`, and `cron` (`CHILD_BLOCKED_TOOLSETS`). The gate and the prompt assembler take them away for a `delegation` session. |
+| Blocked toolsets | `delegation`, `tasks`, `memory`, `clarify`, `cron`, `connections`, and `integrations` (`CHILD_BLOCKED_TOOLSETS`). The gate and the prompt assembler take them away for a `delegation` session. |
 | Budget | The lower of the profile budget and the defaults: 30 turns, 1.00 USD, and 1,800 seconds. A task can ask for at most 100 turns and 10 USD, and it never gets more than the profile allows. |
 | Result | The answer of a child is cut to 4,000 characters and is marked as untrusted data. |
 
