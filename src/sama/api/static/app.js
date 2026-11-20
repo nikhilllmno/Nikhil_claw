@@ -106,6 +106,7 @@ function signOut() {
   }
   $("int-orgs").replaceChildren();
   slackSetups.clear();
+  connectResults.clear();
   render();
 }
 
@@ -511,6 +512,7 @@ function disconnectButton(org, kind, label, question) {
       await api(`/orgs/${org.id}/integrations/${kind}`, { method: "DELETE" });
       // The URLs of the setup belong to the removed integration.
       if (kind === "slack") slackSetups.delete(org.id);
+      connectResults.delete(`${org.id}:${kind}`);
       await refreshIntegrations();
     } catch (error) {
       showError(error.message);
@@ -523,6 +525,16 @@ function disconnectButton(org, kind, label, question) {
 // the bot token and the signing secret of the installed app.
 // The last Slack setup of each org, so that the steps stay after the panel renders again.
 const slackSetups = new Map();
+
+// The last connect result of each org and kind, for example "The workspace X is connected.".
+// The panel renders again after a connect, and the new form shows the result in its status line.
+const connectResults = new Map();
+
+function resultLine(org, kind) {
+  const status = element("p", connectResults.get(`${org.id}:${kind}`) || "", "hint");
+  status.setAttribute("role", "status");
+  return status;
+}
 
 function slackSetup(org, slack) {
   const part = element("div");
@@ -597,8 +609,7 @@ function slackForm(org, connected) {
   }
   const submit = element("button", connected ? "Replace Slack app" : "Connect Slack");
   submit.type = "submit";
-  const status = element("p", "", "hint");
-  status.setAttribute("role", "status");
+  const status = resultLine(org, "slack");
   form.append(submit, status);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -610,7 +621,8 @@ function slackForm(org, connected) {
       const body = Object.fromEntries(fields.map(([name, input]) => [name, input.value.trim()]));
       const result = await api(`/orgs/${org.id}/integrations/slack`, { method: "POST", body });
       for (const [, input] of fields) input.value = "";
-      status.textContent = `The workspace ${result.name} is connected.`;
+      connectResults.set(`${org.id}:slack`, `The workspace ${result.name} is connected.`);
+      status.textContent = connectResults.get(`${org.id}:slack`);
       await refreshIntegrations();
     } catch (error) {
       status.textContent = error.message;
@@ -638,8 +650,7 @@ function telegramForm(org, connected) {
   label.append(input);
   const submit = element("button", connected ? "Replace bot" : "Connect Telegram");
   submit.type = "submit";
-  const status = element("p", "", "hint");
-  status.setAttribute("role", "status");
+  const status = resultLine(org, "telegram");
   form.append(steps, label, submit, status);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -653,9 +664,10 @@ function telegramForm(org, connected) {
         body: { bot_token: input.value.trim() },
       });
       input.value = "";
-      status.textContent = result.status === "active"
+      connectResults.set(`${org.id}:telegram`, result.status === "active"
         ? `@${result.name} is connected.`
-        : `@${result.name} is ${result.status}. ${result.last_error || ""}`;
+        : `@${result.name} is ${result.status}. ${result.last_error || ""}`);
+      status.textContent = connectResults.get(`${org.id}:telegram`);
       await refreshIntegrations();
     } catch (error) {
       status.textContent = error.message;

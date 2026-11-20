@@ -1863,6 +1863,10 @@ the web page. `sama.integrations.Integrations`:
 transaction, writes `integration.disconnected`, and then deletes the webhook at Telegram (best
 effort).
 
+**Connect result on the web page.** The web page keeps the last connect result of each org and
+kind in memory. It shows the result in the status line of the form after the card renders
+again. A disconnect or a sign-out clears the result.
+
 **Changes at the same time.** A connect or a disconnect holds two Postgres advisory locks
 (transaction locks on their own connection): one for the org and kind, then one for the bot.
 It holds them from its first database write to the end of its Telegram calls. A second change
