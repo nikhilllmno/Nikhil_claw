@@ -456,6 +456,239 @@ export interface TaskPatch {
   assignee_user_id?: string;
 }
 
+// -- M3.12: memory, skills, search, export, traces, settings --------------------------------
+
+export type MemoryTarget = "agent" | "user" | "workspace";
+
+export interface MemoryNotes {
+  target: MemoryTarget;
+  entries: string[];
+  chars: number;
+  cap: number;
+  revision: number;
+  can_edit: boolean;
+}
+
+export interface MemoryView {
+  workspace_id: string;
+  targets: MemoryNotes[];
+}
+
+export interface MemoryRevision {
+  seq: number;
+  action: string;
+  entries: string[];
+  author_kind: string;
+  author_user_id: string | null;
+  session_id: string | null;
+  run_id: string | null;
+  reason: string | null;
+  reverted_to: number | null;
+  created_at: string;
+}
+
+export interface MemoryWritten {
+  target: MemoryTarget;
+  entries: string[];
+  chars: number;
+  cap: number;
+  revision: number;
+}
+
+export type SkillScope = "builtin" | "org" | "workspace" | "user";
+export type WritableSkillScope = Exclude<SkillScope, "builtin">;
+export type SkillAction = "create" | "edit" | "write_file" | "remove_file" | "archive";
+
+export interface SkillSummary {
+  /** `null` for a built-in skill. */
+  id: string | null;
+  name: string;
+  description: string;
+  scope: SkillScope;
+  version: string;
+  tags: string[];
+  can_edit: boolean;
+}
+
+export interface SkillCatalog {
+  skills: SkillSummary[];
+  writable_scopes: WritableSkillScope[];
+}
+
+export interface SkillDetail extends SkillSummary {
+  requires_toolsets: string[];
+  skill_md: string;
+  files: Record<string, string>;
+  /** The other scopes that have a skill with the same name. */
+  other_scopes: SkillScope[];
+}
+
+export interface SkillVersion {
+  version: number;
+  description: string;
+  change: string;
+  summary: string | null;
+  author_kind: string;
+  author_user_id: string | null;
+  session_id: string | null;
+  run_id: string | null;
+  created_at: string;
+}
+
+export interface SkillVersionDetail {
+  skill_id: string;
+  version: number;
+  name: string;
+  description: string;
+  change: string;
+  summary: string | null;
+  author_kind: string;
+  author_user_id: string | null;
+  created_at: string;
+  skill_md: string;
+  files: Record<string, string>;
+}
+
+export interface SkillWriteBody {
+  action: SkillAction;
+  name: string;
+  scope: WritableSkillScope;
+  content?: string;
+  file_path?: string;
+  file_content?: string;
+  summary?: string;
+}
+
+export interface SkillWritten {
+  name: string;
+  scope: WritableSkillScope;
+  version: number;
+  change: string;
+}
+
+export interface SearchSnippet {
+  message_id: string;
+  role: string;
+  created_at: string;
+  text: string;
+}
+
+export interface SearchHit {
+  session_id: string;
+  workspace_id: string;
+  title: string | null;
+  audience: string;
+  created_at: string;
+  updated_at: string;
+  snippets: SearchSnippet[];
+}
+
+export type ExportFormat = "markdown" | "json";
+
+export interface ExportFile {
+  name: string;
+  blob: Blob;
+}
+
+export interface RunSummary {
+  id: string;
+  session_id: string;
+  kind: string;
+  status: string;
+  runtime: string;
+  compact: boolean;
+  triggered_by_user_id: string | null;
+  failure_code: string | null;
+  failure_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  /** A decimal number as a string, for example "0.0123". */
+  cost_usd: string;
+  model_calls: number;
+}
+
+export interface TraceStep {
+  seq: number;
+  /** The event type. `text` is a run of `text_delta` events, merged. */
+  type: string;
+  created_at: string;
+  payload: Record<string, unknown>;
+}
+
+export interface TraceToolCall {
+  call_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  decision: string | null;
+  status: string;
+  result_preview: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface TraceModelCall {
+  provider: string;
+  model: string;
+  endpoint: string;
+  status_code: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: string;
+  duration_ms: number;
+  created_at: string;
+}
+
+export interface RunTrace {
+  run: RunSummary;
+  steps: TraceStep[];
+  tool_calls: TraceToolCall[];
+  model_calls: TraceModelCall[];
+  truncated: boolean;
+}
+
+export type ChatChannel = "telegram" | "slack";
+
+export interface IntegrationView {
+  id: string;
+  kind: string;
+  status: string;
+  external_id: string | null;
+  name: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelIdentity {
+  id: string;
+  org_id: string;
+  workspace_id: string;
+  agent_profile_id: string;
+  integration_id: string;
+  created_at: string;
+}
+
+export interface PairingCode {
+  code: string;
+  kind: "user" | "group";
+  expires_at: string;
+  bot_username: string | null;
+  link: string | null;
+  command: string;
+}
+
+/** The file name in a `Content-Disposition: attachment; filename="…"` header, else `fallback`. */
+export function attachmentName(header: string | null, fallback: string): string {
+  const match = header ? /filename="?([^";]+)"?/i.exec(header) : null;
+  const name = match?.[1]?.trim();
+  return name && !/[\\/]/.test(name) ? name : fallback;
+}
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -705,6 +938,117 @@ export class ApiClient {
     this.json<{ cancelled: number }>(`/orgs/${orgId}/jobs/${jobId}/cancel`, { method: "POST" });
   deleteJob = (orgId: string, jobId: string) =>
     this.json<null>(`/orgs/${orgId}/jobs/${jobId}`, { method: "DELETE" });
+  // -- M3.12 ------------------------------------------------------------------------------------
+  getMemory = (workspaceId: string, agentProfileId: string | null) =>
+    this.json<MemoryView>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/memory${query({ agent_profile_id: agentProfileId })}`,
+    );
+  listMemoryRevisions = (
+    workspaceId: string,
+    target: MemoryTarget,
+    agentProfileId: string | null,
+    limit = 20,
+  ) =>
+    this.json<MemoryRevision[]>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}/revisions${query({
+        agent_profile_id: agentProfileId,
+        limit,
+      })}`,
+    );
+  editMemory = (
+    workspaceId: string,
+    target: MemoryTarget,
+    entries: string[],
+    agentProfileId: string | null,
+    reason: string | null,
+  ) =>
+    this.json<MemoryWritten>(`/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}`, {
+      method: "PUT",
+      body: { entries, agent_profile_id: agentProfileId, reason },
+    });
+  revertMemory = (
+    workspaceId: string,
+    target: MemoryTarget,
+    seq: number,
+    agentProfileId: string | null,
+    reason: string | null,
+  ) =>
+    this.json<MemoryWritten>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}/revisions/${seq}/revert`,
+      { method: "POST", body: { agent_profile_id: agentProfileId, reason } },
+    );
+  listSkills = (workspaceId: string) =>
+    this.json<SkillCatalog>(`/workspaces/${encodeURIComponent(workspaceId)}/skills`);
+  getSkill = (workspaceId: string, name: string, scope: SkillScope | null = null) =>
+    this.json<SkillDetail>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}${query({ scope })}`,
+    );
+  writeSkill = (workspaceId: string, body: SkillWriteBody) =>
+    this.json<SkillWritten>(`/workspaces/${encodeURIComponent(workspaceId)}/skills`, {
+      method: "POST",
+      body,
+    });
+  listSkillVersions = (skillId: string) =>
+    this.json<SkillVersion[]>(`/skills/${encodeURIComponent(skillId)}/versions`);
+  getSkillVersion = (skillId: string, version: number) =>
+    this.json<SkillVersionDetail>(`/skills/${encodeURIComponent(skillId)}/versions/${version}`);
+  searchSessions = (orgId: string, q: string, workspaceId: string | null, limit = 10) =>
+    this.json<SearchHit[]>(
+      `/orgs/${encodeURIComponent(orgId)}/session-search${query({ q, workspace_id: workspaceId, limit })}`,
+    );
+  /** The export file of a session. The body is a file, not JSON. */
+  exportSession = async (id: string, format: ExportFormat): Promise<ExportFile> => {
+    const generation = this.tokens.generation;
+    const response = await this.raw(`/sessions/${id}/export${query({ format })}`, {}, generation);
+    if (!response.ok) {
+      const data: unknown = await response.json().catch(() => null);
+      this.assertCurrent(generation);
+      throw new ApiError(response.status, errorMessage(response.status, data));
+    }
+    const blob = await response.blob();
+    this.assertCurrent(generation);
+    const fallback = `session-${id.slice(0, 8)}.${format === "json" ? "json" : "md"}`;
+    return { name: attachmentName(response.headers.get("Content-Disposition"), fallback), blob };
+  };
+  listRuns = (sessionId: string, limit = 50) =>
+    this.json<RunSummary[]>(`/sessions/${sessionId}/runs${query({ limit })}`);
+  getRunTrace = (runId: string) => this.json<RunTrace>(`/runs/${encodeURIComponent(runId)}/trace`);
+  listIntegrations = (orgId: string) =>
+    this.json<IntegrationView[]>(`/orgs/${encodeURIComponent(orgId)}/integrations`);
+  /** Sends the bot token. It goes only to this call, never to the chat. */
+  connectTelegram = (orgId: string, botToken: string) =>
+    this.json<IntegrationView>(`/orgs/${encodeURIComponent(orgId)}/integrations/telegram`, {
+      method: "POST",
+      body: { bot_token: botToken },
+    });
+  disconnectIntegration = (orgId: string, kind: ChatChannel) =>
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/integrations/${kind}`, { method: "DELETE" });
+  listIdentities = (channel: ChatChannel) =>
+    this.json<ChannelIdentity[]>(`/channels/${channel}/identities`);
+  unlinkIdentity = (channel: ChatChannel, identityId: string) =>
+    this.json<null>(`/channels/${channel}/identities/${encodeURIComponent(identityId)}`, {
+      method: "DELETE",
+    });
+  createPairingCode = (
+    channel: ChatChannel,
+    workspaceId: string,
+    agentProfileId: string,
+    kind: "user" | "group" = "user",
+  ) =>
+    this.json<PairingCode>(`/channels/${channel}/pairing-codes`, {
+      method: "POST",
+      body: { workspace_id: workspaceId, agent_profile_id: agentProfileId, kind },
+    });
+}
+
+/** A query string (`?a=1&b=2`) of the values that are not `null`, else "". */
+export function query(values: Record<string, string | number | null | undefined>): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== null && value !== undefined) params.set(key, String(value));
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
 }
 
 /** The public config of the API (no sign-in needed). */

@@ -54,19 +54,29 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | --- | --- |
 | `/login` | Email and password, emailed sign-in link (PKCE), and a developer access-token box. |
 | `/` | New session: workspace, agent, audience, title. |
-| `/s/[sessionId]` | Chat with live streaming, approvals, questions, Stop, and `/compact`. |
+| `/s/[sessionId]` | Chat with live streaming, approvals, questions, Stop, and `/compact`. The header has Runs and the export buttons (Markdown and JSON). |
+| `/s/[sessionId]/runs` | The runs of the session with the token use and the cost. Each run opens its trace: steps, tool calls, and model calls. |
 | `/agents/[profileId]` | Agent settings. Read-only unless you are an admin of the org. |
 | `/tasks` | Task board of the current workspace: columns, new cards, status, assignee, and comments. |
+| `/connections` | The tools that the agents can use: catalog, connect, test, and remove. |
+| `/search` | Search the sessions that you can read, in the current workspace or in the whole org. |
+| `/memory` | Memory editor: agent notes, your profile, and workspace notes, with the revision history and revert. |
+| `/skills` | Skill editor: list, new skill, `SKILL.md`, files, versions, and archive. Built-in skills are read-only. |
+| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot), linked chat accounts with link codes, and the agents. |
 
 ## Layout
 
 ```
 app/          routes, global CSS and design tokens (tokens.css)
-components/   UI: shell, sidebar, chat, composer, cards, agent settings, providers
+components/   UI: shell, sidebar, chat, composer, cards, agent settings, providers,
+              memory editor, skill editor, session search, run traces, settings,
+              the shared page frame (Page.module.css, PageHeader)
 lib/          framework-free logic with unit tests:
               api (client with one refresh and retry on 401), auth (Supabase, PKCE),
               sse (parser), stream (reconnecting event stream), chat (live state),
-              profile (settings draft and validation), time, config
+              profile (settings draft and validation), memory (entries and caps),
+              skills (name and path checks), history (cost, tokens, trace steps, file
+              download), connections, tasks, time, config
 ```
 
 Tokens: all colours, spacing and type come from CSS custom properties in `app/tokens.css`. Light and dark follow `prefers-color-scheme`.
@@ -75,4 +85,4 @@ Auth: tokens live in `sessionStorage` (cleared when the tab closes). A 401 trigg
 
 ## Not in this version
 
-Telegram and Slack linking, memory, skills, search, traces and connections screens. Tool calls that finished before the page was opened are not shown in the chat; only new ones stream in.
+A Slack connect form (the settings page shows only the Slack status), per-skill settings, and a skill revert (load an old version into the editor and save it). Tool calls that finished before the page was opened are not shown in the chat; only new ones stream in.
