@@ -11,7 +11,7 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Protocol
 
 from sama.gate.hardline import hardline_problem
 
@@ -32,9 +32,18 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "skills": frozenset({"skills_list", "skill_view", "skill_manage"}),
     "sessions": frozenset({"session_search", "session_read"}),
     "media": frozenset({"vision_analyze"}),
+    "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
+
+TOOL_SEARCH: Final = "tool_search"
+TOOL_DESCRIBE: Final = "tool_describe"
+TOOL_CALL: Final = "tool_call"
+"""``tool_call`` runs a deferred tool of the sama tool server (Section 10.3). The gate does not
+judge ``tool_call``. It judges the tool that ``tool_call`` names, with the arguments that it
+gives, in the same way as a direct call (``effective_call``)."""
+META_TOOLS: Final = frozenset({TOOL_SEARCH, TOOL_DESCRIBE, TOOL_CALL})
 
 TOOL_LOADERS: Final = frozenset({"ToolSearch"})
 """Native Claude tools that only load the schema of another tool of the run. Every run has
@@ -61,6 +70,8 @@ DEFAULT_ALLOW: Final = frozenset(
         "session_search",
         "session_read",
         "vision_analyze",
+        "tool_search",
+        "tool_describe",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
@@ -126,6 +137,14 @@ class Recorded:
     arguments_digest: str
 
 
+class ToolsetSource(Protocol):
+    """More toolsets than the fixed table ``TOOLSETS``, for example the deferred tools that
+    products and connectors register (Section 10.3). The answer can change while the process
+    runs, so a new tool is usable at once."""
+
+    def toolsets(self) -> Mapping[str, frozenset[str]]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class GateContext:
     toolsets: frozenset[str]
@@ -141,6 +160,8 @@ class GateContext:
     revoked: str | None = None
     """Why the run has no authority now (Section 5.1), or ``None``. See
     ``sama.tenancy.authority``."""
+    catalog: Mapping[str, frozenset[str]] = field(default_factory=lambda: TOOLSETS)
+    """The tools of each toolset. The default is the fixed table."""
 
 
 def canonical_name(tool_name: str) -> str:
@@ -150,11 +171,44 @@ def canonical_name(tool_name: str) -> str:
     return tool_name
 
 
-def tools_of(toolsets: Iterable[str]) -> frozenset[str]:
+def tools_of(
+    toolsets: Iterable[str], catalog: Mapping[str, frozenset[str]] = TOOLSETS
+) -> frozenset[str]:
     tools: set[str] = set()
     for name in toolsets:
-        tools |= TOOLSETS.get(name, frozenset())
+        tools |= catalog.get(name, frozenset())
     return frozenset(tools)
+
+
+def merged_catalog(extra: Mapping[str, frozenset[str]]) -> Mapping[str, frozenset[str]]:
+    """The fixed table and the extra toolsets. A toolset of both has the tools of both."""
+    merged = dict(TOOLSETS)
+    for name, tools in extra.items():
+        merged[name] = merged.get(name, frozenset()) | tools
+    return merged
+
+
+def wrapped_call(arguments: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """The tool name and the arguments that a ``tool_call`` gives, or ``None`` if the
+    arguments are not valid."""
+    name = arguments.get("name")
+    inner = arguments.get("arguments", {})
+    if inner is None:
+        inner = {}
+    if not isinstance(name, str) or not name or not isinstance(inner, Mapping):
+        return None
+    return canonical_name(name), {str(key): value for key, value in inner.items()}
+
+
+def effective_call(tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
+    """The call that the gate records and that a human approves. For ``tool_call`` it is the
+    deferred tool and its arguments: a card shows the real tool, a policy rule for the tool
+    holds, and a ticket matches the tool and not the wrapper. For another tool, and for a
+    ``tool_call`` with arguments that are not valid, it is the call itself."""
+    name = canonical_name(tool_name)
+    if name == TOOL_CALL and (wrapped := wrapped_call(arguments)) is not None:
+        return wrapped
+    return name, arguments
 
 
 def effective_toolsets(
@@ -187,6 +241,8 @@ def arguments_digest(arguments: Mapping[str, Any]) -> str:
 def decide(context: GateContext, tool_name: str, arguments: Mapping[str, Any]) -> Verdict:
     """The verdict for one call. The steps run in the order of Section 16.1."""
     name = canonical_name(tool_name)
+    if name == TOOL_CALL:
+        return _decide_wrapped(context, arguments)
     early = _authority_and_toolset(context, name)
     if early is not None:
         return early
@@ -194,6 +250,28 @@ def decide(context: GateContext, tool_name: str, arguments: Mapping[str, Any]) -
     if problem is not None:
         return Verdict("deny", GateStep.HARDLINE, f"the command is on the hardline list: {problem}")
     return _after_hardline(context, name, arguments_digest(arguments))
+
+
+def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdict:
+    """``tool_call`` has no verdict of its own. The run needs the toolset of ``tool_call``,
+    and no ``deny`` rule can name ``tool_call``. Then the named tool gets the full gate with
+    its own arguments: its toolset, the hardline list, its policy, and the unattended rule.
+    So a deferred call can never get more than a direct call of the same tool."""
+    early = _authority_and_toolset(context, TOOL_CALL)
+    if early is not None:
+        return early
+    own = policy_verdict(context.rules, TOOL_CALL, shared=context.shared)
+    if own.action == "deny":
+        return own
+    wrapped = wrapped_call(arguments)
+    if wrapped is None:
+        return Verdict(
+            "deny", GateStep.TOOLSET, "tool_call needs the name of a tool and an arguments object"
+        )
+    name, inner = wrapped
+    if name in META_TOOLS or name in TOOL_LOADERS:
+        return Verdict("deny", GateStep.TOOLSET, f"{name} cannot be called through tool_call")
+    return decide(context, name, inner)
 
 
 def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdict:
@@ -207,7 +285,7 @@ def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdic
 def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
     if context.revoked is not None:
         return Verdict("deny", GateStep.AUTHORITY, context.revoked)
-    if name not in TOOL_LOADERS and name not in tools_of(context.toolsets):
+    if name not in TOOL_LOADERS and name not in tools_of(context.toolsets, context.catalog):
         return Verdict("deny", GateStep.TOOLSET, f"{name} is not in the toolsets of this run")
     return None
 

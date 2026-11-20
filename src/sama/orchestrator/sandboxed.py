@@ -98,6 +98,8 @@ CAPABILITIES: Final[Mapping[RuntimeKind, Capabilities]] = {
         native_file_checkpoints=True,
         resumable_sessions=True,
         mcp_client=True,
+        manual_compaction=True,
+        compaction_archive=True,
     ),
     RuntimeKind.FAKE: Capabilities(
         streaming=True,
@@ -107,6 +109,8 @@ CAPABILITIES: Final[Mapping[RuntimeKind, Capabilities]] = {
         native_file_checkpoints=False,
         resumable_sessions=True,
         mcp_client=False,
+        manual_compaction=True,
+        compaction_archive=False,
     ),
 }
 """The capabilities of the adapters that the runner can start. A test checks that they are
@@ -157,11 +161,14 @@ class SandboxSettings:
     allowlist of every session sandbox: E2B blocks all other hosts, and an empty list blocks
     all of them. ``open_egress`` turns the block off, for development only. ``model_url`` is
     the model proxy (M1.7). ``gate_url`` is the gate endpoint of the control plane (M1.9):
-    with it, the runner asks the control plane for each tool call."""
+    with it, the runner asks the control plane for each tool call. ``archive_url`` is the
+    archive endpoint (M2.6): with it, the runner gives the transcript to the control plane
+    before a compaction."""
 
     template: str
     model_url: str | None = None
     gate_url: str | None = None
+    archive_url: str | None = None
     allow_out: tuple[str, ...] = ()
     open_egress: bool = False
     runner_argv: tuple[str, ...] = RUNNER_ARGV
@@ -239,6 +246,7 @@ class SandboxedRuntime:
             run=request,
             gate=self._gate,
             gate_url=self._settings.gate_url,
+            archive_url=self._settings.archive_url,
             fake_scripts=scripts,
         )
         async with contextlib.aclosing(self._invoke(job, request.scope, request.budget)) as stream:
@@ -263,7 +271,11 @@ class SandboxedRuntime:
         self._used_approvals.add(request.approval_id)
         self._paused.discard(run_id)
         job = RunnerJob(
-            op="resume", resume=request, gate=self._gate, gate_url=self._settings.gate_url
+            op="resume",
+            resume=request,
+            gate=self._gate,
+            gate_url=self._settings.gate_url,
+            archive_url=self._settings.archive_url,
         )
         # The usage at the pause is in the opaque runtime state. Only the runner reads it, so a
         # failure before the runner starts reports zero usage.

@@ -316,3 +316,44 @@ def test_any_runtime_state_bytes_round_trip_through_json() -> None:
 def test_default_json_fields_are_read_only(value: Any) -> None:
     with pytest.raises(TypeError):
         value["x"] = 1
+
+
+# -- compaction --------------------------------------------------------------------------------
+
+
+def test_a_compact_request_has_a_focus_with_a_limit() -> None:
+    from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS, CompactRequest, RunRequest
+
+    assert CompactRequest().focus == ""
+    with pytest.raises(ValidationError):
+        CompactRequest(focus="x" * (MAX_COMPACT_FOCUS_CHARS + 1))
+    request = RunRequest(
+        scope=make_scope(), input="", config=make_config(), compact=CompactRequest(focus="a")
+    )
+    assert request.compact is not None
+    assert RunRequest(scope=make_scope(), input="hi", config=make_config()).compact is None
+
+
+def test_the_compaction_capabilities_are_off_by_default() -> None:
+    from sama.runtime.contract import Capabilities
+
+    caps = Capabilities(
+        streaming=True,
+        native_subagents=False,
+        native_compaction=False,
+        native_skills=False,
+        native_file_checkpoints=False,
+        resumable_sessions=False,
+        mcp_client=False,
+    )
+    assert not caps.manual_compaction
+    assert not caps.compaction_archive
+
+
+def test_a_compacted_event_says_who_started_it() -> None:
+    from sama.runtime.contract import Compacted
+
+    assert Compacted(tokens_before=2, tokens_after=1).trigger == "auto"
+    assert Compacted(tokens_before=2, tokens_after=1, trigger="manual").trigger == "manual"
+    with pytest.raises(ValidationError):
+        Compacted(tokens_before=2, tokens_after=1, trigger="other")  # type: ignore[arg-type]

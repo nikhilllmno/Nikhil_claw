@@ -50,13 +50,18 @@ from sama.gate.decide import (
     PolicyRule,
     Recorded,
     RuleLevel,
+    ToolsetSource,
     Verdict,
     arguments_digest,
     canonical_name,
     decide,
     decide_recorded,
+    effective_call,
     effective_toolsets,
     json_default,
+    merged_catalog,
+    policy_verdict,
+    tools_of,
 )
 from sama.review.policy import REVIEW_TOOLSETS
 from sama.tenancy.access import load_grants
@@ -145,10 +150,14 @@ class GateService:
         *,
         approval_ttl: timedelta = APPROVAL_TTL,
         clock: Callable[[], datetime] = _utcnow,
+        extra_toolsets: ToolsetSource | None = None,
     ) -> None:
+        """``extra_toolsets`` adds toolsets to the fixed table, for example the deferred tools
+        of the tool server (Section 10.3). It is read at each check."""
         if approval_ttl <= timedelta(0):
             raise ValueError("approval_ttl must be more than 0")
         self._engine = engine
+        self._extra_toolsets = extra_toolsets
         self._ttl = approval_ttl
         self._clock = clock
 
@@ -164,8 +173,10 @@ class GateService:
         """The verdict for one tool call id. Each step is recorded."""
         if not call_id:
             return Verdict("deny", GateStep.TOOLSET, "the tool call has no id")
-        name = canonical_name(tool_name)
-        digest = arguments_digest(arguments)
+        # A ``tool_call`` is recorded as the deferred tool that it names (Section 16.1).
+        original = arguments
+        name, effective = effective_call(tool_name, original)
+        digest = arguments_digest(effective)
         ref = _ref_of(claims)
         async with self._engine.begin() as connection:
             run = None if ref is None else await self._load(connection, ref, claims, call_id)
@@ -178,8 +189,8 @@ class GateService:
                     connection, run.ref, "tool_gate.verdict", call_id, _details(name, verdict)
                 )
             else:
-                verdict = decide(run.context, name, arguments)
-                await self._record(connection, run, call_id, name, arguments, digest, verdict)
+                verdict = decide(run.context, tool_name, original)
+                await self._record(connection, run, call_id, name, effective, digest, verdict)
         log.info(
             "gate org=%s run=%s call=%s tool=%s action=%s step=%s",
             claims.org_id,
@@ -201,15 +212,15 @@ class GateService:
         tool and arguments that ``reconfirm`` allowed and no server call used. The ticket is
         used up. Without a ticket, ``ask`` becomes ``deny``, so a process in the sandbox cannot
         call an ``ask`` tool with the run token alone."""
-        name = canonical_name(tool_name)
+        name, effective = effective_call(tool_name, arguments)
         ref = _ref_of(claims)
         async with self._engine.begin() as connection:
             run = None if ref is None else await self._load(connection, ref, claims, None)
             if run is None:
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
-            verdict = decide(run.context, name, arguments)
+            verdict = decide(run.context, tool_name, arguments)
             if verdict.action == "ask":
-                digest = arguments_digest(arguments)
+                digest = arguments_digest(effective)
                 if await self._take_ticket(connection, run.ref, name, digest):
                     verdict = Verdict("allow", GateStep.RECORDED, "the call has an approved ticket")
                 else:
@@ -221,6 +232,23 @@ class GateService:
                     connection, run.ref, "tool_gate.screen", None, _details(name, verdict)
                 )
         return verdict
+
+    async def visible_tools(self, claims: RunTokenClaims) -> frozenset[str]:
+        """The tools that this run can use now: the tools of its toolsets that no ``deny`` rule
+        blocks. It is empty for a run that has no authority. ``tool_search`` shows only these
+        tools, so a run does not learn the names of tools that it cannot call. A tool that is
+        visible can still get ``ask`` when the run calls it."""
+        ref = _ref_of(claims)
+        async with self._engine.begin() as connection:
+            run = None if ref is None else await self._load(connection, ref, claims, None)
+        if run is None or run.context.revoked is not None:
+            return frozenset()
+        context = run.context
+        return frozenset(
+            name
+            for name in tools_of(context.toolsets, context.catalog)
+            if policy_verdict(context.rules, name, shared=context.shared).action != "deny"
+        )
 
     async def reconfirm(self, *, org_id: uuid.UUID, run_id: uuid.UUID, call_id: str) -> Verdict:
         """The verdict again for an approved call, before the run resumes (Section 16.1). The
@@ -411,6 +439,9 @@ class GateService:
             shared=row.audience == "shared" and row.kind != "review",
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
             revoked=await self._revoked(connection, org_id, run_id),
+            catalog=merged_catalog(
+                self._extra_toolsets.toolsets() if self._extra_toolsets is not None else {}
+            ),
         )
         call = None
         if call_id:

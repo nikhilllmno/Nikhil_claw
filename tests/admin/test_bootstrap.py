@@ -54,7 +54,18 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
     assert profile == (
         None,
         "claude-sonnet-5-5",
-        ["core", "todo", "web", "clarify", "github", "memory", "skills", "sessions", "media"],
+        [
+            "core",
+            "todo",
+            "web",
+            "clarify",
+            "github",
+            "memory",
+            "skills",
+            "sessions",
+            "media",
+            "tool_search",
+        ],
         list(DEFAULT_GROUP_TOOLSETS),
     )
     assert {"core", "github", "skills"}.isdisjoint(profile[3])

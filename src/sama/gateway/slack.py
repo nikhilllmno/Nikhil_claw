@@ -36,10 +36,13 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.context import PinStore
 from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBinding
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
+    COMPACTING,
+    PIN_COMMANDS,
     Bound,
     FollowSettings,
     KeyedLocks,
@@ -50,6 +53,7 @@ from sama.gateway.sessions import (
     find_session,
     follow_run,
     new_session,
+    pin_reply,
     send_ending,
     stop_runs,
     wait_for_tasks,
@@ -94,6 +98,9 @@ HELP: Final = (
     "Send a direct message to the sama app, or mention it in a linked channel.\n"
     "/sama new - start a new session (direct messages)\n"
     "/sama stop - stop the open runs of this conversation\n"
+    "/sama compact [focus] - make the context shorter (direct messages)\n"
+    "/sama pin TEXT - keep a text in the context. /sama pins lists the pins. /sama unpin NUMBER"
+    " removes one (direct messages)\n"
     "/sama pair CODE - link your account, or link this channel with a group code\n"
     "/sama <skill> <request> - use a skill (direct messages). In a channel, mention the app"
     " and write /<skill> <request>\n"
@@ -299,6 +306,7 @@ class SlackGateway:
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
         seen: SeenEvents | None = None,
+        pins: PinStore | None = None,
     ) -> None:
         """``lockout``, ``followers``, and ``seen`` can be shared by all gateways of the process,
         so that the limits and the repeat check hold for the whole process."""
@@ -309,6 +317,7 @@ class SlackGateway:
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
         self._skills = skills
+        self._pins = pins or PinStore(engine)
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -620,7 +629,7 @@ class SlackGateway:
             identity = await self._identity(sender)
             if name == "pair" and rest:
                 return await self._pair(sender, channel, rest, identity)
-            if name not in ("new", "stop"):
+            if name not in ("new", "stop", "compact", *PIN_COMMANDS):
                 if name not in ("help", "pair"):
                     return await self._skill(sender, channel, identity, name, rest)
                 return HELP
@@ -628,6 +637,10 @@ class SlackGateway:
                 return PAIR_PROMPT if channel.startswith("D") else LINK_FIRST
             if name == "new":
                 return await self._new(sender, channel, identity)
+            if name == "compact":
+                return await self._compact(sender, channel, identity, rest)
+            if name in PIN_COMMANDS:
+                return await self._pin(sender, channel, identity, name, rest)
             return await self._stop(sender, channel, identity)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
@@ -648,6 +661,57 @@ class SlackGateway:
             profile = target.agent_profile_id if current is None else current.agent_profile_id
             await new_session(self._engine, CHANNEL, self._key(place), target, profile)
         return "A new session started."
+
+    async def _compact(self, sender: str, channel: str, identity: Any, focus: str) -> str:
+        """``/sama compact`` in a direct message: the busy rules of a message apply (Section
+        6.3). The answer of the compaction comes as a message in the conversation."""
+        if not channel.startswith("D"):
+            return "Compaction works in a direct message with the sama app."
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        if len(self._followers) >= self._settings.max_followers:
+            log.warning("too many runs to follow; channel=%s must try again", channel)
+            return BUSY
+        holder = object()
+        self._followers.add(holder)
+        try:
+            current = await self._session(place, target, grants, create=False)
+            if current is None:
+                self._followers.discard(holder)
+                return "This conversation has no session yet."
+            run_id = await self._queue.enqueue_compact(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                user_id=target.user_id,
+                focus=focus,
+            )
+        except QueueError as error:
+            self._followers.discard(holder)
+            return str(error)
+        except BaseException:
+            self._followers.discard(holder)
+            raise
+        self._spawn(self._follow(place, target, run_id, holder))
+        return COMPACTING
+
+    async def _pin(self, sender: str, channel: str, identity: Any, name: str, rest: str) -> str:
+        """``/sama pin``, ``pins``, and ``unpin`` in a direct message."""
+        if not channel.startswith("D"):
+            return "Pins work in a direct message with the sama app."
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        current = await self._session(place, target, grants, create=False)
+        return await pin_reply(
+            self._pins, target, None if current is None else current.session_id, name, rest
+        )
 
     async def _stop(self, sender: str, channel: str, identity: Any) -> str:
         """Stops the open runs of the direct message, or of all threads of the channel."""

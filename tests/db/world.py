@@ -30,6 +30,7 @@ from sama.db.models import (
     AuditEntry,
     ChannelGroup,
     ChannelIdentity,
+    ContextPin,
     Integration,
     Membership,
     Memory,
@@ -44,6 +45,7 @@ from sama.db.models import (
     RunEvent,
     Session,
     SessionBinding,
+    SessionCompaction,
     SessionTodo,
     StoredContextFile,
     ToolCall,
@@ -255,6 +257,19 @@ def plan(
             session_id=ids[session],
             items=[{"id": "1", "content": f"todo of {session}", "status": "pending"}],
             run_id=run_id,
+        )
+        add(
+            SessionCompaction,
+            org_id=org_id,
+            session_id=ids[session],
+            run_id=run_id,
+            trigger="auto",
+        )
+        add(
+            ContextPin,
+            org_id=org_id,
+            session_id=ids[session],
+            text=f"pin of {session}",
         )
     policies: tuple[tuple[str, str, str | None], ...] = (
         ("rule:org-a", "org-a", None),

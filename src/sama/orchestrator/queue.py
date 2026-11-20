@@ -56,7 +56,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.orm import aliased
 
+from sama.context.compaction import record_compacted
+from sama.context.pins import all_pin_texts, compact_focus, pin_block, pins_for_input
 from sama.db.models import (
+    ENDED_RUN_STATUSES,
     AgentProfile,
     Approval,
     Attachment,
@@ -74,7 +77,12 @@ from sama.orchestrator.limits import QueueLimits
 from sama.review import policy as review_policy
 from sama.review.transcript import build_transcript
 from sama.review.trigger import after_completed_run
-from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
+from sama.runtime.contract import (
+    MAX_COMPACT_FOCUS_CHARS,
+    ApprovalDecision,
+    FailureCode,
+    Usage,
+)
 from sama.vault.redact import default_redactor, redact
 
 DEFAULT_LEASE: Final = timedelta(seconds=30)
@@ -156,6 +164,9 @@ class ClaimedRun:
     kind: str = "chat"
     """``review`` for a background review run (Section 9.4). Its ``input`` is the new part of
     the transcript, ``model`` is the cheap review model, and it has no runtime state."""
+    compact: bool = False
+    """True for a ``/compact`` run (Section 6.3). Its ``input`` is the focus of the summary,
+    not a user message, and the run writes no message."""
 
 
 def _encode_state(state: bytes | None) -> str | None:
@@ -236,6 +247,7 @@ class RunQueue:
         (``QueueLimits``).
         """
         async with self._engine.begin() as connection:
+            await self._rate_lock(connection, org_id)  # the lock order of all enqueues
             session = (
                 await connection.execute(
                     select(
@@ -304,12 +316,104 @@ class RunQueue:
                 )
         return run_id
 
+    async def enqueue_compact(
+        self,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID | None,
+        focus: str = "",
+    ) -> uuid.UUID:
+        """Queues a ``/compact`` run for a session and returns the run id (Section 6.3).
+
+        The run asks the runtime to compact the context of the session. It does not answer a
+        message and it writes no message. The busy rule: the session must have no open run
+        (queued, running, or paused). A paused run waits for a person, and a compaction
+        must not change the context under it. The session must also have a completed run
+        with a runtime state, or there is nothing to compact.
+
+        Raises ``QueueError`` with a message for the person, and ``RateLimitedError`` when
+        the user or the org is over its message rate. A compact run uses a model call, so it
+        counts as a message.
+        """
+        async with self._engine.begin() as connection:
+            # The lock order of all enqueues: the org rate lock first, then the session row.
+            # A run insert needs a share lock on the session row. If this call took the row
+            # first and the rate lock second, a message in the other order would deadlock.
+            await self._rate_lock(connection, org_id)
+            session = (
+                await connection.execute(
+                    select(
+                        Session.status,
+                        Session.agent_profile_id,
+                        func.coalesce(
+                            Session.run_config["runtime"].astext, AgentProfile.runtime
+                        ).label("runtime"),
+                        AgentProfile.budget,
+                    )
+                    .join(
+                        AgentProfile,
+                        and_(
+                            AgentProfile.org_id == Session.org_id,
+                            AgentProfile.id == Session.agent_profile_id,
+                        ),
+                    )
+                    .where(Session.org_id == org_id, Session.id == session_id)
+                    .with_for_update(of=Session)
+                )
+            ).one_or_none()
+            if session is None:
+                raise QueueError("the session does not exist")
+            if session.status != "active":
+                raise QueueError("the session is not active")
+            busy = (
+                await connection.execute(
+                    select(Run.id)
+                    .where(
+                        Run.org_id == org_id,
+                        Run.session_id == session_id,
+                        Run.status.not_in(ENDED_RUN_STATUSES),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if busy is not None:
+                raise QueueError(
+                    "The session is busy: a run is open. Wait until it ends or stop it, then"
+                    " compact again."
+                )
+            if await self._session_state(connection, org_id, session_id, session.runtime) is None:
+                raise QueueError("There is nothing to compact yet.")
+            await self._check_rate(connection, org_id, user_id)
+            run_id = uuid.uuid4()
+            await connection.execute(
+                insert(Run).values(
+                    id=run_id,
+                    org_id=org_id,
+                    session_id=session_id,
+                    agent_profile_id=session.agent_profile_id,
+                    triggered_by_user_id=user_id,
+                    runtime=session.runtime,
+                    budget=session.budget,
+                    compact=True,
+                    compact_focus=redact(focus).strip()[:MAX_COMPACT_FOCUS_CHARS],
+                )
+            )
+        return run_id
+
+    @staticmethod
+    async def _rate_lock(connection: AsyncConnection, org_id: uuid.UUID) -> None:
+        """The lock that puts the enqueues of one org in a sequence. It is the first lock of
+        every enqueue, before any lock of a session row (the rows of a run insert take a share
+        lock on the session). A transaction can take it again."""
+        await connection.execute(_lock("sama.queue.rate", org_id))
+
     async def _check_rate(
         self, connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID | None
     ) -> None:
-        """Counts the runs of the last 60 seconds. The lock puts the enqueues of one org in a
-        sequence, so two messages at the same time cannot both take the last place."""
-        await connection.execute(_lock("sama.queue.rate", org_id))
+        """Counts the runs of the last 60 seconds. The rate lock puts the enqueues of one org
+        in a sequence, so two messages at the same time cannot both take the last place."""
+        await self._rate_lock(connection, org_id)
         limits = QueueLimits.from_json(
             (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
         )
@@ -559,6 +663,8 @@ class RunQueue:
                     Run.resume_reason,
                     Run.attempts,
                     Run.kind,
+                    Run.compact,
+                    Run.compact_focus,
                     Run.review_from_seq,
                     Run.review_to_seq,
                     Session.workspace_id,
@@ -604,9 +710,11 @@ class RunQueue:
                 row.pending_approval_id, ApprovalDecision(row.resume_decision), row.resume_reason
             )
             state = _decode_state(row.runtime_state)
+            message = str((text or {}).get("text", ""))  # not used: a resume has no input
         else:
             resume = None
             state = await self._session_state(connection, row.org_id, row.session_id, row.runtime)
+            message = await self._input(connection, row, run_id, text)
         return ClaimedRun(
             org_id=row.org_id,
             workspace_id=row.workspace_id,
@@ -620,12 +728,28 @@ class RunQueue:
             model=row.model,
             soul=row.soul,
             budget=row.budget,
-            input=str((text or {}).get("text", "")),
+            input=message,
             runtime_state=state,
             resume=resume,
             attempt=row.attempts,
             next_seq=int(next_seq),
+            compact=bool(row.compact),
         )
+
+    @staticmethod
+    async def _input(
+        connection: AsyncConnection, row: Any, run_id: uuid.UUID, text: Mapping[str, Any] | None
+    ) -> str:
+        """The input of a run that starts: the focus of a compact run, or the user message
+        with the pins in front of it (Section 6.3)."""
+        if row.compact:
+            pins = await all_pin_texts(connection, row.org_id, row.session_id)
+            return compact_focus(row.compact_focus or "", pins)
+        # The pins that no run got, or that a compaction made the runtime forget, go in front
+        # of the message. Only the transcript of the runtime has them: the stored message is
+        # the text of the person. A run that resumes after an approval gets no pins here.
+        pins = await pins_for_input(connection, row.org_id, row.session_id, run_id)
+        return pin_block(pins) + str((text or {}).get("text", ""))
 
     async def _claimed_review(
         self, connection: AsyncConnection, run_id: uuid.UUID, row: Any
@@ -670,7 +794,10 @@ class RunQueue:
     async def _session_state(
         self, connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, runtime: str
     ) -> bytes | None:
-        """The runtime state at the end of the last completed run of the session."""
+        """The runtime state that the next run of the session starts from: the state of the
+        newest chat run that saved one. A completed run saves its state. A failed or cancelled
+        run saves one only to keep a count (``RunFailed.runtime_state``), and it keeps the
+        conversation of the last completed run."""
         state = (
             await connection.execute(
                 select(Run.runtime_state)
@@ -679,7 +806,7 @@ class RunQueue:
                     Run.session_id == session_id,
                     Run.runtime == runtime,
                     Run.kind == "chat",
-                    Run.status == "completed",
+                    Run.status.in_(("completed", "failed", "cancelled")),
                     Run.runtime_state.is_not(None),
                 )
                 .order_by(Run.finished_at.desc())
@@ -749,6 +876,17 @@ class RunQueue:
                     for seq, kind, payload in events
                 ],
             )
+            # A compaction is a record of the session, and it is stored with its event.
+            for _seq, kind, payload in events:
+                if kind == "compacted":
+                    await record_compacted(
+                        connection,
+                        org_id=run.org_id,
+                        workspace_id=run.workspace_id,
+                        session_id=run.session_id,
+                        run_id=run.run_id,
+                        payload=payload,
+                    )
         return True
 
     async def complete(
@@ -771,8 +909,9 @@ class RunQueue:
                 usage=usage,
                 runtime_state=_encode_state(runtime_state),
             )
-            # A review run writes no message: nobody reads its reply (Section 9.4).
-            if ended and run.kind == "chat":
+            # A review run writes no message: nobody reads its reply (Section 9.4). A compact
+            # run answers nobody, and it is no user turn.
+            if ended and run.kind == "chat" and not run.compact:
                 await connection.execute(
                     insert(Message).values(
                         org_id=run.org_id,
@@ -787,9 +926,20 @@ class RunQueue:
             return ended
 
     async def fail(
-        self, run: ClaimedRun, owner: str, *, code: FailureCode, message: str, usage: Usage
+        self,
+        run: ClaimedRun,
+        owner: str,
+        *,
+        code: FailureCode,
+        message: str,
+        usage: Usage,
+        runtime_state: bytes | None = None,
     ) -> bool:
-        """Ends the run as ``failed``, or as ``cancelled`` for the code ``cancelled``."""
+        """Ends the run as ``failed``, or as ``cancelled`` for the code ``cancelled``.
+
+        ``runtime_state`` is the state that the next run of the session starts from (see
+        ``RunFailed.runtime_state``). The runtime sets it only to keep a count that the failure
+        would lose, so the next run never resumes the failed conversation."""
         async with self._engine.begin() as connection:
             return await self._end(
                 connection,
@@ -799,6 +949,7 @@ class RunQueue:
                 usage=usage,
                 failure_code=code.value,
                 failure_message=redact(message),
+                runtime_state=_encode_state(runtime_state),
             )
 
     async def pause(

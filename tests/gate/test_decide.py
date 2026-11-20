@@ -522,3 +522,141 @@ def test_an_approval_of_a_shared_memory_write_allows_the_call() -> None:
     recorded = Recorded("approved", "mcp__sama__memory", arguments_digest(args))
     shared = context(toolsets=frozenset({"memory"}), shared=True, recorded=recorded)
     assert decide(shared, "mcp__sama__memory", args).action == "allow"
+
+
+# -- deferred tools: tool_call goes through the same gate (Section 10.3) ----------------------
+
+DEFERRED = {"mail": frozenset({"mail_send", "mail_read"}), "tool_search": frozenset({"tool_call"})}
+
+
+def deferred_context(**kwargs: Any) -> GateContext:
+    from sama.gate.decide import merged_catalog
+
+    values: dict[str, Any] = {
+        "toolsets": frozenset({"tool_search", "mail"}),
+        "catalog": merged_catalog(DEFERRED),
+    }
+    values.update(kwargs)
+    return GateContext(**values)
+
+
+def wrapped(name: str, **arguments: Any) -> dict[str, Any]:
+    return {"name": name, "arguments": arguments}
+
+
+def test_a_deferred_tool_is_in_the_toolset_that_a_source_gives() -> None:
+    from sama.gate.decide import merged_catalog
+
+    catalog = merged_catalog(DEFERRED)
+    assert "mail_send" in tools_of({"mail"}, catalog)
+    assert "mail_send" not in tools_of({"mail"})
+    # A toolset of both tables has the tools of both.
+    assert {"tool_search", "tool_describe", "tool_call"} <= tools_of({"tool_search"}, catalog)
+
+
+def test_the_search_tools_are_in_the_default_profile_and_allowed() -> None:
+    assert "tool_search" in DEFAULT_TOOLSETS
+    for tool in ("tool_search", "tool_describe"):
+        verdict = decide(deferred_context(), f"mcp__sama__{tool}", {})
+        assert verdict.action == "allow"
+
+
+def test_tool_call_gives_the_verdict_of_the_tool_that_it_names() -> None:
+    read = decide(
+        deferred_context(rules=(rule("mail_read", "allow"),)),
+        "mcp__sama__tool_call",
+        wrapped("mail_read"),
+    )
+    assert read.action == "allow"
+    # The same call with no rule has no default allow: it asks, like a direct call.
+    direct = decide(deferred_context(), "mcp__sama__mail_send", {"to": "a@b.c"})
+    through = decide(deferred_context(), "mcp__sama__tool_call", wrapped("mail_send", to="a@b.c"))
+    assert (through.action, through.step) == (direct.action, direct.step)
+    assert through.action == "ask"
+
+
+def test_a_deny_rule_for_the_tool_stops_the_deferred_call() -> None:
+    context_ = deferred_context(rules=(rule("mail_send", "deny"),))
+    verdict = decide(context_, "mcp__sama__tool_call", wrapped("mail_send"))
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+
+
+def test_an_allow_rule_for_tool_call_does_not_open_a_denied_tool() -> None:
+    context_ = deferred_context(rules=(rule("tool_call", "allow"), rule("mail_send", "deny")))
+    assert decide(context_, "tool_call", wrapped("mail_send")).action == "deny"
+
+
+def test_a_deny_rule_for_tool_call_stops_every_deferred_call() -> None:
+    context_ = deferred_context(rules=(rule("tool_call", "deny"), rule("mail_read", "allow")))
+    verdict = decide(context_, "tool_call", wrapped("mail_read"))
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+
+
+def test_the_toolset_of_the_tool_is_needed_not_only_the_one_of_tool_call() -> None:
+    context_ = deferred_context(toolsets=frozenset({"tool_search"}))
+    verdict = decide(context_, "tool_call", wrapped("mail_read"))
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+
+
+def test_tool_call_needs_its_own_toolset() -> None:
+    context_ = deferred_context(toolsets=frozenset({"mail"}))
+    verdict = decide(context_, "tool_call", wrapped("mail_read"))
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+
+
+def test_tool_call_cannot_reach_a_tool_of_no_toolset() -> None:
+    for name in ("Bash", "mcp__other__send", "unknown_tool"):
+        verdict = decide(deferred_context(), "tool_call", wrapped(name))
+        assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET), name
+
+
+@pytest.mark.parametrize("name", ["tool_call", "tool_search", "tool_describe", "ToolSearch"])
+def test_tool_call_cannot_call_a_meta_tool(name: str) -> None:
+    verdict = decide(deferred_context(), "tool_call", wrapped(name))
+    assert verdict.action == "deny"
+    assert "cannot be called" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{}, {"name": ""}, {"name": 5}, {"name": "mail_read", "arguments": "x"}, {"arguments": {}}],
+)
+def test_tool_call_with_bad_arguments_is_denied(arguments: dict[str, Any]) -> None:
+    assert decide(deferred_context(), "tool_call", arguments).action == "deny"
+
+
+def test_the_sama_prefix_of_the_inner_name_does_not_hide_the_tool() -> None:
+    verdict = decide(deferred_context(), "tool_call", wrapped("mcp__sama__mail_send"))
+    assert verdict.action == "ask"
+
+
+def test_a_revoked_run_cannot_call_a_deferred_tool() -> None:
+    context_ = deferred_context(revoked="the run ended")
+    verdict = decide(context_, "tool_call", wrapped("mail_read"))
+    assert (verdict.action, verdict.step) == ("deny", GateStep.AUTHORITY)
+
+
+def test_the_hardline_step_sees_the_arguments_of_the_inner_call() -> None:
+    from sama.gate.decide import merged_catalog
+
+    catalog = merged_catalog({"shell": frozenset({"Bash"})})
+    context_ = GateContext(
+        toolsets=frozenset({"tool_search", "shell"}),
+        catalog=catalog,
+        rules=(rule("Bash", "allow"),),
+    )
+    verdict = decide(context_, "tool_call", wrapped("Bash", command="rm -rf /"))
+    assert (verdict.action, verdict.step) == ("deny", GateStep.HARDLINE)
+
+
+def test_effective_call_is_the_inner_call() -> None:
+    from sama.gate.decide import effective_call
+
+    assert effective_call("mcp__sama__tool_call", wrapped("mail_send", to="x")) == (
+        "mail_send",
+        {"to": "x"},
+    )
+    assert effective_call("tool_call", {"name": "a", "arguments": None}) == ("a", {})
+    # Bad arguments stay the call itself, so the record shows what the model sent.
+    assert effective_call("tool_call", {"name": 1}) == ("tool_call", {"name": 1})
+    assert effective_call("mcp__sama__todo", {"x": 1}) == ("todo", {"x": 1})

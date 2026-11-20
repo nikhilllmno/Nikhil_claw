@@ -111,13 +111,13 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| Compression at 50% of the window, protect last 20 | `agent/context_compressor.py` | Native compaction in both SDKs. Sama archives the transcript before and records a `Compacted` event (§6.2). | SDK | M2 |
+| Compression at 50% of the window, protect last 20 | `agent/context_compressor.py` | Native compaction in both SDKs. Sama archives the transcript before, in a child session, and records each `Compacted` event (§6.3). | SDK | M2 (M2.6 done) |
 | Tool output cap (50,000 bytes) and spill to file | `tools/tool_result_storage*.py` | Sama tools cap at 50 KB and spill to a sandbox file with a preview and path. | Adapt | M1 |
-| Tool search (`tool_search`, `tool_describe`, `tool_call`) | `tools/tool_search*.py` | Same three tools for deferred tools and integrations. Claude native tool search is an option. | Adapt | M2 |
+| Tool search (`tool_search`, `tool_describe`, `tool_call`) | `tools/tool_search*.py` | Same three tools for deferred tools and integrations. The gate judges `tool_call` as a call of the tool that it names (§6.3, §16.1). The Claude native `ToolSearch` stays a loader that the gate allows. | Adapt | M2 (M2.6 done) |
 | Token accounting | `agent/usage*.py` | Model proxy records tokens and cost per call (§18). | Adapt | M1 |
 | `@file`, `@url` references | `agent/context_references.py` | `@file`, `@url`, `@session` in a message. | Adapt | M4 |
-| `/compress` | slash command | `/compact` asks the runtime to compact now. | Adapt | M2 |
-| Context pins | none | A user pins a message or file so that compaction keeps it. | New | M2 |
+| `/compress` | slash command | `/compact [focus]` asks the runtime to compact now, in the API, Telegram, and Slack direct messages (§6.3). | Adapt | M2 (M2.6 done) |
+| Context pins | none | A user pins a text or a message. Sama injects the pins and injects them again after a compaction (§6.3). Files are not pinnable yet. | New | M2 (M2.6 done) |
 
 ## 7. Self-improvement and self-modification
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -57,6 +58,8 @@ from claude_agent_sdk.types import (
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from sama.runtime.archive import Archiver, TranscriptArchive, bound_for_wire
+from sama.runtime.claude_transcript import read_transcript
 from sama.runtime.contract import (
     ApprovalDecision,
     ApprovalRequired,
@@ -80,6 +83,8 @@ from sama.runtime.contract import (
     Usage,
     is_terminal,
 )
+
+log: Final = logging.getLogger("sama.runtime.claude")
 
 DROP_DEFERRED_ENV: Final = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL"
 """CLI switch: drop a deferred tool call when the tool is not available on resume."""
@@ -214,6 +219,15 @@ class _State(BaseModel):
     run_id: str
     usage: Usage = Usage()
     sdk_cost_usd: Decimal = Decimal(0)
+    sdk_tokens: Usage | None = None
+    """The tokens that ``model_usage`` of the last result counted for the SDK session, over all
+    models. A local command, such as ``/compact``, reports no tokens in ``usage``, but it adds
+    to ``model_usage``. The adapter counts the difference. ``None`` means that an older state
+    did not save it, so the difference is not known."""
+    base_session_id: str | None = None
+    """In the state of a paused run: the SDK session of the last completed run, which the run
+    continued. If the run fails later, the next run goes on with that session, and only the
+    count of the cost and the tokens moves on (``_Translator.failure_state``)."""
     turns: int = Field(default=0, ge=0)
     elapsed_s: float = Field(default=0.0, ge=0)
     pending: _PendingCall | None = None
@@ -246,6 +260,13 @@ class _Phase:
     approved_call: str | None = None
 
 
+def _compact_prompt(focus: str) -> str:
+    """The prompt that makes the CLI compact the session (``/compact``). The focus is the
+    custom instruction of the summary."""
+    focus = focus.strip()
+    return f"/compact {focus}" if focus else "/compact"
+
+
 def _reject_prompt(tool_name: str, reason: str | None) -> str:
     text = f"The user rejected the {tool_name} tool call. Do not run it again."
     if reason:
@@ -269,6 +290,14 @@ class _Translator:
     run_id: str
     usage: Usage
     sdk_cost_usd: Decimal
+    sdk_tokens: Usage | None = None
+    """The cumulative tokens of ``model_usage`` at the last result. ``None``: not known."""
+    base_session_id: str | None = None
+    """The SDK session of the last completed run, which this run continues. ``None``: there is
+    none (the first run, or a run that started in a state that was paused)."""
+    compact: bool = False
+    """The run is a ``/compact`` run. It needs a compaction boundary to be complete."""
+    compacted: bool = False
     session_id: str | None = None
     turns: int = 0
     elapsed_before_s: float = 0.0
@@ -354,7 +383,13 @@ class _Translator:
         metadata = message.data.get("compact_metadata") or {}
         before = _non_negative_int(metadata.get("pre_tokens"))
         after = _non_negative_int(metadata.get("post_tokens"))
-        return [Compacted(tokens_before=before, tokens_after=after, usage=self.usage)]
+        trigger: Literal["auto", "manual"] = (
+            "manual" if metadata.get("trigger") == "manual" else "auto"
+        )
+        self.compacted = True
+        return [
+            Compacted(tokens_before=before, tokens_after=after, trigger=trigger, usage=self.usage)
+        ]
 
     def add_result_usage(self, result: ResultMessage) -> None:
         raw = result.usage or {}
@@ -364,6 +399,14 @@ class _Translator:
             cache_read_tokens=_non_negative_int(raw.get("cache_read_input_tokens")),
             cache_write_tokens=_non_negative_int(raw.get("cache_creation_input_tokens")),
         )
+        cumulative = _model_tokens(result.model_usage)
+        if cumulative is not None:
+            if tokens.total_tokens == 0 and self.sdk_tokens is not None:
+                # The CLI reports no tokens in ``usage`` for ``/compact`` (a local command that
+                # calls the model), but ``model_usage`` and the cost count them. A normal turn
+                # reports its tokens in ``usage``, so this never counts a turn two times.
+                tokens = _token_difference(cumulative, self.sdk_tokens)
+            self.sdk_tokens = cumulative
         cost = Decimal(0)
         if result.total_cost_usd is not None and result.total_cost_usd >= 0:
             reported = Decimal(str(result.total_cost_usd))
@@ -388,9 +431,32 @@ class _Translator:
             run_id=self.run_id,
             usage=self.usage,
             sdk_cost_usd=self.sdk_cost_usd,
+            sdk_tokens=self.sdk_tokens,
+            # Only a paused run needs it: a completed run is the base of the next run.
+            base_session_id=self.base_session_id if pending is not None else None,
             turns=self.turns,
             elapsed_s=self.elapsed_s(),
             pending=pending,
+        ).dump()
+
+    def failure_state(self) -> bytes | None:
+        """The state that a failed run leaves for the next run: the state of the last completed
+        run, with the count of the cost and the tokens that this run moved on.
+
+        The paid work of a failed run is in its own usage already. The CLI counts it in the
+        cumulative values of the SDK session too. If the next run started again from the
+        count of the last completed run, it would count that work a second time. The
+        conversation does not change: ``session_id`` is the session of the last completed run,
+        so the next run never resumes the conversation of the failed run. The state has no
+        state if the run did not continue that session: its count is not for that session.
+        """
+        if self.base_session_id is None or self.session_id != self.base_session_id:
+            return None
+        return _State(
+            session_id=self.base_session_id,
+            run_id=self.run_id,
+            sdk_cost_usd=self.sdk_cost_usd,
+            sdk_tokens=self.sdk_tokens,
         ).dump()
 
     def terminal(self, result: ResultMessage, cancelled: bool) -> TerminalEvent:
@@ -431,12 +497,54 @@ class _Translator:
                 retryable=status in _RETRYABLE_STATUS,
                 usage=usage,
             )
+        if self.compact and not self.compacted:
+            # The CLI can answer ``/compact`` with a normal result and an error text, for
+            # example when the summary call fails with HTTP 400. No boundary means that the
+            # context is not smaller, so the run did not do what it was asked.
+            return RunFailed(
+                code=FailureCode.MODEL_ERROR,
+                message="the compaction did not finish: the runtime made no compaction boundary",
+                usage=usage,
+            )
         output = result.result if result.result is not None else "".join(self._text)
         return RunCompleted(output=output, runtime_state=self.state(), usage=usage)
 
 
 def _non_negative_int(value: Any) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _model_tokens(model_usage: Mapping[str, Any] | None) -> Usage | None:
+    """The tokens of ``ResultMessage.model_usage``, summed over the models. ``None`` if the
+    result has none."""
+    if not isinstance(model_usage, Mapping) or not model_usage:
+        return None
+    total = Usage()
+    for entry in model_usage.values():
+        if not isinstance(entry, Mapping):
+            continue
+        total = total + Usage(
+            input_tokens=_non_negative_int(entry.get("inputTokens")),
+            output_tokens=_non_negative_int(entry.get("outputTokens")),
+            cache_read_tokens=_non_negative_int(entry.get("cacheReadInputTokens")),
+            cache_write_tokens=_non_negative_int(entry.get("cacheCreationInputTokens")),
+        )
+    return total
+
+
+def _token_difference(now: Usage, before: Usage) -> Usage:
+    """The tokens that ``now`` has more than ``before``. A part that is lower means that the
+    count started again, so the whole part is new."""
+
+    def part(new: int, old: int) -> int:
+        return new - old if new >= old else new
+
+    return Usage(
+        input_tokens=part(now.input_tokens, before.input_tokens),
+        output_tokens=part(now.output_tokens, before.output_tokens),
+        cache_read_tokens=part(now.cache_read_tokens, before.cache_read_tokens),
+        cache_write_tokens=part(now.cache_write_tokens, before.cache_write_tokens),
+    )
 
 
 def _preview(content: Any) -> str:
@@ -531,8 +639,10 @@ class ClaudeRuntime:
         gate: ToolGate | None = None,
         settings: ClaudeSettings | None = None,
         client_factory: ClientFactory = _sdk_client,
+        archiver: Archiver | None = None,
     ) -> None:
         self._gate = gate or AllowAllGate()
+        self._archiver = archiver
         self._settings = settings or ClaudeSettings()
         self._client_factory = client_factory
         self._active: dict[str, _ActiveRun] = {}
@@ -555,6 +665,8 @@ class ClaudeRuntime:
             native_file_checkpoints=True,
             resumable_sessions=True,
             mcp_client=True,
+            manual_compaction=True,
+            compaction_archive=True,
         )
 
     # -- the protocol ----------------------------------------------------------------------
@@ -572,16 +684,26 @@ class ClaudeRuntime:
         if problem is not None:
             yield _invalid(problem)
             return
+        if request.compact is not None and previous is None:
+            yield _invalid("there is nothing to compact")
+            return
         phases: list[_Phase] = []
         if previous is not None and previous.pending is not None:
             # A new message after an unanswered approval. Drop the deferred call first, or
             # the CLI runs it on resume.
             phases.append(_Phase(prompt=None, drop_tool=previous.pending.tool_name))
-        phases.append(_Phase(prompt=request.input))
+        if request.compact is not None:
+            phases.append(_Phase(prompt=_compact_prompt(request.compact.focus)))
+        else:
+            phases.append(_Phase(prompt=request.input))
         translator = _Translator(
             run_id=run_id,
             usage=Usage(),
             sdk_cost_usd=previous.sdk_cost_usd if previous else Decimal(0),
+            # A new SDK session starts at zero. An older state has no count: not known.
+            sdk_tokens=previous.sdk_tokens if previous else Usage(),
+            base_session_id=previous.session_id if previous else None,
+            compact=request.compact is not None,
             session_id=previous.session_id if previous else None,
         )
         stream = self._stream(request.scope, request.config, request.budget, phases, translator)
@@ -617,6 +739,8 @@ class ClaudeRuntime:
             run_id=run_id,
             usage=state.usage,
             sdk_cost_usd=state.sdk_cost_usd,
+            sdk_tokens=state.sdk_tokens,
+            base_session_id=state.base_session_id,
             session_id=state.session_id,
             turns=state.turns,
             elapsed_before_s=state.elapsed_s,
@@ -735,7 +859,12 @@ class ClaudeRuntime:
         active: _ActiveRun,
     ) -> None:
         """Owns the SDK clients. Every SDK call happens in this task."""
-        send = active.send
+
+        def send(event: RunEvent) -> None:
+            if isinstance(event, RunFailed) and event.runtime_state is None:
+                event = event.model_copy(update={"runtime_state": translator.failure_state()})
+            active.send(event)
+
         translator.started_at = asyncio.get_running_loop().time()
         wall_time: float | None = None
         if budget.max_wall_time_s is not None:
@@ -906,12 +1035,58 @@ class ClaudeRuntime:
             max_turns=_remaining_turns(budget, translator),
             max_budget_usd=_remaining_cost(budget, translator),
             include_partial_messages=True,
-            hooks={"PreToolUse": [HookMatcher(hooks=[self._hook(scope, phase, translator)])]},
+            hooks=self._hooks(scope, phase, translator),
             can_use_tool=_can_use_tool(translator),
             env=env,
             cwd=settings.cwd,
             cli_path=settings.cli_path,
         )
+
+    def _hooks(
+        self, scope: RunScope, phase: _Phase, translator: _Translator
+    ) -> dict[Any, list[HookMatcher]]:
+        hooks: dict[Any, list[HookMatcher]] = {
+            "PreToolUse": [HookMatcher(hooks=[self._hook(scope, phase, translator)])]
+        }
+        if self._archiver is not None:
+            hooks["PreCompact"] = [HookMatcher(hooks=[self._archive_hook(scope, self._archiver)])]
+        return hooks
+
+    def _archive_hook(self, scope: RunScope, archiver: Archiver) -> HookCallback:
+        """The ``PreCompact`` hook: gives the transcript to the archiver before the CLI
+        compacts it (Section 6.3). A failed archive does not stop the compaction, because a
+        session that is full must still be able to make room."""
+
+        async def pre_compact(
+            data: HookInput, tool_use_id: str | None, context: HookContext
+        ) -> SyncHookJSONOutput:
+            raw = cast(Mapping[str, Any], data)
+            if raw.get("hook_event_name") != "PreCompact":
+                return {}
+            trigger: Literal["auto", "manual"] = (
+                "manual" if raw.get("trigger") == "manual" else "auto"
+            )
+            path = raw.get("transcript_path")
+            try:
+                entries, left_out = (
+                    await asyncio.to_thread(read_transcript, path)
+                    if isinstance(path, str) and path
+                    else ([], 0)
+                )
+                if entries:
+                    # Whole entries stay out when the transcript is over the limits of the
+                    # wire. No text is cut here: the control plane redacts it first.
+                    bounded, omitted = bound_for_wire(entries, left_out)
+                    await archiver.archive(
+                        scope, TranscriptArchive(trigger=trigger, entries=bounded, omitted=omitted)
+                    )
+            except Exception as exc:
+                log.warning(
+                    "the transcript archive failed run=%s: %s", scope.run_id, type(exc).__name__
+                )
+            return {}
+
+        return pre_compact
 
     def _hook(self, scope: RunScope, phase: _Phase, translator: _Translator) -> HookCallback:
         gate = self._gate

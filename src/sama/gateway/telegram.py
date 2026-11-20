@@ -33,10 +33,12 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.context import PinStore
 from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
+    COMPACTING,
     Bound,
     FollowSettings,
     KeyedLocks,
@@ -47,6 +49,7 @@ from sama.gateway.sessions import (
     find_session,
     follow_run,
     new_session,
+    pin_reply,
     send_ending,
     stop_runs,
     wait_for_tasks,
@@ -88,11 +91,27 @@ HELP: Final = (
     "/new - start a new session\n"
     "/stop - stop the current run\n"
     "/model - show the agent profiles. /model <name> starts a new session with that profile\n"
+    "/compact [focus] - make the context of this session shorter\n"
+    "/pin <text> - keep a text in the context. /pins lists the pins. /unpin <number> removes one\n"
     "/pair <code> - link this account, or link a group with a group code\n"
     "/skills - list the skills. /<skill> <request> uses a skill"
 )
 
-OWN_COMMANDS: Final = frozenset({"/new", "/stop", "/model", "/skills", "/start", "/pair", "/help"})
+OWN_COMMANDS: Final = frozenset(
+    {
+        "/new",
+        "/stop",
+        "/model",
+        "/skills",
+        "/start",
+        "/pair",
+        "/help",
+        "/compact",
+        "/pin",
+        "/pins",
+        "/unpin",
+    }
+)
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
 
 
@@ -245,6 +264,7 @@ class TelegramGateway:
         transcriber: Transcriber | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
+        pins: PinStore | None = None,
     ) -> None:
         """``lockout`` and ``followers`` can be shared by the gateways of all bots, so that
         the limits hold for the whole process."""
@@ -255,6 +275,7 @@ class TelegramGateway:
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
         self._skills = skills
+        self._pins = pins or PinStore(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
         self._seen: OrderedDict[int, None] = OrderedDict()
@@ -646,8 +667,54 @@ class TelegramGateway:
             await self._model(chat_id, message_id, rest, target, grants)
         elif command == "/skills":
             await self._skill_list(chat_id, message_id, target, grants)
+        elif command == "/compact":
+            await self._compact(chat_id, message_id, rest, target, grants)
+        elif command in ("/pin", "/pins", "/unpin"):
+            current = await self._session(chat_id, target, grants, create=False)
+            answer = await pin_reply(
+                self._pins,
+                target,
+                None if current is None else current.session_id,
+                command[1:],
+                rest,
+            )
+            await self._say(chat_id, answer, reply_to=message_id)
         else:
             await self._say(chat_id, HELP, reply_to=message_id)
+
+    async def _compact(
+        self, chat_id: int, message_id: int, focus: str, target: Target, grants: Grants
+    ) -> None:
+        """``/compact``: the busy rules of a message apply (Section 6.3)."""
+        if len(self._followers) >= self._settings.max_followers:
+            log.warning("too many runs to follow; chat=%s must try again", chat_id)
+            await self._say(chat_id, BUSY, reply_to=message_id)
+            return
+        place = object()
+        self._followers.add(place)
+        try:
+            current = await self._session(chat_id, target, grants, create=False)
+            if current is None:
+                self._followers.discard(place)
+                await self._say(
+                    chat_id, "This chat has no session to compact.", reply_to=message_id
+                )
+                return
+            run_id = await self._queue.enqueue_compact(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                user_id=target.user_id,
+                focus=focus,
+            )
+        except QueueError as error:
+            self._followers.discard(place)
+            await self._say(chat_id, str(error), reply_to=message_id)
+            return
+        except BaseException:
+            self._followers.discard(place)
+            raise
+        await self._say(chat_id, COMPACTING, reply_to=message_id)
+        self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
 
     async def _stop(self, org_id: uuid.UUID, session_id: uuid.UUID) -> int:
         return await stop_runs(self._engine, self._queue, org_id, [session_id])

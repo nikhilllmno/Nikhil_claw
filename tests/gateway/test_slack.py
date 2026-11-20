@@ -25,7 +25,7 @@ from sama.db.models import (
 )
 from sama.gate.approvers import SHARED_REFUSAL
 from sama.gateway.pairing import create_code
-from sama.gateway.sessions import FollowSettings
+from sama.gateway.sessions import COMPACTING, FollowSettings
 from sama.gateway.slack import BUSY, HELP, LINK_FIRST, PAIR_PROMPT, SlackApp, SlackGateway
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
@@ -538,3 +538,53 @@ async def test_a_workspace_admin_decides_a_channel_card(
     await add_bob(gateway, engine, tenant, role="admin")
     await gateway.handle_action(press(card, card_ts, BOB))
     assert slack.method_calls("chat.update")[-1]["text"].endswith(f"Approved by <@{BOB}>.")
+
+
+# -- context: /sama compact and pins (Section 6.3) ----------------------------------------------
+
+
+async def test_compact_and_pin_commands_in_a_direct_message(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    slack: FakeSlack,
+) -> None:
+    assert await gateway.command(command("compact")) == PAIR_PROMPT
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    assert await gateway.command(command("compact")) == "This conversation has no session yet."
+    assert await gateway.command(command("pins")) == "This session has no pins."
+    assert await gateway.command(command("pin keep metric")) == (
+        "Send a message first. Then you can pin."
+    )
+    await gateway.handle_event(dm("hello"))
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert (await gateway.command(command("pin keep metric units"))).startswith("Pinned.")
+    assert await gateway.command(command("pins")) == "Pins:\n1. keep metric units"
+    assert await gateway.command(command("compact the plan")) == COMPACTING
+    assert "busy" in await gateway.command(command("compact"))
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert slack.shown(DM)[-1] == (
+        "The context is compacted: 1000 tokens before and 500 tokens now."
+    )
+    assert await gateway.command(command("unpin 1")) == "Removed."
+    assert await gateway.command(command("pins")) == "This session has no pins."
+
+
+async def test_compact_and_pins_work_only_in_a_direct_message(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+) -> None:
+    await pair(gateway, engine, tenant)
+    await link_channel(gateway, engine, tenant)
+    assert "direct message" in await gateway.command(command("compact", channel=CHANNEL))
+    assert "direct message" in await gateway.command(command("pin x", channel=CHANNEL))
+    assert gateway._followers == set()
+
+
+async def test_help_names_the_context_commands(gateway: SlackGateway) -> None:
+    assert "compact" in HELP
+    assert "pin" in HELP

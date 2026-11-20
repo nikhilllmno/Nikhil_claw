@@ -518,3 +518,49 @@ async def test_review_runs_do_not_count_for_the_rate_limit(
                 )
             )
     await complete_chat(engine, tenant, queue=queue)
+
+
+# -- the lock order ----------------------------------------------------------------------------
+
+
+async def test_a_review_trigger_never_waits_for_the_org_rate_lock(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """Every enqueue takes the org rate lock first and the session row after it. The review
+    trigger locks the session row (the counters) and inserts the review run, and it never
+    asks for the rate lock. So it cannot be a part of a lock cycle with an enqueue. A held rate
+    lock must not delay it."""
+    run = await complete_chat(engine, tenant)
+    await set_counters(engine, tenant, turns=9)
+    async with engine.connect() as holder, holder.begin():
+        await RunQueue._rate_lock(holder, tenant.org)
+        async with asyncio.timeout(10), engine.begin() as connection:
+            review_id = await after_completed_run(connection, run)
+    assert review_id is not None
+    assert len(await reviews(engine, tenant)) == 1
+
+
+async def test_enqueues_and_review_triggers_of_one_session_do_not_deadlock(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """Messages (rate lock, then the session row) and review triggers (the session row, then
+    the review run) run at the same time on one session. All of them end."""
+    queue = RunQueue(engine)
+    run = await complete_chat(engine, tenant, queue=queue)
+    await set_counters(engine, tenant, turns=9)
+
+    async def trigger() -> object:
+        async with engine.begin() as connection:
+            return await after_completed_run(connection, run)
+
+    async def message() -> object:
+        return await queue.enqueue(
+            org_id=tenant.org,
+            session_id=tenant.ids["s1"],
+            text="more",
+            user_id=tenant.ids["mia"],
+        )
+
+    async with asyncio.timeout(30):
+        await asyncio.gather(*(f() for _ in range(6) for f in (trigger, message)))
+    assert len(await reviews(engine, tenant)) == 1

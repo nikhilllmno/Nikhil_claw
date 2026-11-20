@@ -43,6 +43,7 @@ from sama.runtime.contract import (
     ApprovalRequired,
     Audience,
     Budget,
+    CompactRequest,
     FailureCode,
     ResumeRequest,
     RunCompleted,
@@ -239,6 +240,8 @@ class Worker:
         try:
             runtime = self._runtimes.get(RuntimeKind(run.runtime))
             budget = Budget.model_validate(dict(run.budget))
+            if run.compact and not runtime.capabilities().manual_compaction:
+                raise ValueError(f"the runtime {run.runtime} cannot compact on request")
             config = await self._config(run)
             scope = _scope(run)
         except Exception as error:
@@ -343,12 +346,27 @@ class Worker:
             if code is FailureCode.CANCELLED and watch.timed_out and not watch.cancel:
                 code, message = FailureCode.TIMEOUT, "the run took longer than its wall-time limit"
             # Redact before the cut: a cut secret no longer matches.
-            await self._fail(run, code, redact(message)[:MAX_FAILURE_CHARS], terminal.usage)
+            await self._fail(
+                run,
+                code,
+                redact(message)[:MAX_FAILURE_CHARS],
+                terminal.usage,
+                runtime_state=terminal.runtime_state,
+            )
             return
         await self._fail(run, FailureCode.INTERNAL, "the runtime ended without a result", usage)
 
-    async def _fail(self, run: ClaimedRun, code: FailureCode, message: str, usage: Usage) -> None:
-        if await self._queue.fail(run, self.owner, code=code, message=message, usage=usage):
+    async def _fail(
+        self,
+        run: ClaimedRun,
+        code: FailureCode,
+        message: str,
+        usage: Usage,
+        runtime_state: bytes | None = None,
+    ) -> None:
+        if await self._queue.fail(
+            run, self.owner, code=code, message=message, usage=usage, runtime_state=runtime_state
+        ):
             self._ended(run.org_id, run.run_id)
 
     async def _watch(
@@ -425,10 +443,12 @@ async def _stream(
         events = runtime.run(
             RunRequest(
                 scope=scope,
-                input=run.input,
+                # A compact run has no message: its input is the focus of the summary.
+                input="" if run.compact else run.input,
                 config=config,
                 budget=budget,
                 runtime_state=run.runtime_state,
+                compact=CompactRequest(focus=run.input) if run.compact else None,
             )
         )
     try:

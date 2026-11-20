@@ -787,3 +787,98 @@ async def test_a_group_card_names_the_listed_approvers_and_an_unnamed_requester(
         "The person who asked, a person who is listed as an approver or a workspace or org"
         " admin can decide this."
     ) in card["text"]
+
+
+# -- context: /compact and pins (Section 6.3) --------------------------------------------------
+
+
+async def test_compact_and_pin_commands(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    await gateway.handle_update(message("/compact"))
+    assert telegram.texts(DM)[-1] == "This chat has no session to compact."
+    await gateway.handle_update(message("/pins"))
+    assert telegram.texts(DM)[-1] == "This session has no pins."
+    await gateway.handle_update(message("/pin  keep metric units"))
+    assert telegram.texts(DM)[-1] == "Send a message first. Then you can pin."
+
+    await gateway.handle_update(message("hello"))
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    await gateway.handle_update(message("/compact"))
+    assert telegram.texts(DM)[-1] == "Compacting the context. This can take a minute."
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert telegram.texts(DM)[-1] == (
+        "The context is compacted: 1000 tokens before and 500 tokens now."
+    )
+    await gateway.handle_update(message("/pin"))
+    assert "text to pin" in telegram.texts(DM)[-1]
+    await gateway.handle_update(message("/pin keep metric units"))
+    assert telegram.texts(DM)[-1].startswith("Pinned.")
+    await gateway.handle_update(message("/pins"))
+    assert telegram.texts(DM)[-1] == "Pins:\n1. keep metric units"
+    await gateway.handle_update(message("/unpin x"))
+    assert "number" in telegram.texts(DM)[-1]
+    await gateway.handle_update(message("/unpin 9"))
+    assert "No pin has this number" in telegram.texts(DM)[-1]
+    await gateway.handle_update(message("/unpin 1"))
+    assert telegram.texts(DM)[-1] == "Removed."
+    await gateway.handle_update(message("/pins"))
+    assert telegram.texts(DM)[-1] == "This session has no pins."
+
+
+async def test_compact_refuses_a_busy_session(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    no_followers(gateway)
+    await gateway.handle_update(message("hello"))
+    assert await harness.worker.run_once()
+    await gateway.handle_update(message("one more"))  # queued: the session is busy
+    await gateway.handle_update(message("/compact"))
+    assert "busy" in telegram.texts(DM)[-1]
+    assert gateway._followers == set()
+    session = await bound_session(engine, DM)
+    async with engine.connect() as connection:
+        compact_runs = (
+            await connection.execute(
+                select(Run.id).where(Run.session_id == session.id, Run.compact.is_(True))
+            )
+        ).all()
+    assert compact_runs == []
+
+
+async def test_compact_with_a_full_gateway_says_busy(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    for index in range(gateway._settings.max_followers):
+        gateway._followers.add(index)
+    await gateway.handle_update(message("/compact"))
+    assert telegram.texts(DM)[-1] == BUSY
+
+
+async def test_help_lists_the_context_commands(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    await gateway.handle_update(message("/help"))
+    text = telegram.texts(DM)[-1]
+    assert "/compact" in text
+    assert "/pin" in text

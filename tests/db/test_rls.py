@@ -36,6 +36,8 @@ SESSION_CHILDREN = (
     "session_todos",
     "approvals",
     "review_proposals",
+    "session_compactions",
+    "context_pins",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 

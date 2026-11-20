@@ -318,3 +318,39 @@ async def test_compaction_streams_a_compacted_event(target: Target) -> None:
     compacted = [e for e in events if isinstance(e, Compacted)]
     assert len(compacted) == 1
     completed(events)
+
+
+async def test_a_compact_request_compacts_the_session(target: Target) -> None:
+    """``RunRequest.compact`` makes the runtime compact now. It needs the capability, and it
+    keeps the session: the next run continues from the state of the compact run."""
+    from sama.runtime.contract import CompactRequest, RuntimeKind
+
+    if not target.runtime.capabilities().manual_compaction:
+        pytest.skip("the runtime cannot compact on request")
+    word = new_word()
+    first = completed(await run(target, target.prompt(Scenario.REMEMBER, word)))
+    compact_request = RunRequest(
+        scope=scope(),
+        input="",
+        config=target.config,
+        budget=budget_for(target),
+        runtime_state=first.runtime_state,
+        compact=CompactRequest(focus="keep the remembered word"),
+    )
+    events = await collect(target.runtime.run(compact_request))
+    record_spend(target, events)
+    validate_event_stream(events)
+    compacted = [e for e in events if isinstance(e, Compacted)]
+    assert len(compacted) == 1
+    assert compacted[0].trigger == "manual"
+    done = completed(events)
+    if target.runtime.kind is RuntimeKind.CLAUDE_AGENT_SDK:
+        # The compaction calls the model, so the run has usage. The CLI reports no tokens for
+        # a local command in ``usage``: the adapter counts the tokens of ``model_usage``.
+        assert done.usage.input_tokens > 0
+        assert done.usage.output_tokens > 0
+        assert done.usage.cost_usd > 0
+    # The session goes on after the compaction.
+    prompt = target.prompt(Scenario.TEXT, new_word())
+    again = completed(await run(target, prompt, state=done.runtime_state))
+    assert again.runtime_state is not None

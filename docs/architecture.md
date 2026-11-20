@@ -316,7 +316,9 @@ events at once. A resumed run continues the `seq` of the run.
 
 **End.** `RunCompleted` stores the reply as an assistant message and the runtime state.
 `RunFailed` stores the failure code and message; the code `cancelled` gives the status
-`cancelled`. A stream with no terminal event fails with `internal`. When a run ends (not when it
+`cancelled`. `RunFailed.runtime_state` is optional. A runtime sets it only to keep a count that the
+failure would lose, and the next run of the session starts from the newest state, also the state
+of a failed run (Section 6.3, "Tokens of a compaction"). A stream with no terminal event fails with `internal`. When a run ends (not when it
 pauses), the worker calls the run-end hooks, for example `ClarifyBroker.cancel_run`.
 
 **Cancel.** `cancel(org_id, run_id)` ends a `queued` or `paused` run at once. For a `running`
@@ -457,6 +459,10 @@ RunEvent = (
   `cancel` stops an active stream and makes the approvals of a paused run invalid.
 - The adapter saves the runtime's own resumable state as an opaque blob (`bytes`). In JSON it
   is base64, so any byte value can be stored. The orchestrator stores it with the run.
+- **Compaction (M2.6).** `RunRequest.compact` asks the runtime to compact the session now, with
+  no user input and no answer. `Capabilities.manual_compaction` says that the runtime does it.
+  `Capabilities.compaction_archive` says that the runtime gives its transcript to an `Archiver`
+  before it compacts. `Compacted.trigger` is `manual` or `auto`. Section 6.3 has the design.
 
 ### 5.2 What sama owns and what the runtime owns
 
@@ -484,7 +490,7 @@ RunEvent = (
 | Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to sama. | Serialised `RunState` plus a sama `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
 | Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers) | Agents as tools and handoffs |
 | Skills | Native: sama writes the session's skills to `.claude/skills/` and sets the `skills` option. | `SandboxAgent` `Skills` capability with a sama skill source, or the sama `skill_view` tool. |
-| Compaction | Native auto-compaction. The `PreCompact` hook lets sama archive the full transcript first. | `Compaction` capability or `OpenAIResponsesCompactionSession`. |
+| Compaction | Native auto-compaction. The `PreCompact` hook gives the full transcript to the sama archive first. `/compact [focus]` is a CLI slash command that the adapter sends for a compact request (M2.6, Section 6.3). | `Compaction` capability or `OpenAIResponsesCompactionSession`. The adapter sets `manual_compaction` and `compaction_archive` when it supports them (M3.6). |
 | Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
 | Limits | `max_turns`, `max_budget_usd`, `task_budget` | `max_turns`; sama budget in the model proxy |
 | Checkpoints | `enable_file_checkpointing` and `rewind_files()` | Sama git snapshot of the workspace (Section 15.3) |
@@ -551,7 +557,20 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
 - **Errors.** Failure messages are fixed text. CLI error strings and the text of SDK
   exceptions can hold raw tool data, so they do not go into `RunFailed`.
 - **Sub-agents.** Messages with a `parent_tool_use_id` become `SubagentEvent`s.
-  `compact_boundary` system messages become `Compacted`.
+  `compact_boundary` system messages become `Compacted`. The `trigger` of its
+  `compact_metadata` (`manual` or `auto`) goes into the event (M2.6).
+- **Compaction (M2.6).** With an `archiver`, the adapter adds a `PreCompact` hook next to the
+  `PreToolUse` hook. The hook input has `trigger`, `custom_instructions`, and
+  `transcript_path`. The hook reads the transcript file, gives the entries to the archiver,
+  and always returns an empty output, so the compaction goes on also when the archive fails
+  (Section 6.3). A compact request resumes the SDK session and sends `/compact <focus>` as the
+  prompt. A compact request with no earlier state fails with `invalid_request`. A compact run
+  with no compaction boundary fails (`model_error`). The tokens of a compact run come from the
+  difference of `model_usage`, because `usage` is zero (Section 6.3). A failed run keeps this
+  count in `RunFailed.runtime_state` (`_Translator.failure_state`), so the next run does not count
+  the paid work of the failed run again. The adapter
+  does not use the CLI hook `SessionStart` with the source `compact`, because the Python SDK
+  does not expose it: sama injects the pins itself (Section 6.3).
 
 Versions at the time of writing: `claude-agent-sdk==0.2.184` and `openai-agents==0.25.0`.
 Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
@@ -699,13 +718,309 @@ Rules:
 
 | Mechanism | How |
 |---|---|
-| Compaction | Native in both SDKs (Section 5.3). Before compaction, sama archives the full transcript and links the compacted session to its parent (session lineage). |
+| Compaction | Native in both SDKs (Section 5.3). Before compaction, sama archives the full transcript in a child session of the live session (session lineage) and records the compaction. `/compact` asks the runtime to compact now (Section 6.3, M2.6). |
 | Tool output limits | Sama tools return at most 50 KB (head and tail kept). Larger output is written to a file in the sandbox, and the tool returns a preview plus the path (Hermes "spill", Section 16.7). |
-| Tool search | Rare tools (most integrations, cron admin, image generation, TTS) are deferred. The model sees `tool_search`, `tool_describe`, and `tool_call` instead of their schemas. |
+| Tool search | Rare tools (most integrations, cron admin, image generation, TTS) are deferred. The model sees `tool_search`, `tool_describe`, and `tool_call` instead of their schemas. A deferred call passes the same gate as a direct call (Sections 6.3 and 16.1, M2.6). |
 | Progressive skills | Only the skill index is in the prompt. The agent loads a full skill when it needs it. |
-| Context pins | A user can pin a message or file so that compaction keeps it. |
+| Context pins | A user pins a text or a message. Sama puts the pins in front of the next message, and again after each compaction (Section 6.3, M2.6). Files are not pinnable yet. |
 | `@` references | `@file`, `@url`, and `@session` in a message attach that content (M4). |
 | Budgets | Per run: max turns, max tokens, max cost, and wall time. Near the limit, sama tells the agent to wrap up. |
+
+### 6.3 Context management (M2.6)
+
+M2.6 adds five parts. The first four keep a long session usable. The fifth keeps the tool
+list short.
+
+| Part | Where | Section |
+|---|---|---|
+| Compaction record and transcript archive | `sama.context.compaction`, `sama.runtime.archive`, `POST /archive` of the tool server | below |
+| Session lineage | `sessions.parent_session_id` and `sessions.lineage`, `sama.context.lineage` | below |
+| `/compact` | `RunQueue.enqueue_compact`, the API, Telegram, Slack | below |
+| Context pins | `context_pins`, `sama.context.pins` | below |
+| Deferred tools | `sama.tools.deferred`, `tool_search`, `tool_describe`, `tool_call` | below, and Sections 10.3 and 16.1 |
+
+**Contract changes.** Three additions in `src/sama/runtime/contract.py`. All are optional, so
+an adapter that does not know them keeps working.
+
+- `Capabilities.manual_compaction`: the runtime compacts when the request has `compact`.
+- `Capabilities.compaction_archive`: the runtime gives its transcript to an `Archiver` before
+  it compacts.
+- `RunRequest.compact` (`CompactRequest(focus)`): compact the session now. The request has
+  no user input. The runtime sends no answer. `Compacted.trigger` is `manual` or `auto`.
+
+The worker fails a compact run with `INVALID_REQUEST` when the runtime has no
+`manual_compaction`. So an adapter that does not support `/compact` gives a clear failure and
+does not answer with a wrong text. The Claude adapter and the fake runtime have the flag. The
+fake runtime has no archive.
+
+**Compaction record.** A `Compacted` event is stored twice, in one transaction:
+
+1. as the `run_events` row `compacted`, as before;
+2. as a row of `session_compactions`: `trigger`, `tokens_before`, `tokens_after`, the run, the
+   archive session, and the counts of the archive. `RunQueue.add_events` calls
+   `sama.context.record_compacted`, so the event and the row exist together.
+
+`record_compacted` also writes the audit row `context.compacted`, and it makes the runtime
+forget the pins (see Pins). If no archive row is open for the run (an adapter without an
+archive, or an archive that failed), it makes a row with no archive session.
+
+**Transcript archive.** Before the Claude CLI compacts, it runs the `PreCompact` hook. The
+hook input has `trigger` (`manual` or `auto`) and `transcript_path`.
+
+1. The adapter reads the transcript file of the CLI and turns it into `ArchiveEntry` objects:
+   user and assistant text (`role` and `text`), each tool call (`tool_name` and `tool_input`,
+   the input as a **JSON value**), and each tool result as a `tool` entry. It skips thinking
+   blocks and every line type that it does not know. The format of the file is not a public
+   contract, so the parser never raises for a line that it does not understand
+   (`sama.runtime.claude_transcript`).
+2. The runner does not cut inside an entry. It has no redactor, and a cut before the
+   redaction can split a secret into parts that the redactor does not know. So the parser and
+   `bound_for_wire` leave **whole entries** out. The size of an entry is the bytes of its JSON
+   text in UTF-8 (`entry_wire_bytes`). The model of the entry, the parser, and
+   `bound_for_wire` use this one definition. An entry over 1 MB stays out, and a marker
+   (`system` entry) takes its place. The parser checks each **content block**, so one large
+   block does not remove the other blocks of the same message, and each large block counts
+   once in `omitted`. A tool name over 200 characters is not cut either: the entry of that tool
+   call stays out whole, with the same marker (the marker has no part of the name). A transcript over 5,000 entries or 6 MB keeps its first
+   30 % and its last 70 %, with one marker for the middle. The request has `omitted`, the
+   number of entries that stay out, so the row can show `archive_truncated`.
+3. `RemoteArchiver` posts the entries to `POST /archive` of the sama tool server. It sends
+   the run token as the bearer, like every other request from the sandbox. The runner has no
+   database access (Section 16.2).
+4. The tool server checks the run **before it reads the body** (`ContextArchive.authorize`),
+   limits the bodies that it holds at one time (Section 16.7), and calls
+   `ContextArchive.archive`. The archive needs a run in the status `running`, a user of the
+   run that still sees the session (the live check of Section 5.1, `load_authority`), and a
+   session in the status `active`. It checks this again in the transaction that writes. It
+   redacts each entry **whole**: the text of an entry, and the input of a tool call as a JSON
+   value (every string and key), so a secret with quotes, backslashes, or new lines still
+   matches. Only then it makes the text (`[tool call NAME] {json}`) and cuts it. It makes an
+   **archive session** and stores the entries as its messages. It makes a
+   `session_compactions` row that points to the archive session (the row is open, with no
+   token counts). It writes the audit row `context.archived`.
+5. The CLI compacts. The `compact_boundary` message becomes `Compacted`. The event completes
+   the open row (the token counts and `completed_at`).
+
+Limits of the request (the runner and the model refuse more): 5,000 entries, 1 MB for one
+entry (bytes of the JSON text in UTF-8, for the whole entry and not for each field), 8 MB for
+the body. The list is counted before the model builds any entry (the check of the list length
+comes after the items are built, and 200,000 small entries need hundreds of MB). The count is
+a first parse of the body with `json.loads` in which every JSON object becomes `0`
+(`object_pairs_hook`), so the list of items costs one pointer for each item and the count does
+not depend on how the body spells its keys (`"role"` and `"\u0072ole"` are the same key).
+Only a body with at most 5,000 entries goes to the model. A body that is nested too deeply is
+refused too. Limits of the store, after
+the redaction: 20,000 characters for one entry (the start 70 % and the end 30 % stay), 4,000
+entries, 2,000,000 characters for one archive (the first 30 % and the last 70 % stay, with a
+`system` entry that says how many entries are not in the archive), 60 seconds for the call, and
+10 archives for one run. The row has `archive_truncated` when anything was cut, in the runner
+or in the store.
+
+**A failed compaction.** The CLI can answer `/compact` with a normal result that has an error
+text (for example when the summary call fails with HTTP 400). There is no `compact_boundary`
+then, and the context is not smaller. A compact run needs a boundary to complete: the adapter
+ends it with `RunFailed` (`model_error`, "the compaction did not finish: the runtime made no
+compaction boundary"). The archive row that the hook made stays open (`completed_at` is null).
+It is the record of the attempt.
+
+**Tokens of a compaction.** For `/compact` the CLI reports zero tokens in `ResultMessage.usage`,
+but `model_usage` and the cost of the SDK session grow. The adapter keeps the cumulative tokens
+of `model_usage` in its `runtime_state` (`sdk_tokens`). If a result has no tokens in `usage`,
+the run counts the difference of `model_usage`. A normal turn has its tokens in `usage`, so it
+is not counted two times. A state without `sdk_tokens` (an older state) has no known baseline,
+so the first run counts nothing from `model_usage` and then saves the baseline.
+
+The baseline (`sdk_tokens`, and the cost `sdk_cost_usd`) must also move on when a run **fails**
+after it paid for model calls. A failed run has those tokens and that cost in its own usage.
+The CLI counts them in the cumulative values of the SDK session too. If the next run started
+from the baseline of the last completed run, it would count that work a second time (the
+baseline 100, a failed run to 120, the next run to 150 would count 50 and not 30). So
+`RunFailed` has an optional `runtime_state`, and the queue stores it in `runs.runtime_state` of
+the failed run (`RunQueue.fail`). The next run of the session starts from the **newest** chat
+run that saved a state, whether it is `completed`, `failed`, or `cancelled`. The state of a
+failed run is not a state to resume the failed conversation: the adapter writes the state of
+the last completed run (its `session_id`) with only the counts moved on
+(`_Translator.failure_state`). A paused run keeps that session in `base_session_id`, so a run
+that fails after a resume does the same. The adapter writes no state when there is no base
+(the first run of a session, which starts a new SDK session next time), or when the run
+continued another SDK session than the base: the count is not for the base session then, and
+the next run uses the last completed state. A run that the worker stops after the cancel grace
+period (the CLI did not answer) has no result, so it keeps no count (A21).
+
+**An archive that fails does not stop the compaction.** A session that is full must still be
+able to make room. The hook catches every error, logs only the error type, and returns an empty
+output. The compaction then runs, and its row has no archive session. This is a choice: the
+alternative is a hook that blocks the compaction, and then a failed archive makes a full session
+useless.
+
+**Session lineage.** A session can have a parent. `sessions.lineage` says how it came from the
+parent: `compaction` (an archive), `branch` (`/new` and `/model` in a chat), `retry` (reserved),
+`delegation` (M2.7). The archive session is a **child** of the live session. The live session
+keeps its id, its binding, its pins, and its runtime state, so the compaction does not move any
+chat to a new session. The archive session has the status `archived`, so it is not in the
+session list of the API, and it cannot get new runs or pins.
+
+- The archive has the audience, the owner, the workspace, and the profile of the live session.
+  So the visibility rule (Section 11.3, `sama_private.can_read_session`) gives the same people
+  the same access to both. An archive of a private session is private to its owner. The embed
+  worker skips the archive messages (`embedded_at` is set when they are written), because the
+  live session has the same user and assistant text.
+- `session_search` does not list archives, because they repeat the live session. A user who
+  needs a detail that the summary lost reads the archive: `session_read` of the live session
+  names its archives (the ones that the run may see), and `session_read` of an archive shows the
+  `tool` and `system` entries too. The header of a page and of a hit says
+  `compaction of session: <id>` or `branch of session: <id>`.
+- `GET /sessions/{id}/lineage` gives the ancestors and the children of a session. It reads as
+  the user, so a linked session that the user cannot read is not in the answer
+  (`sama.context.lineage`).
+
+**`/compact`.** The user asks the runtime to compact the session now.
+
+- API: `POST /sessions/{id}/compact` with an optional `focus` (at most 6,000 characters). It
+  answers `202` with `run_id`. `409` has the reason: the session is busy, the session is not
+  active, or it has nothing to compact. `429` is the message rate limit.
+  `GET /sessions/{id}/compactions` lists the compactions of a session.
+- Telegram: `/compact [focus]`. Slack: `/sama compact [focus]` in a direct message. The gateway
+  shows "Compacting the context" and, when the run ends, the token counts ("The context is
+  compacted: 1000 tokens before and 500 tokens now."). Slack in a channel does not support it,
+  because the answer of a slash command is a message that only the sender sees, and a channel
+  thread has no single session.
+- The run is a `chat` run with `runs.compact = true`. `runs.compact_focus` holds the focus,
+  redacted. A database check makes a compact run a chat run and allows a focus only on a
+  compact run. The worker sends `RunRequest.compact` and no input. It reuses the claim, lease,
+  event, follow, and cancel code of a chat run, so a compact run can be stopped with `/stop`.
+- **Lock order.** Every enqueue takes the org rate lock first (an advisory lock), and the
+  session row after it. A run insert needs a share lock on the session row, so `enqueue` held
+  the rate lock and waited for the row, while `enqueue_compact` held the row and waited for the
+  rate lock: a deadlock. Both paths use the same order now. The creation of a background
+  review run (`review.trigger.after_completed_run`, M2.4) is the one exception, and it is safe:
+  it runs in the transaction that completes a run, it locks the session row (the counters
+  update) and then inserts the review run, and it **never takes the rate lock and never waits
+  for it**. A lock cycle needs a transaction that holds one lock and waits for the other
+  while another transaction does the reverse. The review path only waits for row locks, and
+  the enqueue paths take the rate lock before any row, so no path holds the session row and
+  waits for the rate lock. A review run is no user message, so it does not count for the rate
+  limit, and it must not wait for the lock that puts the enqueues of an org in a sequence (that
+  would slow the completion of every run). Tests: `test_a_review_trigger_never_waits_for_the_org_rate_lock`
+  and `test_enqueues_and_review_triggers_of_one_session_do_not_deadlock`.
+- **Busy rule.** `enqueue_compact` locks the session row and refuses when any run of the
+  session is open (`queued`, `running`, or `paused`). A message uses the queue rule: it waits
+  behind the open run. A compaction must not change the context under a run, and a run that
+  waits for an approval has the context in the CLI. So `/compact` does not wait. It says "busy".
+  A message that arrives while the compact run is open waits behind it, as it does behind any
+  run.
+- **Nothing to compact.** The session needs a completed run with a runtime state. A session
+  with only a queued message has no CLI session yet.
+- A compact run counts as one message for the rate limit of the user and of the org. It uses a
+  model call (the summary), and it is the same abuse path as a message.
+- A compact run writes no message and starts no review or title job. It is not a user turn, so
+  the history of the session reads the same as before.
+- **The focus.** The text that goes to the CLI is the focus that the user wrote, then the pins
+  of the session: "Keep these pinned notes in the summary, word for word". So the summary keeps
+  them. The whole text is cut to 6,000 characters. The Claude adapter sends `/compact <text>`.
+  This is a slash command of the CLI and the text is its custom instruction.
+
+**Context pins.** A pin is a short text that the user wants the agent to keep in mind. It stays
+true until the user removes it.
+
+- Table `context_pins` (migration `0018`): `org_id`, `session_id`, `created_by_user_id`, `text`,
+  `source` (`user` or `message`), `injected_at`, `injected_run_id`. RLS follows the session.
+- Limits for each session: 10 pins, 2,000 characters for one pin, 8,000 characters in all. The
+  store takes an advisory lock for the session, so two adds at the same time cannot both take
+  the last place. The text is redacted when it is stored, and again when it is injected.
+- API: `GET`, `POST` (`text` or `message_id`, not both), and `DELETE` on
+  `/sessions/{id}/pins`. A message pin copies the text of a user or assistant message of the
+  same session. Telegram: `/pin <text>`, `/pins`, `/unpin <number>`. Slack, in a direct
+  message: `/sama pin TEXT`, `/sama pins`, `/sama unpin NUMBER`. Any user who can read the
+  session can add and remove pins, as any user can send a message. An archive session cannot
+  have pins. The list (API, Telegram, Slack) redacts the **whole** text again with the secrets
+  that the redactor knows now, and then the caller folds and cuts it. So a secret that the
+  system learned after the pin was made is not shown, and a cut cannot split it.
+- **Injection.** The runtime has no native pin. The control plane puts the pins that the
+  runtime has not seen in front of the next user message, in a `<pinned_context>` block that
+  says the text is notes from the user and not system instructions. The stored message is the
+  text of the person. The block is only in the input of the run. A claim of the same run again
+  (after a lost lease) gets the same pins again. An approval resume gets none, because the CLI
+  session already has them.
+- **Reservation, not a mark.** The claim **reserves** the pins for the run (`injected_at` and
+  `injected_run_id`). The reservation is final only while a runtime state that has the pins can
+  be resumed. A pin is due again at the next claim when the run that got it did not keep it:
+  the run failed or was cancelled (it saves no state), or it completed without a runtime
+  state. A run that is `queued`, `running`, or `paused` holds its pins, and a run that
+  completed with a state keeps them (the next run resumes that state). The rule is a query at
+  claim time, so it holds for every way that a run can end (fail, cancel, reap, approval
+  time-out) with no hook in each of them.
+- **Survive compaction.** A compaction can summarise the pin text away. So `record_compacted`
+  sets `injected_at` to null for all pins of the session, and the next message carries all of
+  them again. A `/compact` also passes the pins in the focus, so the summary tries to keep
+  them.
+
+**Deferred tools.** Each tool schema is in every model call. A product or a connector can
+register a tool in the `DeferredCatalog` (`sama.tools.deferred`) instead of listing it. The
+model finds it with three sama tools (toolset `tool_search`, Section 10.2).
+
+- `tool_search(query, limit)` lists the deferred tools that match some words, best first
+  (name 3 points, tag 2, description 1). `tool_describe(name)` gives the description and the
+  input schema. `tool_call(name, arguments)` runs the tool.
+- Both search tools show only the tools that the run can use: the tools of its toolsets, minus
+  the tools that a `deny` rule blocks (`GateService.visible_tools`, so a shared run uses its
+  group set). A hidden tool and an unknown tool give the same error, so a run does not learn
+  that a tool exists. **Fail closed:** a gate that has no `visible_tools` (and a server with no
+  gate) shows no deferred tool. The search is empty and `tool_describe` gives the same error as
+  for an unknown tool. `tool_call` still goes through the gate.
+- **A deferred call never bypasses the gate.** Section 16.1 has the rule: the gate judges a
+  `tool_call` as a call of the tool that it names.
+- The tool server shows the three tools only when the catalog has a tool when the app starts.
+  No product registers a deferred tool in M2.6. M3.4 (connections) is the first user. The
+  catalog is the only extension point: a tool registers a name, a toolset, a description, a
+  JSON schema of the arguments, and an async handler that gets the run token claims. The
+  server checks only that the required arguments are present. The handler validates the rest.
+  A tool name cannot be the name of a sama tool or of a meta tool, and it cannot start with
+  `mcp__sama__`, so the gate and the catalog always read the same name.
+- Claude has its own native `ToolSearch` tool. It stays allowed in every run as a loader
+  (Section 16.1) and the adapter keeps `ENABLE_TOOL_SEARCH=false` (Section 5.3). The sama tools
+  are separate, and they work with every runtime.
+
+**Assumptions.** These are choices where the owner did not decide.
+
+| # | Assumption |
+|---|---|
+| A1 | The archive is a child session of the live session, with lineage `compaction`. The live session is not replaced. The alternative (a new live session after each compaction) moves the chat binding, the pins, and the runtime state. |
+| A2 | The archive belongs to the runtime adapter: the adapter knows its transcript format, and the control plane stores plain entries. The OpenAI adapter (M3.6) sets `compaction_archive` and gives entries to the same `Archiver`. |
+| A3 | A failed archive does not block compaction. |
+| A4 | `/compact` refuses a busy session. A message waits in the queue, but a compaction must not wait behind a run that waits for a human. |
+| A5 | A compact run is a chat run with a flag, not a new run kind. It reuses the claim, lease, event, follow, and rate code. A new kind would need new code in each of them. |
+| A6 | The archive is redacted and cut in the control plane, not in the runner, because the redactor knows the vault secrets of the org. The runner never cuts inside an entry: it leaves whole entries out. A tool input stays a JSON value to the redaction. |
+| A7 | Archives are not searched. They repeat the live session. They are readable by id. |
+| A8 | Pins are session notes that the control plane injects. No runtime has a native pin, so the injection is the same for every runtime. |
+| A9 | Any user who can read a session can pin and unpin, as any user can send a message. |
+| A10 | `compact` and pins in Slack work in direct messages only. |
+| A11 | The default profile gets the toolset `tool_search`. The default group set does not, because no deferred tool is registered yet and a shared session should opt in. Migration `0018` changes only a profile that has the exact old default list. |
+| A12 | `tool_search` and `tool_describe` are allowed by default (they only read). `tool_call` has no default of its own: the called tool has its own rule or its default (`ask` for an unknown tool). |
+| A14 | The archive endpoint has hard limits at the model (5,000 entries, 1 MB for an entry, 8 MB for the body), a check of the run before the body is read, and 2 archive bodies at one time (a third gets `429`; the hook is fail-open, so the cost is one archive). The entries are counted before the model builds them (a first parse that turns every object into `0`), and the size limit of an entry is for the whole entry in UTF-8 bytes. The count runs on the event loop and parses the body two times (at most 8 MB, 0.1 s in a test with 500,000 small entries). |
+| A15 | An archive needs the live authority of the run (the user still sees the session), as a tool call does. A user who loses access while a run runs cannot write an archive. The compaction itself is not stopped. |
+| A16 | A pin is due again unless the run that got it is open or completed with a runtime state. A failed run does not save a state, so the pin goes again. A run that fails after the CLI saved its own session can give a pin two times to that session. The cost is a repeated note, and this is the safe side. |
+| A17 | A compact run that has no compaction boundary fails. The run ends as `failed` with `model_error`. The archive that the hook made stays as an open row. |
+| A18 | `model_usage` of the CLI is cumulative for the SDK session across processes, as the cost is. This is checked with the real CLI and the scripted model, and not with a live model. |
+| A19 | The pin list is redacted again when it is shown. The text in the table can still hold a secret that the redactor learned after the pin was made, until the pin is removed. |
+| A20 | The tool search fails closed without a visibility source. A tool server in a test or a product that has no gate shows no deferred tool. |
+| A21 | The accounting baseline (`sdk_tokens`, `sdk_cost_usd`) of a failed or cancelled run is kept in `runs.runtime_state` of that run (`RunFailed.runtime_state`, optional, so the contract stays compatible), and the next run starts from the newest chat run that has a state. The state of a failed run has the session of the last completed run, so the conversation is never the failed one. A run that the worker stops after the cancel grace period has no result and keeps no baseline: the next run can count that work again (only its cost and the tokens of a compaction; a normal turn counts its own tokens). |
+| A22 | The tool name of a transcript entry is never cut in the runner. A name over 200 characters makes the tool-call entry stay out whole (`omitted` counts it). A real tool name is much shorter, so the cost is a marker for a name that is not real. |
+| A23 | Background review creation does not take the org rate lock. It never waits for it, so it cannot close a lock cycle with the enqueue paths, and it is no user message (it does not count for the rate limit). Taking the lock would put the completion of every run of an org in a sequence. |
+| A13 | The PreCompact hook and the compact boundary behave as the CLI of `claude-agent-sdk==0.2.184` documents. They are not checked against a live model in M2.6 (no key in the test environment). A live check is in the nightly conformance job when a key exists. |
+
+**Limits and gaps.**
+
+- Pins are not injected again in the middle of a run after an automatic compaction. The next
+  message carries them. A pin is also not a file: only text and messages can be pinned.
+- An agent cannot pin by itself. A pin is an action of a user. An agent tool for it needs the
+  review rule of Section 9.4, and it is later work.
+- A user who unpins a text keeps it in the runtime transcript until the next compaction.
+- An archive row has no foreign key cascade to the live session: an archive session stays
+  until the org is deleted.
+- The archive is cut for very long sessions. The row shows `archive_truncated`.
+- No live test of `/compact` and of the hook ran against the real Claude API.
+- No product registers a deferred tool. The code path is covered by tests with fake tools.
 
 ---
 
@@ -717,7 +1032,10 @@ Rules:
   a web chat, or an extension tab. `/new` starts a new session in the same binding.
 - **Resume** uses the runtime's resume (Section 5.3) and the session sandbox.
 - **Lineage**: compaction, `/branch`, `/retry`, and delegation create child sessions linked to
-  the parent. Nothing is overwritten.
+  the parent. Nothing is overwritten. Since M2.6 a compaction makes an archive session
+  (`lineage = compaction`, the status `archived`) that holds the transcript from before the
+  compaction (Section 6.3). `/new` after `/model` makes a `branch`. `retry` and `delegation`
+  come later.
 - **Cross-channel continuity**: a user can continue a session from another channel with
   `/resume <id>` or a session link.
 - **Search**: `session_search` uses Postgres full-text search plus pgvector embeddings,
@@ -1363,7 +1681,7 @@ name) is written. The review must propose again.
 | `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Sama MCP (Composio, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment` through the sama GitHub App. Since M1.16: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15) | Sama MCP |
-| `tool_search` | `tool_search`, `tool_describe`, `tool_call` | Sama MCP |
+| `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, vision,
@@ -1371,7 +1689,8 @@ clarify; for webhook triggers), and `cron` (like `assistant` but no `cron` and n
 A profile also has a **group set**: the toolsets that a chat run in a shared session uses
 (Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`, and
 `media`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`, `browser`,
-`workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`.
+`workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The default
+profile of the first org has `tool_search` since migration `0018` (M2.6).
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -1470,7 +1789,8 @@ gets one notice per change.
   example `GMAIL_SEND_EMAIL`). If a name is longer than 64 characters, sama shortens it and
   adds a short hash. Each connection is also a toolset `conn-<connection>`.
 - Connector tools are deferred behind `tool_search` by default. An agent profile can pin a
-  connection so that its tools are always visible.
+  connection so that its tools are always visible. The mechanism is in M2.6: a connector
+  registers its tools in the `DeferredCatalog`, each with a toolset (Section 6.3).
 - Admins can include or exclude tools per connection, as in Hermes per-server filters.
 
 **Who can use a connection**
@@ -1702,9 +2022,13 @@ cross-org check of Section 17.1 through the API.
 | `GET /config` | The Supabase URL and the public anon key, for the web page. |
 | `GET /me` | The orgs, workspaces, and agent profiles that the user can see. |
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
-| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. |
+| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id`). At most 32,000 characters. `429` over a rate limit. `409` for an archived session. |
+| `POST /sessions/{id}/compact` | Queue a `/compact` run (`202` with `run_id`). The body is optional: `focus`, at most 6,000 characters. `409` if the session is busy, not active, or has nothing to compact. `429` over a rate limit (Section 6.3, M2.6). |
+| `GET /sessions/{id}/compactions` | The compactions of the session, newest first: `trigger`, token counts, the archive session, `completed_at`. |
+| `GET /sessions/{id}/lineage` | The ancestors and the children of the session. A linked session that the user cannot read is not in the answer. |
+| `GET`, `POST /sessions/{id}/pins`, `DELETE /sessions/{id}/pins/{pin_id}` | The context pins of the session. `POST` takes `text` or `message_id`. `409` for a full session or a message that is not in the session (Section 6.3). |
 | `GET /sessions/{id}/events` | Server-sent events (below). |
 | `POST /runs/{id}/cancel` | `RunQueue.cancel`. |
 | `GET /sessions/{id}/approvals` | The pending approvals. |
@@ -1835,7 +2159,9 @@ channel hint in the volatile prompt tier (Section 6.1).
 **Commands.** `/new` starts a new session with the same profile. `/stop` cancels the open runs
 of the session. `/model` lists the profiles of the workspace. `/model <name>` starts a child
 session (`lineage = branch`) with that profile and binds the chat to it. `/help` lists the
-commands.
+commands. Since M2.6, `/compact [focus]` makes the context of the session shorter (it follows
+the busy rule of Section 6.3 and answers with the token counts), and `/pin <text>`, `/pins`,
+and `/unpin <number>` manage the context pins. They work in direct chats and in linked groups.
 
 **Outbound.** For each run the gateway reads the run status and then the new `run_events`.
 Text deltas go into one reply message that the gateway edits at most once in 1.5 seconds.
@@ -2002,7 +2328,8 @@ answer that only the sender sees.
   message that only the sender sees;
 - `/sama new` (direct messages; it takes the lock of the direct message, so a message at the
   same time cannot bind another session), `/sama stop` (the direct message, or all threads of the
-  channel), `/sama pair CODE`, and `/sama help`;
+  channel), `/sama pair CODE`, and `/sama help`. Since M2.6, `/sama compact [focus]`,
+  `/sama pin TEXT`, `/sama pins`, and `/sama unpin NUMBER` work in direct messages (Section 6.3);
 - the gateway escapes `&`, `<`, and `>` in all text that it sends, so the text of a model
   cannot mention people or channels. Approval cards use `plain_text` blocks;
 - before each send it checks the link again, as the Telegram gateway does (Section 11.3).
@@ -2547,6 +2874,39 @@ of `runs.budget` and the budget of the agent profile, for `max_tokens` and `max_
   process in the sandbox can use the ticket before the model does, but only for the same tool
   and arguments that the human approved.
 
+**Deferred calls (M2.6).** `tool_call(name, arguments)` runs a tool of the `DeferredCatalog`
+(Section 6.3). The gate has no verdict for `tool_call` itself. `decide` does this:
+
+1. It checks the authority and the toolset of `tool_call`. The run needs the toolset
+   `tool_search`. A `deny` rule for `tool_call` stops every deferred call. An `allow` or `ask`
+   rule for `tool_call` does nothing more: the next steps decide.
+2. It reads the tool name and the arguments object from the arguments. Arguments that are not
+   valid (no name, a name that is not text, arguments that are not an object) give `deny`.
+3. A meta tool (`tool_search`, `tool_describe`, `tool_call`) and a tool loader (`ToolSearch`)
+   cannot be the target. `deny`.
+4. It gives the named tool the **whole gate with its own arguments**: its toolset (the toolsets
+   of deferred tools come from the catalog through `ToolsetSource`, so a profile grants a
+   deferred tool with its toolset), the hardline list, its policy rules, its default, and the
+   unattended rule. A tool that is in no toolset of the run gets `deny`.
+
+So a deferred call can never get more than a direct call of the same tool. It is not a way to
+call a tool with no rule, to skip an approval, or to reach a tool outside the run's toolsets.
+
+`GateService.check` and `screen` record, ticket, and ask for approval under the **target**:
+the `tool_calls` row, the approval card, the digest, and the ticket have the deferred tool
+name and its arguments. So the human sees `mail_send` and the real arguments, and a "always
+allow" rule is for `mail_send`. The tool server screens the `tool_call` with the arguments as
+the client sent them. The ticket of an approved call matches the target tool and its
+arguments, and only once. The tool server then looks up the target in its catalog by the same
+name: a name that the gate judged but the catalog does not know (for example with the prefix
+`mcp__sama__`) gives an error and runs nothing. A catalog tool cannot take a name that the gate
+would change (the prefix, a sama tool, a meta tool).
+
+`GateService.visible_tools` gives the tools that a run can use: the tools of its toolsets
+(group set for a shared run) minus the tools that a `deny` rule blocks. It is empty for a run
+that has no authority. `tool_search` and `tool_describe` use it. A gate that does not have it
+gives no deferred tool: the search fails closed (Section 6.3).
+
 ### 16.2 Sandbox and runner (M1.6)
 
 - One E2B sandbox per session, from the sama template `sama-runner`. It pauses when idle and
@@ -2868,6 +3228,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `session_search(query, limit)` | Searches past sessions that the run may see, by words and meaning, and returns up to 10 sessions with title, audience, times, and snippets (Section 7.1). An empty query lists the latest sessions. | A database. Without a service the tool is hidden. Meaning search needs an OpenAI key. Without one, the tool uses full text only. |
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
+| `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start. Otherwise the three tools are hidden. |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
@@ -2907,6 +3268,30 @@ their warnings. The tool gate writes the audit log rows (Section 16.1).
 
 **Gate.** With a database, the server checks each call with the tool gate and refuses a
 `deny` (Section 16.1). It still lists every tool that it can serve.
+
+**Archive endpoint (M2.6).** `POST /archive` takes a transcript before a compaction from the
+runner of the run of the token (Section 6.3). The body is JSON: `trigger`, `entries`, and `omitted`. An entry has `role` and
+either `text`, or `tool_name` and `tool_input` (a JSON value). Limits: 5,000 entries, 1 MB for an
+entry (bytes of the JSON text in UTF-8 for the whole entry), 8 MB for the body. The order of
+the checks:
+
+1. `401` without a valid run token. `503` when the server has no archive store.
+2. `ContextArchive.authorize`: `409` when the run is not running, its user cannot see the
+   session any more, the session is not active, or the run made too many archives. The server
+   has read no byte of the body at this point.
+3. `413` for a `Content-Length` or a body over the limit. `429` when 2 archives are in work
+   (`MAX_CONCURRENT_ARCHIVES`). The check is before the body is read, so a busy server holds no
+   new body.
+4. `422` for a body that is not valid: a bad field, too many entries, a value that is too large.
+   The entries are counted in a first parse in which every object becomes `0`, so a body with
+   more than 5,000 entries is refused before the model builds an entry, and it does not
+   matter how the body spells its keys.
+5. `ContextArchive.archive` checks the run again and stores the entries. `409` and `503` as
+   before. The error text of a failure is fixed, so it holds no data.
+
+`ContextArchive` redacts each entry whole (the structure of a tool input), cuts it after, and
+stores it. The runner sends the request. The sandbox needs the control plane host in its egress
+list, like the model and gate URLs.
 
 **Not in M1.8.** The Claude adapter does not yet map the native `TodoWrite` tool
 to `todo`. The search key of the org comes from the vault, with the key of the server
@@ -2949,7 +3334,7 @@ migrated schema.
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `group_toolsets` (migration `0017`), `skills`, `policy`, `budget` |
 | `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content`, `search_vector` (generated, GIN index) and `embedded_at` (migration `0014`, Section 7.1) |
-| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2) |
+| `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2), `compact` and `compact_focus` (migration `0018`, Section 6.3) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
 | `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
 | `session_bindings` | `org_id`, `workspace_id`, `session_id`, `channel`, `external_key` (unique per channel) |
@@ -2966,6 +3351,8 @@ migrated schema.
 | `memories` | The notes of one scope: `org_id`, `scope` (`agent`, `user`, `workspace`), `workspace_id`, `agent_profile_id`, `user_id`, `entries` (JSON list), `revision` (migration `0012`, Section 8.1) |
 | `message_embeddings` | One embedding for each embedded message: `org_id`, `session_id`, `message_id`, `embedding` (`vector(1536)`, HNSW index), `model` (migration `0014`, Section 7.1) |
 | `memory_revisions` | One row per memory write: `org_id`, `memory_id`, `seq`, `action`, `entries`, `session_id`, `run_id`, `author_kind`, `author_user_id`, `reason`, `reverted_to` (migration `0012`, Section 8.1) |
+| `session_compactions` | One row for each compaction of a session: `org_id`, `session_id`, `run_id`, `trigger` (`auto` or `manual`), `tokens_before`, `tokens_after`, `archive_session_id` (unique), `archive_entries`, `archive_truncated`, `completed_at` (null while the compaction is open) (migration `0018`, Section 6.3). |
+| `context_pins` | The pins of a session: `org_id`, `session_id`, `created_by_user_id`, `text` (1 to 2,000 characters), `source` (`user` or `message`), `injected_at`, `injected_run_id` (migration `0018`, Section 6.3). |
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 
 Rules:
@@ -3001,7 +3388,7 @@ Row-level security:
   - the orgs, users, and memberships of the orgs where the user is a member;
   - the workspaces and agent profiles that the user can see;
   - the sessions whose audience includes the user, and the messages, runs, run events, tool
-    calls, and bindings of those sessions;
+    calls, bindings, compactions, and pins of those sessions;
   - the audit log only as an org `owner` or `admin`;
   - the `agent` and `workspace` memory (and its revisions) of the workspaces that the user can
     see, and the `user` memory of the user's own user rows (Section 8.1).

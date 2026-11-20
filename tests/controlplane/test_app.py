@@ -117,6 +117,10 @@ async def test_the_runner_reaches_the_process_by_its_public_url(
     sandbox = plane.sandboxed._settings
     assert sandbox.model_url == "https://sama-staging.fly.dev/model"
     assert sandbox.gate_url == "https://sama-staging.fly.dev/tools/gate"
+    assert sandbox.archive_url == "https://sama-staging.fly.dev/tools/archive"
+    assert plane.tools.archive is not None
+    assert plane.tools.deferred is not None
+    assert len(plane.tools.deferred) == 0, "no product registers a deferred tool yet"
     assert sandbox.allow_out[0] == "sama-staging.fly.dev"
     assert sandbox.allow_out[-1] == "example.org"
     assert "github.com" in sandbox.allow_out

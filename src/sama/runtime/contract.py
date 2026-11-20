@@ -105,6 +105,11 @@ class Capabilities(_Frozen):
     native_file_checkpoints: bool
     resumable_sessions: bool
     mcp_client: bool
+    manual_compaction: bool = False
+    """The runtime compacts its context when a ``RunRequest`` has ``compact`` (``/compact``,
+    Section 6.3). A runtime without it fails such a request with ``INVALID_REQUEST``."""
+    compaction_archive: bool = False
+    """The runtime gives the transcript to an archiver before it compacts (Section 6.3)."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -267,14 +272,30 @@ class Budget(_Frozen):
     max_wall_time_s: float | None = Field(default=None, gt=0)
 
 
+MAX_COMPACT_FOCUS_CHARS: Final = 6_000
+"""The most text that a ``/compact`` request can give to the summary (the focus and the pins)."""
+
+
+class CompactRequest(_Frozen):
+    """Asks the runtime to compact the context of the session now, instead of it answering a
+    message (docs/architecture.md, Section 6.3)."""
+
+    focus: str = Field(default="", max_length=MAX_COMPACT_FOCUS_CHARS)
+    """What the summary must keep. Empty: the runtime decides."""
+
+
 class RunRequest(_Frozen):
     scope: RunScope
     input: str
+    """The user message. Empty for a ``compact`` request."""
     config: RunConfig
     budget: Budget = Budget()
     runtime_state: bytes | None = None
     """The opaque state that the same runtime returned at the end of the previous run of this
     session. ``None`` for the first run."""
+    compact: CompactRequest | None = None
+    """Set for a ``/compact`` run: the runtime compacts the session and sends no answer. It
+    needs ``runtime_state``, because a session with no earlier run has nothing to compact."""
 
 
 class ApprovalDecision(StrEnum):
@@ -368,9 +389,14 @@ class ToolCallFinished(_Event):
 
 
 class Compacted(_Event):
+    """The runtime compacted its context. The control plane stores the event in
+    ``session_compactions`` (Section 6.3)."""
+
     type: Literal["compacted"] = "compacted"
     tokens_before: int = Field(ge=0)
     tokens_after: int = Field(ge=0)
+    trigger: Literal["auto", "manual"] = "auto"
+    """``manual`` after a ``compact`` request, ``auto`` when the runtime decided itself."""
 
 
 class SubagentEvent(_Event):
@@ -408,6 +434,11 @@ class RunFailed(_Event):
     code: FailureCode
     message: str
     retryable: bool = False
+    runtime_state: bytes | None = None
+    """Optional. The state from which the next run of the session starts, if the runtime must
+    keep something that the failure would lose (for example, the count of cost that the runtime
+    reports for a whole session). It is not a state to resume the failed run: the conversation
+    stays the one of the last completed run. A runtime that has nothing to keep sets nothing."""
 
 
 RunEvent = Annotated[
