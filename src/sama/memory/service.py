@@ -32,6 +32,7 @@ from sama.memory.store import (
 )
 from sama.review.proposals import NewProposal, ProposalSink
 from sama.tenancy.run_token import RunTokenClaims
+from sama.vault.redact import redact
 
 
 def scope_of(
@@ -52,12 +53,20 @@ def scope_of(
 
 
 def _describe(target: Target, operations: Sequence[Operation]) -> str:
+    """One line for the person who decides. Each text is redacted in full before it is cut,
+    so a secret is never cut in the middle and shown in part. The text is not escaped
+    (``repr``), because an escape would change a secret and hide it from the redaction."""
     steps = "; ".join(
-        f"{step.action.value} {(step.content or step.old_text or '')[:80]!r}"
+        step.action.value + ' "' + _shown(step.content or step.old_text or "") + '"'
         for step in operations[:3]
     )
     more = f" and {len(operations) - 3} more" if len(operations) > 3 else ""
     return f"{target.value} memory: {steps}{more}"
+
+
+def _shown(text: str, limit: int = 80) -> str:
+    flat = " ".join(redact(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
 def action_of(operations: Sequence[Operation]) -> RevisionAction:

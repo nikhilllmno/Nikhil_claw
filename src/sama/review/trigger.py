@@ -10,7 +10,8 @@ Rules:
 - Only a completed chat run counts. A failed, a cancelled, or a review run does not count. So a
   review cannot start a review (recursion is off).
 - A session of the lineage ``delegation`` is a task of a sub-agent. It is not reviewed.
-- A profile with ``background_review = false`` is not reviewed, and its counters stay at 0.
+- A profile with ``background_review = false`` is not reviewed. Its counters and cursor stay
+  as they were, and count again when the setting is on.
 - A session has at most one waiting review. A new trigger moves the end of the range of the
   waiting review. The running review is not touched, and the session has at most one.
 - When the org or the user spent the model limit, sama does not queue a review. The counters

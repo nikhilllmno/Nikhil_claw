@@ -33,6 +33,10 @@ TRANSCRIPT_MAX_CHARS: Final = 24_000
 """The review reads at most this many characters of transcript. Older text is cut first."""
 MESSAGE_MAX_CHARS: Final = 2_000
 """One message is cut to this length in the transcript of a review."""
+TOOL_NAME_MAX_CHARS: Final = 64
+"""One tool name is cut to this length in the transcript of a review."""
+TOOLS_LINE_MAX_CHARS: Final = 400
+"""The line of the tool names of one turn has at most this many characters."""
 
 PROPOSAL_SUMMARY_MAX_CHARS: Final = 400
 

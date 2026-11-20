@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy import delete, func, insert, or_, select
+from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.types import Lifespan
 
@@ -43,6 +43,7 @@ from sama.db.models import (
     Integration,
     Message,
     Org,
+    ReviewProposal,
     Run,
     RunEvent,
     Session,
@@ -492,6 +493,10 @@ class SamaApi:
         @app.get("/sessions/{session_id}/approvals")
         async def approvals(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
             return await self._approvals(principal, session_id)
+
+        @app.get("/workspaces/{workspace_id}/review-proposals")
+        async def review_proposals(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
+            return await self.review_proposals(principal, workspace_id)
 
         @app.post("/approvals/{approval_id}/approve")
         async def approve(
@@ -1330,14 +1335,13 @@ class SamaApi:
             raise _not_found("the run does not exist") from None
         return {"status": status}
 
-    async def _decide(
-        self,
-        principal: Principal,
-        approval_id: uuid.UUID,
-        approve: bool,
-        always_allow: bool,
-        reason: str | None,
-    ) -> JSONResponse:
+    async def _approval_target(
+        self, principal: Principal, approval_id: uuid.UUID
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, str]:
+        """The org, the user row, the run, and the call id of an approval that the user may
+        decide. A user who reads the session decides here. The proposal of a background review
+        is also open to the workspace admin and the org owner, who may not read the private
+        session (Section 9.4); the gate checks their role. Raises ``404``."""
         async with as_user(self._engine, principal.auth_user_id) as connection:
             row = (
                 await connection.execute(
@@ -1346,28 +1350,151 @@ class SamaApi:
                     )
                 )
             ).one_or_none()
+            if row is not None:
+                try:
+                    access = await session_access(connection, principal, row.session_id)
+                except HTTPException as error:
+                    if error.status_code != 404:
+                        raise
+                else:
+                    return access.org_id, access.user_id, row.run_id, row.call_id
+        proposal = await self._review_approval(principal, approval_id)
+        if proposal is None:
+            raise _not_found("the approval does not exist")
+        return proposal
+
+    async def _review_approval(
+        self, principal: Principal, approval_id: uuid.UUID
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, str] | None:
+        """The approval of a review proposal in a workspace that the user sees. It reads as
+        the table owner, because the user may not read the session. It gives ids only."""
+        async with self._engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(Approval.org_id, Approval.run_id, Approval.call_id, Session.workspace_id)
+                    .join(
+                        ReviewProposal,
+                        and_(
+                            ReviewProposal.org_id == Approval.org_id,
+                            ReviewProposal.approval_id == Approval.id,
+                        ),
+                    )
+                    .join(
+                        Session,
+                        and_(Session.org_id == Approval.org_id, Session.id == Approval.session_id),
+                    )
+                    .where(Approval.id == approval_id)
+                )
+            ).one_or_none()
             if row is None:
-                raise _not_found("the approval does not exist")
-            access = await session_access(connection, principal, row.session_id)
+                return None
+            user_id = await _user_id(connection, principal, row.org_id)
+            if user_id is None:
+                return None
+            grants = await load_grants(connection, row.org_id, user_id)
+            if not grants.sees_workspace(row.workspace_id):
+                return None
+        return row.org_id, user_id, row.run_id, row.call_id
+
+    async def review_proposals(
+        self, principal: Principal, workspace_id: uuid.UUID
+    ) -> list[dict[str, Any]]:
+        """The open proposals of background reviews that the user may decide in a workspace:
+        ``agent`` and ``workspace`` scope for a workspace admin, ``org`` scope for the org
+        owner. The user need not read the session. The answer has the redacted proposal and
+        no session, run, or message (Section 9.4)."""
+        async with self._engine.connect() as connection:
+            org_id = (
+                await connection.execute(
+                    select(Workspace.org_id).where(Workspace.id == workspace_id)
+                )
+            ).scalar_one_or_none()
+            user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+            if org_id is None or user_id is None:
+                raise _not_found("the workspace does not exist")
+            grants = await load_grants(connection, org_id, user_id)
+            if not grants.sees_workspace(workspace_id):
+                raise _not_found("the workspace does not exist")
+            rows = await connection.execute(
+                select(
+                    ReviewProposal.id,
+                    ReviewProposal.kind,
+                    ReviewProposal.scope,
+                    ReviewProposal.payload,
+                    Approval.id.label("approval_id"),
+                    Approval.reason,
+                    Approval.created_at,
+                    Approval.expires_at,
+                )
+                .join(
+                    Approval,
+                    and_(
+                        Approval.org_id == ReviewProposal.org_id,
+                        Approval.id == ReviewProposal.approval_id,
+                    ),
+                )
+                .join(
+                    Session,
+                    and_(
+                        Session.org_id == ReviewProposal.org_id,
+                        Session.id == ReviewProposal.session_id,
+                    ),
+                )
+                .where(
+                    ReviewProposal.org_id == org_id,
+                    Session.workspace_id == workspace_id,
+                    ReviewProposal.status == "pending",
+                    Approval.status == "pending",
+                )
+                .order_by(Approval.created_at, Approval.id)
+            )
+            return [
+                {
+                    "id": str(row.id),
+                    "approval_id": str(row.approval_id),
+                    "kind": row.kind,
+                    "scope": row.scope,
+                    "summary": row.reason,
+                    "proposal": row.payload,
+                    "created_at": row.created_at.isoformat(),
+                    "expires_at": row.expires_at.isoformat(),
+                }
+                for row in rows
+                if (
+                    grants.org_owner
+                    if row.scope == "org"
+                    else grants.admins_workspace(workspace_id)
+                )
+            ]
+
+    async def _decide(
+        self,
+        principal: Principal,
+        approval_id: uuid.UUID,
+        approve: bool,
+        always_allow: bool,
+        reason: str | None,
+    ) -> JSONResponse:
+        org_id, user_id, run_id, call_id = await self._approval_target(principal, approval_id)
         try:
             status = await self._gate.decide_approval(
-                org_id=access.org_id,
-                run_id=row.run_id,
-                call_id=row.call_id,
-                user_id=access.user_id,
+                org_id=org_id,
+                run_id=run_id,
+                call_id=call_id,
+                user_id=user_id,
                 approve=approve,
                 always_allow=always_allow,
                 reason=reason,
             )
         except ApprovalExpiredError as error:
             # An expired approval resumes the run as a reject.
-            await self._queue.release_decided(org_id=access.org_id, run_id=row.run_id)
-            await self._apply_reviews(access.org_id, row.run_id)
+            await self._queue.release_decided(org_id=org_id, run_id=run_id)
+            await self._apply_reviews(org_id, run_id)
             return JSONResponse(status_code=409, content={"detail": str(error)})
         except ApprovalError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
-        resumed = await self._queue.release_decided(org_id=access.org_id, run_id=row.run_id)
-        await self._apply_reviews(access.org_id, row.run_id)
+        resumed = await self._queue.release_decided(org_id=org_id, run_id=run_id)
+        await self._apply_reviews(org_id, run_id)
         return JSONResponse(content={"status": status, "resumed": bool(resumed)})
 
     async def _apply_reviews(self, org_id: uuid.UUID, run_id: uuid.UUID) -> None:

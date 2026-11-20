@@ -8,7 +8,7 @@ time make two versions in sequence.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import Protocol, cast
 
@@ -35,6 +35,15 @@ class Written:
     proposed: bool = False
     """True when a background review proposed the change and a person must approve it first
     (Section 9.4). ``version`` is 0 then, and ``change`` is the action."""
+
+
+@dataclass(frozen=True, slots=True)
+class Expected:
+    """The skill that a person approved: the row and the version that the background review
+    saw (``None`` for a new skill). A write to anything else is refused (Section 9.4)."""
+
+    skill_id: uuid.UUID | None
+    version: int | None
 
 
 class SkillStore(Protocol):
@@ -107,19 +116,38 @@ class PostgresSkillStore:
                 f'A skill "{request.name}" was created at the same time. Try again.'
             ) from None
 
-    async def apply(self, actor: Actor, request: ManageRequest) -> Written:
+    async def apply(
+        self,
+        actor: Actor,
+        request: ManageRequest,
+        *,
+        expected: Expected,
+        after: Callable[[AsyncConnection], Awaitable[None]] | None = None,
+    ) -> Written:
         """Writes an approved proposal of a background review (Section 9.4). ``actor`` has
-        the roles of the person who approved it, so ``authorize`` checks them again."""
+        the roles of the person who approved it, so ``authorize`` checks them again.
+        ``request.scope`` is the scope that the person approved, and ``expected`` is the skill
+        and the version. The write is refused if the skill is another one or changed. ``after``
+        runs in the same transaction, after the write. If it raises, nothing is written."""
         try:
             async with self._engine.begin() as connection:
-                return await self._write(connection, replace(actor, review=False), request)
+                written = await self._write(
+                    connection, replace(actor, review=False), request, expected
+                )
+                if after is not None:
+                    await after(connection)
+                return written
         except IntegrityError:
             raise SkillError(
                 f'A skill "{request.name}" was created at the same time. Try again.'
             ) from None
 
     async def _write(
-        self, connection: AsyncConnection, actor: Actor, request: ManageRequest
+        self,
+        connection: AsyncConnection,
+        actor: Actor,
+        request: ManageRequest,
+        expected: Expected | None = None,
     ) -> Written:
         # The lock stops a second write to this name until this one commits.
         await connection.execute(
@@ -130,6 +158,15 @@ class PostgresSkillStore:
         docs = await load_docs(connection, actor, names=[request.name], full=True)
         builtin = self._builtin.get(request.name)
         plan = plan_write([*docs, *([builtin] if builtin else [])], actor, request)
+        if expected is not None:
+            found = plan.target
+            actual = None if found is None else (found.skill_id, int(found.version))
+            wanted = None if expected.skill_id is None else (expected.skill_id, expected.version)
+            if actual != wanted:
+                raise SkillError(
+                    f'The skill "{request.name}" changed after the background review proposed'
+                    " the change. Ask for a new proposal."
+                )
         return await self._save(connection, actor, plan, request)
 
     async def _review(
@@ -145,6 +182,7 @@ class PostgresSkillStore:
         plan = plan_write(candidates, replace(actor, workspace_admin=True, org_owner=True), request)
         if plan.scope == "user":
             return await self._write(connection, actor, request)
+        target = plan.target
         if self._proposals is None or actor.session_id is None or actor.run_id is None:
             raise SkillError("A background review cannot change a shared skill here.")
         if plan.scope not in ("workspace", "org"):
@@ -158,7 +196,13 @@ class PostgresSkillStore:
                 acting_user_id=actor.user_id,
                 kind="skill",
                 scope="workspace" if plan.scope == "workspace" else "org",
-                payload=asdict(request),
+                payload={
+                    **asdict(request),
+                    # The scope and the skill that the review saw. The approval is for them.
+                    "scope": plan.scope,
+                    "target_skill_id": None if target is None else str(target.skill_id),
+                    "target_version": None if target is None else int(target.version),
+                },
                 summary=f"{request.action} the {plan.scope} skill {request.name}"
                 + (f": {request.summary}" if request.summary else ""),
             )

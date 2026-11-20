@@ -171,6 +171,11 @@ _CANCELLED: Final = {
     "failure_code": "cancelled",
     "failure_message": "cancelled",
 }
+_REVIEW_OFF: Final = {
+    "status": "cancelled",
+    "failure_code": "cancelled",
+    "failure_message": "the background review of this profile is off",
+}
 CRASH_MESSAGE: Final = (
     "the worker stopped during the run; a tool can have run, so the run does not start again"
 )
@@ -426,6 +431,14 @@ class RunQueue:
                     row = (await connection.execute(self._candidate(full))).one_or_none()
                     if row is None:
                         return None
+                    if row.kind == "review" and not await self._review_on(connection, row.id):
+                        # A person turned the review off after it was queued (Section 9.4).
+                        await connection.execute(
+                            update(Run)
+                            .where(Run.id == row.id)
+                            .values(**_REVIEW_OFF, finished_at=func.now())
+                        )
+                        continue
                     await connection.execute(_lock("sama.queue.running", row.org_id))
                     if await self._at_limit(connection, row.org_id):
                         full.add(row.org_id)
@@ -478,7 +491,7 @@ class RunQueue:
         if full:
             conditions.append(Run.org_id.not_in(full))
         return (
-            select(Run.id, Run.org_id)
+            select(Run.id, Run.org_id, Run.kind)
             .where(*conditions)
             .order_by(case((Run.kind == "chat", 0), else_=1), Run.created_at, Run.id)
             .limit(1)
@@ -500,6 +513,25 @@ class RunQueue:
                 for row in rows
                 if row.running >= QueueLimits.from_json(row.limits).max_running_runs
             }
+
+    @staticmethod
+    async def _review_on(connection: AsyncConnection, run_id: uuid.UUID) -> bool:
+        """The setting ``background_review`` of the profile of a review run, read at claim."""
+        return bool(
+            (
+                await connection.execute(
+                    select(AgentProfile.background_review)
+                    .join(
+                        Run,
+                        and_(
+                            AgentProfile.org_id == Run.org_id,
+                            AgentProfile.id == Run.agent_profile_id,
+                        ),
+                    )
+                    .where(Run.id == run_id)
+                )
+            ).scalar_one()
+        )
 
     @staticmethod
     async def _at_limit(connection: AsyncConnection, org_id: uuid.UUID) -> bool:

@@ -14,12 +14,14 @@ from sama.memory import PostgresMemoryStore, Target
 from sama.review.apply import ReviewApplier
 from sama.runtime.contract import RunCompleted, RunRequest, TextDelta, Usage
 from sama.runtime.fake import FakeScript
+from sama.skills import ManageRequest
 from tests.api.conftest import bearer
 from tests.api.test_app import sse
 from tests.orchestrator.conftest import Tenant
 from tests.orchestrator.test_worker import Harness
-from tests.review.support import reviews
+from tests.review.support import add_member, reviews
 from tests.review.test_writes import add, start_review
+from tests.skills.helpers import md
 
 pytestmark = pytest.mark.usefixtures("tenant")
 
@@ -138,3 +140,98 @@ async def test_a_review_run_is_a_run_row_with_a_kind(engine: AsyncEngine, tenant
     async with engine.connect() as connection:
         row = (await connection.execute(select(Run).where(Run.id == review.run.run_id))).one()
     assert (row.kind, row.unattended, row.triggered_by_user_id) == ("review", True, None)
+
+
+# -- a proposal of a private session, decided by a person who cannot read the session ----------
+
+
+async def test_an_admin_decides_a_proposal_of_a_private_session_of_another_user(
+    api: SamaApi, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    review = await start_review(engine, tenant, "mine")
+    api._reviews = ReviewApplier(engine, PostgresMemoryStore(engine), review.skills)
+    await review.memory.write(review.claims, Target.WORKSPACE, [add("builds with make")], "why")
+    admin = bearer(tenant.ids["admin_auth"])
+    mine = tenant.ids["mine"]
+    # The admin cannot read the private session of mia, and sees its proposal.
+    assert (await client.get(f"/sessions/{mine}", headers=admin)).status_code == 404
+    assert (await client.get(f"/sessions/{mine}/approvals", headers=admin)).status_code == 404
+    listed = (
+        await client.get(f"/workspaces/{tenant.ids['ws']}/review-proposals", headers=admin)
+    ).json()
+    assert len(listed) == 1
+    (proposal,) = listed
+    assert (proposal["kind"], proposal["scope"]) == ("memory", "workspace")
+    assert proposal["summary"].startswith("the background review proposes")
+    assert proposal["proposal"]["operations"][0]["content"] == "builds with make"
+    assert not {"session_id", "run_id", "messages", "transcript"} & proposal.keys()
+    assert str(mine) not in str(proposal)
+    # A member who does not read the session cannot decide it. The owner of the session is
+    # a plain member and cannot decide it either.
+    member = bearer(tenant.ids["mia_auth"])
+    assert (
+        await client.get(f"/workspaces/{tenant.ids['ws']}/review-proposals", headers=member)
+    ).json() == []
+    refused = await client.post(f"/approvals/{proposal['approval_id']}/approve", headers=member)
+    assert refused.status_code == 409
+    assert "workspace admin" in refused.json()["detail"]
+    await add_member(engine, tenant, "outsider", workspace_role=None)
+    outsider = bearer(tenant.ids["outsider_auth"])
+    assert (
+        await client.get(f"/workspaces/{tenant.ids['ws']}/review-proposals", headers=outsider)
+    ).status_code == 404
+    assert (
+        await client.post(f"/approvals/{proposal['approval_id']}/approve", headers=outsider)
+    ).status_code == 404
+    assert await review.entries(Target.WORKSPACE) == ()
+    decided = await client.post(f"/approvals/{proposal['approval_id']}/approve", headers=admin)
+    assert decided.status_code == 200
+    assert decided.json()["status"] == "approved"
+    assert await review.entries(Target.WORKSPACE) == ("builds with make",)
+    assert (await review.proposal_rows())[0].status == "applied"
+    assert (await client.get(f"/sessions/{mine}", headers=admin)).status_code == 404
+    assert (
+        await client.get(f"/workspaces/{tenant.ids['ws']}/review-proposals", headers=admin)
+    ).json() == []
+
+
+async def test_a_rejection_of_a_proposal_of_a_private_session_needs_the_role(
+    api: SamaApi, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    review = await start_review(engine, tenant, "mine")
+    api._reviews = review.applier
+    await review.memory.write(review.claims, Target.AGENT, [add("no")], None)
+    (listed,) = (
+        await client.get(
+            f"/workspaces/{tenant.ids['ws']}/review-proposals",
+            headers=bearer(tenant.ids["admin_auth"]),
+        )
+    ).json()
+    denied = await client.post(
+        f"/approvals/{listed['approval_id']}/deny", headers=bearer(tenant.ids["admin_auth"])
+    )
+    assert denied.status_code == 200
+    assert (await review.proposal_rows())[0].status == "discarded"
+
+
+async def test_an_org_proposal_is_for_the_org_owner_only(
+    api: SamaApi, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    review = await start_review(engine, tenant, "mine")
+    api._reviews = ReviewApplier(engine, PostgresMemoryStore(engine), review.skills)
+    await review.skills.manage(
+        review.claims,
+        ManageRequest(action="create", name="policy", scope="org", content=md("policy")),
+    )
+    url = f"/workspaces/{tenant.ids['ws']}/review-proposals"
+    admin = bearer(tenant.ids["admin_auth"])
+    owner = bearer(tenant.ids["owner_auth"])
+    assert (await client.get(url, headers=admin)).json() == []
+    (proposal,) = (await client.get(url, headers=owner)).json()
+    assert (proposal["kind"], proposal["scope"]) == ("skill", "org")
+    refused = await client.post(f"/approvals/{proposal['approval_id']}/approve", headers=admin)
+    assert refused.status_code == 409
+    assert "org owner" in refused.json()["detail"]
+    approved = await client.post(f"/approvals/{proposal['approval_id']}/approve", headers=owner)
+    assert approved.status_code == 200
+    assert (await review.proposal_rows())[0].status == "applied"

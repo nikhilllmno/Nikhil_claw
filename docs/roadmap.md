@@ -178,8 +178,10 @@ Done: M1.1 to M1.19, M2.1 to M2.5 (below the list of M1 notes).
   unattended, and writes no message. It uses a cheap model, has only the `memory` and `skills`
   toolsets, and cannot start a review. A write to `user` scope applies. A write to `agent` or
   `workspace` scope, or a workspace or org skill, makes a proposal and an approval. A workspace
-  admin approves `agent` and `workspace` scope, and an org owner approves `org` scope. The
-  decision applies in the API and in the worker sweep. Not in M2.4: summaries, a web card for the
+  admin approves `agent` and `workspace` scope, and an org owner approves `org` scope. They do
+  not need access to the session, and list the proposals with
+  `GET /workspaces/{id}/review-proposals`. The decision applies in the API and in the worker
+  sweep, in one transaction with the write. Not in M2.4: summaries, a web card for the
   proposals (M3.2), and notes to the user after an applied write. The assumptions are in
   architecture Section 9.4.1.
 

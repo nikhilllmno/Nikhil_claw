@@ -141,8 +141,18 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("review_proposals")
-    # The old schema has no run kind. A review run must not become a chat run.
-    op.execute("DELETE FROM public.runs WHERE kind = 'review'")
+    # The old schema has no run kind. Old code would start a waiting review as a chat run, so
+    # no review stays active. A review run is not deleted: the rows of ``model_calls`` of a
+    # run go with the run (``ON DELETE CASCADE``), and the budgets of the org and the user are
+    # the sum of these rows. The old code reads the run as an ended chat run without a message.
+    op.execute("DELETE FROM public.approvals WHERE status = 'pending' AND call_id LIKE 'review:%'")
+    op.execute(
+        "UPDATE public.runs SET status = 'cancelled', failure_code = 'cancelled',"
+        " failure_message = 'the background review was removed by a downgrade',"
+        " lease_owner = NULL, lease_expires_at = NULL, pending_approval_id = NULL,"
+        " finished_at = COALESCE(finished_at, now())"
+        " WHERE kind = 'review' AND status IN ('queued', 'running', 'paused')"
+    )
     op.drop_constraint(op.f("uq_approvals_org_id_id"), "approvals", type_="unique")
     op.drop_index("ix_runs_one_queued_review_per_session", table_name="runs")
     op.drop_constraint(op.f("ck_runs_review_unattended"), "runs", type_="check")

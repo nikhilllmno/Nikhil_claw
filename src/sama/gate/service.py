@@ -607,8 +607,6 @@ class GateService:
             if row is None:
                 raise ApprovalError("the approval does not exist")
             grants = await load_grants(connection, org_id, user_id)
-            if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
-                raise ApprovalError("this user cannot decide the approval")
             proposed = (
                 await connection.execute(
                     select(ReviewProposal.scope).where(
@@ -616,9 +614,14 @@ class GateService:
                     )
                 )
             ).scalar_one_or_none()
-            if proposed is not None:
+            if proposed is None:
+                if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
+                    raise ApprovalError("this user cannot decide the approval")
+            else:
                 # The proposal of a background review changes shared memory or a shared skill
-                # (Section 9.4). Seeing the session is not enough to decide it.
+                # (Section 9.4). The role decides, and the access to the session does not: the
+                # owner of a private session may lack the role, and an admin may not read the
+                # private session. The admin sees the redacted proposal only.
                 allowed = (
                     grants.org_owner
                     if proposed == "org"

@@ -134,6 +134,49 @@ async def test_a_profile_with_the_setting_off_is_not_counted(
     assert await reviews(engine, tenant) == []
 
 
+async def test_a_queued_review_is_cancelled_when_the_setting_goes_off(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await set_counters(engine, tenant, turns=9)
+    await complete_chat(engine, tenant, queue=queue)
+    (queued,) = await reviews(engine, tenant)
+    assert queued.status == "queued"
+    await set_profile(engine, tenant, background_review=False)
+    assert await queue.claim(OWNER) is None, "the review does not run"
+    (cancelled,) = await reviews(engine, tenant)
+    assert cancelled.status == "cancelled"
+    assert cancelled.failure_code == "cancelled"
+    assert "off" in (cancelled.failure_message or "")
+    assert cancelled.finished_at is not None
+    # The next chat run is not blocked. The counters stay as they were while the setting is off.
+    run_id = await queue.enqueue(
+        org_id=tenant.org, session_id=tenant.ids["s1"], text="next", user_id=tenant.ids["mia"]
+    )
+    claimed = await queue.claim(OWNER)
+    assert claimed is not None
+    assert (claimed.kind, claimed.run_id) == ("chat", run_id)
+    before = await counters(engine, tenant)
+    assert await queue.complete(claimed, OWNER, output="x", runtime_state=None, usage=Usage())
+    assert await counters(engine, tenant) == before
+    assert len(await reviews(engine, tenant)) == 1
+
+
+async def test_a_review_runs_again_when_the_setting_is_on_again(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await set_profile(engine, tenant, background_review=False)
+    await set_counters(engine, tenant, turns=9)
+    await complete_chat(engine, tenant, queue=queue)
+    assert await reviews(engine, tenant) == []
+    await set_profile(engine, tenant, background_review=True)
+    await complete_chat(engine, tenant, queue=queue)
+    review = await queue.claim(OWNER)
+    assert review is not None
+    assert review.kind == "review"
+
+
 async def test_the_setting_is_on_by_default(engine: AsyncEngine, tenant: Tenant) -> None:
     async with engine.connect() as connection:
         from sama.db.models import AgentProfile

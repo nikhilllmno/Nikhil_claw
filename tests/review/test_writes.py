@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from sama.db.models import (
     Membership,
     ReviewProposal,
     Skill,
+    SkillVersion,
     ToolPolicy,
 )
 from sama.gate import GateStep
@@ -38,7 +40,9 @@ from sama.review.apply import ReviewApplier
 from sama.review.proposals import PostgresProposalStore
 from sama.skills import Actor, ManageRequest, PostgresSkillStore
 from sama.skills.errors import SkillError
+from sama.skills.store import Expected
 from sama.tenancy.run_token import RunTokenClaims
+from sama.vault.redact import default_redactor
 from tests.orchestrator.conftest import Tenant
 from tests.review.support import OWNER, add_member, complete_chat, set_counters, set_profile
 from tests.skills.helpers import md
@@ -195,6 +199,51 @@ async def test_shared_memory_becomes_a_proposal_and_an_approval(
             )
         ).scalars()
         assert "review.proposed" in set(actions)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "legacy-token-" + "abcdefghij" * 9,
+        'legacy "quoted"\nline\ttab ' + "0123456789" * 9,
+    ],
+    ids=["long", "escaped"],
+)
+async def test_a_proposal_summary_never_shows_a_known_secret(
+    engine: AsyncEngine, tenant: Tenant, secret: str
+) -> None:
+    review = await start_review(engine, tenant)
+    default_redactor().add(secret)
+    try:
+        await review.memory_store.change(
+            review.scope(Target.WORKSPACE),
+            lambda entries: [secret],
+            writer=Writer("agent", None, uuid.uuid4(), uuid.uuid4()),
+            action="add",
+        )
+        for operation in (
+            Operation(action=Action.REMOVE, old_text=secret),
+            Operation(action=Action.PATCH, old_text=secret, content="gone"),
+        ):
+            await review.memory.write(review.claims, Target.WORKSPACE, [operation], "why")
+        async with engine.connect() as connection:
+            texts = [
+                str(value)
+                for query in (
+                    select(Approval.reason, Approval.arguments),
+                    select(AuditEntry.details).where(AuditEntry.org_id == tenant.org),
+                    select(ReviewProposal.payload),
+                )
+                for row in (await connection.execute(query)).all()
+                for value in row
+            ]
+        blob = "\n".join(texts)
+        assert len(await review.approvals()) == 2
+        assert secret[:12] not in blob
+        assert secret[-12:] not in blob
+        assert "REDACTED" in blob.upper()
+    finally:
+        default_redactor().forget(secret)
 
 
 async def test_a_proposal_that_changes_nothing_is_not_stored(
@@ -416,12 +465,243 @@ async def test_a_proposal_that_no_longer_fits_fails_with_a_reason(
             workspace_admin=True,
         ),
         request,
+        expected=Expected(None, None),
     )
     await review.decide("admin")
     await review.applier.apply_decided()
     (proposal,) = await review.proposal_rows()
     assert proposal.status == "failed"
     assert proposal.error
+
+
+# -- atomic apply and a stale target ------------------------------------------------------------
+
+
+def _fail_once(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """The status mark of the applier fails once, after the domain write in the same
+    transaction. Returns the list of the calls."""
+    original = ReviewApplier._mark
+    calls: list[int] = []
+
+    async def mark(connection: Any, row: Any, status: str, error: str | None) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("the process stops before the commit")
+        await original(connection, row, status, error)
+
+    monkeypatch.setattr(ReviewApplier, "_mark", staticmethod(mark))
+    return calls
+
+
+async def _legacy_memory(review: Review, text: str) -> None:
+    await review.memory_store.change(
+        review.scope(Target.WORKSPACE),
+        lambda entries: [text],
+        writer=Writer("agent", None, uuid.uuid4(), uuid.uuid4()),
+        action="add",
+    )
+
+
+async def test_a_failure_after_the_memory_write_rolls_the_write_back(
+    engine: AsyncEngine, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = await start_review(engine, tenant)
+    await _legacy_memory(review, "region=us")
+    scope = review.scope(Target.WORKSPACE)
+    await review.memory.write(
+        review.claims,
+        Target.WORKSPACE,
+        [Operation(action=Action.PATCH, old_text="region=us", content="region=us-east")],
+        None,
+    )
+    await review.decide("admin")
+    revisions = len(await review.memory_store.revisions(scope, 50))
+    calls = _fail_once(monkeypatch)
+    assert await review.applier.apply_decided() == 0
+    assert await review.entries(Target.WORKSPACE) == ("region=us",)
+    assert len(await review.memory_store.revisions(scope, 50)) == revisions
+    assert (await review.proposal_rows())[0].status == "pending"
+    assert await review.applier.apply_decided() == 1
+    assert len(calls) == 2
+    assert await review.entries(Target.WORKSPACE) == ("region=us-east",), "applied exactly once"
+    assert len(await review.memory_store.revisions(scope, 50)) == revisions + 1
+    (proposal,) = await review.proposal_rows()
+    assert (proposal.status, proposal.error) == ("applied", None)
+    assert await review.applier.apply_decided() == 0
+    assert await review.entries(Target.WORKSPACE) == ("region=us-east",)
+
+
+async def _versions(engine: AsyncEngine, tenant: Tenant, name: str) -> list[tuple[str, int]]:
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            select(Skill.scope, SkillVersion.version_no)
+            .join(SkillVersion, SkillVersion.skill_id == Skill.id)
+            .where(Skill.org_id == tenant.org, Skill.name == name)
+            .order_by(Skill.scope, SkillVersion.version_no)
+        )
+        return [(row.scope, row.version_no) for row in rows]
+
+
+async def test_a_failure_after_the_skill_write_rolls_the_write_back(
+    engine: AsyncEngine, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = await start_review(engine, tenant)
+    await review.skills.manage(
+        review.claims,
+        ManageRequest(action="create", name="deploy", scope="workspace", content=md("deploy")),
+    )
+    await review.decide("admin")
+    _fail_once(monkeypatch)
+    assert await review.applier.apply_decided() == 0
+    assert await _versions(engine, tenant, "deploy") == []
+    assert (await review.proposal_rows())[0].status == "pending"
+    assert await review.applier.apply_decided() == 1
+    assert await _versions(engine, tenant, "deploy") == [("workspace", 1)]
+    assert (await review.proposal_rows())[0].status == "applied"
+    assert await review.applier.apply_decided() == 0
+    assert await _versions(engine, tenant, "deploy") == [("workspace", 1)]
+
+
+async def test_two_appliers_apply_a_proposal_once(engine: AsyncEngine, tenant: Tenant) -> None:
+    review = await start_review(engine, tenant)
+    await _legacy_memory(review, "region=us")
+    await review.memory.write(
+        review.claims,
+        Target.WORKSPACE,
+        [Operation(action=Action.PATCH, old_text="region=us", content="region=us-east")],
+        None,
+    )
+    await review.decide("admin")
+    other = ReviewApplier(engine, review.memory_store, review.skills)
+    results = await asyncio.gather(review.applier.apply_decided(), other.apply_decided())
+    assert sum(results) == 1
+    assert await review.entries(Target.WORKSPACE) == ("region=us-east",)
+    async with engine.connect() as connection:
+        applied = (
+            await connection.execute(
+                select(func.count())
+                .select_from(AuditEntry)
+                .where(AuditEntry.org_id == tenant.org, AuditEntry.action == "review.applied")
+            )
+        ).scalar_one()
+    assert applied == 1
+
+
+def _admin(tenant: Tenant, *, owner: bool = False) -> Actor:
+    return Actor(
+        org_id=tenant.org,
+        workspace_id=tenant.ids["ws"],
+        user_id=tenant.ids["owner" if owner else "admin"],
+        private=False,
+        workspace_admin=True,
+        org_owner=owner,
+    )
+
+
+async def _skill_id(engine: AsyncEngine, tenant: Tenant, scope: str, name: str) -> uuid.UUID:
+    async with engine.connect() as connection:
+        return (
+            await connection.execute(
+                select(Skill.id).where(
+                    Skill.org_id == tenant.org, Skill.scope == scope, Skill.name == name
+                )
+            )
+        ).scalar_one()
+
+
+async def test_a_stale_skill_target_fails_and_does_not_reach_another_scope(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    review = await start_review(engine, tenant)
+    # A workspace skill exists. The review proposes an edit of it.
+    await review.skills.apply(
+        _admin(tenant),
+        ManageRequest(action="create", name="deploy", scope="workspace", content=md("deploy")),
+        expected=Expected(None, None),
+    )
+    await review.skills.manage(
+        review.claims,
+        ManageRequest(
+            action="edit",
+            name="deploy",
+            content=md("deploy", body="Do it the new way."),
+        ),
+    )
+    (proposal,) = await review.proposal_rows()
+    assert proposal.payload["scope"] == "workspace"
+    assert proposal.payload["target_version"] == 1
+    # Before the approval: the workspace skill is archived, and an org skill has the name.
+    workspace_id = await _skill_id(engine, tenant, "workspace", "deploy")
+    await review.skills.apply(
+        _admin(tenant),
+        ManageRequest(action="archive", name="deploy", scope="workspace"),
+        expected=Expected(workspace_id, 1),
+    )
+    await review.skills.apply(
+        _admin(tenant, owner=True),
+        ManageRequest(action="create", name="deploy", scope="org", content=md("deploy")),
+        expected=Expected(None, None),
+    )
+    await review.decide("admin")
+    await review.applier.apply_decided()
+    (proposal,) = await review.proposal_rows()
+    assert proposal.status == "failed"
+    assert proposal.error
+    assert await _versions(engine, tenant, "deploy") == [
+        ("org", 1),
+        ("workspace", 1),
+        ("workspace", 2),
+    ]
+
+
+async def test_a_skill_that_changed_since_the_proposal_fails(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    review = await start_review(engine, tenant)
+    admin = _admin(tenant)
+    await review.skills.apply(
+        admin,
+        ManageRequest(action="create", name="deploy", scope="workspace", content=md("deploy")),
+        expected=Expected(None, None),
+    )
+    await review.skills.manage(
+        review.claims,
+        ManageRequest(action="edit", name="deploy", content=md("deploy", body="Review text.")),
+    )
+    skill = await _skill_id(engine, tenant, "workspace", "deploy")
+    await review.skills.apply(
+        admin,
+        ManageRequest(
+            action="edit", name="deploy", scope="workspace", content=md("deploy", body="A person.")
+        ),
+        expected=Expected(skill, 1),
+    )
+    await review.decide("admin")
+    await review.applier.apply_decided()
+    (proposal,) = await review.proposal_rows()
+    assert proposal.status == "failed"
+    assert "changed after" in (proposal.error or "")
+    assert await _versions(engine, tenant, "deploy") == [("workspace", 1), ("workspace", 2)]
+
+
+async def test_a_proposal_for_an_unchanged_state_still_applies(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    review = await start_review(engine, tenant)
+    admin = _admin(tenant)
+    await review.skills.apply(
+        admin,
+        ManageRequest(action="create", name="deploy", scope="workspace", content=md("deploy")),
+        expected=Expected(None, None),
+    )
+    await review.skills.manage(
+        review.claims,
+        ManageRequest(action="edit", name="deploy", content=md("deploy", body="Review text.")),
+    )
+    await review.decide("admin")
+    await review.applier.apply_decided()
+    assert (await review.proposal_rows())[0].status == "applied"
+    assert await _versions(engine, tenant, "deploy") == [("workspace", 1), ("workspace", 2)]
 
 
 async def test_the_role_is_checked_again_when_the_proposal_is_applied(
