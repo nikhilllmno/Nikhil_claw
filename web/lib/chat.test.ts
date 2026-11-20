@@ -22,6 +22,47 @@ describe("applyStreamEvent", () => {
     expect(state.text).toEqual({ r1: "Hello" });
   });
 
+  it("does not bring back the text of a run that the snapshot shows as completed", () => {
+    const delta = (text: string, seq: number) => ({
+      run_id: "r1",
+      seq,
+      type: "text_delta",
+      payload: { text },
+    });
+    let state = applyStreamEvent(initialLive, "runs", { runs: [run("r1", "completed")] }).state;
+    for (const [i, text] of ["Hel", "lo"].entries()) {
+      state = applyStreamEvent(state, "run_event", delta(text, i + 1)).state;
+    }
+    expect(state.text).toEqual({});
+    const done = applyStreamEvent(state, "run_event", {
+      run_id: "r1",
+      seq: 3,
+      type: "run_completed",
+      payload: {},
+    });
+    expect(done.effects).toEqual(["reload_messages"]);
+    expect(done.state.text).toEqual({});
+  });
+
+  it("clears the live text of a run at its terminal event", () => {
+    let state = applyStreamEvent(initialLive, "run_event", {
+      run_id: "r1",
+      seq: 1,
+      type: "text_delta",
+      payload: { text: "Hi" },
+    }).state;
+    state = applyStreamEvent(state, "run_event", {
+      run_id: "r2",
+      seq: 1,
+      type: "text_delta",
+      payload: { text: "Other" },
+    }).state;
+    for (const type of ["run_completed", "run_failed"]) {
+      const ended = applyStreamEvent(state, "run_event", { run_id: "r1", seq: 2, type, payload: {} });
+      expect(ended.state.text).toEqual({ r2: "Other" });
+    }
+  });
+
   it("tracks tool calls from start to finish", () => {
     let state = initialLive;
     state = applyStreamEvent(state, "run_event", {

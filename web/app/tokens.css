@@ -38,6 +38,7 @@
   --radius-lg: 1rem;
   --radius-full: 999px;
   --border-width: 1px;
+  --border-width-accent: 3px;
 
   /* Layout */
   --sidebar-width: 18rem;
@@ -45,6 +46,8 @@
   --content-max: 46rem;
   --settings-max: 52rem;
   --touch-target: 2.5rem;
+  --code-inline-padding: 0.1em 0.35em;
+  --code-inline-size: 0.9em;
   --z-sticky: 10;
   --z-drawer: 40;
   --z-overlay: 30;

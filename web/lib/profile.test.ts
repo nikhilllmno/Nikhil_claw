@@ -28,7 +28,16 @@ const profile: AgentProfile = {
     toolsets: [],
     models: ["claude-sonnet-5-5"],
     subagents: true,
-    limits: { soul_max_chars: 20000, subagent_name_pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$", subagent_max_turns: 50 },
+    limits: {
+      name_max_chars: 80,
+      soul_max_chars: 20000,
+      max_subagents: 10,
+      subagent_name_max_chars: 40,
+      subagent_name_pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+      subagent_description_max_chars: 400,
+      subagent_prompt_max_chars: 20000,
+      subagent_max_turns: 50,
+    },
   },
 };
 

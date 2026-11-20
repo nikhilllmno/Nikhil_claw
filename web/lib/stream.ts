@@ -2,7 +2,7 @@
 // cursor (`after`), so no event is lost or shown twice.
 
 import type { ApiClient } from "./api";
-import { ApiError } from "./api";
+import { ApiError, errorText } from "./api";
 import { eventJson, SseParser } from "./sse";
 
 export interface StreamOptions {
@@ -84,7 +84,7 @@ export async function runEventStream(options: StreamOptions): Promise<void> {
         onConnection?.(false, error.message);
         return; // The client signed the user out.
       }
-      onConnection?.(false, error instanceof Error ? error.message : "The event stream failed.");
+      onConnection?.(false, errorText(error, "The event stream failed."));
     }
     await wait(backoff(attempt), signal);
     attempt += 1;

@@ -39,10 +39,16 @@ export interface AuthDeps {
   onChange?: (tokens: Tokens | null) => void;
 }
 
+interface TokenData {
+  access_token?: unknown;
+  refresh_token?: unknown;
+  expires_in?: unknown;
+}
+
 export class AuthSession implements TokenSource {
   private tokens: Tokens | null = null;
   private inflight: Promise<string | null> | null = null;
-  /** Grows at each sign-out, so that a late answer for the old user is dropped. */
+  /** Grows at each sign-out and each new sign-in, so that a late answer for the old user is dropped. */
   private epoch = 0;
   private readonly fetcher: FetchLike;
   private readonly now: () => number;
@@ -77,7 +83,19 @@ export class AuthSession implements TokenSource {
     return this.tokens;
   }
 
-  private store(data: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown }) {
+  /** Changes when the account changes (sign-out or a new sign-in), not at a token refresh. */
+  get generation(): number {
+    return this.epoch;
+  }
+
+  /** A sign-in starts a new generation: the answers that wait for the old one are dropped. */
+  private signedIn(data: TokenData) {
+    this.epoch += 1;
+    this.inflight = null;
+    this.store(data);
+  }
+
+  private store(data: TokenData) {
     if (typeof data.access_token !== "string" || data.access_token === "") {
       throw new AuthError("Sign-in failed.");
     }
@@ -108,7 +126,7 @@ export class AuthSession implements TokenSource {
   }
 
   async signInWithPassword(email: string, password: string): Promise<void> {
-    this.store(await this.auth("token?grant_type=password", { email, password }));
+    this.signedIn(await this.auth("token?grant_type=password", { email, password }));
   }
 
   /** Asks Supabase to email a sign-in link that comes back to `redirectTo` with a `code`. */
@@ -130,19 +148,19 @@ export class AuthSession implements TokenSource {
         "This sign-in link is not from this browser, or it is too old. Ask for a new link.",
       );
     }
-    this.store(await this.auth("token?grant_type=pkce", { auth_code: code, code_verifier: verifier }));
+    this.signedIn(await this.auth("token?grant_type=pkce", { auth_code: code, code_verifier: verifier }));
   }
 
   /** Uses an access token that the user pastes (development). It cannot refresh. */
   useAccessToken(token: string): void {
-    this.store({ access_token: token.trim(), expires_in: 3600 });
+    this.signedIn({ access_token: token.trim(), expires_in: 3600 });
   }
 
   async getToken(): Promise<string> {
     const tokens = this.tokens;
     if (tokens === null) throw new AuthError("Sign in first.");
     if (tokens.refresh_token !== null && this.now() > tokens.expires_at - REFRESH_MARGIN_MS) {
-      const token = await this.refresh();
+      const token = await this.refresh(this.epoch);
       if (token === null) throw new AuthError("Your sign-in ended. Sign in again.");
       return token;
     }
@@ -150,7 +168,8 @@ export class AuthSession implements TokenSource {
   }
 
   /** One refresh at a time: calls that overlap share the same answer. */
-  refresh(): Promise<string | null> {
+  refresh(generation: number): Promise<string | null> {
+    if (generation !== this.epoch) return Promise.resolve(null);
     if (this.inflight !== null) return this.inflight;
     const refreshToken = this.tokens?.refresh_token ?? null;
     if (refreshToken === null) {
@@ -170,15 +189,18 @@ export class AuthSession implements TokenSource {
         if (epoch === this.epoch) this.signOut();
         return null;
       } finally {
-        this.inflight = null;
+        if (epoch === this.epoch) this.inflight = null;
       }
     };
     this.inflight = run();
     return this.inflight;
   }
 
-  signOut(): void {
+  /** Signs out. With `generation`: only if it is the current one. */
+  signOut(generation?: number): void {
+    if (generation !== undefined && generation !== this.epoch) return;
     this.epoch += 1;
+    this.inflight = null;
     this.tokens = null;
     this.deps.session.removeItem(AUTH_KEY);
     this.deps.onChange?.(null);

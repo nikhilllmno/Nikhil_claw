@@ -2106,7 +2106,8 @@ origins, for example `https://sama-web.vercel.app,http://localhost:3000`:
 - With the setting, the API answers a preflight request from a listed origin. It allows the
   methods `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`, the headers `Authorization`,
   `Content-Type`, and `Last-Event-ID`, and caches the answer for 600 seconds. It never allows
-  credentials. The event stream and error answers have the CORS header, too.
+  credentials. The event stream and error answers have the CORS header, too, also the answer
+  to an unhandled error (`500`): the CORS layer is outside the layer that makes that answer.
 - Without the setting (the default), the API sends no CORS header. The page at `/` does not
   need CORS, because it has the same origin as the API.
 - `sama.api.__main__` and `sama.controlplane` both read the setting.
@@ -2148,8 +2149,18 @@ The rules of an update:
   writes nothing.
 - The read goes through the same guards as the session routes (code and RLS). The write uses
   the table owner, as the other writes do, after the code checked the role.
-- A session keeps the config that it froze. A change applies from the next session. The web app
-  shows this note.
+- A session keeps the soul, the model, and the sub-agents that it froze. A change to them
+  applies from the next session. The gate reads the toolsets of the profile on every tool call,
+  so a change to the toolsets applies at the next tool call, also in a session that is running.
+  This keeps a revoked toolset immediate (Section 5.1). The web app shows this note.
+- A change to the soul or to the sub-agents needs a redactor that knows every secret of the org,
+  as `python -m sama.admin subagents set` does (`sama.vault.standalone.know_the_secrets`). It
+  fails closed with `503`, and the message has no secret, when the org has vault entries but the
+  process has no `SAMA_VAULT_KEY`, or when the vault cannot be read or an entry does not decrypt.
+  A change to the name, the model, or the toolsets does not need it.
+- The write checks the role again after it locks the profile row, and it locks the membership
+  row of the admin (`FOR SHARE`) until the end of the transaction. An admin who loses the role
+  while the write waits for the lock gets `403`, and nothing is written.
 
 In-place edits by an admin are the M3.8 interim. When `change_propose` (M6.1) exists, a change
 to a profile goes through an approval card, and the history and the revert are in the web app.

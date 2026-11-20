@@ -3,24 +3,16 @@
 // The data that every signed-in screen needs: the orgs, workspaces, and agents of the user
 // (`GET /me`), the session list, and the workspace that the sidebar shows.
 
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import { createContext, useCallback, useContext, useMemo, useState } from "react";
 import type { AgentProfileSummary, Me, Org, SessionOut } from "@/lib/api";
 import { useApi } from "./AuthProvider";
+import { useLoad } from "./useLoad";
 
 const WORKSPACE_KEY = "sama.workspace";
 
 export interface WorkspaceChoice {
   id: string;
   name: string;
-  orgId: string;
-  orgName: string;
   /** Name with the org, when the user has more than one org. */
   label: string;
 }
@@ -52,50 +44,19 @@ export function useData(): Data {
 
 export function DataProvider({ children }: { children: React.ReactNode }) {
   const api = useApi();
-  const [me, setMe] = useState<Me | null>(null);
-  const [meError, setMeError] = useState<string | null>(null);
-  const [sessions, setSessions] = useState<SessionOut[] | null>(null);
-  const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [meTick, setMeTick] = useState(0);
-  const [sessionsTick, setSessionsTick] = useState(0);
-
-  useEffect(() => {
-    let live = true;
-    api
-      .me()
-      .then((loaded) => {
-        if (!live) return;
-        setMe(loaded);
-        setMeError(null);
-      })
-      .catch((error: unknown) => {
-        if (live) setMeError(error instanceof Error ? error.message : "Could not load your account.");
-      });
-    return () => {
-      live = false;
-    };
-  }, [api, meTick]);
-
-  useEffect(() => {
-    let live = true;
-    api
-      .listSessions()
-      .then((loaded) => {
-        if (!live) return;
-        setSessionsError(null);
-        // The archive of a compacted transcript is not a session to open from the list.
-        setSessions(loaded.filter((s) => s.lineage !== "compaction"));
-      })
-      .catch((error: unknown) => {
-        if (live) {
-          setSessionsError(error instanceof Error ? error.message : "Could not load sessions.");
-        }
-      });
-    return () => {
-      live = false;
-    };
-  }, [api, sessionsTick]);
+  const loadMe = useCallback(() => api.me(), [api]);
+  // The archive of a compacted transcript is not a session to open from the list.
+  const loadSessions = useCallback(
+    async () => (await api.listSessions()).filter((s) => s.lineage !== "compaction"),
+    [api],
+  );
+  const { data: me, error: meError, reload: reloadMe } = useLoad(loadMe, "Could not load your account.");
+  const {
+    data: sessions,
+    error: sessionsError,
+    reload: reloadSessions,
+  } = useLoad(loadSessions, "Could not load sessions.");
 
   const workspaces = useMemo<WorkspaceChoice[]>(() => {
     const orgs = me?.orgs ?? [];
@@ -103,8 +64,6 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
       org.workspaces.map((w) => ({
         id: w.id,
         name: w.name,
-        orgId: org.id,
-        orgName: org.name,
         label: orgs.length > 1 ? `${org.name} / ${w.name}` : w.name,
       })),
     );
@@ -149,8 +108,8 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
       profilesFor,
       orgOfWorkspace,
       orgOfProfile,
-      reloadMe: () => setMeTick((n) => n + 1),
-      reloadSessions: () => setSessionsTick((n) => n + 1),
+      reloadMe,
+      reloadSessions,
     }),
     [
       me,
@@ -163,6 +122,8 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
       profilesFor,
       orgOfWorkspace,
       orgOfProfile,
+      reloadMe,
+      reloadSessions,
     ],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;

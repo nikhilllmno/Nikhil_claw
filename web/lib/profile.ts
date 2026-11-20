@@ -1,6 +1,6 @@
 // The draft of the agent settings form and its change to a PATCH body.
 
-import type { AgentProfile, AgentProfilePatch, Subagent } from "./api";
+import type { AgentProfile, AgentProfileLimits, AgentProfilePatch, Subagent } from "./api";
 
 export interface DraftSubagent {
   /** A key for React. It is not sent. */
@@ -83,15 +83,15 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
 }
 
 /** The first problem that the browser can see before it sends the form, or `null`. */
-export function validateDraft(draft: Draft, limits: AgentProfile["options"]["limits"]): string | null {
+export function validateDraft(draft: Draft, limits: AgentProfileLimits): string | null {
   if (draft.name.trim() === "") return "The agent needs a name.";
-  if (limits.name_max_chars !== undefined && draft.name.trim().length > limits.name_max_chars) {
+  if (draft.name.trim().length > limits.name_max_chars) {
     return `The name has at most ${limits.name_max_chars} characters.`;
   }
-  if (limits.soul_max_chars !== undefined && draft.soul.length > limits.soul_max_chars) {
+  if (draft.soul.length > limits.soul_max_chars) {
     return `The soul has at most ${limits.soul_max_chars.toLocaleString()} characters.`;
   }
-  const pattern = limits.subagent_name_pattern ? safeRegExp(limits.subagent_name_pattern) : null;
+  const pattern = safeRegExp(limits.subagent_name_pattern);
   const names = new Set<string>();
   for (const [index, sub] of draft.subagents.entries()) {
     const label = sub.name.trim() || `Sub-agent ${index + 1}`;
@@ -106,8 +106,8 @@ export function validateDraft(draft: Draft, limits: AgentProfile["options"]["lim
     const turns = sub.maxTurns.trim();
     if (turns !== "") {
       const n = Number(turns);
-      if (!Number.isInteger(n) || n < 1 || (limits.subagent_max_turns !== undefined && n > limits.subagent_max_turns)) {
-        return `${label}: max turns is a whole number from 1 to ${limits.subagent_max_turns ?? "the limit"}.`;
+      if (!Number.isInteger(n) || n < 1 || n > limits.subagent_max_turns) {
+        return `${label}: max turns is a whole number from 1 to ${limits.subagent_max_turns}.`;
       }
     }
   }

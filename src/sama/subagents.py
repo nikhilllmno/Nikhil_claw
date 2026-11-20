@@ -276,7 +276,6 @@ class LockedProfile(NamedTuple):
     runtime: RuntimeKind
     model: str
     toolsets: list[str]
-    group_toolsets: list[str]
     subagents: Any
     workspace_id: uuid.UUID | None
 
@@ -296,7 +295,6 @@ async def lock_profile(
                 AgentProfile.runtime,
                 AgentProfile.model,
                 AgentProfile.toolsets,
-                AgentProfile.group_toolsets,
                 AgentProfile.subagents,
                 AgentProfile.workspace_id,
             )
@@ -312,9 +310,6 @@ async def lock_profile(
         runtime=RuntimeKind(row.runtime),
         model=row.model,
         toolsets=[str(t) for t in row.toolsets] if isinstance(row.toolsets, list) else [],
-        group_toolsets=(
-            [str(t) for t in row.group_toolsets] if isinstance(row.group_toolsets, list) else []
-        ),
         subagents=row.subagents,
         workspace_id=row.workspace_id,
     )

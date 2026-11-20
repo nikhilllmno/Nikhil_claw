@@ -73,7 +73,7 @@ describe("AuthSession", () => {
       .mockResolvedValueOnce(reply({ msg: "Invalid Refresh Token" }, 400));
     const { auth, session } = make(fetcher);
     await auth.signInWithPassword("a@b.c", "pw");
-    expect(await auth.refresh()).toBeNull();
+    expect(await auth.refresh(auth.generation)).toBeNull();
     expect(session.getItem(AUTH_KEY)).toBeNull();
     expect(auth.current).toBeNull();
   });

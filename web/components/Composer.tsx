@@ -15,19 +15,9 @@ interface Props {
   running: boolean;
   stopping: boolean;
   onStop: () => void;
-  disabled?: boolean;
 }
 
-export function Composer({
-  value,
-  onChange,
-  onSend,
-  sending,
-  running,
-  stopping,
-  onStop,
-  disabled = false,
-}: Props) {
+export function Composer({ value, onChange, onSend, sending, running, stopping, onStop }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
 
   // The field grows with the text, up to the CSS max-height.
@@ -38,7 +28,7 @@ export function Composer({
     field.style.height = `${field.scrollHeight}px`;
   }, [value]);
 
-  const canSend = !disabled && !sending && value.trim() !== "";
+  const canSend = !sending && value.trim() !== "";
   const nearLimit = value.length > MAX_MESSAGE_CHARS * 0.9;
 
   return (
@@ -60,7 +50,6 @@ export function Composer({
         value={value}
         maxLength={MAX_MESSAGE_CHARS}
         placeholder="Message the agent"
-        disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {

@@ -94,6 +94,10 @@ export function applyStreamEvent(
   const payload = event.payload ?? {};
   switch (event.type) {
     case "text_delta": {
+      // A run that the view knows as ended has its reply in the messages. Replayed deltas
+      // (after a reconnect) must not bring its live text back.
+      const known = state.runs[event.run_id];
+      if (known !== undefined && !OPEN_RUN_STATUSES.has(known.status)) return { state, effects };
       const text = typeof payload.text === "string" ? payload.text : "";
       return {
         state: { ...state, text: { ...state.text, [event.run_id]: (state.text[event.run_id] ?? "") + text } },
@@ -134,7 +138,7 @@ export function applyStreamEvent(
     case "run_completed":
     case "run_failed":
       effects.push("reload_messages");
-      return { state, effects };
+      return { state: { ...state, text: dropRunText(state, event.run_id) }, effects };
     default:
       return { state, effects };
   }

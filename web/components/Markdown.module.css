@@ -44,11 +44,11 @@
 }
 
 .markdown code {
-  padding: 0.1em 0.35em;
+  padding: var(--code-inline-padding);
   border-radius: var(--radius-sm);
   background: var(--code-bg);
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: var(--code-inline-size);
 }
 
 .markdown pre {
@@ -68,7 +68,7 @@
 
 .markdown blockquote {
   padding-left: var(--space-4);
-  border-left: 3px solid var(--border-strong);
+  border-left: var(--border-width-accent) solid var(--border-strong);
   color: var(--text-muted);
 }
 

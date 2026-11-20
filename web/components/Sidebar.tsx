@@ -9,7 +9,18 @@ import { useAuth } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import styles from "./Sidebar.module.css";
 
-export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function Sidebar({
+  open,
+  modal,
+  onClose,
+  ref,
+}: {
+  open: boolean;
+  /** The sidebar is an open drawer: a dialog that holds the focus. */
+  modal: boolean;
+  onClose: () => void;
+  ref: React.Ref<HTMLElement>;
+}) {
   const pathname = usePathname();
   const { signOut } = useAuth();
   const {
@@ -39,7 +50,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const activeSession = pathname.startsWith("/s/") ? pathname.slice(3) : null;
 
   return (
-    <aside id="sidebar" className={`${styles.sidebar} ${open ? styles.open : ""}`} aria-label="Sidebar">
+    <aside
+      ref={ref}
+      id="sidebar"
+      className={`${styles.sidebar} ${open ? styles.open : ""}`}
+      aria-label="Sidebar"
+      role={modal ? "dialog" : undefined}
+      aria-modal={modal || undefined}
+    >
       <div className={styles.head}>
         <Link href="/" className={styles.brand}>
           sama

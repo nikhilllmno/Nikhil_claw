@@ -4,7 +4,9 @@
 profile in one transaction. It writes one audit entry with the names of the changed fields and
 the names of the sub-agents, never the text of the soul or of a prompt.
 
-A session keeps the config that it froze, so a change applies from the next session.
+A session keeps the soul, the model, and the sub-agents that it froze, so those changes apply
+from the next session. The gate reads the toolsets on every tool call, so a change to the
+toolsets applies at the next tool call, also in a session that is running.
 
 This is the M3.8 interim. A change to a profile will go through ``change_propose`` (M6.1) when
 that tool exists.
@@ -17,10 +19,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
-from sqlalchemy import func, insert, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import AgentProfile, AuditEntry
+from sama.db.models import AgentProfile, AuditEntry, Membership
 from sama.gate.decide import TOOLSETS
 from sama.runtime.contract import (
     SUBAGENT_DESCRIPTION_MAX_CHARS,
@@ -39,6 +41,7 @@ from sama.subagents import (
     supports_subagents,
     validate_subagents,
 )
+from sama.tenancy.access import ADMIN_ROLES
 from sama.vault.redact import redact
 
 NAME_MAX_CHARS: Final = 80
@@ -47,6 +50,10 @@ SOUL_MAX_CHARS: Final = 20_000
 
 class ProfileError(ValueError):
     """The change is not valid. The text is safe to show to the caller."""
+
+
+class NotAdminError(Exception):
+    """The actor is not an org owner or admin any more when the write runs."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,13 +105,16 @@ async def update_profile(
     changes: ProfileChanges,
     *,
     actor_user_id: uuid.UUID,
-) -> list[str]:
-    """Applies the changes and writes the audit entry. Returns the names of the changed fields.
+) -> None:
+    """Applies the changes and writes the audit entry.
 
     A field with the value that the profile has now is not a change. Without a change, the
     function writes nothing. Raises ``ProfileError`` when a value is not valid, and
     ``SubagentError`` when the profile does not exist or the sub-agents do not fit the profile
     after the change (for example, a toolset that a sub-agent uses is not in the new toolsets).
+    Raises ``NotAdminError`` when the actor is not an org owner or admin at the time of the
+    write: the caller checked the role earlier, and the role can change while the write waits
+    for the lock of the profile.
     """
     soul = changes.soul
     if soul is not None:
@@ -117,7 +127,23 @@ async def update_profile(
 
     async with engine.begin() as connection:
         profile = await lock_profile(connection, org_id, profile_id)
+        # Checked after the lock of the profile, and the share lock keeps the membership until
+        # the end of the transaction, so a demotion that is waiting cannot slip in before the
+        # write.
+        admin = await connection.execute(
+            select(Membership.id)
+            .where(
+                Membership.org_id == org_id,
+                Membership.user_id == actor_user_id,
+                Membership.workspace_id.is_(None),
+                Membership.role.in_(ADMIN_ROLES),
+            )
+            .with_for_update(read=True)
+        )
+        if admin.first() is None:
+            raise NotAdminError
         values: dict[str, Any] = {}
+        subagent_names: list[str] = []
         if changes.name is not None and changes.name != profile.name:
             values["name"] = changes.name
         if soul is not None and soul != profile.soul:
@@ -142,16 +168,17 @@ async def update_profile(
             validate_subagents(
                 specs, toolsets=values.get("toolsets", profile.toolsets), runtime=profile.runtime
             )
-            if subagents_value(specs) != profile.subagents:
-                values["subagents"] = subagents_value(specs)
+            value = subagents_value(specs)
+            if value != profile.subagents:
+                values["subagents"] = value
+                subagent_names = [spec.name for spec in specs]
         if not values:
-            return []
+            return
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .values(**values, updated_at=func.now())
         )
-        fields = sorted(values)
         await connection.execute(
             insert(AuditEntry).values(
                 org_id=org_id,
@@ -162,11 +189,8 @@ async def update_profile(
                 target_type="agent_profile",
                 target_id=str(profile_id),
                 details={
-                    "fields": fields,
-                    "subagents": [spec.name for spec in specs or ()]
-                    if "subagents" in values
-                    else [],
+                    "fields": sorted(values),
+                    "subagents": subagent_names,
                 },
             )
         )
-    return fields

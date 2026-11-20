@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import type { AgentProfile } from "@/lib/api";
+import { type AgentProfile, errorText } from "@/lib/api";
 import {
   type Draft,
   type DraftSubagent,
@@ -14,32 +14,29 @@ import {
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import { ErrorState, LoadingState } from "./ui";
+import { useLoad } from "./useLoad";
 import styles from "./AgentSettings.module.css";
 
-const DEFAULT_MAX_SUBAGENTS = 10;
-const DEFAULT_SOUL_MAX = 20_000;
+/** `list` with `value` in it, so that a select shows a value that the options do not have. */
+function withCurrent(list: string[], value: string): string[] {
+  return value === "" || list.includes(value) ? list : [value, ...list];
+}
 
 export function AgentSettings({ profileId }: { profileId: string }) {
   const api = useApi();
   const { me, meError, reloadMe, orgOfProfile } = useData();
   const org = orgOfProfile(profileId);
-  const [profile, setProfile] = useState<AgentProfile | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
-
-  useEffect(() => {
-    if (org === null) return;
-    let live = true;
-    api
-      .getAgentProfile(org.id, profileId)
-      .then((loaded) => live && setProfile(loaded))
-      .catch((e: unknown) => {
-        if (live) setLoadError(e instanceof Error ? e.message : "Could not load the agent.");
-      });
-    return () => {
-      live = false;
-    };
-  }, [api, org, profileId, tick]);
+  const orgId = org?.id ?? null;
+  const loadProfile = useMemo(
+    () => (orgId === null ? null : () => api.getAgentProfile(orgId, profileId)),
+    [api, orgId, profileId],
+  );
+  const {
+    data: profile,
+    setData: setProfile,
+    error: loadError,
+    reload,
+  } = useLoad(loadProfile, "Could not load the agent.");
 
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the agent" />;
@@ -52,13 +49,7 @@ export function AgentSettings({ profileId }: { profileId: string }) {
     );
   }
   if (loadError) {
-    return (
-      <ErrorState title="The agent did not load" message={loadError} onRetry={() => {
-          setLoadError(null);
-          setTick((n) => n + 1);
-        }}
-      />
-    );
+    return <ErrorState title="The agent did not load" message={loadError} onRetry={reload} />;
   }
   if (profile === null) return <LoadingState label="Loading the agent" />;
   return (
@@ -89,7 +80,8 @@ function SettingsForm({
   const [draft, setDraft] = useState<Draft>(() => toDraft(profile));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
+  // The draft that the last save made. The form shows "Saved" only while it is the draft.
+  const [savedDraft, setSavedDraft] = useState<Draft | null>(null);
 
   const patch = useMemo(() => diffDraft(profile, draft), [profile, draft]);
   const dirty = Object.keys(patch).length > 0;
@@ -97,8 +89,8 @@ function SettingsForm({
 
   const edit = useCallback((change: Partial<Draft>) => {
     setDraft((d) => ({ ...d, ...change }));
-    setSaved(false);
   }, []);
+  const saved = savedDraft === draft;
 
   // Warn before the page closes with unsaved changes.
   useEffect(() => {
@@ -111,23 +103,25 @@ function SettingsForm({
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!dirty || problem || readOnly) return;
+    const submitted = draft;
     setSaving(true);
     setError(null);
     try {
       const result = await api.updateAgentProfile(orgId, profile.id, patch);
       onSaved(result);
-      setDraft(toDraft(result));
-      setSaved(true);
-      setSaving(false);
+      // Edits made while the request ran stay: then the form is still dirty.
+      const fresh = toDraft(result);
+      setDraft((current) => (current === submitted ? fresh : current));
+      setSavedDraft(fresh);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The changes were not saved.");
+      setError(errorText(e, "The changes were not saved."));
+    } finally {
       setSaving(false);
     }
   };
 
-  const soulMax = options.limits.soul_max_chars ?? DEFAULT_SOUL_MAX;
-  const maxSubagents = options.limits.max_subagents ?? DEFAULT_MAX_SUBAGENTS;
-  const models = options.models.includes(draft.model) ? options.models : [draft.model, ...options.models];
+  const { soul_max_chars: soulMax, max_subagents: maxSubagents } = options.limits;
+  const models = withCurrent(options.models, draft.model);
   const toggle = (list: string[], name: string) =>
     list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
@@ -152,7 +146,7 @@ function SettingsForm({
         </p>
       ) : (
         <p className="alert" role="note">
-          Changes apply to new sessions. Sessions that already exist keep their current settings.
+          Soul, model, and sub-agent changes apply to new sessions. Toolset changes apply at the next tool call in every session.
         </p>
       )}
 
@@ -163,7 +157,7 @@ function SettingsForm({
           <input
             className="input"
             value={draft.name}
-            maxLength={options.limits.name_max_chars ?? 80}
+            maxLength={options.limits.name_max_chars}
             readOnly={readOnly}
             onChange={(e) => edit({ name: e.target.value })}
           />
@@ -273,7 +267,7 @@ function SettingsForm({
                     <input
                       className="input"
                       value={sub.name}
-                      maxLength={options.limits.subagent_name_max_chars ?? 40}
+                      maxLength={options.limits.subagent_name_max_chars}
                       readOnly={readOnly}
                       onChange={(e) => updateSub(sub.uid, { name: e.target.value })}
                     />
@@ -336,10 +330,7 @@ function SettingsForm({
                         onChange={(e) => updateSub(sub.uid, { model: e.target.value })}
                       >
                         <option value="">Same as the agent</option>
-                        {(sub.model === "" || options.models.includes(sub.model)
-                          ? options.models
-                          : [sub.model, ...options.models]
-                        ).map((m) => (
+                        {withCurrent(options.models, sub.model).map((m) => (
                           <option key={m} value={m}>
                             {m}
                           </option>
@@ -378,7 +369,7 @@ function SettingsForm({
             ) : problem && dirty ? (
               <span className={styles.errorText}>{problem}</span>
             ) : saved ? (
-              <span>Saved. Changes apply to new sessions.</span>
+              <span>Saved.</span>
             ) : dirty ? (
               <span>Unsaved changes</span>
             ) : null}

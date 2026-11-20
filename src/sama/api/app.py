@@ -40,7 +40,7 @@ from pydantic import (
 )
 from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
-from starlette.types import Lifespan
+from starlette.types import ASGIApp, Lifespan
 
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.origins import check_origins
@@ -93,6 +93,7 @@ from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.profiles import (
     NAME_MAX_CHARS,
     SOUL_MAX_CHARS,
+    NotAdminError,
     ProfileChanges,
     ProfileError,
     profile_options,
@@ -105,6 +106,7 @@ from sama.skills.service import SkillLibrary
 from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
+from sama.vault.standalone import VaultUnreadableError, know_the_secrets
 
 log = logging.getLogger("sama.api")
 
@@ -336,6 +338,33 @@ class SessionAccess:
         return self.session.org_id  # type: ignore[no-any-return]
 
 
+_ADMIN_ONLY: Final = "only an org owner or admin can do this"
+
+
+class _CorsApp(FastAPI):
+    """A ``FastAPI`` app with CORS for ``app.state.web_origins`` as its outermost layer.
+
+    ``add_middleware`` puts a middleware inside ``ServerErrorMiddleware``, so an unhandled error
+    would have an answer without the CORS headers, and the browser would hide the status from
+    the web app. This wrapper is outside of it: every answer has the same origin policy. The
+    web app sends a Bearer token and no cookies, so credentials stay off.
+    """
+
+    def build_middleware_stack(self) -> ASGIApp:
+        stack = super().build_middleware_stack()
+        origins = list(getattr(self.state, "web_origins", ()))
+        if not origins:
+            return stack
+        return CORSMiddleware(
+            stack,
+            allow_origins=origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+            max_age=600,
+        )
+
+
 def _not_found(what: str = NOT_FOUND) -> HTTPException:
     return HTTPException(status_code=404, detail=what)
 
@@ -518,7 +547,7 @@ class SamaApi:
             ) from None
 
     def app(self, *, lifespan: Lifespan[FastAPI] | None = None) -> FastAPI:
-        app = FastAPI(title="sama", docs_url=None, redoc_url=None, lifespan=lifespan)
+        app = _CorsApp(title="sama", docs_url=None, redoc_url=None, lifespan=lifespan)
         app.state.sama_api = self
         settings = self._settings
 
@@ -536,18 +565,7 @@ class SamaApi:
             response.headers["Referrer-Policy"] = "no-referrer"
             return response
 
-        if settings.web_origins:
-            # The web app sends a Bearer token and no cookies, so credentials stay off. The
-            # middleware is added after the others, so it is the outermost: an error answer
-            # and the event stream get the headers, too.
-            app.add_middleware(
-                CORSMiddleware,
-                allow_origins=list(settings.web_origins),
-                allow_credentials=False,
-                allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-                allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
-                max_age=600,
-            )
+        app.state.web_origins = settings.web_origins
 
         @app.get("/healthz")
         async def healthz() -> dict[str, str]:
@@ -890,14 +908,14 @@ class SamaApi:
 
     async def _profile_access(
         self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID
-    ) -> tuple[Any, Grants, uuid.UUID]:
-        """The row of the profile, the grants, and the user row. Raises ``404`` if the user is not
-        a member of the org or cannot see the profile (the rule of ``/me``)."""
+    ) -> tuple[Any, Grants]:
+        """The row of the profile and the grants. Raises ``404`` if the user is not a member of
+        the org or cannot see the profile (the rule of ``/me``)."""
         missing = "the agent profile does not exist"
         async with as_user(self._engine, principal.auth_user_id) as connection:
             user_id = await _user_id(connection, principal, org_id)
             grants = None if user_id is None else await load_grants(connection, org_id, user_id)
-            if user_id is None or grants is None or not grants.org_member:
+            if grants is None or not grants.org_member:
                 raise _not_found(missing)
             row = (
                 await connection.execute(
@@ -918,12 +936,12 @@ class SamaApi:
             ).one_or_none()
         if row is None or not (row.workspace_id is None or grants.sees_workspace(row.workspace_id)):
             raise _not_found(missing)
-        return row, grants, user_id
+        return row, grants
 
     async def _profile(
         self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID
     ) -> dict[str, Any]:
-        row, grants, _ = await self._profile_access(principal, org_id, profile_id)
+        row, grants = await self._profile_access(principal, org_id, profile_id)
         runtime = RuntimeKind(row.runtime)
         return {
             "id": str(row.id),
@@ -944,20 +962,28 @@ class SamaApi:
     async def _edit_profile(
         self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
     ) -> dict[str, Any]:
-        """Changes the profile. A session keeps its frozen config: the change applies from the
-        next session."""
-        _, grants, user_id = await self._profile_access(principal, org_id, profile_id)
+        """Changes the profile. A session keeps its frozen soul, model, and sub-agents: those
+        changes apply from the next session. A change to the toolsets applies at the next tool
+        call of every session, because the gate reads them on every call."""
+        _, grants = await self._profile_access(principal, org_id, profile_id)
         if not grants.org_admin:
-            raise HTTPException(status_code=403, detail="only an org owner or admin can do this")
-        changes = ProfileChanges(
-            name=body.name,
-            soul=body.soul,
-            model=body.model,
-            toolsets=body.toolsets,
-            subagents=body.subagents,
-        )
+            raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
+        if body.soul is not None or body.subagents is not None:
+            # The redactor must know every vault value before the text is checked. Fail closed.
+            try:
+                await know_the_secrets(self._engine, org_id)
+            except VaultUnreadableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from None
         try:
-            await update_profile(self._engine, org_id, profile_id, changes, actor_user_id=user_id)
+            await update_profile(
+                self._engine,
+                org_id,
+                profile_id,
+                ProfileChanges(**body.model_dump()),
+                actor_user_id=grants.user_id,
+            )
+        except NotAdminError:
+            raise HTTPException(status_code=403, detail=_ADMIN_ONLY) from None
         except ProfileError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
         except SubagentError as error:
@@ -1432,7 +1458,7 @@ class SamaApi:
         owner or an admin of the org."""
         grants = await self._org_grants(principal, org_id)
         if not grants.org_admin:
-            raise HTTPException(status_code=403, detail="only an org owner or admin can do this")
+            raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
         return grants
 
     async def _identities(self, principal: Principal, channel: Channel) -> list[dict[str, Any]]:

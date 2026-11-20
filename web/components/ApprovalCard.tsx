@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useApi } from "./AuthProvider";
-import type { Approval } from "@/lib/api";
+import { type Approval, errorText } from "@/lib/api";
 import styles from "./Cards.module.css";
 
 type Action = "approve" | "always" | "deny";
@@ -20,7 +20,7 @@ export function ApprovalCard({ approval, onDecided }: { approval: Approval; onDe
       else await api.approve(approval.id, action === "always");
       onDecided();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The decision was not saved.");
+      setError(errorText(e, "The decision was not saved."));
       setBusy(null);
     }
   };

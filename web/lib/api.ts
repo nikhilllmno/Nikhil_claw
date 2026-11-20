@@ -1,6 +1,9 @@
 // The types of the sama API (src/sama/api/app.py) and a small client for it.
 // Every call sends `Authorization: Bearer <access token>`. On 401 the client refreshes the
 // token once and tries the call again. If that fails, it signs the user out.
+// Each call belongs to the sign-in generation that it started in. If the account changes
+// while the call waits, the answer is dropped: it is never retried, and it never signs out
+// the new account.
 
 // -- types --------------------------------------------------------------------------------------
 
@@ -169,16 +172,16 @@ export interface AgentProfileOptions {
   limits: AgentProfileLimits;
 }
 
-/** The limits of the editor. A missing limit means that the API did not tell it. */
+/** The limits of the editor. The API sends all of them. */
 export interface AgentProfileLimits {
-  name_max_chars?: number;
-  soul_max_chars?: number;
-  max_subagents?: number;
-  subagent_name_max_chars?: number;
-  subagent_name_pattern?: string;
-  subagent_description_max_chars?: number;
-  subagent_prompt_max_chars?: number;
-  subagent_max_turns?: number;
+  name_max_chars: number;
+  soul_max_chars: number;
+  max_subagents: number;
+  subagent_name_max_chars: number;
+  subagent_name_pattern: string;
+  subagent_description_max_chars: number;
+  subagent_prompt_max_chars: number;
+  subagent_max_turns: number;
 }
 
 export interface AgentProfile {
@@ -219,6 +222,11 @@ export class ApiError extends Error {
   }
 }
 
+/** The message of a caught error, or `fallback` if it is not an `Error`. */
+export function errorText(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
 /** The text of an error body: `detail` as a string, or the messages of a validation error. */
 export function errorMessage(status: number, body: unknown): string {
   if (body !== null && typeof body === "object" && "detail" in body) {
@@ -248,15 +256,18 @@ export function errorMessage(status: number, body: unknown): string {
 
 /** What the client needs from the sign-in state. */
 export interface TokenSource {
+  /** Changes when the account changes (sign-out or a new sign-in), not at a token refresh. */
+  readonly generation: number;
   /** The access token to use now (the source refreshes one that is about to expire). */
   getToken(): Promise<string>;
   /**
-   * Gets a new access token after a 401. Returns `null` if it cannot. The source calls
-   * `signOut` itself in that case.
+   * Gets a new access token after a 401 in `generation`. Returns `null` if it cannot, or if
+   * the generation is not the current one. The source signs out itself if the refresh token
+   * of the current generation does not work.
    */
-  refresh(): Promise<string | null>;
-  /** The server did not accept the token, also not after a refresh. */
-  signOut(): void;
+  refresh(generation: number): Promise<string | null>;
+  /** The server did not accept the token. Does nothing if `generation` is not the current one. */
+  signOut(generation: number): void;
 }
 
 export interface RequestOptions {
@@ -267,6 +278,9 @@ export interface RequestOptions {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** The most that `GET /sessions/{id}/messages` returns in one page. */
+const MESSAGE_PAGE = 500;
+
 export class ApiClient {
   constructor(
     private readonly baseUrl: string,
@@ -274,8 +288,17 @@ export class ApiClient {
     private readonly fetcher: FetchLike = (input, init) => fetch(input, init),
   ) {}
 
-  /** A call with the Bearer token. A 401 gives one refresh and one more try. */
+  /**
+   * A call with the Bearer token. A 401 gives one refresh and one more try. A call whose
+   * account changed while it waited throws and does nothing else.
+   */
   async raw(path: string, options: RequestOptions = {}): Promise<Response> {
+    const generation = this.tokens.generation;
+    const current = () => {
+      if (this.tokens.generation !== generation) {
+        throw new ApiError(401, "You signed in as someone else. Try again.");
+      }
+    };
     const send = async (token: string): Promise<Response> => {
       const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
       if (options.body !== undefined) headers["Content-Type"] = "application/json";
@@ -286,19 +309,19 @@ export class ApiClient {
         signal: options.signal,
       });
     };
-    let response = await send(await this.tokens.getToken());
-    if (response.status !== 401) return response;
-    const token = await this.tokens.refresh();
-    if (token === null) {
-      this.tokens.signOut();
-      throw new ApiError(401, errorMessage(401, null));
+    let token: string | null = await this.tokens.getToken();
+    current();
+    for (let retried = false; ; retried = true) {
+      const response = await send(token);
+      current();
+      if (response.status !== 401) return response;
+      token = retried ? null : await this.tokens.refresh(generation);
+      if (token === null) {
+        this.tokens.signOut(generation);
+        throw new ApiError(401, errorMessage(401, null));
+      }
+      current();
     }
-    response = await send(token);
-    if (response.status === 401) {
-      this.tokens.signOut();
-      throw new ApiError(401, errorMessage(401, null));
-    }
-    return response;
   }
 
   /** A call that returns JSON. A status that is not 2xx throws an `ApiError`. */
@@ -315,7 +338,18 @@ export class ApiClient {
   createSession = (body: NewSession) =>
     this.json<SessionOut>("/sessions", { method: "POST", body });
   getSession = (id: string) => this.json<SessionDetail>(`/sessions/${id}`);
-  listMessages = (id: string) => this.json<ChatMessage[]>(`/sessions/${id}/messages?limit=500`);
+  /** All messages of a session, oldest first, read page by page with the `after` cursor. */
+  listMessages = async (id: string): Promise<ChatMessage[]> => {
+    const all: ChatMessage[] = [];
+    for (;;) {
+      const after = all.at(-1)?.seq ?? 0;
+      const page = await this.json<ChatMessage[]>(
+        `/sessions/${id}/messages?after=${after}&limit=${MESSAGE_PAGE}`,
+      );
+      all.push(...page);
+      if (page.length < MESSAGE_PAGE) return all;
+    }
+  };
   sendMessage = (id: string, text: string) =>
     this.json<{ run_id: string }>(`/sessions/${id}/messages`, { method: "POST", body: { text } });
   compact = (id: string, focus: string) =>

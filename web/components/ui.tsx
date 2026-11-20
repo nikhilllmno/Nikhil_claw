@@ -1,6 +1,9 @@
-// Small shared pieces for the states that every screen has: loading, error with retry, empty.
+// Small shared pieces for the states that every screen has: loading, error with retry, and the
+// screen of a sign-in status that has no content yet.
 
-export function Spinner({ label }: { label?: string }) {
+import type { Status } from "./AuthProvider";
+
+function Spinner({ label }: { label?: string }) {
   return (
     <span role="status" style={{ display: "inline-flex" }}>
       <span className="spinner" aria-hidden="true" />
@@ -40,17 +43,34 @@ export function ErrorState({
   );
 }
 
-export function EmptyState({
-  title,
+/**
+ * The screen for a sign-in status without content (connecting, not set up, API not
+ * reachable). For any other status it shows `children`.
+ */
+export function AuthStatusScreen({
+  status,
+  onRetry,
+  loadingLabel,
   children,
 }: {
-  title: string;
-  children?: React.ReactNode;
+  status: Status;
+  onRetry: () => void;
+  loadingLabel: string;
+  children: React.ReactNode;
 }) {
-  return (
-    <div className="state">
-      <h2>{title}</h2>
-      {children}
-    </div>
-  );
+  switch (status.kind) {
+    case "loading":
+      return <LoadingState label={loadingLabel} />;
+    case "unconfigured":
+      return (
+        <ErrorState
+          title="The app is not set up"
+          message="NEXT_PUBLIC_SAMA_API_URL is not set. Set it to the address of the sama API and build the app again."
+        />
+      );
+    case "unreachable":
+      return <ErrorState title="Cannot reach the sama API" message={status.message} onRetry={onRetry} />;
+    default:
+      return children;
+  }
 }

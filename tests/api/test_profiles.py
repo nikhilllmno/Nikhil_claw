@@ -2,26 +2,36 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.origins import check_origins, parse_origins
-from sama.db.models import AgentProfile, AuditEntry
+from sama.db.models import AgentProfile, AuditEntry, Membership, Run, User
+from sama.gate import GateStep
 from sama.gate.decide import TOOLSETS
+from sama.gate.service import GateService
+from sama.profiles import NotAdminError, ProfileChanges, update_profile
 from sama.subagents import MAX_SUBAGENTS
+from sama.tenancy import RunTokenClaims
+from sama.vault.crypto import VaultKey
+from sama.vault.redact import default_redactor
+from sama.vault.store import SecretName, Vault
 from tests.api.conftest import ISSUER, SECRET, bearer
 from tests.api.test_app import add_user, mia
 from tests.orchestrator.conftest import Tenant
+from tests.waiting import async_wait_until
 
 pytestmark = pytest.mark.usefixtures("tenant")
 
+OPAQUE = "signing-opaque-0123456789abcdef"  # no pattern of the redactor matches it
 SECRET_PROMPT = "do-not-log-this-prompt-text"
 SECRET_SOUL = "do-not-log-this-soul-text"
 FAKE_KEY = "sk-ant-api03-" + "a1B2c3D4e5F6g7H8i9J0" * 3
@@ -434,6 +444,204 @@ async def test_a_change_to_nothing_writes_no_audit_entry(
     assert await audits(engine, tenant) == []
 
 
+# -- the vault guard -------------------------------------------------------------------------
+
+
+async def _vault_entry(engine: AsyncEngine, tenant: Tenant, key: str) -> None:
+    await Vault(engine, VaultKey.from_text(key)).put(tenant.org, SecretName.BRAVE_API_KEY, OPAQUE)
+    default_redactor().forget(OPAQUE)  # the API process must learn it from the vault
+
+
+@pytest.fixture
+def forget_opaque() -> Any:
+    yield
+    default_redactor().forget(OPAQUE)
+
+
+@pytest.mark.usefixtures("forget_opaque")
+async def test_an_edit_of_the_soul_needs_the_vault_key_when_the_org_has_entries(
+    client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _vault_entry(engine, tenant, VaultKey.generate())
+    monkeypatch.delenv("SAMA_VAULT_KEY", raising=False)
+    admin = await admin_headers(engine, tenant)
+
+    for body in ({"soul": f"Use {OPAQUE}."}, {"subagents": [spec()]}):
+        response = await client.patch(agent(tenant), headers=admin, json=body)
+        assert response.status_code == 503
+        assert "SAMA_VAULT_KEY" in response.json()["detail"]
+        assert OPAQUE not in response.text
+    row = await stored(engine, tenant)
+    assert (row.soul, row.subagents) == ("You are a test agent.", [])
+    assert await audits(engine, tenant) == []
+    # A change that has no text for the redactor to check does not need the vault.
+    response = await client.patch(agent(tenant), headers=admin, json={"name": "Helper"})
+    assert response.status_code == 200
+
+
+@pytest.mark.usefixtures("forget_opaque")
+async def test_an_edit_is_refused_when_a_vault_entry_does_not_decrypt(
+    client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _vault_entry(engine, tenant, VaultKey.generate())
+    monkeypatch.setenv("SAMA_VAULT_KEY", VaultKey.generate())  # another key
+    admin = await admin_headers(engine, tenant)
+
+    response = await client.patch(agent(tenant), headers=admin, json={"soul": f"Use {OPAQUE}."})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "the vault cannot be read, so the change is not stored"
+    assert OPAQUE not in response.text
+    assert (await stored(engine, tenant)).soul == "You are a test agent."
+
+
+@pytest.mark.usefixtures("forget_opaque")
+async def test_a_vaulted_secret_in_the_soul_or_a_subagent_is_not_stored(
+    client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = VaultKey.generate()
+    await _vault_entry(engine, tenant, key)
+    monkeypatch.setenv("SAMA_VAULT_KEY", key)
+    admin = await admin_headers(engine, tenant)
+
+    response = await client.patch(agent(tenant), headers=admin, json={"soul": f"Use {OPAQUE}."})
+    assert response.status_code == 422
+    assert response.json()["detail"] == "the soul contains a secret"
+    response = await client.patch(
+        agent(tenant), headers=admin, json={"subagents": [spec(prompt=f"Use {OPAQUE}.")]}
+    )
+    assert response.status_code == 422
+    assert OPAQUE not in response.text
+    row = await stored(engine, tenant)
+    assert (row.soul, row.subagents) == ("You are a test agent.", [])
+    # A text without the secret is stored.
+    response = await client.patch(agent(tenant), headers=admin, json={"soul": "Be brief."})
+    assert response.status_code == 200
+
+
+# -- the role at the time of the write -------------------------------------------------------
+
+
+async def _demote(engine: AsyncEngine, tenant: Tenant, auth_id: uuid.UUID) -> None:
+    async with engine.begin() as connection:
+        await _demote_in(connection, auth_id)
+
+
+async def _demote_in(connection: Any, auth_id: uuid.UUID) -> None:
+    await connection.execute(
+        update(Membership)
+        .where(
+            Membership.workspace_id.is_(None),
+            Membership.user_id
+            == select(User.id).where(User.auth_user_id == auth_id).scalar_subquery(),
+        )
+        .values(role="member")
+    )
+
+
+async def test_the_write_checks_the_role_again(engine: AsyncEngine, tenant: Tenant) -> None:
+    auth_id = await add_user(engine, tenant, workspace_member=False, role="admin")
+    async with engine.connect() as connection:
+        user_id = (
+            await connection.execute(select(User.id).where(User.auth_user_id == auth_id))
+        ).scalar_one()
+    await _demote(engine, tenant, auth_id)
+
+    with pytest.raises(NotAdminError):
+        await update_profile(
+            engine,
+            tenant.org,
+            tenant.ids["profile"],
+            ProfileChanges(name="Helper"),
+            actor_user_id=user_id,
+        )
+
+    assert (await stored(engine, tenant)).name == "p"
+    assert await audits(engine, tenant) == []
+
+
+async def test_a_demotion_while_the_write_waits_for_the_lock_gets_403(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    auth_id = await add_user(engine, tenant, workspace_member=False, role="admin")
+
+    async def waiting() -> bool:
+        async with engine.connect() as connection:
+            count = (
+                await connection.execute(
+                    text("select count(*) from pg_stat_activity where wait_event_type = 'Lock'")
+                )
+            ).scalar_one()
+        return bool(count)
+
+    async with engine.connect() as holder:
+        transaction = await holder.begin()
+        await holder.execute(
+            select(AgentProfile.id)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .with_for_update()
+        )
+        # The role check of the route passes, then the write waits for the row lock.
+        patch = asyncio.create_task(
+            client.patch(agent(tenant), headers=bearer(auth_id), json={"name": "Helper"})
+        )
+        await async_wait_until(waiting, what="the write waits for the lock")
+        await _demote_in(holder, auth_id)
+        await transaction.commit()
+    response = await patch
+
+    assert response.status_code == 403
+    assert (await stored(engine, tenant)).name == "p"
+    assert await audits(engine, tenant) == []
+
+
+async def test_a_toolset_change_reaches_a_session_that_is_running(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The gate reads the toolsets on every tool call, so a revoked toolset stops the tool in a
+    run that started before the edit."""
+    # The private session of mia uses the toolsets; a shared session uses the group toolsets.
+    run_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Run).values(
+                id=run_id,
+                org_id=tenant.org,
+                session_id=tenant.ids["mine"],
+                agent_profile_id=tenant.ids["profile"],
+                runtime="claude_agent_sdk",
+            )
+        )
+    claims = RunTokenClaims(
+        org_id=str(tenant.org),
+        workspace_id=str(tenant.ids["ws"]),
+        session_id=str(tenant.ids["mine"]),
+        run_id=str(run_id),
+        token_id="t-1",
+        expires_at=2_000_000_000,
+    )
+    gate = GateService(engine)
+    before = await gate.check(claims, "c1", "Read", {})
+    assert before.step != GateStep.TOOLSET
+
+    response = await client.patch(
+        agent(tenant), headers=await admin_headers(engine, tenant), json={"toolsets": ["web"]}
+    )
+
+    assert response.status_code == 200
+    after = await gate.check(claims, "c2", "Read", {})
+    assert (after.action, after.step) == ("deny", GateStep.TOOLSET)
+
+
 # -- CORS ------------------------------------------------------------------------------------
 
 WEB = "https://sama-web.example.test"
@@ -453,7 +661,8 @@ def cors_client(engine: AsyncEngine, *origins: str) -> httpx.AsyncClient:
         ),
     )
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=api.app()), base_url="http://sama.test"
+        transport=httpx.ASGITransport(app=api.app(), raise_app_exceptions=False),
+        base_url="http://sama.test",
     )
 
 
@@ -548,3 +757,23 @@ def test_the_origins_are_read_from_a_list() -> None:
         WEB,
         "http://localhost:3000",
     )
+
+
+async def test_an_unhandled_error_answer_has_the_cors_header(
+    engine: AsyncEngine, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(*_: Any, **__: Any) -> None:
+        raise RuntimeError("detail-that-stays-in-the-log")
+
+    monkeypatch.setattr(SamaApi, "_profile", boom)
+    async with cors_client(engine, WEB) as client:
+        listed = await client.get(agent(tenant), headers={**mia(tenant), "Origin": WEB})
+        other = await client.get(
+            agent(tenant), headers={**mia(tenant), "Origin": "https://evil.test"}
+        )
+
+    assert listed.status_code == 500
+    assert listed.headers["access-control-allow-origin"] == WEB
+    assert "detail-that-stays-in-the-log" not in listed.text
+    assert other.status_code == 500
+    assert "access-control-allow-origin" not in other.headers

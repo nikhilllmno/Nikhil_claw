@@ -4,7 +4,7 @@ import { eventJson, parseBlock, SseParser } from "./sse";
 describe("SseParser", () => {
   it("parses id, event, and data", () => {
     const events = new SseParser().push('id: 7\nevent: run_event\ndata: {"a":1}\n\n');
-    expect(events).toEqual([{ id: "7", event: "run_event", data: '{"a":1}', retry: null }]);
+    expect(events).toEqual([{ id: "7", event: "run_event", data: '{"a":1}' }]);
   });
 
   it("uses message as the default event name", () => {
@@ -49,11 +49,8 @@ describe("SseParser", () => {
     expect(new SseParser().push("data:none\n\n")[0]?.data).toBe("none");
   });
 
-  it("reads the retry field and passes it on", () => {
-    expect(new SseParser().push("retry: 2000\n\n")).toEqual([
-      { id: null, event: "message", data: "", retry: 2000 },
-    ]);
-    expect(new SseParser().push("retry: soon\n\n")).toEqual([]);
+  it("ignores the retry field", () => {
+    expect(new SseParser().push("retry: 2000\n\n")).toEqual([]);
   });
 
   it("treats a field without a colon as a field with an empty value", () => {
@@ -67,7 +64,7 @@ describe("parseBlock and eventJson", () => {
   });
 
   it("returns null JSON for empty or invalid data", () => {
-    expect(eventJson({ id: null, event: "x", data: "", retry: null })).toBeNull();
-    expect(eventJson({ id: null, event: "x", data: "{nope", retry: null })).toBeNull();
+    expect(eventJson({ id: null, event: "x", data: "" })).toBeNull();
+    expect(eventJson({ id: null, event: "x", data: "{nope" })).toBeNull();
   });
 });

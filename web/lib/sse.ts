@@ -9,8 +9,6 @@ export interface SseEvent {
   event: string;
   /** The `data` lines, joined with a line feed. */
   data: string;
-  /** The `retry` field in milliseconds, if the event has a valid one. */
-  retry: number | null;
 }
 
 /** Incremental parser. Call `push` with each chunk of text, in order. */
@@ -44,7 +42,6 @@ export class SseParser {
 export function parseBlock(block: string): SseEvent | null {
   let id: string | null = null;
   let name = "";
-  let retry: number | null = null;
   const data: string[] = [];
   let hasData = false;
   for (const line of block.split("\n")) {
@@ -59,13 +56,11 @@ export function parseBlock(block: string): SseEvent | null {
     } else if (field === "data") {
       data.push(value);
       hasData = true;
-    } else if (field === "retry" && /^\d+$/.test(value)) {
-      retry = Number(value);
     }
   }
-  // An event with only `retry` or `id` fields still carries them to the caller.
-  if (!hasData && id === null && retry === null && name === "") return null;
-  return { id, event: name || "message", data: data.join("\n"), retry };
+  // An event with only an `id` or an `event` field still carries it to the caller.
+  if (!hasData && id === null && name === "") return null;
+  return { id, event: name || "message", data: data.join("\n") };
 }
 
 /** The `data` of an event as JSON, or `null` if it is empty or not valid JSON. */

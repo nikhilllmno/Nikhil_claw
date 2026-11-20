@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
-import { ErrorState, LoadingState } from "@/components/ui";
+import { AuthStatusScreen } from "@/components/ui";
+import { errorText } from "@/lib/api";
 import styles from "./login.module.css";
 
 /** The codes of sign-in links that this page already used (a code works once). */
@@ -40,27 +41,11 @@ export default function LoginPage() {
     setBusy("code");
     auth
       .exchangeCode(code)
-      .catch((error: unknown) =>
-        setNotice({ kind: "error", text: error instanceof Error ? error.message : "Sign-in failed." }),
-      )
+      .catch((error: unknown) => setNotice({ kind: "error", text: errorText(error, "Sign-in failed.") }))
       .finally(() => setBusy(null));
   }, [auth]);
 
-  if (status.kind === "loading") return <LoadingState label="Connecting" />;
-  if (status.kind === "unconfigured") {
-    return (
-      <ErrorState
-        title="The app is not set up"
-        message="NEXT_PUBLIC_SAMA_API_URL is not set. Set it to the address of the sama API and build the app again."
-      />
-    );
-  }
-  if (status.kind === "unreachable") {
-    return <ErrorState title="Cannot reach the sama API" message={status.message} onRetry={retry} />;
-  }
-
-  const fail = (error: unknown) =>
-    setNotice({ kind: "error", text: error instanceof Error ? error.message : "Sign-in failed." });
+  const fail = (error: unknown) => setNotice({ kind: "error", text: errorText(error, "Sign-in failed.") });
 
   const signIn = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -104,68 +89,70 @@ export default function LoginPage() {
 
   const working = busy !== null;
   return (
-    <main className={styles.page}>
-      <div className={styles.panel}>
-        <h1 className={styles.brand}>sama</h1>
-        <p className={styles.tagline}>Sign in to your agents.</p>
-        <form className={styles.form} onSubmit={signIn}>
-          <label className="field">
-            <span className="label">Email</span>
-            <input
-              className="input"
-              type="email"
-              autoComplete="username"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={working}
-            />
-          </label>
-          <label className="field">
-            <span className="label">Password</span>
-            <input
-              className="input"
-              type="password"
-              autoComplete="current-password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={working}
-            />
-          </label>
-          <button type="submit" className="btn btn-primary" disabled={working}>
-            {busy === "password" || busy === "code" ? "Signing in…" : "Sign in"}
-          </button>
-          <button type="button" className="btn" onClick={sendLink} disabled={working}>
-            {busy === "link" ? "Sending…" : "Send a sign-in link"}
-          </button>
-        </form>
-        <div aria-live="polite">
-          {notice ? (
-            <p className={`alert ${notice.kind === "error" ? "alert-error" : "alert-success"}`}>
-              {notice.text}
-            </p>
-          ) : null}
-        </div>
-        <details className={styles.dev}>
-          <summary>Use an access token (development)</summary>
-          <form className={styles.form} onSubmit={useToken}>
+    <AuthStatusScreen status={status} onRetry={retry} loadingLabel="Connecting">
+      <main className={styles.page}>
+        <div className={styles.panel}>
+          <h1 className={styles.brand}>sama</h1>
+          <p className={styles.tagline}>Sign in to your agents.</p>
+          <form className={styles.form} onSubmit={signIn}>
             <label className="field">
-              <span className="label">Access token</span>
+              <span className="label">Email</span>
+              <input
+                className="input"
+                type="email"
+                autoComplete="username"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={working}
+              />
+            </label>
+            <label className="field">
+              <span className="label">Password</span>
               <input
                 className="input"
                 type="password"
-                autoComplete="off"
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={working}
               />
             </label>
-            <button type="submit" className="btn" disabled={!token.trim()}>
-              Use token
+            <button type="submit" className="btn btn-primary" disabled={working}>
+              {busy === "password" || busy === "code" ? "Signing in…" : "Sign in"}
+            </button>
+            <button type="button" className="btn" onClick={sendLink} disabled={working}>
+              {busy === "link" ? "Sending…" : "Send a sign-in link"}
             </button>
           </form>
-        </details>
-      </div>
-    </main>
+          <div aria-live="polite">
+            {notice ? (
+              <p className={`alert ${notice.kind === "error" ? "alert-error" : "alert-success"}`}>
+                {notice.text}
+              </p>
+            ) : null}
+          </div>
+          <details className={styles.dev}>
+            <summary>Use an access token (development)</summary>
+            <form className={styles.form} onSubmit={useToken}>
+              <label className="field">
+                <span className="label">Access token</span>
+                <input
+                  className="input"
+                  type="password"
+                  autoComplete="off"
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                />
+              </label>
+              <button type="submit" className="btn" disabled={!token.trim()}>
+                Use token
+              </button>
+            </form>
+          </details>
+        </div>
+      </main>
+    </AuthStatusScreen>
   );
 }

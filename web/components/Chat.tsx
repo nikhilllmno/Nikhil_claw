@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   type Approval,
+  errorText,
   type ChatMessage,
   type ClarifyRequest,
   OPEN_RUN_STATUSES,
@@ -34,10 +35,6 @@ import styles from "./Chat.module.css";
 
 const QUESTION_POLL_MS = 4_000;
 
-function message(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
-}
-
 export function Chat({ sessionId }: { sessionId: string }) {
   const api = useApi();
   const { me, setWorkspaceId, reloadSessions } = useData();
@@ -46,6 +43,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
   const [messagesError, setMessagesError] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [approvalsError, setApprovalsError] = useState<string | null>(null);
   const [questions, setQuestions] = useState<ClarifyRequest[]>([]);
   const [live, setLive] = useState<LiveState>(initialLive);
   const liveRef = useRef<LiveState>(initialLive);
@@ -73,14 +71,16 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setMessages(await api.listMessages(sessionId));
       setMessagesError(null);
     } catch (e) {
-      setMessagesError(message(e, "Could not load the messages."));
+      setMessagesError(errorText(e, "Could not load the messages."));
     }
   }, [api, sessionId]);
   const loadApprovals = useCallback(async () => {
     try {
       setApprovals(await api.listApprovals(sessionId));
-    } catch {
-      // The list stays as it is. The next event or reload tries again.
+      setApprovalsError(null);
+    } catch (e) {
+      // The cards that are shown stay: they are still valid. The user can try again.
+      setApprovalsError(errorText(e, "Could not load the approvals."));
     }
   }, [api, sessionId]);
   const loadQuestions = useCallback(async () => {
@@ -112,7 +112,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       try {
         loaded = await api.getSession(sessionId);
       } catch (e) {
-        if (!controller.signal.aborted) setLoadError(message(e, "Could not load the session."));
+        if (!controller.signal.aborted) setLoadError(errorText(e, "Could not load the session."));
         return;
       }
       if (controller.signal.aborted) return;
@@ -130,12 +130,18 @@ export function Chat({ sessionId }: { sessionId: string }) {
       void loadMessages();
       void loadApprovals();
       void loadQuestions();
+      let connectedBefore = false;
       await runEventStream({
         api,
         sessionId,
         after: loaded.last_event_id,
         signal: controller.signal,
-        onConnection: (connected, error) => setConnection({ connected, error }),
+        onConnection: (connected, error) => {
+          setConnection({ connected, error });
+          // A run may have paused while the stream was away.
+          if (connected && connectedBefore) void loadApprovals();
+          connectedBefore ||= connected;
+        },
         onEvent: (name, data) => {
           const result = applyStreamEvent(liveRef.current, name, data);
           if (result.state !== liveRef.current) setLiveState(result.state);
@@ -161,7 +167,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   }, [running, loadQuestions]);
 
   const send = async () => {
-    const text = draft.trim();
+    const submitted = draft;
+    const text = submitted.trim();
     if (!text) return;
     setSending(true);
     setSendError(null);
@@ -170,7 +177,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
       const focus = parseCompact(text);
       const { run_id: runId } =
         focus === null ? await api.sendMessage(sessionId, text) : await api.compact(sessionId, focus);
-      setDraft("");
+      // Only the text that was sent goes: what the user typed meanwhile stays.
+      setDraft((current) => (current === submitted ? "" : current));
       if (focus === null) {
         const now = new Date().toISOString();
         localId.current += 1;
@@ -203,7 +211,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       reloadSessions();
     } catch (e) {
       // The text stays in the composer: nothing was sent.
-      setSendError(message(e, "The message was not sent."));
+      setSendError(errorText(e, "The message was not sent."));
     } finally {
       setSending(false);
     }
@@ -215,7 +223,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
     const results = await Promise.allSettled(openRunIds(liveRef.current).map((id) => api.cancelRun(id)));
     const failed = results.find((r) => r.status === "rejected");
     if (failed && failed.status === "rejected") {
-      setSendError(message(failed.reason, "The run was not stopped."));
+      setSendError(errorText(failed.reason, "The run was not stopped."));
       setStopping(false);
     }
   };
@@ -341,6 +349,14 @@ export function Chat({ sessionId }: { sessionId: string }) {
         {connection.error ? (
           <p className={`alert alert-warning ${styles.banner}`} role="status">
             Live updates paused: {connection.error} Trying again.
+          </p>
+        ) : null}
+        {approvalsError ? (
+          <p className={`alert alert-error ${styles.banner}`} role="alert">
+            {approvalsError}{" "}
+            <button type="button" className="btn btn-small" onClick={() => void loadApprovals()}>
+              Try again
+            </button>
           </p>
         ) : null}
         {approvals.map((approval) => (

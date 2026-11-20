@@ -3,11 +3,11 @@
 // Holds the sign-in state and the API client for the whole app.
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { ApiClient, fetchConfig, type PublicConfig } from "@/lib/api";
+import { ApiClient, errorText, fetchConfig } from "@/lib/api";
 import { AuthSession } from "@/lib/auth";
 import { apiUrl } from "@/lib/config";
 
-type Status =
+export type Status =
   | { kind: "loading" }
   /** The API address is not set. */
   | { kind: "unconfigured" }
@@ -21,7 +21,6 @@ interface AuthContext {
   /** The sign-in object. `null` until the config is loaded. */
   auth: AuthSession | null;
   api: ApiClient | null;
-  config: PublicConfig | null;
   signOut: () => void;
   retry: () => void;
 }
@@ -42,8 +41,9 @@ export function useApi(): ApiClient {
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [status, setStatus] = useState<Status>({ kind: "loading" });
-  const [config, setConfig] = useState<PublicConfig | null>(null);
+  const [status, setStatus] = useState<Status>(() =>
+    apiUrl() === "" ? { kind: "unconfigured" } : { kind: "loading" },
+  );
   const [auth, setAuth] = useState<AuthSession | null>(null);
   const [attempt, setAttempt] = useState(0);
 
@@ -63,16 +63,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           local: window.localStorage,
           onChange: (tokens) => setStatus({ kind: tokens ? "signed-in" : "signed-out" }),
         });
-        setConfig(loaded);
         setAuth(session);
         setStatus({ kind: session.load() ? "signed-in" : "signed-out" });
       })
       .catch((error: unknown) => {
         if (cancelled) return;
-        setStatus({
-          kind: "unreachable",
-          message: error instanceof Error ? error.message : "The API did not answer.",
-        });
+        setStatus({ kind: "unreachable", message: errorText(error, "The API did not answer.") });
       });
     return () => {
       cancelled = true;
@@ -89,13 +85,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAttempt((n) => n + 1);
   }, []);
 
-  const unconfigured = apiUrl() === "";
-  const shown: Status = unconfigured ? { kind: "unconfigured" } : status;
   const value = useMemo(
-    () => ({ status: shown, auth, api, config, signOut, retry }),
-    // `shown` is new at each render only when the status object changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [status, unconfigured, auth, api, config, signOut, retry],
+    () => ({ status, auth, api, signOut, retry }),
+    [status, auth, api, signOut, retry],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }

@@ -5,7 +5,7 @@ import { useState } from "react";
 import { useApi } from "@/components/AuthProvider";
 import { useData } from "@/components/DataProvider";
 import { ErrorState, LoadingState } from "@/components/ui";
-import type { Audience } from "@/lib/api";
+import { type Audience, errorText } from "@/lib/api";
 import styles from "./home.module.css";
 
 export default function HomePage() {
@@ -51,7 +51,7 @@ export default function HomePage() {
       reloadSessions();
       router.push(`/s/${session.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not start the session.");
+      setError(errorText(e, "Could not start the session."));
       setBusy(false);
     }
   };

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useApi } from "./AuthProvider";
-import type { ClarifyRequest } from "@/lib/api";
+import { type ClarifyRequest, errorText } from "@/lib/api";
 import styles from "./Cards.module.css";
 
 export function QuestionCard({
@@ -29,7 +29,7 @@ export function QuestionCard({
       await api.answerQuestion(sessionId, request.id, answers);
       onAnswered();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The answer was not saved.");
+      setError(errorText(e, "The answer was not saved."));
       setBusy(false);
     }
   };
