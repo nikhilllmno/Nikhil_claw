@@ -22,6 +22,7 @@ from sama.gateway.slack_client import (
     signature,
     signed,
 )
+from sama.gateway.telegram import _approval_card as telegram_card
 from sama.integrations.service import SLACK_SCOPES, SlackSetup, slack_manifest
 from tests.integrations.support import SIGNING, SLACK_TOKEN, FakeSlack
 
@@ -88,6 +89,19 @@ def test_a_proposal_card_has_no_always_allow_button() -> None:
     assert "A workspace admin or the org owner can decide this." in text
     values = [button["value"] for button in blocks[1]["elements"]]
     assert values == [f"ap:{row.id.hex}:y", f"ap:{row.id.hex}:n"], "a rule cannot approve it"
+
+
+@pytest.mark.parametrize("tool", ["repo_push_approval", "mcp__sama__repo_push_approval"])
+def test_a_push_approval_card_has_no_always_allow_button(tool: str) -> None:
+    """The gate asks for a protected push each time (Section 15.1): a rule cannot approve it."""
+    row = SimpleNamespace(
+        id=uuid.uuid4(), tool_name=tool, arguments={}, reason="a protected path", answerers=None
+    )
+    _, blocks = approval_blocks(row)
+    values = [button["value"] for button in blocks[1]["elements"]]
+    assert values == [f"ap:{row.id.hex}:y", f"ap:{row.id.hex}:n"]
+    _, buttons = telegram_card(row)
+    assert [b["callback_data"] for line in buttons for b in line] == values
 
 
 def test_the_manifest_holds_the_urls_of_the_integration() -> None:

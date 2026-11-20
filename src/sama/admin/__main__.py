@@ -7,6 +7,9 @@
 - ``python -m sama.admin secret set|list|delete --org <id> [--name <name>]``: the vault
   entries of an org. ``set`` reads the value from stdin, so the value is not in the shell
   history or the process list.
+- ``python -m sama.admin github-app manifest [--public-url <url>] [--org <github org>]
+  [--out <file>]`` and ``github-app convert <code> [--out-dir <dir>] [--fly-app <app>]``: the
+  manifest flow of the sama GitHub App (Section 15.1). They need no database.
 
 It uses ``SAMA_DATABASE_URL``, and ``SAMA_VAULT_KEY`` for ``secret``. ``subagents set`` also
 gives the redactor the secrets of the environment and the vault values, so the check of a spec
@@ -27,8 +30,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from sama.admin import github_app
 from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Owner, bootstrap
 from sama.db.engine import create_engine
+from sama.github.client import GitHubError
 from sama.subagents import SubagentError, parse_subagents, profile_subagents, set_profile_subagents
 from sama.vault.crypto import VaultKey
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
@@ -122,6 +127,29 @@ def _subagents_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _github_app_command(args: argparse.Namespace) -> int:
+    try:
+        if args.action == "manifest":
+            public_url = (args.public_url or os.environ.get("SAMA_PUBLIC_URL", "")).rstrip("/")
+            if not public_url.startswith(("https://", "http://")):
+                raise SystemExit("set --public-url or SAMA_PUBLIC_URL")
+            form = github_app.manifest_form(public_url, org=args.org, name=args.name)
+            if args.out:
+                Path(args.out).write_text(form, "utf-8")
+                print(json.dumps({"form": args.out}))
+            else:
+                print(form, end="")
+            return 0
+        if not args.code:
+            raise SystemExit("github-app convert needs the code")
+        result = github_app.convert(args.code, Path(args.out_dir), fly_app=args.fly_app)
+    except (GitHubError, ValueError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m sama.admin")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -152,7 +180,20 @@ def main(argv: list[str] | None = None) -> int:
     subagents.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
     subagents.add_argument("--profile", type=uuid.UUID, required=True, help="The profile id.")
     subagents.add_argument("--file", help="The JSON file of the specs. Without it, stdin.")
+    app = commands.add_parser(
+        "github-app", help="Create the sama GitHub App with the manifest flow of GitHub."
+    )
+    app.add_argument("action", choices=("manifest", "convert"))
+    app.add_argument("code", nargs="?", help="convert: the code from /github/app/created.")
+    app.add_argument("--public-url", help="manifest: the public URL of sama.")
+    app.add_argument("--org", help="manifest: the GitHub organization that owns the App.")
+    app.add_argument("--name", default="sama", help="manifest: the name of the App.")
+    app.add_argument("--out", help="manifest: write the form to this file.")
+    app.add_argument("--out-dir", default=".", help="convert: the folder of the secret files.")
+    app.add_argument("--fly-app", default="sama-staging", help="convert: the Fly app.")
     args = parser.parse_args(argv)
+    if args.command == "github-app":
+        return _github_app_command(args)
     if args.command == "subagents":
         return _subagents_command(args)
     if args.command == "secret":

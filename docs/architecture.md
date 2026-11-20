@@ -1758,7 +1758,8 @@ profile on purpose.
 
 **Approvals over chat.** A Slack card and a Telegram card have three buttons for a tool call:
 Approve, Deny, and "Always allow for me". A proposal card has Approve and Deny only, because a
-policy rule cannot approve a proposal.
+policy rule cannot approve a proposal. A card for a tool in `ALWAYS_ASK` (`repo_push_approval`,
+Section 15.1) also has Approve and Deny only.
 
 - "Always allow for me" approves the call and writes a user rule `allow` for the tool and the
   profile of the run (Section 16.1). The card then shows "Always allowed by <user>".
@@ -1841,7 +1842,7 @@ policy rule cannot approve a proposal.
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Later: MCP, database, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
-| `github` | `repo_clone`, `pr_create`, `pr_comment` through the sama GitHub App. Since M1.16: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
+| `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
 
@@ -2636,8 +2637,8 @@ answer that only the sender sees.
   cannot mention people or channels. Approval cards use `plain_text` blocks;
 - before each send it checks the link again, as the Telegram gateway does (Section 11.3). In a
   worker bot channel it checks that the same bot still has the channel;
-- approval cards have the buttons Approve, Deny, and "Always allow for me" (a proposal card has
-  no "Always allow for me"). Section 9.4.2 has the rules.
+- approval cards have the buttons Approve, Deny, and "Always allow for me" (a proposal card and
+  a card for a tool in `ALWAYS_ASK` have no "Always allow for me"). Section 9.4.2 has the rules.
 
 **Shared sessions in Slack (M3.3).** A channel thread is a `shared` session (Section 11.3), and
 the same rules hold as for a Telegram group:
@@ -3197,7 +3198,7 @@ Tools:
 - Repo `AGENTS.md` and `CLAUDE.md` load as context files for that session.
 
 **Code (M1.16).** The first step: the agent clones a public repo, edits files, and runs tests
-in the sandbox with native tools. It cannot push yet.
+in the sandbox with native tools. M3.7 adds push and pull requests (below).
 
 | Part | Where | What it does |
 |---|---|---|
@@ -3205,9 +3206,6 @@ in the sandbox with native tools. It cannot push yet.
 | Cloner | `src/sama/tools/repos.py` | `RepoCloner.clone` runs `git clone` in the session sandbox through `Sandbox.exec`. The clone is partial (`--filter=blob:none`) and has one branch. The folder is `<work folder>/<folder>`, and the default folder is the repo name. The command turns off credential helpers and prompts, and allows only the protocol of the source URL. A failed clone removes its folder. |
 | Tool | `src/sama/tools/server.py` | `repo_clone(repo, ref, folder)` in the toolset `github`. The tool is hidden when the server has no sandboxed runtime. |
 
-- **No token.** The sandbox has no GitHub token, so only public repos clone. A private or
-  unknown repo gets the error "does not exist or is not public". The git proxy, push, and
-  `pr_create` come later (M2).
 - **Ref.** `ref` is a branch or a tag. A tag gives a detached HEAD. A ref with `..`, `//`, a
   space, a start other than a letter or a digit, or an end of `/`, `.`, or `.lock` is refused.
 - **Folder.** One segment of letters, digits, `.`, `_`, or `-`. Not `.` or `..`. If the folder
@@ -3230,6 +3228,133 @@ in the sandbox with native tools. It cannot push yet.
   `tool_policies` for a profile.
 - `python -m sama.admin bootstrap` gives new profiles the `github` toolset. Existing profiles
   keep their toolsets.
+
+- **No token.** The sandbox has no GitHub token. Without the GitHub App (M3.7), only public
+  repos clone. A private or unknown repo gets the error "does not exist or is not public".
+
+**Code (M3.7): GitHub App, git proxy, and pull requests.**
+
+| Part | Where | What it does |
+|---|---|---|
+| App and client | `src/sama/github/client.py` | `GitHubAppConfig` holds the App id, slug, client id, private key, and client secret. `app_manifest` gives the manifest of the App. `GitHubClient` signs the App JWT (9 minutes), makes installation tokens, keeps each token for its life minus 5 minutes, and calls the REST API (installations, repos, pull requests, comments, `compare`). A `401` removes the kept token. No error message has a token. |
+| Org connections | `src/sama/github/service.py` | `GitHubService`: the install URL with a signed state, the end of the install, the allowlist of repos, and the push grants. |
+| Push checks | `src/sama/github/push.py`, `src/sama/github/packscan.py` | The size check of the pack and the checks of each ref update of a push (below). |
+| Git proxy | `src/sama/github/proxy.py`, `src/sama/github/pktline.py` | Smart HTTP git at `<SAMA_PUBLIC_URL>/git/<owner>/<name>.git`. A fetch goes to GitHub as it is. A push goes to GitHub only after the push checks. |
+| Tools | `src/sama/tools/github.py`, `src/sama/tools/server.py` | `pr_create`, `pr_comment`, and `repo_push_approval` in the toolset `github`. The tools are hidden when the GitHub App is off. |
+| Clone | `src/sama/tools/repos.py` | A repo on the allowlist clones through the proxy. Other repos clone from GitHub with no credentials. |
+| API | `src/sama/api/app.py`, `src/sama/github/routes.py` | The org routes and the two public pages of the install (below). |
+| Admin | `src/sama/admin/github_app.py` | `python -m sama.admin github-app manifest` and `convert` (Section 19.5). |
+| Tables | migration `0024` | `github_installations`, `github_repos`, `github_push_grants` (below). |
+
+- **The App.** One sama GitHub App serves one deployment. Its permissions are `contents:
+  write`, `pull_requests: write`, `metadata: read`, and `members: read`. `members: read` lets
+  sama read the role of a person in a GitHub organization during the install. The App is
+  public, so each sama org can install it on its own GitHub account. It has no `workflows` permission, so
+  GitHub also refuses a push that changes `.github/workflows`. It has no `administration`
+  permission, so it cannot change a branch rule or a ruleset. The webhook is off, because sama
+  needs no events. A person creates the App from the manifest (Section 19.5). Only the control
+  plane has the private key and the installation tokens.
+- **Install.** An org admin calls `POST /orgs/{org_id}/github/install`. The answer is the URL
+  `https://github.com/apps/<slug>/installations/new?state=<state>`. The state is signed with
+  the run token key, has the org and the admin, and lives 30 minutes. The App has "request
+  user authorization (OAuth) during installation" on. So GitHub sends the person to
+  `/github/setup` with `installation_id`, `code`, `setup_action`, and the same `state`.
+  - The `GET` changes nothing. It shows a confirm page with the sama org and the GitHub
+    account, and a "Connect" button. The button sends a `POST` to `/github/setup`. A link from
+    another person thus cannot connect an account without a click on the page.
+  - The `POST` checks the state again. The admin in the state must be an org admin now.
+  - The installation id in the URL alone proves nothing. Sama changes the code into a user
+    token and checks that this person can see the installation (`GET /user/installations`).
+  - To see an installation is not enough: a collaborator with read access to one repo also
+    sees it. For an organization account, the person must be an active `admin` of that GitHub
+    organization (`GET /user/memberships/orgs/{org}`). For a user account, the person must
+    be that user.
+  - Then sama writes the installation for the org, in a transaction that checks the org
+    admin again. One installation belongs to one org: another org gets `409`.
+  - `setup_action=request` shows that a GitHub owner must approve the install first.
+- **Allowlist.** An org admin adds a repo with `POST /orgs/{org_id}/github/repos`
+  (`repo` is `<owner>/<name>`, `protected_paths` is optional). Sama asks GitHub for the
+  installation of the repo, and the installation must belong to the org. The default protected
+  paths are `.github/workflows/`, `.github/actions/`, `.github/CODEOWNERS`, `CODEOWNERS`, and
+  `docs/CODEOWNERS`. A path that ends with `/` is a folder. The match ignores case. Members
+  read the list with `GET`. Admins remove a repo or an installation with `DELETE`. Each change
+  writes an audit entry.
+- **Clone.** `repo_clone` asks the allowlist first. For a repo on the allowlist, the control
+  plane runs `git clone` in the sandbox from the proxy, with the run token of the call in the
+  environment of that command only. The clone keeps a credential helper that reads
+  `$SAMA_RUN_TOKEN` each time git runs. So the token is not in `.git/config`, and a later run
+  of the session uses its own token. The runner process in the sandbox has the run token in
+  its environment, and the shell of the agent gets it from that environment.
+- **Proxy.** The proxy reads the run token from HTTP Basic auth (the password) and checks it.
+  The run must be live: a run that ended, or a run whose user lost access to the session, gets
+  `403`. The repo must be on the allowlist of the org of the token, else `404`. Before it
+  sends a push to GitHub, the proxy checks the run and the allowlist again. The proxy takes only
+  the smart protocol. It removes the push capabilities `side-band`, `side-band-64k`,
+  `report-status-v2`, `push-cert`, and `push-options`, and adds `no-thin`. So the push has
+  only the commands and a full pack, and the proxy writes the push result itself. A refused
+  push gets a `report-status` that refuses every ref with the reason, so `git push` shows the
+  reason to the agent. A push is at most 100 MB. The limit counts the bytes that arrive, also
+  for a gzip body, and the inflated body too. A gzip body must end once, with no data after it.
+  At most 4 push checks run at one time.
+- **Push checks.** The proxy sends a push to GitHub only when every ref update passes:
+  - The ref is a branch `refs/heads/sama/<name>`. Other branches, tags, and other refs are
+    refused.
+  - The update does not delete the ref.
+  - The update is a fast-forward. GitHub `compare` must say that the old commit is an
+    ancestor of the new commit. A force-push is refused.
+  - The protected paths of the new commit are the same as in a trusted base, or a person
+    approved the push. The trusted bases are the old commit of the branch and the commit of
+    the default branch. GitHub runs the workflows of the pushed commit, so the check compares
+    trees: it looks at the tree of the new commit, not at each commit of the push. A change
+    that a later commit puts back needs no approval. A symlink in place of a protected folder
+    is a change. `git index-pack` reads the pack in an empty temporary repo, and the proxy
+    fetches the trees of the bases from GitHub without blobs. If a check cannot read an
+    object, the proxy refuses the push.
+  - The proxy finds the commits and their parents with `git rev-list --parents`, which reads
+    only the real parent headers of a commit. A `parent` line after the `committer` line does
+    not make a fast-forward.
+  - Before `git index-pack` reads the pack, a size check (`src/sama/github/packscan.py`)
+    reads the header of each object and inflates it in small parts, with no copy of the
+    output. A commit or a tag is at most 1 MB, a tree at most 16 MB, and a delta, its base,
+    and its result at most 64 MB each. All objects together inflate to at most 1 GB, and a
+    pack has at most 200,000 objects. Each object must inflate to the size of its header.
+    `git index-pack` runs with `core.bigFileThreshold=1m`, so it streams a large blob and does
+    not keep it in memory. The proxy reads at most 64 MB of output from each git command.
+- **Approval of protected paths.** The refusal tells the agent to call
+  `repo_push_approval(repo, branch, commit)`. This tool is in `ALWAYS_ASK` (Section 16.1): a
+  person approves each call, an `allow` rule does not remove the ask, and "always allow"
+  writes no rule. The Slack and Telegram cards for it have no "Always allow for me" button. It is in `NEEDS_A_HUMAN`, so an unattended run gets `deny`. The tool server
+  checks the gate itself before it runs a sama tool, so the sandbox cannot call the tool with
+  only the run token. The approved call writes a push grant for one repo, one branch, and one
+  commit. The grant lives 1 hour. The proxy uses it once (`FOR UPDATE SKIP LOCKED`), then the
+  agent pushes again.
+- **Pull requests.** `pr_create(repo, head, base, title, body, draft)` opens a pull request
+  from a `sama/*` branch. `pr_comment(repo, number, body)` comments on a pull request only,
+  not on an issue. The tools run on the control plane with the installation token. They are
+  not in `DEFAULT_ALLOW`, so they get `ask` unless a policy rule allows them. Sama has no
+  merge tool.
+- **Branch rules.** The App has `contents: write`, so a token of the App can merge through
+  the API. The proxy and the tools never do. The setup still requires a ruleset on the default branch of
+  each repo on the allowlist, with no bypass for the App (Section 19.5).
+- **Tables.** `github_installations` (org, installation id, account, unique installation
+  id), `github_repos` (org, installation, owner, name, protected paths, unique per org and
+  lower-case name), and `github_push_grants` (org, repo, ref, commit, expiry, used time, the
+  approving run). Members of the org read the installations and the repos. Org admins read
+  the grants. No policy allows writes: the control plane writes with the service role.
+- **Residual risks.**
+  - The proxy uses a grant before it sends the push to GitHub. If GitHub then refuses the
+    push, the agent needs a new approval.
+  - A push larger than 100 MB is refused. A push with more than 2,000 new commits is refused.
+  - The tree check trusts the default branch of GitHub at the time of the push.
+  - A sama org admin can send an install link to a person who owns another GitHub account.
+    That person sees the sama org name on the confirm page and must click "Connect".
+  - In its 30 minutes, a state works again. A second install of the same installation for
+    the same org changes the same row.
+  - The git commands of the proxy have no memory limit of their own. The size check above
+    limits what they read. A push can write up to 1 GB of objects to a temporary folder on the
+    disk of the control plane.
+  - Not verified live: that the Claude Code `Bash` tool in an E2B sandbox sees
+    `SAMA_RUN_TOKEN`. The proxy tests run `git` with that variable on the local machine.
 
 ### 15.2 Changing its own stack
 
@@ -3326,7 +3451,8 @@ Rules of the steps:
   gets `deny`.
 - **Toolsets.** `core` (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`,
   `Grep`, `WebFetch`), `todo` (`todo`, `TodoWrite`), `web` (`web_search`, `web_extract`),
-  `clarify`, `github` (`repo_clone`, M1.16), and `skills` (`skills_list`, `skill_view`,
+  `clarify`, `github` (`repo_clone`, M1.16; `pr_create`, `pr_comment`, `repo_push_approval`,
+  M3.7), and `skills` (`skills_list`, `skill_view`,
   `skill_manage`, M2.2; allowed without a rule, because the store checks the role of the
   user), and `subagents` (`Task`, `Agent`, M2.7). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
   default is an empty list, so a new profile can use no tool until an admin sets its toolsets.
@@ -3355,8 +3481,9 @@ Rules of the steps:
   tools are allowed (`ToolSearch`, `Read`, `Glob`, `Grep`, `todo`, `TodoWrite`,
   `web_search`, `web_extract`, `clarify`), the sub-agent tools `Task` and `Agent` (a run needs
   the toolset `subagents`, and each call of the sub-agent has its own check, Section 13.1),
-  and `repo_clone`, which only copies public data into the
-  sandbox. Every other tool gets `ask`. The classifier comes later.
+  and `repo_clone`, which only copies data into the
+  sandbox. Every other tool gets `ask`. `repo_push_approval` is in `ALWAYS_ASK`: it gets `ask`
+  even with an `allow` rule, and only a `deny` rule changes that (Section 15.1). The classifier comes later.
 - **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
   `deny`, and `ask` becomes `deny`. Job pre-approvals come with jobs (M3); until then the set
   is empty.
@@ -3508,8 +3635,10 @@ gives no deferred tool: the search fails closed (Section 6.3).
 - **Risk: exfiltration through allowed hosts.** An allowed host accepts writes too. A prompt
   injection can tell the agent to push session data to an attacker repo on GitHub, or to
   publish a package, with a token in the injected text. The sandbox has no sama secrets, so
-  the data at risk is the session files and the conversation. The git proxy (Section 15.1)
-  closes the push path when it replaces direct GitHub access. Registry uploads stay a risk
+  the data at risk is the session files and the conversation. The git proxy (Section 15.1,
+  M3.7) holds the tokens of the repos on the allowlist. `github.com` stays an allowed host,
+  for public clones and package installs, so a token in injected text can still push to
+  another repo. Registry uploads stay a risk
   until the egress filter checks methods and paths. The gate `ask` on `Bash` is the control
   until then.
 
@@ -4261,6 +4390,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
+| `SAMA_GITHUB_APP_ID`, `SAMA_GITHUB_APP_SLUG`, `SAMA_GITHUB_CLIENT_ID`, `SAMA_GITHUB_APP_PRIVATE_KEY`, `SAMA_GITHUB_CLIENT_SECRET` | No | The sama GitHub App (Section 19.5). With `SAMA_GITHUB_APP_ID`, all five are required. The private key can have `\n` in place of its line breaks. Without them, the git proxy and the pull request tools are off. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first
@@ -4314,6 +4444,51 @@ org-level `owner` membership, the workspace `main`, and the agent profile `sama`
 `claude-sonnet-5-5`, toolsets `core`, `todo`, `web`, `clarify`, `github`, `skills`). The owner signs in on the web
 page one time first, so that the email finds the Supabase Auth user. A second run adds only
 what is missing. Run it on the app machine with `fly ssh console`.
+
+### 19.5 GitHub App (M3.7)
+
+A person must do these steps. Sama cannot create a GitHub App or a ruleset by itself.
+
+1. Make the form of the App manifest:
+   `python -m sama.admin github-app manifest --public-url https://<host> --out form.html`.
+   Add `--org <github-org>` to make an App that a GitHub organization owns. Without it, the
+   personal account of the person owns the App. Add `--name <name>` if the name `sama` is
+   taken: App names are unique on GitHub.
+2. Open `form.html` in a browser that is signed in to GitHub, and click the button. GitHub
+   shows the App and creates it. Then GitHub opens
+   `<public_url>/github/app/created?code=<code>`. The page shows the next command. The code
+   works one time, for 1 hour.
+3. Run `python -m sama.admin github-app convert <code> --out-dir <private folder>
+   --fly-app <app>`. It writes the private key and the client secret to files with mode
+   `0600` and prints a `flyctl secrets set` command. The command reads the files, so the
+   values are not in the output. Run that command, then delete the two files.
+4. In the App settings on GitHub, keep the webhook off. Keep "Request user authorization
+   (OAuth) during installation" on: the manifest sets it, and the install needs it.
+5. For each sama org, an org admin calls `POST /orgs/{org_id}/github/install` and opens the
+   URL of the answer. The same person must own the GitHub account: an owner of the GitHub
+   organization, or the GitHub user. On GitHub, the person installs the App on the GitHub
+   account, with "Only select repositories". GitHub sends the person back to
+   `<public_url>/github/setup`, which shows the sama org and the GitHub account. Check them and
+   click "Connect". The page then shows "GitHub is connected".
+6. **Required: a ruleset on the default branch of each repo.** In the repo (or the GitHub
+   organization) settings, open Rules, then Rulesets, and add a branch ruleset:
+   - Target: the default branch.
+   - Rules: "Require a pull request before merging" with at least 1 approval, "Block force
+     pushes", and "Restrict deletions".
+   - Bypass list: empty, or only people. **Do not add the sama App to the bypass list.**
+
+   The App has `contents: write`, so without this ruleset a token of the App could merge or
+   push to the default branch. The proxy refuses such pushes, and sama has no merge tool. The
+   ruleset is the second wall.
+7. An org admin adds each repo to the allowlist:
+   `POST /orgs/{org_id}/github/repos` with `{"repo": "<owner>/<name>"}`. Add
+   `"protected_paths"` to change the default list (Section 15.1).
+8. Give the agent profiles the toolset `github`. The tools `pr_create` and `pr_comment` get
+   `ask` by default. An admin can add `allow` rules in `tool_policies`.
+
+The process turns the App on when `SAMA_GITHUB_APP_ID` is set (Section 19.2). Then the API
+has the routes `/orgs/{org_id}/github/...`, the pages `/github/app/created` and
+`/github/setup`, and the git proxy at `/git`.
 
 ---
 

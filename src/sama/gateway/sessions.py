@@ -38,6 +38,7 @@ from sama.db.models import (
     User,
 )
 from sama.gate.approvers import Approvers, approvers_of
+from sama.gate.decide import ALWAYS_ASK, canonical_name
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.orchestrator.queue import RunQueue
 from sama.review.apply import ReviewApplier
@@ -430,6 +431,15 @@ class ShownApproval:
     cannot approve a proposal."""
 
 
+def offers_always(row: Any) -> bool:
+    """True when an approval card gets "Always allow for me". A proposal does not: a rule cannot
+    approve a proposal. A tool in ``ALWAYS_ASK`` (such as ``repo_push_approval``) does not: the
+    gate asks for it each time and writes no rule for it (Section 15.1)."""
+    if getattr(row, "proposal", False):
+        return False
+    return canonical_name(str(getattr(row, "tool_name", ""))) not in ALWAYS_ASK
+
+
 ALWAYS_LABEL: Final = "Always allow for me"
 ALWAYS_OUTCOME: Final = "Always allowed"
 """The outcome of "Always allow for me": the call is approved, and a user policy rule allows
@@ -640,8 +650,14 @@ async def decide(
         grants = await load_grants(connection, org_id, user_id)
     if row is None or not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
         raise ApprovalError("You cannot decide this approval.")
-    # The gate ignores "always allow" for a proposal: a rule cannot approve a proposal.
-    always = always_allow and approve and row.proposal_id is None
+    # The gate ignores "always allow" for a proposal (a rule cannot approve a proposal) and for
+    # a tool in ALWAYS_ASK (the gate asks for it each time).
+    always = (
+        always_allow
+        and approve
+        and row.proposal_id is None
+        and canonical_name(row.tool_name) not in ALWAYS_ASK
+    )
     try:
         await gate.decide_approval(
             org_id=org_id,

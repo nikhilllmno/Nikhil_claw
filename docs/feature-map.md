@@ -217,7 +217,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 |---|---|---|---|---|
 | Hardline deny floor | `tools/approval_detection.py` | Same idea, own pattern list (§16.1). | Adapt | M1 |
 | Dangerous command approval, `smart` mode | `tools/approval*.py` | Policy `allow`, `ask`, `deny` plus an optional small-model classifier (§16.1). | Adapt | M1 |
-| Protected paths and write guards | `tools/file_tools_write_guards.py` | Sandbox isolation plus protected paths in repos (for example `.github/workflows`) need `ask`. | Adapt | M3 |
+| Protected paths and write guards | `tools/file_tools_write_guards.py` | Sandbox isolation. The sama git proxy refuses a push that changes a protected path of a repo (for example `.github/workflows`) until a person approves `repo_push_approval` (§15.1). | Adapt | M3 (M3.7 done) |
 | Secret redaction | `agent/redact*.py` | Redaction of tool output, logs, and traces (§16.3). | Adapt | M1 |
 | Secrets in `.env` and vault backends | `agent/secret_sources/` | Sama vault in Postgres. No secrets in the sandbox (D6). | Adapt | M1 |
 | SSRF and web access policy | `tools/website_policy.py` | Sandbox egress allowlist (§16.2) and control-plane outbound URL policy against SSRF and DNS rebinding (§16.4). | Adapt | M1 |
@@ -250,5 +250,6 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Workflows with approval steps | §12.3 | M4 |
 | Chrome extension: click, type, cursor in the user's browser | §14.2 | M5 |
 | Versioned and revertible self-improvement | D14 | M2 |
+| GitHub App and git proxy: no token in the sandbox, `sama/*` branches only, no force-push or delete, pull requests by tool | §15.1 | M3 (M3.7 done) |
 | Self-modification through pull requests | §15.2 | M6 |
 | Customer sign-up, billing, quotas | §17 | M6 |

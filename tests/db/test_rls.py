@@ -58,6 +58,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "connections": {"conn:a1", "conn:a1-alice"},
         "memories": {"mem:alice", "mem:a1", "mem:a1-agent"},
         "memory_revisions": {"rev:mem:alice", "rev:mem:a1", "rev:mem:a1-agent"},
+        "github_installations": {"gh-inst:org-a"},
+        "github_repos": {"gh-repo:org-a"},
+        "github_push_grants": set(),
     },
     "carol": {
         "orgs": {"org-a"},
@@ -74,6 +77,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "connections": {"conn:a1", "conn:a2"},
         "memories": {"mem:a1", "mem:a2", "mem:a1-agent"},
         "memory_revisions": {"rev:mem:a1", "rev:mem:a2", "rev:mem:a1-agent"},
+        "github_installations": {"gh-inst:org-a"},
+        "github_repos": {"gh-repo:org-a"},
+        "github_push_grants": {"gh-grant:org-a"},
     },
     "dave": {
         "orgs": {"org-a"},
@@ -90,6 +96,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "connections": set(),
         "memories": {"mem:dave"},
         "memory_revisions": {"rev:mem:dave"},
+        "github_installations": {"gh-inst:org-a"},
+        "github_repos": {"gh-repo:org-a"},
+        "github_push_grants": set(),
     },
     "bob": {
         "orgs": {"org-b"},
@@ -106,6 +115,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "connections": {"conn:b1", "conn:b1-bob"},
         "memories": {"mem:bob", "mem:b1"},
         "memory_revisions": {"rev:mem:bob", "rev:mem:b1"},
+        "github_installations": {"gh-inst:org-b"},
+        "github_repos": {"gh-repo:org-b"},
+        "github_push_grants": {"gh-grant:org-b"},
     },
     "stranger": {
         "orgs": set(),
@@ -122,6 +134,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "connections": set(),
         "memories": set(),
         "memory_revisions": set(),
+        "github_installations": set(),
+        "github_repos": set(),
+        "github_push_grants": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

@@ -155,3 +155,67 @@ def test_the_vision_model_has_a_default_and_can_be_set() -> None:
     assert settings().vision_model == DEFAULT_VISION_MODEL
     assert settings(SAMA_VISION_MODEL="  ").vision_model == DEFAULT_VISION_MODEL
     assert settings(SAMA_VISION_MODEL=" claude-opus-5 ").vision_model == "claude-opus-5"
+
+
+GITHUB = {
+    "SAMA_GITHUB_APP_ID": "123456",
+    "SAMA_GITHUB_APP_SLUG": "sama-test",
+    "SAMA_GITHUB_CLIENT_ID": "Iv1.client",
+    "SAMA_GITHUB_APP_PRIVATE_KEY": (
+        # Two parts, so the secret scan does not see a key. The value is not a key.
+        "-----BEGIN RSA PRIVATE " + "KEY-----\\nAAAA\\n-----END RSA PRIVATE KEY-----"
+    ),
+    "SAMA_GITHUB_CLIENT_SECRET": "client-secret-value",
+}
+
+
+def test_the_github_app_is_off_without_an_app_id() -> None:
+    s = settings()
+    assert s.github is None
+    assert s.git_url == "https://sama-staging.fly.dev/git"
+
+
+def test_the_github_app_is_read_with_the_escaped_line_breaks() -> None:
+    s = settings(**GITHUB)
+    assert s.github is not None
+    assert (s.github.app_id, s.github.slug, s.github.client_id) == (
+        "123456",
+        "sama-test",
+        "Iv1.client",
+    )
+    key = s.github.private_key.get_secret_value()
+    assert key.startswith("-----BEGIN RSA PRIVATE KEY-----\nAAAA\n")
+    assert key.endswith("-----END RSA PRIVATE KEY-----\n")
+    assert key in s.secret_values()
+    assert "client-secret-value" in s.secret_values()
+    assert "client-secret-value" not in repr(s)
+    assert "AAAA" not in repr(s)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SAMA_GITHUB_APP_SLUG",
+        "SAMA_GITHUB_CLIENT_ID",
+        "SAMA_GITHUB_APP_PRIVATE_KEY",
+        "SAMA_GITHUB_CLIENT_SECRET",
+    ],
+)
+def test_a_partial_github_app_is_refused(name: str) -> None:
+    with pytest.raises(SettingsError, match=name):
+        settings(**{**GITHUB, name: None})
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"SAMA_GITHUB_APP_ID": "abc"}, "SAMA_GITHUB_APP_ID must be a number"),
+        ({"SAMA_GITHUB_APP_PRIVATE_KEY": "not-a-key"}, "must be a PEM private key"),
+    ],
+)
+def test_a_bad_github_value_is_refused_without_its_value(
+    changes: dict[str, str], message: str
+) -> None:
+    with pytest.raises(SettingsError, match=message) as error:
+        settings(**{**GITHUB, **changes})
+    assert "not-a-key" not in str(error.value)

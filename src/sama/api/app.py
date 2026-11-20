@@ -89,6 +89,8 @@ from sama.db.models import (
 from sama.db.models import Connection as ConnectionRow
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.gateway.pairing import PairingError, create_code
+from sama.github.routes import setup_router
+from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
 from sama.memory import (
     CAPS,
@@ -230,6 +232,20 @@ class NewPairingCode(_Body):
 class TelegramConnect(_Body):
     bot_token: SecretStr = Field(min_length=1, max_length=200)
     """The token of the bot from @BotFather."""
+
+
+class GitHubRepoAdd(_Body):
+    repo: str = Field(min_length=3, max_length=300)
+    """``owner/name`` or the URL of the repository."""
+    protected_paths: list[str] = Field(default_factory=list, max_length=MAX_PROTECTED_PATHS)
+    """More protected paths, after the default ones. A path that ends with ``/`` is a folder."""
+
+    @field_validator("protected_paths")
+    @classmethod
+    def _short(cls, paths: list[str]) -> list[str]:
+        if any(len(path) > MAX_PATH_CHARS for path in paths):
+            raise ValueError(f"a protected path has more than {MAX_PATH_CHARS} characters")
+        return paths
 
 
 class ConnectionStart(_Body):
@@ -575,15 +591,18 @@ class SamaApi:
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
         pins: PinStore | None = None,
+        github: GitHubService | None = None,
         connections: ConnectionService | None = None,
     ) -> None:
-        """Without ``integrations`` the integration routes answer ``409``. Without
-        ``connections`` the connection routes answer ``409``. Without ``skills``,
+        """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
+        the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
+        ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
+        self._github = github
         self._connections = connections
         self._skills = skills
         self._reviews = reviews
@@ -854,6 +873,53 @@ class SamaApi:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             if not gone:
                 raise _not_found("the org has no such integration")
+            return Response(status_code=204)
+
+        app.include_router(setup_router(self._github))
+
+        @app.post("/orgs/{org_id}/github/install")
+        async def github_install(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            return {"url": self._require_github().install_url(org_id, grants.user_id)}
+
+        @app.get("/orgs/{org_id}/github/installations")
+        async def github_installations(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            await self._org_grants(principal, org_id)
+            return await self._require_github().installations(org_id)
+
+        @app.delete("/orgs/{org_id}/github/installations/{row_id}", status_code=204)
+        async def github_uninstall(principal: Me, org_id: uuid.UUID, row_id: uuid.UUID) -> Response:
+            grants = await self._org_admin(principal, org_id)
+            github = self._require_github()
+            if not await github.remove_installation(org_id, grants.user_id, row_id):
+                raise _not_found("the org has no such installation")
+            return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/github/repos")
+        async def github_repos(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            await self._org_grants(principal, org_id)
+            return [repo.public() for repo in await self._require_github().repos(org_id)]
+
+        @app.post("/orgs/{org_id}/github/repos", status_code=201)
+        async def github_add_repo(
+            principal: Me, org_id: uuid.UUID, body: GitHubRepoAdd
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                repo = await self._require_github().add_repo(
+                    org_id, grants.user_id, body.repo, body.protected_paths
+                )
+            except GitHubSetupError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return repo.public()
+
+        @app.delete("/orgs/{org_id}/github/repos/{repo_id}", status_code=204)
+        async def github_remove_repo(
+            principal: Me, org_id: uuid.UUID, repo_id: uuid.UUID
+        ) -> Response:
+            grants = await self._org_admin(principal, org_id)
+            if not await self._require_github().remove_repo(org_id, grants.user_id, repo_id):
+                raise _not_found("the allowlist of the org has no such repository")
             return Response(status_code=204)
 
         @app.get("/connectors")
@@ -1649,6 +1715,11 @@ class SamaApi:
             "link": link,
             "command": command,
         }
+
+    def _require_github(self) -> GitHubService:
+        if self._github is None:
+            raise HTTPException(status_code=409, detail="the GitHub App is off in this process")
+        return self._github
 
     def _require_connections(self) -> ConnectionService:
         if self._connections is None:
