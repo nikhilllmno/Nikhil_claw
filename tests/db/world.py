@@ -36,6 +36,7 @@ from sama.db.models import (
     Connection,
     ContextPin,
     Delivery,
+    GeneratedMedia,
     GitHubInstallation,
     GitHubPushGrant,
     GitHubRepo,
@@ -190,6 +191,18 @@ def plan(
             mime_type="image/png",
             size_bytes=3,
             sha256="0" * 64,
+            data=b"png",
+        )
+        add(
+            GeneratedMedia,
+            org_id=org_id,
+            session_id=ids[session],
+            run_id=run_id,
+            kind="image",
+            mime_type="image/png",
+            size_bytes=3,
+            sha256="0" * 64,
+            caption=f"image of {session}",
             data=b"png",
         )
         add(

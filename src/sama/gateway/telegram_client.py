@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from typing import Any, Final
 
 import httpx
@@ -68,12 +69,27 @@ class TelegramClient:
         view._max_retries = 0
         return view
 
-    async def call(self, method: str, **params: Any) -> Any:
+    async def call(
+        self,
+        method: str,
+        *,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
+        **params: Any,
+    ) -> Any:
+        """Calls ``method``. With ``files``, the body is ``multipart/form-data``: a nested value
+        goes as JSON text, as the Bot API asks."""
         url = f"{self._base_url}/bot{self._token.get_secret_value()}/{method}"
         body = {name: value for name, value in params.items() if value is not None}
+        form = {
+            name: json.dumps(value) if isinstance(value, dict | list) else str(value)
+            for name, value in body.items()
+        }
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._http.post(url, json=body)
+                if files is None:
+                    response = await self._http.post(url, json=body)
+                else:
+                    response = await self._http.post(url, data=form, files=files)
                 data = response.json()
             except (httpx.HTTPError, ValueError) as error:
                 raise TelegramError(f"{method} failed: {type(error).__name__}") from None
@@ -102,13 +118,29 @@ class TelegramClient:
             "sendMessage",
             chat_id=chat_id,
             text=text[:MAX_TEXT],
-            reply_parameters=(
-                None
-                if reply_to is None
-                else {"message_id": reply_to, "allow_sending_without_reply": True}
-            ),
+            reply_parameters=_reply(reply_to),
             reply_markup=None if buttons is None else {"inline_keyboard": buttons},
             link_preview_options={"is_disabled": True},
+        )
+        return int(result["message_id"])
+
+    async def send_photo(self, chat_id: int, data: bytes, *, reply_to: int | None = None) -> int:
+        """Sends a PNG image (``image_generate``, Section 11.8). Returns the message id."""
+        result = await self.call(
+            "sendPhoto",
+            files={"photo": ("image.png", data, "image/png")},
+            chat_id=chat_id,
+            reply_parameters=_reply(reply_to),
+        )
+        return int(result["message_id"])
+
+    async def send_voice(self, chat_id: int, data: bytes, *, reply_to: int | None = None) -> int:
+        """Sends an Ogg Opus voice note (``text_to_speech``). Returns the message id."""
+        result = await self.call(
+            "sendVoice",
+            files={"voice": ("voice.ogg", data, "audio/ogg")},
+            chat_id=chat_id,
+            reply_parameters=_reply(reply_to),
         )
         return int(result["message_id"])
 
@@ -159,3 +191,9 @@ class TelegramClient:
 
     async def delete_webhook(self) -> None:
         await self.call("deleteWebhook", drop_pending_updates=True)
+
+
+def _reply(reply_to: int | None) -> dict[str, Any] | None:
+    if reply_to is None:
+        return None
+    return {"message_id": reply_to, "allow_sending_without_reply": True}

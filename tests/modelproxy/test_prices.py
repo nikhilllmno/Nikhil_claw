@@ -67,3 +67,14 @@ def test_a_long_prompt_uses_the_long_context_prices() -> None:
     # Above it, 0.50 input, 0.05 cache read, and 2.50 output.
     expected = Decimal("0.045") + Decimal("0.00050005") + Decimal("0.0025")
     assert TABLE.cost(Provider.ANTHROPIC, "claude-haiku-5-5", long) == expected
+
+
+def test_the_media_models_have_prices_but_the_proxy_does_not_allow_them() -> None:
+    for model in ("gpt-image-2.6-flare", "tts-1"):
+        assert TABLE.media(Provider.OPENAI, model) is not None
+        assert TABLE.lookup(Provider.OPENAI, model) is None
+    # tts-1: USD 15 for each million characters.
+    cost = TABLE.media_cost(Provider.OPENAI, "tts-1", TokenCounts(input=1_000_000))
+    assert cost == 15
+    with pytest.raises(KeyError):
+        TABLE.media_cost(Provider.OPENAI, "gpt-6-luna", TokenCounts(input=1))

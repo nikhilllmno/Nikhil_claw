@@ -10,6 +10,7 @@ import asyncio
 import copy
 import hashlib
 import hmac
+import json
 import re
 import time
 from typing import Any, Final
@@ -29,6 +30,8 @@ again later."""
 
 FILE_HOSTS: Final = ("slack.com", "slack-files.com")
 """The hosts of the files that users share. The bot token goes only to these hosts."""
+UPLOAD_HOSTS: Final = ("slack.com",)
+"""The hosts of an upload URL from ``files.getUploadURLExternal``. The upload has no token."""
 
 BOT_TOKEN: Final = re.compile(r"xoxb-[A-Za-z0-9-]{20,250}")
 SIGNING_SECRET: Final = re.compile(r"[0-9a-f]{32}")
@@ -93,15 +96,24 @@ class SlackClient:
         view._max_retries = 0
         return view
 
-    async def call(self, method: str, **params: Any) -> dict[str, Any]:
+    async def call(self, method: str, *, form: bool = False, **params: Any) -> dict[str, Any]:
+        """Calls ``method`` with a JSON body, or with a form body when ``form`` is set (the
+        file upload methods accept only forms). A nested value of a form goes as JSON text."""
         url = f"{self._base_url}/{method}"
         body = {name: value for name, value in params.items() if value is not None}
+        fields = {
+            name: json.dumps(value) if isinstance(value, dict | list) else str(value)
+            for name, value in body.items()
+        }
         headers = {"Authorization": f"Bearer {self._token.get_secret_value()}"}
         wait: float | None = None
         error = "unknown"
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._http.post(url, json=body, headers=headers)
+                if form:
+                    response = await self._http.post(url, data=fields, headers=headers)
+                else:
+                    response = await self._http.post(url, json=body, headers=headers)
             except httpx.HTTPError as failure:
                 raise SlackError(f"{method} failed: {type(failure).__name__}") from None
             if response.status_code == 429:
@@ -189,6 +201,50 @@ class SlackClient:
         """A message that only ``user`` sees."""
         await self.call(
             "chat.postEphemeral", channel=channel, user=user, text=text, thread_ts=thread_ts
+        )
+
+    async def upload_file(
+        self,
+        channel: str,
+        data: bytes,
+        *,
+        filename: str,
+        title: str,
+        thread_ts: str | None = None,
+    ) -> None:
+        """Shares a file in a conversation with the upload flow of Slack: get an upload URL,
+        send the bytes to it, then complete the upload in the channel. It needs the scope
+        ``files:write``. The bytes go only to an https URL of a Slack host, and without the
+        token."""
+        ticket = await self.call(
+            "files.getUploadURLExternal", form=True, filename=filename, length=len(data)
+        )
+        upload_url = str(ticket.get("upload_url") or "")
+        file_id = str(ticket.get("file_id") or "")
+        parts = urlsplit(upload_url)
+        host = (parts.hostname or "").lower()
+        if (
+            parts.scheme != "https"
+            or not file_id
+            or not any(host == known or host.endswith(f".{known}") for known in UPLOAD_HOSTS)
+        ):
+            raise SlackError("files.getUploadURLExternal failed: not a Slack upload URL")
+        try:
+            response = await self._http.post(
+                upload_url,
+                content=data,
+                headers={"content-type": "application/octet-stream"},
+            )
+        except httpx.HTTPError as failure:
+            raise SlackError(f"file upload failed: {type(failure).__name__}") from None
+        if response.status_code != 200:
+            raise SlackError(f"file upload failed: {response.status_code}")
+        await self.call(
+            "files.completeUploadExternal",
+            form=True,
+            files=[{"id": file_id, "title": title}],
+            channel_id=channel,
+            thread_ts=thread_ts,
         )
 
     async def revoke(self) -> None:

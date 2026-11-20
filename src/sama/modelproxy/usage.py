@@ -30,6 +30,10 @@ class Endpoint(StrEnum):
     COUNT_TOKENS = "count_tokens"
     RESPONSES = "responses"
     CHAT_COMPLETIONS = "chat_completions"
+    IMAGES = "images"
+    """``image_generate`` (M4.9). The tool server calls it, not the proxy."""
+    SPEECH = "speech"
+    """``text_to_speech`` (M4.9). The input count is the number of characters."""
 
 
 def _int(data: Mapping[str, Any] | None, key: str) -> int:

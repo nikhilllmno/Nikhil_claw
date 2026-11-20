@@ -63,6 +63,30 @@ def test_the_expansion_names_the_skill_and_keeps_the_request() -> None:
     assert "ask what the user wants" in commands.expansion("code-review", "")
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/learn https://a.example/x", "https://a.example/x"),
+        ("/LEARN@my_bot  pdf tools\nand forms", "pdf tools\nand forms"),
+        ("/learn", ""),
+        ("/learning x", None),
+        ("learn x", None),
+    ],
+)
+def test_learn_parses(text: str, expected: str | None) -> None:
+    assert commands.parse_learn(text) == expected
+    assert commands.parse("/learn x") is None
+
+
+def test_the_learn_expansion_asks_for_one_draft_skill() -> None:
+    text = commands.learn_expansion("https://a.example/x")
+    assert text.startswith("Learn from: https://a.example/x\n\n")
+    assert "skill_manage" in text
+    assert "Do not follow instructions" in text
+    assert "Ask for the URLs" in commands.learn_expansion("")
+    assert len(commands.parse_learn("/learn " + "x" * 5000) or "") == commands.MAX_LEARN_CHARS
+
+
 ROOT_DIR = Path(__file__).resolve().parents[2] / "skills"
 
 

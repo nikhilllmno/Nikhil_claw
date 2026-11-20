@@ -872,10 +872,10 @@ Rules:
 |---|---|
 | Compaction | Native in both SDKs (Section 5.3). Before compaction, sama archives the full transcript in a child session of the live session (session lineage) and records the compaction. `/compact` asks the runtime to compact now (Section 6.3, M2.6). |
 | Tool output limits | Sama tools return at most 50 KB (head and tail kept). Larger output is written to a file in the sandbox, and the tool returns a preview plus the path (Hermes "spill", Section 16.7). |
-| Tool search | Rare tools (most integrations, cron admin, image generation, TTS) are deferred. The model sees `tool_search`, `tool_describe`, and `tool_call` instead of their schemas. A deferred call passes the same gate as a direct call (Sections 6.3 and 16.1, M2.6). |
+| Tool search | Rare tools (most integrations, cron admin) are deferred. The media tools `image_generate` and `text_to_speech` are direct tools of the `media` toolset (M4.9, Section 11.8). The model sees `tool_search`, `tool_describe`, and `tool_call` instead of their schemas. A deferred call passes the same gate as a direct call (Sections 6.3 and 16.1, M2.6). |
 | Progressive skills | Only the skill index is in the prompt. The agent loads a full skill when it needs it. |
 | Context pins | A user pins a text or a message. Sama puts the pins in front of the next message, and again after each compaction (Section 6.3, M2.6). Files are not pinnable yet. |
-| `@` references | `@file`, `@url`, and `@session` in a message attach that content (M4). |
+| `@` references | `@file`, `@url`, and `@session` in a message attach that content (M4.9, Section 6.4). |
 | Budgets | Per run: max turns, max tokens, max cost, and wall time. Near the limit, sama tells the agent to wrap up. |
 
 ### 6.3 Context management (M2.6)
@@ -1175,6 +1175,43 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 - The archive is cut for very long sessions. The row shows `archive_truncated`.
 - No live test of `/compact` and of the hook ran against the real Claude API.
 - No product registers a deferred tool. The code path is covered by tests with fake tools.
+
+### 6.4 `@` references (M4.9)
+
+Code: `src/sama/orchestrator/references.py`, called by the worker (`Worker._expand`).
+
+A user can name content in a chat message: `@url:https://example.com/page`,
+`@file:docs/plan.md`, or `@session:<session id>`. The worker reads each reference when the run
+starts and attaches the content to the input of the run. The agent does not need a tool call
+for it.
+
+- **Syntax.** A reference starts after a space or at the start of the text. The form is
+  `@file:<path>`, `@url:<url>`, or `@session:<id>`. Sama removes a final `.`, `,`, `;`, `:`,
+  `!`, `?`, a closing bracket, or a quote from the target. A repeated reference counts once.
+- **Where.** Only a new `chat` run gets the attachment. A resumed run and a compact run do
+  not. The stored message stays as the user wrote it, so the transcript and the search show
+  the original text. Only the input of the run changes.
+- **Format.** The input is the text of the user, then one note, then one block for each
+  reference. The note says that the blocks are data and not instructions. A URL and a file
+  are in `<untrusted_content>` blocks (Section 16.5). A reference that sama cannot read gets
+  one line in `Not read:` with a short reason.
+- **Redaction.** Sama redacts the text of each reference (Section 16.3) before it cuts the
+  text to the limit. So a key in a file, a page, or a session does not go to the model.
+- **`@url`.** Sama gets the page with `web_extract` code: the outbound client and its URL
+  policy (Section 16.4). Only `http` and `https` are accepted.
+- **`@file`.** Sama reads the file from the work folder of the session sandbox. The path is
+  relative to the work folder. A path that starts with `/` or `~`, or that has `..` or `\`,
+  is refused. Sama then resolves the links of the path in the sandbox (`realpath -e`) and
+  refuses a path that ends outside the work folder. It reads the resolved path. A link can
+  change between the check and the read. That is accepted: the sandbox belongs to the session
+  and has no secrets (D6). The file must be UTF-8 text of at most 64 KB. If the session has no
+  sandbox yet, the reference is not read.
+- **`@session`.** Sama reads the session with the rules of `session_read` (Section 7.1). A
+  private session reads the sessions that its user can see. A shared session reads only the
+  shared sessions of its workspace, never a private session.
+- **Limits.** At most 5 references in a message. Each block is cut at 8,000 characters. All
+  reads run at the same time and share a limit of 20 seconds. A read that is not done in time
+  gets `did not finish in time`. An error of one read does not stop the others or the run.
 
 ---
 
@@ -1683,8 +1720,8 @@ flowchart LR
 5. **Check.** Every new or changed skill passes a linter (frontmatter, length, tool names)
    and a scan (secrets, network calls to unknown hosts, prompt-injection patterns) before it
    becomes active.
-6. **Learn on request.** `/learn <url or topic>` makes the agent read sources and write a
-   skill.
+6. **Learn on request.** `/learn <urls or topic>` makes the agent read sources and write a
+   draft skill (Section 9.6).
 
 ### 9.4.1 Background review (M2.4)
 
@@ -1906,6 +1943,53 @@ Section 15.1) also has Approve and Deny only.
   the DM. In a channel, the user mentions the app and writes `/<name> <request>`.
 - `/skills` in Telegram lists the index of the session in one message.
 
+### 9.6 Skill import and `/learn` (M4.10)
+
+**`skill_import`.** Code: `src/sama/skills/importer.py`. The tool is in the `skills` toolset.
+It is not in the default allow list, so the gate asks a person before each import
+(Section 16.1).
+
+- **Source.** `url` is `https://github.com/<owner>/<repo>` or
+  `https://github.com/<owner>/<repo>/tree/<ref>/<folder>`. The arguments `path` and `ref`
+  replace the folder and the ref of the URL. The default ref is `HEAD`. Only public GitHub
+  repositories work, because sama sends no token.
+- **Fetch.** Sama reads the commit of the ref, then the tree of that commit, then each file at
+  that commit SHA. So all files come from one commit. It uses the outbound client with a
+  policy that allows only `api.github.com` and `raw.githubusercontent.com` and follows no
+  redirect (Section 16.4). A truncated tree is refused.
+- **Files.** The folder must have `SKILL.md`. Sama takes `SKILL.md` and the files in
+  `references/`, `templates/`, `scripts/`, and `assets/`. It leaves out the other files and
+  the files that are not UTF-8 text, and the result lists them. The limits of Section 9.2
+  apply (20 files and the size limits).
+- **Scan.** The import scan refuses a file that runs a script from the network
+  (`curl ... | sh`, `bash <(curl ...)`), decodes code and runs it (`base64 -d ... | sh`,
+  `exec(b64decode(...))`), or deletes a root or home folder. For the delete check, the scan
+  gives each line, without a list mark or a shell prompt, to the hardline check of the gate
+  (Section 16.1). So `rm -rf "$HOME"`, `rm -r -f /`, `rm -Rf /etc`, and `rm -rf ~; ...` are
+  refused too. Then the write is a normal `skill_manage` `create`: the lint and the injection
+  and secret scan of every skill write run (Section 9.2).
+- **Write.** The name comes from the `name` argument, else from the frontmatter, else from
+  the folder. If the name is not the frontmatter name, sama changes the `name:` line of the
+  frontmatter to the name and keeps the other lines, so the lint accepts it. `scope` works as
+  in `skill_manage`, and the result depends on the role of the user. A workspace admin or the
+  org owner writes a `workspace` skill directly, and the org owner writes an `org` skill
+  directly. For another user, a `workspace` or `org` skill from a chat run is a proposal that a
+  person with the role approves (Section 9.4.2). The proposal has the files. The summary
+  of the version is `Imported from github.com/<owner>/<repo>/<folder> at <short SHA>`.
+- `ManageRequest.files` carries the files. Only `create` takes files, and only
+  `skill_import` sets them. The `skill_manage` tool has no such argument.
+- `execute_code` cannot call `skill_import` (Section 10.2.1).
+
+**`/learn`.** `/learn <urls or topic>` is a command of sama in Telegram, the web API, and Slack
+(`/sama learn ...` in a direct message, or a mention with `/learn ...`). The channel changes
+the message, as for a skill command (Section 9.5). The new text starts with
+`Learn from: <request>`. Then a note tells the agent to read the sources, to treat them as
+data, and to write one draft skill with `skill_manage` `create`. The rules of Section 9.4 apply
+to the write: a user skill in a private session. A shared skill is a direct write when the user
+has the role (as for `skill_import`), else a proposal. The command needs the
+`skills` toolset. Without it, Telegram shows the help, and the web API and Slack keep the text
+as it is.
+
 ---
 
 ## 10. Tools, toolsets, and integrations
@@ -1927,17 +2011,17 @@ Section 15.1) also has Approve and Deny only.
 | `todo` | `todo` (read and write the session task list). On Claude, the adapter also maps native `TodoWrite` calls to the same list with a `PostToolUse` hook. | Sama MCP |
 | `web` | `web_search`, `web_extract` | Sama MCP (search provider key on the control plane) |
 | `memory` | `memory` (since M2.1, Section 8.1). The snapshot goes in the prompt. | Sama MCP |
-| `skills` | `skills_list`, `skill_view`, `skill_manage` | Sama MCP |
+| `skills` | `skills_list`, `skill_view`, `skill_manage`, `skill_import` (M4.10, Section 9.6) | Sama MCP |
 | `sessions` | `session_search`, `session_read` (since M2.5, Section 7.1) | Sama MCP |
 | `clarify` | `clarify` (1 to 5 questions, choices or free text, rendered per channel) | Sama MCP |
-| `code_exec` | `execute_code` (Python that calls sama tools through a local RPC stub) | Sandbox, tools through MCP |
+| `code_exec` | `execute_code` (Python that calls sama tools through a stub, M4.8, Section 10.2.1) | Sandbox, tools through MCP |
 | `subagents` | `Task` and `Agent`, the native tool of Claude that starts a sub-agent (since M2.7, Section 13.1). It is separate from `delegation`. | Runtime, in the sandbox |
 | `delegation` | `delegate_task`, `delegate_status` (since M4.6, Section 13.2) | Sama MCP |
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
-| `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
+| `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Later: MCP, database, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
@@ -1953,11 +2037,41 @@ A profile also has a **group set**: the toolsets that a chat run in a shared ses
 `browser`, `workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The
 default profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
-and `delegation` and `tasks` since migration `0023` (M4.6, M4.7). The default group set has no
+`delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
+(M4.2), and `code_exec` since migration `0027` (M4.8). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
-Migrations `0022` and `0023` change only the lists that are equal to the old defaults.
+Migrations `0022`, `0023`, `0026`, and `0027` change only the lists that are equal to the old defaults.
 Sub-agents (Section 13.1) do not get `connections` or `integrations`.
+
+### 10.2.1 Code execution (M4.8)
+
+Code: `src/sama/tools/code.py`. `execute_code(code, timeout_s)` runs a Python program in the
+session sandbox. The program can call sama tools, and only its standard output returns to the
+model. So one call can do many tool calls and give back a short result.
+
+- **Stub.** Sama writes the module `sama_tools.py` next to the program. `sama_tools.call(name,
+  **arguments)` or `sama_tools.<name>(**arguments)` sends one MCP `tools/call` request to the
+  sama tool server and returns the text result, or raises `ToolError`. The stub uses the run
+  token of the run, which the sandbox runner already has. So the sandbox gets no new secret,
+  and the template of the sandbox does not change.
+- **Gate.** Each stub call passes the tool gate on the tool server, as a direct call does. A
+  tool that gets `ask` runs only with an approved call that has the same arguments. The stub
+  also refuses `execute_code`, `clarify`, `memory`, `skill_manage`, `skill_import`,
+  `change_propose`, and `tool_call`, and it allows at most 50 calls. The block list and the
+  call limit are helper behavior and not a security boundary: they live in the program process,
+  and the program also has the run token, so it can change them or send requests itself. The
+  gate (toolsets, deny rules, and approval tickets) is the boundary, and every request passes
+  it. `execute_code` itself gets `ask` by default, like `Bash`.
+- **Limits.** The code has at most 50,000 characters. The time limit is 60 seconds by default
+  and 300 seconds at most. A file that the program writes has at most 50 MB. The tool reads at
+  most 200 KB of standard output, and the output cap of the tool server applies (50 KB, then a
+  spill file). The result has the exit code and the end of the standard error only when the
+  program fails or stops at the time limit.
+- **Where.** Each call has its own folder in `.sama/code/` of the work folder, and the folder
+  is removed at the end. The session must have a sandbox. New profiles get `code_exec`.
+  Migration `0027` adds it to a profile that still has the default toolsets of `0026`. The
+  default group set has no `code_exec`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -2700,8 +2814,8 @@ connect has two steps:
 1. the admin clicks "Start Slack setup". `setup_slack` makes a `pending` row (audit
    `integration.created`) and returns `<SAMA_PUBLIC_URL>/slack/<integration id>/events`,
    `.../interactions`, and `.../commands`, and a manifest with these URLs, the bot scopes
-   (`app_mentions:read`, `chat:write`, `commands`, `files:read`, `im:history`, `im:read`,
-   `im:write`, `users:read`), the events `app_mention` and `message.im`, and the `/sama` command. The link
+   (`app_mentions:read`, `chat:write`, `commands`, `files:read`, `files:write`, `im:history`,
+   `im:read`, `im:write`, `users:read`), the events `app_mention` and `message.im`, and the `/sama` command. The link
    opens `https://api.slack.com/apps?new_app=1&manifest_json=...`. The admin picks the Slack
    workspace, makes the app, and installs it. When Slack checks the events URL, the `pending`
    row answers the `url_verification` challenge;
@@ -2773,6 +2887,11 @@ with an image is valid without text. Section 11.7 has the rules. An app that was
 before M2.8 needs the new scope: the admin adds `files:read` to the app and installs it again.
 Without the scope, the download fails and the sender gets the message that sama cannot read
 the image.
+
+**Generated files.** The scope `files:write` lets the gateway upload the images and the audio
+that `image_generate` and `text_to_speech` make (Section 11.8). An app that was connected before
+M4.9 needs the new scope: the admin adds `files:write` to the app and installs it again. Without
+the scope, the upload fails, the file stays in the API, and the reply text still goes.
 
 **Limits.** Slack has no voice notes and no `/model` command. In a channel thread, each message
 to the app needs a mention. The pairing lockout and the limit of 200 followed runs are for each
@@ -2964,6 +3083,62 @@ or not available.
 - A13. A call that the provider has not answered yet is not in the budget. Calls of one org that
   run at the same time can pass the limit together by their cost, as in the model proxy
   (Section 16.6). The budget limits the calls that start after a record is pending or written.
+
+### 11.8 Generated images and voice notes (M4.9)
+
+Code: `src/sama/media/generate.py` and `src/sama/media/meter.py`. Migration `0027` adds the
+table `generated_media`.
+
+**Tools.** Both tools are in the `media` toolset and in the default allow list, like
+`vision_analyze`. The budget checks still apply to each call.
+
+| Tool | What it does |
+|---|---|
+| `image_generate(prompt, size)` | Makes one PNG image with the OpenAI image model (`gpt-image-2.6-flare`, quality `medium`). `size` is `1024x1024` (default), `1536x1024`, or `1024x1536`. The prompt has at most 4,000 characters. |
+| `text_to_speech(text, voice)` | Makes one Opus audio file in an Ogg container with the OpenAI speech model (`tts-1`). The text has at most 4,096 characters. `voice` is `alloy` (default), `echo`, `fable`, `onyx`, `nova`, or `shimmer`. |
+
+`gpt-image-1` shut down on 2026-10-23, so the image tool uses `gpt-image-2.6-flare`. OpenAI
+shuts down `tts-1` on 2027-01-06. A change of the speech model before that date is a
+separate item.
+
+- The tools use the OpenAI key of the org from the vault. The key stays in the control plane.
+  The sandbox, the logs, and the errors never have it. Without a key the tool answers that the
+  feature is not available.
+- Sama checks the bytes: a PNG signature for an image and an Ogg signature for audio. A file
+  has at most 10 MB.
+- The tool result tells the model that the file goes to the user with the reply. The result
+  has no file bytes.
+
+**Storage.** `generated_media` has `org_id`, `session_id`, `run_id`, `kind` (`image` or
+`audio`), `mime_type`, `size_bytes`, `sha256`, `caption`, `data`, `delivered_at`, and
+`created_at`. RLS lets a member read the metadata of the sessions that the member can see,
+never the bytes: the column `data` is not in the grant. No policy allows a write. The control
+plane writes as the table owner.
+
+**Delivery.** When the run ends, the gateway that follows the run sends the files of the run
+that are not sent yet, oldest first, at most 10 for each run:
+
+- Telegram: an image is a photo (`sendPhoto`), and audio is a voice note (`sendVoice`). Both
+  reply to the message of the user.
+- Slack: the gateway uploads the file in the thread with `files.getUploadURLExternal`, a POST
+  of the bytes, and `files.completeUploadExternal`. The upload URL must be `https` on a
+  `slack.com` host. The POST of the bytes has no token. This needs the scope `files:write`
+  (Section 11.6).
+- A file that was sent gets `delivered_at`. A failed send stops the rest of the files of the
+  run. They stay pending and are not sent again, but the HTTP API still gives them.
+- HTTP API: `GET /v1/sessions/{id}/media` lists the files of a session (`limit` 1 to 100,
+  default 50). `GET /v1/sessions/{id}/media/{media_id}` returns the bytes with the stored type,
+  `Content-Disposition: inline`, and `Cache-Control: private, max-age=3600`. Both need access
+  to the session.
+
+**Money.** The `MediaMeter` does the checks of the model proxy before each call: the budget of
+the run token, and the daily and monthly limits of the user and the org. It writes one
+`model_calls` row for each call (endpoints `images` and `speech`). A call that the API
+refuses gets a row with its status code and zero cost. It shares the
+`UsageLedger` of the model proxy (Section 16.6). `image_generate` records the tokens that the
+API returns. `text_to_speech` records one input token for each character, because the API
+charges by character. The prices are in the `media` section of `prices.toml`. The proxy does
+not allow these models, so a run cannot call them through the proxy.
 
 ---
 
@@ -4003,8 +4178,8 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 ### 16.4 Outbound requests from the control plane
 
 Some requests start on the control plane, not in the sandbox: `web_extract`, connector
-discovery and calls (MCP, HTTP API, database), OAuth flows, skill imports, webhook deliveries, and browser
-navigation. Sandbox egress rules do not cover them. One outbound HTTP client enforces a URL
+discovery and calls (MCP, HTTP API, database), OAuth flows, skill imports (Section 9.6), `@url`
+references (Section 6.4), webhook deliveries, and browser navigation. Sandbox egress rules do not cover them. One outbound HTTP client enforces a URL
 policy for all of them:
 
 - Only `https` (and `http` where the org allows it) to public addresses.
@@ -4040,6 +4215,8 @@ policy for all of them:
   They apply to every hop. The client compares host names in their IDNA (punycode) form, in
   lower case, without a final dot. So `bücher.de` and `xn--bcher-kva.de` match the same entry.
   The org settings that fill the lists come with the org settings API (M3).
+- `skill_import` uses its own policy: only `api.github.com` and `raw.githubusercontent.com`,
+  and no redirect (M4.10).
 
 ### 16.5 Untrusted content
 
@@ -4119,9 +4296,10 @@ with `503`. The next call tries the write again, under a lock. The record stays 
 list until its write succeeds. A record also blocks its org while its write runs, and each write
 attempt has a time limit of 5 seconds, so a write that stalls without an error cannot open the
 budget. A budget check waits at most 2 seconds for the pending writes of its own org. The model
-proxy and `vision_analyze` share one `UsageLedger` (`sama.modelproxy.ledger`) in the control
-plane. So a record that one of them cannot write blocks new calls of that org in both (Section
-11.7).
+proxy, `vision_analyze`, and the media tools (`image_generate`, `text_to_speech`) share one
+`UsageLedger` (`sama.modelproxy.ledger`) in the control plane. So a record that one of them
+cannot write blocks new calls of that org in all of them (Sections 11.7 and 11.8). The price
+table has a `media` section for the media models. The proxy does not allow those models.
 
 **Stop.** When the proxy stops, open streams get 5 seconds to end. Then each pump stops
 reading and writes its record, with an estimate if the usage is not final. The proxy builds
@@ -4187,6 +4365,16 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start. Otherwise the three tools are hidden. |
 | `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
+
+**Tools since M4.8 to M4.10.** The table above has the tools of M1.8 and M2. These tools came
+later. Each tool is hidden when its service is missing.
+
+| Tool | Section | Needs | Gate default |
+|---|---|---|---|
+| `execute_code(code, timeout_s)` | 10.2.1 | The session sandbox | `ask` |
+| `image_generate(prompt, size)` | 11.8 | A database and the OpenAI key of the org | `allow` |
+| `text_to_speech(text, voice)` | 11.8 | A database and the OpenAI key of the org | `allow` |
+| `skill_import(url, path, ref, name, scope)` | 9.6 | The skill store | `ask` |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
 `<untrusted_content source="web">` block (Section 16.5). The tool escapes a closing tag in the

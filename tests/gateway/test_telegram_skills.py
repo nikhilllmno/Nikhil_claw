@@ -186,3 +186,36 @@ async def test_a_group_needs_a_mention_for_a_plain_skill_text_but_not_for_a_comm
     # A shared session has a skill index without user skills (Section 9.2).
     session = await bound_session(engine, GROUP)
     assert session.audience == "shared"
+
+
+async def test_learn_asks_the_agent_for_a_draft_skill(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    assert "/learn" in HELP
+    await pair(gateway, engine, tenant)
+    await gateway.handle_update(message("/learn https://docs.example.com/pdf"))
+    (text,) = await user_texts(engine, DM)
+    assert text.startswith("Learn from: https://docs.example.com/pdf\n\n")
+    assert "skill_manage" in text
+    assert HELP not in telegram.texts(DM)
+
+
+async def test_learn_needs_the_skills_toolset(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(toolsets=["core"], group_toolsets=["core"])
+        )
+    await pair(gateway, engine, tenant)
+    await gateway.handle_update(message("/learn pdf tools"))
+    assert telegram.texts(DM)[-1] == HELP
+    assert await bound_session(engine, DM) is None

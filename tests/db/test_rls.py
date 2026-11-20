@@ -22,13 +22,15 @@ from tests.db.world import World
 pytestmark = pytest.mark.usefixtures("world")
 
 TABLES = sorted(Base.metadata.tables)
-COLUMNS = "attachments"
-"""The table whose grant is on columns: the bytes of an image are not readable."""
+COLUMNS = ("attachments", "generated_media")
+"""The tables whose grant is on columns: the bytes of an image or a voice note are not
+readable."""
 SESSION_CHILDREN = (
     "runs",
     "messages",
     "message_embeddings",
     "attachments",
+    "generated_media",
     "run_events",
     "tool_calls",
     "session_bindings",
@@ -419,21 +421,25 @@ async def test_only_authenticated_select_is_granted(engine: AsyncEngine) -> None
             )
         )
         grants = {(grantee, table, privilege) for grantee, table, privilege in rows}
-    # ``attachments`` has a grant on columns only: the table grant is absent on purpose.
-    assert grants == {("authenticated", table, "SELECT") for table in TABLES if table != COLUMNS}
+    # ``COLUMNS`` have a grant on columns only: the table grant is absent on purpose.
+    assert grants == {
+        ("authenticated", table, "SELECT") for table in TABLES if table not in COLUMNS
+    }
 
 
-async def test_nobody_reads_the_bytes_of_an_image_through_the_data_api(
-    engine: AsyncEngine, world: World
+@pytest.mark.parametrize("table", COLUMNS)
+async def test_nobody_reads_the_bytes_of_a_file_through_the_data_api(
+    engine: AsyncEngine, world: World, table: str
 ) -> None:
     async with engine.connect() as connection:
         rows = await connection.execute(
             text(
                 "SELECT grantee, column_name, privilege_type"
                 " FROM information_schema.column_privileges"
-                " WHERE table_schema = 'public' AND table_name = 'attachments'"
+                " WHERE table_schema = 'public' AND table_name = :table"
                 " AND grantee IN ('anon', 'authenticated', 'PUBLIC')"
-            )
+            ),
+            {"table": table},
         )
         columns = {(grantee, column, privilege) for grantee, column, privilege in rows}
     assert columns
@@ -441,9 +447,9 @@ async def test_nobody_reads_the_bytes_of_an_image_through_the_data_api(
     assert {privilege for _, _, privilege in columns} == {"SELECT"}
     assert "data" not in {column for _, column, _ in columns}
     async with as_user(engine, world.auth["alice"]) as connection:
-        assert await count(connection, "attachments") >= 1
+        assert await count(connection, table) >= 1
         with pytest.raises(DBAPIError) as error:
-            await connection.execute(text("SELECT data FROM attachments"))
+            await connection.execute(text(f"SELECT data FROM {table}"))  # noqa: S608
     assert sqlstate(error.value) == "42501"
 
 

@@ -5,7 +5,10 @@ from __future__ import annotations
 import itertools
 import json
 import uuid
+from email.parser import BytesParser
+from email.policy import default
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 from pydantic import SecretStr
@@ -45,6 +48,8 @@ class FakeTelegram:
         self.files: dict[str, bytes] = {}
         """The bytes of the files that users sent, by ``file_id``. A voice note has none: it
         gets the bytes ``OGG``."""
+        self.media: list[tuple[str, int, bytes]] = []
+        """The ``(method, chat id, bytes)`` of each photo and voice note that the bot sent."""
         self._ids = itertools.count(100)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -53,7 +58,7 @@ class FakeTelegram:
             return httpx.Response(200, content=self.files.get(name, b"OGG"))
         token_part, method = request.url.path.rsplit("/", 2)[-2:]
         token = token_part.removeprefix("bot")
-        body = json.loads(request.content or b"{}")
+        body = request_body(request)
         self.calls.append((method, body))
         self.tokens.append((token, method))
         if method in self.failing:
@@ -67,6 +72,10 @@ class FakeTelegram:
                     401, json={"ok": False, "error_code": 401, "description": "Unauthorized"}
                 )
             return httpx.Response(200, json={"ok": True, "result": me})
+        if method in ("sendPhoto", "sendVoice"):
+            field = "photo" if method == "sendPhoto" else "voice"
+            self.media.append((method, int(body["chat_id"]), body[field]))
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": next(self._ids)}})
         if method == "sendMessage":
             message_id = next(self._ids)
             self.messages[message_id] = (body["chat_id"], body["text"])
@@ -158,6 +167,9 @@ class FakeSlack:
         """The bytes of the shared files, by URL."""
         self.downloads: list[tuple[str, str]] = []
         """The ``(url, bearer token)`` of each file download."""
+        self.uploads: list[tuple[str, bytes, str | None]] = []
+        """The ``(upload URL, bytes, Authorization header)`` of each file upload."""
+        self.upload_url = "https://files.slack.com/upload/v1/ABC"
         self._ts = itertools.count(1)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -167,9 +179,13 @@ class FakeSlack:
             self.downloads.append((url, token))
             data = self.files.get(url)
             return httpx.Response(404 if data is None else 200, content=data or b"")
+        if request.url.host == "files.slack.com":
+            auth = request.headers.get("Authorization")
+            self.uploads.append((str(request.url), request.content, auth))
+            return httpx.Response(200, text="OK")
         method = request.url.path.rsplit("/", 1)[-1]
         token = request.headers.get("Authorization", "").removeprefix("Bearer ")
-        body = json.loads(request.content or b"{}")
+        body = request_body(request)
         self.calls.append((method, body))
         self.tokens.append((token, method))
         if method in self.limited:
@@ -184,6 +200,10 @@ class FakeSlack:
             return httpx.Response(200, json={"ok": True, **me})
         if method == "bots.info":
             return httpx.Response(200, json={"ok": True, "bot": {"app_id": APP_ID}})
+        if method == "files.getUploadURLExternal":
+            return httpx.Response(
+                200, json={"ok": True, "upload_url": self.upload_url, "file_id": "F0FILE1"}
+            )
         if method == "chat.postMessage":
             ts = f"1700000000.{next(self._ts):06d}"
             self.messages[ts] = (body["channel"], body["text"])
@@ -251,3 +271,25 @@ async def add_slack(
         )
     tenant.ids["slack"] = integration_id
     return integration_id
+
+
+def request_body(request: httpx.Request) -> dict[str, Any]:
+    """The parameters of a fake API call: a JSON, a form, or a multipart body. A file part of
+    a multipart body is its bytes."""
+    kind = request.headers.get("content-type", "")
+    if kind.startswith("multipart/form-data"):
+        head = f"Content-Type: {kind}\r\n\r\n".encode()
+        message = BytesParser(policy=default).parsebytes(head + request.content)
+        body: dict[str, Any] = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            payload = part.get_payload(decode=True)
+            assert isinstance(name, str)
+            assert isinstance(payload, bytes)
+            body[name] = payload if part.get_filename() else payload.decode()
+        return body
+    if kind.startswith("application/x-www-form-urlencoded"):
+        return {name: values[0] for name, values in parse_qs(request.content.decode()).items()}
+    loaded = json.loads(request.content or b"{}")
+    assert isinstance(loaded, dict)
+    return loaded

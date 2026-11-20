@@ -71,6 +71,7 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
             "delegation",
             "tasks",
             "cron",
+            "code_exec",
         ],
         list(DEFAULT_GROUP_TOOLSETS),
     )

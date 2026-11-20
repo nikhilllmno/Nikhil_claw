@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.runtime.contract import RunScope
 from sama.skills import commands
-from sama.skills.library import Actor, SkillDoc, index
+from sama.skills.library import SKILLS_TOOLSET, Actor, SkillDoc, index
 from sama.skills.lint import KNOWN_TOOLSETS
 from sama.skills.sql import load_actor, load_docs, profile_limits
 
@@ -108,7 +108,13 @@ class SkillLibrary:
 
     async def expand(self, actor: Actor, text: str) -> str | None:
         """The message text for a skill command, or ``None`` if ``text`` is not a command of
-        a skill that the actor can use (Section 9.5)."""
+        a skill that the actor can use (Section 9.5). ``/learn`` is a command of sama: it asks
+        the agent for a draft skill, if the session has the skills toolset (Section 9.4)."""
+        learn = commands.parse_learn(text)
+        if learn is not None:
+            if SKILLS_TOOLSET not in actor.toolsets:
+                return None
+            return commands.learn_expansion(learn)
         parsed = commands.parse(text)
         if parsed is None:
             return None

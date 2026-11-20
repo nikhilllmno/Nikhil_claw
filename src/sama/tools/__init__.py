@@ -1,6 +1,7 @@
 """Sama tools and the sama MCP tool server (docs/architecture.md, Sections 16.4 and 16.7)."""
 
 from sama.tools.clarify import ClarifyBroker, ClarifyQuestion, ClarifyRequest
+from sama.tools.code import CodeError, CodeRunner
 from sama.tools.outbound import BlockedUrlError, FetchError, OutboundClient, UrlPolicy
 from sama.tools.output import MAX_OUTPUT_BYTES, SandboxSpill, Spill
 from sama.tools.repos import RepoCloner, RepoError
@@ -15,6 +16,8 @@ __all__ = [
     "ClarifyBroker",
     "ClarifyQuestion",
     "ClarifyRequest",
+    "CodeError",
+    "CodeRunner",
     "FetchError",
     "MemoryTodoStore",
     "OutboundClient",

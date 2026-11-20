@@ -33,9 +33,9 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "clarify": frozenset({"clarify"}),
     "github": frozenset({"repo_clone", "pr_create", "pr_comment", "repo_push_approval"}),
     "memory": frozenset({"memory"}),
-    "skills": frozenset({"skills_list", "skill_view", "skill_manage"}),
+    "skills": frozenset({"skills_list", "skill_view", "skill_manage", "skill_import"}),
     "sessions": frozenset({"session_search", "session_read"}),
-    "media": frozenset({"vision_analyze"}),
+    "media": frozenset({"vision_analyze", "image_generate", "text_to_speech"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
     "cron": frozenset({"cronjob_manage"}),
@@ -44,6 +44,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "integrations": frozenset(),
     "delegation": frozenset({"delegate_task", "delegate_status"}),
     "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
+    "code_exec": frozenset({"execute_code"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet. ``integrations`` has no fixed tools: the connector tools are deferred tools
@@ -87,6 +88,8 @@ DEFAULT_ALLOW: Final = frozenset(
         "session_search",
         "session_read",
         "vision_analyze",
+        "image_generate",
+        "text_to_speech",
         "tool_search",
         "tool_describe",
         "Task",
