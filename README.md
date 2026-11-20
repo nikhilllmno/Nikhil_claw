@@ -110,6 +110,10 @@ plain `postgres` image fails at migration 0014. Supabase has the extension.
 
 Without `SAMA_TEST_DATABASE_URL` these tests are skipped. CI runs them with a Postgres service.
 
+Each test has a time limit of 120 seconds (900 for `live` tests). A test that waits longer
+fails and shows the stack of each thread and asyncio task (`tests/conftest.py`). Set
+`SAMA_TEST_TIMEOUT_S` to change the limit, or to `0` to remove it, for example in a debugger.
+
 Migrations use Alembic. Set `SAMA_DATABASE_URL` to the database URL (for Supabase, the session
 pooler URL on port 5432), then run:
 
