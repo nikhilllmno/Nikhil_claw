@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from sama.connectors.manifest import ENV_DIRECTORY, Catalog, ManifestError, catalog_directory, parse
+from sama.connectors.manifest import (
+    ENV_DIRECTORY,
+    TOKEN_FIELD,
+    Catalog,
+    ManifestError,
+    catalog_directory,
+    mcp_fields,
+    parse,
+)
 from sama.gate.decide import TOOLSETS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,7 +51,14 @@ def test_the_catalog_of_the_repo_loads() -> None:
     catalog = Catalog.load(ROOT / "connectors" / "catalog")
     names = {m.name for m in catalog}
     assert {"gmail", "googlecalendar", "github", "slack", "linear", "notion"} <= names
+    assert {"deepwiki", "neon", "sentry", "supabase", "stripe"} <= names
     for manifest in catalog:
+        if manifest.kind == "mcp_remote":
+            # A remote MCP server gives its tools at check time.
+            assert manifest.mcp is not None, manifest.name
+            assert not manifest.tools, manifest.name
+            assert manifest.mcp.url.startswith("https://"), manifest.name
+            continue
         assert manifest.tools, manifest.name
         accesses = {t.access for t in manifest.tools}
         assert "read" in accesses, manifest.name
@@ -110,4 +125,68 @@ def test_two_connectors_cannot_share_a_tool(tmp_path: Path) -> None:
         )
     )
     with pytest.raises(ManifestError, match="acme_two_get_item"):
+        Catalog.load(tmp_path)
+
+
+MCP = """
+name: remote
+title: Remote
+description: A remote MCP server.
+kind: mcp_remote
+mcp:
+  url: https://mcp.remote.test/mcp
+  auth: bearer
+  include: ["get_*", "list_*"]
+  exclude: ["*_secret"]
+  access: {"list_*": read}
+"""
+
+
+def test_an_mcp_manifest_gets_its_form_from_the_auth() -> None:
+    manifest = parse(MCP)
+    assert manifest.mcp is not None
+    assert manifest.mcp.include == ("get_*", "list_*")
+    assert [(f.name, f.secret, f.required) for f in manifest.fields] == [(TOKEN_FIELD, True, True)]
+    assert manifest.public()["mcp"]["url"] == "https://mcp.remote.test/mcp"
+    oauth = parse(MCP.replace("auth: bearer", "auth: oauth"))
+    assert oauth.fields == ()
+    header = parse(MCP.replace("auth: bearer", "auth: header\n  header: X-Api-Key"))
+    assert header.fields == mcp_fields("header", "X-Api-Key")
+    assert "X-Api-Key" in header.fields[0].help
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (("https://mcp.remote.test/mcp", "http://mcp.remote.test/mcp"), "url"),
+        (("https://mcp.remote.test/mcp", "https://mcp.remote.test/mcp?x=1"), "url"),
+        (("auth: bearer", "auth: header"), "header"),
+        (("auth: bearer", "auth: bearer\n  header: X-Key"), "header"),
+        (("auth: bearer", "auth: header\n  header: Mcp-Session-Id"), "sama sets"),
+        (("auth: bearer", "auth: basic"), "auth"),
+        (('"*_secret"', '"bad pattern"'), "pattern"),
+        (('list_*": read', 'list_*": maybe'), "access"),
+        (("kind: mcp_remote", "kind: http_api"), "mcp"),
+    ],
+)
+def test_a_bad_mcp_manifest_is_refused(change: tuple[str, str], error: str) -> None:
+    with pytest.raises(ManifestError, match=error):
+        parse(MCP.replace(*change))
+
+
+def test_an_mcp_manifest_cannot_list_tools_or_a_form() -> None:
+    tool = (
+        "tools:\n- name: remote_x\n  access: read\n  description: X.\n"
+        "  input_schema: {type: object}\n"
+    )
+    with pytest.raises(ManifestError, match="from the server"):
+        parse(MCP + tool)
+    form = "fields:\n- name: key\n  label: Key\n  secret: true\n"
+    with pytest.raises(ManifestError, match="token"):
+        parse(MCP + form)
+
+
+def test_the_catalog_refuses_a_custom_manifest(tmp_path: Path) -> None:
+    (tmp_path / "remote.yaml").write_text(MCP + "custom: true\n")
+    with pytest.raises(ManifestError, match="custom"):
         Catalog.load(tmp_path)

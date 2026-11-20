@@ -256,11 +256,48 @@ export interface Connector {
   name: string;
   title: string;
   description: string;
-  /** `composio`: a sign-in link. `http_api`: a form. */
+  /** `composio`: a sign-in link. `http_api`: a form. `mcp_remote`: a remote MCP server. */
   kind: string;
   scopes: ConnectionScope[];
   fields: ConnectorField[];
+  /** Empty for a remote MCP server: the server lists its tools after the connection. */
   tools: ConnectorTool[];
+  mcp?: { url: string; auth: McpAuth; header: string | null } | null;
+}
+
+/** How sama signs in to a remote MCP server. */
+export type McpAuth = "oauth" | "bearer" | "header" | "none";
+
+/** One tool of a remote MCP server, as sama shows it to the agent. */
+export interface McpTool {
+  /** The name for the agent: `mcp_<connection>_<tool>`. */
+  name: string;
+  remote_name: string;
+  description: string;
+  access: "read" | "write" | "destructive";
+  /** False when a filter of the connection or of the connector turns the tool off. */
+  enabled: boolean;
+}
+
+/** The remote MCP part of a connection (`kind` is `mcp_remote`). */
+export interface ConnectionMcp {
+  /** The server that an admin added by URL, or `null` for a server of the catalog. */
+  custom: { title: string | null; url: string; auth: McpAuth; header: string | null } | null;
+  include: string[];
+  exclude: string[];
+  discovered_at: string | null;
+  tools: McpTool[];
+}
+
+/** A new remote MCP server by URL (`POST /workspaces/{id}/connections/mcp`). */
+export interface McpServerAdd {
+  name: string;
+  url: string;
+  auth: McpAuth;
+  header?: string | null;
+  oauth_scope?: string | null;
+  title?: string | null;
+  scope: ConnectionScope;
 }
 
 /** A connection without secrets. Only the backend sets the state `connected`. */
@@ -279,6 +316,8 @@ export interface Connection {
   /** The values of the fields that are not secret. */
   fields: Record<string, string>;
   has_secret: boolean;
+  /** Only for a remote MCP server. */
+  mcp?: ConnectionMcp | null;
 }
 
 /** The answer to a new connection: the sign-in link of Composio, or `null` for a form. */
@@ -1022,6 +1061,21 @@ export class ApiClient {
       method: "POST",
       body: { workspace_id: workspaceId, agent_profile_id: agentProfileId, kind },
     });
+  /** Adds a remote MCP server by URL. Only a workspace admin can do this. */
+  addMcpServer = (workspaceId: string, body: McpServerAdd) =>
+    this.json<StartedConnection>(`/workspaces/${workspaceId}/connections/mcp`, {
+      method: "POST",
+      body,
+    });
+  /** Ends an OAuth sign-in: the server sent the user back with `state` and `code` (or `error`). */
+  finishOAuth = (state: string, code: string | null, error: string | null) =>
+    this.json<Connection>("/connections/oauth/callback", {
+      method: "POST",
+      body: { state, code, error },
+    });
+  /** The include and exclude filters of the tools of a remote MCP server. */
+  setConnectionTools = (id: string, include: string[], exclude: string[]) =>
+    this.json<Connection>(`/connections/${id}/tools`, { method: "PUT", body: { include, exclude } });
 }
 
 /** A query string (`?a=1&b=2`) of the values that are not `null`, else "". */

@@ -9,17 +9,26 @@ import {
   type Connection,
   type ConnectionScope,
   type Connector,
+  type McpAuth,
   errorText,
 } from "@/lib/api";
 import {
   type ConnectionList,
+  EMPTY_SERVER,
+  type ServerDraft,
   connectionOf,
+  customServers,
   formProblem,
   formValues,
   initialValues,
   isSafeRedirect,
   listFor,
+  mcpToolSummary,
   parseConnectionQuery,
+  parsePatterns,
+  patternProblem,
+  serverBody,
+  serverProblem,
   stateLabel,
   stateTone,
   toolSummary,
@@ -38,6 +47,15 @@ const SCOPE_LABELS: Record<ConnectionScope, string> = {
   personal: "Only you",
   workspace: "Whole workspace",
 };
+
+const AUTH_LABELS: Record<McpAuth, string> = {
+  oauth: "Sign in (OAuth)",
+  bearer: "Access token",
+  header: "Key in a header",
+  none: "No sign-in",
+};
+
+const ACCESS_LABELS = { read: "Read", write: "Write (asks first)", destructive: "Can delete (asks first)" };
 
 type Notice = { tone: "success" | "info" | "error"; connector: string | null; text: string } | null;
 
@@ -102,17 +120,24 @@ export function Connections() {
     setList((current) => withoutConnection(current, id));
   }, []);
 
-  const start = useCallback(
-    async (workspace: string, connector: string, scope: ConnectionScope) => {
-      const started = await api.startConnection(workspace, connector, scope);
+  /** After a start: go to the sign-in link, or open the form if the connection needs one. */
+  const opened = useCallback(
+    (started: { connection: Connection; redirect_url: string | null }) => {
       if (isSafeRedirect(started.redirect_url)) {
         window.location.assign(started.redirect_url);
         return;
       }
       replace(started.connection);
-      setFormFor(started.connection.id);
+      if (started.connection.state === "pending") setFormFor(started.connection.id);
     },
-    [api, replace],
+    [replace],
+  );
+
+  const start = useCallback(
+    async (workspace: string, connector: string, scope: ConnectionScope) => {
+      opened(await api.startConnection(workspace, connector, scope));
+    },
+    [api, opened],
   );
 
   // The entry links: `?connect=` starts a connection, `?connection=` checks it after sign-in.
@@ -124,6 +149,17 @@ export function Connections() {
     history.replaceState(null, "", window.location.pathname + withoutEntryParams(window.location.search));
     // The state changes run after the effect, in the promise.
     const run = async () => {
+      if (intent.kind === "oauth") {
+        const done = await api.finishOAuth(intent.state, intent.code, intent.error);
+        if (workspaces.some((w) => w.id === done.workspace_id)) setWorkspaceId(done.workspace_id);
+        replace(done);
+        setNotice(
+          done.state === "connected"
+            ? { tone: "success", connector: done.connector, text: "is connected." }
+            : { tone: "error", connector: done.connector, text: `${stateLabel(done.state)}. ${done.last_error ?? ""}`.trim() },
+        );
+        return;
+      }
       if (!workspaces.some((w) => w.id === intent.workspaceId)) {
         throw new Error("You are not in the workspace of this link.");
       }
@@ -158,6 +194,7 @@ export function Connections() {
   if (me === null) return <LoadingState label="Loading the connections" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
   const rows = workspace === null ? null : listFor(list, workspace.id);
+  const cards = catalog.data === null || rows === null ? [] : [...catalog.data, ...customServers(rows, catalog.data)];
 
   return (
     <div className={styles.page}>
@@ -189,11 +226,11 @@ export function Connections() {
         <ErrorState title="The connections did not load" message={listError} onRetry={reloadList} />
       ) : catalog.data === null || rows === null ? (
         <LoadingState label="Loading the connections" />
-      ) : catalog.data.length === 0 ? (
-        <p className="alert">This sama has no connectors.</p>
       ) : (
+        <>
+        {cards.length === 0 ? <p className="alert">This sama has no connectors.</p> : null}
         <ul className={styles.list}>
-          {catalog.data.map((connector) => (
+          {cards.map((connector) => (
             <li key={connector.name}>
               <ConnectorCard
                 connector={connector}
@@ -210,8 +247,158 @@ export function Connections() {
             </li>
           ))}
         </ul>
+        <AddServer
+          onAdd={async (draft) => {
+            opened(await api.addMcpServer(workspace.id, serverBody(draft)));
+          }}
+        />
+        </>
       )}
     </div>
+  );
+}
+
+/** The form to add a remote MCP server by URL. Only a workspace admin can send it. */
+function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<ServerDraft>(EMPTY_SERVER);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const edit = (patch: Partial<ServerDraft>) => setDraft((d) => ({ ...d, ...patch }));
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const problem = serverProblem(draft);
+    if (problem !== null) {
+      setError(problem);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await onAdd(draft);
+      setDraft(EMPTY_SERVER);
+      setOpen(false);
+    } catch (e) {
+      setError(errorText(e, "The server was not added."));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <div>
+        <button type="button" className="btn btn-small" onClick={() => setOpen(true)}>
+          Add a server by URL
+        </button>
+      </div>
+    );
+  }
+  return (
+    <section className={`card ${styles.card}`} aria-label="Add a remote MCP server">
+      <div className={styles.cardHead}>
+        <h2 className={styles.heading}>Add a remote MCP server</h2>
+        <span className={styles.meta}>Only a workspace admin can add a server.</span>
+      </div>
+      <form className={styles.form} onSubmit={submit}>
+        <label className="field">
+          <span className="label">Name</span>
+          <input
+            className="input"
+            value={draft.name}
+            maxLength={40}
+            autoComplete="off"
+            onChange={(e) => edit({ name: e.target.value })}
+          />
+          <span className="hint">The tools get the names mcp_&lt;name&gt;_&lt;tool&gt;.</span>
+        </label>
+        <label className="field">
+          <span className="label">Title (optional)</span>
+          <input className="input" value={draft.title} maxLength={60} onChange={(e) => edit({ title: e.target.value })} />
+        </label>
+        <label className="field">
+          <span className="label">Address</span>
+          <input
+            className="input"
+            type="url"
+            inputMode="url"
+            placeholder="https://mcp.example.com/mcp"
+            value={draft.url}
+            maxLength={2000}
+            autoComplete="off"
+            onChange={(e) => edit({ url: e.target.value })}
+          />
+        </label>
+        <label className="field">
+          <span className="label">Sign-in</span>
+          <select className="input" value={draft.auth} onChange={(e) => edit({ auth: e.target.value as McpAuth })}>
+            {(Object.keys(AUTH_LABELS) as McpAuth[]).map((auth) => (
+              <option key={auth} value={auth}>
+                {AUTH_LABELS[auth]}
+              </option>
+            ))}
+          </select>
+          <span className="hint">You give a token or a key in the next step, not here.</span>
+        </label>
+        {draft.auth === "header" ? (
+          <label className="field">
+            <span className="label">Header name</span>
+            <input
+              className="input"
+              placeholder="X-Api-Key"
+              value={draft.header}
+              maxLength={64}
+              autoComplete="off"
+              onChange={(e) => edit({ header: e.target.value })}
+            />
+          </label>
+        ) : null}
+        {draft.auth === "oauth" ? (
+          <label className="field">
+            <span className="label">OAuth scope (optional)</span>
+            <input
+              className="input"
+              value={draft.oauthScope}
+              maxLength={400}
+              autoComplete="off"
+              onChange={(e) => edit({ oauthScope: e.target.value })}
+            />
+          </label>
+        ) : null}
+        <label className="field">
+          <span className="label">Who can use it</span>
+          <select className="input" value={draft.scope} onChange={(e) => edit({ scope: e.target.value as ConnectionScope })}>
+            {(Object.keys(SCOPE_LABELS) as ConnectionScope[]).map((scope) => (
+              <option key={scope} value={scope}>
+                {SCOPE_LABELS[scope]}
+              </option>
+            ))}
+          </select>
+        </label>
+        {error ? (
+          <p className="alert alert-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <div className={styles.actions}>
+          <button type="submit" className="btn btn-primary btn-small" disabled={saving}>
+            {saving ? "Adding" : "Add and connect"}
+          </button>
+          <button
+            type="button"
+            className="btn btn-quiet btn-small"
+            disabled={saving}
+            onClick={() => {
+              setOpen(false);
+              setError(null);
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </form>
+    </section>
   );
 }
 
@@ -352,6 +539,7 @@ function ScopeRow({
         </div>
       </div>
       {connection?.last_error ? <p className={styles.error}>{connection.last_error}</p> : null}
+      {connection?.mcp ? <McpTools connection={connection} onSaved={onSaved} /> : null}
       {error ? (
         <p className="alert alert-error" role="alert">
           {error}
@@ -440,5 +628,73 @@ function ConnectForm({
         </button>
       </div>
     </form>
+  );
+}
+
+/** The tools of a remote MCP server, and the filters that turn tools on and off. */
+function McpTools({ connection, onSaved }: { connection: Connection; onSaved: (connection: Connection) => void }) {
+  const api = useApi();
+  const mcp = connection.mcp;
+  const [include, setInclude] = useState(() => (mcp?.include ?? []).join("\n"));
+  const [exclude, setExclude] = useState(() => (mcp?.exclude ?? []).join("\n"));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const summary = mcpToolSummary(connection);
+  if (!mcp || summary === null) return null;
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const wanted = parsePatterns(include);
+    const unwanted = parsePatterns(exclude);
+    const problem = patternProblem(wanted) ?? patternProblem(unwanted);
+    if (problem !== null) {
+      setError(problem);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      onSaved(await api.setConnectionTools(connection.id, wanted, unwanted));
+    } catch (e) {
+      setError(errorText(e, "The filters were not saved."));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <details className={styles.tools}>
+      <summary className={styles.meta}>Tools: {summary}</summary>
+      <ul className={styles.toolList}>
+        {mcp.tools.map((tool) => (
+          <li key={tool.name} className={tool.enabled ? styles.tool : `${styles.tool} ${styles.toolOff}`}>
+            <span className={styles.toolName}>{tool.remote_name}</span>
+            <span className="badge">{tool.enabled ? ACCESS_LABELS[tool.access] : "Off"}</span>
+            {tool.description ? <span className={styles.toolText}>{tool.description}</span> : null}
+          </li>
+        ))}
+      </ul>
+      <form className={styles.form} onSubmit={save} aria-label="Tool filters">
+        <label className="field">
+          <span className="label">Use only these tools (optional)</span>
+          <textarea className="input" rows={2} value={include} onChange={(e) => setInclude(e.target.value)} />
+          <span className="hint">One name or pattern on each line, for example list_*. Empty: all tools.</span>
+        </label>
+        <label className="field">
+          <span className="label">Never use these tools (optional)</span>
+          <textarea className="input" rows={2} value={exclude} onChange={(e) => setExclude(e.target.value)} />
+        </label>
+        {error ? (
+          <p className="alert alert-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <div className={styles.actions}>
+          <button type="submit" className="btn btn-small" disabled={saving}>
+            {saving ? "Saving" : "Save filters"}
+          </button>
+        </div>
+      </form>
+    </details>
   );
 }

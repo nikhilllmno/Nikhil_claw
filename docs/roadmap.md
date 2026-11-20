@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M3.11, M4.1 to M4.3 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -182,6 +182,18 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M3.11, M4.1 to M4.3 (below the list of 
   session of the trigger owner, with the `safe` toolsets unless an admin gave more. Not in
   M4.4: workflows as targets (M4.5), delivery of the answer to a channel (M4.3), channel
   events, and a web page for triggers.
+- M3.5: remote MCP connections in `src/sama/connectors/mcp_remote.py`, `oauth.py`, and
+  `mcp_driver.py` (architecture Section 10.3, "What M3.5 builds"). The catalog has `deepwiki`,
+  `neon`, `stripe`, `sentry`, and `supabase`. A workspace admin or the org owner adds a server by
+  URL (`POST /workspaces/{id}/connections/mcp`). Auth: OAuth 2.1 with dynamic client
+  registration, PKCE, and the `resource` parameter; a bearer token; a header; or none. The
+  OAuth answer goes through the web app to `POST /connections/oauth/callback`. The tools are
+  `mcp_<connection>_<tool>` in `tool_search`, read for each run, so a new server needs no new
+  session. `tool_cache` keeps the tool list, a check is the health check, and a list older than
+  6 hours is read again in the background. `PUT /connections/{id}/tools` sets the include and
+  exclude filters. Every request uses the outbound client without redirects. Not in M3.5:
+  `policy_overrides` in the gate, MCP resources and prompts, a refresh lock across processes,
+  and an MCP `listChanged` notice (sama reads the list again at a check or after 6 hours).
 - M3.4: connections in `src/sama/connectors/` and `connectors/catalog/` (architecture Section
   10.3). Migration `0022` adds `connections` with RLS, the vault names `composio_api_key` and
   `connection:<uuid>`, and the toolsets `connections` and `integrations` in the default
@@ -367,7 +379,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M3.11, M4.1 to M4.3 (below the list of 
 | M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. Done. |
 | M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. Done. |
 | M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. Done. |
-| M3.5 | Remote MCP connections | Add a remote MCP server from the catalog or by URL, with OAuth 2.1 (dynamic client registration and PKCE), a bearer token, or a header. Tools proxied by the sama MCP server as `mcp_<connection>_<tool>`. Include and exclude filters, a tool schema cache, and a health check. New tools are usable without a new session. All calls use the outbound URL policy (architecture §16.4). |
+| M3.5 | Remote MCP connections | Add a remote MCP server from the catalog or by URL, with OAuth 2.1 (dynamic client registration and PKCE), a bearer token, or a header. Tools proxied by the sama MCP server as `mcp_<connection>_<tool>`. Include and exclude filters, a tool schema cache, and a health check. New tools are usable without a new session. All calls use the outbound URL policy (architecture §16.4). Done. |
 | M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the local sandbox client inside the E2B sandbox (no E2B key in the runner), a sama `Session` over the control-plane API (no database credentials in the runner), `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. Done. |
 | M3.7 | GitHub App, git proxy, and pull requests | Sama GitHub App. Sama git proxy holds the tokens; the sandbox has none. `repo_clone`, `pr_create`, `pr_comment`. Allowlist of repos per org. The proxy rejects pushes to non-`sama/*` refs, force-pushes, and ref deletes, and needs an approval for protected paths. Setup docs require a default-branch ruleset with no bypass for the App. Tests cover each rejected push. Done. A person still creates the real App and the rulesets (architecture §19.5). |
 | M3.8 | Web app v1 core | Next.js app in `web/`, hosted on Vercel: sign-in (password and email link), session list, chat with live streaming, approvals and questions, stop, and agent settings (soul, model, toolsets, sub-agents) for org admins. CORS from `SAMA_WEB_ORIGINS`. CI runs lint, typecheck, tests, and build. Done. |

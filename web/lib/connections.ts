@@ -4,20 +4,43 @@
 //   the tool `connection_request`. The page starts the connection.
 // - `/connections?workspace=<id>&connection=<id>` from the Composio sign-in. The page asks the
 //   API to check the connection. Only the API sets the state `connected`.
+// - `/connections?code=<code>&state=<state>` (or `?error=<error>&state=<state>`) from the OAuth
+//   sign-in of a remote MCP server. The page gives both to the API, which compares the state
+//   with the one that it stored.
 
-import type { Connection, ConnectionScope, ConnectionState, Connector, ConnectorField } from "./api";
+import type {
+  Connection,
+  ConnectionScope,
+  ConnectionState,
+  Connector,
+  ConnectorField,
+  McpAuth,
+  McpServerAdd,
+} from "./api";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** The same rule as the `ck_connections_connector` CHECK of the database. */
 const CONNECTOR = /^[a-z][a-z0-9_-]{0,39}$/;
 
+/** The OAuth state of sama: `<connection id>.<random>`. */
+const OAUTH_STATE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9_-]{16,160}$/i;
+
 export type ConnectionIntent =
   | { kind: "connect"; workspaceId: string; connector: string; scope: ConnectionScope }
-  | { kind: "callback"; workspaceId: string; connectionId: string };
+  | { kind: "callback"; workspaceId: string; connectionId: string }
+  | { kind: "oauth"; state: string; code: string | null; error: string | null };
 
 /** The action of an entry link, or `null` if the query has no valid action. */
 export function parseConnectionQuery(search: string): ConnectionIntent | null {
   const query = new URLSearchParams(search);
+  const state = query.get("state");
+  if (state !== null) {
+    const code = query.get("code");
+    const error = query.get("error");
+    if (!OAUTH_STATE.test(state) || (code === null) === (error === null)) return null;
+    if ((code?.length ?? 0) > 4000 || (error?.length ?? 0) > 200) return null;
+    return { kind: "oauth", state, code, error };
+  }
   const workspaceId = query.get("workspace") ?? "";
   if (!UUID.test(workspaceId)) return null;
   const connectionId = query.get("connection");
@@ -141,6 +164,7 @@ export function initialValues(
 
 /** A short line for the tools of a connector, for example "3 read, 2 write". */
 export function toolSummary(connector: Connector): string {
+  if (connector.kind === "mcp_remote") return "Remote MCP server";
   const read = connector.tools.filter((t) => t.access === "read").length;
   const write = connector.tools.length - read;
   const parts = [`${read} read`];
@@ -151,7 +175,157 @@ export function toolSummary(connector: Connector): string {
 /** The query of a page address without the entry-link parameters. */
 export function withoutEntryParams(search: string): string {
   const query = new URLSearchParams(search);
-  for (const key of ["workspace", "connect", "scope", "connection"]) query.delete(key);
+  const keys = ["workspace", "connect", "scope", "connection"];
+  // The OAuth answer: the code is used once, and it must not stay in the address or history.
+  keys.push("code", "state", "error", "error_description", "error_uri", "iss");
+  for (const key of keys) query.delete(key);
   const rest = query.toString();
   return rest === "" ? "" : `?${rest}`;
+}
+
+// -- remote MCP servers (M3.5) ------------------------------------------------------------------
+
+/** The same rules as the API (`connectors/manifest.py`). */
+const SERVER_NAME = /^[a-z][a-z0-9_-]{0,39}$/;
+const HEADER = /^[A-Za-z][A-Za-z0-9-]{0,63}$/;
+const TOOL_PATTERN = /^[A-Za-z0-9_.*?/:-]{1,100}$/;
+const MAX_PATTERNS = 50;
+/** The headers that sama sets itself. A server by URL cannot use them for its credential. */
+const RESERVED_HEADERS = new Set([
+  "accept",
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "content-type",
+  "host",
+  "mcp-protocol-version",
+  "mcp-session-id",
+  "transfer-encoding",
+]);
+
+/** The form of a new server by URL, as the user types it. */
+export type ServerDraft = {
+  name: string;
+  title: string;
+  url: string;
+  auth: McpAuth;
+  header: string;
+  oauthScope: string;
+  scope: ConnectionScope;
+};
+
+export const EMPTY_SERVER: ServerDraft = {
+  name: "",
+  title: "",
+  url: "",
+  auth: "oauth",
+  header: "",
+  oauthScope: "",
+  scope: "workspace",
+};
+
+/** The text of the first problem of a new server, or `null` if the form can be sent. */
+export function serverProblem(draft: ServerDraft): string | null {
+  if (!SERVER_NAME.test(draft.name.trim().toLowerCase())) {
+    return "The name has 1 to 40 lower-case letters, digits, _ and -, and starts with a letter.";
+  }
+  let url: URL;
+  try {
+    url = new URL(draft.url.trim());
+  } catch {
+    return "Give the full address of the server, for example https://mcp.example.com/mcp.";
+  }
+  if (url.protocol !== "https:") return "The address must start with https://.";
+  if (url.username !== "" || url.password !== "") return "The address cannot have a user name or a password.";
+  if (url.search !== "" || url.hash !== "") return "The address cannot have a query or a fragment.";
+  if (draft.auth === "header") {
+    const header = draft.header.trim();
+    if (!HEADER.test(header)) return "Give the name of the header, for example X-Api-Key.";
+    if (RESERVED_HEADERS.has(header.toLowerCase())) return `sama sets the ${header} header itself.`;
+  }
+  return null;
+}
+
+/** The body of `POST /workspaces/{id}/connections/mcp`. */
+export function serverBody(draft: ServerDraft): McpServerAdd {
+  const title = draft.title.trim();
+  const oauthScope = draft.oauthScope.trim();
+  return {
+    name: draft.name.trim().toLowerCase(),
+    url: draft.url.trim(),
+    auth: draft.auth,
+    header: draft.auth === "header" ? draft.header.trim() : null,
+    oauth_scope: draft.auth === "oauth" && oauthScope !== "" ? oauthScope : null,
+    title: title === "" ? null : title,
+    scope: draft.scope,
+  };
+}
+
+/**
+ * The servers that an admin added by URL, as connectors: they are not in the catalog, so the
+ * page makes a card for each from its connections.
+ */
+export function customServers(
+  connections: readonly Connection[],
+  catalog: readonly Connector[],
+): Connector[] {
+  const known = new Set(catalog.map((c) => c.name));
+  const out = new Map<string, Connector>();
+  for (const connection of connections) {
+    const custom = connection.mcp?.custom;
+    if (!custom || known.has(connection.connector)) continue;
+    const seen = out.get(connection.connector);
+    if (seen) {
+      if (!seen.scopes.includes(connection.scope)) seen.scopes.push(connection.scope);
+      continue;
+    }
+    out.set(connection.connector, {
+      name: connection.connector,
+      title: custom.title ?? connection.connector,
+      description: `Added by URL: ${custom.url}`,
+      kind: "mcp_remote",
+      scopes: [connection.scope],
+      fields: mcpFields(custom.auth, custom.header),
+      tools: [],
+      mcp: { url: custom.url, auth: custom.auth, header: custom.header },
+    });
+  }
+  return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The form of a server: the same field as `mcp_fields` of the API. */
+export function mcpFields(auth: McpAuth, header: string | null): ConnectorField[] {
+  if (auth === "bearer") {
+    return [{ name: "token", label: "Access token", secret: true, required: true, help: "The token goes into the Authorization header." }];
+  }
+  if (auth === "header") {
+    return [{ name: "token", label: "Header value", secret: true, required: true, help: `The value goes into the ${header ?? ""} header.` }];
+  }
+  return [];
+}
+
+/** A short line for the tools of a connected server, for example "12 tools, 4 read only, 2 off". */
+export function mcpToolSummary(connection: Connection): string | null {
+  const tools = connection.mcp?.tools;
+  if (!tools || connection.mcp?.discovered_at == null) return null;
+  const on = tools.filter((t) => t.enabled);
+  const parts = [`${on.length} ${on.length === 1 ? "tool" : "tools"}`, `${on.filter((t) => t.access === "read").length} read only`];
+  const off = tools.length - on.length;
+  if (off > 0) parts.push(`${off} off`);
+  return parts.join(", ");
+}
+
+/** The patterns of a filter: one for each line or comma. */
+export function parsePatterns(text: string): string[] {
+  return text
+    .split(/[\n,]/)
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+}
+
+/** The text of the first bad pattern, or `null` if all are good. */
+export function patternProblem(patterns: readonly string[]): string | null {
+  if (patterns.length > MAX_PATTERNS) return `Give ${MAX_PATTERNS} patterns or fewer.`;
+  const bad = patterns.find((p) => !TOOL_PATTERN.test(p));
+  return bad === undefined ? null : `"${bad}" is not a pattern. Use letters, digits, and _ . * ? / : -.`;
 }

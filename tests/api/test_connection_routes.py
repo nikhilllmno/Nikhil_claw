@@ -16,6 +16,7 @@ from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import Vault
 from tests.api.conftest import ISSUER, SECRET, bearer
 from tests.api.test_app import add_user, mia
+from tests.connectors.fake_mcp import URL, FakeMcp, driver
 from tests.connectors.support import NOTION_TOKEN, FakeComposio, FakeForm, service
 from tests.orchestrator.conftest import Tenant
 
@@ -170,3 +171,93 @@ async def test_bad_input_is_refused(web: httpx.AsyncClient, tenant: Tenant) -> N
     ):
         response = await web.post(path(tenant), headers=mia(tenant), json=body)
         assert response.status_code == status, body
+
+
+# -- remote MCP servers (M3.5) -----------------------------------------------------------------
+
+
+@pytest.fixture
+def remote() -> FakeMcp:
+    fake = FakeMcp("oauth")
+    fake.tokens = set()
+    return fake
+
+
+@pytest.fixture
+async def mcp_web(
+    engine: AsyncEngine, tenant: Tenant, remote: FakeMcp
+) -> AsyncIterator[httpx.AsyncClient]:
+    vault = Vault(engine, VaultKey(b"w" * KEY_BYTES))
+    connections = service(engine, vault, FakeComposio(), FakeForm(), mcp=driver(remote, vault))
+    api = SamaApi(
+        engine,
+        verifier=JwtVerifier(secret=SecretStr(SECRET), issuer=ISSUER),
+        connections=connections,
+    )
+    transport = httpx.ASGITransport(app=api.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        yield client
+    await connections.aclose()
+
+
+async def make_admin(engine: AsyncEngine, tenant: Tenant) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(
+                Membership.user_id == tenant.ids["mia"],
+                Membership.workspace_id == tenant.ids["ws"],
+            )
+            .values(role="admin")
+        )
+
+
+async def test_an_admin_adds_a_server_by_url_and_signs_in(
+    mcp_web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, remote: FakeMcp
+) -> None:
+    body = {"name": "tracker", "url": URL, "auth": "oauth", "scope": "personal"}
+    url = path(tenant) + "/mcp"
+    # Only a workspace admin adds a server by URL.
+    assert (await mcp_web.post(url, headers=mia(tenant), json=body)).status_code == 403
+    await make_admin(engine, tenant)
+    for bad in (
+        {**body, "url": "http://mcp.remote.test/mcp"},
+        {**body, "name": "Bad Name"},
+        {**body, "auth": "basic"},
+    ):
+        assert (await mcp_web.post(url, headers=mia(tenant), json=bad)).status_code == 422, bad
+    started = await mcp_web.post(url, headers=mia(tenant), json=body)
+    assert started.status_code == 201
+    redirect = started.json()["redirect_url"]
+    connection = started.json()["connection"]
+    assert connection["state"] == "initiated"
+    assert connection["mcp"]["custom"]["url"] == URL
+    code, state = remote.approve(redirect)
+    callback = "/connections/oauth/callback"
+    for broken, status in (("not-a-uuid.x", 400), (state[:-1] + "x", 400)):
+        answer = await mcp_web.post(
+            callback, headers=mia(tenant), json={"state": broken, "code": code}
+        )
+        assert answer.status_code == status, broken
+    # Another member cannot finish the sign-in of mia.
+    other = bearer(await add_user(engine, tenant, workspace_member=True))
+    refused = await mcp_web.post(callback, headers=other, json={"state": state, "code": code})
+    assert refused.status_code == 404
+    done = await mcp_web.post(callback, headers=mia(tenant), json={"state": state, "code": code})
+    assert done.status_code == 200
+    assert done.json()["state"] == "connected"
+    assert "access-1" not in done.text
+    names = [t["name"] for t in done.json()["mcp"]["tools"]]
+    assert names == ["mcp_tracker_list_items", "mcp_tracker_create_item", "mcp_tracker_drop_item"]
+    # The tool filters.
+    tools = f"/connections/{connection['id']}/tools"
+    saved = await mcp_web.put(
+        tools, headers=mia(tenant), json={"include": ["*_item*"], "exclude": ["drop_*"]}
+    )
+    assert saved.status_code == 200
+    enabled = {t["remote_name"]: t["enabled"] for t in saved.json()["mcp"]["tools"]}
+    assert enabled == {"list_items": True, "create_item": True, "drop_item": False}
+    assert saved.json()["mcp"]["exclude"] == ["drop_*"]
+    refused_pattern = await mcp_web.put(tools, headers=mia(tenant), json={"include": ["a b"]})
+    assert refused_pattern.status_code == 422
+    assert (await mcp_web.put(tools, headers=other, json={})).status_code == 404

@@ -1,0 +1,12 @@
+# Sentry (docs/architecture.md, Section 10.3): the remote MCP server of Sentry. The user signs
+# in with OAuth. The server gives the tool list.
+name: sentry
+title: Sentry
+description: Read and manage Sentry issues, events, projects, and releases.
+kind: mcp_remote
+scopes:
+- personal
+- workspace
+mcp:
+  url: https://mcp.sentry.dev/mcp
+  auth: oauth

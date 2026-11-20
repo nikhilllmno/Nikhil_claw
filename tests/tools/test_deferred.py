@@ -513,6 +513,7 @@ class FakeConnections:
 
     connected: frozenset[str] = frozenset({"mail_read"})
     calls: list[tuple[str, Any]] = field(default_factory=list)
+    remote: list[DeferredTool] = field(default_factory=list)
 
     async def list_for_agent(self, claims: RunTokenClaims) -> str:
         self.calls.append(("list", claims.run_id))
@@ -531,6 +532,10 @@ class FakeConnections:
 
     async def usable_tools(self, claims: RunTokenClaims, names: Any) -> frozenset[str]:
         return frozenset(n for n in names if n != "mail_send" or n in self.connected)
+
+    async def mcp_tools(self, claims: RunTokenClaims) -> list[DeferredTool]:
+        """The tools of the remote MCP servers of the run, read for each search."""
+        return list(self.remote)
 
 
 async def test_the_connection_tools_answer_through_the_gate() -> None:
@@ -570,3 +575,64 @@ async def test_the_connection_tools_answer_through_the_gate() -> None:
         "connection_request",
         "connection_test",
     ]
+
+
+async def test_remote_mcp_tools_are_usable_at_once_in_a_running_session() -> None:
+    """A server that connects during a session gives its tools to the next search (M3.5)."""
+
+    async def docs(claims: RunTokenClaims, arguments: Mapping[str, Any]) -> str:
+        return f"docs for {arguments['q']}"
+
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    gate = VisibleGate(visible=frozenset({"mail_read", "mcp_wiki_read_docs"}))
+    connections = FakeConnections()
+    # No static catalog: the connections alone turn on the search tools.
+    tools = ToolServer(
+        signer=signer,
+        todos=MemoryTodoStore(),
+        deferred=DeferredCatalog(),
+        gate=gate,
+        connections=cast("ConnectionService", connections),
+    )
+    remote = DeferredTool(
+        "mcp_wiki_read_docs",
+        "Wiki (remote MCP server): read the docs of a repository.",
+        "integrations",
+        docs,
+        input_schema={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        access="read",
+    )
+    hidden = DeferredTool("mcp_wiki_drop", "Wiki: drop the docs.", "integrations", docs)
+    with serve(tools.app()) as base:
+        async with connect(base + "/mcp", signer.issue(make_scope("run-5"), ttl_s=600)) as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+            assert {"tool_search", "tool_describe", "tool_call"} <= names
+            before = await client.call_tool("tool_search", {"query": "docs"})
+            assert "mcp_wiki_read_docs" not in text_of(before)
+            connections.remote = [remote, hidden]
+            found = await client.call_tool("tool_search", {"query": "docs"})
+            described = await client.call_tool("tool_describe", {"name": "mcp_wiki_read_docs"})
+            ran = await client.call_tool(
+                "tool_call", {"name": "mcp_wiki_read_docs", "arguments": {"q": "x"}}
+            )
+            blocked = await client.call_tool("tool_describe", {"name": "mcp_wiki_drop"})
+    assert "mcp_wiki_read_docs" in text_of(found)
+    assert "mcp_wiki_drop" not in text_of(found)
+    assert '"required"' in text_of(described)
+    assert not ran.is_error
+    assert text_of(ran) == "docs for x"
+    assert blocked.is_error
+
+
+def test_an_extended_catalog_keeps_the_first_tool_of_a_name() -> None:
+    async def handler(claims: RunTokenClaims, arguments: Mapping[str, Any]) -> str:
+        return "x"
+
+    base = DeferredCatalog(mail_tools())
+    first = base.get("mail_read")
+    other = DeferredTool("mail_read", "Another read.", "other", handler)
+    extra = DeferredTool("mcp_x_y", "Remote.", "integrations", handler)
+    extended = base.extended([other, extra])
+    assert extended.get("mail_read") is first
+    assert extended.get("mcp_x_y") is extra
+    assert base.get("mcp_x_y") is None

@@ -121,6 +121,15 @@ class DeferredCatalog:
     def get(self, name: str) -> DeferredTool | None:
         return self._tools.get(name)
 
+    def extended(self, extra: Collection[DeferredTool]) -> DeferredCatalog:
+        """A copy with more tools, for example the tools of the remote MCP servers of one run.
+        A tool with the name of a tool in this catalog is not added."""
+        copy = DeferredCatalog()
+        copy._tools = dict(self._tools)
+        for tool in extra:
+            copy._tools.setdefault(tool.name, tool)
+        return copy
+
     def names(self) -> frozenset[str]:
         return frozenset(self._tools)
 

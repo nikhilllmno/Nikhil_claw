@@ -1,0 +1,12 @@
+# Supabase MCP (docs/architecture.md, Section 10.3): the remote MCP server of Supabase. The user
+# signs in with OAuth. The server gives the tool list.
+name: supabase-mcp
+title: Supabase MCP
+description: Manage Supabase projects, run SQL, and read logs and docs.
+kind: mcp_remote
+scopes:
+- personal
+- workspace
+mcp:
+  url: https://mcp.supabase.com/mcp
+  auth: oauth

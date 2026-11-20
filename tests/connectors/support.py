@@ -13,6 +13,7 @@ from pydantic import SecretStr
 from sama.connectors.composio import ComposioClient
 from sama.connectors.http_api import DriverError, DriverUnavailableError
 from sama.connectors.manifest import Catalog, Manifest, ToolSpec
+from sama.connectors.mcp_driver import McpDriver
 from sama.connectors.service import ConnectionService
 from sama.vault.store import OrgKeys, SecretName, Vault
 
@@ -118,7 +119,13 @@ class FakeForm:
         return '{"results": []}'
 
 
-def service(engine: Any, vault: Vault, fake: FakeComposio, form: FakeForm) -> ConnectionService:
+def service(
+    engine: Any,
+    vault: Vault,
+    fake: FakeComposio,
+    form: FakeForm,
+    mcp: McpDriver | None = None,
+) -> ConnectionService:
     """A connection service with the catalog of the repo and the fakes."""
     return ConnectionService(
         engine,
@@ -127,5 +134,6 @@ def service(engine: Any, vault: Vault, fake: FakeComposio, form: FakeForm) -> Co
         vault=vault,
         composio=ComposioClient(transport=httpx.MockTransport(fake)),
         drivers={"http_api": form},
+        mcp=mcp,
         web_base=WEB + "/",
     )
