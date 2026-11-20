@@ -7,7 +7,13 @@ name: Deploy
 # - Production: run this workflow by hand with the commit to promote. It deploys the image
 #   that staging built for that commit, so production runs the tested image.
 #
-# Each GitHub environment (staging, production) needs the secret FLY_API_TOKEN.
+# Each commit gets its own E2B template, sama-runner-<first 12 characters of the SHA>, and the
+# deploy sets SAMA_SANDBOX_TEMPLATE to it. The runner in the sandbox then always has the code of
+# the control plane that starts it, so a change of the runner protocol cannot break an
+# environment that runs an older commit (docs/architecture.md, Section 19.3).
+#
+# Each GitHub environment (staging, production) needs the secret FLY_API_TOKEN. The template
+# build needs the repository secret E2B_API_KEY.
 
 on:
   workflow_run:
@@ -25,6 +31,7 @@ permissions:
   contents: read
 
 env:
+  UV_VERSION: "0.13.8"
   FLYCTL_VERSION: "0.5.13"
   FLYCTL_SHA256: "f1ae6fc1d0151d9a3a0086d22e0552e33cf9ab6f8f9c7c2baf7daa96d3ee0870"
 
@@ -57,12 +64,31 @@ jobs:
           echo "${FLYCTL_SHA256}  flyctl.tgz" | sha256sum --check --strict
           tar -xzf flyctl.tgz flyctl
           rm flyctl.tgz
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # The build is the same for the same commit, and E2B caches the layers, so the production
+      # job builds again only to be sure that the template exists.
+      - name: Build the E2B template of the commit
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+        run: |
+          if [ -z "$E2B_API_KEY" ]; then
+            echo "::error::Add the repository secret E2B_API_KEY."
+            exit 1
+          fi
+          uv sync --locked
+          uv run python -m sama.sandbox.template --alias "sama-runner-${SHA:0:12}"
       - name: Deploy
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: >-
           ./flyctl deploy --config deploy/fly.staging.toml --remote-only --ha=false
           --image-label "main-${SHA}" --wait-timeout 10m
+          --env "SAMA_SANDBOX_TEMPLATE=sama-runner-${SHA:0:12}"
       - name: Check the health of each part
         run: |
           for path in /healthz /tools/healthz /model/healthz; do
@@ -106,12 +132,31 @@ jobs:
           echo "${FLYCTL_SHA256}  flyctl.tgz" | sha256sum --check --strict
           tar -xzf flyctl.tgz flyctl
           rm flyctl.tgz
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # The build is the same for the same commit, and E2B caches the layers, so the production
+      # job builds again only to be sure that the template exists.
+      - name: Build the E2B template of the commit
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+        run: |
+          if [ -z "$E2B_API_KEY" ]; then
+            echo "::error::Add the repository secret E2B_API_KEY."
+            exit 1
+          fi
+          uv sync --locked
+          uv run python -m sama.sandbox.template --alias "sama-runner-${SHA:0:12}"
       - name: Deploy the staging image of the commit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: >-
           ./flyctl deploy --config deploy/fly.production.toml --ha=false
           --image "registry.fly.io/sama-staging:main-${SHA}" --wait-timeout 10m
+          --env "SAMA_SANDBOX_TEMPLATE=sama-runner-${SHA:0:12}"
       - name: Check the health of each part
         run: |
           for path in /healthz /tools/healthz /model/healthz; do
