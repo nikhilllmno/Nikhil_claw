@@ -17,7 +17,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-import tempfile
 from collections.abc import AsyncIterator, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,7 +48,7 @@ from tests.conformance.targets import (
     mcp_config,
 )
 from tests.conformance.tool_server import ToolServer
-from tests.support import stop_warm_servers
+from tests.support import warm_socket
 
 if TYPE_CHECKING:
     from sama.runtime.claude import ToolGate
@@ -147,12 +146,10 @@ def _suite_gate() -> ToolGate:
 
 
 @pytest.fixture(scope="session")
-def warm_socket() -> Iterator[str]:
-    """One warm server for the suite. A Unix socket path must be short."""
-    with tempfile.TemporaryDirectory(prefix="sama-") as folder:
-        path = f"{folder}/w.sock"
+def warm_server_socket() -> Iterator[str]:
+    """One warm server for the suite."""
+    with warm_socket() as path:
         yield path
-        stop_warm_servers(path)
 
 
 @pytest.fixture(params=TARGETS)
@@ -170,7 +167,9 @@ async def target(
 
     if request.param in {"claude-runner", "claude-warm", "claude-docker"}:
         store, proxy_url = request.getfixturevalue("model_proxy")
-        socket = request.getfixturevalue("warm_socket") if request.param == "claude-warm" else ""
+        socket = (
+            request.getfixturevalue("warm_server_socket") if request.param == "claude-warm" else ""
+        )
         sandboxed = _sandboxed_runtime(request.param, tools, proxy_url, tmp_path, socket)
         yield ClaudeTarget(
             name=request.param,
@@ -225,25 +224,25 @@ def _scripted_config(tools: ToolServer, tools_url: str, model: str) -> RunConfig
 def _sandboxed_runtime(
     name: str, tools: ToolServer, model_url: str, tmp_path: Path, socket: str = ""
 ) -> SandboxedRuntime:
-    """The orchestrator side. The runner gets only the run token and the model URL."""
+    """The orchestrator side. The runner gets only the run token and the model URL. With a
+    ``socket``, the warm runner on that socket starts it."""
     provider: SandboxProvider
-    extra_env: dict[str, str] = {}
     if name == "claude-docker":
         provider = DockerProvider(image=DOCKER_IMAGE, network="host")
         argv = RUNNER_ARGV
-    elif name == "claude-warm":
-        provider = LocalProvider(tmp_path / "sandboxes")
-        argv = (sys.executable, "-m", "sama.warm")
-        extra_env = {SOCKET_ENV: socket}
     else:
         provider = LocalProvider(tmp_path / "sandboxes")
-        argv = (sys.executable, "-m", "sama.runtime.runner")
+        module = "sama.warm" if socket else "sama.runtime.runner"
+        argv = (sys.executable, "-m", module)
     return SandboxedRuntime(
         kind=RuntimeKind.CLAUDE_AGENT_SDK,
         provider=provider,
         signer=tools.run_tokens,
         settings=SandboxSettings(
-            template=name, model_url=model_url, runner_argv=argv, extra_env=extra_env
+            template=name,
+            model_url=model_url,
+            runner_argv=argv,
+            extra_env={SOCKET_ENV: socket} if socket else {},
         ),
         gate=GatePolicy(ask=GATED_TOOL_NAMES),
     )

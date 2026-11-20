@@ -7,7 +7,6 @@ import contextlib
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -31,7 +30,7 @@ from sama.runtime.fake import FakeScript
 from sama.runtime.runner import RUN_TOKEN_ENV, WORKDIR_ENV, RunnerJob
 from sama.sandbox.local import LocalProvider
 from sama.tenancy import RunTokenSigner
-from tests.support import collect, make_scope, stop_warm_servers, warm_servers
+from tests.support import collect, make_scope, warm_servers, warm_socket
 
 KEY = b"k" * 32
 WARM = (sys.executable, "-m", "sama.warm")
@@ -59,11 +58,8 @@ def _wait_until(check: Callable[[], bool], timeout_s: float = 10.0) -> None:
 
 @pytest.fixture
 def socket_path() -> Iterator[str]:
-    # A short folder: a Unix socket path has at most 107 bytes.
-    with tempfile.TemporaryDirectory(prefix="sama-") as d:
-        path = f"{d}/w.sock"
+    with warm_socket() as path:
         yield path
-        stop_warm_servers(path)
 
 
 @pytest.fixture

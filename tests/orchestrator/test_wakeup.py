@@ -35,7 +35,6 @@ async def test_a_notify_before_the_wait_is_not_lost() -> None:
     wakeup = QueueWakeup(None)
     ticket = wakeup.ticket()
     wakeup.notify()  # for example, a run queued while the slot read the queue
-    assert ticket.woken
     assert await ticket.wait(asyncio.Event(), 10.0)
 
 

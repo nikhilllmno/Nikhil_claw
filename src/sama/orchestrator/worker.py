@@ -144,7 +144,6 @@ class Worker:
         poll_s: float = 1.0,
         maintenance_s: float = 30.0,
         flush_s: float = 0.25,
-        wakeup: QueueWakeup | None = None,
     ) -> None:
         self.owner = owner or default_owner()
         self._queue = queue
@@ -157,7 +156,7 @@ class Worker:
         self._poll_s = poll_s
         self._maintenance_s = maintenance_s
         self._flush_s = flush_s
-        self._wakeup = wakeup if wakeup is not None else QueueWakeup(queue.engine)
+        self._wakeup = QueueWakeup(queue.engine)
 
     # -- loops ------------------------------------------------------------------------------
 

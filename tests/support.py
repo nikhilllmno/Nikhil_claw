@@ -5,7 +5,8 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
-from collections.abc import AsyncIterator, Callable
+import tempfile
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,7 +154,13 @@ def warm_servers(path: str) -> list[int]:
     return found
 
 
-def stop_warm_servers(path: str) -> None:
-    for pid in warm_servers(path):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGTERM)
+@contextlib.contextmanager
+def warm_socket() -> Iterator[str]:
+    """A socket path for a warm server. It stops the warm servers on the path at the end. The
+    folder is short: a Unix socket path has at most 107 bytes."""
+    with tempfile.TemporaryDirectory(prefix="sama-") as folder:
+        path = f"{folder}/w.sock"
+        yield path
+        for pid in warm_servers(path):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)

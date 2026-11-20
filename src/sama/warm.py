@@ -69,10 +69,6 @@ _STALE: Final = b"S"
 _EXIT: Final = b"X"
 
 
-def socket_path(env: Mapping[str, str]) -> str:
-    return env.get(SOCKET_ENV) or DEFAULT_SOCKET
-
-
 def code_id() -> str:
     """An id of the Python and the sama code. A warm server with another id is stale."""
     digest = hashlib.sha256(f"{sys.executable}\0{sys.version}".encode())
@@ -157,7 +153,7 @@ def start_server(path: str) -> None:
 
 def client_main() -> NoReturn:
     started = time.time()
-    path = socket_path(os.environ)
+    path = os.environ.get(SOCKET_ENV) or DEFAULT_SOCKET
     code = code_id()
     exit_code = run_warm(path, code, started)
     if exit_code is not None:

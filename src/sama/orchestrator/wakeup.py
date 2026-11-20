@@ -37,22 +37,12 @@ class Ticket:
     def __init__(self, event: asyncio.Event) -> None:
         self._event = event
 
-    @property
-    def woken(self) -> bool:
-        return self._event.is_set()
-
     async def wait(self, stop: asyncio.Event, timeout_s: float) -> bool:
         """Waits for a notification, ``stop``, or ``timeout_s``. True if a notification
         came."""
-        if self._event.is_set() or stop.is_set():
-            return self._event.is_set()
-        woken = asyncio.ensure_future(self._event.wait())
-        stopped = asyncio.ensure_future(stop.wait())
-        try:
-            await asyncio.wait({woken, stopped}, timeout=timeout_s, return_when="FIRST_COMPLETED")
-        finally:
-            woken.cancel()
-            stopped.cancel()
+        if not self._event.is_set() and not stop.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(_first(self._event, stop), timeout=timeout_s)
         return self._event.is_set()
 
 
@@ -87,14 +77,13 @@ class QueueWakeup:
 
     async def run(self, stop: asyncio.Event) -> None:
         """Listens until ``stop`` is set. It connects again after an error."""
-        if self._engine is None:
+        engine = self._engine
+        if engine is None:
             return
         warned = False
         while not stop.is_set():
             try:
-                await self._listen(stop)
-            except asyncio.CancelledError:
-                raise
+                await self._listen(engine, stop)
             except Exception as error:
                 # One warning for each outage. The poll finds the runs in the meantime.
                 if not warned:
@@ -108,8 +97,7 @@ class QueueWakeup:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=self._retry_s)
 
-    async def _listen(self, stop: asyncio.Event) -> None:
-        assert self._engine is not None  # noqa: S101 -- run() checks it
+    async def _listen(self, engine: AsyncEngine, stop: asyncio.Event) -> None:
         lost = asyncio.Event()
 
         def on_notify(*_: Any) -> None:
@@ -118,7 +106,7 @@ class QueueWakeup:
         def on_lost(*_: Any) -> None:
             lost.set()
 
-        async with self._engine.connect() as connection:
+        async with engine.connect() as connection:
             raw = await connection.get_raw_connection()
             driver: Any = raw.driver_connection
             try:
