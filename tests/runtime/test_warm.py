@@ -261,34 +261,56 @@ def test_a_client_that_closes_at_once_leaves_no_runner(tmp_path: Path, socket_pa
     _wait_until(lambda: len(warm_servers(socket_path)) == 1, timeout_s=5)
 
 
-def test_a_lost_reply_does_not_run_the_job_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+_LOST_REPLY_CLIENT = """
+import sys, time
+from sama import warm
+
+def lost(_):
+    raise ConnectionResetError
+
+warm._read_reply = lost
+code = warm.run_warm(sys.argv[1], "code", time.time())
+sys.exit(99 if code is None else code)
+"""
+
+
+def test_a_lost_reply_does_not_run_the_job_again(tmp_path: Path) -> None:
     path = str(tmp_path / "s")
+    errors: list[BaseException] = []
     with socket.socket(socket.AF_UNIX) as server:
         server.bind(path)
         server.listen()
+        server.settimeout(20)
 
         def take() -> None:
-            conn, _ = server.accept()
-            with conn:
-                # Read the whole request (the environment can be large), then drop the link.
-                data, fds, _, _ = socket.recv_fds(conn, 65536, 3)
-                for fd in fds:
-                    os.close(fd)
-                (size,) = warm._HEADER.unpack_from(data)
-                while len(data) < warm._HEADER.size + size:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    data += chunk
+            try:
+                conn, _ = server.accept()
+                with conn:
+                    # Read the whole request, then drop the link without a reply.
+                    data, fds, _, _ = socket.recv_fds(conn, 65536, 3)
+                    for fd in fds:
+                        os.close(fd)
+                    (size,) = warm._HEADER.unpack_from(data)
+                    while len(data) < warm._HEADER.size + size:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+            except BaseException as error:
+                errors.append(error)
 
         thread = threading.Thread(target=take)
         thread.start()
-
-        def lost(_: socket.socket) -> bytes:
-            raise ConnectionResetError
-
-        monkeypatch.setattr(warm, "_read_reply", lost)
-        assert warm.run_warm(path, "code", time.time()) == 1
+        # A separate client process with known standard files and a small environment.
+        client = subprocess.run(
+            [sys.executable, "-c", _LOST_REPLY_CLIENT, path],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": os.pathsep.join(sys.path)},
+            timeout=30,
+            check=False,
+        )
         thread.join(timeout=5)
+    assert errors == []
+    assert client.returncode == 1, client.stderr.decode()
+    assert b"the connection to the warm runner failed" in client.stderr
