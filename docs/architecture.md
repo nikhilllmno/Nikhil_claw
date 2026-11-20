@@ -2056,7 +2056,7 @@ as it is.
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
-| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
+| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run). | Sama MCP |
@@ -2122,7 +2122,7 @@ Hermes has the same idea (`tools/connectors/`, the `optional-mcps/` catalog, and
 | `composio` | Managed app toolkits with managed OAuth and triggers | Gmail, Google Calendar, Drive, Sheets, GitHub, Linear, Notion, HubSpot, Slack | Control plane, through the Composio API |
 | `mcp_remote` | A remote MCP server over streamable HTTP. Auth: OAuth 2.1 (with dynamic client registration and PKCE), a bearer token, or a custom header | Supabase, Neon, Sentry, Stripe, Atlassian, Notion, Linear, any vendor MCP | Control plane, through the sama MCP proxy |
 | `mcp_hosted` | A stdio MCP server (`command` and `args`, for example an `npx` or `uvx` package) that sama runs for the user | Community MCP servers with no hosted version | A **connector host** (see below) |
-| `database` | A database with a native sama driver | PostgreSQL (also Supabase, Neon, RDS), MySQL and MariaDB, Microsoft SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB | Control plane, through the sama database gateway (Section 10.4) |
+| `database` | A database with a native sama driver | PostgreSQL (also Supabase, Neon, RDS) since M3.11. MySQL and MariaDB, Microsoft SQL Server, BigQuery, Snowflake, ClickHouse, and MongoDB (read only) since M4.13 | Control plane, through the sama database gateway (Section 10.4) |
 | `http_api` | A REST API from an OpenAPI document or from a list of endpoints. Auth: API key, bearer, basic, or OAuth 2 client credentials | Internal company APIs, a PMS, a CRM without a Composio toolkit | Control plane, through the sama HTTP client |
 | `plugin` | Python code that a product registers through the extension points (D16) | vorflux: Beds24 PMS, hotel channel managers | Control plane, in the product's tool pack |
 
@@ -2609,6 +2609,107 @@ at the driver, so a prompt cannot remove them.
   check, the manifests, the form, TLS, and the limits. `tests/db/test_database_gateway.py`
   runs the tools against a real PostgreSQL server.
 
+**What M4.13 builds**
+
+- **Connectors.** `connectors/catalog/` also has `mysql`, `mariadb`, `sqlserver` (engine
+  `mssql`), `clickhouse`, `bigquery`, `snowflake`, and `mongodb`. The tools are
+  `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`, as for PostgreSQL. `mongodb`
+  has no `execute` tool: a MongoDB connection is read only. `sama.connectors.dbforms` makes
+  the form and the tools of each engine, and `sama.connectors.dbsettings` checks the form.
+- **Drivers.** The drivers are in the `databases` dependency group (`aiomysql`,
+  `python-tds`, `pymongo`, `asyncssh`, `pyopenssl`). The group is a default group, and the
+  image installs it. The gateway imports an engine module only when a connection of that
+  engine is used, so the manifests load without the drivers. BigQuery, Snowflake, and
+  ClickHouse need no driver: the gateway calls their HTTPS APIs with `httpx`.
+- **Forms.** MySQL, MariaDB, SQL Server, ClickHouse, and MongoDB have `host`, `port`,
+  `database`, `user`, `password`, `sslmode`, the policy lists, and the SSH fields (Section
+  10.6). The default ports are 3306, 1433, 8443 (the HTTPS interface of ClickHouse), and
+  27017. BigQuery has `project`, `dataset`, `location`, `service_account_json` (a secret), and
+  `max_bytes_billed`. Snowflake has `account`, `user`, `private_key` (a secret, key-pair
+  authentication), `warehouse`, `database`, `schema`, and `role`. A form field has at most
+  8,000 characters, so a service account key or a private key fits.
+- **Network and TLS.** The gateway checks the host as for PostgreSQL (a public address, no
+  second DNS answer) and connects to the checked address, with the real host name for SNI
+  and the certificate check. `require` encrypts and does not check the certificate;
+  `verify-full` checks the chain (the `certifi` roots) and the host name. `disable` is
+  allowed only through an SSH tunnel. BigQuery and Snowflake send each request through
+  `OutboundClient` (Section 16.4).
+  - SQL Server can send a routing redirect to another host. The gateway refuses it, because
+    the other host is not checked.
+  - pymongo resolves the host itself. So the driver connects to a local relay on
+    `127.0.0.1` for one call, and the relay connects to the checked address with TLS. The
+    client uses `directConnection`, so it connects to no other member of a replica set. A
+    `mongodb+srv://` string is not supported: the form has a host and a port.
+- **SQL check.** `sama.connectors.sql` parses each statement in the dialect of the engine
+  (`mysql`, `tsql`, `bigquery`, `snowflake`, `clickhouse`). In `query` and `export`, every
+  engine takes only `SELECT` (with `WITH` and set operations). `EXPLAIN` and `VALUES` are for
+  PostgreSQL only. Each dialect has its own list of refused functions:
+  - MySQL and MariaDB: `load_file`, the lock functions, `benchmark`, and the replication
+    waits.
+  - SQL Server: `OPENROWSET`, `OPENDATASOURCE`, `OPENQUERY`, `OPENXML`, `xp_*`, and `sp_*`.
+  - ClickHouse: the table functions that read files, URLs, or other servers (`file`, `url`,
+    `s3`, `remote`, `mysql`, ...), `dictGet`, `joinGet`, `COLUMNS`, and the functions that
+    show settings or roles. A `FORMAT` clause is refused: the gateway sets the format.
+  - BigQuery: `EXTERNAL_QUERY`. Snowflake: the `SYSTEM$` functions and the stage functions.
+- **Names.** A schema is a database for MySQL, MariaDB, and ClickHouse, and a dataset for
+  BigQuery. A name without a schema is in the database of the form (MySQL, ClickHouse), the
+  default dataset (BigQuery), or the schema of the form (Snowflake). Snowflake makes names
+  without quotes upper case. SQL Server has no fixed default schema for the gateway, so a
+  restricted SQL Server connection needs the schema in each name (`dbo.orders`). A name with a
+  database part must use the database of the form (SQL Server, Snowflake) or the project
+  (BigQuery).
+- **Hidden columns.** The rules of PostgreSQL apply. Each engine also refuses the forms that
+  read a whole row: `FOR JSON` and `FOR XML` (SQL Server), a `*` in a value subquery, and
+  `tuple(t.*)` (ClickHouse).
+- **Read only and time limits.**
+  - MySQL and MariaDB: a read runs in `START TRANSACTION READ ONLY` and is rolled back. The
+    time limit is `max_execution_time` (MySQL) or `max_statement_time` (MariaDB). A lock wait
+    stops after 5 seconds.
+  - SQL Server has no read-only transaction. A read runs in a transaction that is always
+    rolled back, and the SQL check refuses writes. `SET LOCK_TIMEOUT` is 5 seconds. A
+    statement stops when the socket has no answer for the time limit.
+  - ClickHouse has no transactions. A read has `readonly=1`, so the server refuses each write
+    and each change of a setting (also a `SETTINGS` clause). The time limit is
+    `max_execution_time`. A write is done at once.
+  - BigQuery: the time limit is `timeoutMs`, and the gateway cancels a job that runs longer.
+    Each job has `maximumBytesBilled` (the form value, default 1 GB, at least 10 MB): BigQuery
+    refuses a query that would bill more, and the query costs nothing.
+  - Snowflake: each statement has `MULTI_STATEMENT_COUNT` 1. The gateway polls a long
+    statement and cancels it after the time limit.
+- **MongoDB.** `query` and `export` take `collection` and either `filter`, `projection`,
+  `sort`, and `limit` (a `find`) or `pipeline` (an `aggregate`). `sample` reads 20 documents.
+  `sama.connectors.mongoquery` checks each read before the gateway connects:
+  - The collection, and each collection of `$lookup`, `$graphLookup`, and `$unionWith`, must
+    be allowed. `system.*` collections are refused.
+  - Only stages that read are allowed. `$out`, `$merge`, and the stages that show the server
+    (`$currentOp`, ...) are refused. Operators that run code (`$where`, `$function`,
+    `$accumulator`) are refused.
+  - With hidden fields, a reference to a hidden field, `$$ROOT`, `$$CURRENT`, and the
+    operators that read a field by a computed name (`$getField`, `$objectToArray`, ...) are
+    refused. The gateway also drops hidden fields at every depth of the result.
+  - Each row is one document as relaxed extended JSON. The time limit is `maxTimeMS`.
+- **Errors.** An error gives the message of the database. A duplicate key or a foreign key
+  error of MySQL, MariaDB, and SQL Server gives a fixed text, because the message of the
+  database contains the key value.
+- **Connections.** The new engines open one connection (or one HTTPS session) for each call
+  and close it after the call. They keep no pool. The limit of 4 calls at a time for each
+  org applies to all engines.
+- **Tests.** Each engine has the M3.11 tests: `query` is read only, DDL is denied by default,
+  `execute` changes rows with parameters, a query stops after the time limit, the model gets
+  at most 1,000 rows and 50 KB and the rest spills to a file, hidden columns never appear,
+  only the allowed tables and schemas show, `export` writes a CSV file, and the form test
+  uses the gateway.
+  - `tests/db/test_database_engines.py` (MySQL, MariaDB, SQL Server, ClickHouse),
+    `tests/db/test_database_mongo.py`, and `tests/db/test_database_tunnel.py` run against
+    real servers in docker. `scripts/test-databases.sh` starts the servers and runs the
+    tests. The CI job "Database engines (docker)" runs the script. It is not a required
+    check. Without the `SAMA_TEST_*_URL` variables, these tests skip.
+  - BigQuery and Snowflake have no docker image. `tests/connectors/test_engine_bigquery.py`
+    and `test_engine_snowflake.py` test them against fakes of the REST APIs (`httpx`
+    transports). No test calls the real services.
+  - `tests/connectors/test_engines.py` tests the dialect checks, the MongoDB read check, the
+    ClickHouse parameters, and the tunnel pool without a server.
+
 ### 10.5 Connector hosts for stdio MCP servers
 
 Hermes starts stdio MCP servers as local processes. In the cloud, sama runs each
@@ -2639,12 +2740,41 @@ per connection:
 | Route | How |
 |---|---|
 | IP allowlist | The sama services that call connectors use static egress IP addresses (Fly.io). The customer allows these addresses in the database firewall. See "Egress IP addresses" below. |
-| SSH tunnel | Sama opens an SSH tunnel through the customer's bastion host. The SSH key is in the vault. |
+| SSH tunnel | Sama opens an SSH tunnel through the customer's bastion host. The SSH key is in the vault. Since M4.13, for every database engine with a host and a port. See "SSH tunnels" below. |
 | Private network agent (later) | A small sama relay that the customer runs inside the network. It connects out to sama over TLS, so no inbound port is open. |
 
 The outbound URL policy (Section 16.4) blocks private addresses for normal requests. A
 connection that uses a tunnel or a relay is the only way to reach a private address, and only
 for that connection.
+
+**SSH tunnels (M4.13)**
+
+`sama.connectors.tunnel` opens the tunnels of the database gateway. PostgreSQL, MySQL,
+MariaDB, SQL Server, ClickHouse, and MongoDB connections can use a tunnel. BigQuery and
+Snowflake are HTTPS APIs at fixed public hosts, so they have no tunnel.
+
+- **Form.** `ssh_host`, `ssh_port` (empty means 22), `ssh_user`, `ssh_private_key` (a secret,
+  OpenSSH or PEM, without a passphrase), and `ssh_host_key`. Empty `ssh_host` means no
+  tunnel. With `ssh_host`, the other SSH fields are required.
+- **Host key.** `ssh_host_key` is the public host key of the bastion (`ssh-ed25519 AAAA...`)
+  or its fingerprint (`SHA256:...`). The gateway connects only to a bastion that sends this
+  key. It reads no `known_hosts` file, no SSH agent, and no SSH config. Only the private key
+  logs in (no password, no keyboard-interactive login).
+- **Addresses.** The gateway checks the bastion like a database host: a public address, and
+  the connection goes to the checked address. The database host is the host as the bastion
+  sees it, so it can be private. A cloud metadata host and a link-local address are refused.
+- **Route.** The tunnel listens on `127.0.0.1`, on a free port of the gateway process, and
+  forwards to the database host and port. The driver of the connection connects to that
+  port. The tunnel is kept for the connection (by its ID) and closes after 5 minutes without
+  calls, as a pool does. A change of the form makes a new tunnel. A tunnel with a running call
+  does not close.
+- **Isolation.** Only the connection that owns the tunnel gets its port. Every other database
+  connection and every outbound request (`web_extract`, connector calls) refuses loopback
+  addresses (Section 16.4), so they cannot use the port. `tests/db/test_database_tunnel.py`
+  shows this: a second connection with the host `127.0.0.1` or `localhost` and the port of the
+  tunnel is refused, and `OutboundClient` refuses a URL to the port.
+- **TLS.** TLS to the database is still the default through a tunnel. `sslmode` `disable` is
+  allowed only through a tunnel, because the SSH connection encrypts the bytes.
 
 **Egress IP addresses**
 
@@ -4835,7 +4965,10 @@ policy for all of them:
 - Sama checks every redirect hop again, with a limit on the number of hops.
 - Org allowlists and block lists apply. Response size and time limits apply.
 - A connection that has a private network route (SSH tunnel or relay, Section 10.6) may reach
-  the private addresses of that route only. No other request can use the route.
+  the private addresses of that route only. No other request can use the route. Since M4.13,
+  an SSH tunnel listens on `127.0.0.1` of the gateway. Only its own connection gets the port.
+  Every other database connection and every outbound request refuses loopback addresses, so
+  they cannot reach it (`tests/db/test_database_tunnel.py`).
 
 **Code (M1.8).** `src/sama/tools/outbound.py` has `UrlPolicy` and `OutboundClient`.
 

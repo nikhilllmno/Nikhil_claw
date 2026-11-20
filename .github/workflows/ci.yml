@@ -115,6 +115,26 @@ jobs:
       - name: Docker provider and claude-docker conformance target
         run: uv run pytest tests/sandbox tests/conformance -k docker -rs
 
+  database-engines:
+    name: Database engines (docker)
+    # The live tests of the database gateway against MySQL, MariaDB, SQL Server, ClickHouse,
+    # MongoDB, and an SSH bastion (docs/architecture.md, Section 10.4, "What M4.13 builds").
+    # BigQuery and Snowflake use fakes in the Python job. This job is not a required check.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: scripts/test-databases.sh
+
   web:
     name: Web (lint, typecheck, test, build)
     runs-on: ubuntu-latest

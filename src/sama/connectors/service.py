@@ -113,7 +113,8 @@ INITIATED_TTL: Final = timedelta(minutes=30)
 MCP_STALE: Final = timedelta(hours=6)
 """A remote MCP connection reads its tool list again in the background after this time."""
 MAX_ERROR_CHARS: Final = 500
-MAX_FIELD_CHARS: Final = 2_000
+MAX_FIELD_CHARS: Final = 8_000
+"""A form field. A service account key (JSON) or a private key (PEM) is up to about 4,000."""
 MAX_ANSWER_CHARS: Final = 200_000
 CHAT_WARNING: Final = (
     "Do not send passwords, API keys, or tokens in a chat. Give them only on the sama web page."

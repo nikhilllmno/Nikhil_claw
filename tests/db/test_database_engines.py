@@ -29,7 +29,8 @@ from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import Catalog, Manifest
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.output import MAX_OUTPUT_BYTES, untrusted
-from tests.db.test_database_gateway import CATALOG, Sink
+from tests.connectors.support import CATALOG
+from tests.db.test_database_gateway import Sink
 
 ROWS = 1_500
 SECRET_EMAIL = "e1@hidden.example"
@@ -53,7 +54,8 @@ def _users(start: int, end: int) -> str:
 def _seed(create_users: str, create_orders: str) -> list[str]:
     statements = [create_users, create_orders]
     for start in range(1, ROWS + 1, 500):
-        statements.append(f"INSERT INTO users VALUES {_users(start, min(start + 500, ROWS + 1))}")
+        rows = _users(start, min(start + 500, ROWS + 1))
+        statements.append(f"INSERT INTO users VALUES {rows}")  # noqa: S608
     statements.append("INSERT INTO orders VALUES (1, 1, 9.50), (2, 2, 3.25)")
     return statements
 
@@ -352,7 +354,7 @@ async def test_a_query_stops_after_the_timeout(live: Live) -> None:
     gw = DatabaseGateway(allow_private=True, require_tls=False, timeout_s=1)
     try:
         started = time.monotonic()
-        with pytest.raises(DriverError, match="stopped after|time limit"):
+        with pytest.raises(DriverError, match=r"stopped after|time limit"):
             await live.run("query", gw=gw, sql=live.engine.sleep_sql)
         assert time.monotonic() - started < 8
         assert "[1]" in await live.run("query", gw=gw, sql="select 1 as one")
@@ -401,7 +403,7 @@ async def test_hidden_columns_never_appear(live: Live) -> None:
     assert "name" in texts[2]
     for sql in (
         "select email from users",
-        f"select id from users where email = '{SECRET_EMAIL}'",
+        f"select id from users where email = '{SECRET_EMAIL}'",  # noqa: S608
         live.engine.row_object_sql,
         "select (select ssn from users where id = 1)",
     ):
@@ -429,7 +431,7 @@ async def test_only_the_allowed_schemas_show(live: Live) -> None:
     # SQL Server: the gateway does not know the default schema of the user, so a name needs
     # its schema on a restricted connection.
     orders = "dbo.orders" if sqlserver else "orders"
-    assert "[2]" in await live.run("query", values, sql=f"select count(*) from {orders}")
+    assert "[2]" in await live.run("query", values, sql=f"select count(*) from {orders}")  # noqa: S608
     for sql in ("select * from information_schema.tables", "select * from other.orders"):
         with pytest.raises(DriverError, match="allowed"):
             await live.run("query", values, sql=sql)

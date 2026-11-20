@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -255,6 +255,21 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
   M3.11: Parquet export, the estimated row count in the card, a static egress address (an
   operator allocates it, architecture Section 10.6), SSH tunnels (M4.13), other engines
   (M4.13), and a policy for each tool of a connection.
+- M4.13: more database engines and SSH tunnels in `src/sama/connectors/` (architecture
+  Sections 10.4 and 10.6). No migration. The catalog adds `mysql`, `mariadb`, `sqlserver`,
+  `clickhouse`, `bigquery`, `snowflake`, and `mongodb`. The engines are in `engines/`, the
+  forms in `dbforms.py` and `dbsettings.py`, the MongoDB read check in `mongoquery.py`, and the
+  tunnels in `tunnel.py`. The drivers are in the default dependency group `databases`. The SQL
+  check has a dialect for each engine, and `query` takes only `SELECT` on every engine.
+  BigQuery sets `maximumBytesBilled` (default 1 GB). MongoDB is read only, with `find` and
+  `aggregate`. An SSH tunnel listens on `127.0.0.1` for its own connection only, and checks the
+  host key of the bastion. A form field can have 8,000 characters. The M3.11 tests run for each
+  engine. MySQL, MariaDB, SQL Server, ClickHouse, MongoDB, and the SSH tunnel run against
+  docker servers (`scripts/test-databases.sh`, CI job "Database engines (docker)", not a
+  required check). BigQuery and Snowflake run against fakes of their REST APIs only. Not in
+  M4.13: a static egress address (architecture Section 10.6), `mongodb+srv://` strings,
+  MongoDB writes, connection pools for the new engines, the private network relay, Parquet
+  export, and live tests against BigQuery and Snowflake.
 - M3.7: the GitHub App, the git proxy, and pull requests in `src/sama/github/` and
   `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0024` adds
   `github_installations`, `github_repos`, and `github_push_grants` with RLS. An org admin
@@ -421,7 +436,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
 | M4.10 | Skills import and `/learn` | Import a skill from a Git URL with scan and approval. `/learn` creates a draft skill from sources. Done (public GitHub repositories; architecture §9.6). |
 | M4.11 | Hosted stdio MCP connections | Connector host per connection in its own E2B sandbox (architecture §10.5). Pinned package from the manifest, egress allowlist, start on first call, pause when idle, restart on memory limit. The agent cannot run commands in the host. A custom command needs the org `owner`. A test shows that the agent sandbox cannot read the host's secrets. Done. |
 | M4.12 | HTTP API connections | Import an OpenAPI document or a list of endpoints. One tool per operation as `api_<connection>_<tool>`. Auth by API key, bearer, basic, or OAuth 2 client credentials. `GET` and `HEAD` tools `allow`, other methods `ask`. Done. |
-| M4.13 | More databases and SSH tunnels | MySQL and MariaDB, Microsoft SQL Server, BigQuery (with maximum bytes billed), Snowflake, ClickHouse, and MongoDB (read with `find` and `aggregate`) in the database gateway, with the M3.11 tests for each engine. SSH tunnel route per connection (architecture §10.6). A test shows that a tunnel route cannot be used by another connection or by `web_extract`. |
+| M4.13 | More databases and SSH tunnels | MySQL and MariaDB, Microsoft SQL Server, BigQuery (with maximum bytes billed), Snowflake, ClickHouse, and MongoDB (read with `find` and `aggregate`) in the database gateway, with the M3.11 tests for each engine. SSH tunnel route per connection (architecture §10.6). A test shows that a tunnel route cannot be used by another connection or by `web_extract`. Done. BigQuery and Snowflake are tested with fakes of their APIs. The apps have no static egress address yet (M3.11). |
 
 ## M5 — Browser
 
