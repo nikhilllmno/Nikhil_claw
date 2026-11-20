@@ -171,7 +171,11 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   deferred tools in the `DeferredCatalog`. The gate judges `tool_call` as a call of the tool that
   it names, so a deferred call has the same toolset check, rules, approval, and ticket as a
   direct call. Capability flags `manual_compaction` and `compaction_archive` keep the adapter
-  parts apart for the OpenAI adapter. Not in M2.6: a live test of `/compact` and of the hook
+  parts apart for the OpenAI adapter. After review: the archive redacts tool inputs as JSON
+  values and whole entries (the runner leaves whole entries out and never cuts), it has hard
+  limits and a check of the live run authority before the body is read, a pin is reserved until
+  a run saves a runtime state, enqueue and compact use one lock order, a compact run without a
+  compaction boundary fails, and its tokens come from `model_usage`. Not in M2.6: a live test of `/compact` and of the hook
   against the Claude API, a deferred tool in production (M3.4 is the first), a pin of a file, a pin
   by the agent, pins in a Slack channel, a search of archives, and a web UI.
 - M2.5: session search in `src/sama/search/` (architecture Section 7.1). Migration `0014` makes

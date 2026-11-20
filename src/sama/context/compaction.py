@@ -17,6 +17,7 @@ the visibility rule of search and read (Section 7.1) holds for it without a new 
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -27,9 +28,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.context.pins import forget_injections
 from sama.db.models import AuditEntry, Message, Run, Session, SessionCompaction
-from sama.runtime.archive import ArchiveAnswer, TranscriptArchive, fit
+from sama.runtime.archive import ArchiveAnswer, ArchiveEntry, TranscriptArchive, fit
+from sama.tenancy.authority import load_authority
 from sama.tenancy.run_token import RunTokenClaims
-from sama.vault.redact import redact
+from sama.vault.redact import default_redactor, redact
 
 MAX_ARCHIVES_PER_RUN: Final = 10
 """A run that asks for more archives is refused: the run token must not fill the table."""
@@ -38,6 +40,18 @@ TITLE_CHARS: Final = 80
 
 class ArchiveError(Exception):
     """The archive is refused. The message is safe to show to the runner."""
+
+
+def _redacted(entry: ArchiveEntry) -> ArchiveEntry:
+    """The entry as text, with every secret redacted. The input of a tool call is redacted as a
+    JSON value (strings and keys), and then it becomes text. The redactor sees each string as
+    it is, so a secret with quotes, backslashes, or new lines still matches."""
+    redactor = default_redactor()
+    if entry.tool_name is None and entry.tool_input is None:
+        return ArchiveEntry(role=entry.role, text=redactor.text(entry.text))
+    arguments = json.dumps(redactor.json(entry.tool_input), ensure_ascii=False, default=str)
+    name = redactor.text(entry.tool_name or "?")
+    return ArchiveEntry(role=entry.role, text=f"[tool call {name}] {arguments}")
 
 
 def _ids(claims: RunTokenClaims) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -53,41 +67,75 @@ class ContextArchive:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
 
+    async def authorize(self, claims: RunTokenClaims) -> None:
+        """Checks that the run can archive now, before the tool server reads a body. Raises
+        ``ArchiveError`` if it cannot. ``archive`` checks again in its own transaction."""
+        org_id, session_id, run_id = _ids(claims)
+        async with self._engine.connect() as connection:
+            await self._live(connection, org_id, session_id, run_id, lock=False)
+
+    async def _live(
+        self,
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        run_id: uuid.UUID,
+        *,
+        lock: bool,
+    ) -> Any:
+        """The live session row, if the run has the authority to archive it now: the run is
+        running, its user still sees the session (Section 5.1), the session is active, and the
+        run has not made too many archives. This is the authority that the tool gate checks for
+        each tool call, and not only the state of the run."""
+        status = (
+            await connection.execute(
+                select(Run.status).where(
+                    Run.org_id == org_id, Run.session_id == session_id, Run.id == run_id
+                )
+            )
+        ).scalar_one_or_none()
+        if status != "running":
+            raise ArchiveError("the run is not running")
+        authority = await load_authority(connection, org_id, run_id)
+        if authority.problem is not None:
+            raise ArchiveError(authority.problem)
+        query = select(
+            Session.workspace_id,
+            Session.agent_profile_id,
+            Session.audience,
+            Session.owner_user_id,
+            Session.title,
+            Session.status,
+        ).where(Session.org_id == org_id, Session.id == session_id)
+        live = (await connection.execute(query.with_for_update() if lock else query)).one_or_none()
+        if live is None or live.status != "active":
+            raise ArchiveError("the session is not active")
+        this_run = (
+            await connection.execute(
+                select(func.count()).where(
+                    SessionCompaction.org_id == org_id, SessionCompaction.run_id == run_id
+                )
+            )
+        ).scalar_one()
+        if this_run >= MAX_ARCHIVES_PER_RUN:
+            raise ArchiveError("the run made too many archives")
+        return live
+
     async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer:
         org_id, session_id, run_id = _ids(claims)
-        # Redact the whole text first. The cut comes after, because a cut can split a secret
-        # into parts that the redactor does not know.
-        redacted = [entry.model_copy(update={"text": redact(entry.text)}) for entry in body.entries]
+        await self.authorize(claims)  # before the work of the redaction
+        # Redact the whole value first: the structure of a tool input, and the text of the
+        # other entries. The cut comes after, because a cut can split a secret into parts that
+        # the redactor does not know. The runner did not cut inside an entry.
+        redacted = [_redacted(entry) for entry in body.entries]
         entries, truncated = fit(redacted)
+        # The runner left whole entries out and put a marker in their place.
+        truncated = truncated or body.omitted > 0
         entries = [entry for entry in entries if entry.text.strip()]
         if not entries:
             return ArchiveAnswer(entries=0)
         async with self._engine.begin() as connection:
-            run = (
-                await connection.execute(
-                    select(Run.status).where(
-                        Run.org_id == org_id, Run.session_id == session_id, Run.id == run_id
-                    )
-                )
-            ).scalar_one_or_none()
-            if run != "running":
-                raise ArchiveError("the run is not running")
-            live = (
-                await connection.execute(
-                    select(
-                        Session.workspace_id,
-                        Session.agent_profile_id,
-                        Session.audience,
-                        Session.owner_user_id,
-                        Session.title,
-                        Session.status,
-                    )
-                    .where(Session.org_id == org_id, Session.id == session_id)
-                    .with_for_update()
-                )
-            ).one_or_none()
-            if live is None or live.status != "active":
-                raise ArchiveError("the session is not active")
+            live = await self._live(connection, org_id, session_id, run_id, lock=True)
             earlier = (
                 await connection.execute(
                     select(func.count()).where(
@@ -96,15 +144,6 @@ class ContextArchive:
                     )
                 )
             ).scalar_one()
-            this_run = (
-                await connection.execute(
-                    select(func.count()).where(
-                        SessionCompaction.org_id == org_id, SessionCompaction.run_id == run_id
-                    )
-                )
-            ).scalar_one()
-            if this_run >= MAX_ARCHIVES_PER_RUN:
-                raise ArchiveError("the run made too many archives")
             title = " ".join(redact(live.title or "session").split())[:TITLE_CHARS]
             archive_id = uuid.uuid4()
             await connection.execute(

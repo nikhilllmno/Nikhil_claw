@@ -562,7 +562,9 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   `transcript_path`. The hook reads the transcript file, gives the entries to the archiver,
   and always returns an empty output, so the compaction goes on also when the archive fails
   (Section 6.3). A compact request resumes the SDK session and sends `/compact <focus>` as the
-  prompt. A compact request with no earlier state fails with `invalid_request`. The adapter
+  prompt. A compact request with no earlier state fails with `invalid_request`. A compact run
+  with no compaction boundary fails (`model_error`). The tokens of a compact run come from the
+  difference of `model_usage`, because `usage` is zero (Section 6.3). The adapter
   does not use the CLI hook `SessionStart` with the source `compact`, because the Python SDK
   does not expose it: sama injects the pins itself (Section 6.3).
 
@@ -761,29 +763,58 @@ archive, or an archive that failed), it makes a row with no archive session.
 **Transcript archive.** Before the Claude CLI compacts, it runs the `PreCompact` hook. The
 hook input has `trigger` (`manual` or `auto`) and `transcript_path`.
 
-1. The adapter reads the transcript file of the CLI and turns it into `ArchiveEntry` objects
-   (`role` and `text`): user and assistant text, each tool call as `[tool call NAME]` and its
-   JSON arguments, and each tool result as a `tool` entry. It skips thinking blocks and every
-   line type that it does not know. The format of the file is not a public contract, so the
-   parser never raises for a line that it does not understand
+1. The adapter reads the transcript file of the CLI and turns it into `ArchiveEntry` objects:
+   user and assistant text (`role` and `text`), each tool call (`tool_name` and `tool_input`,
+   the input as a **JSON value**), and each tool result as a `tool` entry. It skips thinking
+   blocks and every line type that it does not know. The format of the file is not a public
+   contract, so the parser never raises for a line that it does not understand
    (`sama.runtime.claude_transcript`).
-2. `RemoteArchiver` posts the entries to `POST /archive` of the sama tool server. It sends
+2. The runner does not cut inside an entry. It has no redactor, and a cut before the
+   redaction can split a secret into parts that the redactor does not know. So
+   `bound_for_wire` leaves **whole entries** out. An entry over 1 MB stays out, and a marker
+   (`system` entry) takes its place. A transcript over 5,000 entries or 6 MB keeps its first
+   30 % and its last 70 %, with one marker for the middle. The request has `omitted`, the
+   number of entries that stay out, so the row can show `archive_truncated`.
+3. `RemoteArchiver` posts the entries to `POST /archive` of the sama tool server. It sends
    the run token as the bearer, like every other request from the sandbox. The runner has no
    database access (Section 16.2).
-3. The tool server calls `ContextArchive.archive`. It needs a run in the status `running`
-   and a session in the status `active`. It redacts the text (Section 16.3), then cuts it,
-   because a cut can split a secret into parts that the redactor does not know. It makes an
+4. The tool server checks the run **before it reads the body** (`ContextArchive.authorize`),
+   limits the bodies that it holds at one time (Section 16.7), and calls
+   `ContextArchive.archive`. The archive needs a run in the status `running`, a user of the
+   run that still sees the session (the live check of Section 5.1, `load_authority`), and a
+   session in the status `active`. It checks this again in the transaction that writes. It
+   redacts each entry **whole**: the text of an entry, and the input of a tool call as a JSON
+   value (every string and key), so a secret with quotes, backslashes, or new lines still
+   matches. Only then it makes the text (`[tool call NAME] {json}`) and cuts it. It makes an
    **archive session** and stores the entries as its messages. It makes a
    `session_compactions` row that points to the archive session (the row is open, with no
    token counts). It writes the audit row `context.archived`.
-4. The CLI compacts. The `compact_boundary` message becomes `Compacted`. The event completes
+5. The CLI compacts. The `compact_boundary` message becomes `Compacted`. The event completes
    the open row (the token counts and `completed_at`).
 
-Limits: 20,000 characters for one entry (the start 70 % and the end 30 % stay), 4,000 entries,
-2,000,000 characters for one archive (the first 30 % and the last 70 % stay, with a `system`
-entry that says how many entries are not in the archive), 16 MB for the request body, 60
-seconds for the call, and 10 archives for one run. The row has `archive_truncated` when
-anything was cut.
+Limits of the request (the runner and the model refuse more): 5,000 entries, 1 MB for one
+entry, 8 MB for the body. A body that has far more `"role"` keys than the limit is refused
+from its bytes, before the model builds any entry (the check of the list length comes after
+the items are built, and 200,000 small entries need hundreds of MB). Limits of the store, after
+the redaction: 20,000 characters for one entry (the start 70 % and the end 30 % stay), 4,000
+entries, 2,000,000 characters for one archive (the first 30 % and the last 70 % stay, with a
+`system` entry that says how many entries are not in the archive), 60 seconds for the call, and
+10 archives for one run. The row has `archive_truncated` when anything was cut, in the runner
+or in the store.
+
+**A failed compaction.** The CLI can answer `/compact` with a normal result that has an error
+text (for example when the summary call fails with HTTP 400). There is no `compact_boundary`
+then, and the context is not smaller. A compact run needs a boundary to complete: the adapter
+ends it with `RunFailed` (`model_error`, "the compaction did not finish: the runtime made no
+compaction boundary"). The archive row that the hook made stays open (`completed_at` is null).
+It is the record of the attempt.
+
+**Tokens of a compaction.** For `/compact` the CLI reports zero tokens in `ResultMessage.usage`,
+but `model_usage` and the cost of the SDK session grow. The adapter keeps the cumulative tokens
+of `model_usage` in its `runtime_state` (`sdk_tokens`). If a result has no tokens in `usage`,
+the run counts the difference of `model_usage`. A normal turn has its tokens in `usage`, so it
+is not counted two times. A state without `sdk_tokens` (an older state) has no known baseline,
+so the first run counts nothing from `model_usage` and then saves the baseline.
 
 **An archive that fails does not stop the compaction.** A session that is full must still be
 able to make room. The hook catches every error, logs only the error type, and returns an empty
@@ -827,6 +858,10 @@ session list of the API, and it cannot get new runs or pins.
   redacted. A database check makes a compact run a chat run and allows a focus only on a
   compact run. The worker sends `RunRequest.compact` and no input. It reuses the claim, lease,
   event, follow, and cancel code of a chat run, so a compact run can be stopped with `/stop`.
+- **Lock order.** Every enqueue takes the org rate lock first (an advisory lock), and the
+  session row after it. A run insert needs a share lock on the session row, so `enqueue` held
+  the rate lock and waited for the row, while `enqueue_compact` held the row and waited for the
+  rate lock: a deadlock. Both paths use the same order now.
 - **Busy rule.** `enqueue_compact` locks the session row and refuses when any run of the
   session is open (`queued`, `running`, or `paused`). A message uses the queue rule: it waits
   behind the open run. A compaction must not change the context under a run, and a run that
@@ -857,13 +892,23 @@ true until the user removes it.
   same session. Telegram: `/pin <text>`, `/pins`, `/unpin <number>`. Slack, in a direct
   message: `/sama pin TEXT`, `/sama pins`, `/sama unpin NUMBER`. Any user who can read the
   session can add and remove pins, as any user can send a message. An archive session cannot
-  have pins.
+  have pins. The list (API, Telegram, Slack) redacts the **whole** text again with the secrets
+  that the redactor knows now, and then the caller folds and cuts it. So a secret that the
+  system learned after the pin was made is not shown, and a cut cannot split it.
 - **Injection.** The runtime has no native pin. The control plane puts the pins that the
   runtime has not seen in front of the next user message, in a `<pinned_context>` block that
-  says the text is notes from the user and not system instructions. `injected_at` records
-  which pins the runtime has seen. The stored message is the text of the person. The block is
-  only in the input of the run. A claim of the same run again (after a lost lease) gets the
-  same pins again. An approval resume gets none, because the CLI session already has them.
+  says the text is notes from the user and not system instructions. The stored message is the
+  text of the person. The block is only in the input of the run. A claim of the same run again
+  (after a lost lease) gets the same pins again. An approval resume gets none, because the CLI
+  session already has them.
+- **Reservation, not a mark.** The claim **reserves** the pins for the run (`injected_at` and
+  `injected_run_id`). The reservation is final only while a runtime state that has the pins can
+  be resumed. A pin is due again at the next claim when the run that got it did not keep it:
+  the run failed or was cancelled (it saves no state), or it completed without a runtime
+  state. A run that is `queued`, `running`, or `paused` holds its pins, and a run that
+  completed with a state keeps them (the next run resumes that state). The rule is a query at
+  claim time, so it holds for every way that a run can end (fail, cancel, reap, approval
+  time-out) with no hook in each of them.
 - **Survive compaction.** A compaction can summarise the pin text away. So `record_compacted`
   sets `injected_at` to null for all pins of the session, and the next message carries all of
   them again. A `/compact` also passes the pins in the focus, so the summary tries to keep
@@ -879,7 +924,9 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 - Both search tools show only the tools that the run can use: the tools of its toolsets, minus
   the tools that a `deny` rule blocks (`GateService.visible_tools`, so a shared run uses its
   group set). A hidden tool and an unknown tool give the same error, so a run does not learn
-  that a tool exists.
+  that a tool exists. **Fail closed:** a gate that has no `visible_tools` (and a server with no
+  gate) shows no deferred tool. The search is empty and `tool_describe` gives the same error as
+  for an unknown tool. `tool_call` still goes through the gate.
 - **A deferred call never bypasses the gate.** Section 16.1 has the rule: the gate judges a
   `tool_call` as a call of the tool that it names.
 - The tool server shows the three tools only when the catalog has a tool when the app starts.
@@ -902,13 +949,20 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 | A3 | A failed archive does not block compaction. |
 | A4 | `/compact` refuses a busy session. A message waits in the queue, but a compaction must not wait behind a run that waits for a human. |
 | A5 | A compact run is a chat run with a flag, not a new run kind. It reuses the claim, lease, event, follow, and rate code. A new kind would need new code in each of them. |
-| A6 | The archive is redacted and cut in the control plane, not in the runner, because the redactor knows the vault secrets of the org. |
+| A6 | The archive is redacted and cut in the control plane, not in the runner, because the redactor knows the vault secrets of the org. The runner never cuts inside an entry: it leaves whole entries out. A tool input stays a JSON value to the redaction. |
 | A7 | Archives are not searched. They repeat the live session. They are readable by id. |
 | A8 | Pins are session notes that the control plane injects. No runtime has a native pin, so the injection is the same for every runtime. |
 | A9 | Any user who can read a session can pin and unpin, as any user can send a message. |
 | A10 | `compact` and pins in Slack work in direct messages only. |
 | A11 | The default profile gets the toolset `tool_search`. The default group set does not, because no deferred tool is registered yet and a shared session should opt in. Migration `0018` changes only a profile that has the exact old default list. |
 | A12 | `tool_search` and `tool_describe` are allowed by default (they only read). `tool_call` has no default of its own: the called tool has its own rule or its default (`ask` for an unknown tool). |
+| A14 | The archive endpoint has hard limits at the model (5,000 entries, 1 MB for an entry, 8 MB for the body), a check of the run before the body is read, and 2 archive bodies at one time (a third gets `429`; the hook is fail-open, so the cost is one archive). A tool input with many `"role"` keys of its own can make a body that is refused (over 10,000 such keys). The archive is lost then, and the compaction goes on. |
+| A15 | An archive needs the live authority of the run (the user still sees the session), as a tool call does. A user who loses access while a run runs cannot write an archive. The compaction itself is not stopped. |
+| A16 | A pin is due again unless the run that got it is open or completed with a runtime state. A failed run does not save a state, so the pin goes again. A run that fails after the CLI saved its own session can give a pin two times to that session. The cost is a repeated note, and this is the safe side. |
+| A17 | A compact run that has no compaction boundary fails. The run ends as `failed` with `model_error`. The archive that the hook made stays as an open row. |
+| A18 | `model_usage` of the CLI is cumulative for the SDK session across processes, as the cost is. This is checked with the real CLI and the scripted model, and not with a live model. |
+| A19 | The pin list is redacted again when it is shown. The text in the table can still hold a secret that the redactor learned after the pin was made, until the pin is removed. |
+| A20 | The tool search fails closed without a visibility source. A tool server in a test or a product that has no gate shows no deferred tool. |
 | A13 | The PreCompact hook and the compact boundary behave as the CLI of `claude-agent-sdk==0.2.184` documents. They are not checked against a live model in M2.6 (no key in the test environment). A live check is in the nightly conformance job when a key exists. |
 
 **Limits and gaps.**
@@ -2806,7 +2860,8 @@ would change (the prefix, a sama tool, a meta tool).
 
 `GateService.visible_tools` gives the tools that a run can use: the tools of its toolsets
 (group set for a shared run) minus the tools that a `deny` rule blocks. It is empty for a run
-that has no authority. `tool_search` and `tool_describe` use it.
+that has no authority. `tool_search` and `tool_describe` use it. A gate that does not have it
+gives no deferred tool: the search fails closed (Section 6.3).
 
 ### 16.2 Sandbox and runner (M1.6)
 
@@ -3171,13 +3226,26 @@ their warnings. The tool gate writes the audit log rows (Section 16.1).
 `deny` (Section 16.1). It still lists every tool that it can serve.
 
 **Archive endpoint (M2.6).** `POST /archive` takes a transcript before a compaction from the
-runner of the run of the token (Section 6.3). The body is JSON: `trigger` and `entries` (`role`
-and `text`), at most 16 MB. It answers `401` without a valid run token, `413` for a body that
-is too large, `422` for a body that is not valid, `409` when the run is not running or the
-session is not active or the run made too many archives, and `503` when the server has no
-archive store or the store failed. The error text of a failure is fixed, so it holds no data.
-`ContextArchive` redacts and stores the entries. The runner sends the request. The sandbox needs
-the control plane host in its egress list, like the model and gate URLs.
+runner of the run of the token (Section 6.3). The body is JSON: `trigger`, `entries`, and `omitted`. An entry has `role` and
+either `text`, or `tool_name` and `tool_input` (a JSON value). Limits: 5,000 entries, 1 MB for an
+entry, 8 MB for the body. The order of the checks:
+
+1. `401` without a valid run token. `503` when the server has no archive store.
+2. `ContextArchive.authorize`: `409` when the run is not running, its user cannot see the
+   session any more, the session is not active, or the run made too many archives. The server
+   has read no byte of the body at this point.
+3. `413` for a `Content-Length` or a body over the limit. `429` when 2 archives are in work
+   (`MAX_CONCURRENT_ARCHIVES`). The check is before the body is read, so a busy server holds no
+   new body.
+4. `422` for a body that is not valid: a bad field, too many entries, a value that is too large.
+   A body with more than 10,000 `"role"` keys is refused from its bytes, before the model
+   builds the entries.
+5. `ContextArchive.archive` checks the run again and stores the entries. `409` and `503` as
+   before. The error text of a failure is fixed, so it holds no data.
+
+`ContextArchive` redacts each entry whole (the structure of a tool input), cuts it after, and
+stores it. The runner sends the request. The sandbox needs the control plane host in its egress
+list, like the model and gate URLs.
 
 **Not in M1.8.** The Claude adapter does not yet map the native `TodoWrite` tool
 to `todo`. The search key of the org comes from the vault, with the key of the server

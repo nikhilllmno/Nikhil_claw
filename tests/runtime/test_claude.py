@@ -84,6 +84,9 @@ def result(
     errors: list[str] | None = None,
     api_error_status: int | None = None,
     num_turns: int = 1,
+    cache_read: int = 2,
+    cache_write: int = 1,
+    model_usage: dict[str, Any] | None = None,
 ) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
@@ -97,9 +100,10 @@ def result(
         usage={
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_read_input_tokens": 2,
-            "cache_creation_input_tokens": 1,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
         },
+        model_usage=model_usage,
         result=text,
         deferred_tool_use=deferred,
         terminal_reason=terminal_reason,

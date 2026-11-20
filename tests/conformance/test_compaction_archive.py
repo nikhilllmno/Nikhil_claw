@@ -77,6 +77,7 @@ async def test_the_hook_gives_the_transcript_to_the_archiver_before_the_compacti
     # The compaction happens, with an archive or without one.
     assert [e.trigger for e in events if isinstance(e, Compacted)] == ["manual"]
     assert isinstance(events[-1], RunCompleted)
+    assert events[-1].usage.total_tokens > 0  # the compaction used the model
     ((scope, archive),) = archiver.archives
     assert scope.run_id == request.scope.run_id
     assert archive.trigger == "manual"

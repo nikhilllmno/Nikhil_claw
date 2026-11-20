@@ -247,6 +247,7 @@ class RunQueue:
         (``QueueLimits``).
         """
         async with self._engine.begin() as connection:
+            await self._rate_lock(connection, org_id)  # the lock order of all enqueues
             session = (
                 await connection.execute(
                     select(
@@ -336,6 +337,10 @@ class RunQueue:
         counts as a message.
         """
         async with self._engine.begin() as connection:
+            # The lock order of all enqueues: the org rate lock first, then the session row.
+            # A run insert needs a share lock on the session row. If this call took the row
+            # first and the rate lock second, a message in the other order would deadlock.
+            await self._rate_lock(connection, org_id)
             session = (
                 await connection.execute(
                     select(
@@ -396,12 +401,19 @@ class RunQueue:
             )
         return run_id
 
+    @staticmethod
+    async def _rate_lock(connection: AsyncConnection, org_id: uuid.UUID) -> None:
+        """The lock that puts the enqueues of one org in a sequence. It is the first lock of
+        every enqueue, before any lock of a session row (the rows of a run insert take a share
+        lock on the session). A transaction can take it again."""
+        await connection.execute(_lock("sama.queue.rate", org_id))
+
     async def _check_rate(
         self, connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID | None
     ) -> None:
-        """Counts the runs of the last 60 seconds. The lock puts the enqueues of one org in a
-        sequence, so two messages at the same time cannot both take the last place."""
-        await connection.execute(_lock("sama.queue.rate", org_id))
+        """Counts the runs of the last 60 seconds. The rate lock puts the enqueues of one org
+        in a sequence, so two messages at the same time cannot both take the last place."""
+        await self._rate_lock(connection, org_id)
         limits = QueueLimits.from_json(
             (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
         )

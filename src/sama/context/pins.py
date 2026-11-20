@@ -4,7 +4,10 @@ A person pins a short text to a session. Compaction can drop any text of the con
 does not trust the runtime to keep a pin. It gives the pin to the runtime in the input of a
 run:
 
-- A new pin goes into the input of the next run of the session.
+- A new pin goes into the input of the next run of the session. The claim reserves the pin
+  for the run. The reservation is final only while a runtime state that has the pin can be
+  resumed: a run that fails, is cancelled, or completes without a state gives the pin back
+  (``pins_for_input``).
 - A compaction makes the runtime forget the pins that it had, so ``record_compacted`` marks
   all pins as not given. The next run gets all of them again.
 - A ``/compact`` run also gets the pins in its focus, so the summary can keep them.
@@ -21,10 +24,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
-from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy import and_, delete, exists, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import ContextPin, Message, Session
+from sama.db.models import ContextPin, Message, Run, Session
 from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS
 from sama.vault.redact import redact
 
@@ -155,13 +158,16 @@ class PinStore:
         )
 
     async def list(self, org_id: uuid.UUID, session_id: uuid.UUID) -> list[Pin]:
+        """The pins of a session, oldest first. The text is redacted again with the secrets
+        that the redactor knows now, over the whole text. The callers (the API, the chat
+        commands) cut and fold the text after this, so a cut cannot split a secret."""
         async with self._engine.connect() as connection:
             rows = await connection.execute(
                 select(*_columns())
                 .where(ContextPin.org_id == org_id, ContextPin.session_id == session_id)
                 .order_by(ContextPin.created_at, ContextPin.id)
             )
-            return [_pin(row) for row in rows]
+            return [_pin(row, redact(row.text)) for row in rows]
 
     async def remove(self, org_id: uuid.UUID, session_id: uuid.UUID, pin_id: uuid.UUID) -> bool:
         """Removes a pin. Returns False if the session has no such pin."""
@@ -204,25 +210,50 @@ def _columns() -> tuple[Any, ...]:
     )
 
 
-def _pin(row: Any) -> Pin:
-    return Pin(row.id, row.text, row.source, row.created_by_user_id, row.created_at)
+def _pin(row: Any, text: str | None = None) -> Pin:
+    shown = row.text if text is None else text
+    return Pin(row.id, shown, row.source, row.created_by_user_id, row.created_at)
+
+
+def _kept_by_runtime(session_id: uuid.UUID) -> Any:
+    """A condition on ``ContextPin``: the run that got the pin still holds it, or its runtime
+    state keeps it. That run is open (queued, running, paused: the state is in the run), or it
+    completed and saved a runtime state, which the next run of the session resumes. A run that
+    failed, was cancelled, or completed without a state leaves the pin due again, because no
+    later run resumes a context that has the pin."""
+    return exists().where(
+        Run.org_id == ContextPin.org_id,
+        Run.id == ContextPin.injected_run_id,
+        Run.session_id == session_id,
+        or_(
+            Run.status.in_(("queued", "running", "paused")),
+            and_(Run.status == "completed", Run.runtime_state.is_not(None)),
+        ),
+    )
 
 
 async def pins_for_input(
     connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, run_id: uuid.UUID
 ) -> list[str]:
-    """The pins that the input of this run must carry, and marks them as given to this run.
+    """The pins that the input of this run must carry, and reserves them for this run.
 
-    These are the pins that no run has got, and the pins that this run got before: a claim of
-    the same run again (after a lost lease) gets them again. The rows are locked, so two
-    claims cannot both give the same pin."""
+    These are the pins that no run got, the pins that this run got before (a claim of the
+    same run again, after a lost lease, gets them again), and the pins that an earlier run got
+    but lost: the run failed, was cancelled, or saved no runtime state, so the next run cannot
+    resume a context that has the pin. A reservation is not final until the run saves a
+    runtime state (``_kept_by_runtime``). The rows are locked, so two claims cannot both give
+    the same pin."""
     rows = (
         await connection.execute(
             select(ContextPin.id, ContextPin.text)
             .where(
                 ContextPin.org_id == org_id,
                 ContextPin.session_id == session_id,
-                or_(ContextPin.injected_at.is_(None), ContextPin.injected_run_id == run_id),
+                or_(
+                    ContextPin.injected_at.is_(None),
+                    ContextPin.injected_run_id == run_id,
+                    ~_kept_by_runtime(session_id),
+                ),
             )
             .order_by(ContextPin.created_at, ContextPin.id)
             .with_for_update()
@@ -234,7 +265,7 @@ async def pins_for_input(
             .where(
                 ContextPin.org_id == org_id,
                 ContextPin.id.in_([row.id for row in rows]),
-                ContextPin.injected_at.is_(None),
+                ContextPin.injected_run_id.is_distinct_from(run_id),
             )
             .values(injected_at=func.now(), injected_run_id=run_id)
         )

@@ -8,6 +8,7 @@ goes away before the answer, the tool call is cancelled.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
@@ -55,6 +56,7 @@ from sama.runtime.archive import (
     MAX_ARCHIVE_BODY_BYTES,
     ArchiveAnswer,
     TranscriptArchive,
+    parse_archive,
 )
 from sama.search import (
     DEFAULT_LIMIT,
@@ -110,6 +112,8 @@ log = logging.getLogger("sama.tools")
 
 SERVER_NAME: Final = "sama"
 MCP_PATH: Final = "/mcp"
+MAX_CONCURRENT_ARCHIVES: Final = 2
+"""The most archive bodies that the server reads and stores at one time."""
 
 WEB_SEARCH: Final = "web_search"
 WEB_EXTRACT: Final = "web_extract"
@@ -162,7 +166,11 @@ class ToolVisibility(Protocol):
 
 
 class ArchiveBackend(Protocol):
-    """Stores the transcript of a compaction, normally ``sama.context.ContextArchive``."""
+    """Stores the transcript of a compaction, normally ``sama.context.ContextArchive``.
+    ``authorize`` raises ``ArchiveError`` if the run cannot archive. The server calls it before
+    it reads the body."""
+
+    async def authorize(self, claims: RunTokenClaims) -> None: ...
 
     async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer: ...
 
@@ -272,6 +280,7 @@ class ToolServer:
         self.signer = signer
         self.deferred = deferred
         self.archive = archive
+        self._archive_slots = asyncio.Semaphore(MAX_CONCURRENT_ARCHIVES)
         self.gate = gate
         self.todos = todos
         self.outbound = outbound or OutboundClient()
@@ -715,7 +724,9 @@ class ToolServer:
         """The deferred tools that the run can use now."""
         if isinstance(self.gate, ToolVisibility):
             return await self.gate.visible_tools(claims)
-        return catalog.names()
+        # A gate that cannot say what the run may use shows nothing: the search must not tell
+        # a run the names and the schemas of tools that the gate may deny.
+        return frozenset()
 
     def _deferred_tools(self, server: MCPServer, catalog: DeferredCatalog) -> None:
         """``tool_search``, ``tool_describe``, and ``tool_call`` (Section 10.3)."""
@@ -864,22 +875,39 @@ class ToolServer:
             return _unauthorized(error)
         if self.archive is None:
             return JSONResponse({"error": "the archive is not configured"}, status_code=503)
-        raw = bytearray()
-        async for chunk in request.stream():
-            raw += chunk
-            if len(raw) > MAX_ARCHIVE_BODY_BYTES:
-                return JSONResponse({"error": "the archive is too large"}, status_code=413)
         try:
-            body = TranscriptArchive.model_validate_json(bytes(raw))
-        except ValidationError:
-            return JSONResponse({"error": "the archive is not valid"}, status_code=422)
-        try:
-            answer = await self.archive.archive(claims, body)
+            # The run must be able to archive before the server reads the body.
+            await self.archive.authorize(claims)
         except ArchiveError as error:
             return JSONResponse({"error": str(error)}, status_code=409)
         except Exception as error:
             log.error("archive failed run=%s error=%s", claims.run_id, type(error).__name__)
             return JSONResponse({"error": "the archive failed"}, status_code=503)
+        declared = request.headers.get("content-length", "")
+        if declared.isdecimal() and int(declared) > MAX_ARCHIVE_BODY_BYTES:
+            return JSONResponse({"error": "the archive is too large"}, status_code=413)
+        # At most MAX_CONCURRENT_ARCHIVES bodies are in memory. The runner archives with the
+        # fail-open rule, so a busy answer costs it only the archive.
+        if self._archive_slots.locked():
+            return JSONResponse({"error": "the archive is busy"}, status_code=429)
+        async with self._archive_slots:
+            raw = bytearray()
+            async for chunk in request.stream():
+                raw += chunk
+                if len(raw) > MAX_ARCHIVE_BODY_BYTES:
+                    return JSONResponse({"error": "the archive is too large"}, status_code=413)
+            try:
+                body = parse_archive(bytes(raw))
+            except ValueError:
+                return JSONResponse({"error": "the archive is not valid"}, status_code=422)
+            del raw
+            try:
+                answer = await self.archive.archive(claims, body)
+            except ArchiveError as error:
+                return JSONResponse({"error": str(error)}, status_code=409)
+            except Exception as error:
+                log.error("archive failed run=%s error=%s", claims.run_id, type(error).__name__)
+                return JSONResponse({"error": "the archive failed"}, status_code=503)
         return JSONResponse(answer.model_dump())
 
 

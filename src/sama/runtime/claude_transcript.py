@@ -15,15 +15,15 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Final, Literal
 
-from sama.runtime.archive import ArchiveEntry
+from sama.runtime.archive import MAX_TOOL_NAME_CHARS, ArchiveEntry
 
 MAX_TRANSCRIPT_BYTES: Final = 64 * 1024 * 1024
 """A larger file keeps its last bytes. The archive cuts long transcripts anyway."""
-_TOOL_INPUT_CHARS: Final = 4_000
 
 
-def read_transcript(path: str) -> list[ArchiveEntry]:
-    """The entries of a transcript file. An unreadable file gives no entries."""
+def read_transcript(path: str) -> tuple[list[ArchiveEntry], int]:
+    """The entries of a transcript file, and how many entries stay out (whole). An unreadable
+    file gives no entries."""
     try:
         file = Path(path)
         size = file.stat().st_size
@@ -33,20 +33,35 @@ def read_transcript(path: str) -> list[ArchiveEntry]:
                 handle.readline()  # the first line is cut
             raw = handle.read().decode("utf-8", errors="replace")
     except OSError:
-        return []
-    return parse_transcript(raw)
+        return [], 0
+    entries, omitted = parse_transcript(raw)
+    if size > MAX_TRANSCRIPT_BYTES:
+        marker = ArchiveEntry(role="system", text="[the start of the transcript is not here]")
+        return [marker, *entries], omitted + 1
+    return entries, omitted
 
 
-def parse_transcript(raw: str) -> list[ArchiveEntry]:
+def parse_transcript(raw: str) -> tuple[list[ArchiveEntry], int]:
+    """The entries of a transcript, and how many entries stay out. An entry that is too large
+    for the wire stays out whole, and a marker takes its place: the control plane redacts a
+    whole entry, so the parser must not cut one."""
     entries: list[ArchiveEntry] = []
+    omitted = 0
     for line in raw.splitlines():
         try:
             item = json.loads(line)
         except ValueError:
             continue
-        if isinstance(item, dict):
+        if not isinstance(item, dict):
+            continue
+        try:
             entries.extend(_entries(item))
-    return entries
+        except ValueError:  # an entry over the limits of the model
+            omitted += 1
+            entries.append(
+                ArchiveEntry(role="system", text="[a large entry is not in this archive]")
+            )
+    return entries, omitted
 
 
 def _entries(item: Mapping[str, Any]) -> Iterator[ArchiveEntry]:
@@ -76,11 +91,12 @@ def _block(role: Literal["user", "assistant"], block: Mapping[str, Any]) -> Arch
             if isinstance(text, str) and text.strip():
                 return ArchiveEntry(role=role, text=text)
         case "tool_use":
-            arguments = json.dumps(block.get("input"), ensure_ascii=False, default=str)
-            if len(arguments) > _TOOL_INPUT_CHARS:
-                arguments = arguments[:_TOOL_INPUT_CHARS] + " [cut]"
+            # The input stays a JSON value and whole. The control plane redacts it, and then it
+            # makes the text and cuts it (a cut before the redaction could split a secret).
             return ArchiveEntry(
-                role="assistant", text=f"[tool call {block.get('name', '?')}] {arguments}"
+                role="assistant",
+                tool_name=str(block.get("name", "?"))[:MAX_TOOL_NAME_CHARS],
+                tool_input=block.get("input"),
             )
         case "tool_result":
             text = _result_text(block.get("content"))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,7 +19,7 @@ from sama.runtime import Compacted, FailureCode, RunCompleted, RunFailed, RunReq
 from sama.runtime.archive import Archiver, TranscriptArchive
 from sama.runtime.claude import ClaudeRuntime
 from sama.runtime.contract import CompactRequest, RunScope
-from tests.runtime.test_claude import SESSION, Factory, FakeClient, config, result
+from tests.runtime.test_claude import SESSION, Factory, FakeClient, config, delta, result
 from tests.support import collect, make_scope
 
 
@@ -100,7 +101,7 @@ def test_the_capabilities_name_the_compaction_features() -> None:
 
 
 async def test_a_compact_request_sends_the_slash_command() -> None:
-    factory = Factory([result(text="")])
+    factory = Factory([boundary("manual"), result(text="")])
     events = await collect(
         ClaudeRuntime(client_factory=factory).run(compact_request("keep the plan"))
     )
@@ -123,6 +124,180 @@ async def test_a_compact_request_without_state_is_invalid() -> None:
     assert events[-1].code is FailureCode.INVALID_REQUEST
     assert "nothing to compact" in events[-1].message
     assert first.clients == []
+
+
+async def test_a_compact_run_without_a_boundary_fails() -> None:
+    """The CLI can answer ``/compact`` with a normal result and an error text (for example an
+    HTTP 400 on the summary call). Nothing was compacted, so the run must not complete."""
+    factory = Factory([delta("API Error: 400 summary failed"), result(text="API Error: 400")])
+    events = await collect(ClaudeRuntime(client_factory=factory).run(compact_request()))
+    done = events[-1]
+    assert isinstance(done, RunFailed)
+    assert done.code is FailureCode.MODEL_ERROR
+    assert "compaction did not finish" in done.message
+    assert "no compaction boundary" in done.message
+    assert not any(isinstance(e, Compacted) for e in events)
+    assert not any(isinstance(e, RunCompleted) for e in events)
+
+
+async def test_a_failed_compact_keeps_its_attempted_archive(tmp_path: Path) -> None:
+    """The archive is made before the compaction. A compaction that fails leaves it as the
+    record of the attempt: the hook ran, and the run failed."""
+    recorder = Recorder()
+    factory = Factory([pre_compact(transcript(tmp_path)), result(text="API Error: 400")])
+    runtime = ClaudeRuntime(client_factory=factory, archiver=cast(Archiver, recorder))
+    events = await collect(runtime.run(compact_request()))
+    assert isinstance(events[-1], RunFailed)
+    assert len(recorder.archives) == 1
+
+
+async def test_a_chat_run_does_not_need_a_boundary() -> None:
+    factory = Factory([result()])
+    events = await collect(ClaudeRuntime(client_factory=factory).run(chat()))
+    assert isinstance(events[-1], RunCompleted)
+
+
+# -- the tokens of a local command -------------------------------------------------------------
+
+
+def models(
+    input_tokens: int, output_tokens: int, cache_read: int, cache_write: int
+) -> dict[str, Any]:
+    return {
+        "claude-haiku-4-5": {
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "cacheReadInputTokens": cache_read,
+            "cacheCreationInputTokens": cache_write,
+            "costUSD": 0.01,
+        }
+    }
+
+
+async def counted_state() -> bytes:
+    """The state of a chat run whose result has the tokens in ``usage`` and ``model_usage``."""
+    first = result(input_tokens=10, output_tokens=5, model_usage=models(10, 5, 2, 1))
+    done = (await collect(ClaudeRuntime(client_factory=Factory([first])).run(chat())))[-1]
+    assert isinstance(done, RunCompleted)
+    assert done.runtime_state is not None
+    return done.runtime_state
+
+
+async def test_a_compact_run_counts_the_tokens_of_model_usage() -> None:
+    """For ``/compact`` the CLI reports zero tokens in ``usage``, but the cost and the
+    ``model_usage`` of the SDK session grow. The adapter counts the difference."""
+    state = await counted_state()
+    zero = result(
+        input_tokens=0,
+        output_tokens=0,
+        cache_read=0,
+        cache_write=0,
+        model_usage=models(40, 9, 6, 3),
+        cost=0.05,
+    )
+    factory = Factory([boundary("manual"), zero])
+    events = await collect(ClaudeRuntime(client_factory=factory).run(compact_request(state=state)))
+    done = events[-1]
+    assert isinstance(done, RunCompleted)
+    assert (done.usage.input_tokens, done.usage.output_tokens) == (30, 4)
+    assert (done.usage.cache_read_tokens, done.usage.cache_write_tokens) == (4, 2)
+    assert done.usage.cost_usd == Decimal("0.04")
+    # The next run counts from the new total.
+    assert done.runtime_state is not None
+    again = result(
+        input_tokens=0, output_tokens=0, cache_read=0, cache_write=0,
+        model_usage=models(50, 12, 6, 3), cost=0.06,
+    )  # fmt: skip
+    follow = Factory([boundary("manual"), again])
+    events = await collect(
+        ClaudeRuntime(client_factory=follow).run(compact_request(state=done.runtime_state))
+    )
+    assert isinstance(events[-1], RunCompleted)
+    assert (events[-1].usage.input_tokens, events[-1].usage.output_tokens) == (10, 3)
+
+
+async def test_a_normal_turn_is_not_counted_two_times() -> None:
+    """A turn has its tokens in ``usage``. ``model_usage`` only gives the baseline."""
+    state = await counted_state()
+    turn = result(input_tokens=10, output_tokens=5, model_usage=models(20, 10, 4, 2), cost=0.02)
+    events = await collect(
+        ClaudeRuntime(client_factory=Factory([turn])).run(
+            RunRequest(scope=make_scope(), input="more", config=config(), runtime_state=state)
+        )
+    )
+    done = events[-1]
+    assert isinstance(done, RunCompleted)
+    assert (done.usage.input_tokens, done.usage.output_tokens) == (10, 5)
+    assert (done.usage.cache_read_tokens, done.usage.cache_write_tokens) == (2, 1)
+
+
+async def test_a_state_without_a_baseline_does_not_count_the_whole_session() -> None:
+    """A state of an older version has no ``sdk_tokens``. The first difference is not known,
+    so the run counts no tokens from ``model_usage``. It does not count the whole session."""
+    state = json.loads((await counted_state()).decode())
+    del state["sdk_tokens"]
+    zero = result(
+        input_tokens=0, output_tokens=0, cache_read=0, cache_write=0,
+        model_usage=models(40, 9, 6, 3), cost=0.05,
+    )  # fmt: skip
+    events = await collect(
+        ClaudeRuntime(client_factory=Factory([boundary("manual"), zero])).run(
+            compact_request(state=json.dumps(state).encode())
+        )
+    )
+    done = events[-1]
+    assert isinstance(done, RunCompleted)
+    assert done.usage.total_tokens == 0
+    # The new state has the baseline for the next run.
+    assert done.runtime_state is not None
+    assert json.loads(done.runtime_state)["sdk_tokens"]["input_tokens"] == 40
+
+
+async def test_a_result_without_model_usage_changes_nothing() -> None:
+    state = await counted_state()
+    zero = result(input_tokens=0, output_tokens=0, cache_read=0, cache_write=0)
+    events = await collect(
+        ClaudeRuntime(client_factory=Factory([boundary("manual"), zero])).run(
+            compact_request(state=state)
+        )
+    )
+    done = events[-1]
+    assert isinstance(done, RunCompleted)
+    assert done.usage.total_tokens == 0
+
+
+async def test_a_large_transcript_goes_out_whole_with_the_omitted_count(tmp_path: Path) -> None:
+    """The hook does not cut a tool input or a text. It leaves whole entries out, and it says
+    how many (``omitted``), so the archive row can show ``archive_truncated``."""
+    from sama.runtime.archive import MAX_WIRE_ENTRIES
+
+    big = {"data": 'x"y' * 20_000, "secret": 'pa"ss\\word\nline'}
+    lines = [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": "W", "input": big}]},
+            }
+        )
+    ] + [
+        json.dumps({"type": "user", "message": {"content": f"m{n}"}})
+        for n in range(MAX_WIRE_ENTRIES + 50)
+    ]
+    path = tmp_path / "big.jsonl"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    recorder = Recorder()
+    factory = Factory([pre_compact(str(path)), boundary("manual"), result(text="")])
+    runtime = ClaudeRuntime(client_factory=factory, archiver=cast(Archiver, recorder))
+    await collect(runtime.run(compact_request()))
+    ((_, archive),) = recorder.archives
+    assert len(archive.entries) <= MAX_WIRE_ENTRIES
+    assert archive.omitted > 0
+    assert any(e.role == "system" and "not in this archive" in e.text for e in archive.entries)
+    # The last entries stay. The first entry (a tool call) was in the 30% of the head.
+    assert archive.entries[-1].text == f"m{MAX_WIRE_ENTRIES + 49}"
+    call = archive.entries[0]
+    assert call.tool_name == "W"
+    assert call.tool_input == big
 
 
 async def test_the_trigger_of_the_boundary_is_in_the_compacted_event() -> None:

@@ -58,7 +58,7 @@ from claude_agent_sdk.types import (
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from sama.runtime.archive import Archiver, TranscriptArchive
+from sama.runtime.archive import Archiver, TranscriptArchive, bound_for_wire
 from sama.runtime.claude_transcript import read_transcript
 from sama.runtime.contract import (
     ApprovalDecision,
@@ -219,6 +219,11 @@ class _State(BaseModel):
     run_id: str
     usage: Usage = Usage()
     sdk_cost_usd: Decimal = Decimal(0)
+    sdk_tokens: Usage | None = None
+    """The tokens that ``model_usage`` of the last result counted for the SDK session, over all
+    models. A local command, such as ``/compact``, reports no tokens in ``usage``, but it adds
+    to ``model_usage``. The adapter counts the difference. ``None`` means that an older state
+    did not save it, so the difference is not known."""
     turns: int = Field(default=0, ge=0)
     elapsed_s: float = Field(default=0.0, ge=0)
     pending: _PendingCall | None = None
@@ -281,6 +286,11 @@ class _Translator:
     run_id: str
     usage: Usage
     sdk_cost_usd: Decimal
+    sdk_tokens: Usage | None = None
+    """The cumulative tokens of ``model_usage`` at the last result. ``None``: not known."""
+    compact: bool = False
+    """The run is a ``/compact`` run. It needs a compaction boundary to be complete."""
+    compacted: bool = False
     session_id: str | None = None
     turns: int = 0
     elapsed_before_s: float = 0.0
@@ -369,6 +379,7 @@ class _Translator:
         trigger: Literal["auto", "manual"] = (
             "manual" if metadata.get("trigger") == "manual" else "auto"
         )
+        self.compacted = True
         return [
             Compacted(tokens_before=before, tokens_after=after, trigger=trigger, usage=self.usage)
         ]
@@ -381,6 +392,14 @@ class _Translator:
             cache_read_tokens=_non_negative_int(raw.get("cache_read_input_tokens")),
             cache_write_tokens=_non_negative_int(raw.get("cache_creation_input_tokens")),
         )
+        cumulative = _model_tokens(result.model_usage)
+        if cumulative is not None:
+            if tokens.total_tokens == 0 and self.sdk_tokens is not None:
+                # The CLI reports no tokens in ``usage`` for ``/compact`` (a local command that
+                # calls the model), but ``model_usage`` and the cost count them. A normal turn
+                # reports its tokens in ``usage``, so this never counts a turn two times.
+                tokens = _token_difference(cumulative, self.sdk_tokens)
+            self.sdk_tokens = cumulative
         cost = Decimal(0)
         if result.total_cost_usd is not None and result.total_cost_usd >= 0:
             reported = Decimal(str(result.total_cost_usd))
@@ -405,6 +424,7 @@ class _Translator:
             run_id=self.run_id,
             usage=self.usage,
             sdk_cost_usd=self.sdk_cost_usd,
+            sdk_tokens=self.sdk_tokens,
             turns=self.turns,
             elapsed_s=self.elapsed_s(),
             pending=pending,
@@ -448,12 +468,54 @@ class _Translator:
                 retryable=status in _RETRYABLE_STATUS,
                 usage=usage,
             )
+        if self.compact and not self.compacted:
+            # The CLI can answer ``/compact`` with a normal result and an error text, for
+            # example when the summary call fails with HTTP 400. No boundary means that the
+            # context is not smaller, so the run did not do what it was asked.
+            return RunFailed(
+                code=FailureCode.MODEL_ERROR,
+                message="the compaction did not finish: the runtime made no compaction boundary",
+                usage=usage,
+            )
         output = result.result if result.result is not None else "".join(self._text)
         return RunCompleted(output=output, runtime_state=self.state(), usage=usage)
 
 
 def _non_negative_int(value: Any) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _model_tokens(model_usage: Mapping[str, Any] | None) -> Usage | None:
+    """The tokens of ``ResultMessage.model_usage``, summed over the models. ``None`` if the
+    result has none."""
+    if not isinstance(model_usage, Mapping) or not model_usage:
+        return None
+    total = Usage()
+    for entry in model_usage.values():
+        if not isinstance(entry, Mapping):
+            continue
+        total = total + Usage(
+            input_tokens=_non_negative_int(entry.get("inputTokens")),
+            output_tokens=_non_negative_int(entry.get("outputTokens")),
+            cache_read_tokens=_non_negative_int(entry.get("cacheReadInputTokens")),
+            cache_write_tokens=_non_negative_int(entry.get("cacheCreationInputTokens")),
+        )
+    return total
+
+
+def _token_difference(now: Usage, before: Usage) -> Usage:
+    """The tokens that ``now`` has more than ``before``. A part that is lower means that the
+    count started again, so the whole part is new."""
+
+    def part(new: int, old: int) -> int:
+        return new - old if new >= old else new
+
+    return Usage(
+        input_tokens=part(now.input_tokens, before.input_tokens),
+        output_tokens=part(now.output_tokens, before.output_tokens),
+        cache_read_tokens=part(now.cache_read_tokens, before.cache_read_tokens),
+        cache_write_tokens=part(now.cache_write_tokens, before.cache_write_tokens),
+    )
 
 
 def _preview(content: Any) -> str:
@@ -609,6 +671,9 @@ class ClaudeRuntime:
             run_id=run_id,
             usage=Usage(),
             sdk_cost_usd=previous.sdk_cost_usd if previous else Decimal(0),
+            # A new SDK session starts at zero. An older state has no count: not known.
+            sdk_tokens=previous.sdk_tokens if previous else Usage(),
+            compact=request.compact is not None,
             session_id=previous.session_id if previous else None,
         )
         stream = self._stream(request.scope, request.config, request.budget, phases, translator)
@@ -644,6 +709,7 @@ class ClaudeRuntime:
             run_id=run_id,
             usage=state.usage,
             sdk_cost_usd=state.sdk_cost_usd,
+            sdk_tokens=state.sdk_tokens,
             session_id=state.session_id,
             turns=state.turns,
             elapsed_before_s=state.elapsed_s,
@@ -966,14 +1032,17 @@ class ClaudeRuntime:
             )
             path = raw.get("transcript_path")
             try:
-                entries = (
+                entries, left_out = (
                     await asyncio.to_thread(read_transcript, path)
                     if isinstance(path, str) and path
-                    else []
+                    else ([], 0)
                 )
                 if entries:
+                    # Whole entries stay out when the transcript is over the limits of the
+                    # wire. No text is cut here: the control plane redacts it first.
+                    bounded, omitted = bound_for_wire(entries, left_out)
                     await archiver.archive(
-                        scope, TranscriptArchive(trigger=trigger, entries=entries)
+                        scope, TranscriptArchive(trigger=trigger, entries=bounded, omitted=omitted)
                     )
             except Exception as exc:
                 log.warning(

@@ -272,6 +272,38 @@ async def test_tool_call_redacts_the_result() -> None:
     assert "sk-ant-api03-" + "a" * 40 not in text_of(result)
 
 
+class StaticGate:
+    """A gate that allows every call and has no ``visible_tools``."""
+
+    async def check(
+        self, claims: RunTokenClaims, call_id: str, tool_name: str, arguments: Mapping[str, Any]
+    ) -> Verdict:
+        return Verdict("allow", GateStep.POLICY, "ok")
+
+    async def screen(
+        self, claims: RunTokenClaims, tool_name: str, arguments: Mapping[str, Any]
+    ) -> Verdict:
+        return Verdict("allow", GateStep.POLICY, "ok")
+
+
+@pytest.mark.parametrize("gate", [None, StaticGate()], ids=["no-gate", "gate-without-visibility"])
+async def test_a_gate_without_visibility_shows_no_deferred_tools(gate: Any) -> None:
+    """Fail closed: a gate that cannot say what the run may use must not let the search show
+    the names and the schemas of tools that a rule may deny."""
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    tools = ToolServer(
+        signer=signer, todos=MemoryTodoStore(), deferred=DeferredCatalog(mail_tools()), gate=gate
+    )
+    with serve(tools.app()) as base:
+        async with connect(base + "/mcp", signer.issue(make_scope(), ttl_s=600)) as client:
+            found = await client.call_tool("tool_search", {"query": "mail"})
+            described = await client.call_tool("tool_describe", {"name": "mail_send"})
+    assert "mail_send" not in text_of(found)
+    assert "mail_read" not in text_of(found)
+    assert described.is_error
+    assert '"required"' not in text_of(described)
+
+
 # -- the archive route -------------------------------------------------------------------------
 
 
@@ -279,10 +311,14 @@ class FakeArchive:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.bodies: list[tuple[str, TranscriptArchive]] = []
+        self.authorized: list[str] = []
 
-    async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer:
+    async def authorize(self, claims: RunTokenClaims) -> None:
+        self.authorized.append(claims.run_id)
         if self.error is not None:
             raise self.error
+
+    async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer:
         self.bodies.append((claims.run_id, body))
         return ArchiveAnswer(entries=len(body.entries))
 
@@ -373,3 +409,80 @@ async def test_an_archive_error_is_409_and_a_crash_is_503_without_details() -> N
         response = await post(base, signer.issue(make_scope(), ttl_s=600), GOOD)
     assert response.status_code == 503
     assert "hunter2" not in response.text
+
+
+async def test_the_run_must_be_able_to_archive_before_the_body_is_read() -> None:
+    """A run that cannot archive gets 409 at once, also with a body that is too large: the
+    server did not read the body, and it did not parse it."""
+    from sama.context import ArchiveError
+
+    archive = FakeArchive(ArchiveError("the run is not running"))
+    tools, signer = archive_rig(archive)
+    raw = b'{"pad": "' + b"x" * (MAX_ARCHIVE_BODY_BYTES + 10) + b'"}'
+    with serve(tools.app()) as base:
+        response = await post(base, signer.issue(make_scope("run-9"), ttl_s=600), raw=raw)
+    assert response.status_code == 409
+    assert archive.authorized == ["run-9"]
+    assert archive.bodies == []
+
+
+async def test_a_body_with_too_many_entries_gets_422() -> None:
+    from sama.runtime.archive import MAX_WIRE_ENTRIES
+
+    archive = FakeArchive()
+    tools, signer = archive_rig(archive)
+    body = {"trigger": "auto", "entries": [{"role": "user"}] * (200_000)}
+    with serve(tools.app()) as base:
+        response = await post(base, signer.issue(make_scope(), ttl_s=600), body)
+        small = {"trigger": "auto", "entries": [{"role": "user", "text": "a"}] * MAX_WIRE_ENTRIES}
+        accepted = await post(base, signer.issue(make_scope(), ttl_s=600), small)
+        over = {
+            "trigger": "auto",
+            "entries": [{"role": "user", "text": "a"}] * (MAX_WIRE_ENTRIES + 1),
+        }
+        refused = await post(base, signer.issue(make_scope(), ttl_s=600), over)
+    assert response.status_code == 422
+    assert accepted.status_code == 200
+    assert refused.status_code == 422
+    assert len(archive.bodies) == 1
+
+
+async def test_only_a_few_archives_are_processed_at_the_same_time() -> None:
+    """The server has a fixed number of slots. A request over it gets 429 before it sends a
+    byte of the body into memory."""
+    import asyncio
+
+    from sama.tools.server import MAX_CONCURRENT_ARCHIVES
+
+    release = asyncio.Event()
+    entered = 0
+
+    class Slow(FakeArchive):
+        async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer:
+            nonlocal entered
+            entered += 1
+            await release.wait()
+            return await super().archive(claims, body)
+
+    archive = Slow()
+    tools, signer = archive_rig(archive)
+    token = signer.issue(make_scope(), ttl_s=600)
+    with serve(tools.app()) as base:
+        async with httpx.AsyncClient(timeout=20) as http:
+            headers = {"authorization": f"Bearer {token}"}
+            pending = [
+                asyncio.create_task(http.post(base + "/archive", headers=headers, json=GOOD))
+                for _ in range(MAX_CONCURRENT_ARCHIVES)
+            ]
+            for _ in range(200):
+                if entered == MAX_CONCURRENT_ARCHIVES:
+                    break
+                await asyncio.sleep(0.05)
+            assert entered == MAX_CONCURRENT_ARCHIVES
+            busy = await http.post(base + "/archive", headers=headers, json=GOOD)
+            release.set()
+            done = await asyncio.gather(*pending)
+            after = await http.post(base + "/archive", headers=headers, json=GOOD)
+    assert busy.status_code == 429
+    assert [r.status_code for r in done] == [200] * MAX_CONCURRENT_ARCHIVES
+    assert after.status_code == 200
