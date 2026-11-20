@@ -4,9 +4,8 @@
 // its tokens and cost, and on request its trace: the steps, the tool calls, and the model calls.
 // The API redacts the text again before it sends it.
 
-import Link from "next/link";
 import { useCallback, useState } from "react";
-import type { RunSummary, RunTrace } from "@/lib/api";
+import type { RunSummary } from "@/lib/api";
 import { sessionTitle } from "@/lib/chat";
 import {
   formatCost,
@@ -16,25 +15,20 @@ import {
   runUsage,
   stepSummary,
   stepTitle,
+  toneBadge,
   toolTone,
 } from "@/lib/history";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
+import { PageHeader } from "./PageHeader";
 import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./Page.module.css";
 
-const TONE_BADGE = {
-  ok: "badge badge-accent",
-  wait: "badge badge-warning",
-  error: `badge ${styles.badgeError}`,
-  off: "badge",
-} as const;
-
 export function RunTraces({ sessionId }: { sessionId: string }) {
   const api = useApi();
   const loadSession = useCallback(() => api.getSession(sessionId), [api, sessionId]);
-  const loadRuns = useCallback(() => api.listRuns(sessionId, 50), [api, sessionId]);
+  const loadRuns = useCallback(() => api.listRuns(sessionId), [api, sessionId]);
   const session = useLoad(loadSession, "Could not load the session.");
   const runs = useLoad(loadRuns, "Could not load the runs.");
   const [open, setOpen] = useState<string | null>(null);
@@ -57,16 +51,16 @@ export function RunTraces({ sessionId }: { sessionId: string }) {
 
   return (
     <div className={styles.page}>
-      <header className={styles.header}>
-        <Link href={`/s/${sessionId}`} className={styles.back}>
-          Back to the session
-        </Link>
-        <h1 className={styles.title}>Runs</h1>
-        <p className={styles.meta}>
-          {sessionTitle(session.data)} · Each run is one answer of the agent. Open a run to see its
-          steps, tool calls, and model calls.
-        </p>
-      </header>
+      <PageHeader
+        title="Runs"
+        back={{ href: `/s/${sessionId}`, label: "Back to the session" }}
+        meta={
+          <>
+            {sessionTitle(session.data)} · Each run is one answer of the agent. Open a run to see its
+            steps, tool calls, and model calls.
+          </>
+        }
+      />
       {runs.data.length === 0 ? (
         <p className="alert">This session has no runs yet.</p>
       ) : (
@@ -103,7 +97,7 @@ function RunCard({
     <section className={`card ${styles.card}`} aria-label={`Run ${run.id.slice(0, 8)}`}>
       <div className={styles.cardHead}>
         <div className={styles.name}>
-          <span className={TONE_BADGE[runTone(run.status)]}>{run.status}</span>
+          <span className={toneBadge(runTone(run.status))}>{run.status}</span>
           <span>{run.compact ? "Compaction" : run.kind === "review" ? "Background review" : "Answer"}</span>
         </div>
         <span className={styles.meta}>
@@ -131,7 +125,7 @@ function RunCard({
 function Trace({ runId }: { runId: string }) {
   const api = useApi();
   const load = useCallback(() => api.getRunTrace(runId), [api, runId]);
-  const trace = useLoad<RunTrace>(load, "Could not load the trace.");
+  const trace = useLoad(load, "Could not load the trace.");
   if (trace.error) return <ErrorState title="The trace did not load" message={trace.error} onRetry={trace.reload} />;
   if (trace.data === null) return <LoadingState label="Loading the trace" />;
   const { steps, tool_calls: tools, model_calls: models, truncated } = trace.data;
@@ -182,7 +176,7 @@ function Trace({ runId }: { runId: string }) {
                   <span className={`mono ${styles.name}`}>{call.tool_name}</span>
                   <span className={styles.name}>
                     {call.decision ? <span className="badge">{call.decision}</span> : null}
-                    <span className={TONE_BADGE[toolTone(call.status)]}>
+                    <span className={toneBadge(toolTone(call.status))}>
                       {call.status}
                     </span>
                   </span>

@@ -8,6 +8,12 @@ describe("memory helpers", () => {
     expect(memoryUsed(["ab", "cd"])).toBe(7);
   });
 
+  it("counts a character outside the BMP as one", () => {
+    expect("😀".length).toBe(2);
+    expect(memoryUsed(["😀"])).toBe(1);
+    expect(memoryUsed(["😀", "a😀"])).toBe(1 + 3 + 2);
+  });
+
   it("trims, drops empty entries, and drops duplicates", () => {
     expect(cleanEntries([" a ", "", "b", "a", "  "])).toEqual(["a", "b"]);
   });

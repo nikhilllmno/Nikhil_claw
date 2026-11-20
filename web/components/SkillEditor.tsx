@@ -4,13 +4,13 @@
 // workspace, writes the skills of the scopes that they can change, and reads old versions.
 // A built-in skill is read-only. A save is a new version with the author "user".
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorText,
+  type SkillCatalog,
   type SkillDetail,
   type SkillScope,
   type SkillSummary,
-  type SkillVersion,
   type SkillVersionDetail,
   type SkillWriteBody,
   type WritableSkillScope,
@@ -21,39 +21,17 @@ import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import { PageHeader } from "./PageHeader";
 import { ErrorState, LoadingState } from "./ui";
+import { useFocusWhen } from "./useFocusWhen";
 import { useLoad } from "./useLoad";
 import styles from "./Page.module.css";
 
 type Open = { kind: "skill"; name: string; scope: SkillScope } | { kind: "new" } | null;
 
 export function SkillEditor() {
-  const api = useApi();
   const { me, meError, reloadMe, workspaces, workspaceId } = useData();
-  // The open skill keeps its workspace: a new workspace shows the list again.
-  const [opened, setOpened] = useState<{ workspaceId: string | null; open: Open }>({
-    workspaceId: null,
-    open: null,
-  });
-  const [filter, setFilter] = useState("");
-  const [notice, setNotice] = useState<string | null>(null);
-
-  const load = useCallback(
-    () => (workspaceId === null ? Promise.resolve(null) : api.listSkills(workspaceId)),
-    [api, workspaceId],
-  );
-  const catalog = useLoad(load, "Could not load the skills.");
-  const open = opened.workspaceId === workspaceId ? opened.open : null;
-  const setOpen = (next: Open) => setOpened({ workspaceId, open: next });
-
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the skills" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
-
-  const back = (text: string | null) => {
-    setOpen(null);
-    setNotice(text);
-    catalog.reload();
-  };
 
   return (
     <div className={styles.page}>
@@ -66,24 +44,53 @@ export function SkillEditor() {
           </>
         }
       />
+      {workspace === null ? (
+        <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
+      ) : (
+        // The key gives each workspace its own catalog, so one workspace never shows the skills
+        // of another one while the new list loads.
+        <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} />
+      )}
+    </div>
+  );
+}
+
+function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
+  const api = useApi();
+  const [open, setOpen] = useState<Open>(null);
+  // The row that the list gives the focus to when it shows again: "new" or `scope:name`.
+  const [focusKey, setFocusKey] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const load = useCallback(() => api.listSkills(workspaceId), [api, workspaceId]);
+  const catalog = useLoad(load, "Could not load the skills.");
+
+  const back = (text: string | null) => {
+    setOpen(null);
+    setNotice(text);
+    catalog.reload();
+  };
+
+  return (
+    <>
       {notice ? (
         <p className="alert alert-success" role="status">
           {notice}
         </p>
       ) : null}
-      {workspace === null ? (
-        <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
-      ) : catalog.error ? (
+      {catalog.error ? (
         <ErrorState title="The skills did not load" message={catalog.error} onRetry={catalog.reload} />
       ) : catalog.data === null ? (
         <LoadingState label="Loading the skills" />
       ) : open?.kind === "new" ? (
         <NewSkill
-          workspaceId={workspace.id}
+          workspaceId={workspaceId}
           scopes={catalog.data.writable_scopes}
           onCancel={() => setOpen(null)}
           onCreated={(name, scope) => {
             setNotice(`The skill ${name} is created.`);
+            setFocusKey(`${scope}:${name}`);
             catalog.reload();
             setOpen({ kind: "skill", name, scope });
           }}
@@ -91,11 +98,14 @@ export function SkillEditor() {
       ) : open?.kind === "skill" ? (
         <SkillView
           key={`${open.scope}:${open.name}`}
-          workspaceId={workspace.id}
+          workspaceId={workspaceId}
           name={open.name}
           scope={open.scope}
           onBack={() => back(null)}
-          onOpen={(scope) => setOpen({ kind: "skill", name: open.name, scope })}
+          onOpen={(scope) => {
+            setFocusKey(`${scope}:${open.name}`);
+            setOpen({ kind: "skill", name: open.name, scope });
+          }}
           onArchived={() => back(`The skill ${open.name} is archived.`)}
           onSaved={(text) => {
             setNotice(text);
@@ -103,52 +113,101 @@ export function SkillEditor() {
           }}
         />
       ) : (
-        <>
-          <div className={styles.toolbar}>
-            <label className={`field ${styles.grow}`}>
-              <span className="label">Filter</span>
-              <input
-                className="input"
-                type="search"
-                value={filter}
-                placeholder="Name, description, or tag"
-                onChange={(e) => setFilter(e.target.value)}
-              />
-            </label>
-            {catalog.data.writable_scopes.length > 0 ? (
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => {
-                  setNotice(null);
-                  setOpen({ kind: "new" });
-                }}
-              >
-                New skill
-              </button>
-            ) : null}
-          </div>
-          <SkillList
-            skills={filterSkills(catalog.data.skills, filter)}
-            total={catalog.data.skills.length}
-            onOpen={(s) => {
-              setNotice(null);
-              setOpen({ kind: "skill", name: s.name, scope: s.scope });
-            }}
-          />
-        </>
+        <SkillsHome
+          catalog={catalog.data}
+          filter={filter}
+          onFilter={setFilter}
+          focusKey={focusKey}
+          onNew={() => {
+            setNotice(null);
+            setFocusKey("new");
+            setOpen({ kind: "new" });
+          }}
+          onOpen={(s) => {
+            setNotice(null);
+            setFocusKey(`${s.scope}:${s.name}`);
+            setOpen({ kind: "skill", name: s.name, scope: s.scope });
+          }}
+        />
       )}
-    </div>
+    </>
+  );
+}
+
+function SkillsHome({
+  catalog,
+  filter,
+  onFilter,
+  focusKey,
+  onNew,
+  onOpen,
+}: {
+  catalog: SkillCatalog;
+  filter: string;
+  onFilter: (text: string) => void;
+  focusKey: string | null;
+  onNew: () => void;
+  onOpen: (skill: SkillSummary) => void;
+}) {
+  const newButton = useRef<HTMLButtonElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const rows = useRef(new Map<string, HTMLButtonElement>());
+  const registerRow = useCallback((key: string, button: HTMLButtonElement | null) => {
+    if (button === null) rows.current.delete(key);
+    else rows.current.set(key, button);
+  }, []);
+
+  // The list shows again after a skill or the new skill form closes. The focus goes back to
+  // the button that opened it, or to the heading if that button is gone.
+  useEffect(() => {
+    if (focusKey === null) return;
+    const target = focusKey === "new" ? newButton.current : rows.current.get(focusKey);
+    (target ?? heading.current)?.focus();
+    // Only when the list mounts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <>
+      <h2 ref={heading} tabIndex={-1} className="sr-only">
+        All skills
+      </h2>
+      <div className={styles.toolbar}>
+        <label className={`field ${styles.grow}`}>
+          <span className="label">Filter</span>
+          <input
+            className="input"
+            type="search"
+            value={filter}
+            placeholder="Name, description, or tag"
+            onChange={(e) => onFilter(e.target.value)}
+          />
+        </label>
+        {catalog.writable_scopes.length > 0 ? (
+          <button ref={newButton} type="button" className="btn btn-primary" onClick={onNew}>
+            New skill
+          </button>
+        ) : null}
+      </div>
+      <SkillList
+        skills={filterSkills(catalog.skills, filter)}
+        total={catalog.skills.length}
+        registerRow={registerRow}
+        onOpen={onOpen}
+      />
+    </>
   );
 }
 
 function SkillList({
   skills,
   total,
+  registerRow,
   onOpen,
 }: {
   skills: SkillSummary[];
   total: number;
+  registerRow: (key: string, button: HTMLButtonElement | null) => void;
   onOpen: (skill: SkillSummary) => void;
 }) {
   if (total === 0) return <p className="alert">This workspace has no skills yet. Make one with New skill.</p>;
@@ -170,7 +229,12 @@ function SkillList({
             <p className={styles.text}>{s.description}</p>
             {s.tags.length > 0 ? <p className={styles.meta}>Tags: {s.tags.join(", ")}</p> : null}
             <div className={styles.actions}>
-              <button type="button" className="btn btn-small" onClick={() => onOpen(s)}>
+              <button
+                ref={(button) => registerRow(`${s.scope}:${s.name}`, button)}
+                type="button"
+                className="btn btn-small"
+                onClick={() => onOpen(s)}
+              >
                 {s.can_edit ? "Open and edit" : "Open"}
                 <span className="sr-only"> {s.name}</span>
               </button>
@@ -217,6 +281,8 @@ function NewSkill({
   const [content, setContent] = useState(() => skillTemplate(""));
   const [touched, setTouched] = useState(false);
   const { busy, error, setError, write } = useWrite(workspaceId);
+  const nameField = useRef<HTMLInputElement>(null);
+  useFocusWhen(true, nameField);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -236,6 +302,7 @@ function NewSkill({
         <label className="field">
           <span className="label">Name</span>
           <input
+            ref={nameField}
             className="input"
             value={name}
             maxLength={64}
@@ -313,6 +380,9 @@ function SkillView({
   const [summary, setSummary] = useState("");
   const [versionsTick, setVersionsTick] = useState(0);
   const { busy, error, write } = useWrite(workspaceId);
+  const heading = useRef<HTMLHeadingElement>(null);
+  // The skill is open when it has loaded: the focus goes to its name.
+  useFocusWhen(detail.data !== null, heading);
 
   if (detail.error) {
     return (
@@ -324,15 +394,21 @@ function SkillView({
   }
   if (detail.data === null) return <LoadingState label="Loading the skill" />;
   const skill = detail.data;
-  const writable = skill.can_edit && skill.scope !== "builtin";
+  const writable = skill.can_edit;
   const text = content ?? skill.skill_md;
 
-  const saved = (version: number, what: string) => {
+  // A save or a file change makes a new version. The files and the versions load again.
+  const changed = (version: number, what: string) => {
     onSaved(`${what} Version ${version}.`);
-    setContent(null);
-    setSummary("");
     setVersionsTick((n) => n + 1);
     detail.reload();
+  };
+
+  // The new version has the text of the editor, so the draft ends only here.
+  const markdownSaved = (version: number) => {
+    changed(version, "The skill is saved.");
+    setContent(null);
+    setSummary("");
   };
 
   const save = async (event: React.FormEvent) => {
@@ -344,7 +420,7 @@ function SkillView({
       content: text,
       summary: summary.trim() || undefined,
     });
-    if (done) saved(done.version, "The skill is saved.");
+    if (done) markdownSaved(done.version);
   };
 
   const archive = async () => {
@@ -362,7 +438,9 @@ function SkillView({
       <BackButton onBack={onBack} />
       <section className={`card ${styles.card}`} aria-label={skill.name}>
         <div className={styles.cardHead}>
-          <h2 className={styles.heading}>{skill.name}</h2>
+          <h2 ref={heading} tabIndex={-1} className={styles.heading}>
+            {skill.name}
+          </h2>
           <div className={styles.name}>
             <span className={skill.scope === "builtin" ? "badge" : "badge badge-accent"}>
               {SCOPE_LABELS[skill.scope]}
@@ -439,7 +517,7 @@ function SkillView({
             </p>
           </>
         )}
-        <Files skill={skill} writable={writable} workspaceId={workspaceId} onSaved={saved} />
+        <Files skill={skill} writable={writable} workspaceId={workspaceId} onChanged={changed} />
         {skill.id !== null ? (
           <Versions
             key={versionsTick}
@@ -467,16 +545,21 @@ function Files({
   skill,
   writable,
   workspaceId,
-  onSaved,
+  onChanged,
 }: {
   skill: SkillDetail;
   writable: boolean;
   workspaceId: string;
-  onSaved: (version: number, what: string) => void;
+  onChanged: (version: number, what: string) => void;
 }) {
   const [open, setOpen] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ path: string; content: string; isNew: boolean } | null>(null);
   const { busy, error, setError, write } = useWrite(workspaceId);
+  const pathField = useRef<HTMLInputElement>(null);
+  const contentField = useRef<HTMLTextAreaElement>(null);
+  const addButton = useRef<HTMLButtonElement>(null);
+  // A new file starts with its path. An old file has its path, so it starts with its content.
+  useFocusWhen(editing !== null, editing?.isNew ? pathField : contentField, addButton);
   const paths = Object.keys(skill.files).sort();
   const scope = skill.scope as WritableSkillScope;
 
@@ -497,14 +580,14 @@ function Files({
     });
     if (done) {
       setEditing(null);
-      onSaved(done.version, `The file ${editing.path} is saved.`);
+      onChanged(done.version, `The file ${editing.path} is saved.`);
     }
   };
 
   const remove = async (path: string) => {
     if (!window.confirm(`Remove the file ${path}?`)) return;
     const done = await write(`remove:${path}`, { action: "remove_file", name: skill.name, scope, file_path: path });
-    if (done) onSaved(done.version, `The file ${path} is removed.`);
+    if (done) onChanged(done.version, `The file ${path} is removed.`);
   };
 
   return (
@@ -513,6 +596,7 @@ function Files({
         <h3 className={styles.subheading}>Files</h3>
         {writable && editing === null ? (
           <button
+            ref={addButton}
             type="button"
             className="btn btn-small"
             onClick={() => setEditing({ path: "references/", content: "", isNew: true })}
@@ -569,6 +653,7 @@ function Files({
           <label className="field">
             <span className="label">Path</span>
             <input
+              ref={pathField}
               className="input mono"
               value={editing.path}
               readOnly={!editing.isNew}
@@ -580,6 +665,7 @@ function Files({
           <label className="field">
             <span className="label">Content</span>
             <textarea
+              ref={contentField}
               className={`input ${styles.editor}`}
               value={editing.content}
               spellCheck={false}
@@ -620,7 +706,7 @@ function Versions({
 }) {
   const api = useApi();
   const load = useCallback(() => api.listSkillVersions(skillId), [api, skillId]);
-  const versions = useLoad<SkillVersion[]>(load, "Could not load the versions.");
+  const versions = useLoad(load, "Could not load the versions.");
   const [shown, setShown] = useState<SkillVersionDetail | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);

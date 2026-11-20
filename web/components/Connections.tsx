@@ -27,6 +27,7 @@ import {
   withoutConnection,
   withoutEntryParams,
 } from "@/lib/connections";
+import { toneBadge } from "@/lib/history";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import { ErrorState, LoadingState } from "./ui";
@@ -293,15 +294,13 @@ function ScopeRow({
   const connected = connection?.state === "connected";
   const showForm = connection !== null && connector.kind !== "composio" && connection.id === formFor;
   const tone = connection ? stateTone(connection.state) : "off";
-  const badge =
-    tone === "ok" ? "badge badge-accent" : tone === "wait" ? "badge badge-warning" : tone === "error" ? `badge ${styles.badgeError}` : "badge";
 
   return (
     <div className={styles.scope}>
       <div className={styles.row}>
         <div className={styles.scopeName}>
           <span>{SCOPE_LABELS[scope]}</span>
-          <span className={badge}>{connection ? stateLabel(connection.state) : "Not connected"}</span>
+          <span className={toneBadge(tone)}>{connection ? stateLabel(connection.state) : "Not connected"}</span>
         </div>
         <div className={styles.actions}>
           {!connected ? (

@@ -46,6 +46,9 @@
   --content-max: 46rem;
   --settings-max: 52rem;
   --touch-target: 2.5rem;
+  --field-basis: 14rem;
+  --editor-min-height: 16rem;
+  --viewer-max-height: 24rem;
   --code-inline-padding: 0.1em 0.35em;
   --code-inline-size: 0.9em;
   --z-sticky: 10;

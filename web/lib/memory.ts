@@ -18,9 +18,12 @@ export const TARGET_HELP: Record<MemoryTarget, string> = {
   workspace: "Notes that every agent of the workspace reads. A workspace admin changes them.",
 };
 
-/** The characters that the entries use for the cap, delimiters included. */
+/**
+ * The characters that the entries use for the cap, delimiters included. Like the API, it counts
+ * Unicode code points, not UTF-16 units.
+ */
 export function memoryUsed(entries: readonly string[]): number {
-  return entries.join(ENTRY_DELIMITER).length;
+  return Array.from(entries.join(ENTRY_DELIMITER)).length;
 }
 
 /** The entries to save: trimmed, without empty entries, without duplicates. */

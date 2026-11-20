@@ -11,8 +11,10 @@ import {
   type ChatChannel,
   errorText,
   type Org,
+  type IntegrationSummary,
   type PairingCode,
 } from "@/lib/api";
+import { integrationTone, toneBadge } from "@/lib/history";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
@@ -93,9 +95,14 @@ export function Settings() {
 }
 
 function statusBadge(status: string | undefined): string {
-  if (status === "active") return "badge badge-accent";
-  if (status === undefined) return "badge";
-  return `badge ${styles.badgeError}`;
+  return toneBadge(integrationTone(status));
+}
+
+/** The text of a Telegram connect: a success only when the bot is active. */
+function connectResult(view: IntegrationSummary): string | { failure: string } {
+  if (view.status === "active") return `The Telegram bot${view.name ? ` @${view.name}` : ""} is connected.`;
+  const why = view.last_error ? ` Telegram gave this error: ${view.last_error}` : "";
+  return { failure: `The Telegram bot is not active.${why} Check the token and connect again.` };
 }
 
 function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
@@ -107,12 +114,16 @@ function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const act = async (label: string, action: () => Promise<string>) => {
+  // An action gives the text of its success, or `{ failure }` when the API said yes but the
+  // change did not work.
+  const act = async (label: string, action: () => Promise<string | { failure: string }>) => {
     setBusy(label);
     setError(null);
     setNotice(null);
     try {
-      setNotice(await action());
+      const done = await action();
+      if (typeof done === "string") setNotice(done);
+      else setError(done.failure);
       onChanged();
     } catch (e) {
       setError(errorText(e, "The change failed."));
@@ -132,7 +143,7 @@ function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
       const view = await api.connectTelegram(org.id, value);
       // The secret leaves the page state as soon as the API has it.
       setToken("");
-      return `The Telegram bot${view.name ? ` @${view.name}` : ""} is connected.`;
+      return connectResult(view);
     });
   };
 
@@ -174,7 +185,15 @@ function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
             </button>
           ) : null}
         </div>
-        {org.admin && !telegram ? (
+        {telegram && telegram.status !== "active" ? (
+          <p className={styles.error}>
+            {telegram.last_error
+              ? `The bot is not active. Telegram gave this error: ${telegram.last_error}`
+              : `The bot is not active. Its status is ${telegram.status}.`}
+            {org.admin ? " Connect it again with the token of the bot." : " An org admin must connect it again."}
+          </p>
+        ) : null}
+        {org.admin && telegram?.status !== "active" ? (
           <form className={styles.form} onSubmit={connect} aria-label="Connect a Telegram bot">
             <label className="field">
               <span className="label">Bot token</span>
@@ -190,7 +209,7 @@ function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
             </label>
             <div className={styles.actions}>
               <button type="submit" className="btn btn-primary btn-small" disabled={busy !== null}>
-                {busy === "connect" ? "Connecting" : "Connect"}
+                {busy === "connect" ? "Connecting" : telegram ? "Connect again" : "Connect"}
               </button>
             </div>
           </form>
@@ -215,6 +234,17 @@ function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
   );
 }
 
+type PairTarget = { workspaceId: string; profileId: string };
+type PairResult = { code: PairingCode | null; error: string | null };
+
+function pairKey(t: PairTarget): string {
+  return `${t.workspaceId}:${t.profileId}`;
+}
+
+function samePair(a: PairTarget, b: PairTarget | null): boolean {
+  return b !== null && a.workspaceId === b.workspaceId && a.profileId === b.profileId;
+}
+
 function LinkedAccounts({
   orgs,
   workspaceId,
@@ -236,10 +266,16 @@ function LinkedAccounts({
   const identities = useLoad(load, "Could not load the linked chat accounts.");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [code, setCode] = useState<PairingCode | null>(null);
+  // A code belongs to one workspace and one agent. It shows only for that pair. An answer that
+  // comes after the pair changed is kept under its own pair and does not show for the new pair.
+  const [pairing, setPairing] = useState<PairTarget | null>(null);
+  const [pairResults, setPairResults] = useState<Record<string, PairResult>>({});
   const profiles = profilesFor(workspaceId);
   const [profileId, setProfileId] = useState<string | null>(null);
   const agent = profiles.find((p) => p.id === profileId) ?? profiles[0] ?? null;
+  const target = workspaceId !== null && agent !== null ? { workspaceId, profileId: agent.id } : null;
+  const pairingHere = pairing !== null && samePair(pairing, target);
+  const result = target === null ? null : (pairResults[pairKey(target)] ?? null);
   const telegramOn = org?.integrations.some((i) => i.kind === "telegram" && i.status === "active") ?? false;
   const [now] = useState(() => Date.now());
 
@@ -265,15 +301,23 @@ function LinkedAccounts({
   };
 
   const pair = async () => {
-    if (workspaceId === null || agent === null) return;
-    setBusy("pair");
-    setError(null);
+    if (target === null) return;
+    const started = { ...target };
+    setPairing(started);
+    const key = pairKey(started);
+    const keep = (result: PairResult) => setPairResults((all) => ({ ...all, [key]: result }));
+    setPairResults((all) => {
+      const next = { ...all };
+      delete next[key];
+      return next;
+    });
     try {
-      setCode(await api.createPairingCode("telegram", workspaceId, agent.id));
+      const code = await api.createPairingCode("telegram", started.workspaceId, started.profileId);
+      keep({ code, error: null });
     } catch (e) {
-      setError(errorText(e, "No code was made."));
+      keep({ code: null, error: errorText(e, "No code was made.") });
     } finally {
-      setBusy(null);
+      setPairing((p) => (p === started ? null : p));
     }
   };
 
@@ -327,16 +371,21 @@ function LinkedAccounts({
             </label>
           ) : null}
           <div className={styles.actions}>
-            <button type="button" className="btn btn-small" disabled={busy !== null} onClick={() => void pair()}>
-              {busy === "pair" ? "Making a code" : "Get a link code"}
+            <button type="button" className="btn btn-small" disabled={pairingHere} onClick={() => void pair()}>
+              {pairingHere ? "Making a code" : "Get a link code"}
             </button>
           </div>
-          {code ? (
+          {result?.error ? (
+            <p className="alert alert-error" role="alert">
+              {result.error}
+            </p>
+          ) : null}
+          {result?.code ? (
             <div className="alert" role="status">
               <p>
-                {code.link ? (
+                {result.code.link ? (
                   <>
-                    <a href={code.link} target="_blank" rel="noopener noreferrer">
+                    <a href={result.code.link} target="_blank" rel="noopener noreferrer">
                       Open the bot in Telegram
                     </a>{" "}
                     or send{" "}
@@ -344,8 +393,8 @@ function LinkedAccounts({
                 ) : (
                   "Send "
                 )}
-                <code className="mono">{code.command}</code> to the bot. The code stops working{" "}
-                {new Date(code.expires_at).toLocaleTimeString()}.
+                <code className="mono">{result.code.command}</code> to the bot. The code stops working{" "}
+                {new Date(result.code.expires_at).toLocaleTimeString()}.
               </p>
             </div>
           ) : null}

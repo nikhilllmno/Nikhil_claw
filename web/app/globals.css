@@ -284,6 +284,11 @@ textarea.input {
   color: var(--warning);
 }
 
+.badge-danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .card {
   padding: var(--space-4);
   border: var(--border-width) solid var(--border);

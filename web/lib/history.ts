@@ -39,6 +39,26 @@ export function runTone(status: string): Tone {
   return "off";
 }
 
+/** The tone of a chat app status (`pending`, `active`, `failed`). `undefined`: not connected. */
+export function integrationTone(status: string | undefined): Tone {
+  if (status === undefined) return "off";
+  if (status === "active") return "ok";
+  if (status === "pending") return "wait";
+  return "error";
+}
+
+const TONE_BADGES: Record<Tone, string> = {
+  ok: "badge badge-accent",
+  wait: "badge badge-warning",
+  error: "badge badge-danger",
+  off: "badge",
+};
+
+/** The global badge classes of a tone. */
+export function toneBadge(tone: Tone): string {
+  return TONE_BADGES[tone];
+}
+
 /** The tone of a tool call status (`started`, `finished`, `failed`, `denied`). */
 export function toolTone(status: string): Tone {
   if (status === "finished") return "ok";
@@ -78,6 +98,30 @@ export function stepSummary(step: TraceStep): string {
     default:
       return "";
   }
+}
+
+/** A part of a search snippet. `match` is true for the words that the search found. */
+export interface SnippetPart {
+  text: string;
+  match: boolean;
+}
+
+const SNIPPET_MARK = /<<(.*?)>>/gs;
+
+/**
+ * Splits a search snippet at the markers `<<` and `>>` of the API (src/sama/search/core.py).
+ * The result has no markers. A marker without its pair stays as text.
+ */
+export function snippetParts(snippet: string): SnippetPart[] {
+  const parts: SnippetPart[] = [];
+  let last = 0;
+  for (const found of snippet.matchAll(SNIPPET_MARK)) {
+    if (found.index > last) parts.push({ text: snippet.slice(last, found.index), match: false });
+    if (found[1] !== "") parts.push({ text: found[1] ?? "", match: true });
+    last = found.index + found[0].length;
+  }
+  if (last < snippet.length) parts.push({ text: snippet.slice(last), match: false });
+  return parts;
 }
 
 /** The input and output tokens of a run as one line. */

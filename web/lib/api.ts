@@ -32,6 +32,8 @@ export interface IntegrationSummary {
   kind: string;
   status: string;
   name: string | null;
+  /** The last error of the app. Only the answer of a connect has it. */
+  last_error?: string | null;
 }
 
 export interface Org {
@@ -487,13 +489,7 @@ export interface MemoryRevision {
   created_at: string;
 }
 
-export interface MemoryWritten {
-  target: MemoryTarget;
-  entries: string[];
-  chars: number;
-  cap: number;
-  revision: number;
-}
+export type MemoryWritten = Omit<MemoryNotes, "can_edit">;
 
 export type SkillScope = "builtin" | "org" | "workspace" | "user";
 export type WritableSkillScope = Exclude<SkillScope, "builtin">;
@@ -652,17 +648,6 @@ export interface RunTrace {
 }
 
 export type ChatChannel = "telegram" | "slack";
-
-export interface IntegrationView {
-  id: string;
-  kind: string;
-  status: string;
-  external_id: string | null;
-  name: string | null;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 export interface ChannelIdentity {
   id: string;
@@ -1013,11 +998,9 @@ export class ApiClient {
   listRuns = (sessionId: string, limit = 50) =>
     this.json<RunSummary[]>(`/sessions/${sessionId}/runs${query({ limit })}`);
   getRunTrace = (runId: string) => this.json<RunTrace>(`/runs/${encodeURIComponent(runId)}/trace`);
-  listIntegrations = (orgId: string) =>
-    this.json<IntegrationView[]>(`/orgs/${encodeURIComponent(orgId)}/integrations`);
   /** Sends the bot token. It goes only to this call, never to the chat. */
   connectTelegram = (orgId: string, botToken: string) =>
-    this.json<IntegrationView>(`/orgs/${encodeURIComponent(orgId)}/integrations/telegram`, {
+    this.json<IntegrationSummary>(`/orgs/${encodeURIComponent(orgId)}/integrations/telegram`, {
       method: "POST",
       body: { bot_token: botToken },
     });
