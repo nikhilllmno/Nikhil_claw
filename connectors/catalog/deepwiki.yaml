@@ -1,0 +1,14 @@
+# DeepWiki (docs/architecture.md, Section 10.3): a remote MCP server that reads the docs of
+# public GitHub repositories. It needs no credential. The server gives the tool list.
+name: deepwiki
+title: DeepWiki
+description: Read and ask about the documentation of public GitHub repositories.
+kind: mcp_remote
+scopes:
+- personal
+- workspace
+mcp:
+  url: https://mcp.deepwiki.com/mcp
+  auth: none
+  access:
+    "*": read

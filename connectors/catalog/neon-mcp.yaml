@@ -1,0 +1,12 @@
+# Neon MCP (docs/architecture.md, Section 10.3): the remote MCP server of Neon Postgres. The
+# credential is a Neon API key. The server gives the tool list.
+name: neon-mcp
+title: Neon MCP
+description: Manage Neon Postgres projects, branches, and databases, and run SQL.
+kind: mcp_remote
+scopes:
+- personal
+- workspace
+mcp:
+  url: https://mcp.neon.tech/mcp
+  auth: bearer

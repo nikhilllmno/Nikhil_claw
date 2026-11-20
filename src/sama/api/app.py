@@ -288,6 +288,32 @@ class ConnectionForm(_Body):
     the non-secret fields in the row and the secret fields in the vault."""
 
 
+class McpServerAdd(_Body):
+    """A remote MCP server that is not in the catalog (Section 10.3)."""
+
+    name: str = Field(min_length=1, max_length=40)
+    url: str = Field(min_length=9, max_length=2000)
+    auth: Literal["oauth", "bearer", "header", "none"]
+    header: str | None = Field(default=None, max_length=64)
+    """The header of the credential, for ``auth: header``."""
+    oauth_scope: str | None = Field(default=None, max_length=400)
+    title: str | None = Field(default=None, max_length=60)
+    scope: Literal["personal", "workspace"] = "workspace"
+
+
+class OAuthCallback(_Body):
+    """The query of the redirect of an authorization server to the Connections page."""
+
+    state: str = Field(min_length=10, max_length=200)
+    code: str | None = Field(default=None, max_length=4000)
+    error: str | None = Field(default=None, max_length=200)
+
+
+class ToolFilters(_Body):
+    include: list[str] = Field(default_factory=list, max_length=50)
+    exclude: list[str] = Field(default_factory=list, max_length=50)
+
+
 class SlackConnect(_Body):
     bot_token: SecretStr = Field(min_length=1, max_length=300)
     """The bot token of the Slack app (``xoxb-``), from OAuth & Permissions."""
@@ -1091,6 +1117,58 @@ class SamaApi:
             service = self._require_connections()
             started = await service.start(org_id, workspace_id, grants, body.connector, body.scope)
             return started.public()
+
+        @app.post("/workspaces/{workspace_id}/connections/mcp", status_code=201)
+        async def add_mcp_server(
+            principal: Me, workspace_id: uuid.UUID, body: McpServerAdd
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            started = await self._require_connections().add_mcp(
+                org_id,
+                workspace_id,
+                grants,
+                name=body.name,
+                url=body.url,
+                auth=body.auth,
+                header=body.header,
+                oauth_scope=body.oauth_scope,
+                title=body.title,
+                scope=body.scope,
+            )
+            return started.public()
+
+        @app.post("/connections/oauth/callback")
+        async def connection_oauth_callback(principal: Me, body: OAuthCallback) -> dict[str, Any]:
+            # The state is ``<connection id>.<random>``: the id finds the connection, and the
+            # service compares the whole state with the one that it stored.
+            try:
+                connection_id = uuid.UUID(body.state.split(".", 1)[0])
+            except ValueError:
+                raise HTTPException(status_code=400, detail="the state is not valid") from None
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            done = await self._require_connections().finish_oauth(
+                org_id,
+                view.id,
+                state=body.state,
+                code=body.code,
+                error=body.error,
+                actor=grants.user_id,
+            )
+            return done.public()
+
+        @app.put("/connections/{connection_id}/tools")
+        async def connection_tools(
+            principal: Me, connection_id: uuid.UUID, body: ToolFilters
+        ) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            saved = await self._require_connections().set_filters(
+                org_id,
+                view.id,
+                include=tuple(body.include),
+                exclude=tuple(body.exclude),
+                actor=grants.user_id,
+            )
+            return saved.public()
 
         @app.post("/connections/{connection_id}/check")
         async def check_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:

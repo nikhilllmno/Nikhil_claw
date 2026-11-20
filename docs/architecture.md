@@ -2024,10 +2024,10 @@ as it is.
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
-| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.11: database (PostgreSQL, Supabase, Neon). Later: MCP, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
+| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Later: hosted MCP, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
-| `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
+| `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run). | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, media,
@@ -2119,7 +2119,8 @@ pull request. A manifest holds:
 
 An org admin can also add a custom connection that is not in the catalog (a URL, an OpenAPI
 document, a database, or a stdio command). A custom `mcp_hosted` connection needs the org
-`owner`.
+`owner`. Since M3.5, a workspace `admin` or the org `owner` can add a remote MCP server by URL
+to a workspace.
 
 **Connection record**
 
@@ -2222,7 +2223,8 @@ gets one notice per change.
   429, or 5xx keeps the state and stores the error. A check writes its result only if the row
   did not change during the check, so a `disable` or a remove during a check wins. A check does
   not change a `disabled` connection. `policy_overrides` is stored but not
-  used yet. Discovery and `tool_cache` come later: the tools come from the manifest.
+  used yet. For `composio` and `http_api`, the tools come from the manifest. Discovery and
+  `tool_cache` are used by `mcp_remote` (M3.5).
 - **Web app.** The Connections page (`/connections`) lists the connectors of the catalog with a
   row per scope. It starts a connection, sends the user to the Composio link, checks the
   connection when Composio sends the user back (`?connection=<id>`), shows the form of an
@@ -2246,6 +2248,87 @@ gets one notice per change.
   connection of its user first, then the workspace connection. A shared session uses only the
   workspace connection. Default policy: `read` is `allow`, `write` is `ask`, and
   `destructive` is `ask` with a stronger reason. An admin rule wins over the default.
+
+**What M3.5 builds**
+
+- **Catalog servers.** `connectors/catalog/` has `deepwiki` (no sign-in), `neon-mcp` and
+  `stripe` (a bearer token in a form), and `sentry` and `supabase-mcp` (OAuth). The names
+  `neon` and `supabase` belong to the database connectors of M3.11 (Section 10.4). So the tools
+  of the Neon MCP server are `mcp_neon_mcp_<tool>`. A manifest of kind
+  `mcp_remote` has an `mcp` block: `url` (`https`, no query), `auth` (`oauth`, `bearer`,
+  `header`, or `none`), `header` (for `auth: header`), `scope` (the OAuth scope), `include`
+  and `exclude` (tool patterns), and `access` (an access per tool pattern). It has no tool
+  list: the server lists its tools. The form comes from `auth`: one secret field `token` for
+  `bearer` and `header`, and no form for `oauth` and `none`. sama refuses a header that it sets
+  itself (for example `Host` or `Mcp-Session-Id`).
+- **Servers by URL.** `POST /workspaces/{id}/connections/mcp` adds a server that is not in the
+  catalog. Only a workspace `admin` or the org `owner` can do this, also for a personal
+  connection. The name has the rule of a connector name and cannot be the name of a catalog
+  connector. The server goes into `config.mcp` of the row, so it stays after a restart. A new
+  URL, auth, or header for the same name deletes the stored credential and the tool list, so
+  a credential never goes to a server that it was not given for.
+- **Client.** sama speaks MCP over streamable HTTP (protocol `2025-06-18`): `initialize`, then
+  `tools/list` (at most 10 pages and 200 tools) and `tools/call`. It reads a JSON answer and an
+  SSE answer. sama keeps one MCP session for each connection in memory. A new credential starts
+  a new session. A server that forgets a session (HTTP 404) gets a new session once. A tool
+  error comes back to the agent as text.
+- **OAuth 2.1.** sama follows the MCP authorization specification. It finds the protected
+  resource metadata (RFC 9728) from the `401` answer or the well-known path, then the metadata
+  of the authorization server (RFC 8414 or OpenID Connect). It registers a client for each
+  sign-in (dynamic client registration, RFC 7591). The sign-in link has PKCE (`S256`), a
+  `state`, and the `resource` parameter (RFC 8707). The redirect URI is the Connections page
+  (`/connections`). The state is `<connection id>.<random>`. The web app gives the `code` and
+  the `state` to `POST /connections/oauth/callback`. The API compares the state with the stored
+  one, and uses the state and the PKCE verifier once. Before the code exchange, the callback
+  claims the row: it moves the row from `initiated` to `pending` only if the row did not change
+  since the API read it. A second callback at the same time loses the claim and gets a `400`,
+  so one code is exchanged once. If the server does not answer after the exchange, the row
+  stays `pending` with the error, and a check (the page shows **Check**) finishes it with the
+  stored tokens. The tokens, the client secret, the state, and the verifier are
+  in the vault entry `connection:<id>`. The tokens carry `bound`, a hash of the server URL and
+  the OAuth client id. sama does not use tokens whose `bound` is not that of the current
+  connection, so a late refresh or exchange for an old server or an old client cannot give a
+  token to the new one. sama refreshes a token 60 seconds before it expires and after a
+  `401`. One process refreshes one connection at a time. A refused refresh sets `expired`.
+- **Discovery, cache, and health.** A check opens a new session and lists the tools. This is
+  the health check. The tool names, descriptions, schemas, and annotations go into
+  `tool_cache`. sama cuts a description to 1,800 characters. It drops a tool whose schema is not
+  an object, whose schema is larger than 20,000 bytes, or whose name does not fit. A tool
+  without a schema gets `{"type": "object"}`. A tool list that is older than 6 hours
+  is read again in the background when a run asks for the tools. A network error, a timeout, or
+  an HTTP 5xx keeps the state and the old tool list, and stores the error.
+- **Remote text is untrusted.** The server writes the tool descriptions, titles, and schemas.
+  sama redacts the secrets that the vault knows from them (Section 16) before it cuts or stores
+  them, and again when it reads `tool_cache`, so a secret that the vault learns later is also
+  removed. `tool_search` and `tool_describe` put this text in an `untrusted_content` block with
+  the source `connector:<name>`, one block for each server.
+- **Tool names and access.** A remote tool `<tool>` is `mcp_<connection>_<tool>` for the agent
+  (a `-` becomes `_`, and a name longer than 64 characters is dropped). Two connections can give
+  the same name (for example `a-b` and `a_b`). Such a name is ambiguous: no connection gives it
+  to a run, the gate does not know it, and sama logs a warning. The Connections page still
+  shows the tool. The access comes from
+  the `access` of the manifest, else from the annotations: `readOnlyHint` gives `read`,
+  `destructiveHint: false` gives `write`, and a tool without hints is `destructive`, as the MCP
+  specification says. The default policy of Section 10.3 applies.
+- **Filters.** The `include` and `exclude` of the manifest apply when sama reads the tool
+  list. The `include` and `exclude` of the connection (`PUT /connections/{id}/tools`, at most
+  50 patterns each) apply when a run reads the tools. A pattern uses `*` and `?`. An excluded
+  tool is not in `tool_search`, and the gate denies a call to it.
+- **No new session.** The tools of the remote servers are not in the static
+  `DeferredCatalog`. The sama MCP server asks the connection service for the tools of the run
+  at each `tool_search`, `tool_describe`, and `tool_call`. The gate asks the same service for the
+  access and the toolset of a tool (`run_tools`). So a server that connects during a session
+  gives its tools to the next search, and the frozen prompt prefix does not change (D9).
+- **Outbound policy.** Every MCP and OAuth request goes through `OutboundClient` (Section
+  16.4), without redirects. sama checks the URL when an admin adds a server. An SSE answer is
+  read only to the end of the event that has the answer (with `\n`, `\r\n`, or `\r` line
+  ends), so a stream that stays open does not hold the request.
+- **Web app.** The Connections page shows the servers of the catalog and the servers by URL,
+  a form to add a server by URL, the tool list of a connected server with its access, and the
+  include and exclude filters. It handles the OAuth answer (`?code=&state=` or
+  `?error=&state=`). It removes the code and the state from the address, also when the answer
+  is not valid, and then shows a notice. Each connection of a server by URL has its own form,
+  from its own URL and auth.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
 start runs or workflows (Section 12).
@@ -4437,6 +4520,13 @@ policy for all of them:
   The org settings that fill the lists come with the org settings API (M3).
 - `skill_import` uses its own policy: only `api.github.com` and `raw.githubusercontent.com`,
   and no redirect (M4.10).
+- **Remote MCP (M3.5).** The MCP client and the OAuth client use `OutboundClient` with their own
+  limits. They follow no redirect, because a redirect could send the credential to another
+  host. MCP: 5 MB, 60 seconds for each hop, and 90 seconds in total. OAuth: 1 MB, 20 seconds
+  for each hop, and 30 seconds in total. `OutboundClient.check(url)` checks a URL without a
+  request, for a server that an admin adds by URL. `OutboundClient.request` can send a form
+  body (`form`) and stop at the first full answer of a stream (`enough`). `FetchResult.headers`
+  has the answer headers with lower-case names.
 
 ### 16.5 Untrusted content
 
@@ -4582,7 +4672,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `session_search(query, limit)` | Searches past sessions that the run may see, by words and meaning, and returns up to 10 sessions with title, audience, times, and snippets (Section 7.1). An empty query lists the latest sessions. | A database. Without a service the tool is hidden. Meaning search needs an OpenAI key. Without one, the tool uses full text only. |
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
-| `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start. Otherwise the three tools are hidden. |
+| `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start, or the connection service (M3.5: the tools of remote MCP servers come for each run). Otherwise the three tools are hidden. |
 | `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 

@@ -28,6 +28,7 @@ from typing import Any, Final
 
 from sama.gate.decide import META_TOOLS, TOOLSETS, ToolAccess, canonical_name, tools_of
 from sama.tenancy.run_token import RunTokenClaims
+from sama.tools.output import untrusted
 
 DEFAULT_SEARCH_LIMIT: Final = 5
 MAX_SEARCH_LIMIT: Final = 10
@@ -62,6 +63,10 @@ class DeferredTool:
     access: ToolAccess = "write"
     """What the tool does, for its default policy (Section 10.3). A ``destructive`` tool can
     delete or change data that cannot be restored; the approval card says so."""
+    source: str | None = None
+    """Set when an outside party wrote the description and the schema, for example a remote
+    MCP server. ``tool_search`` and ``tool_describe`` then put that text in an untrusted
+    content block."""
 
     def __post_init__(self) -> None:
         if _NAME.fullmatch(self.name) is None:
@@ -121,6 +126,15 @@ class DeferredCatalog:
     def get(self, name: str) -> DeferredTool | None:
         return self._tools.get(name)
 
+    def extended(self, extra: Collection[DeferredTool]) -> DeferredCatalog:
+        """A copy with more tools, for example the tools of the remote MCP servers of one run.
+        A tool with the name of a tool in this catalog is not added."""
+        copy = DeferredCatalog()
+        copy._tools = dict(self._tools)
+        for tool in extra:
+            copy._tools.setdefault(tool.name, tool)
+        return copy
+
     def names(self) -> frozenset[str]:
         return frozenset(self._tools)
 
@@ -152,18 +166,25 @@ class DeferredCatalog:
 
 
 def format_search(tools: list[DeferredTool], *, query: str | None) -> str:
-    """The result of ``tool_search``."""
+    """The result of ``tool_search``. The lines of tools that an outside party describes are
+    in untrusted content blocks, one block for each source."""
     if not tools:
         return "No tool matches." if query else "There are no tools to search."
-    lines = []
+    lines: list[str] = []
+    outside: dict[str, list[str]] = {}
     for tool in tools:
         short = " ".join(tool.description.split())
         if len(short) > SHORT_CHARS:
             short = short[:SHORT_CHARS].rstrip() + "..."
-        lines.append(f"- {tool.name}: {short}")
+        line = f"- {tool.name}: {short}"
+        if tool.source is None:
+            lines.append(line)
+        else:
+            outside.setdefault(tool.source, []).append(line)
+    blocks = [untrusted("\n".join(found), source=source) for source, found in outside.items()]
     return (
         f"{len(tools)} tools. Use tool_describe to see the arguments of one tool, then "
-        "tool_call to run it.\n" + "\n".join(lines)
+        "tool_call to run it.\n" + "\n".join([*lines, *blocks])
     )
 
 
@@ -175,7 +196,10 @@ def format_describe(tool: DeferredTool) -> str:
         "write": "can change things",
         "destructive": "can delete things",
     }[tool.access]
+    body = f"{tool.description}\n\nArguments (JSON schema):\n{schema}"
+    if tool.source is not None:
+        body = untrusted(body, source=tool.source)
     return (
-        f"{tool.name} ({kind})\n{tool.description}\n\nArguments (JSON schema):\n{schema}\n\n"
+        f"{tool.name} ({kind})\n{body}\n\n"
         f'Run it with tool_call: name="{tool.name}" and arguments as an object.'
     )

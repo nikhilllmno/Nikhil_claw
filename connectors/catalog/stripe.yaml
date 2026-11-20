@@ -1,0 +1,12 @@
+# Stripe (docs/architecture.md, Section 10.3): the remote MCP server of Stripe. The credential
+# is a Stripe secret key or a restricted key. The server gives the tool list.
+name: stripe
+title: Stripe
+description: Read and manage Stripe customers, products, prices, invoices, and payments.
+kind: mcp_remote
+scopes:
+- personal
+- workspace
+mcp:
+  url: https://mcp.stripe.com
+  auth: bearer

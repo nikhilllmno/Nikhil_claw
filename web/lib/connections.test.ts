@@ -1,13 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiClient, type Connection, type Connector, type TokenSource } from "./api";
 import {
+  EMPTY_SERVER,
+  canCheck,
   connectionOf,
+  connectorFor,
+  customServers,
   formProblem,
   formValues,
+  hasOAuthAnswer,
   initialValues,
   isSafeRedirect,
   listFor,
+  mcpFields,
+  mcpToolSummary,
   parseConnectionQuery,
+  parsePatterns,
+  patternProblem,
+  serverBody,
+  serverProblem,
   stateLabel,
   stateTone,
   toolSummary,
@@ -211,3 +222,165 @@ describe("the connection list of a workspace", () => {
     expect(withoutConnection(null, CONN)).toBeNull();
   });
 });
+
+describe("remote MCP servers", () => {
+  const STATE = `${CONN}.abcdefghijklmnopqrstuvwx`;
+
+  it("reads the OAuth answer without a workspace", () => {
+    expect(parseConnectionQuery(`?code=c1&state=${STATE}`)).toEqual({
+      kind: "oauth",
+      state: STATE,
+      code: "c1",
+      error: null,
+    });
+    expect(parseConnectionQuery(`?error=access_denied&state=${STATE}`)).toEqual({
+      kind: "oauth",
+      state: STATE,
+      code: null,
+      error: "access_denied",
+    });
+  });
+
+  it("refuses a bad OAuth answer", () => {
+    expect(parseConnectionQuery(`?code=c1&state=short`)).toBeNull();
+    expect(parseConnectionQuery(`?state=${STATE}`)).toBeNull();
+    expect(parseConnectionQuery(`?code=c1&error=x&state=${STATE}`)).toBeNull();
+    expect(parseConnectionQuery(`?code=${"c".repeat(4001)}&state=${STATE}`)).toBeNull();
+  });
+
+  it("removes the code and the state from the address", () => {
+    expect(withoutEntryParams(`?code=c1&state=${STATE}&iss=x&tab=2`)).toBe("?tab=2");
+    // A broken answer is still an answer: the page removes it and says so.
+    expect(hasOAuthAnswer("?state=short&code=c1")).toBe(true);
+    expect(parseConnectionQuery("?state=short&code=c1")).toBeNull();
+    expect(hasOAuthAnswer("?error=access_denied")).toBe(true);
+    expect(hasOAuthAnswer(`?workspace=${WS}&connection=${CONN}`)).toBe(false);
+  });
+
+  it("checks a new server before it goes to the API", () => {
+    const good = { ...EMPTY_SERVER, name: " Docs ", url: "https://mcp.example.com/mcp" };
+    expect(serverProblem(good)).toBeNull();
+    expect(serverProblem({ ...good, name: "9docs" })).toMatch(/name/);
+    expect(serverProblem({ ...good, url: "mcp.example.com" })).toMatch(/full address/);
+    expect(serverProblem({ ...good, url: "http://mcp.example.com/mcp" })).toMatch(/https/);
+    expect(serverProblem({ ...good, url: "https://u:p@mcp.example.com/" })).toMatch(/user name/);
+    expect(serverProblem({ ...good, url: "https://mcp.example.com/?key=1" })).toMatch(/query/);
+    expect(serverProblem({ ...good, auth: "header", header: "" })).toMatch(/header/);
+    expect(serverProblem({ ...good, auth: "header", header: "Host" })).toMatch(/sets the Host/);
+    expect(serverProblem({ ...good, auth: "header", header: "X-Api-Key" })).toBeNull();
+    expect(serverBody({ ...good, oauthScope: " read ", header: "X" })).toEqual({
+      name: "docs",
+      url: "https://mcp.example.com/mcp",
+      auth: "oauth",
+      header: null,
+      oauth_scope: "read",
+      title: null,
+      scope: "workspace",
+    });
+  });
+
+  it("makes a card for each server that an admin added by URL", () => {
+    const mcp = {
+      custom: { title: "Docs", url: "https://mcp.example.com/mcp", auth: "bearer" as const, header: null },
+      include: [],
+      exclude: [],
+      discovered_at: null,
+      tools: [],
+    };
+    const rows = [
+      connection({ connector: "docs", kind: "mcp_remote", scope: "workspace", mcp }),
+      connection({ id: "x", connector: "docs", kind: "mcp_remote", scope: "personal", mcp }),
+      connection({ connector: "notion" }),
+    ];
+    const cards = customServers(rows, [NOTION]);
+    expect(cards.map((c) => [c.name, c.title, c.scopes])).toEqual([["docs", "Docs", ["workspace", "personal"]]]);
+    expect(cards[0]?.fields.map((f) => [f.name, f.secret])).toEqual([["token", true]]);
+    expect(mcpFields("oauth", null)).toEqual([]);
+    expect(mcpFields("header", "X-Key")[0]?.help).toContain("X-Key");
+  });
+
+  it("gives each connection of a server by URL its own form", () => {
+    const base = { include: [], exclude: [], discovered_at: null, tools: [] };
+    const team = connection({
+      connector: "docs",
+      kind: "mcp_remote",
+      scope: "workspace",
+      mcp: { ...base, custom: { title: "Docs", url: "https://a.example.com/mcp", auth: "bearer", header: null } },
+    });
+    const mine = connection({
+      id: "x",
+      connector: "docs",
+      kind: "mcp_remote",
+      scope: "personal",
+      mcp: { ...base, custom: { title: "Docs", url: "https://b.example.com/mcp", auth: "header", header: "X-Key" } },
+    });
+    const [card] = customServers([team, mine], [NOTION]);
+    expect(card?.description).toBe("Added by URL: https://a.example.com/mcp, https://b.example.com/mcp");
+    if (card === undefined) throw new Error("no card");
+    expect(connectorFor(card, team).fields[0]?.help).toContain("Authorization");
+    expect(connectorFor(card, mine).fields[0]?.help).toContain("X-Key");
+    expect(connectorFor(card, mine).mcp?.url).toBe("https://b.example.com/mcp");
+    expect(connectorFor(NOTION, connection())).toBe(NOTION);
+    expect(connectorFor(card, null)).toBe(card);
+    // A pending server with a form waits for the form. An OAuth server can be checked.
+    expect(canCheck(card, { ...team, state: "pending" })).toBe(false);
+    expect(canCheck(card, { ...team, state: "connected" })).toBe(true);
+    const oauth = connection({
+      connector: "docs",
+      kind: "mcp_remote",
+      state: "pending",
+      mcp: { ...base, custom: { title: "Docs", url: "https://a.example.com/mcp", auth: "oauth", header: null } },
+    });
+    expect(canCheck(card, oauth)).toBe(true);
+    expect(canCheck(NOTION, connection({ state: "pending" }))).toBe(false);
+  });
+
+  it("sums up the tools and checks the filters", () => {
+    const tool = (name: string, access: "read" | "write", enabled: boolean) => ({
+      name: `mcp_docs_${name}`,
+      remote_name: name,
+      description: "",
+      access,
+      enabled,
+    });
+    const mcp = {
+      custom: null,
+      include: [],
+      exclude: ["drop"],
+      discovered_at: "2026-11-20T00:00:00Z",
+      tools: [tool("read", "read", true), tool("add", "write", true), tool("drop", "write", false)],
+    };
+    expect(mcpToolSummary(connection({ kind: "mcp_remote", mcp }))).toBe("2 tools, 1 read only, 1 off");
+    expect(mcpToolSummary(connection({ kind: "mcp_remote", mcp: { ...mcp, discovered_at: null } }))).toBeNull();
+    expect(mcpToolSummary(connection())).toBeNull();
+    expect(parsePatterns(" list_*\n, drop ,\n")).toEqual(["list_*", "drop"]);
+    expect(patternProblem(["list_*", "a/b:c"])).toBeNull();
+    expect(patternProblem(["a b"])).toMatch(/not a pattern/);
+    expect(patternProblem(Array.from({ length: 51 }, (_, i) => `t${i}`))).toMatch(/50/);
+  });
+
+  it("calls the MCP routes", async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.addMcpServer(WS, { name: "docs", url: "https://m.test/mcp", auth: "none", scope: "workspace" });
+    await client.finishOAuth(STATE, "c1", null);
+    await client.setConnectionTools(CONN, ["a*"], []);
+    const calls = fetcher.mock.calls.map((call) => {
+      const [url, init] = call as unknown as [string, RequestInit | undefined];
+      return [init?.method, url, init?.body];
+    });
+    expect(calls).toEqual([
+      [
+        "POST",
+        `https://api.test/workspaces/${WS}/connections/mcp`,
+        '{"name":"docs","url":"https://m.test/mcp","auth":"none","scope":"workspace"}',
+      ],
+      ["POST", "https://api.test/connections/oauth/callback", `{"state":"${STATE}","code":"c1","error":null}`],
+      ["PUT", `https://api.test/connections/${CONN}/tools`, '{"include":["a*"],"exclude":[]}'],
+    ]);
+  });
+});
+
+function tokens(): TokenSource {
+  return { generation: 1, getToken: async () => "t", refresh: async () => "t", signOut: () => undefined };
+}

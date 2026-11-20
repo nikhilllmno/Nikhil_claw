@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, Protocol, cast
 
 from sqlalchemy import and_, case, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -52,6 +52,7 @@ from sama.gate.decide import (
     Preapproval,
     Recorded,
     RuleLevel,
+    ToolAccess,
     ToolsetSource,
     Verdict,
     always_asks,
@@ -145,6 +146,23 @@ def stored_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
     return {"_cut": True, "preview": text[:MAX_STORED_ARGUMENT_CHARS]}
 
 
+class RunToolSource(Protocol):
+    """Tools that depend on the run, for example the tools of the remote MCP servers that the
+    run may use (Section 10.3). The gate reads them at each check, in its transaction, so a
+    new tool is usable at once."""
+
+    async def run_tools(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        user_id: uuid.UUID | None,
+        shared: bool,
+        toolsets: frozenset[str],
+    ) -> tuple[Mapping[str, frozenset[str]], Mapping[str, ToolAccess]]: ...
+
+
 class GateService:
     """The real ``ToolGate`` of sama. One instance serves all orgs: every query is scoped by
     the run token claims."""
@@ -156,13 +174,16 @@ class GateService:
         approval_ttl: timedelta = APPROVAL_TTL,
         clock: Callable[[], datetime] = _utcnow,
         extra_toolsets: ToolsetSource | None = None,
+        run_tools: RunToolSource | None = None,
     ) -> None:
         """``extra_toolsets`` adds toolsets to the fixed table, for example the deferred tools
-        of the tool server (Section 10.3). It is read at each check."""
+        of the tool server (Section 10.3). It is read at each check. ``run_tools`` adds the
+        tools that depend on the run."""
         if approval_ttl <= timedelta(0):
             raise ValueError("approval_ttl must be more than 0")
         self._engine = engine
         self._extra_toolsets = extra_toolsets
+        self._run_tools = run_tools
         self._ttl = approval_ttl
         self._clock = clock
 
@@ -461,6 +482,21 @@ class GateService:
             # only when a human approved this exact version of the job.
             toolsets -= {JOB_TOOLSET}
             preapproved = job.preapproved
+        extra = dict(self._extra_toolsets.toolsets()) if self._extra_toolsets is not None else {}
+        access = dict(self._extra_toolsets.access()) if self._extra_toolsets is not None else {}
+        if self._run_tools is not None:
+            more, more_access = await self._run_tools.run_tools(
+                connection,
+                org_id=org_id,
+                workspace_id=ref.workspace_id,
+                user_id=user_id,
+                shared=row.audience != "private",
+                toolsets=toolsets,
+            )
+            for name, tools in more.items():
+                extra[name] = extra.get(name, frozenset()) | tools
+            # A fixed tool keeps its own access.
+            access = {**more_access, **access}
         context = GateContext(
             toolsets=toolsets,
             rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
@@ -469,10 +505,8 @@ class GateService:
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
             revoked=await self._revoked(connection, org_id, run_id),
             preapproved=preapproved,
-            catalog=merged_catalog(
-                self._extra_toolsets.toolsets() if self._extra_toolsets is not None else {}
-            ),
-            access=self._extra_toolsets.access() if self._extra_toolsets is not None else {},
+            catalog=merged_catalog(extra),
+            access=access,
         )
         call = None
         if call_id:

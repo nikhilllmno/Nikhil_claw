@@ -800,7 +800,8 @@ class ToolServer:
                 arguments = {"text": text, "voice": voice}
                 return await self._call(ctx, TEXT_TO_SPEECH, arguments, body)
 
-        if self.deferred is not None and len(self.deferred) > 0:
+        if self.deferred is not None and (len(self.deferred) > 0 or self.connections is not None):
+            # With connections, a run can get the tools of a remote MCP server at any time.
             self._deferred_tools(server, self.deferred)
 
         if self.connections is not None:
@@ -1073,6 +1074,15 @@ class ToolServer:
             present = {key: value for key, value in arguments.items() if value is not None}
             return await self._call(ctx, CRONJOB_MANAGE, present, body)
 
+    async def _run_catalog(
+        self, claims: RunTokenClaims, catalog: DeferredCatalog
+    ) -> DeferredCatalog:
+        """The catalog and the tools of the remote MCP servers that the run may use now."""
+        if self.connections is None:
+            return catalog
+        extra = await self.connections.mcp_tools(claims)
+        return catalog.extended(extra) if extra else catalog
+
     async def _visible(self, claims: RunTokenClaims, catalog: DeferredCatalog) -> frozenset[str]:
         """The deferred tools that the run can use now."""
         if isinstance(self.gate, ToolVisibility):
@@ -1246,8 +1256,9 @@ class ToolServer:
             limit: Annotated[int, Field(ge=1, le=MAX_SEARCH_LIMIT)] = DEFAULT_SEARCH_LIMIT,
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
-                allowed = await self._visible(claims, catalog)
-                found = catalog.search(query, allowed, limit)
+                tools = await self._run_catalog(claims, catalog)
+                allowed = await self._visible(claims, tools)
+                found = tools.search(query, allowed, limit)
                 return format_search(found, query=(query or "").strip() or None)
 
             return await self._call(ctx, TOOL_SEARCH, {"query": query, "limit": limit}, body)
@@ -1265,8 +1276,9 @@ class ToolServer:
             name: Annotated[str, Field(min_length=1, max_length=64)], ctx: Context
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
-                tool = catalog.get(name)
-                if tool is None or name not in await self._visible(claims, catalog):
+                tools = await self._run_catalog(claims, catalog)
+                tool = tools.get(name)
+                if tool is None or name not in await self._visible(claims, tools):
                     raise DeferredToolError(f"no tool has the name {name}")
                 return format_describe(tool)
 
@@ -1291,6 +1303,8 @@ class ToolServer:
                 # The gate judged the tool that this call names, with these arguments, in
                 # ``_call``. The catalog gives no authority of its own.
                 tool = catalog.get(name)
+                if tool is None:
+                    tool = (await self._run_catalog(claims, catalog)).get(name)
                 if tool is None:
                     raise DeferredToolError(f"no tool has the name {name}")
                 given = arguments or {}

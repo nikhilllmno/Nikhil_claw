@@ -20,7 +20,7 @@ import http.cookiejar
 import ipaddress
 import socket
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 import httpx
@@ -74,6 +74,9 @@ class FetchResult:
     content: bytes
     truncated: bool
     """True if the body was larger than ``max_bytes`` and the client stopped reading."""
+    headers: Mapping[str, str] = field(default_factory=dict)
+    """The response headers, with lower-case names. Two headers with one name are joined
+    with a comma."""
 
 
 def address_problem(address: IPAddress) -> str | None:
@@ -224,16 +227,22 @@ class OutboundClient:
         headers: Mapping[str, str] | None = None,
         params: Mapping[str, str] | None = None,
         json: object = None,
+        form: Mapping[str, str] | None = None,
+        enough: Callable[[bytes], bool] | None = None,
     ) -> FetchResult:
         """Sends one request under the policy and does not follow a redirect: a redirect would
         send the headers (for example a credential) to a URL that the caller did not choose.
         Raises ``BlockedUrlError``, or ``FetchError`` for a redirect, a network error, or a
-        time limit. An error status is a result, not an error."""
+        time limit. An error status is a result, not an error.
+
+        ``form`` sends a form-encoded body instead of ``json``. ``enough`` gets the body read
+        so far after each chunk. When it returns true, the client stops reading: an event
+        stream can stay open after the answer that the caller needs."""
         try:
             async with asyncio.timeout(self.policy.total_timeout_s):
                 target = str(httpx.URL(url, params=params)) if params else url
                 parsed, address = await self.check(target)
-                result = await self._send(parsed, address, method, headers, json)
+                result = await self._send(parsed, address, method, headers, json, form, enough)
         except TimeoutError:
             raise FetchError("the request took too long") from None
         if isinstance(result, str):
@@ -247,6 +256,8 @@ class OutboundClient:
         method: str = "GET",
         extra_headers: Mapping[str, str] | None = None,
         json: object = None,
+        form: Mapping[str, str] | None = None,
+        enough: Callable[[bytes], bool] | None = None,
     ) -> FetchResult | str:
         """Sends one request to the checked address. Returns the result, or the next URL of a
         redirect."""
@@ -265,7 +276,12 @@ class OutboundClient:
         headers["accept-encoding"] = "identity"
         extensions = {"sni_hostname": host} if parsed.scheme == "https" else {}
         request = self._client.build_request(
-            method, target, headers=headers, json=json, extensions=extensions
+            method,
+            target,
+            headers=headers,
+            json=json,
+            data=dict(form) if form is not None else None,
+            extensions=extensions,
         )
         try:
             response = await self._client.send(request, stream=True)
@@ -291,6 +307,8 @@ class OutboundClient:
                         truncated = True
                         break
                     body += chunk
+                    if enough is not None and enough(bytes(body)):
+                        break
             except httpx.HTTPError as error:
                 raise FetchError(f"reading {host} failed: {type(error).__name__}") from None
             return FetchResult(
@@ -299,6 +317,7 @@ class OutboundClient:
                 content_type=response.headers.get("content-type", ""),
                 content=bytes(body),
                 truncated=truncated,
+                headers={k.lower(): v for k, v in response.headers.items()},
             )
         finally:
             await response.aclose()

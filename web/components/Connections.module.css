@@ -101,3 +101,48 @@
   flex-direction: column;
   gap: var(--space-3);
 }
+
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.tools > summary {
+  cursor: pointer;
+}
+
+.toolList {
+  margin: var(--space-2) 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: var(--scroll-list-max);
+  overflow-y: auto;
+}
+
+.tool {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.toolOff {
+  color: var(--text-subtle);
+}
+
+.toolName {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.toolText {
+  flex-basis: 100%;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}

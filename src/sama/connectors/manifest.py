@@ -12,6 +12,10 @@ deploy ships them. A manifest gives:
 - for ``database``: the database engine (only ``postgres``). The model makes the form fields
   and the five tools ``db_<conn>_schema``, ``sample``, ``query``, ``export``, and ``execute``
   (Section 10.4). A manifest of this kind does not list fields or tools;
+- for ``mcp_remote``: the URL of a remote MCP server, its auth (``oauth``, ``bearer``,
+  ``header``, or ``none``), the include and exclude filters of its tools, and the ``access``
+  of tools that the server describes wrongly. The tools come from the server (``tools/list``),
+  so the manifest has none;
 - the tools of the connector. Each tool has a name, a description, a JSON schema of its
   arguments, and an ``access``: ``read``, ``write``, or ``destructive``. A ``read`` tool gets
   ``allow`` and the other tools get ``ask`` (Section 10.3).
@@ -39,7 +43,7 @@ CONNECTOR_NAME: Final = re.compile(r"[a-z][a-z0-9_-]{0,39}")
 _PATH_PARAM: Final = re.compile(r"\{([a-z_][a-z0-9_]{0,63})\}")
 
 Scope = Literal["personal", "workspace"]
-Kind = Literal["composio", "http_api", "database"]
+Kind = Literal["composio", "http_api", "database", "mcp_remote"]
 """The kinds that this release can connect. The table allows more kinds (Section 10.3)."""
 DatabaseOperation = Literal["schema", "sample", "query", "export", "execute"]
 DATABASE_OPERATIONS: Final[tuple[DatabaseOperation, ...]] = get_args(DatabaseOperation)
@@ -83,6 +87,81 @@ class HttpApi(_Strict):
     auth: HttpAuth
     headers: Mapping[str, str] = Field(default_factory=dict)
     test: HttpRequest
+
+
+McpAuth = Literal["oauth", "bearer", "header", "none"]
+TOOL_PATTERN: Final = re.compile(r"[A-Za-z0-9_.*?/:-]{1,100}")
+"""A tool filter: a shell-style pattern (``fnmatch``) of the remote tool name."""
+MAX_PATTERNS: Final = 50
+TOKEN_FIELD: Final = "token"  # noqa: S105 - a field name, not a password
+"""The form field of the credential of a ``bearer`` or ``header`` MCP server."""
+
+
+def check_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    if len(patterns) > MAX_PATTERNS:
+        raise ValueError(f"at most {MAX_PATTERNS} tool patterns")
+    for pattern in patterns:
+        if TOOL_PATTERN.fullmatch(pattern) is None:
+            raise ValueError(f"not a valid tool pattern: {pattern!r}")
+    return patterns
+
+
+class McpRemote(_Strict):
+    """A remote MCP server (streamable HTTP)."""
+
+    url: Annotated[str, Field(pattern=r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s#?]*)?$")]
+    auth: McpAuth
+    header: Annotated[str | None, Field(pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")] = None
+    """The header of the credential (``auth: header``)."""
+    scope: Annotated[str | None, Field(max_length=400)] = None
+    """The OAuth scope to ask for (``auth: oauth``). Without it, sama asks for the scopes that
+    the server names."""
+    include: tuple[str, ...] = ()
+    """Only the remote tools that match one of these patterns. Empty: all tools."""
+    exclude: tuple[str, ...] = ()
+    """No remote tool that matches one of these patterns."""
+    access: Mapping[str, ToolAccess] = Field(default_factory=dict)
+    """The access of the remote tools that match a pattern. It wins over the hints of the
+    server."""
+
+    @model_validator(mode="after")
+    def _valid(self) -> McpRemote:
+        if (self.auth == "header") != (self.header is not None):
+            raise ValueError("an MCP server has a header if and only if its auth is header")
+        if self.header is not None and self.header.lower() in RESERVED_HEADERS:
+            raise ValueError(f"sama sets the header {self.header}")
+        check_patterns(self.include)
+        check_patterns(self.exclude)
+        check_patterns(tuple(self.access))
+        return self
+
+
+RESERVED_HEADERS: Final = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "content-length",
+        "content-type",
+        "host",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "transfer-encoding",
+        "connection",
+    }
+)
+"""Headers that the MCP client sets. A credential header cannot be one of them."""
+
+
+def mcp_fields(auth: McpAuth, header: str | None) -> tuple[FormField, ...]:
+    """The form of an MCP server: one secret field for a ``bearer`` or ``header`` credential,
+    and no form for ``oauth`` and ``none``."""
+    if auth == "bearer":
+        label, help_text = "Access token", "The token goes into the Authorization header."
+    elif auth == "header":
+        label, help_text = "Header value", f"The value goes into the {header} header."
+    else:
+        return ()
+    return (FormField(name=TOKEN_FIELD, label=label, secret=True, help=help_text),)
 
 
 class Composio(_Strict):
@@ -132,8 +211,27 @@ class Manifest(_Strict):
     composio: Composio | None = None
     http: HttpApi | None = None
     database: Database | None = None
+    mcp: McpRemote | None = None
     fields: tuple[FormField, ...] = ()
-    tools: Annotated[tuple[ToolSpec, ...], Field(min_length=1)]
+    tools: tuple[ToolSpec, ...] = ()
+    custom: bool = False
+    """A connection that a workspace admin added by URL. It is not in the catalog."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mcp_form(cls, data: Any) -> Any:
+        """An ``mcp_remote`` manifest does not write its form: it follows from the auth."""
+        if (
+            isinstance(data, dict)
+            and data.get("kind") == "mcp_remote"
+            and "fields" not in data
+            and isinstance(data.get("mcp"), dict)
+        ):
+            auth = data["mcp"].get("auth")
+            header = data["mcp"].get("header")
+            if auth in ("bearer", "header"):
+                return {**data, "fields": mcp_fields(auth, header)}
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -162,7 +260,12 @@ class Manifest(_Strict):
     @model_validator(mode="after")
     def _fits_kind(self) -> Manifest:
         if self.kind == "database":
-            if self.database is None or self.http is not None or self.composio is not None:
+            if (
+                self.database is None
+                or self.http is not None
+                or self.composio is not None
+                or self.mcp is not None
+            ):
                 raise ValueError("a database connector has a database block only")
             for tool in self.tools:
                 if tool.request is not None or tool.slug is not None:
@@ -172,6 +275,25 @@ class Manifest(_Strict):
             return self
         if self.database is not None:
             raise ValueError("only a database connector has a database block")
+        if self.kind == "mcp_remote":
+            if self.mcp is None or self.composio is not None or self.http is not None:
+                raise ValueError("an mcp_remote connector has an mcp block only")
+            if self.tools:
+                raise ValueError("an mcp_remote connector gets its tools from the server")
+            if self.fields != mcp_fields(self.mcp.auth, self.mcp.header):
+                raise ValueError(
+                    f"an mcp_remote connector with auth {self.mcp.auth} has "
+                    + (
+                        "one secret field named token"
+                        if self.mcp.auth in ("bearer", "header")
+                        else "no form fields"
+                    )
+                )
+            return self
+        if self.mcp is not None:
+            raise ValueError("only an mcp_remote connector has an mcp block")
+        if not self.tools:
+            raise ValueError(f"a {self.kind} connector has at least one tool")
         if self.kind == "composio":
             if self.composio is None or self.http is not None or self.fields:
                 raise ValueError("a composio connector has a composio block and no form")
@@ -228,6 +350,11 @@ class Manifest(_Strict):
                 {"name": t.name, "description": t.description, "access": t.access}
                 for t in self.tools
             ],
+            "mcp": (
+                None
+                if self.mcp is None
+                else {"url": self.mcp.url, "auth": self.mcp.auth, "header": self.mcp.header}
+            ),
         }
 
 
@@ -248,6 +375,8 @@ class Catalog:
         self._manifests = dict(sorted(manifests.items()))
         self._tools: dict[str, tuple[Manifest, ToolSpec]] = {}
         for manifest in self._manifests.values():
+            if manifest.custom:
+                raise ManifestError(f"{manifest.name}: a catalog connector is not custom")
             for tool in manifest.tools:
                 if tool.name in self._tools:
                     raise ManifestError(f"two connectors have the tool {tool.name}")

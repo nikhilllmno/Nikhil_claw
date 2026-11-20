@@ -184,7 +184,8 @@ def build(
         database=database,
     )
     connections.register_tools(deferred)
-    gate = GateService(engine, extra_toolsets=deferred)
+    # The gate also reads the tools of the remote MCP servers that each run may use.
+    gate = GateService(engine, extra_toolsets=deferred, run_tools=connections)
     broker = ClarifyBroker()
     library = SkillLibrary(engine, BuiltinSkills().all())
     # A background review proposes the changes of shared memory and shared skills. A person
