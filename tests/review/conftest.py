@@ -3,5 +3,5 @@ tests."""
 
 from __future__ import annotations
 
-from tests.api.conftest import api, broker, client  # noqa: F401
+from tests.api.conftest import api, app, broker, client  # noqa: F401
 from tests.orchestrator.conftest import engine, queue_database_url, tenant  # noqa: F401
