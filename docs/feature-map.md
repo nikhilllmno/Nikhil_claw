@@ -172,7 +172,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `delegate_task` (single and batch) | `tools/delegate_tool.py` | Child session and run in its own sandbox. Summary returns to the parent (§13). | Adapt | M4 |
 | Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget. | Adapt | M4 |
 | Cheaper model for children | `delegation.model` | Child model per profile. | Adapt | M4 |
-| Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents`, OpenAI agents as tools and handoffs (§13). | SDK | M2 |
+| Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents`, OpenAI agents as tools and handoffs (§13). | SDK | M2 (done) |
 | Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for running children. | Adapt | M4 |
 | Kanban board and dispatcher | `hermes kanban` | Task board with `task_*` tools (§12.4). | Adapt | M4 |
 | Worker bots in Slack channels | `gateway/bot_*` | An agent profile bound to a Slack channel with a budget. | Adapt | M3 |

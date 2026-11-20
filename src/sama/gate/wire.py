@@ -20,6 +20,9 @@ class GateRequest(BaseModel):
     call_id: str = Field(min_length=1, max_length=200)
     tool_name: str = Field(min_length=1, max_length=200)
     arguments: dict[str, Any] = Field(default_factory=dict)
+    child: bool = False
+    """True for a call of a sub-agent. It cannot ask a human, so ``ask`` becomes ``deny`` and
+    the gate records no approval."""
 
 
 class GateAnswer(BaseModel):

@@ -60,6 +60,7 @@ class AskForBash:
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision:
         if tool_name == "Bash":
             return GateDecision("ask", "shell commands need approval")

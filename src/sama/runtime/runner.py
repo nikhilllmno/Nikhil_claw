@@ -191,6 +191,7 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
                 arguments: Mapping[str, Any],
                 *,
                 call_id: str,
+                child: bool = False,
             ) -> GateDecision:
                 if tool_name in policy.deny:
                     return GateDecision("deny", "the tool policy denies this tool")

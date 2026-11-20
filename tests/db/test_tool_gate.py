@@ -241,6 +241,42 @@ async def test_ask_creates_one_approval(engine: AsyncEngine, org: Org1) -> None:
     assert actions == ["tool_gate.verdict", "approval.requested", "tool_gate.verdict"]
 
 
+async def test_a_call_of_a_subagent_that_would_ask_is_denied_and_has_no_approval(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """No human can answer a sub-agent call. The gate must not leave a pending approval."""
+    gate = GateService(engine)
+    verdict = await gate.check(org.claims(), "c1", "Bash", ARGS, child=True)
+    assert verdict.action == "deny"
+    assert "sub-agent" in verdict.reason
+    async with engine.connect() as connection:
+        call = (
+            await connection.execute(
+                select(ToolCall.decision, ToolCall.status).where(
+                    ToolCall.run_id == org.ids["run"], ToolCall.call_id == "c1"
+                )
+            )
+        ).one()
+    assert tuple(call) == ("deny", "denied")
+    assert await approval(engine, org, "c1") is None
+    actions = [action for action, _, _ in await audit(engine, org)]
+    assert actions == ["tool_gate.verdict"], "no approval.requested"
+    # A call of the run itself still asks, and it still gets its approval.
+    parent = await gate.check(org.claims(), "c2", "Bash", ARGS)
+    assert parent.action == "ask"
+    row = await approval(engine, org, "c2")
+    assert row is not None
+    assert row.status == "pending"
+
+
+async def test_a_call_of_a_subagent_that_would_allow_is_allowed(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    verdict = await gate.check(org.claims(), "c1", "Read", {"file_path": "a.txt"}, child=True)
+    assert verdict.action == "allow"
+
+
 async def test_a_denied_call_is_recorded_as_denied(engine: AsyncEngine, org: Org1) -> None:
     gate = GateService(engine)
     verdict = await gate.check(org.claims(), "c1", "Bash", {"command": "rm -rf /"})

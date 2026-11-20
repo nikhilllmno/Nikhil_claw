@@ -82,6 +82,7 @@ from sama.runtime.contract import (
     ApprovalDecision,
     FailureCode,
     Usage,
+    clip_subagent_text,
 )
 from sama.vault.redact import default_redactor, redact
 
@@ -167,6 +168,17 @@ class ClaimedRun:
     compact: bool = False
     """True for a ``/compact`` run (Section 6.3). Its ``input`` is the focus of the summary,
     not a user message, and the run writes no message."""
+
+
+def _stored_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """The payload of a run event as stored: redacted, and then cut. The runner sends the whole
+    text of a sub-agent event, and it never cuts, so a known secret cannot lose a part before
+    the redaction. The cut is after it."""
+    redacted: dict[str, Any] = default_redactor().json(payload)
+    text = redacted.get("text")
+    if kind == "subagent_event" and isinstance(text, str):
+        redacted["text"] = clip_subagent_text(text)
+    return redacted
 
 
 def _encode_state(state: bytes | None) -> str | None:
@@ -871,7 +883,7 @@ class RunQueue:
                         "run_id": run.run_id,
                         "seq": seq,
                         "type": kind,
-                        "payload": default_redactor().json(payload),
+                        "payload": _stored_payload(kind, payload),
                     }
                     for seq, kind, payload in events
                 ],

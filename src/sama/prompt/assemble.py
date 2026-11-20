@@ -31,7 +31,11 @@ from sama.runtime.contract import (
     RunConfig,
     RuntimeKind,
     SkillIndexEntry,
+    SubagentDefinition,
 )
+from sama.subagents import TOOLSET as SUBAGENT_TOOLSET
+from sama.subagents import SubagentError, parse_subagents
+from sama.subagents import resolve as resolve_subagents
 from sama.tenancy.authority import run_user
 
 if TYPE_CHECKING:
@@ -221,6 +225,7 @@ class PromptAssembler:
             environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
             skill_index=await self._skill_index(connection, run),
+            subagents=await _subagents(connection, run),
         )
 
     async def _skill_index(
@@ -260,6 +265,33 @@ async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[s
         audience=run.audience,
         kind=run.kind,
     )
+
+
+async def _subagents(
+    connection: AsyncConnection, run: ClaimedRun
+) -> tuple[SubagentDefinition, ...]:
+    """The native sub-agents of the run (Section 13.1): the sub-agents of the profile, limited
+    to the toolsets of the run. A run without the toolset ``subagents`` has none, and a runtime
+    without native sub-agents has none. A bad value in the column gives none and a warning, so
+    a run never fails because of it."""
+    toolsets = await _toolsets(connection, run)
+    if SUBAGENT_TOOLSET not in toolsets:
+        return ()
+    raw = (
+        await connection.execute(
+            select(AgentProfile.subagents).where(
+                AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id
+            )
+        )
+    ).scalar_one_or_none()
+    try:
+        specs = parse_subagents(raw if raw is not None else [])
+    except SubagentError as error:
+        log.warning(
+            "the sub-agents of a profile are not valid profile=%s: %s", run.agent_profile_id, error
+        )
+        return ()
+    return resolve_subagents(specs, toolsets=toolsets, runtime=RuntimeKind(run.runtime))
 
 
 async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:

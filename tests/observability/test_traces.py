@@ -304,3 +304,79 @@ async def test_a_transport_error_is_sent_again_only_before_the_request_left(
     with pytest.raises(LangfuseError) as caught:
         await _client(handler).send(build_trace(RunRecord(run=_run())))
     assert caught.value.retry is retry
+
+
+def _subagent_event(seq: int, text: str, **payload: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        seq=seq,
+        type="subagent_event",
+        payload={"subagent": "researcher", "text": text, **payload},
+        created_at=T0 + timedelta(seconds=seq),
+    )
+
+
+def test_a_subagent_invocation_is_one_agent_span_under_its_tool_call() -> None:
+    run = _run()
+    record = RunRecord(
+        run=run,
+        tool_calls=[_tool(call_id="toolu_1", tool_name="Agent")],
+        events=[
+            _subagent_event(1, "started: look", call_id="toolu_1"),
+            _subagent_event(2, "calls mcp__sama__lookup", call_id="toolu_1"),
+            _subagent_event(3, "completed: found it", call_id="toolu_1", done=True, tokens=42),
+        ],
+    )
+    root, tool, subagent = build_trace(record)
+    assert subagent.name == "subagent:researcher"
+    assert subagent.span_id == span_id(run.id, "subagent", "toolu_1")
+    assert subagent.parent_id == tool.span_id
+    assert subagent.start == T0 + timedelta(seconds=1)
+    assert subagent.end == T0 + timedelta(seconds=3)
+    attributes = subagent.attributes
+    assert attributes["langfuse.observation.type"] == "agent"
+    assert attributes["langfuse.observation.metadata.subagent"] == "researcher"
+    assert attributes["langfuse.observation.metadata.events"] == "3"
+    assert attributes["langfuse.observation.metadata.finished"] == "true"
+    assert attributes["langfuse.observation.metadata.tokens"] == "42"
+    assert attributes["langfuse.observation.output"] == (
+        "started: look\ncalls mcp__sama__lookup\ncompleted: found it"
+    )
+    assert root.parent_id is None
+
+
+def test_two_invocations_of_one_subagent_are_two_spans() -> None:
+    record = RunRecord(
+        run=_run(),
+        events=[
+            _subagent_event(1, "a", call_id="toolu_1"),
+            _subagent_event(2, "b", call_id="toolu_2"),
+            _subagent_event(3, "c", call_id="toolu_1"),
+        ],
+    )
+    spans = build_trace(record)[1:]
+    assert [s.attributes["langfuse.observation.metadata.events"] for s in spans] == ["2", "1"]
+    assert len({s.span_id for s in spans}) == 2
+
+
+def test_subagent_events_without_a_call_id_group_by_name_under_the_root() -> None:
+    record = RunRecord(run=_run(), events=[_subagent_event(1, "a"), _subagent_event(2, "b")])
+    root, subagent = build_trace(record)
+    assert subagent.parent_id == root.span_id
+    assert subagent.attributes["langfuse.observation.metadata.finished"] == "false"
+    assert "langfuse.observation.metadata.tokens" not in subagent.attributes
+
+
+def test_subagent_text_is_redacted_and_content_can_be_off() -> None:
+    secret = "sk-ant-api03-" + "a" * 40
+    record = RunRecord(run=_run(), events=[_subagent_event(1, f"key {secret}", call_id="toolu_1")])
+    with_content = build_trace(record)[1]
+    assert secret not in str(with_content.attributes)
+    assert "[REDACTED]" in str(with_content.attributes["langfuse.observation.output"])
+    without = build_trace(record, include_content=False)[1]
+    assert "langfuse.observation.output" not in without.attributes
+    assert without.attributes["langfuse.observation.metadata.events"] == "1"
+
+
+def test_subagent_events_do_not_become_compaction_events() -> None:
+    record = RunRecord(run=_run(), events=[_subagent_event(1, "a", call_id="toolu_1")])
+    assert [span.name for span in build_trace(record)] == ["run", "subagent:researcher"]

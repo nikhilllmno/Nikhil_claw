@@ -488,7 +488,7 @@ RunEvent = (
 | Sama tools | `mcp_servers` with the sama MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the sama tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
 | Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to sama. | Serialised `RunState` plus a sama `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
-| Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers) | Agents as tools and handoffs |
+| Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers). Sama sets it from the agent profile (Section 13.1). | Agents as tools and handoffs |
 | Skills | Native: sama writes the session's skills to `.claude/skills/` and sets the `skills` option. | `SandboxAgent` `Skills` capability with a sama skill source, or the sama `skill_view` tool. |
 | Compaction | Native auto-compaction. The `PreCompact` hook gives the full transcript to the sama archive first. `/compact [focus]` is a CLI slash command that the adapter sends for a compact request (M2.6, Section 6.3). | `Compaction` capability or `OpenAIResponsesCompactionSession`. The adapter sets `manual_compaction` and `compaction_archive` when it supports them (M3.6). |
 | Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with `Shell` and `Filesystem` capabilities (with `apply_patch`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
@@ -515,8 +515,12 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   (Section 10.3) does this job.
 - **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
   16.1). `allow` and `deny` go to the CLI.
-  `ask` becomes `defer`. A sub-agent cannot pause the run, so `ask` inside a sub-agent becomes
-  `deny`. If the gate fails, the call gets `deny`.
+  `ask` becomes `defer`. A sub-agent cannot pause the run, so the hook tells the gate that a
+  call is of a sub-agent (`child`, from the `agent_id` of the hook input). The gate gives `deny`
+  for it in place of `ask`, and it records no approval (Section 13.1). The runner sends `child` only
+  when it is true, so an older control plane that does not know the key still accepts the body of a
+  call of the main agent. If the gate fails, the
+  call gets `deny`.
 - **Pause.** On `defer`, the CLI ends the turn with `stop_reason` `tool_deferred` and
   `deferred_tool_use`. The adapter yields `ApprovalRequired`. The approval id is the tool use
   id. `runtime_state` holds the SDK session id, the run id, the usage, and the pending call.
@@ -556,7 +560,22 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   adapter. `max_tokens` is enforced by the model proxy.
 - **Errors.** Failure messages are fixed text. CLI error strings and the text of SDK
   exceptions can hold raw tool data, so they do not go into `RunFailed`.
-- **Sub-agents.** Messages with a `parent_tool_use_id` become `SubagentEvent`s.
+- **Sub-agents (M2.7).** The adapter sets the `agents` option from `RunConfig.subagents`
+  (Section 13.1). Each `SubagentDefinition` becomes one `AgentDefinition`. A native tool of
+  the definition keeps its name. Each other tool gets the prefix `mcp__sama__`. The
+  definition always has `disallowedTools` `Task` and `Agent`, `background` off, and the
+  model `inherit` when it has no model. With sub-agents, the adapter also sets
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` in the CLI env. Without it, the CLI starts a
+  sub-agent in the background, and the run can end before the sub-agent ends. The
+  `PreToolUse` hook denies `Task` and `Agent` before the gate when `subagent_type` is not a
+  name in the config (this also stops the built-in agents of the CLI) or when
+  `run_in_background` is set. Messages with a `parent_tool_use_id` become `SubagentEvent`s
+  with the id of the `Agent` call in `call_id`. The system messages `task_started` and
+  `task_notification` of a sub-agent give a start event and an end event (`done`, and
+  `tokens` when the CLI reports them). The adapter never cuts the text of an event, because it
+  has no redactor and a cut can split a secret. A text over 100,000 characters stays out, and a
+  fixed marker takes its place. The control plane redacts the text and then cuts it to 2,000
+  characters (Section 13.1).
   `compact_boundary` system messages become `Compacted`. The `trigger` of its
   `compact_metadata` (`manual` or `auto`) goes into the event (M2.6).
 - **Compaction (M2.6).** With an `archiver`, the adapter adds a `PreCompact` hook next to the
@@ -1672,6 +1691,7 @@ name) is written. The review must propose again.
 | `sessions` | `session_search`, `session_read` (since M2.5, Section 7.1) | Sama MCP |
 | `clarify` | `clarify` (1 to 5 questions, choices or free text, rendered per channel) | Sama MCP |
 | `code_exec` | `execute_code` (Python that calls sama tools through a local RPC stub) | Sandbox, tools through MCP |
+| `subagents` | `Task` and `Agent`, the native tool of Claude that starts a sub-agent (since M2.7, Section 13.1). It is separate from `delegation`. | Runtime, in the sandbox |
 | `delegation` | `delegate_task`, `delegate_status` | Sama MCP |
 | `cron` | `cronjob_manage` (create, list, update, pause, resume, remove, run, cancel) | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
@@ -1690,7 +1710,8 @@ A profile also has a **group set**: the toolsets that a chat run in a shared ses
 (Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`, and
 `media`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`, `browser`,
 `workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The default
-profile of the first org has `tool_search` since migration `0018` (M2.6).
+profile of the first org has `tool_search` since migration `0018` (M2.6) and `subagents`
+since migration `0019` (M2.7). The default group set has no `subagents`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -2586,6 +2607,91 @@ Limits for `delegate_task` (Hermes defaults): depth 1 unless the profile allows 
 children (`delegate_task`, `memory` writes, `cronjob_manage`, `clarify`, and outbound
 messages). Children inherit the parent's approval policy and can only narrow it.
 
+### 13.1 Native sub-agents (M2.7)
+
+A native sub-agent is a short side task inside one run. It has its own prompt, its own tools,
+and an empty context. Only its final answer goes back to the main agent. Only a runtime with
+the capability `native_subagents` has them. This is Claude today (Section 5.3).
+
+**Profile.** `agent_profiles.subagents` (migration `0019`) is a JSON list of at most 8 specs.
+It is empty by default. A spec has:
+
+| Field | Rule |
+|---|---|
+| `name` | Lowercase letters, digits, and single hyphens. 40 characters at most. Unique in the profile. |
+| `description` | 1 to 300 characters. It tells the main agent when to use the sub-agent. |
+| `prompt` | 1 to 8,000 characters. The system prompt of the sub-agent. |
+| `toolsets` | Names of toolsets. No duplicates. |
+| `model` | Not set or `inherit`: the model of the run. Else a model id that has a price in the price table. |
+| `max_turns` | Not set, or 1 to 50. |
+
+**Write.** `set_profile_subagents` is the only code that writes the column. It locks the
+profile and checks the specs. It rejects the specs when: the runtime of the profile has no
+`native_subagents`; the profile has no `subagents` toolset; a spec uses a toolset that the
+profile does not have, or `subagents`, `clarify`, or `tool_search`; a model has no price; or the description
+or the prompt has a secret or a finding of the injection scan (Section 6.1). The error text
+has only the names of the fields of the schema and fixed messages. It never has the text of a
+spec, and it never has the name of an unknown key: such a key shows as `unknown field`. The function writes an audit entry
+`profile.subagents_set` with the names of the sub-agents only. The admin command
+`python -m sama.admin subagents show|set --org <id> --profile <id> [--file <path>]` calls it.
+The command first gives the redactor the secrets of the environment and the vault of
+the org, so a secret that no pattern matches is also found in a spec. It fails closed: it reads
+the vault in one strict refresh, and it stops when any entry does not decrypt or the vault cannot
+be read. It also stops when the org has vault entries but `SAMA_VAULT_KEY` is not set. There is no HTTP API for it yet.
+
+**Build.** The prompt assembler (Section 6.1) turns the specs into `SubagentDefinition`
+objects and puts them in `RunConfig.subagents`. The config is frozen with the session (D9),
+so a change applies from the next session. A definition has sama tool names. The tools are
+the tools of the toolsets of the spec that the run also has, so a sub-agent never has more
+tools than the run. A shared chat run has the group set, which has no `subagents` by default,
+so it has no sub-agents. The assembler gives no sub-agents when the run has no `subagents`
+toolset, when the runtime has no `native_subagents` (it writes a warning), and for a review
+run. A column with a bad value gives no sub-agents and a warning, and the run goes on. The
+fingerprint of a config without sub-agents does not change.
+
+**Rules at run time.**
+
+- A sub-agent cannot start a sub-agent, and it cannot ask a person. The toolsets `subagents`,
+  `clarify`, and `tool_search` are never in a definition (`tool_search` reaches each deferred
+  tool of the run with the authority of the run), and the adapter adds `Task` and `Agent` to
+  `disallowedTools`.
+- The model can start only the sub-agents of the config. The hook denies the built-in agents
+  of the CLI (`general-purpose`, `Explore`, `Plan`) and every call without a known
+  `subagent_type`.
+- The tool gate judges the `Agent` call, and it judges each tool call inside the sub-agent
+  with its own call id. `Agent` and `Task` are allowed without a rule when the run has the
+  toolset `subagents`. A rule can still deny them.
+- A sub-agent cannot pause the run. The gate gets `child` for a call inside a sub-agent. For
+  such a call, it changes `ask` to `deny` before it records anything: the `tool_calls` row is
+  `denied`, and there is no pending approval and no `approval.requested` entry. A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it.
+- A sub-agent runs in the foreground. The adapter turns off the background tasks of the CLI.
+
+**Budget.** The model calls of a sub-agent go through the model proxy (D6) with the run
+token, and the cost goes into the usage of the run. So the budgets of the run, the session,
+and the org apply. `max_turns` limits one sub-agent call (50 at most). The proxy does not
+know which sub-agent made a call, so the cost of one sub-agent is not in the data.
+
+**Traces.** The adapter sends `SubagentEvent`s with `call_id` (the `Agent` call), `done`, and
+`tokens`. The control plane stores them as `run_events` of the type `subagent_event`. The
+trace exporter (Section 18.2) groups them by `call_id` and writes one span `subagent:<name>`
+for each call, with the type `agent`. A span of a call that has no id uses the name. At most
+200 event lines go in one span. The gate rows of the tool calls of a sub-agent are children of
+the root and not of the sub-agent span, because the gate does not receive the sub-agent id.
+
+#### 13.1.1 Assumptions
+
+| # | Assumption |
+|---|---|
+| A1 | Sub-agents belong to the agent profile and are frozen with the session config (D9). |
+| A2 | A spec uses toolsets, not tools. The profile must have each toolset, and the build uses only the toolsets that the run has. `subagents`, `clarify`, and `tool_search` are never given. Deferred and connector tools are not given. |
+| A3 | A gate `ask` inside a sub-agent is `deny`, because nobody can approve it. The gate does this when it gets `child`, before it records an approval. The adapter also maps `ask` to `deny` for a gate that does not. |
+| A4 | `Task` and `Agent` are allowed by default and need the `subagents` toolset. The default profile of the first org has it. The default group set does not. |
+| A5 | The built-in agents of the CLI and background sub-agents are not allowed. The adapter sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for a config with sub-agents. |
+| A6 | A runtime without `native_subagents` ignores sub-agents. The assembler logs a warning, and the write rejects them. A review run has none. |
+| A7 | The model of a sub-agent is `inherit` or a priced Anthropic model id. |
+| A8 | The spend of a sub-agent is limited by the budgets of the run and by `max_turns`. The tokens of one sub-agent come from the CLI task message when the CLI reports them. |
+| A9 | The runner never cuts the text of a `SubagentEvent`. The control plane redacts it and then cuts it, so a secret cannot lose a part to a cut before the redaction (same rule as the archive, M2.6 A6). |
+
 ---
 
 ## 14. Browser use and the Chrome extension
@@ -2780,7 +2886,7 @@ Rules of the steps:
   `Grep`, `WebFetch`), `todo` (`todo`, `TodoWrite`), `web` (`web_search`, `web_extract`),
   `clarify`, `github` (`repo_clone`, M1.16), and `skills` (`skills_list`, `skill_view`,
   `skill_manage`, M2.2; allowed without a rule, because the store checks the role of the
-  user). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
+  user), and `subagents` (`Task`, `Agent`, M2.7). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
   default is an empty list, so a new profile can use no tool until an admin sets its toolsets.
 - **Hardline.** Recursive deletes of `/`, `~`, `$HOME`, or a top-level system folder;
   `--no-preserve-root`; fork bombs; `mkfs`, `wipefs`, `blkdiscard`; `dd`, `shred`, or `>` to
@@ -2805,7 +2911,9 @@ Rules of the steps:
   prefix. A `deny` at any level wins. An org or profile `ask` holds over a user rule. Else
   the user rule wins, then the profile rule, then the org rule. Without a rule, read-only
   tools are allowed (`ToolSearch`, `Read`, `Glob`, `Grep`, `todo`, `TodoWrite`,
-  `web_search`, `web_extract`, `clarify`), and `repo_clone`, which only copies public data into the
+  `web_search`, `web_extract`, `clarify`), the sub-agent tools `Task` and `Agent` (a run needs
+  the toolset `subagents`, and each call of the sub-agent has its own check, Section 13.1),
+  and `repo_clone`, which only copies public data into the
   sandbox. Every other tool gets `ask`. The classifier comes later.
 - **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
   `deny`, and `ask` becomes `deny`. Job pre-approvals come with jobs (M3); until then the set
@@ -3309,7 +3417,7 @@ environment as the default (Section 16.3).
 | `orgs` | Tenant, plan, limits, region |
 | `workspaces` | Units inside an org |
 | `users`, `memberships` | Users and their role per org and workspace (`owner`, `admin`, `member`) |
-| `agent_profiles` | SOUL, runtime, model, toolsets, skills, policy, budgets |
+| `agent_profiles` | SOUL, runtime, model, toolsets, sub-agents, skills, policy, budgets |
 | `channel_identities`, `channel_groups`, `pairing_codes`, `session_bindings` | Paired Slack and Telegram identities and groups, pairing codes, chat-to-session bindings |
 | `vault_secrets`, `connections`, `connector_hosts` | Encrypted secrets, connections of all kinds (Section 10.3), connector host state (Section 10.5) |
 
@@ -3334,7 +3442,7 @@ migrated schema.
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
-| `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `group_toolsets` (migration `0017`), `skills`, `policy`, `budget` |
+| `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `group_toolsets` (migration `0017`), `subagents` (migration `0019`), `skills`, `policy`, `budget` |
 | `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content`, `search_vector` (generated, GIN index) and `embedded_at` (migration `0014`, Section 7.1) |
 | `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2), `compact` and `compact_focus` (migration `0018`, Section 6.3) |
@@ -3460,6 +3568,7 @@ runtimes.
 | Root, type `agent`, name `run` | `runs`, the profile name | Input: the user message. Output: the answer. Level `ERROR` and the failure code for a failed run, `WARNING` for a cancelled run. |
 | `generation`, name = model | `model_calls` (Section 16.6) | Model, tokens (`input`, `output`, cache read, cache write), cost in USD, provider, endpoint, status. Start = end minus `duration_ms`. `ERROR` for a status of 400 or more. |
 | `tool`, name = tool | `tool_calls`, `run_events` | Gate decision and status. `ERROR` when failed, `WARNING` when denied. With `SAMA_TRACE_CONTENT`, the redacted arguments as input and the redacted output preview of `tool_call_finished` as output, at most 4,000 characters each. |
+| `agent`, name `subagent:<name>` | `run_events` (`subagent_event`) | One for each sub-agent call (M2.7, Section 13.1). The parent is the `tool` span of the `Agent` call. Metadata: the name, the number of events, `finished`, the call id, and the tokens that the CLI reports. With `SAMA_TRACE_CONTENT`, the redacted event lines as output, at most 4,000 characters. |
 | `event` | `run_events` | `approval` (the tool name) and `compaction` (tokens before and after). |
 
 - The trace id is the run id. The span ids come from a hash of the run id and the row, so the

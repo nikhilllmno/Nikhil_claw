@@ -26,6 +26,8 @@ from sama.runtime import (
     RuntimeKind,
     RuntimeRegistry,
     SkillIndexEntry,
+    SubagentDefinition,
+    SubagentEvent,
     TextDelta,
     ToolCallStarted,
     ToolSchema,
@@ -357,3 +359,73 @@ def test_a_compacted_event_says_who_started_it() -> None:
     assert Compacted(tokens_before=2, tokens_after=1, trigger="manual").trigger == "manual"
     with pytest.raises(ValidationError):
         Compacted(tokens_before=2, tokens_after=1, trigger="other")  # type: ignore[arg-type]
+
+
+# --- native sub-agents ---------------------------------------------------------------------------
+
+
+def researcher(**changes: Any) -> SubagentDefinition:
+    values: dict[str, Any] = {"name": "researcher", "description": "Looks.", "prompt": "Look."}
+    values.update(changes)
+    return SubagentDefinition(**values)
+
+
+def test_the_fingerprint_does_not_change_for_a_config_without_subagents() -> None:
+    base = make_config()
+    assert base.model_copy(update={"subagents": ()}).fingerprint() == base.fingerprint()
+    with_one = base.model_copy(update={"subagents": (researcher(),)})
+    assert with_one.fingerprint() != base.fingerprint()
+    other = base.model_copy(update={"subagents": (researcher(prompt="Other."),)})
+    assert other.fingerprint() not in {base.fingerprint(), with_one.fingerprint()}
+
+
+def test_a_subagent_has_limits() -> None:
+    assert researcher(tools=("Read", "lookup"), max_turns=50).max_turns == 50
+    bad: list[dict[str, Any]] = [
+        {"name": "Researcher"},
+        {"name": "a_b"},
+        {"name": "-a"},
+        {"name": "a" * 41},
+        {"description": ""},
+        {"description": "d" * 301},
+        {"prompt": ""},
+        {"prompt": "p" * 8001},
+        {"max_turns": 0},
+        {"max_turns": 51},
+        {"tools": ("Read", "Read")},
+        {"tools": tuple(f"t{i}" for i in range(65))},
+        {"model": ""},
+        {"unknown": 1},
+    ]
+    for changes in bad:
+        with pytest.raises(ValidationError):
+            researcher(**changes)
+
+
+def test_two_subagents_cannot_have_the_same_name() -> None:
+    with pytest.raises(ValidationError, match="researcher"):
+        RunConfig(runtime=RuntimeKind.FAKE, model="m", subagents=(researcher(), researcher()))
+
+
+def test_a_subagent_event_has_defaults_and_a_limit() -> None:
+    event = SubagentEvent(subagent="researcher", text="x")
+    assert (event.call_id, event.done, event.tokens) == (None, False, None)
+    with pytest.raises(ValidationError):
+        SubagentEvent(subagent="researcher", text="x", tokens=-1)
+
+
+def test_a_subagent_text_is_bounded_without_a_cut() -> None:
+    from sama.runtime.contract import (
+        SUBAGENT_STORED_MAX_CHARS,
+        SUBAGENT_WIRE_MAX_CHARS,
+        bound_subagent_text,
+        clip_subagent_text,
+    )
+
+    assert bound_subagent_text("abc") == "abc"
+    assert bound_subagent_text("a" * SUBAGENT_WIRE_MAX_CHARS) == "a" * SUBAGENT_WIRE_MAX_CHARS
+    marker = bound_subagent_text("a" * (SUBAGENT_WIRE_MAX_CHARS + 1))
+    assert "a" not in marker.replace("characters", "").replace("a text", "")
+    assert clip_subagent_text("a" * 5_000) == "a" * SUBAGENT_STORED_MAX_CHARS
+    with pytest.raises(ValidationError):
+        SubagentEvent(subagent="r", text="a" * (SUBAGENT_WIRE_MAX_CHARS + 1))

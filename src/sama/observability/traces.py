@@ -7,7 +7,9 @@ plane builds the trace of a run after the run ends, from the rows that it alread
 - ``messages``: the input and the output of the root span,
 - ``model_calls`` from the model proxy: one ``generation`` per model call, with tokens and cost,
 - ``tool_calls`` from the tool gate: one ``tool`` span per call, with the decision and status,
-- ``run_events``: an ``event`` for each approval pause and each compaction.
+- ``run_events``: an ``event`` for each approval pause and each compaction, and one ``agent``
+  span for each invocation of a native sub-agent (Section 13.1). The span has the sub-agent
+  events as lines of text. It is a child of the span of the tool call that started it.
 
 The same code works for both runtimes. ``TraceExporter`` sends one trace per ended run and
 marks the run with ``trace_exported_at``. Two exporters never send the same run, because
@@ -59,7 +61,10 @@ MAX_TEXT_CHARS: Final = 20_000
 MAX_TOOL_CHARS: Final = 4_000
 """The arguments and the output of a tool span are cut at this length."""
 EVENT_TYPES: Final = ("approval_required", "compacted")
+SUBAGENT_EVENT: Final = "subagent_event"
 TOOL_FINISHED: Final = "tool_call_finished"
+MAX_SUBAGENT_LINES: Final = 200
+"""A sub-agent span has at most this number of lines of text."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +205,8 @@ def build_trace(
         )
 
     for event in record.events:
+        if event.type == SUBAGENT_EVENT:
+            continue
         attributes = {**shared, "langfuse.observation.type": "event"}
         payload = event.payload or {}
         if event.type == "approval_required":
@@ -219,6 +226,56 @@ def build_trace(
                 event.created_at,
                 event.created_at,
                 parent_id=root_id,
+                attributes=attributes,
+            )
+        )
+    spans += _subagent_spans(record, shared, root_id, include_content=include_content)
+    return spans
+
+
+def _subagent_spans(
+    record: RunRecord, shared: Mapping[str, AttributeValue], root_id: str, *, include_content: bool
+) -> list[Span]:
+    """One span for each invocation of a sub-agent. The events of an invocation have the id of
+    the tool call that started it. An event without it goes to a group of its sub-agent."""
+    run = record.run
+    groups: dict[str, list[Any]] = {}
+    for event in record.events:
+        if event.type != SUBAGENT_EVENT or not isinstance(event.payload, Mapping):
+            continue
+        key = event.payload.get("call_id") or f"name:{event.payload.get('subagent', '')}"
+        groups.setdefault(str(key), []).append(event)
+    tool_ids = {tool.call_id for tool in record.tool_calls}
+    spans: list[Span] = []
+    for key, events in groups.items():
+        payloads = [event.payload for event in events]
+        name = str(payloads[0].get("subagent") or "subagent")
+        done = [payload for payload in payloads if payload.get("done")]
+        attributes: dict[str, AttributeValue] = {
+            **shared,
+            "langfuse.observation.type": "agent",
+            "langfuse.observation.metadata.subagent": redact(name),
+            "langfuse.observation.metadata.events": str(len(events)),
+            "langfuse.observation.metadata.finished": "true" if done else "false",
+        }
+        if key in tool_ids:
+            attributes["langfuse.observation.metadata.call_id"] = key
+        tokens = done[-1].get("tokens") if done else None
+        if tokens is not None:
+            attributes["langfuse.observation.metadata.tokens"] = str(tokens)
+        if include_content:
+            lines = [redact(str(payload.get("text", ""))) for payload in payloads]
+            attributes["langfuse.observation.output"] = _cut(
+                "\n".join(lines[:MAX_SUBAGENT_LINES]), MAX_TOOL_CHARS
+            )
+        spans.append(
+            Span(
+                run.id.hex,
+                span_id(run.id, "subagent", key),
+                f"subagent:{redact(name)}",
+                events[0].created_at,
+                events[-1].created_at,
+                parent_id=span_id(run.id, "tool", key) if key in tool_ids else root_id,
                 attributes=attributes,
             )
         )
@@ -375,7 +432,7 @@ async def _load(connection: AsyncConnection, run: Any) -> RunRecord:
             .where(
                 RunEvent.org_id == run.org_id,
                 RunEvent.run_id == run.id,
-                RunEvent.type.in_((*EVENT_TYPES, TOOL_FINISHED)),
+                RunEvent.type.in_((*EVENT_TYPES, SUBAGENT_EVENT, TOOL_FINISHED)),
             )
             .order_by(RunEvent.seq)
         )

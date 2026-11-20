@@ -660,3 +660,30 @@ def test_effective_call_is_the_inner_call() -> None:
     # Bad arguments stay the call itself, so the record shows what the model sent.
     assert effective_call("tool_call", {"name": 1}) == ("tool_call", {"name": 1})
     assert effective_call("mcp__sama__todo", {"x": 1}) == ("todo", {"x": 1})
+
+
+# -- native sub-agents (Section 13.1) ----------------------------------------------------------
+
+
+def test_the_subagents_toolset_has_the_agent_tools() -> None:
+    assert TOOLSETS["subagents"] == frozenset({"Task", "Agent"})
+    assert "subagents" in DEFAULT_TOOLSETS
+    assert "subagents" not in DEFAULT_GROUP_TOOLSETS
+
+
+def test_a_subagent_call_is_allowed_with_the_toolset_and_denied_without_it() -> None:
+    arguments = {"subagent_type": "researcher", "prompt": "x"}
+    with_toolset = context(toolsets=frozenset({"subagents"}))
+    for tool in ("Agent", "Task"):
+        assert decide(with_toolset, tool, arguments).action == "allow"
+        denied = decide(context(toolsets=ALL), tool, arguments)
+        assert (denied.action, denied.step) == ("deny", GateStep.TOOLSET)
+
+
+def test_a_rule_can_deny_the_subagent_tool() -> None:
+    verdict = decide(
+        context(toolsets=frozenset({"subagents"}), rules=(rule("Agent", "deny"),)),
+        "Agent",
+        {"subagent_type": "researcher"},
+    )
+    assert verdict.action == "deny"

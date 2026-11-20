@@ -1,11 +1,16 @@
 """Admin commands (docs/architecture.md, Sections 16.3 and 19.4):
 
 - ``python -m sama.admin bootstrap ...``: the first org, owner, workspace, and agent profile.
+- ``python -m sama.admin subagents show|set --org <id> --profile <id> [--file <path>]``: the
+  native sub-agents of an agent profile (Section 13.1). ``set`` reads a JSON list of sub-agent
+  specs from the file, or from stdin, and replaces the list. It applies from the next session.
 - ``python -m sama.admin secret set|list|delete --org <id> [--name <name>]``: the vault
   entries of an org. ``set`` reads the value from stdin, so the value is not in the shell
   history or the process list.
 
-It uses ``SAMA_DATABASE_URL``, and ``SAMA_VAULT_KEY`` for ``secret``. Run it on a control
+It uses ``SAMA_DATABASE_URL``, and ``SAMA_VAULT_KEY`` for ``secret``. ``subagents set`` also
+gives the redactor the secrets of the environment and the vault values, so the check of a spec
+finds an opaque secret. It stops when the vault cannot be read (fail closed). Run it on a control
 plane machine, for example with ``fly ssh console -C "python -m sama.admin bootstrap ..."``.
 """
 
@@ -19,11 +24,19 @@ import json
 import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Owner, bootstrap
 from sama.db.engine import create_engine
+from sama.db.models import VaultSecret
+from sama.subagents import SubagentError, parse_subagents, profile_subagents, set_profile_subagents
 from sama.vault.crypto import VaultKey
+from sama.vault.redact import default_redactor, env_secrets
+from sama.vault.standalone import vault_from_env
 from sama.vault.store import SecretName, Vault
 
 
@@ -85,6 +98,79 @@ async def _secret(args: argparse.Namespace) -> dict[str, Any]:
         await engine.dispose()
 
 
+ENV_SECRETS = (
+    "SAMA_RUN_TOKEN_KEY",
+    "SAMA_DATABASE_URL",
+    "SAMA_VAULT_KEY",
+    "SAMA_SUPABASE_JWT_SECRET",
+    "SAMA_ALERT_SLACK_WEBHOOK_URL",
+    "LANGFUSE_SECRET_KEY",
+    "E2B_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "BRAVE_API_KEY",
+)
+"""The environment variables that hold a secret of the control plane. The redactor knows their
+values before the sub-agent specs are checked."""
+
+VAULT_UNREADABLE = "the vault cannot be read, so the sub-agents are not stored"
+
+
+async def _know_the_secrets(engine: AsyncEngine, org_id: uuid.UUID) -> None:
+    """Gives the redactor the environment secrets and every vault value, as the control plane
+    does at start (Section 16.3). A spec with an opaque known secret is then not stored.
+
+    Fails closed: if the vault key is bad, the table cannot be read, or an entry does not
+    decrypt, there is no write. Without ``SAMA_VAULT_KEY`` the org must have no vault entry.
+    """
+    default_redactor().add(*env_secrets(*ENV_SECRETS))
+    try:
+        vault = vault_from_env(engine)
+        if vault is None:
+            async with engine.connect() as connection:
+                stored = (
+                    await connection.execute(
+                        select(func.count()).where(VaultSecret.org_id == org_id)
+                    )
+                ).scalar_one()
+            if stored:
+                raise SystemExit("set SAMA_VAULT_KEY: the org has vault entries")
+            return
+        # Strict: one read, and any entry that does not decrypt raises. No count to compare.
+        await vault.refresh_redactor(strict=True)
+    except SystemExit:
+        raise
+    except Exception:
+        # No detail: the text of a database error can have the connection URL.
+        raise SystemExit(VAULT_UNREADABLE) from None
+
+
+async def _subagents(args: argparse.Namespace, raw: Any) -> dict[str, Any]:
+    engine = create_engine(_database_url())
+    try:
+        result: dict[str, Any] = {"org_id": str(args.org), "profile_id": str(args.profile)}
+        if args.action == "set":
+            await _know_the_secrets(engine, args.org)
+            await set_profile_subagents(engine, args.org, args.profile, parse_subagents(raw))
+        specs = await profile_subagents(engine, args.org, args.profile)
+        return result | {"subagents": [spec.model_dump(mode="json") for spec in specs]}
+    finally:
+        await engine.dispose()
+
+
+def _subagents_command(args: argparse.Namespace) -> int:
+    try:
+        raw: Any = None
+        if args.action == "set":
+            raw = json.loads(Path(args.file).read_text("utf-8") if args.file else sys.stdin.read())
+        print(json.dumps(asyncio.run(_subagents(args, raw))))
+    except (SubagentError, ValueError, OSError) as error:
+        # ``ValueError`` has the JSON errors. The message has no spec text.
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m sama.admin")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -108,7 +194,16 @@ def main(argv: list[str] | None = None) -> int:
     secret.add_argument("action", choices=("set", "list", "delete"))
     secret.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
     secret.add_argument("--name", choices=[name.value for name in SecretName])
+    subagents = commands.add_parser(
+        "subagents", help="Show or replace the native sub-agents of an agent profile."
+    )
+    subagents.add_argument("action", choices=("show", "set"))
+    subagents.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
+    subagents.add_argument("--profile", type=uuid.UUID, required=True, help="The profile id.")
+    subagents.add_argument("--file", help="The JSON file of the specs. Without it, stdin.")
     args = parser.parse_args(argv)
+    if args.command == "subagents":
+        return _subagents_command(args)
     if args.command == "secret":
         if args.action != "list" and args.name is None:
             parser.error(f"secret {args.action} needs --name")

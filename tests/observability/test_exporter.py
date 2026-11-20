@@ -8,10 +8,10 @@ from typing import Any
 
 import httpx
 from pydantic import SecretStr
-from sqlalchemy import select, text
+from sqlalchemy import insert, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Run
+from sama.db.models import Run, RunEvent
 from sama.observability.langfuse import LangfuseClient
 from sama.observability.traces import TraceExporter
 from tests.observability.conftest import add_details, add_run
@@ -198,3 +198,35 @@ async def test_a_run_waits_until_its_usage_is_stored(engine: AsyncEngine, tenant
     )
     assert await exporter.export_pending() == 1
     assert langfuse.trace_ids() == [ready.hex]
+
+
+async def test_subagent_events_are_exported_as_a_span(engine: AsyncEngine, tenant: Tenant) -> None:
+    langfuse = Langfuse()
+    exporter = langfuse.exporter(engine)
+    run_id = await add_run(engine, tenant)
+    keys = {"org_id": tenant.org, "session_id": tenant.ids["s1"], "run_id": run_id}
+    async with engine.begin() as connection:
+        for seq, payload in enumerate(
+            [
+                {"subagent": "researcher", "text": "started: look", "call_id": "toolu_1"},
+                {
+                    "subagent": "researcher",
+                    "text": "completed: ok",
+                    "call_id": "toolu_1",
+                    "done": True,
+                    "tokens": 7,
+                },
+            ],
+            start=1,
+        ):
+            await connection.execute(
+                insert(RunEvent).values(seq=seq, type="subagent_event", payload=payload, **keys)
+            )
+    assert await exporter.export_pending() == 1
+    spans = langfuse.traces[0]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    assert [span["name"] for span in spans] == ["run", "subagent:researcher"]
+    attributes = {a["key"]: a["value"] for a in spans[1]["attributes"]}
+    assert attributes["langfuse.observation.metadata.tokens"] == {"stringValue": "7"}
+    assert attributes["langfuse.observation.output"] == {
+        "stringValue": "started: look\ncompleted: ok"
+    }

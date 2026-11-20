@@ -206,6 +206,7 @@ class ScriptedGate:
     def __init__(self, decision: GateDecision | Exception) -> None:
         self.decision = decision
         self.calls: list[tuple[str, Mapping[str, Any]]] = []
+        self.children: list[bool] = []
 
     async def check(
         self,
@@ -214,15 +215,21 @@ class ScriptedGate:
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision:
         self.calls.append((tool_name, arguments))
+        self.children.append(child)
         if isinstance(self.decision, Exception):
             raise self.decision
         return self.decision
 
 
 def call_hook(
-    tool_name: str, call_id: str, *, subagent: bool = False
+    tool_name: str,
+    call_id: str,
+    *,
+    subagent: bool = False,
+    tool_input: Mapping[str, Any] | None = None,
 ) -> Callable[[FakeClient], Any]:
     """A step that runs the PreToolUse hook of the options, like the CLI does."""
 
@@ -232,7 +239,7 @@ def call_hook(
         data: dict[str, Any] = {
             "hook_event_name": "PreToolUse",
             "tool_name": tool_name,
-            "tool_input": {"to": "a@b.c"},
+            "tool_input": dict(tool_input) if tool_input is not None else {"to": "a@b.c"},
             "tool_use_id": call_id,
             "session_id": SESSION,
             "transcript_path": "",

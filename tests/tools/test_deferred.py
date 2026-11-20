@@ -149,7 +149,13 @@ class VisibleGate:
     screens: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
     async def check(
-        self, claims: RunTokenClaims, call_id: str, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        claims: RunTokenClaims,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        child: bool = False,
     ) -> Verdict:
         return self.verdict
 
@@ -276,7 +282,13 @@ class StaticGate:
     """A gate that allows every call and has no ``visible_tools``."""
 
     async def check(
-        self, claims: RunTokenClaims, call_id: str, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        claims: RunTokenClaims,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        child: bool = False,
     ) -> Verdict:
         return Verdict("allow", GateStep.POLICY, "ok")
 

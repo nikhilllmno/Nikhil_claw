@@ -1,0 +1,4 @@
+# Test fixtures (not real secrets) in commit ed66e65 of the branch vorflux/m2-subagents.
+# A later commit renamed the variables. The squash merge does not contain these lines.
+ed66e65381f3c73774cc9bad42200527580f6bda:tests/orchestrator/test_queue.py:generic-api-key:281
+ed66e65381f3c73774cc9bad42200527580f6bda:tests/runtime/test_claude_subagents.py:generic-api-key:236
