@@ -14,8 +14,8 @@ webhook subscription of an org) and ``trigger:<id>`` (the signing secret of one 
 Row level security: a member of the workspace (or an org admin) sees its triggers. An event row
 shows to the users who can read its session. The control plane writes both tables as the owner.
 
-Revision ID: 0027
-Revises: 0026
+Revision ID: 0028
+Revises: 0027
 Create Date: 2026-11-21
 """
 
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0027"
-down_revision: str | None = "0026"
+revision: str = "0028"
+down_revision: str | None = "0027"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

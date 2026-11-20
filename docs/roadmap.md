@@ -173,7 +173,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 note
   with the profile of the bot. The gateway does not start a run after the bot spent its daily
   budget (UTC day), and the live authority limits a running run to the rest of the budget. Not
   in M3.10: a web page for the bots, and bots in Telegram.
-- M4.4: event triggers in `src/sama/triggers/` (architecture Section 12.2). Migration `0027`
+- M4.4: event triggers in `src/sama/triggers/` (architecture Section 12.2). Migration `0028`
   adds `triggers` and `trigger_events` with RLS, `runs.toolsets`, and the vault names
   `trigger:<uuid>` and `composio_webhook_secret`. A webhook trigger has its own URL and secret
   and uses the Standard Webhooks signature. A Composio trigger is a Composio trigger instance on
