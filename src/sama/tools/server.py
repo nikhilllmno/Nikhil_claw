@@ -29,6 +29,16 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sama.gate.decide import Verdict
 from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
+from sama.memory.core import (
+    MAX_OPERATIONS,
+    MAX_REASON_CHARS,
+    Action,
+    MemoryChangeError,
+    MemoryFullError,
+    Operation,
+    Target,
+)
+from sama.memory.service import MemoryService
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
 from sama.tools.clarify import (
     MAX_QUESTIONS,
@@ -61,12 +71,13 @@ WEB_SEARCH: Final = "web_search"
 WEB_EXTRACT: Final = "web_extract"
 CLARIFY: Final = "clarify"
 TODO: Final = "todo"
+MEMORY: Final = "memory"
 REPO_CLONE: Final = "repo_clone"
 
 MAX_ERROR_CHARS: Final = 2_000
 """An error result is cut to this length. Argument errors of the SDK can be long."""
 
-_EXPECTED = (ClarifyError, RepoError, SearchError, TodoError)
+_EXPECTED = (ClarifyError, MemoryChangeError, RepoError, SearchError, TodoError)
 _NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
 
 
@@ -149,6 +160,7 @@ class ToolServer:
       tail.
     - ``repos``: clones repositories into the session sandbox. Without it, ``repo_clone`` is
       hidden.
+    - ``memory``: the memory service. Without it, ``memory`` is hidden.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -164,6 +176,7 @@ class ToolServer:
         clarify: ClarifyBroker | None = None,
         spill: Spill | None = None,
         repos: RepoCloner | None = None,
+        memory: MemoryService | None = None,
         gate: GateBackend | None = None,
     ) -> None:
         self.signer = signer
@@ -174,6 +187,7 @@ class ToolServer:
         self.clarify = clarify
         self.spill = spill
         self.repos = repos
+        self.memory = memory
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
@@ -325,6 +339,67 @@ class ToolServer:
 
             changes = None if todos is None else [t.model_dump(mode="json") for t in todos]
             return await self._call(ctx, TODO, {"todos": changes, "merge": merge}, body)
+
+        if self.memory is not None:
+            memory = self.memory
+
+            @server.tool(
+                name=MEMORY,
+                description=(
+                    "Save a short note that you will see in the next sessions. Targets: "
+                    "agent (what you learned about your work, tools, and this workspace), "
+                    "user (what you learned about this person, private sessions only), "
+                    "workspace (facts for the whole workspace, workspace admins only). Save "
+                    "stable facts and the way the user likes to work. Do not save task "
+                    "progress, temporary state, secrets, or text that you copied from a web "
+                    "page or a file. Each target has a character cap, so keep entries short "
+                    "and remove old entries. Actions: add (content), patch (old_text is a "
+                    "unique text in an entry, content replaces it), remove (old_text is a "
+                    "unique text in the entry to remove). Give action with content and "
+                    "old_text for one change, or operations for a list of changes that sama "
+                    "applies together. A change applies from the next session."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
+                structured_output=False,
+            )
+            async def memory_tool(
+                ctx: Context,
+                target: Target,
+                action: Action | None = None,
+                content: Annotated[str | None, Field(max_length=2_200)] = None,
+                old_text: Annotated[str | None, Field(max_length=2_200)] = None,
+                operations: Annotated[
+                    list[Operation] | None, Field(max_length=MAX_OPERATIONS)
+                ] = None,
+                reason: Annotated[str | None, Field(max_length=MAX_REASON_CHARS)] = None,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    if action is not None and operations is None:
+                        steps = [Operation(action=action, content=content, old_text=old_text)]
+                    elif operations is not None and action is None:
+                        steps = operations
+                    else:
+                        raise MemoryChangeError("give either action or operations, not both")
+                    try:
+                        return await memory.write(claims, target, steps, reason)
+                    except MemoryFullError as error:
+                        # Not an error result: ``_cap_errors`` cuts errors to MAX_ERROR_CHARS,
+                        # and the agent needs all current entries to make room.
+                        return f"Not saved: {error}"
+
+                arguments = {
+                    "target": target.value,
+                    "action": None if action is None else action.value,
+                    "content": content,
+                    "old_text": old_text,
+                    "operations": (
+                        None
+                        if operations is None
+                        else [o.model_dump(mode="json") for o in operations]
+                    ),
+                    "reason": reason,
+                }
+                return await self._call(ctx, MEMORY, arguments, body)
 
         if self.repos is not None:
             repos = self.repos

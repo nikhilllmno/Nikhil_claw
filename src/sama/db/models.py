@@ -846,3 +846,99 @@ class VaultSecret(Base):
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
+
+
+MEMORY_SCOPES: Final = ("agent", "user", "workspace")
+MEMORY_ACTIONS: Final = ("add", "patch", "remove", "batch", "edit", "revert")
+MEMORY_AUTHORS: Final = ("user", "agent")
+
+
+class Memory(Base):
+    """The current notes of one scope (docs/architecture.md, Section 8). ``agent`` notes
+    belong to an agent profile in a workspace, ``user`` notes to one user, and ``workspace``
+    notes to a workspace. ``entries`` is a list of strings. ``revision`` is the ``seq`` of the
+    last row in ``memory_revisions``."""
+
+    __tablename__ = "memories"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint(
+            "org_id",
+            "scope",
+            "workspace_id",
+            "agent_profile_id",
+            "user_id",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(_one_of("scope", MEMORY_SCOPES), name="scope"),
+        CheckConstraint(
+            "(scope = 'agent' AND workspace_id IS NOT NULL AND agent_profile_id IS NOT NULL"
+            " AND user_id IS NULL)"
+            " OR (scope = 'user' AND user_id IS NOT NULL AND workspace_id IS NULL"
+            " AND agent_profile_id IS NULL)"
+            " OR (scope = 'workspace' AND workspace_id IS NOT NULL AND agent_profile_id IS NULL"
+            " AND user_id IS NULL)",
+            name="scope_keys",
+        ),
+        CheckConstraint("jsonb_typeof(entries) = 'array'", name="entries_array"),
+        CheckConstraint("revision >= 0", name="revision"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    agent_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    entries: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class MemoryRevision(Base):
+    """One write to memory, with the full new content (Section 8). A revert is a new row with
+    the old content. The session, the run, and the author are not foreign keys: the history
+    outlives them."""
+
+    __tablename__ = "memory_revisions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "memory_id"], ["memories.org_id", "memories.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("org_id", "memory_id", "seq"),
+        CheckConstraint(_one_of("action", MEMORY_ACTIONS), name="action"),
+        CheckConstraint(_one_of("author_kind", MEMORY_AUTHORS), name="author_kind"),
+        CheckConstraint("author_kind <> 'user' OR author_user_id IS NOT NULL", name="user_has_id"),
+        CheckConstraint("jsonb_typeof(entries) = 'array'", name="entries_array"),
+        CheckConstraint("seq >= 1", name="seq"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    entries: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    author_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    """``user`` for a person, ``agent`` for the memory tool."""
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The person. For an ``agent`` write: the user of the run, if there is one."""
+    reason: Mapped[str | None] = mapped_column(Text)
+    reverted_to: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = _created_at()

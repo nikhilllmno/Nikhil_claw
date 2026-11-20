@@ -30,6 +30,8 @@ from sama.db.models import (
     ChannelIdentity,
     Integration,
     Membership,
+    Memory,
+    MemoryRevision,
     Message,
     ModelCall,
     Org,
@@ -296,6 +298,39 @@ def plan(
             code_hash=uuid.uuid4().hex * 2,
             expires_at=text("now() + interval '10 minutes'"),
             **links,
+        )
+    # Notes: the user notes belong to one user, the workspace notes to a workspace, and the
+    # agent notes to a profile in a workspace.
+    notes: tuple[tuple[str, str, str, dict[str, str]], ...] = (
+        ("mem:alice", "org-a", "user", {"user": "alice"}),
+        ("mem:dave", "org-a", "user", {"user": "dave"}),
+        ("mem:a1", "org-a", "workspace", {"workspace": "a1"}),
+        ("mem:a2", "org-a", "workspace", {"workspace": "a2"}),
+        ("mem:a1-agent", "org-a", "agent", {"workspace": "a1", "profile": "profile-a"}),
+        ("mem:bob", "org-b", "user", {"user": "bob"}),
+        ("mem:b1", "org-b", "workspace", {"workspace": "b1"}),
+    )
+    for label, org, scope, keys in notes:
+        add(
+            Memory,
+            label,
+            org_id=ids[org],
+            scope=scope,
+            workspace_id=ids[keys["workspace"]] if "workspace" in keys else None,
+            agent_profile_id=ids[keys["profile"]] if "profile" in keys else None,
+            user_id=ids[keys["user"]] if "user" in keys else None,
+            entries=[f"note of {label}"],
+            revision=1,
+        )
+        add(
+            MemoryRevision,
+            f"rev:{label}",
+            org_id=ids[org],
+            memory_id=ids[label],
+            seq=1,
+            action="add",
+            entries=[f"note of {label}"],
+            author_kind="agent",
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")

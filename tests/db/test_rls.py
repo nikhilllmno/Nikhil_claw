@@ -47,6 +47,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_groups": {"group:a1"},
         "pairing_codes": {"code:alice"},
         "integrations": {"int:org-a"},
+        "memories": {"mem:alice", "mem:a1", "mem:a1-agent"},
+        "memory_revisions": {"rev:mem:alice", "rev:mem:a1", "rev:mem:a1-agent"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -59,6 +61,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_groups": {"group:a1"},
         "pairing_codes": set(),
         "integrations": {"int:org-a"},
+        "memories": {"mem:a1", "mem:a2", "mem:a1-agent"},
+        "memory_revisions": {"rev:mem:a1", "rev:mem:a2", "rev:mem:a1-agent"},
     },
     "dave": {
         "orgs": {"org-a"},
@@ -71,6 +75,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_groups": set(),
         "pairing_codes": set(),
         "integrations": {"int:org-a"},
+        "memories": {"mem:dave"},
+        "memory_revisions": {"rev:mem:dave"},
     },
     "bob": {
         "orgs": {"org-b"},
@@ -83,6 +89,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_groups": {"group:b1"},
         "pairing_codes": {"code:bob"},
         "integrations": {"int:org-b"},
+        "memories": {"mem:bob", "mem:b1"},
+        "memory_revisions": {"rev:mem:bob", "rev:mem:b1"},
     },
     "stranger": {
         "orgs": set(),
@@ -95,6 +103,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "channel_groups": set(),
         "pairing_codes": set(),
         "integrations": set(),
+        "memories": set(),
+        "memory_revisions": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

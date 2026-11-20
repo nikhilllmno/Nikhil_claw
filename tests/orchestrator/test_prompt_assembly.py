@@ -13,6 +13,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import AgentProfile, AuditEntry, Run, Session, StoredContextFile, Workspace
+from sama.memory import MemoryScope, PostgresMemoryStore, Target, Writer
+from sama.memory.store import Change
 from sama.orchestrator.queue import ClaimedRun, RunQueue
 from sama.orchestrator.worker import Worker
 from sama.prompt import MAX_CONTEXT_FILES, SYSTEM_PROMPT, PromptAssembler
@@ -252,3 +254,89 @@ async def test_paths_are_unique_per_scope(engine: AsyncEngine, tenant: Tenant) -
     await add_file(engine, tenant, "AGENTS.md", "b", workspace_id=tenant.ids["ws"])
     with pytest.raises(IntegrityError):
         await add_file(engine, tenant, "AGENTS.md", "c")
+
+
+# -- memory (Section 8) ----------------------------------------------------------------------
+
+
+def only(entry: str) -> Change:
+    return lambda entries: [entry]
+
+
+async def add_notes(engine: AsyncEngine, tenant: Tenant) -> None:
+    store = PostgresMemoryStore(engine)
+    writer = Writer("agent")
+    ws, org = tenant.ids["ws"], tenant.org
+    for scope, entry in (
+        (MemoryScope(org, Target.AGENT, ws, tenant.ids["profile"]), "uses uv"),
+        (MemoryScope(org, Target.WORKSPACE, ws), "builds with make"),
+        (MemoryScope(org, Target.USER, user_id=tenant.ids["mia"]), "likes tea"),
+    ):
+        await store.change(scope, only(entry), writer=writer, action="add")
+
+
+async def give_memory(engine: AsyncEngine, tenant: Tenant) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(toolsets=["core", "todo", "memory"])
+        )
+
+
+async def test_a_profile_without_the_memory_toolset_gets_no_snapshot(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await add_notes(engine, tenant)
+    run = await claimed(engine, tenant)
+    config = await PromptAssembler(engine)(run)
+    await end(engine, run)
+    assert config.memory_snapshot == ""
+    assert "<memory>" not in config.render_prefix()
+
+
+async def test_a_shared_session_gets_the_agent_and_workspace_notes(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await give_memory(engine, tenant)
+    await add_notes(engine, tenant)
+    run = await claimed(engine, tenant, "s1")
+    config = await PromptAssembler(engine)(run)
+    await end(engine, run)
+    assert "uses uv" in config.memory_snapshot
+    assert "builds with make" in config.memory_snapshot
+    assert "likes tea" not in config.memory_snapshot
+    assert "<memory>" in config.render_prefix()
+
+
+async def test_a_private_session_also_gets_the_notes_of_its_owner(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await give_memory(engine, tenant)
+    await add_notes(engine, tenant)
+    run = await claimed(engine, tenant, "mine")
+    config = await PromptAssembler(engine)(run)
+    await end(engine, run)
+    assert "likes tea" in config.memory_snapshot
+
+
+async def test_the_snapshot_is_frozen_with_the_session_config(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await give_memory(engine, tenant)
+    await add_notes(engine, tenant)
+    first = await claimed(engine, tenant)
+    before = await PromptAssembler(engine)(first)
+    await end(engine, first)
+    await PostgresMemoryStore(engine).change(
+        MemoryScope(tenant.org, Target.WORKSPACE, tenant.ids["ws"]),
+        lambda e: [*e, "added later"],
+        writer=Writer("agent"),
+        action="add",
+    )
+    second = await claimed(engine, tenant)
+    after = await PromptAssembler(engine)(second)
+    await end(engine, second)
+    assert "added later" not in after.memory_snapshot
+    assert after.memory_snapshot == before.memory_snapshot
+    assert after.fingerprint() == before.fingerprint()

@@ -41,3 +41,17 @@ def test_no_rows_sees_nothing() -> None:
     assert not grants.org_member
     assert not grants.org_admin
     assert not grants.sees_workspace(WS)
+
+
+def test_the_org_owner_and_the_workspace_admin_admin_the_workspace() -> None:
+    assert Grants(USER, ((None, "owner"),)).admins_workspace(WS)
+    assert Grants(USER, ((None, "member"), (WS, "admin"))).admins_workspace(WS)
+    assert Grants(USER, ((None, "member"), (WS, "owner"))).admins_workspace(WS)
+
+
+def test_a_member_an_org_admin_and_a_workspace_row_alone_do_not_admin_the_workspace() -> None:
+    assert not Grants(USER, ((None, "member"), (WS, "member"))).admins_workspace(WS)
+    assert not Grants(USER, ((None, "admin"),)).admins_workspace(WS)
+    assert not Grants(USER, ((None, "member"), (OTHER, "admin"))).admins_workspace(WS)
+    assert not Grants(USER, ((WS, "admin"),)).admins_workspace(WS)
+    assert not Grants(USER, ()).admins_workspace(WS)

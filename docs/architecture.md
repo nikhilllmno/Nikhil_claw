@@ -679,6 +679,8 @@ Rules:
   `[... N characters cut ...]` replaces the middle.
 - Not in M1.11: channel formatting hints (M1.13), pinned skills, the skill index, the memory snapshot, and the user profile
   block (later milestones). The `RunConfig` fields for them exist, and they are empty.
+  Since M2.1 the memory snapshot is full: the `agent`, `workspace`, and (in a private session)
+  `user` notes of the run (Section 8.1). The user profile block is the `user` part of it.
 - Repo `AGENTS.md` and `CLAUDE.md` files do not go into the prefix. The prefix stays the same
   for the whole session, and a repo is cloned during a run. Since M1.16 the `repo_clone`
   result holds these files (Section 15.1).
@@ -742,6 +744,114 @@ prompt cheap.
   pgvector is the default.
 - **Safety**: delegated children and webhook-triggered runs cannot write memory. Memory
   content is scanned for secrets before it is saved.
+
+#### 8.1 Implementation (M2.1)
+
+The code is in `src/sama/memory/`. It does not import the tool server, so the prompt
+assembler can use it.
+
+| File | Content |
+|---|---|
+| `core.py` | The rules, with no database: caps, `apply` (the three actions), `validate` (cap, secrets, injection), `render_snapshot`. |
+| `store.py` | `MemoryStore` protocol, `InProcessMemoryStore` (tests, local runs), `PostgresMemoryStore`, and the read helpers that the API and the assembler use. |
+| `service.py` | `MemoryService`: who may write, and the steps of a write. The tool, the API edit, and the revert use it. |
+
+**Entries.** A scope holds a list of text entries. They show to the model with the text
+`\n§\n` between them, and this text counts for the cap. Caps: `agent` 2,200, `user` 1,375,
+`workspace` 2,200 characters. An entry cannot contain `§`.
+
+**Actions.**
+
+- `add` appends a trimmed entry. An entry that is already in the list is a no-op.
+- `patch` replaces `old_text` with `content`. `old_text` must occur exactly one time in all
+  entries. Zero or more than one is an error, and the error shows the current entries (zero)
+  or asks for a longer text (more than one).
+- `remove` removes the whole entry that has `old_text`. The text must be in exactly one entry.
+- `operations` (at most 20) run in order, as one change. If one step fails, sama saves
+  nothing. Sama checks the cap only on the end result, so one batch can remove old entries
+  and add new ones. `reason` (at most 200 characters) goes to the revision.
+
+**Over the cap.** The message says that the memory is full, how many characters the change
+needs and the cap, how many characters to free, and the current entries (before the change)
+with their size. The tool returns it as a normal result that starts with `Not saved:`, not as
+an error result. The tool server cuts an error result to 2,000 characters (`MAX_ERROR_CHARS`),
+and the agent needs all current entries (up to 2,200 characters) to make room. The API maps
+the same failure (`MemoryFullError`) to `422`.
+
+**Content checks.** For each new entry, sama refuses text that the redactor changes (a
+secret, Section 16.3) and text that the prompt scan finds (Section 6.1). The error does not
+repeat the secret. Entries that are already saved are not checked again, so the agent can
+remove them. The tool, the API edit, and the revert all use these checks.
+
+The redactor must know the secrets of the process, or the check only finds the key patterns.
+The control plane gives it the settings and refreshes the vault values. The standalone API
+(`python -m sama.api`) does the same: it adds `SAMA_DATABASE_URL`, `SAMA_SUPABASE_JWT_SECRET`,
+and `SAMA_VAULT_KEY` when it builds the app. With `SAMA_VAULT_KEY` it refreshes the vault values
+before the first request (a failed refresh stops the start) and then every few minutes.
+
+**Who may write.** The service checks the rules in this order:
+
+1. An unattended run (cron, workflow, webhook) cannot write. The run has no person.
+2. A run of a delegated child session cannot write.
+3. `user`: only in a private session, for its owner. A shared session has no `user` target.
+4. `workspace`: the user of the run must be a workspace admin: the org `owner`, or a member
+   with the workspace role `admin` or `owner` (Q5). An org `admin` with no workspace role is
+   not enough. Other users get an error that tells the agent to ask an admin. Approval
+   cards for this case come in M3.2.
+5. `agent`: any run that can write. The agent notes belong to the profile of the run in the
+   workspace of the run.
+
+The user of the run is the user who started it, else the owner of a private session
+(`run_user`). The run token does not hold the agent profile or the unattended flag, so the
+store loads them from the run and its session.
+
+**Storage.** Migration `0012` adds two tables (Section 17.1).
+
+- `memories`: one row per scope, with `entries` (JSON list) and `revision` (the number of
+  the last revision). A unique index with `NULLS NOT DISTINCT` on the scope keys gives one
+  row per scope. A check constraint makes the keys fit the scope: `agent` has a workspace and
+  a profile, `user` has a user, `workspace` has a workspace.
+- `memory_revisions`: one row per write, with the full new entries, the action (`add`,
+  `patch`, `remove`, `batch`, `edit`, `revert`), the author (`user` or `agent`), the session
+  and run, the `reason`, and `reverted_to`. The session, run, and author ids are plain
+  columns, not foreign keys, so the history stays when a session is deleted. A revision is
+  not changed after it is written, but no trigger enforces this (the audit log has one).
+
+A write is one transaction: sama creates the row if it is missing, locks it with
+`SELECT ... FOR UPDATE`, applies the change, and writes the new entries and the revision. Two
+writes at the same time do not lose a note. A change that does not alter the entries writes no
+revision.
+
+**Snapshot.** When the assembler builds the config of a new session, it reads the notes in the
+same transaction and puts them in `RunConfig.memory_snapshot` (Section 6.1). The text has a
+note that the entries are data, and then one block for each scope that has entries, with its
+usage (for example `Agent notes (120 of 2,200 characters)`). A block for which the prompt
+scan finds a pattern is not loaded, and the prompt says so. An entry that the redactor
+changes (it holds a secret) shows as a note in place of its text, so a value that was saved
+before sama knew the secret never reaches the model. A shared session gets the `agent`
+and `workspace` blocks. A private session also gets the `user` block of its owner. Only a
+profile with the `memory` toolset gets a snapshot. The config is frozen with the session, so
+a write of the run applies from the next session, and the tool result says so.
+
+**HTTP API.** The routes are under `/workspaces/{workspace_id}/memory` (Section 11.4). They
+read as the user (`as_user`), so RLS is the second guard, and they write through
+`MemoryService`. A person replaces all entries of a scope (`edit`), or sets a scope back to an
+old revision (`revert`). A revert adds a new revision with the old entries. Each write adds an
+audit row (`memory.edited`, `memory.reverted`) with the new revision number but not the text.
+The memory row, the revision, and the audit row are one transaction (`after` hook of
+`MemoryStore.change`), so a failed audit write undoes the edit.
+
+**Assumptions in M2.1.**
+
+- A workspace write of a user who is not an admin returns an error. Approval cards that let an
+  admin approve it come in M3.2.
+- The `user` target works in private sessions only. A person edits their own notes in the API.
+- Any user who can see the workspace can edit the `agent` notes in the API, like the tool.
+- Unattended and delegated runs cannot write. The background review (M2.4) needs an explicit
+  exception.
+- Migration `0012` adds `memory` to the toolsets of profiles that have exactly the old default
+  toolsets. New profiles get it from `DEFAULT_TOOLSETS`. The gate allows `memory` by default,
+  because the tool checks the rules itself.
 
 ---
 
@@ -838,7 +948,7 @@ flowchart LR
 | `core` (native) | Shell, read, write, edit, search files, web fetch | Runtime, in the sandbox |
 | `todo` | `todo` (read and write the session task list). On Claude, the adapter also maps native `TodoWrite` calls to the same list with a `PostToolUse` hook. | Sama MCP |
 | `web` | `web_search`, `web_extract` | Sama MCP (search provider key on the control plane) |
-| `memory` | `memory` | Sama MCP |
+| `memory` | `memory` (since M2.1, Section 8.1). The snapshot goes in the prompt. | Sama MCP |
 | `skills` | `skills_list`, `skill_view`, `skill_manage` | Sama MCP |
 | `sessions` | `session_search`, `session_read` | Sama MCP |
 | `clarify` | `clarify` (1 to 5 questions, choices or free text, rendered per channel) | Sama MCP |
@@ -1137,6 +1247,7 @@ cross-org check of Section 17.1 through the API.
 | `POST /runs/{id}/cancel` | `RunQueue.cancel`. |
 | `GET /sessions/{id}/approvals` | The pending approvals. |
 | `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_approval`, then `RunQueue.release_decided`. `always_allow` writes the user rule. `409` if the approval is decided or expired. |
+| `GET /workspaces/{id}/memory`, `GET .../memory/{target}/revisions`, `PUT .../memory/{target}`, `POST .../memory/{target}/revisions/{seq}/revert` | The memory of the workspace (Section 8.1). `target` is `agent`, `user`, or `workspace`. The `agent` target needs `agent_profile_id` (query or body). `user` is the notes of the caller. A user who cannot see the workspace gets `404`. A `workspace` write needs a workspace admin (`403`). A change that is not valid gets `422`. |
 | `GET /sessions/{id}/questions`, `POST .../questions/{request_id}/answer` | The open `clarify` questions of the session, when the process has a `ClarifyBroker` (Section 16.7). |
 
 **Event stream.** `GET /sessions/{id}/events` sends `text/event-stream`:
@@ -2113,6 +2224,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `web_search(query, limit)` | Searches the web and returns up to 10 results: title, URL, and snippet. | A search key (`BRAVE_API_KEY`, Brave Search API). Without a key the tool is hidden. |
 | `web_extract(urls)` | Gets 1 to 5 pages through the outbound client (Section 16.4) and returns their text. HTML becomes plain text. Text, Markdown, JSON, XML, and CSV stay as they are. Other types get an error for that URL. | Nothing. |
 | `clarify(questions)` | Asks the user 1 to 5 questions. Each question has 2 to 6 choices, or none for a free answer. The call waits for the answers, at most 10 minutes. If nobody answers, the tool tells the agent to continue and state its assumptions. | A clarify broker. Without one the tool is hidden. |
+| `memory(target, action, content, old_text, operations, reason)` | Saves a short note for the next sessions (Section 8.1). `target` is `agent`, `user`, or `workspace`. `action` is `add`, `patch`, or `remove`. Give `action` or `operations` (at most 20), not both. Returns the current entries and the usage. The tool has no read action. | A memory service. Without one the tool is hidden. |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
@@ -2206,6 +2318,8 @@ migrated schema.
 | `context_files` | Context files per org, workspace, and profile (migration `0006`, Section 6.1) |
 | `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
 | `integrations` | The chat apps of each org, for example its Telegram bot (migration `0011`, Section 11.6) |
+| `memories` | The notes of one scope: `org_id`, `scope` (`agent`, `user`, `workspace`), `workspace_id`, `agent_profile_id`, `user_id`, `entries` (JSON list), `revision` (migration `0012`, Section 8.1) |
+| `memory_revisions` | One row per memory write: `org_id`, `memory_id`, `seq`, `action`, `entries`, `session_id`, `run_id`, `author_kind`, `author_user_id`, `reason`, `reverted_to` (migration `0012`, Section 8.1) |
 
 Rules:
 
@@ -2241,7 +2355,9 @@ Row-level security:
   - the workspaces and agent profiles that the user can see;
   - the sessions whose audience includes the user, and the messages, runs, run events, tool
     calls, and bindings of those sessions;
-  - the audit log only as an org `owner` or `admin`.
+  - the audit log only as an org `owner` or `admin`;
+  - the `agent` and `workspace` memory (and its revisions) of the workspaces that the user can
+    see, and the `user` memory of the user's own user rows (Section 8.1).
 - `anon` gets no access. All writes go through the control plane. The control plane
   connects as the table owner, which RLS does not limit, and checks scope in code.
 - **Closed by default.** Supabase gives `anon` and `authenticated` all rights on new objects
