@@ -10,6 +10,7 @@ Each pass has two steps:
    with ``task_complete`` or ``task_block``.
 
 ``FOR UPDATE SKIP LOCKED`` lets more than one control plane run the loop at the same time.
+An advisory lock per org keeps the running cap when two control planes dispatch together.
 """
 
 from __future__ import annotations
@@ -118,12 +119,16 @@ class TaskDispatcher:
     async def dispatch(self) -> tuple[int, int]:
         started = blocked = 0
         async with self._engine.begin() as connection:
+            ids = (await connection.execute(self._candidates())).scalars().all()
+            if not ids:
+                return 0, 0
+            # The second read locks the cards. It checks the status again, because the first
+            # read did not lock. The org order is the lock order of the capacity locks below.
             cards = (
                 await connection.execute(
                     select(Task.__table__)
-                    .where(Task.status == "todo", Task.assignee_profile_id.is_not(None))
-                    .order_by(Task.created_at, Task.id)
-                    .limit(self._batch)
+                    .where(Task.id.in_(ids), Task.status == "todo")
+                    .order_by(Task.org_id, Task.created_at, Task.id)
                     .with_for_update(skip_locked=True)
                 )
             ).all()
@@ -133,6 +138,54 @@ class TaskDispatcher:
                 started += outcome == "started"
                 blocked += outcome == "blocked"
         return started, blocked
+
+    def _candidates(self) -> Any:
+        """The ids of the cards that can change in this pass, oldest first.
+
+        A card that waits for a dependency is not a candidate, and an org gets at most
+        ``max_running_per_org`` candidates. So waiting cards and one busy org cannot fill the
+        batch and stop the cards of other orgs.
+        """
+        dependency = Task.__table__.alias("dependency")
+        waiting_dependency = (
+            select(dependency.c.id)
+            .where(
+                dependency.c.org_id == Task.org_id,
+                dependency.c.workspace_id == Task.workspace_id,
+                dependency.c.id == func.any(Task.depends_on),
+                dependency.c.status.in_(("todo", "running", "blocked")),
+            )
+            .exists()
+        )
+        running_card = Task.__table__.alias("running_card")
+        busy_orgs = (
+            select(running_card.c.org_id)
+            .where(running_card.c.status == "running")
+            .group_by(running_card.c.org_id)
+            .having(func.count() >= self._max_running)
+        )
+        ranked = (
+            select(
+                Task.id,
+                Task.created_at,
+                func.row_number()
+                .over(partition_by=Task.org_id, order_by=(Task.created_at, Task.id))
+                .label("rank"),
+            )
+            .where(
+                Task.status == "todo",
+                Task.assignee_profile_id.is_not(None),
+                ~waiting_dependency,
+                Task.org_id.not_in(busy_orgs),
+            )
+            .subquery()
+        )
+        return (
+            select(ranked.c.id)
+            .where(ranked.c.rank <= self._max_running)
+            .order_by(ranked.c.created_at, ranked.c.id)
+            .limit(self._batch)
+        )
 
     async def _dispatch_one(
         self, connection: AsyncConnection, card: Any, running: dict[uuid.UUID, int]
@@ -158,6 +211,9 @@ class TaskDispatcher:
         if any(d.status != "done" for d in dependencies):
             return "waiting"
         if card.org_id not in running:
+            # The lock puts the dispatchers of one org in a sequence until the commit, so two
+            # control planes cannot both see free capacity and start too many cards.
+            await connection.execute(_org_lock(card.org_id))
             running[card.org_id] = (
                 await connection.execute(
                     select(func.count()).where(Task.org_id == card.org_id, Task.status == "running")
@@ -208,6 +264,9 @@ class TaskDispatcher:
                         status="running",
                         session_id=session_id,
                         run_id=run_id,
+                        # A new attempt: the result of an earlier run must not come back.
+                        result=None,
+                        finished_at=None,
                         updated_at=func.now(),
                     )
                 )
@@ -265,6 +324,12 @@ class TaskDispatcher:
                 )
                 finished += 1
         return finished
+
+
+def _org_lock(org_id: uuid.UUID) -> Any:
+    """A transaction-level advisory lock on the running cards of one org."""
+    key = func.hashtextextended(f"sama.tasks.running:{org_id}", 0)
+    return select(func.pg_advisory_xact_lock(key))
 
 
 async def _answer(connection: AsyncConnection, org_id: uuid.UUID, run_id: uuid.UUID) -> str:

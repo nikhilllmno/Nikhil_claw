@@ -3,14 +3,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Message, Run, Session, Task, TaskComment
+from sama.db.models import Message, Org, Run, Session, Task, TaskComment
 from sama.orchestrator.queue import ClaimedRun, RunQueue
 from sama.runtime.contract import FailureCode, Usage
 from sama.tasks.dispatcher import TaskDispatcher, task_prompt
@@ -30,7 +31,7 @@ from sama.tasks.service import (
     list_tasks,
 )
 from sama.tenancy import RunTokenClaims
-from tests.orchestrator.conftest import Tenant
+from tests.orchestrator.conftest import Tenant, add_tenant
 
 OWNER = "worker-t"
 
@@ -276,6 +277,71 @@ async def test_the_dispatcher_ends_a_card_when_its_run_ends(
     assert (await dispatcher.run_once()).finished == 1
     assert (await card(engine, bad.id)).status == "blocked"
     assert await comments(engine, bad.id) == ["the run failed: too slow"]
+
+
+async def test_waiting_cards_do_not_stop_the_cards_of_another_org(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    human = await create(engine, tenant, title="a person does this first")
+    for n in range(4):
+        await create(
+            engine,
+            tenant,
+            title=f"waits {n}",
+            depends_on=[human.id],
+            assignee_profile_id=tenant.ids["profile"],
+        )
+    other = await add_tenant(engine)
+    try:
+        ready = await create(engine, other, title="ready", assignee_profile_id=other.ids["profile"])
+        dispatcher = TaskDispatcher(engine, RunQueue(engine), batch=2)
+        assert (await dispatcher.run_once()).started == 1
+        assert (await card(engine, ready.id)).status == "running"
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(Run)
+                .where(Run.org_id == other.org, Run.status == "queued")
+                .values(status="cancelled", finished_at=func.now())
+            )
+            await connection.execute(text("SET LOCAL sama.audit_purge = 'on'"))
+            await connection.execute(delete(Org).where(Org.id == other.org))
+
+
+async def test_two_dispatchers_keep_the_running_cap_of_an_org(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    for n in range(6):
+        await create(engine, tenant, title=f"card {n}", assignee_profile_id=tenant.ids["profile"])
+    queue = RunQueue(engine)
+    first = TaskDispatcher(engine, queue, batch=1, max_running_per_org=1)
+    second = TaskDispatcher(engine, queue, batch=1, max_running_per_org=1)
+    for _ in range(3):
+        await asyncio.gather(first.dispatch(), second.dispatch())
+    async with engine.connect() as connection:
+        running = (
+            await connection.execute(
+                select(func.count()).where(Task.org_id == tenant.org, Task.status == "running")
+            )
+        ).scalar_one()
+    assert running == 1
+
+
+async def test_a_new_attempt_does_not_keep_the_old_result(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    task = await create(engine, tenant, title="retry", assignee_profile_id=tenant.ids["profile"])
+    dispatcher = TaskDispatcher(engine, queue)
+    for answer in ("old result", "new result"):
+        await dispatcher.run_once()
+        row = await card(engine, task.id)
+        assert (row.status, row.result) == ("running", None)
+        run = await claim(queue, row.run_id)
+        await queue.complete(run, OWNER, output=answer, runtime_state=None, usage=Usage())
+        assert (await dispatcher.run_once()).finished == 1
+        assert (await card(engine, task.id)).result == answer
+        await change(engine, tenant, task.id, status="todo")
 
 
 def test_the_prompt_cuts_long_dependency_results() -> None:

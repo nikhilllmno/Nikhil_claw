@@ -2946,13 +2946,19 @@ shared card never reads a private result.
 **Dispatcher** (`TaskDispatcher`, a control-plane loop, every 5 seconds):
 
 1. It takes at most 20 `todo` cards that have an agent assignee, oldest first, with
-   `FOR UPDATE SKIP LOCKED`, so two control planes do not start one card two times.
+   `FOR UPDATE SKIP LOCKED`, so two control planes do not start one card two times. A card
+   that waits for a dependency is not taken, an org with 5 running cards is not taken, and
+   an org gives at most 5 cards to one pass. So waiting cards and one busy org do not stop
+   the cards of other orgs.
 2. A card waits until each dependency is `done`. A cancelled or deleted dependency moves
    the card to `blocked` and adds a comment from `system`.
-3. An org has at most 5 running cards. An agent profile that is not in the workspace moves
-   the card to `blocked`.
+3. An org has at most 5 running cards. The dispatcher counts them under an advisory lock of
+   the org, so two control planes cannot both see free capacity. It takes the locks in the
+   order of the org ids. An agent profile that is not in the workspace moves the card to
+   `blocked`.
 4. The dispatcher makes a new session for the card (with the audience and owner of the
-   card) and an unattended run in one transaction. The prompt has the title, the body, and
+   card) and an unattended run in one transaction. It clears the result of an earlier
+   attempt. The prompt has the title, the body, and
    the results of the dependencies (each cut to 1,500 characters and marked as untrusted
    data). A rate limit leaves the card in `todo` for the next pass.
 5. When the run ends, the dispatcher reconciles the card. A completed run makes the card
