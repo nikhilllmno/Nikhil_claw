@@ -38,9 +38,19 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "media": frozenset({"vision_analyze"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
+    "self": frozenset({"change_propose"}),
+    "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
+    "integrations": frozenset(),
+    "delegation": frozenset({"delegate_task", "delegate_status"}),
+    "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
-has no tools yet."""
+has no tools yet. ``integrations`` has no fixed tools: the connector tools are deferred tools
+that the catalog of the tool server adds (Section 10.3)."""
+
+ToolAccess = Literal["read", "write", "destructive"]
+"""What a deferred tool does, for its default policy (Section 10.3): ``read`` gets ``allow``,
+``write`` and ``destructive`` get ``ask``. ``destructive`` has a stronger reason on the card."""
 
 TOOL_SEARCH: Final = "tool_search"
 TOOL_DESCRIBE: Final = "tool_describe"
@@ -72,6 +82,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "skills_list",
         "skill_view",
         "skill_manage",
+        "change_propose",
         "session_search",
         "session_read",
         "vision_analyze",
@@ -79,12 +90,39 @@ DEFAULT_ALLOW: Final = frozenset(
         "tool_describe",
         "Task",
         "Agent",
+        "connections_list",
+        "connection_request",
+        "connection_test",
+        "delegate_task",
+        "delegate_status",
+        "task_create",
+        "task_list",
+        "task_complete",
+        "task_block",
+        "task_comment",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
 rule, they are allowed. Every other tool gets ``ask``. ``skill_manage`` is here because the
 skill store checks the role of the user for the scope of each write (Section 9.2), and every
-write is a version that can be reverted."""
+write is a version that can be reverted. ``change_propose`` is here because it only stores a
+proposal: a person with the role decides it on an approval card (M3.2). ``connection_request``
+only sends a link, and the agent cannot give credentials with it (Section 10.3).
+The ``delegation`` and ``tasks`` tools are here because they write only sama state of the same
+workspace and audience, and each child run or task run passes the gate again for every tool
+that it calls (Sections 12.4 and 13.2)."""
+
+
+DELEGATION_LINEAGE: Final = "delegation"
+CHILD_BLOCKED_TOOLSETS: Final = frozenset(
+    {"delegation", "tasks", "memory", "clarify", "cron", "connections", "integrations"}
+)
+"""The toolsets that a delegated child never has (Section 13.2). ``delegation`` keeps the depth
+at 1, and ``tasks`` stops a child that makes a task card that delegates again. ``memory``
+keeps the shared notes free of child writes. ``clarify`` waits for a person, and a child has
+none. ``cron`` stops a child that outlives its parent. ``connections`` and ``integrations`` are
+out for the reason of sub-agents (Section 13.1): a connection acts with the authority of the
+user, and only a run that the user watches asks the user to connect (Section 10.3)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""
@@ -151,6 +189,11 @@ class ToolsetSource(Protocol):
 
     def toolsets(self) -> Mapping[str, frozenset[str]]: ...
 
+    def access(self) -> Mapping[str, ToolAccess]:
+        """What each extra tool does, for its default policy. A tool that is not here gets the
+        default of an unknown tool: ``ask``."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class GateContext:
@@ -169,6 +212,8 @@ class GateContext:
     ``sama.tenancy.authority``."""
     catalog: Mapping[str, frozenset[str]] = field(default_factory=lambda: TOOLSETS)
     """The tools of each toolset. The default is the fixed table."""
+    access: Mapping[str, ToolAccess] = field(default_factory=dict)
+    """What each deferred tool does, for its default policy (``ToolsetSource.access``)."""
 
 
 def canonical_name(tool_name: str) -> str:
@@ -219,16 +264,26 @@ def effective_call(tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, M
 
 
 def effective_toolsets(
-    toolsets: Iterable[str], group_toolsets: Iterable[str], *, audience: str, kind: str = "chat"
+    toolsets: Iterable[str],
+    group_toolsets: Iterable[str],
+    *,
+    audience: str,
+    kind: str = "chat",
+    lineage: str | None = None,
 ) -> frozenset[str]:
     """The toolsets of a run (Section 10.2). A chat run in a shared session has the group
     toolsets of the profile, and not its toolsets. A private session has the toolsets. A
     background review has the toolsets of the profile that the review clamp keeps (Section
     9.4): it has no person in it, and its changes of shared state are proposals that a person
-    decides, so the group toolsets do not apply to it."""
+    decides, so the group toolsets do not apply to it. A delegated child (lineage
+    ``delegation``) loses ``CHILD_BLOCKED_TOOLSETS`` (Section 13.2)."""
     if audience == "shared" and kind != "review":
-        return frozenset(group_toolsets)
-    return frozenset(toolsets)
+        found = frozenset(group_toolsets)
+    else:
+        found = frozenset(toolsets)
+    if lineage == DELEGATION_LINEAGE:
+        return found - CHILD_BLOCKED_TOOLSETS
+    return found
 
 
 def json_default(value: Any) -> Any:
@@ -267,7 +322,7 @@ def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdi
     early = _authority_and_toolset(context, TOOL_CALL)
     if early is not None:
         return early
-    own = policy_verdict(context.rules, TOOL_CALL, shared=context.shared)
+    own = policy_verdict(context.rules, TOOL_CALL, shared=context.shared, access=context.access)
     if own.action == "deny":
         return own
     wrapped = wrapped_call(arguments)
@@ -299,7 +354,7 @@ def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
 
 def _after_hardline(context: GateContext, name: str, digest: str) -> Verdict:
     # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
-    policy = policy_verdict(context.rules, name, shared=context.shared)
+    policy = policy_verdict(context.rules, name, shared=context.shared, access=context.access)
     if policy.action == "deny":
         return policy
     verdict = _recorded(context.recorded, name, digest) or policy
@@ -322,12 +377,20 @@ def _recorded(recorded: Recorded | None, name: str, digest: str) -> Verdict | No
             return Verdict("ask", GateStep.RECORDED, "the approval is still open")
 
 
-def policy_verdict(rules: Iterable[PolicyRule], name: str, *, shared: bool = False) -> Verdict:
+def policy_verdict(
+    rules: Iterable[PolicyRule],
+    name: str,
+    *,
+    shared: bool = False,
+    access: Mapping[str, ToolAccess] | None = None,
+) -> Verdict:
     """Step 4. A ``deny`` rule at any level wins. An org or profile ``ask`` rule cannot be
     removed by a user rule. Otherwise a user rule wins, then the profile rule, then the org
     rule. At one level an exact name wins over a prefix. Without a rule, the built-in
     default applies, and the default for unknown tools is ``ask``. In a shared session, the
-    tools in ``SHARED_ASK`` also get ``ask`` by default."""
+    tools in ``SHARED_ASK`` also get ``ask`` by default. A deferred tool with an ``access``
+    gets the connector default: ``read`` is ``allow``, ``write`` and ``destructive`` are
+    ``ask`` (Section 10.3)."""
     matching = [rule for rule in rules if rule.matches(name)]
     if any(rule.action == "deny" for rule in matching):
         return Verdict("deny", GateStep.POLICY, f"a policy rule denies {name}")
@@ -344,7 +407,17 @@ def policy_verdict(rules: Iterable[PolicyRule], name: str, *, shared: bool = Fal
         return Verdict("ask", GateStep.POLICY, f"{name} needs an approval in a shared session")
     if name in DEFAULT_ALLOW:
         return Verdict("allow", GateStep.POLICY, f"{name} is allowed by default")
-    return Verdict("ask", GateStep.POLICY, f"{name} needs an approval")
+    match (access or {}).get(name):
+        case "read":
+            return Verdict("allow", GateStep.POLICY, f"{name} only reads, so it is allowed")
+        case "destructive":
+            return Verdict(
+                "ask",
+                GateStep.POLICY,
+                f"{name} can delete or change data that cannot be restored. It needs an approval",
+            )
+        case _:
+            return Verdict("ask", GateStep.POLICY, f"{name} needs an approval")
 
 
 def _most_specific(rules: Iterable[PolicyRule]) -> PolicyRule | None:

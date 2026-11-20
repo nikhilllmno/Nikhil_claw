@@ -22,7 +22,7 @@ from sama.gate import (
     effective_toolsets,
     policy_verdict,
 )
-from sama.gate.decide import TOOLSETS, tools_of
+from sama.gate.decide import CHILD_BLOCKED_TOOLSETS, TOOLSETS, tools_of
 from sama.gate.hardline import MAX_COMMAND_CHARS
 from sama.gate.service import stored_arguments
 from sama.runtime.contract import ApprovalRequired
@@ -469,6 +469,33 @@ def test_a_review_run_does_not_use_the_group_toolsets() -> None:
     assert effective_toolsets(PROFILE, GROUP, audience="shared", kind="review") == frozenset(
         PROFILE
     )
+
+
+def test_a_delegated_child_loses_the_blocked_toolsets() -> None:
+    # Section 13.2: depth 1, no task cards, no shared notes, no person to ask, no cron.
+    toolsets = (*PROFILE, "delegation", "tasks", "clarify", "cron", "web")
+    child = effective_toolsets(toolsets, GROUP, audience="private", lineage="delegation")
+    assert child == frozenset(toolsets) - CHILD_BLOCKED_TOOLSETS
+    assert not child & {"delegation", "tasks", "memory", "clarify", "cron"}
+    shared = effective_toolsets(toolsets, GROUP, audience="shared", lineage="delegation")
+    assert shared == frozenset(GROUP)
+    assert effective_toolsets(toolsets, GROUP, audience="private", lineage="compaction") == (
+        frozenset(toolsets)
+    )
+
+
+def test_the_delegation_and_task_tools_are_in_their_toolsets() -> None:
+    assert set(tools_of(["delegation"])) == {"delegate_task", "delegate_status"}
+    assert set(tools_of(["tasks"])) == {
+        "task_create",
+        "task_list",
+        "task_complete",
+        "task_block",
+        "task_comment",
+    }
+    assert {"delegation", "tasks"} <= set(DEFAULT_TOOLSETS)
+    assert "tasks" in DEFAULT_GROUP_TOOLSETS
+    assert "delegation" not in DEFAULT_GROUP_TOOLSETS
 
 
 def test_the_default_group_toolsets_have_no_shell_no_edit_and_no_outbound_write() -> None:

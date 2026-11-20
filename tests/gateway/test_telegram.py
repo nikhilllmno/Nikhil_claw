@@ -14,19 +14,24 @@ from pydantic import SecretStr
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.connectors.service import CHAT_WARNING
 from sama.db.models import (
     AgentProfile,
     AuditEntry,
     ChannelGroup,
     ChannelIdentity,
+    Connection,
     Membership,
     Run,
     Session,
     SessionBinding,
+    ToolPolicy,
     User,
 )
 from sama.gate.approvers import SHARED_REFUSAL
+from sama.gateway.connect import NO_CONNECTIONS
 from sama.gateway.pairing import create_code
+from sama.gateway.sessions import ALWAYS_LABEL, ALWAYS_OUTCOME
 from sama.gateway.telegram import (
     BUSY,
     PAIR_PROMPT,
@@ -37,6 +42,10 @@ from sama.gateway.telegram import (
 from sama.gateway.telegram_client import TelegramClient
 from sama.runtime.contract import FailureCode, RunCompleted, RunFailed, TextDelta
 from sama.runtime.fake import FakeScript
+from sama.vault.crypto import KEY_BYTES, VaultKey
+from sama.vault.store import Vault
+from tests.connectors.support import WEB, FakeComposio, FakeForm
+from tests.connectors.support import service as connections_service
 from tests.integrations.support import BOT_ID, FakeTelegram, add_bot
 from tests.orchestrator.conftest import (  # noqa: F401
     Tenant,
@@ -346,6 +355,55 @@ async def test_an_approval_card_is_decided_with_a_button(
     edits = [body for method, body in telegram.calls if method == "editMessageText"]
     assert edits[-1]["text"].endswith("Approved by Mia.")
     assert edits[-1]["reply_markup"] == {"inline_keyboard": []}
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert telegram.texts(DM)[-1] == "deleted"
+
+
+async def test_always_allow_for_me_writes_a_policy_rule(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(approval_script())
+    await gateway.handle_update(message("clean up"))
+    assert await harness.worker.run_once()
+
+    async def carded() -> bool:
+        return any("reply_markup" in body for body in telegram.sent(DM))
+
+    await until(carded)
+    card = next(body for body in telegram.sent(DM) if "reply_markup" in body)
+    always = card["reply_markup"]["inline_keyboard"][1][0]
+    assert always["text"] == ALWAYS_LABEL
+    assert always["callback_data"].endswith(":a")
+    await gateway.handle_update(
+        {
+            "update_id": next(_update_ids),
+            "callback_query": {
+                "id": "cb-always",
+                "from": {"id": MIA_TG, "first_name": "Mia"},
+                "data": always["callback_data"],
+                "message": {"message_id": 101, "chat": {"id": DM}, "text": card["text"]},
+            },
+        }
+    )
+    answers = [body for method, body in telegram.calls if method == "answerCallbackQuery"]
+    assert answers[-1] == {"callback_query_id": "cb-always", "text": ALWAYS_OUTCOME}
+    edits = [body for method, body in telegram.calls if method == "editMessageText"]
+    assert edits[-1]["text"].endswith(f"{ALWAYS_OUTCOME} by Mia.")
+    async with engine.connect() as connection:
+        rules = (
+            await connection.execute(
+                select(ToolPolicy.user_id, ToolPolicy.tool, ToolPolicy.action).where(
+                    ToolPolicy.org_id == tenant.org
+                )
+            )
+        ).all()
+    assert [tuple(rule) for rule in rules] == [(tenant.ids["mia"], "Bash", "allow")]
     assert await harness.worker.run_once()
     await gateway.drain()
     assert telegram.texts(DM)[-1] == "deleted"
@@ -882,3 +940,38 @@ async def test_help_lists_the_context_commands(
     text = telegram.texts(DM)[-1]
     assert "/compact" in text
     assert "/pin" in text
+
+
+async def test_connect_gives_a_web_link_and_never_asks_for_a_secret(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    """``/connect <name>`` (Section 10.3): a direct chat gets a personal link, a group chat a
+    workspace link. The chat never takes a credential."""
+    no_followers(gateway)
+    await pair(gateway, engine, tenant)
+    await gateway.handle_update(message("/connect gmail"))
+    assert telegram.texts(DM)[-1] == NO_CONNECTIONS
+    vault = Vault(engine, VaultKey(b"t" * KEY_BYTES))
+    gateway._connections = connections_service(engine, vault, FakeComposio(), FakeForm())
+    await gateway.handle_update(message("/help"))
+    assert "/connect" in telegram.texts(DM)[-1]
+    await gateway.handle_update(message("/connect gmail"))
+    text = telegram.texts(DM)[-1]
+    assert f"{WEB}/connections?workspace={tenant.ids['ws']}&connect=gmail&scope=personal" in text
+    assert CHAT_WARNING in text
+    group_code = await code_for(engine, tenant, kind="group")
+    await gateway.handle_update(message(f"/pair@sama_bot {group_code}", chat=GROUP))
+    await gateway.handle_update(message("/connect@sama_bot notion", chat=GROUP))
+    text = telegram.texts(GROUP)[-1]
+    assert "connect=notion&scope=workspace" in text
+    assert "A workspace admin must do it." in text
+    await gateway.handle_update(message("/connect"))
+    assert "Connectors: " in telegram.texts(DM)[-1]
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(select(Connection.id).where(Connection.org_id == tenant.org))
+        ).all()
+    assert rows == [], "the command makes no connection"

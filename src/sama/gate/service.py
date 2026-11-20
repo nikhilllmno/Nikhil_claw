@@ -257,7 +257,10 @@ class GateService:
         return frozenset(
             name
             for name in tools_of(context.toolsets, context.catalog)
-            if policy_verdict(context.rules, name, shared=context.shared).action != "deny"
+            if policy_verdict(
+                context.rules, name, shared=context.shared, access=context.access
+            ).action
+            != "deny"
         )
 
     async def reconfirm(self, *, org_id: uuid.UUID, run_id: uuid.UUID, call_id: str) -> Verdict:
@@ -408,6 +411,7 @@ class GateService:
                     AgentProfile.group_toolsets,
                     Session.audience,
                     Session.owner_user_id,
+                    Session.lineage,
                 )
                 .join(
                     AgentProfile,
@@ -438,6 +442,7 @@ class GateService:
             _names(row.group_toolsets),
             audience=row.audience,
             kind=row.kind,
+            lineage=row.lineage,
         )
         if row.kind == "review":
             # A background review has the memory and skill tools and no other tool (Section 9.4).
@@ -452,6 +457,7 @@ class GateService:
             catalog=merged_catalog(
                 self._extra_toolsets.toolsets() if self._extra_toolsets is not None else {}
             ),
+            access=self._extra_toolsets.access() if self._extra_toolsets is not None else {},
         )
         call = None
         if call_id:
@@ -691,10 +697,11 @@ class GateService:
                 ):
                     raise ApprovalError(SHARED_REFUSAL)
             else:
-                # The proposal of a background review changes shared memory or a shared skill
-                # (Section 9.4). The role decides, and the access to the session does not: the
-                # owner of a private session may lack the role, and an admin may not read the
-                # private session. The admin sees the redacted proposal only.
+                # A proposal of a background review or a chat run changes shared memory, a
+                # shared skill, or a soul (Section 9.4). The role decides, and the access to the
+                # session does not: the owner of a private session may lack the role, and an
+                # admin may not read the private session. The admin sees the redacted proposal
+                # only.
                 allowed = (
                     grants.org_owner
                     if proposed == "org"
@@ -702,9 +709,9 @@ class GateService:
                 )
                 if not allowed:
                     raise ApprovalError(
-                        "only an org owner can decide this proposal"
+                        "only the org owner can decide this proposal"
                         if proposed == "org"
-                        else "only a workspace admin can decide this proposal"
+                        else "only a workspace admin or the org owner can decide this proposal"
                     )
                 always_allow = False
             if row.status != "pending":

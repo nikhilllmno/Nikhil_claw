@@ -8,8 +8,9 @@ A session keeps the soul, the runtime, the model, and the sub-agents that it fro
 changes apply from the next session. The gate reads the toolsets on every tool call, so a change
 to the toolsets applies at the next tool call, also in a session that is running.
 
-This is the M3.8 interim. A change to a profile will go through ``change_propose`` (M6.1) when
-that tool exists.
+This is the M3.8 interim. Since M3.2, the agent can propose a new soul with ``change_propose``
+(``sama.review.soul``), and a person approves it on an approval card. The other fields of a
+profile will go through ``change_propose`` when it gets the targets profile and toolsets (M6.1).
 """
 
 from __future__ import annotations

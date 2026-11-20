@@ -47,11 +47,15 @@ log: Final = logging.getLogger("sama.subagents")
 TOOLSET: Final = "subagents"
 """The toolset that lets a run start a sub-agent. A profile needs it for its sub-agents."""
 
-NOT_FOR_SUBAGENTS: Final = frozenset({TOOLSET, "clarify", "tool_search"})
+NOT_FOR_SUBAGENTS: Final = frozenset(
+    {TOOLSET, "clarify", "tool_search", "connections", "integrations"}
+)
 """Toolsets that a sub-agent never has. A sub-agent cannot start a sub-agent, and it has no
 direct line to the user. It has no ``tool_search``, too: ``tool_search``, ``tool_describe``, and
 ``tool_call`` reach each deferred tool of the run with the authority of the run, and the spec of
-a sub-agent does not name those tools."""
+a sub-agent does not name those tools. It has no ``connections`` and no ``integrations``: a
+connection is used with the authority of the run user, and only the run itself asks the user to
+connect (Section 10.3)."""
 
 MAX_SUBAGENTS: Final = 8
 """A profile has at most this number of sub-agents. Each one is in the prompt of the model."""

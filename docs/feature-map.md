@@ -32,7 +32,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Agent loop | `run_agent.py`, `agent/` | The SDK runs the loop. Sama wraps it in the `AgentRuntime` contract (§5). | SDK | M1 |
 | Provider abstraction (many providers) | `agent/transports/`, `providers/` | Only Anthropic and OpenAI models. Claude adapter (default) and OpenAI Agents adapter (M3.6 done). An admin switches the runtime of a profile. | Adapt | M1, M3 (M3.6 done) |
 | Three-tier prompt (stable, context, volatile) | `agent/prompt_builder*.py` | Frozen prefix per session: SOUL, context files, memory snapshot, skill index. Volatile notes on the user message (§6.1, D9). | Adapt | M1 |
-| `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). | Adapt | M1 |
+| `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). Since M3.2, `change_propose` proposes a new SOUL, and a workspace admin or the org owner approves it (§9.4.2). | Adapt | M1 |
 | Context files (`AGENTS.md`, `CLAUDE.md`, `.hermes.md`) | `agent/context_files*.py` | Loaded from the repo in the sandbox and from workspace settings, 20,000-char cap, injection scan (§6). | Adapt | M1 |
 | Personalities (`/personality`) | `hermes_cli` | Agent profiles cover this. | Adapt | M3 |
 | Model switch per session (`/model`) | `hermes_cli/commands.py` | `/model` starts a child session (lineage) with the new model and a new prefix. The old session keeps its frozen prefix. | Adapt | M1 |
@@ -60,7 +60,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `clarify` | `tools/clarify_tool.py` | Sama tool, rendered as buttons per channel. Denied in unattended runs. | Adapt | M1 |
 | `execute_code` (RPC to tools) | `tools/code_execution_tool.py` | Sama `code_exec`: Python in the sandbox with a stub that calls sama tools over MCP. | Adapt | M4 |
 | `computer_use` (desktop control) | `tools/computer_use_tool.py` | Browser vision mode (§14) covers web apps. Full desktop control is not planned. | Defer | — |
-| `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` (link or web form), `connection_test`. Add, change, and remove happen in the web app or through `/connect`, so secrets never enter chat (§10.3). | Adapt | M3 |
+| `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` (a link to the Connections page), `connection_test`. Add, change, and remove happen in the web app. `/connect` gives a link, so secrets never enter chat (§10.3). | Adapt | M3 (M3.4 done) |
 | Discord and Feishu tools | `tools/discord_tool.py`, `tools/feishu_*.py` | Through Composio toolkits when needed. | Defer | — |
 | Desktop-only tools (`desktop_ui`, `project`, `catalog`) | `tools/project_tools.py` and others | No desktop app. | Skip | — |
 | No agent-callable `send_message` | `toolsets.py` | Same rule: replies go to the trigger's channel (§10.1). | Adapt | M1 |
@@ -128,7 +128,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `/learn` (skill from sources) | `learn_prompt.py` | `/learn <url or files>` creates a draft skill for review. | Adapt | M4 |
 | Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace. Archive, never delete. Pins (§9). | Adapt | M6 |
 | Checkpoints and `/rollback`, `/undo` | `agent/checkpoints/` | Shadow git in the sandbox or Claude file checkpointing. User commands, not model tools (§15.3). | Adapt | M6 |
-| Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). | Adapt | M6 |
+| Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). The SOUL target is done in M3.2 (§9.4.2). | Adapt | M6 |
 | Changes to its own code | `self_repo_guard.py`, `hermes update` | `sama_pr`: a pull request to the sama repo that a human merges. CI deploys (§15.2). | New | M6 |
 | Version history and revert for all agent changes | partial (curator backups) | Every self-improvement write is a versioned row with provenance (D14). | New | M2 |
 
@@ -154,12 +154,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | Telegram adapter | `plugins/platforms/telegram/` | Bot API webhook adapter, inline keyboards, voice notes (§11.2). | Adapt | M1 |
-| Slack adapter | `plugins/platforms/slack/` | Events API and Web API with `httpx` (no Bolt), one Slack app per org as an integration, Block Kit approvals, thread = session (§11.2, §11.6). | Adapt | M3 (M3.1 done) |
+| Slack adapter | `plugins/platforms/slack/` | Events API and Web API with `httpx` (no Bolt), one Slack app per org as an integration, Block Kit approvals, thread = session (§11.2, §11.6). Threads are shared sessions with the audience rule (M3.3). | Adapt | M3 (M3.1, M3.3 done) |
 | 24 other platforms (Discord, WhatsApp, Signal, Email, Teams, ...) | `plugins/platforms/` | Same adapter shape. Email and WhatsApp first, on request. | Defer | — |
 | API server (OpenAI-compatible) | `gateway/platforms/api_server*.py` | Sama HTTP API with streaming events (§4.1). OpenAI-compatible endpoint later. | Adapt | M1 |
 | Authorization ladder, default deny | `gateway/authz_mixin.py` | Paired identities only. Group toolset and approver rule for shared sessions. Private and shared session audiences (§11.3). | Adapt | M1 |
 | DM pairing codes with rate limits and lockout | `gateway/pairing.py` | Codes from the web app, 10-minute expiry, lockout (§11.3). | Adapt | M1 |
-| Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. | Adapt | M1, M3 |
+| Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. Since M3.2: "Always allow for me" on Slack and Telegram cards, chat proposals, and the timeout counts as deny (§9.4.2). | Adapt | M1, M3 (M3.2 done) |
 | Streaming edits to messages | `gateway/stream_consumer*.py` | Edit one message as text arrives, with rate limits per channel. | Adapt | M1 |
 | Slash command registry | `hermes_cli/commands.py` | One command registry for all channels (§11.1). | Adapt | M1 |
 | Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, jobs, workflows, connections, traces (§11.2). | Adapt | M1 (minimal), M3, M6 |
@@ -169,13 +169,13 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| `delegate_task` (single and batch) | `tools/delegate_tool.py` | Child session and run in its own sandbox. Summary returns to the parent (§13). | Adapt | M4 |
-| Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget. | Adapt | M4 |
-| Cheaper model for children | `delegation.model` | Child model per profile. | Adapt | M4 |
+| `delegate_task` (single and batch) | `tools/delegate_tool.py` | Child session and run in its own sandbox. Summary returns to the parent (§13.2). | Adapt | M4 (done, M4.6) |
+| Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget, and lose `tasks`, `memory`, `clarify`, `cron`, `connections`, and `integrations` (§13.2). | Adapt | M4 (done, M4.6) |
+| Cheaper model for children | `delegation.model` | Child model per profile. M4.6 children use the model of the parent profile. | Adapt | Later |
 | Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents` (M2.7 done). OpenAI agents as tools and handoffs later: the OpenAI adapter (M3.6) has no native sub-agents (§13). | SDK | M2 (Claude done) |
-| Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for running children. | Adapt | M4 |
-| Kanban board and dispatcher | `hermes kanban` | Task board with `task_*` tools (§12.4). | Adapt | M4 |
-| Worker bots in Slack channels | `gateway/bot_*` | An agent profile bound to a Slack channel with a budget. | Adapt | M3 |
+| Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for children. Steer is a message after the current child run (§13.2). | Adapt | M4 (done, M4.6) |
+| Kanban board and dispatcher | `hermes kanban` | Task board with a dispatcher, `task_*` tools, and the web route `/tasks` (§12.4). | Adapt | M4 (done, M4.7) |
+| Worker bots in Slack channels | `gateway/bot_*` | An agent profile bound to a Slack channel with a daily budget (§11.6). Done in M3.10. | Adapt | M3 |
 
 ## 11. Browser
 
@@ -200,12 +200,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | MCP tool naming `mcp_<server>_<tool>` | `tools/mcp_tool.py` | Same naming as `mcp_<connection>_<tool>`, plus `db_` and `api_` prefixes, behind `tool_search` (§10.3). | Adapt | M3 |
 | Per-server tool filters, schema cache, health checks | `tools/mcp_tool_registration.py`, `tools/mcp_schema_cache.py`, `tools/mcp_tool_health.py` | Include and exclude filters, `tool_cache`, and health checks per connection (§10.3). | Adapt | M3 |
 | `/reload-mcp` | `tui_gateway/methods_tools.py` | Not needed. New connector tools are reachable through `tool_search`, so the prompt prefix does not change (§10.3). | Skip | — |
-| `${ENV_VAR}` in MCP config | `tools/mcp_tool_config.py` | Secrets come from the vault reference of the connection, not from environment variables (§10.3). | Adapt | M3 |
-| MCP catalog (`optional-mcps/`, 66 manifests) | `optional-mcps/` | Connector catalog of YAML manifests in `connectors/catalog/`, added by reviewed pull requests (§10.3). We write our own manifests. | Adapt | M3 |
-| Connection state contract | `tools/connectors/contract.py` | Same idea: only the backend sets `connected`; a clock expires `initiated` (§10.3). | Adapt | M3 |
-| Managed connectors (Nous tool gateway) | `tools/connectors/` | Composio with entities per user and per workspace (§10.3). | Adapt | M3 |
+| `${ENV_VAR}` in MCP config | `tools/mcp_tool_config.py` | Secrets come from the vault reference of the connection, not from environment variables (§10.3). | Adapt | M3 (M3.4 done for `http_api`) |
+| MCP catalog (`optional-mcps/`, 66 manifests) | `optional-mcps/` | Connector catalog of YAML manifests in `connectors/catalog/`, added by reviewed pull requests (§10.3). We write our own manifests. M3.4 has six: five Composio connectors and Notion (`http_api`). | Adapt | M3 (M3.4 done) |
+| Connection state contract | `tools/connectors/contract.py` | Same idea: only the backend sets `connected`; a clock expires `initiated` (§10.3). | Adapt | M3 (M3.4 done) |
+| Managed connectors (Nous tool gateway) | `tools/connectors/` | Composio with entities per user and per workspace (§10.3). | Adapt | M3 (M3.4 done) |
 | Database access | Through MCP servers (for example Supabase, Neon) | Native database connections with a sama database gateway: read-only by default, one statement per call, timeouts, row limits, hidden columns, approval for writes (§10.4). Vendor MCP servers also work. | New | M3 (PostgreSQL), M4 (others) |
-| HTTP API connectors | none | `http_api` connections from an OpenAPI document (§10.3). | New | M4 |
+| HTTP API connectors | none | `http_api` connections from a list of endpoints in the manifest (M3.4), and later from an OpenAPI document (§10.3). | New | M3.4 (endpoints), M4 (OpenAPI) |
 | Private networks | none | Static egress IPs and SSH tunnels per connection; a relay later (§10.6). | New | M4 |
 | Hermes as an MCP server (`hermes mcp serve`) | moved out of core (`hermes_cli/left_core_migration.py`) | Sama as an MCP server later (§10.7). | Defer | — |
 | Plugin system | `plugins/`, `hermes_cli/plugins*` | Extension points for products (tools, skills, toolsets, channels, policies) (D16). | Adapt | M1 |

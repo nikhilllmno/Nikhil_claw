@@ -32,10 +32,13 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.connectors.manifest import Catalog
+from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
 from sama.context.session_items import PostgresSessionItems
 from sama.controlplane.settings import ControlPlaneSettings
 from sama.db.engine import create_engine
+from sama.delegation import DelegationService
 from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
 from sama.integrations.hub import TelegramHub
@@ -56,12 +59,15 @@ from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, Sand
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
 from sama.review.proposals import PostgresProposalStore
+from sama.review.soul import SoulProposer
 from sama.runtime.archive import ARCHIVE_PATH
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.runtime.session_items import SESSION_ITEMS_PATH
 from sama.sandbox.base import SandboxProvider
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
+from sama.tasks.dispatcher import TaskDispatcher
+from sama.tasks.runs import TaskTools
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
 from sama.tools.deferred import DeferredCatalog
@@ -142,12 +148,22 @@ def build(
             SecretName.ANTHROPIC_API_KEY: settings.anthropic_key,
             SecretName.OPENAI_API_KEY: settings.openai_key,
             SecretName.BRAVE_API_KEY: settings.brave_key,
+            SecretName.COMPOSIO_API_KEY: settings.composio_key,
         },
     )
     signer = RunTokenSigner(settings.run_token_key.get_secret_value().encode())
     # The deferred tools are in one catalog. The gate reads their toolsets from it, and the tool
-    # server runs them (Section 10.3). The catalog is empty until a feature adds tools.
+    # server runs them (Section 10.3). The connector tools of the catalog in
+    # ``connectors/catalog/`` are deferred tools of the toolset ``integrations``.
     deferred = DeferredCatalog()
+    connections = ConnectionService(
+        engine,
+        Catalog.load(),
+        keys=keys,
+        vault=vault,
+        web_base=settings.web_base,
+    )
+    connections.register_tools(deferred)
     gate = GateService(engine, extra_toolsets=deferred)
     broker = ClarifyBroker()
     library = SkillLibrary(engine, BuiltinSkills().all())
@@ -187,8 +203,9 @@ def build(
     for runtime in runtimes:
         registry.register(runtime)
 
+    queue = RunQueue(engine)
     worker = Worker(
-        RunQueue(engine),
+        queue,
         registry,
         config=PromptAssembler(
             engine,
@@ -225,6 +242,7 @@ def build(
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
         memory=MemoryService(memory_store, proposals),
         skills=skill_store,
+        souls=SoulProposer(engine, proposals),
         sessions=SessionSearch(engine, embedder),
         vision=(
             VisionService(
@@ -240,9 +258,12 @@ def build(
             else None
         ),
         deferred=deferred,
+        connections=connections,
         archive=ContextArchive(engine),
         session_items=PostgresSessionItems(engine),
         gate=gate,
+        delegation=DelegationService(engine, queue),
+        tasks=TaskTools(engine),
     )
     proxy = ModelProxy(
         signer=signer,
@@ -255,11 +276,23 @@ def build(
         ledger=ledger,
     )
     hub = (
-        TelegramHub(engine, vault, keys=keys, gate=gate, skills=library)
+        TelegramHub(
+            engine,
+            vault,
+            keys=keys,
+            gate=gate,
+            skills=library,
+            reviews=reviews,
+            connections=connections,
+        )
         if vault is not None
         else None
     )
-    slack = SlackHub(engine, vault, gate=gate, skills=library) if vault is not None else None
+    slack = (
+        SlackHub(engine, vault, gate=gate, skills=library, reviews=reviews, connections=connections)
+        if vault is not None
+        else None
+    )
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack):
@@ -274,6 +307,7 @@ def build(
     )
     api = SamaApi(
         engine,
+        queue=queue,
         verifier=JwtVerifier(
             secret=settings.supabase_jwt_secret,
             jwks_url=jwks_url(settings.supabase_url),
@@ -288,6 +322,7 @@ def build(
         integrations=integrations,
         skills=library,
         reviews=reviews,
+        connections=connections,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -310,11 +345,13 @@ def build(
                 stack.push_async_callback(_close_sandboxes, sandboxed)
             await stack.enter_async_context(proxy_app.router.lifespan_context(proxy_app))
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
+            stack.push_async_callback(connections.aclose)
             if hub is not None:
                 stack.push_async_callback(hub.aclose)
             if slack is not None:
                 stack.push_async_callback(slack.aclose)
             loops = _monitor(settings, engine, stack)
+            loops.append(TaskDispatcher(engine, queue))
             if embedder is not None:
                 stack.push_async_callback(embedder.aclose)
                 loops.append(EmbedWorker(engine, embedder))

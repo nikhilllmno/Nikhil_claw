@@ -123,6 +123,8 @@ async def load_actor(
                 Run.agent_profile_id,
                 Run.triggered_by_user_id,
                 Run.kind,
+                Run.unattended,
+                Session.lineage,
             )
             .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
             .where(Session.org_id == org_id, Session.id == session_id, Run.id == run_id)
@@ -130,7 +132,7 @@ async def load_actor(
     ).one_or_none()
     if row is None:
         raise SkillError("The run is not known.")
-    workspace_id, audience, owner, profile_id, triggered_by, kind = row
+    workspace_id, audience, owner, profile_id, triggered_by, kind, unattended, lineage = row
     user_id = run_user(triggered_by, audience, owner) or (
         uuid.UUID(token_user) if token_user else None
     )
@@ -163,4 +165,5 @@ async def load_actor(
         session_id=session_id,
         run_id=run_id,
         review=kind == "review",
+        attended=kind == "chat" and not unattended and lineage != "delegation",
     )

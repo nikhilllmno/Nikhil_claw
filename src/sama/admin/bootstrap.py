@@ -30,11 +30,17 @@ DEFAULT_TOOLSETS: Final = (
     "media",
     "tool_search",
     "subagents",
+    "connections",
+    "integrations",
+    "delegation",
+    "tasks",
 )
-DEFAULT_GROUP_TOOLSETS: Final = ("todo", "web", "clarify", "memory", "sessions", "media")
+DEFAULT_GROUP_TOOLSETS: Final = ("todo", "web", "clarify", "memory", "sessions", "media", "tasks")
 """The toolsets of a shared session (Section 10.2): no shell, no code edit, no outbound write.
 ``skills`` is out because ``skill_manage`` writes workspace skills. ``github`` is out because
-``repo_clone`` needs the sandbox. Migration 0017 has a copy of this list."""
+``repo_clone`` needs the sandbox. ``tasks`` is in because the run of a shared card is a shared
+session, and it ends its card with ``task_complete``. ``delegation`` is out: a child run holds
+sandboxes and budget. Migrations 0017 and 0023 have a copy of this list."""
 
 
 class BootstrapError(ValueError):

@@ -39,6 +39,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final
 
@@ -169,6 +170,33 @@ def _check_rate(row: Any) -> None:
             )
 
 
+BUDGET_KEYS: Final = ("max_turns", "max_tokens", "max_cost_usd", "max_wall_time_s")
+
+
+def narrow_budget(
+    budget: Mapping[str, Any] | None, cap: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """The lower of two run budgets (``Budget``), key by key. A missing key means no limit.
+    A cost is a ``Decimal`` string in JSON, so the stored value is exact."""
+    out = dict(budget or {})
+    for key, value in (cap or {}).items():
+        if key not in BUDGET_KEYS:
+            raise ValueError(f"not a budget key: {key}")
+        if value is None:
+            continue
+        current = out.get(key)
+        if key == "max_cost_usd":
+            low = (
+                Decimal(str(value))
+                if current is None
+                else min(Decimal(str(current)), Decimal(str(value)))
+            )
+            out[key] = str(low)
+        else:
+            out[key] = value if current is None else min(current, value)
+    return out
+
+
 def _session_state_query(runs: Any, org_id: Any, session_id: Any, runtime: Any) -> Any:
     """The runtime state of the newest chat run of a session that saved one (see
     ``RunQueue._session_state``). ``runs`` is ``Run`` or an alias of it."""
@@ -242,6 +270,9 @@ class ClaimedRun:
     compact: bool = False
     """True for a ``/compact`` run (Section 6.3). Its ``input`` is the focus of the summary,
     not a user message, and the run writes no message."""
+    lineage: str | None = None
+    """The lineage of the session. ``delegation`` for a delegated child (Section 13.2): the
+    gate and the prompt take away the toolsets in ``CHILD_BLOCKED_TOOLSETS``."""
 
 
 def _stored_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -333,83 +364,109 @@ class RunQueue:
         (``QueueLimits``).
         """
         async with self._engine.begin() as connection:
-            await self._rate_lock(connection, org_id)  # the lock order of all enqueues
-            # One statement reads the session, the limits, and the rate counts. It comes
-            # after the lock statement, so its snapshot has every enqueue before the lock.
-            session = (
-                await connection.execute(
-                    select(
-                        Session.status,
-                        Session.agent_profile_id,
-                        func.coalesce(
-                            Session.run_config["runtime"].astext, AgentProfile.runtime
-                        ).label("runtime"),
-                        AgentProfile.budget,
-                        *_rate_columns(org_id, user_id),
-                    )
-                    .join(
-                        AgentProfile,
-                        and_(
-                            AgentProfile.org_id == Session.org_id,
-                            AgentProfile.id == Session.agent_profile_id,
-                        ),
-                    )
-                    .where(Session.org_id == org_id, Session.id == session_id)
+            return await self.enqueue_in(
+                connection,
+                org_id=org_id,
+                session_id=session_id,
+                text=text,
+                user_id=user_id,
+                unattended=unattended,
+                attachments=attachments,
+            )
+
+    async def enqueue_in(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None = None,
+        unattended: bool = False,
+        attachments: Sequence[NewAttachment] = (),
+        budget: Mapping[str, Any] | None = None,
+    ) -> uuid.UUID:
+        """``enqueue`` in the transaction of the caller. A caller that makes the session in
+        the same transaction (delegation, the task dispatcher) gets the session and the run
+        together, or neither. ``budget`` can only make the profile budget smaller
+        (``narrow_budget``)."""
+        await self._rate_lock(connection, org_id)  # the lock order of all enqueues
+        # One statement reads the session, the limits, and the rate counts. It comes
+        # after the lock statement, so its snapshot has every enqueue before the lock.
+        session = (
+            await connection.execute(
+                select(
+                    Session.status,
+                    Session.agent_profile_id,
+                    func.coalesce(Session.run_config["runtime"].astext, AgentProfile.runtime).label(
+                        "runtime"
+                    ),
+                    AgentProfile.budget,
+                    *_rate_columns(org_id, user_id),
                 )
-            ).one_or_none()
-            if session is None:
-                raise QueueError("the session does not exist")
-            if session.status != "active":
-                raise QueueError("the session is not active")
-            _check_rate(session)
-            run_id = uuid.uuid4()
-            # The run and the message go in one statement: the run insert is a CTE.
-            message_id = (
-                await connection.execute(
-                    insert(Message)
+                .join(
+                    AgentProfile,
+                    and_(
+                        AgentProfile.org_id == Session.org_id,
+                        AgentProfile.id == Session.agent_profile_id,
+                    ),
+                )
+                .where(Session.org_id == org_id, Session.id == session_id)
+            )
+        ).one_or_none()
+        if session is None:
+            raise QueueError("the session does not exist")
+        if session.status != "active":
+            raise QueueError("the session is not active")
+        _check_rate(session)
+        run_id = uuid.uuid4()
+        # The run and the message go in one statement: the run insert is a CTE.
+        message_id = (
+            await connection.execute(
+                insert(Message)
+                .values(
+                    org_id=org_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    role="user",
+                    author_user_id=user_id,
+                    content={"text": redact(text)},
+                )
+                .returning(Message.id)
+                .add_cte(
+                    insert(Run)
                     .values(
+                        id=run_id,
                         org_id=org_id,
                         session_id=session_id,
-                        run_id=run_id,
-                        role="user",
-                        author_user_id=user_id,
-                        content={"text": redact(text)},
+                        agent_profile_id=session.agent_profile_id,
+                        triggered_by_user_id=user_id,
+                        runtime=session.runtime,
+                        budget=narrow_budget(session.budget, budget),
+                        unattended=unattended,
                     )
-                    .returning(Message.id)
-                    .add_cte(
-                        insert(Run)
-                        .values(
-                            id=run_id,
-                            org_id=org_id,
-                            session_id=session_id,
-                            agent_profile_id=session.agent_profile_id,
-                            triggered_by_user_id=user_id,
-                            runtime=session.runtime,
-                            budget=session.budget,
-                            unattended=unattended,
-                        )
-                        .cte("new_run")
-                    )
+                    .cte("new_run")
                 )
-            ).scalar_one()
-            if attachments:
-                await connection.execute(
-                    insert(Attachment),
-                    [
-                        {
-                            "id": image.id,
-                            "org_id": org_id,
-                            "session_id": session_id,
-                            "message_id": message_id,
-                            "name": image.name,
-                            "mime_type": image.mime_type,
-                            "size_bytes": len(image.data),
-                            "sha256": image.sha256,
-                            "data": image.data,
-                        }
-                        for image in attachments
-                    ],
-                )
+            )
+        ).scalar_one()
+        if attachments:
+            await connection.execute(
+                insert(Attachment),
+                [
+                    {
+                        "id": image.id,
+                        "org_id": org_id,
+                        "session_id": session_id,
+                        "message_id": message_id,
+                        "name": image.name,
+                        "mime_type": image.mime_type,
+                        "size_bytes": len(image.data),
+                        "sha256": image.sha256,
+                        "data": image.data,
+                    }
+                    for image in attachments
+                ],
+            )
         return run_id
 
     async def enqueue_compact(
@@ -754,6 +811,7 @@ class RunQueue:
                     Session.workspace_id,
                     Session.audience,
                     Session.owner_user_id,
+                    Session.lineage,
                     AgentProfile.model,
                     AgentProfile.soul,
                     AgentProfile.review_model,
@@ -816,6 +874,7 @@ class RunQueue:
             attempt=row.attempts,
             next_seq=int(next_seq),
             compact=bool(row.compact),
+            lineage=row.lineage,
         )
 
     @staticmethod

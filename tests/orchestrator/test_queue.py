@@ -22,6 +22,7 @@ from sama.orchestrator.queue import (
     QueueError,
     RunQueue,
     RunRef,
+    narrow_budget,
 )
 from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
 from sama.vault.redact import default_redactor
@@ -107,6 +108,52 @@ async def test_enqueue_copies_the_profile_budget(engine: AsyncEngine) -> None:
     tenant = await add_tenant(engine, budget={"max_turns": 4})
     run_id = await enqueue(RunQueue(engine), tenant, "s1")
     assert (await run_row(engine, run_id)).budget == {"max_turns": 4}
+
+
+async def test_enqueue_in_can_only_make_the_budget_smaller(engine: AsyncEngine) -> None:
+    tenant = await add_tenant(engine, budget={"max_turns": 4, "max_cost_usd": "2.50"})
+    queue = RunQueue(engine)
+    async with engine.begin() as connection:
+        run_id = await queue.enqueue_in(
+            connection,
+            org_id=tenant.org,
+            session_id=tenant.ids["s1"],
+            text="hi",
+            budget={"max_turns": 30, "max_cost_usd": "1.00", "max_wall_time_s": 60},
+        )
+    assert (await run_row(engine, run_id)).budget == {
+        "max_turns": 4,
+        "max_cost_usd": "1.00",
+        "max_wall_time_s": 60,
+    }
+
+
+async def test_enqueue_in_rolls_back_with_the_transaction_of_the_caller(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        run_id = await queue.enqueue_in(
+            connection, org_id=tenant.org, session_id=tenant.ids["s1"], text="hi"
+        )
+        await transaction.rollback()
+    async with engine.connect() as connection:
+        found = await connection.execute(select(Run.id).where(Run.id == run_id))
+        assert found.first() is None
+
+
+def test_narrow_budget_takes_the_lower_value_of_each_key() -> None:
+    assert narrow_budget(None, None) == {}
+    assert narrow_budget({"max_turns": 5}, {"max_turns": 9, "max_cost_usd": 1}) == {
+        "max_turns": 5,
+        "max_cost_usd": "1",
+    }
+    assert narrow_budget({"max_cost_usd": "0.5"}, {"max_cost_usd": "0.75", "max_turns": None}) == {
+        "max_cost_usd": "0.5"
+    }
+    with pytest.raises(ValueError, match="not a budget key"):
+        narrow_budget({}, {"max_gpus": 1})
 
 
 # -- claim ------------------------------------------------------------------------------------

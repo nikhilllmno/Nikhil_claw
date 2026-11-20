@@ -66,6 +66,10 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
             "media",
             "tool_search",
             "subagents",
+            "connections",
+            "integrations",
+            "delegation",
+            "tasks",
         ],
         list(DEFAULT_GROUP_TOOLSETS),
     )

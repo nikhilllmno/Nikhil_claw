@@ -69,6 +69,9 @@ class Actor:
     review: bool = False
     """True in a background review run. It writes user skills itself and proposes the rest
     (Section 9.4)."""
+    attended: bool = False
+    """True in a chat run with a person in it: not unattended, not a delegated child. Such a
+    run proposes a shared change that its user has no role for (M3.2)."""
 
     @property
     def sees_user_skills(self) -> bool:

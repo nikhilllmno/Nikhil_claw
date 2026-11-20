@@ -150,12 +150,52 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
   work. The Telegram and Slack gateways share `src/sama/gateway/sessions.py`. Not in M3.1:
   Slack OAuth distribution, voice notes, and `/model` in Slack. Approver rules per role stay in
   M3.2.
+- M3.2: approvals over chat (architecture Section 9.4.2). Migration `0021` adds
+  `review_proposals.origin` and the proposal kind `soul`. In an attended chat run, a workspace
+  memory or workspace skill write of a user who is not a workspace admin, and an org skill write
+  of a user who is not the org owner, is a chat proposal. The new tool `change_propose` (toolset
+  `self`) proposes a new SOUL; a SOUL change is always a proposal. A workspace admin or the org
+  owner decides a workspace proposal, and only the org owner decides an org proposal (the gate
+  checks the role). Slack and Telegram cards have "Always allow for me", which writes a user
+  policy rule; a proposal card does not have it. A click after the timeout counts as deny and
+  shows "Expired". A decided proposal applies at once and in the worker sweep. Not in M3.2: the
+  `change_propose` targets profile, toolsets, and policy (M6.1), and copies of a proposal card in
+  the direct messages of the admins.
+- M3.3: shared sessions in Slack (architecture Section 11.6). A channel thread is a shared
+  session; its run has no user, so it gets no `user` memory, and `session_search` sees only the
+  shared sessions of the workspace. Delivery checks the link of the channel (or the worker bot)
+  before each send. `tests/gateway/test_slack_m3.py` shows that the `user` memory of a member is
+  in the direct message and not in a channel thread.
+- M3.10: worker bots in `src/sama/workerbots.py` (architecture Section 11.6). Migration `0021`
+  adds `worker_bots` (RLS: a user who can see the workspace reads them) and
+  `sessions.worker_bot_id`. A workspace admin, the org owner, or an org admin manages the bots
+  with `/workspaces/{id}/worker-bots`. A mention in the channel of a bot starts a shared session
+  with the profile of the bot. The gateway does not start a run after the bot spent its daily
+  budget (UTC day), and the live authority limits a running run to the rest of the budget. Not
+  in M3.10: a web page for the bots, and bots in Telegram.
+- M3.4: connections in `src/sama/connectors/` and `connectors/catalog/` (architecture Section
+  10.3). Migration `0022` adds `connections` with RLS, the vault names `composio_api_key` and
+  `connection:<uuid>`, and the toolsets `connections` and `integrations` in the default
+  profile. The catalog has five Composio connectors (Gmail, Google Calendar, GitHub, Slack,
+  Linear) and one `http_api` connector (Notion, with a form). A Composio connection uses the
+  Composio link flow and the entity `sama-<org>-u-<user>` or `sama-<org>-w-<workspace>`. Only a
+  backend check sets `connected`. The Connections page of the web app starts, checks, fills,
+  disables, and removes connections. `/connect <name>` (Telegram) and `/sama connect <name>`
+  (Slack) give a link to that page and never take a secret. `connections_list`,
+  `connection_request`, and `connection_test` are default allow tools. The connector tools are
+  deferred tools in `integrations`: `tool_search` shows them only with a connected connection
+  that the run can use, and a shared session uses only workspace connections. Read tools are
+  `allow`, write tools `ask`. The `http_api` driver uses the outbound client (public addresses
+  only, no redirects), and a check never overwrites a `disable` that happens during it. Not in
+  M3.4: `mcp_remote`, `mcp_hosted`, `database`, and
+  `plugin` connectors, tool discovery and `tool_cache`, `policy_overrides` in the gate,
+  Composio triggers, custom connections, and per-tool filters.
 - M3.6: the OpenAI Agents SDK adapter in `src/sama/runtime/openai_agents.py` (architecture
   Section 5.3). A run is a `SandboxAgent` with the `Shell` and `Compaction` capabilities and the
   local sandbox client, so the runner needs no E2B key. The model is the Responses API through
   the model proxy (`/openai/v1`, and `/openai/v1/responses/compact` for a manual compaction).
   The SDK `Session` is a sama store over `POST /session-items` of the tool server, so the runner
-  needs no database credential. Migration `0021` adds `runtime_session_items` with RLS that
+  needs no database credential. Migration `0024` adds `runtime_session_items` with RLS that
   follows the session. Each tool has `needs_approval`, which asks the sama gate. A pause saves
   the SDK `RunState`, and a resume calls `approve()` or `reject()`. The adapter archives the
   items that a compaction drops. The conformance targets `openai-scripted` and `openai-runner`
@@ -277,15 +317,15 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
 | # | Item | Acceptance criteria |
 |---|---|---|
 | M3.1 | Slack channel | A Slack integration per org (architecture §11.6): an org admin installs a Slack app from a manifest and pastes its tokens. DMs and mentions, thread = session, streaming edits, Block Kit approvals, slash commands. Each request is checked with the signing secret of the app. A Slack workspace belongs to one org. Done (ahead of M2). |
-| M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. |
-| M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. |
-| M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. |
+| M3.2 | Approvals over chat | Approval cards in Slack (Telegram cards come in M1.13). Approver rules per workspace role: workspace `admin` or org `owner` approve workspace memory, skills, and SOUL; org scope needs the org `owner`. Timeout counts as `deny`. "Always allow for me" writes a policy rule. Done. |
+| M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. Done. |
+| M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. Done. |
 | M3.5 | Remote MCP connections | Add a remote MCP server from the catalog or by URL, with OAuth 2.1 (dynamic client registration and PKCE), a bearer token, or a header. Tools proxied by the sama MCP server as `mcp_<connection>_<tool>`. Include and exclude filters, a tool schema cache, and a health check. New tools are usable without a new session. All calls use the outbound URL policy (architecture §16.4). |
 | M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the local sandbox client inside the E2B sandbox (no E2B key in the runner), a sama `Session` over the control-plane API (no database credentials in the runner), `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. Done. |
 | M3.7 | GitHub App, git proxy, and pull requests | Sama GitHub App. Sama git proxy holds the tokens; the sandbox has none. `repo_clone`, `pr_create`, `pr_comment`. Allowlist of repos per org. The proxy rejects pushes to non-`sama/*` refs, force-pushes, and ref deletes, and needs an approval for protected paths. Setup docs require a default-branch ruleset with no bypass for the App. Tests cover each rejected push. |
 | M3.8 | Web app v1 core | Next.js app in `web/`, hosted on Vercel: sign-in (password and email link), session list, chat with live streaming, approvals and questions, stop, and agent settings (soul, model, toolsets, sub-agents) for org admins. CORS from `SAMA_WEB_ORIGINS`. CI runs lint, typecheck, tests, and build. Done. |
 | M3.9 | Busy controls and handoff | Queue, `/stop`, `/steer` while a run is busy. `/handoff` between channels. |
-| M3.10 | Worker bots | An agent profile bound to a Slack channel with a daily budget. |
+| M3.10 | Worker bots | An agent profile bound to a Slack channel with a daily budget. Done. |
 | M3.11 | PostgreSQL connections | Database gateway with PostgreSQL (also Supabase and Neon) (architecture §10.4). Tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`. Tests show that: `query` runs in a read-only transaction; a write or a second statement in `query` is rejected; DDL is denied by default; a query stops after 30 seconds; the model gets at most 1,000 rows and 50 KB, and the rest spills to a file; hidden columns do not appear in any result; `execute` needs an approval that shows the SQL. Static egress IP addresses are documented for allowlists. |
 | M3.12 | Web app v1 rest | Memory editor, skill editor, connections, sessions with search and export (Markdown and JSON), run traces, settings. |
 
@@ -298,8 +338,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
 | M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. |
 | M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. |
 | M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
-| M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. |
-| M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. |
+| M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. Done. |
+| M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. Done. |
 | M4.8 | Code execution | `execute_code` with a stub that calls sama tools over MCP. Only stdout returns to the model. |
 | M4.9 | More media and references | `image_generate`, `text_to_speech` (Telegram voice note), `@file`, `@url`, `@session`. |
 | M4.10 | Skills import and `/learn` | Import a skill from a Git URL with scan and approval. `/learn` creates a draft skill from sources. |
@@ -322,7 +362,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
 
 | # | Item | Acceptance criteria |
 |---|---|---|
-| M6.1 | `change_propose` | The agent proposes changes to SOUL, profile, toolsets, and policy. An approval card shows the diff. Approved changes apply from the next session. History and revert in the web app. |
+| M6.1 | `change_propose` | The agent proposes changes to SOUL, profile, toolsets, and policy. An approval card shows the diff. Approved changes apply from the next session. History and revert in the web app. The SOUL target is done in M3.2 (no diff on the card). |
 | M6.2 | `sama_pr` | The agent clones the sama repo, changes code, runs tests, and opens a pull request with a summary. Changes to protected paths request the owner's review (CODEOWNERS). The agent cannot merge. |
 | M6.3 | Curator | Weekly job per workspace. Usage counts, active to stale to archived, pins, report to the owner. Never deletes. |
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. |

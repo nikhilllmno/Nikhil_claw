@@ -53,8 +53,10 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "context_files": {"file:org-a"},
         "channel_identities": {"tg:alice"},
         "channel_groups": {"group:a1"},
+        "worker_bots": {"bot:a1"},
         "pairing_codes": {"code:alice"},
         "integrations": {"int:org-a"},
+        "connections": {"conn:a1", "conn:a1-alice"},
         "memories": {"mem:alice", "mem:a1", "mem:a1-agent"},
         "memory_revisions": {"rev:mem:alice", "rev:mem:a1", "rev:mem:a1-agent"},
     },
@@ -67,8 +69,10 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "context_files": {"file:org-a", "file:a2", "file:profile-a2"},
         "channel_identities": set(),
         "channel_groups": {"group:a1"},
+        "worker_bots": {"bot:a1"},
         "pairing_codes": set(),
         "integrations": {"int:org-a"},
+        "connections": {"conn:a1", "conn:a2"},
         "memories": {"mem:a1", "mem:a2", "mem:a1-agent"},
         "memory_revisions": {"rev:mem:a1", "rev:mem:a2", "rev:mem:a1-agent"},
     },
@@ -81,8 +85,10 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "context_files": {"file:org-a"},
         "channel_identities": set(),
         "channel_groups": set(),
+        "worker_bots": set(),
         "pairing_codes": set(),
         "integrations": {"int:org-a"},
+        "connections": set(),
         "memories": {"mem:dave"},
         "memory_revisions": {"rev:mem:dave"},
     },
@@ -95,8 +101,10 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "context_files": {"file:org-b"},
         "channel_identities": {"tg:bob"},
         "channel_groups": {"group:b1"},
+        "worker_bots": {"bot:b1"},
         "pairing_codes": {"code:bob"},
         "integrations": {"int:org-b"},
+        "connections": {"conn:b1", "conn:b1-bob"},
         "memories": {"mem:bob", "mem:b1"},
         "memory_revisions": {"rev:mem:bob", "rev:mem:b1"},
     },
@@ -109,8 +117,10 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "context_files": set(),
         "channel_identities": set(),
         "channel_groups": set(),
+        "worker_bots": set(),
         "pairing_codes": set(),
         "integrations": set(),
+        "connections": set(),
         "memories": set(),
         "memory_revisions": set(),
     },
@@ -163,6 +173,10 @@ async def test_each_user_reads_only_the_rows_they_may_see(
         # Only org admins see which vault secrets exist, like the audit log.
         assert await count(connection, "vault_secrets") == AUDIT_ROWS[user]
         assert await labels(connection, world, "tool_policies", "id") == TOOL_POLICIES[user]
+        # A task card follows the visibility of a session with the same audience and owner.
+        cards = {f"task:{session}" for session in expected["sessions"]}
+        assert await labels(connection, world, "tasks", "id") == cards
+        assert await labels(connection, world, "task_comments", "task_id") == cards
 
 
 @pytest.mark.parametrize("table", TABLES)

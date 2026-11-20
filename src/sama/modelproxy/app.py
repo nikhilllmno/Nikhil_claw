@@ -312,7 +312,11 @@ class ModelProxy:
         claims = self._verify(request)
         body, request_bytes = await self._body(request)
         model = self._check(route, body)
-        # Every route needs live authority. Only the recorded routes spend the budget.
+        # Every route needs live authority. Only the recorded routes spend the budget. The
+        # pending usage is written first, so the live limits (for example the rest of the daily
+        # budget of a worker bot) count it.
+        if route.recorded:
+            await self._settle(claims)
         authority = await self._check_authority(claims)
         if route.recorded:
             await self._check_budget(claims, authority)
@@ -474,12 +478,15 @@ class ModelProxy:
             raise ProxyError(REVOKED_STATUS, "permission_error", authority.problem)
         return authority
 
-    async def _check_budget(self, claims: RunTokenClaims, authority: Authority) -> None:
-        """Fails closed: a store that cannot read, or a record that the store did not take,
-        refuses the call."""
+    async def _settle(self, claims: RunTokenClaims) -> None:
+        """Writes the pending usage of the org. Fails closed: a record that the store did not
+        take refuses the call."""
         await self._ledger.flush(claims.org_id)
         if self._ledger.blocked(claims.org_id):
             raise ProxyError(503, "api_error", "the proxy cannot record usage now")
+
+    async def _check_budget(self, claims: RunTokenClaims, authority: Authority) -> None:
+        """Fails closed: a store that cannot read refuses the call. ``_settle`` runs first."""
         try:
             await self._check_limits(claims, authority)
         except ProxyError:

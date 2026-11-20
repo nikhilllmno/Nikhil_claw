@@ -114,6 +114,13 @@ export function Sidebar({
         <Link href="/" className="btn btn-primary" aria-current={pathname === "/" ? "page" : undefined}>
           New session
         </Link>
+        <Link
+          href="/tasks"
+          className="btn"
+          aria-current={pathname === "/tasks" ? "page" : undefined}
+        >
+          Task board
+        </Link>
       </div>
 
       <nav className={styles.sessions} aria-label="Sessions">
@@ -179,6 +186,20 @@ export function Sidebar({
             </ul>
           </nav>
         ) : null}
+        <nav aria-label="Settings">
+          <ul className={styles.list}>
+            <li>
+              <Link
+                href="/connections"
+                className={styles.item}
+                aria-current={pathname === "/connections" ? "page" : undefined}
+              >
+                <span className={styles.itemTitle}>Connections</span>
+                <span className={styles.itemMeta}>The tools that the agent can use</span>
+              </Link>
+            </li>
+          </ul>
+        </nav>
         <div className={styles.user}>
           <span className={styles.userName} title={org?.name}>
             {org ? org.display_name || org.name : ""}

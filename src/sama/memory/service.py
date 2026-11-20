@@ -30,7 +30,7 @@ from sama.memory.store import (
     RunContext,
     Writer,
 )
-from sama.review.proposals import NewProposal, ProposalSink
+from sama.review.proposals import NewProposal, ProposalOrigin, ProposalSink
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import redact
 
@@ -97,6 +97,16 @@ class MemoryService:
         context = await self.store.context(claims)
         if context.review and target is not Target.USER:
             return await self._propose(claims, context, target, operations, reason)
+        if (
+            target is Target.WORKSPACE
+            and not context.workspace_admin
+            and not context.unattended
+            and not context.delegated
+            and self.proposals is not None
+        ):
+            # A member who is not an admin asks for a change of workspace memory in a chat. The
+            # change waits for a workspace admin or the org owner (M3.2, Section 9.4).
+            return await self._propose(claims, context, target, operations, reason, origin="chat")
         scope = self._scope(claims, context, target)
 
         def change(entries: list[str]) -> list[str]:
@@ -119,10 +129,13 @@ class MemoryService:
         target: Target,
         operations: Sequence[Operation],
         reason: str | None,
+        *,
+        origin: ProposalOrigin = "review",
     ) -> str:
-        """A background review does not change agent or workspace memory itself. It checks the
-        change against the current entries, and then it proposes the change. A person with the
-        right role approves it (Section 9.4)."""
+        """A background review does not change agent or workspace memory itself, and a chat run
+        of a user who is not a workspace admin does not change workspace memory itself. The
+        service checks the change against the current entries, and then it proposes the change.
+        A person with the right role approves it (Section 9.4)."""
         if self.proposals is None:
             raise MemoryDeniedError("a background review cannot change shared memory here")
         scope = scope_of(
@@ -152,11 +165,17 @@ class MemoryService:
                     "reason": reason,
                 },
                 summary=describe_operations(target, operations),
+                origin=origin,
             )
         )
+        who = (
+            "A workspace admin or the org owner must approve it first."
+            if target is Target.WORKSPACE
+            else "A person must approve it first."
+        )
         return (
-            f"Proposed a change of {target.value} memory. It is not saved. A person must"
-            " approve it first. Do not propose it again."
+            f"Proposed a change of {target.value} memory. It is not saved. {who} An approval"
+            " card shows the change. Do not propose it again."
         )
 
     def _scope(self, claims: RunTokenClaims, context: RunContext, target: Target) -> MemoryScope:

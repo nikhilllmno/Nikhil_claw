@@ -56,6 +56,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/` | New session: workspace, agent, audience, title. |
 | `/s/[sessionId]` | Chat with live streaming, approvals, questions, Stop, and `/compact`. |
 | `/agents/[profileId]` | Agent settings. Read-only unless you are an admin of the org. |
+| `/tasks` | Task board of the current workspace: columns, new cards, status, assignee, and comments. |
 
 ## Layout
 

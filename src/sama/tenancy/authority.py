@@ -7,6 +7,9 @@ each tool call, each model call, and each approval resume:
 - The user of the run must still see the session (``load_grants`` and ``sees_session``).
 - The run budget is the lower of the run budget and the live budget of the agent profile. So a
   lower budget applies at once, and a higher budget does not change a run that started.
+- A run of a worker bot (Section 11.6) also stays below the rest of the daily budget of the bot:
+  the budget less the cost of the other runs of the bot since 00:00 UTC. A bot that is disabled
+  or removed, or that spent its budget, stops its runs.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import ENDED_RUN_STATUSES, AgentProfile, ModelCall, Run, Session
 from sama.tenancy.access import load_grants
+from sama.workerbots import bot_limit
 
 UNKNOWN_RUN: Final = "the run is unknown"
 ENDED_RUN: Final = "the run ended"
@@ -101,6 +105,7 @@ async def load_authority(
                 Session.workspace_id,
                 Session.audience,
                 Session.owner_user_id,
+                Session.worker_bot_id,
             )
             .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
             .join(
@@ -119,9 +124,15 @@ async def load_authority(
         grants = await load_grants(connection, org_id, user_id)
         if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
             return Authority(problem=LOST_ACCESS)
+    max_cost_usd = lower(_cost(row.budget), _cost(row.profile_budget))
+    if row.worker_bot_id is not None:
+        limit = await bot_limit(connection, org_id, row.worker_bot_id, run_id)
+        if limit.problem is not None:
+            return Authority(problem=limit.problem)
+        max_cost_usd = lower(max_cost_usd, limit.max_cost_usd)
     return Authority(
         max_tokens=lower(_tokens(row.budget), _tokens(row.profile_budget)),
-        max_cost_usd=lower(_cost(row.budget), _cost(row.profile_budget)),
+        max_cost_usd=max_cost_usd,
     )
 
 

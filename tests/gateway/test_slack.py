@@ -13,6 +13,7 @@ from pydantic import SecretStr
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.connectors.service import CHAT_WARNING
 from sama.db.models import (
     ChannelGroup,
     ChannelIdentity,
@@ -24,11 +25,16 @@ from sama.db.models import (
     User,
 )
 from sama.gate.approvers import SHARED_REFUSAL
+from sama.gateway.connect import NO_CONNECTIONS
 from sama.gateway.pairing import create_code
 from sama.gateway.sessions import COMPACTING, FollowSettings
 from sama.gateway.slack import BUSY, HELP, LINK_FIRST, PAIR_PROMPT, SlackApp, SlackGateway
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
+from sama.vault.crypto import KEY_BYTES, VaultKey
+from sama.vault.store import Vault
+from tests.connectors.support import WEB, FakeComposio, FakeForm
+from tests.connectors.support import service as connections_service
 from tests.integrations.support import APP_ID, BOT_USER, SLACK_TOKEN, TEAM, FakeSlack, add_slack
 from tests.orchestrator.conftest import (  # noqa: F401
     Tenant,
@@ -588,3 +594,27 @@ async def test_compact_and_pins_work_only_in_a_direct_message(
 async def test_help_names_the_context_commands(gateway: SlackGateway) -> None:
     assert "compact" in HELP
     assert "pin" in HELP
+
+
+async def test_connect_gives_a_web_link_only_to_the_sender(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+) -> None:
+    """``/sama connect <name>`` (Section 10.3): the answer is a link, and only the sender sees
+    it. A direct message gets a personal link, a linked channel a workspace link."""
+    assert "connect" in HELP
+    assert await gateway.command(command("connect gmail")) == PAIR_PROMPT
+    await pair(gateway, engine, tenant)
+    assert await gateway.command(command("connect gmail")) == NO_CONNECTIONS
+    vault = Vault(engine, VaultKey(b"k" * KEY_BYTES))
+    gateway._connections = connections_service(engine, vault, FakeComposio(), FakeForm())
+    answer = await gateway.command(command("connect github"))
+    assert f"{WEB}/connections?workspace={tenant.ids['ws']}&connect=github&scope=personal" in answer
+    assert CHAT_WARNING in answer
+    assert await gateway.command(command("connect gmail", channel=CHANNEL)) == (
+        "This channel is not linked to sama."
+    )
+    await link_channel(gateway, engine, tenant)
+    answer = await gateway.command(command("connect gmail", channel=CHANNEL))
+    assert "connect=gmail&scope=workspace" in answer
