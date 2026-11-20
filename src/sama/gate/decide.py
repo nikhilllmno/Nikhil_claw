@@ -20,6 +20,10 @@ Action = Literal["allow", "ask", "deny"]
 SAMA_MCP_PREFIX: Final = "mcp__sama__"
 """The Claude CLI names a tool of the sama MCP server ``mcp__sama__<tool>``."""
 
+SUBAGENT_TOOLS: Final = frozenset({"Task", "Agent"})
+"""The native tool that starts a Claude sub-agent. The CLI calls it ``Task`` in old versions and
+``Agent`` in new versions. The toolset ``subagents`` has it (Section 13.1)."""
+
 TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "core": frozenset(
         {"Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch"}
@@ -33,6 +37,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "sessions": frozenset({"session_search", "session_read"}),
     "media": frozenset({"vision_analyze"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
+    "subagents": SUBAGENT_TOOLS,
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
@@ -72,6 +77,8 @@ DEFAULT_ALLOW: Final = frozenset(
         "vision_analyze",
         "tool_search",
         "tool_describe",
+        "Task",
+        "Agent",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy

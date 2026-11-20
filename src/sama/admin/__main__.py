@@ -1,6 +1,9 @@
 """Admin commands (docs/architecture.md, Sections 16.3 and 19.4):
 
 - ``python -m sama.admin bootstrap ...``: the first org, owner, workspace, and agent profile.
+- ``python -m sama.admin subagents show|set --org <id> --profile <id> [--file <path>]``: the
+  native sub-agents of an agent profile (Section 13.1). ``set`` reads a JSON list of sub-agent
+  specs from the file, or from stdin, and replaces the list. It applies from the next session.
 - ``python -m sama.admin secret set|list|delete --org <id> [--name <name>]``: the vault
   entries of an org. ``set`` reads the value from stdin, so the value is not in the shell
   history or the process list.
@@ -19,10 +22,12 @@ import json
 import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Owner, bootstrap
 from sama.db.engine import create_engine
+from sama.subagents import SubagentError, parse_subagents, profile_subagents, set_profile_subagents
 from sama.vault.crypto import VaultKey
 from sama.vault.store import SecretName, Vault
 
@@ -85,6 +90,31 @@ async def _secret(args: argparse.Namespace) -> dict[str, Any]:
         await engine.dispose()
 
 
+async def _subagents(args: argparse.Namespace, raw: Any) -> dict[str, Any]:
+    engine = create_engine(_database_url())
+    try:
+        result: dict[str, Any] = {"org_id": str(args.org), "profile_id": str(args.profile)}
+        if args.action == "set":
+            await set_profile_subagents(engine, args.org, args.profile, parse_subagents(raw))
+        specs = await profile_subagents(engine, args.org, args.profile)
+        return result | {"subagents": [spec.model_dump(mode="json") for spec in specs]}
+    finally:
+        await engine.dispose()
+
+
+def _subagents_command(args: argparse.Namespace) -> int:
+    try:
+        raw: Any = None
+        if args.action == "set":
+            raw = json.loads(Path(args.file).read_text("utf-8") if args.file else sys.stdin.read())
+        print(json.dumps(asyncio.run(_subagents(args, raw))))
+    except (SubagentError, ValueError, OSError) as error:
+        # ``ValueError`` has the JSON errors. The message has no spec text.
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m sama.admin")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -108,7 +138,16 @@ def main(argv: list[str] | None = None) -> int:
     secret.add_argument("action", choices=("set", "list", "delete"))
     secret.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
     secret.add_argument("--name", choices=[name.value for name in SecretName])
+    subagents = commands.add_parser(
+        "subagents", help="Show or replace the native sub-agents of an agent profile."
+    )
+    subagents.add_argument("action", choices=("show", "set"))
+    subagents.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
+    subagents.add_argument("--profile", type=uuid.UUID, required=True, help="The profile id.")
+    subagents.add_argument("--file", help="The JSON file of the specs. Without it, stdin.")
     args = parser.parse_args(argv)
+    if args.command == "subagents":
+        return _subagents_command(args)
     if args.command == "secret":
         if args.action != "list" and args.name is None:
             parser.error(f"secret {args.action} needs --name")

@@ -226,6 +226,7 @@ class AgentProfile(Base):
             ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
         ),
         CheckConstraint(_one_of("runtime", RUNTIMES), name="runtime"),
+        CheckConstraint("jsonb_typeof(subagents) = 'array'", name="subagents_is_array"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -252,6 +253,11 @@ class AgentProfile(Base):
     """False turns the background review off for the sessions of the profile (Section 9.4)."""
     review_model: Mapped[str | None] = mapped_column(Text)
     """The model of the background review. ``None``: the default cheap model of the runtime."""
+    subagents: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    """The native sub-agents of the profile: a JSON array of ``SubagentSpec`` (Section 13.1).
+    Write it only with ``sama.subagents.set_profile_subagents``."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
