@@ -2024,7 +2024,7 @@ as it is.
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
-| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Later: MCP, database, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
+| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.11: database (PostgreSQL, Supabase, Neon). Later: MCP, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
@@ -2264,8 +2264,8 @@ at the driver, so a prompt cannot remove them.
 | `db_<conn>_schema` | Lists schemas, tables, columns, types, keys, indexes, and comments. Filters by schema or table. Results are cached for 10 minutes. | `allow` |
 | `db_<conn>_sample` | Returns up to 20 rows of one table | `allow` |
 | `db_<conn>_query` | Runs one read statement (`SELECT`, `WITH`, `EXPLAIN`, or the equivalent for the engine) with bound parameters | `allow` |
-| `db_<conn>_export` | Runs one read statement and writes the full result as CSV or Parquet to a file in the agent sandbox, for analysis with code | `allow` |
-| `db_<conn>_execute` | Runs one write statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`). Only on connections with writes turned on. | `ask`, with the SQL and the estimated row count in the approval card |
+| `db_<conn>_export` | Runs one read statement and writes the full result as CSV (Parquet later) to a file in the agent sandbox, for analysis with code | `allow` |
+| `db_<conn>_execute` | Runs one write statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`). Only on connections with writes turned on. | `ask`, with the SQL in the approval card (the estimated row count comes later) |
 
 **Limits**
 
@@ -2293,6 +2293,69 @@ at the driver, so a prompt cannot remove them.
   connection string for a scratch database. Sama does not put production credentials in the
   sandbox.
 
+**What M3.11 builds**
+
+- **Connectors.** `connectors/catalog/` has `postgres`, `supabase`, and `neon` (kind
+  `database`, scopes `workspace` and `personal`). A `database` manifest has a `database` block
+  (`engine: postgres`, the default `sslmode`, and help text for the form) and no tool list:
+  the control plane adds the form and the five tools, `db_<conn>_schema`, `sample`, `query`,
+  `export`, and `execute`. `<conn>` is the connector name with `_` for `-`. There is one
+  connection per scope for each connector (Section 10.3), so the tool names are stable.
+- **Form.** `host`, `port` (empty means 5432), `database`, `user`, `password` (the only
+  secret, in the vault), `sslmode`, `schemas`, `tables`, `hidden_columns`, `writes`, and `ddl`.
+  The lists are comma lists. `writes` and `ddl` are `on` or `off` (empty means `off`), and
+  `ddl` needs `writes`. All fields are text fields, so `web/` does not change. The form test
+  connects and runs `SELECT 1` in a read-only transaction.
+- **Network and TLS.** The gateway resolves the host, rejects a private, loopback,
+  link-local, or metadata address (Section 16.4), and connects to the checked address. It does
+  not resolve the name again. TLS is required. `require` encrypts and does not check the
+  certificate; `verify-full` checks the certificate (the `certifi` roots) and the real host
+  name, also when the socket goes to the IP address. `postgres` and `supabase` default to
+  `require`, because Supabase uses its own CA. `neon` defaults to `verify-full`.
+- **SQL check.** `sama.connectors.sql` parses each statement with `sqlglot` (PostgreSQL
+  dialect) and fails closed. `query` and `export` take exactly one `SELECT`, `WITH`, `VALUES`,
+  set operation, or `EXPLAIN` of one of these. The check rejects a
+  data-modifying CTE, `SELECT INTO`, a locking clause, and `SET`. `execute` takes exactly one
+  `INSERT`, `UPDATE`, `DELETE`, or `MERGE`, and DDL only with `ddl` on. The check rejects all
+  other statements (`COPY`, `CALL`, `DO`, `VACUUM`, ...) and, in every mode, functions that
+  read files, run SQL from text, signal sessions, or change the server. The SQL has at most
+  20,000 characters and at most 100 parameters (`$1`, `$2`, ...).
+- **Transactions.** `schema`, `sample`, `query`, and `export` run in a `READ ONLY`
+  transaction that the gateway always rolls back. So a function that writes, or `nextval`,
+  also fails. `execute` runs in a read-write transaction that the gateway commits. Each
+  transaction sets `statement_timeout` (30 seconds), `lock_timeout` (5 seconds), and, if the
+  connection has allowed schemas, `search_path`. A local timer of 35 seconds ends the
+  connection if the server does not answer.
+- **Result limits.** The model gets at most 1,000 rows and 48,000 bytes of rows, so the
+  result with its notes and the untrusted wrapper stays below the 50 KB of Section 6.2. If a
+  result is larger, the full result (at most 100,000 rows or 20 MB) goes to a CSV file in
+  `.sama/spill/` of the session sandbox, and the answer gives the path. `export` writes a CSV
+  file (at most 200,000 rows or 50 MB) to `.sama/exports/`. Without a session sandbox,
+  `export` fails and `query` gives the rows that fit.
+- **Hidden columns.** An item is `column` (in every table) or `table.column`. The check
+  rejects each reference to a hidden column, a whole-row reference (`row_to_json(t)`, `t`),
+  and a `*` where the gateway cannot drop the hidden columns by name. The gateway drops
+  result columns with a hidden name, and `schema` and `sample` leave them out, also in the
+  keys and indexes that use them. A view or a function can still return a hidden value under
+  another name, so the grants of the database user are the strongest control.
+- **Allowed schemas and tables.** Each table of a statement must be in an allowed schema and,
+  if `tables` is set, in the list. A name without a schema matches through `search_path`.
+  The check rejects the system catalogs when a list is set, and the statistics views
+  (`pg_stats`) when a list or a hidden column is set.
+- **Approval.** `execute` has the access `destructive`, so the gate asks a person each time
+  (Section 16.1). The approval card shows the full SQL and the parameters. The gateway rejects
+  an `execute` call whose SQL has more than 1,000 characters, or whose card text has more than
+  1,400 characters, so the card never cuts the SQL. `tool_search` shows `execute` only for a
+  connection with `writes` on. Errors give the database message and the SQLSTATE, never the
+  detail (it can hold row values).
+- **Pools.** One `asyncpg` pool per connection (at most 2 connections, no prepared statement
+  cache, so transaction poolers such as Supavisor and the Neon pooler work), closed after 5
+  minutes idle. A change of the settings makes a new pool. At most 4 calls run at a time for
+  each org. The `schema` result is cached for 10 minutes.
+- **Tests.** `tests/connectors/test_sql.py` and `tests/connectors/test_database.py` test the
+  check, the manifests, the form, TLS, and the limits. `tests/db/test_database_gateway.py`
+  runs the tools against a real PostgreSQL server.
+
 ### 10.5 Connector hosts for stdio MCP servers
 
 Hermes starts stdio MCP servers as local processes. In the cloud, sama runs each
@@ -2316,13 +2379,39 @@ per connection:
 
 | Route | How |
 |---|---|
-| IP allowlist | The sama services that call connectors use static egress IP addresses (Fly.io). The customer allows these addresses in the database firewall. |
+| IP allowlist | The sama services that call connectors use static egress IP addresses (Fly.io). The customer allows these addresses in the database firewall. See "Egress IP addresses" below. |
 | SSH tunnel | Sama opens an SSH tunnel through the customer's bastion host. The SSH key is in the vault. |
 | Private network agent (later) | A small sama relay that the customer runs inside the network. It connects out to sama over TLS, so no inbound port is open. |
 
 The outbound URL policy (Section 16.4) blocks private addresses for normal requests. A
 connection that uses a tunnel or a relay is the only way to reach a private address, and only
 for that connection.
+
+**Egress IP addresses**
+
+The database gateway runs in the control plane, so the database sees the egress address of
+the Fly.io app. On 2026-11-21, `fly ips list` shows only ingress addresses for both apps:
+
+| App | Region | IPv6 (ingress, dedicated) | IPv4 (ingress, shared) | Static egress |
+|---|---|---|---|---|
+| `sama-staging` | `sin` | `2a09:8280:1::211:5e7a:0` | `66.241.125.56` | None |
+| `sama-production` | `sin` | `2a09:8280:1::211:5e7b:0` | `66.241.124.161` | None |
+
+Ingress addresses are not egress addresses. Without a static egress address, the outbound
+address of a Machine can change, so a customer cannot allowlist it. Until an operator
+allocates static egress addresses, a database for sama must accept TLS connections from any
+address, with a strong password and a user with few grants.
+
+To allocate them (an operator does this; app-scoped egress addresses cost money):
+
+```sh
+fly ips allocate-egress --app sama-production --region sin
+fly ips list --app sama-production
+```
+
+The command gives one IPv4 and one IPv6 address for the region. Add a region for each region
+that runs Machines. Then add the addresses to this table and to the database setup help.
+`fly ips release-egress` releases them.
 
 ### 10.7 Sama as an MCP server (later)
 

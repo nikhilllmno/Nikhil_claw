@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M3.11, M4.1 to M4.3 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -213,6 +213,19 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 note
   sandbox image and the default `uv sync` install the group `runtime-openai`. Not in M3.6: native
   sub-agents (agents as tools and handoffs), native skills, the filesystem capability, and a live
   test against the OpenAI API.
+- M3.11: the database gateway in `src/sama/connectors/database.py`, `postgres.py`, and
+  `sql.py` (architecture Section 10.4). No migration: a database connection is a row of
+  `connections` (M3.4). The catalog has `postgres`, `supabase`, and `neon` (kind `database`).
+  Each connection has the tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`.
+  The SQL check (`sqlglot`) allows one statement, rejects a write in `query`, and denies DDL
+  unless the connection allows it. Reads run in a read-only transaction. Each statement has a
+  30-second timeout. The model gets at most 1,000 rows and 48,000 bytes of rows, and the full
+  result goes to a CSV file in the session sandbox. Hidden columns do not show in any tool.
+  `execute` is `ask` with the full SQL in the card, and `tool_search` shows it only when the
+  connection has writes on. The gateway connects only to public addresses, with TLS. Not in
+  M3.11: Parquet export, the estimated row count in the card, a static egress address (an
+  operator allocates it, architecture Section 10.6), SSH tunnels (M4.13), other engines
+  (M4.13), and a policy for each tool of a connection.
 - M3.7: the GitHub App, the git proxy, and pull requests in `src/sama/github/` and
   `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0024` adds
   `github_installations`, `github_repos`, and `github_push_grants` with RLS. An org admin
@@ -360,7 +373,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 note
 | M3.8 | Web app v1 core | Next.js app in `web/`, hosted on Vercel: sign-in (password and email link), session list, chat with live streaming, approvals and questions, stop, and agent settings (soul, model, toolsets, sub-agents) for org admins. CORS from `SAMA_WEB_ORIGINS`. CI runs lint, typecheck, tests, and build. Done. |
 | M3.9 | Busy controls and handoff | Queue, `/stop`, `/steer` while a run is busy. `/handoff` between channels. |
 | M3.10 | Worker bots | An agent profile bound to a Slack channel with a daily budget. Done. |
-| M3.11 | PostgreSQL connections | Database gateway with PostgreSQL (also Supabase and Neon) (architecture §10.4). Tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`. Tests show that: `query` runs in a read-only transaction; a write or a second statement in `query` is rejected; DDL is denied by default; a query stops after 30 seconds; the model gets at most 1,000 rows and 50 KB, and the rest spills to a file; hidden columns do not appear in any result; `execute` needs an approval that shows the SQL. Static egress IP addresses are documented for allowlists. |
+| M3.11 | PostgreSQL connections | Database gateway with PostgreSQL (also Supabase and Neon) (architecture §10.4). Tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`. Tests show that: `query` runs in a read-only transaction; a write or a second statement in `query` is rejected; DDL is denied by default; a query stops after 30 seconds; the model gets at most 1,000 rows and 50 KB, and the rest spills to a file; hidden columns do not appear in any result; `execute` needs an approval that shows the SQL. Static egress IP addresses are documented for allowlists. Done. The apps have no static egress address yet; architecture §10.6 shows how an operator allocates one. |
 | M3.12 | Web app v1 rest | Memory editor, skill editor, connections, sessions with search and export (Markdown and JSON), run traces, settings. Done. |
 
 ## M4 — Automation
