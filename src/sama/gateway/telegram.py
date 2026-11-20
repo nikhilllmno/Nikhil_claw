@@ -38,6 +38,7 @@ from sama.context import PinStore
 from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.connect import connect_answer
+from sama.gateway.cron import cron_reply
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
@@ -75,6 +76,7 @@ from sama.media.images import (
 )
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.review.apply import ReviewApplier
+from sama.scheduler.jobs import JobService
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 
@@ -100,7 +102,8 @@ HELP: Final = (
     "/pin <text> - keep a text in the context. /pins lists the pins. /unpin <number> removes one\n"
     "/pair <code> - link this account, or link a group with a group code\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
-    "/connect <name> - get a link to connect a tool such as gmail or github"
+    "/connect <name> - get a link to connect a tool such as gmail or github\n"
+    "/cron - list and make scheduled jobs. /cron help shows more"
 )
 
 OWN_COMMANDS: Final = frozenset(
@@ -117,6 +120,7 @@ OWN_COMMANDS: Final = frozenset(
         "/pins",
         "/unpin",
         "/connect",
+        "/cron",
     }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
@@ -279,9 +283,11 @@ class TelegramGateway:
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
         pins: PinStore | None = None,
+        jobs: JobService | None = None,
     ) -> None:
         """``lockout`` and ``followers`` can be shared by the gateways of all bots, so that
         the limits hold for the whole process."""
+        self._jobs = jobs
         self._engine = engine
         self._client = client
         self._bot = bot
@@ -685,6 +691,14 @@ class TelegramGateway:
             await self._skill_list(chat_id, message_id, target, grants)
         elif command == "/compact":
             await self._compact(chat_id, message_id, rest, target, grants)
+        elif command == "/cron":
+
+            async def session_of() -> uuid.UUID | None:
+                bound = await self._session(chat_id, target, grants, create=True)
+                return None if bound is None else bound.session_id
+
+            answer = await cron_reply(self._jobs, target, rest, session_of)
+            await self._say(chat_id, answer, reply_to=message_id)
         elif command in ("/pin", "/pins", "/unpin"):
             current = await self._session(chat_id, target, grants, create=False)
             answer = await pin_reply(

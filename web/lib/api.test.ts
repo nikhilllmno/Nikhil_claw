@@ -297,3 +297,107 @@ describe("errorMessage", () => {
     expect(errorMessage(403, {})).toBe("You do not have permission to do this.");
   });
 });
+
+describe("job calls", () => {
+  const ORG = "org-1";
+  const JOB = "job-1";
+
+  function call(fetcher: ReturnType<typeof vi.fn>): { url: string; init: RequestInit } {
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    return { url, init };
+  }
+
+  async function run(
+    status: number,
+    body: unknown,
+    invoke: (client: ApiClient) => Promise<unknown>,
+  ): Promise<{ url: string; init: RequestInit; result: unknown }> {
+    const fetcher = vi.fn(async () => json(status, body));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    const result = await invoke(client);
+    return { ...call(fetcher), result };
+  }
+
+  it("previews a schedule with and without a time zone", async () => {
+    const preview = { schedule: { kind: "interval", every_s: 7200 }, text: "every 2 hours", next_fires: [] };
+    const withTz = await run(200, preview, (c) => c.previewSchedule("every 2 hours", "Asia/Kolkata"));
+    expect(withTz.url).toBe("https://api.test/jobs/preview");
+    expect(withTz.init.method).toBe("POST");
+    expect(withTz.init.body).toBe('{"schedule":"every 2 hours","tz":"Asia/Kolkata"}');
+    expect(withTz.result).toEqual(preview);
+    const without = await run(200, preview, (c) => c.previewSchedule("hourly"));
+    expect(without.init.body).toBe('{"schedule":"hourly"}');
+  });
+
+  it("shows the detail text of a bad schedule", async () => {
+    const fetcher = vi.fn(async () => json(400, { detail: "the unit 'foo' is not known" }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.previewSchedule("every 2 foo")).rejects.toMatchObject({
+      status: 400,
+      message: "the unit 'foo' is not known",
+    });
+  });
+
+  it("lists and reads jobs", async () => {
+    const list = await run(200, [], (c) => c.listJobs(ORG));
+    expect(list.url).toBe(`https://api.test/orgs/${ORG}/jobs`);
+    expect(list.init.method).toBe("GET");
+    const one = await run(200, { id: JOB }, (c) => c.getJob(ORG, JOB));
+    expect(one.url).toBe(`https://api.test/orgs/${ORG}/jobs/${JOB}`);
+    expect(one.result).toEqual({ id: JOB });
+  });
+
+  it("creates a job with a POST and updates it with a PATCH", async () => {
+    const created = await run(201, { id: JOB }, (c) =>
+      c.createJob(ORG, { name: "Digest", schedule: "daily at 9am", prompt: "Send the digest." }),
+    );
+    expect(created.url).toBe(`https://api.test/orgs/${ORG}/jobs`);
+    expect(created.init.method).toBe("POST");
+    expect(created.init.body).toBe('{"name":"Digest","schedule":"daily at 9am","prompt":"Send the digest."}');
+    expect(created.result).toEqual({ id: JOB });
+    const updated = await run(200, { id: JOB }, (c) => c.updateJob(ORG, JOB, { model: "m" }));
+    expect(updated.url).toBe(`https://api.test/orgs/${ORG}/jobs/${JOB}`);
+    expect(updated.init.method).toBe("PATCH");
+    expect(updated.init.body).toBe('{"model":"m"}');
+  });
+
+  it("approves one version", async () => {
+    const { url, init } = await run(200, { id: JOB }, (c) => c.approveJob(ORG, JOB, 3));
+    expect(url).toBe(`https://api.test/orgs/${ORG}/jobs/${JOB}/approve`);
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe('{"version":3}');
+  });
+
+  it("sends the actions pause, resume, run, and cancel as POST without a body", async () => {
+    const cases: [string, (c: ApiClient) => Promise<unknown>, unknown][] = [
+      ["pause", (c) => c.pauseJob(ORG, JOB), { id: JOB }],
+      ["resume", (c) => c.resumeJob(ORG, JOB), { id: JOB }],
+      ["run", (c) => c.runJob(ORG, JOB), { fire_id: "f" }],
+      ["cancel", (c) => c.cancelJob(ORG, JOB), { cancelled: 1 }],
+    ];
+    for (const [action, invoke, body] of cases) {
+      const { url, init, result } = await run(200, body, invoke);
+      expect(url).toBe(`https://api.test/orgs/${ORG}/jobs/${JOB}/${action}`);
+      expect(init.method).toBe("POST");
+      expect(init.body).toBeUndefined();
+      expect(result).toEqual(body);
+    }
+  });
+
+  it("removes a job with a DELETE and gets null for 204", async () => {
+    const fetcher = vi.fn(async () => new Response(null, { status: 204 }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.deleteJob(ORG, JOB)).resolves.toBeNull();
+    const { url, init } = call(fetcher);
+    expect(url).toBe(`https://api.test/orgs/${ORG}/jobs/${JOB}`);
+    expect(init.method).toBe("DELETE");
+    expect(authOf(init)).toBe("Bearer old");
+  });
+
+  it("shows the answer of a job that is not found or off", async () => {
+    const missing = new ApiClient("https://api.test", tokens(), vi.fn(async () => json(404, { detail: "the job does not exist" })));
+    await expect(missing.getJob(ORG, JOB)).rejects.toMatchObject({ status: 404, message: "the job does not exist" });
+    const off = new ApiClient("https://api.test", tokens(), vi.fn(async () => json(409, { detail: "scheduled jobs are off in this process" })));
+    await expect(off.listJobs(ORG)).rejects.toMatchObject({ status: 409 });
+  });
+});

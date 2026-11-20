@@ -64,6 +64,7 @@ from sama.runtime.runner import (
 )
 from sama.sandbox.base import (
     DEFAULT_IDLE_TIMEOUT_S,
+    ExecResult,
     Sandbox,
     SandboxError,
     SandboxNotFoundError,
@@ -366,6 +367,17 @@ class SandboxedRuntime:
             # Also an outdated sandbox. It is not paused here: a run can move its state at
             # this time (``acquire``). The next run kills it; E2B pauses it when it is idle.
             return None
+
+    async def exec_script(self, scope: RunScope, script: str, *, timeout_s: float) -> ExecResult:
+        """Runs a job script with ``bash -c`` in the session sandbox (Section 12.1). The script
+        gets no run token and no secret: the sandbox environment has none."""
+        sandbox = await self.acquire(scope, Budget(max_wall_time_s=timeout_s))
+        try:
+            return await sandbox.exec(
+                ["bash", "-c", script], cwd=sandbox.workdir, timeout_s=timeout_s
+            )
+        finally:
+            await self._end_session_run((scope.org_id, scope.session_id), sandbox)
 
     async def wait_for_cleanup(self) -> None:
         """Waits for the background work: the invocations that still run after their stream

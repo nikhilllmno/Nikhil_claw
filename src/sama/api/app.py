@@ -19,7 +19,7 @@ import logging
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -120,6 +120,10 @@ from sama.profiles import (
 from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
 from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS, RuntimeKind
+from sama.scheduler.jobs import Actor as JobActor
+from sama.scheduler.jobs import JobService
+from sama.scheduler.jobs import preview as preview_schedule
+from sama.scheduler.spec import JobError, JobInput, JobNotFoundError
 from sama.skills.service import SkillLibrary
 from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
@@ -351,6 +355,26 @@ class SessionOut(BaseModel):
     parent_session_id: uuid.UUID | None = None
 
 
+JobAction = Literal["pause", "resume", "run", "cancel"]
+
+
+class SchedulePreview(BaseModel):
+    """A schedule to check: natural language, a cron line, or a schedule object."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedule: Annotated[str, StringConstraints(min_length=1, max_length=300)] | dict[str, Any]
+    tz: Annotated[str, StringConstraints(max_length=64)] | None = None
+
+
+class JobApproval(BaseModel):
+    """The version that the person saw. An approval of another version fails."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1)
+
+
 class PinOut(BaseModel):
     id: uuid.UUID
     text: str
@@ -572,6 +596,16 @@ def _chat_runs(session_id: uuid.UUID) -> Any:
     return select(Run.id).where(Run.session_id == session_id, Run.kind == "chat")
 
 
+async def _job_call[T](call: Awaitable[T]) -> T:
+    """Maps the errors of the job service to HTTP answers."""
+    try:
+        return await call
+    except JobNotFoundError:
+        raise _not_found("the job does not exist") from None
+    except JobError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
 # -- the service ----------------------------------------------------------------------------
 
 
@@ -594,10 +628,11 @@ class SamaApi:
         pins: PinStore | None = None,
         github: GitHubService | None = None,
         connections: ConnectionService | None = None,
+        jobs: JobService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
-        ``409``. Without ``skills``,
+        ``409``. Without ``jobs``, the job routes answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command."""
         self._engine = engine
@@ -608,6 +643,7 @@ class SamaApi:
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
+        self._jobs = jobs
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._board = TaskBoard(engine, self._queue)
@@ -979,6 +1015,65 @@ class SamaApi:
             principal: Me, org_id: uuid.UUID, workspace_id: uuid.UUID
         ) -> list[dict[str, Any]]:
             return await self._skills_of(principal, org_id, workspace_id)
+
+        @app.post("/jobs/preview")
+        async def job_preview(principal: Me, body: SchedulePreview) -> dict[str, Any]:
+            self._require_jobs()
+            try:
+                return preview_schedule(body.schedule, body.tz)
+            except JobError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from None
+
+        @app.get("/orgs/{org_id}/jobs")
+        async def list_jobs(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            jobs, actor = await self._job_actor(principal, org_id)
+            return [view.as_json() for view in await jobs.list(actor)]
+
+        @app.post("/orgs/{org_id}/jobs", status_code=201)
+        async def create_job(principal: Me, org_id: uuid.UUID, body: JobInput) -> dict[str, Any]:
+            jobs, actor = await self._job_actor(principal, org_id)
+            return (await _job_call(jobs.create(actor, body))).as_json()
+
+        @app.get("/orgs/{org_id}/jobs/{job_id}")
+        async def get_job(principal: Me, org_id: uuid.UUID, job_id: uuid.UUID) -> dict[str, Any]:
+            jobs, actor = await self._job_actor(principal, org_id)
+            return (await _job_call(jobs.get(actor, job_id))).as_json()
+
+        @app.patch("/orgs/{org_id}/jobs/{job_id}")
+        async def update_job(
+            principal: Me, org_id: uuid.UUID, job_id: uuid.UUID, body: JobInput
+        ) -> dict[str, Any]:
+            jobs, actor = await self._job_actor(principal, org_id)
+            return (await _job_call(jobs.update(actor, job_id, body))).as_json()
+
+        @app.post("/orgs/{org_id}/jobs/{job_id}/approve")
+        async def approve_job(
+            principal: Me, org_id: uuid.UUID, job_id: uuid.UUID, body: JobApproval
+        ) -> dict[str, Any]:
+            jobs, actor = await self._job_actor(principal, org_id)
+            return (await _job_call(jobs.approve(actor, job_id, body.version))).as_json()
+
+        @app.post("/orgs/{org_id}/jobs/{job_id}/{action}")
+        async def job_action(
+            principal: Me, org_id: uuid.UUID, job_id: uuid.UUID, action: JobAction
+        ) -> dict[str, Any]:
+            jobs, actor = await self._job_actor(principal, org_id)
+            if action == "pause":
+                view = await _job_call(jobs.pause(actor, job_id))
+            elif action == "resume":
+                view = await _job_call(jobs.resume(actor, job_id))
+            elif action == "run":
+                fire_id = await _job_call(jobs.run_now(actor, job_id))
+                return {"fire_id": str(fire_id)}
+            else:
+                return {"cancelled": await _job_call(jobs.cancel(actor, job_id))}
+            return view.as_json()
+
+        @app.delete("/orgs/{org_id}/jobs/{job_id}", status_code=204)
+        async def remove_job(principal: Me, org_id: uuid.UUID, job_id: uuid.UUID) -> Response:
+            jobs, actor = await self._job_actor(principal, org_id)
+            await _job_call(jobs.remove(actor, job_id))
+            return Response(status_code=204)
 
         @app.get("/skills/{skill_id}/versions")
         async def skill_versions(principal: Me, skill_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -1799,6 +1894,20 @@ class SamaApi:
         if not (grants.org_admin or grants.admins_workspace(workspace_id)):
             raise HTTPException(status_code=403, detail=_BOT_ADMIN_ONLY)
         return org_id, grants
+
+    def _require_jobs(self) -> JobService:
+        if self._jobs is None:
+            raise HTTPException(status_code=409, detail="scheduled jobs are off in this process")
+        return self._jobs
+
+    async def _job_actor(
+        self, principal: Principal, org_id: uuid.UUID
+    ) -> tuple[JobService, JobActor]:
+        """The job service and the user as the actor. A user sees and changes only the jobs
+        that the user owns (Section 12.1)."""
+        jobs = self._require_jobs()
+        grants = await self._org_grants(principal, org_id)
+        return jobs, JobActor(org_id=org_id, user_id=grants.user_id, kind="user")
 
     async def _org_admin(self, principal: Principal, org_id: uuid.UUID) -> Grants:
         """Raises ``404`` for a user who is not a member and ``403`` for a member who is not an

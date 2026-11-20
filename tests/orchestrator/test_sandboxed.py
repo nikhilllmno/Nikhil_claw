@@ -924,3 +924,15 @@ async def test_the_timing_line_of_the_runner_is_logged(
     assert lines[0].startswith("runner timing mode=cold job_s=")
     assert "terminal_s=" in lines[0]
     assert lines[0].endswith("run=run-timing")
+
+
+async def test_a_job_script_runs_in_the_session_sandbox(runtime: SandboxedRuntime) -> None:
+    scope = make_scope("fire-1")
+    result = await runtime.exec_script(
+        scope, 'echo "out $((1 + 2))"; echo oops >&2; exit 3', timeout_s=30
+    )
+    assert (result.exit_code, result.stdout.strip(), result.stderr.strip()) == (3, "out 3", "oops")
+    again = await runtime.exec_script(scope, "pwd", timeout_s=30)
+    sandbox = await runtime.session_sandbox(scope.org_id, scope.session_id)
+    assert sandbox is not None
+    assert again.stdout.strip() == sandbox.workdir

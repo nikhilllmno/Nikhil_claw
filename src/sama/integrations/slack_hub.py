@@ -50,6 +50,7 @@ from sama.integrations.hub import GatewayCache
 from sama.integrations.service import SlackClientFactory, secret_hash
 from sama.orchestrator.queue import RunQueue
 from sama.review.apply import ReviewApplier
+from sama.scheduler.jobs import JobService
 from sama.skills.service import SkillLibrary
 from sama.vault.crypto import VaultError
 from sama.vault.store import SecretName, Vault
@@ -86,6 +87,7 @@ class SlackHub(GatewayCache[_App]):
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
         connections: ConnectionService | None = None,
+        jobs: JobService | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__()
@@ -98,6 +100,7 @@ class SlackHub(GatewayCache[_App]):
         self._skills = skills
         self._reviews = reviews
         self._connections = connections
+        self._jobs = jobs
         self._clock = clock
         self._lockout = Lockout()
         self._followers: set[object] = set()
@@ -241,6 +244,7 @@ class SlackHub(GatewayCache[_App]):
             skills=self._skills,
             reviews=self._reviews,
             connections=self._connections,
+            jobs=self._jobs,
             lockout=self._lockout,
             followers=self._followers,
             seen=self._seen,

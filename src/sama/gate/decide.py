@@ -38,6 +38,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "media": frozenset({"vision_analyze"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
+    "cron": frozenset({"cronjob_manage"}),
     "self": frozenset({"change_propose"}),
     "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
     "integrations": frozenset(),
@@ -100,6 +101,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "task_complete",
         "task_block",
         "task_comment",
+        "cronjob_manage",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
@@ -110,7 +112,8 @@ proposal: a person with the role decides it on an approval card (M3.2). ``connec
 only sends a link, and the agent cannot give credentials with it (Section 10.3).
 The ``delegation`` and ``tasks`` tools are here because they write only sama state of the same
 workspace and audience, and each child run or task run passes the gate again for every tool
-that it calls (Sections 12.4 and 13.2)."""
+that it calls (Sections 12.4 and 13.2). ``cronjob_manage`` is here because a job that the
+agent creates or widens waits for the approval of its owner before it fires (Section 12.1)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"
@@ -133,10 +136,18 @@ remove the ask, and "always allow" writes no rule for them. A ``deny`` rule stil
 approval of ``repo_push_approval`` is the approval of a push that changes a protected path
 (Section 15.1)."""
 
-SHARED_ASK: Final = frozenset({"memory"})
+SHARED_ASK: Final = frozenset({"memory", "cronjob_manage"})
 """Tools that are in ``DEFAULT_ALLOW`` but get ``ask`` in a shared session (Section 11.3). Every
 call of ``memory`` writes a note that all later sessions of the profile or workspace read, and
-every member of a group can steer the run. A policy rule still wins over this default."""
+every member of a group can steer the run. A job runs as its owner without a human, so a group
+member must not create one in the name of the owner. A policy rule still wins over this
+default."""
+
+JOB_TOOLSET: Final = "cron"
+"""The toolset of ``cronjob_manage``. A job run does not have it: a job run cannot create jobs
+(Section 12.1)."""
+
+MCP_PREFIX: Final = "mcp__"
 
 
 class GateStep(StrEnum):
@@ -188,6 +199,50 @@ class Recorded:
     arguments_digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class Preapproval:
+    """A tool that a human pre-approved for one job version (Section 12.1).
+
+    ``connection`` is the MCP server of a connector tool (``mcp__<connection>__<tool>``), or
+    ``None`` for a tool of sama or of the runtime. ``limits`` maps an argument name to the
+    values that it can have. A call fits when each limited argument has one of its values.
+    """
+
+    tool: str
+    connection: str | None = None
+    limits: tuple[tuple[str, tuple[Any, ...]], ...] = ()
+
+    def covers(self, name: str, arguments: Mapping[str, Any] | None) -> bool:
+        """``arguments`` is ``None`` when the gate knows only the digest of the call. Then a
+        pre-approval with limits does not cover the call: it fails closed."""
+        if connection_of(name) != self.connection or name != self.tool:
+            return False
+        if not self.limits:
+            return True
+        if arguments is None:
+            return False
+        return all(
+            key in arguments and _allowed(arguments[key], allowed) for key, allowed in self.limits
+        )
+
+
+def _allowed(value: Any, allowed: tuple[Any, ...]) -> bool:
+    """The value is one of the allowed values, with the same type: ``True`` is not ``1``, and a
+    list or an object is never a limited value."""
+    if not isinstance(value, str | int | float | bool):
+        return False
+    return any(type(value) is type(item) and value == item for item in allowed)
+
+
+def connection_of(name: str) -> str | None:
+    """The connection of a tool: the MCP server of ``mcp__<server>__<tool>``, other than the
+    sama server. A sama tool and a native tool have no connection."""
+    if not name.startswith(MCP_PREFIX) or name.startswith(SAMA_MCP_PREFIX):
+        return None
+    server, _, tool = name[len(MCP_PREFIX) :].partition("__")
+    return server if server and tool else None
+
+
 class ToolsetSource(Protocol):
     """More toolsets than the fixed table ``TOOLSETS``, for example the deferred tools that
     products and connectors register (Section 10.3). The answer can change while the process
@@ -206,9 +261,9 @@ class GateContext:
     toolsets: frozenset[str]
     rules: tuple[PolicyRule, ...] = ()
     unattended: bool = False
-    preapproved: frozenset[str] = field(default_factory=frozenset)
-    """Tools that a human pre-approved for this job version (Section 12.1). Jobs come in M3,
-    so today the set is always empty."""
+    preapproved: tuple[Preapproval, ...] = ()
+    """The tools that a human pre-approved for this job version (Section 12.1). It is empty
+    for a run that is not a job fire, and for a job version without an approval."""
     shared: bool = False
     """The run is a chat run in a shared session. ``SHARED_ASK`` tools get ``ask``. A background
     review is not a chat run: its shared changes are proposals that a person decides."""
@@ -317,7 +372,7 @@ def decide(context: GateContext, tool_name: str, arguments: Mapping[str, Any]) -
     problem = hardline_problem(name, arguments)
     if problem is not None:
         return Verdict("deny", GateStep.HARDLINE, f"the command is on the hardline list: {problem}")
-    return _after_hardline(context, name, arguments_digest(arguments))
+    return _after_hardline(context, name, arguments_digest(arguments), arguments)
 
 
 def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdict:
@@ -345,9 +400,10 @@ def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdi
 def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdict:
     """The verdict again for a call that a human decided, before the run resumes. It has
     all the steps of ``decide`` except the hardline step. That step ran at the first check of
-    the call, and its result depends only on the tool name and the arguments."""
+    the call, and its result depends only on the tool name and the arguments. The arguments
+    are not known here, so a pre-approval with argument limits does not apply."""
     name = canonical_name(tool_name)
-    return _authority_and_toolset(context, name) or _after_hardline(context, name, digest)
+    return _authority_and_toolset(context, name) or _after_hardline(context, name, digest, None)
 
 
 def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
@@ -358,13 +414,15 @@ def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
     return None
 
 
-def _after_hardline(context: GateContext, name: str, digest: str) -> Verdict:
+def _after_hardline(
+    context: GateContext, name: str, digest: str, arguments: Mapping[str, Any] | None
+) -> Verdict:
     # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
     policy = policy_verdict(context.rules, name, shared=context.shared, access=context.access)
     if policy.action == "deny":
         return policy
     verdict = _recorded(context.recorded, name, digest) or policy
-    return _in_context(context, name, verdict)
+    return _in_context(context, name, verdict, arguments)
 
 
 def _recorded(recorded: Recorded | None, name: str, digest: str) -> Verdict | None:
@@ -433,16 +491,21 @@ def _most_specific(rules: Iterable[PolicyRule]) -> PolicyRule | None:
     return max(rules, key=lambda rule: (rank[rule.level], rule.exact), default=None)
 
 
-def _in_context(context: GateContext, name: str, verdict: Verdict) -> Verdict:
-    """Step 5. An unattended run has no human to ask."""
+def _in_context(
+    context: GateContext, name: str, verdict: Verdict, arguments: Mapping[str, Any] | None
+) -> Verdict:
+    """Step 5. An unattended run has no human to ask. An ``ask`` call is allowed only when a
+    pre-approval of the job version covers the tool, its connection, and its arguments."""
     if not context.unattended or verdict.action == "deny":
         return verdict
     if name in NEEDS_A_HUMAN:
         return Verdict(
             "deny", GateStep.CONTEXT, f"{name} needs a human, and this run is unattended"
         )
-    if verdict.action == "ask" and name not in context.preapproved:
-        return Verdict(
-            "deny", GateStep.CONTEXT, f"{name} needs an approval, and this run is unattended"
-        )
-    return verdict
+    if verdict.action != "ask":
+        return verdict
+    if any(item.covers(name, arguments) for item in context.preapproved):
+        return Verdict("allow", GateStep.CONTEXT, "pre-approved for this job version")
+    return Verdict(
+        "deny", GateStep.CONTEXT, f"{name} needs an approval, and this run is unattended"
+    )

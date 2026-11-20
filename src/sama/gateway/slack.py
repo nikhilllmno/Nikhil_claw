@@ -41,6 +41,7 @@ from sama.context import PinStore
 from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBinding
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.connect import connect_answer
+from sama.gateway.cron import cron_reply
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
@@ -78,6 +79,7 @@ from sama.media.images import (
 )
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.review.apply import ReviewApplier
+from sama.scheduler.jobs import JobService
 from sama.skills import commands
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
@@ -107,6 +109,7 @@ HELP: Final = (
     "/sama compact [focus] - make the context shorter (direct messages)\n"
     "/sama pin TEXT - keep a text in the context. /sama pins lists the pins. /sama unpin NUMBER"
     " removes one (direct messages)\n"
+    "/sama cron - list and make scheduled jobs. /sama cron help shows more (direct messages)\n"
     "/sama pair CODE - link your account, or link this channel with a group code\n"
     "/sama connect NAME - get a link to connect a tool such as gmail or github. In a direct"
     " message it is for you only; in a linked channel it is for the workspace\n"
@@ -326,6 +329,7 @@ class SlackGateway:
         followers: set[object] | None = None,
         seen: SeenEvents | None = None,
         pins: PinStore | None = None,
+        jobs: JobService | None = None,
     ) -> None:
         """``lockout``, ``followers``, and ``seen`` can be shared by all gateways of the process,
         so that the limits and the repeat check hold for the whole process."""
@@ -339,6 +343,7 @@ class SlackGateway:
         self._reviews = reviews
         self._connections = connections
         self._pins = pins or PinStore(engine)
+        self._jobs = jobs
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -669,7 +674,7 @@ class SlackGateway:
             identity = await self._identity(sender)
             if name == "pair" and rest:
                 return await self._pair(sender, channel, rest, identity)
-            if name not in ("new", "stop", "compact", "connect", *PIN_COMMANDS):
+            if name not in ("new", "stop", "compact", "connect", "cron", *PIN_COMMANDS):
                 if name not in ("help", "pair"):
                     return await self._skill(sender, channel, identity, name, rest)
                 return HELP
@@ -683,6 +688,8 @@ class SlackGateway:
                 return await self._pin(sender, channel, identity, name, rest)
             if name == "connect":
                 return await self._connect(channel, identity, rest)
+            if name == "cron":
+                return await self._cron(sender, channel, identity, rest)
             return await self._stop(sender, channel, identity)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
@@ -770,6 +777,24 @@ class SlackGateway:
         if not grants.sees_workspace(target.workspace_id):
             return "You do not have access to this workspace now."
         return connect_answer(self._connections, target, grants, name)
+
+    async def _cron(self, sender: str, channel: str, identity: Any, rest: str) -> str:
+        """``/sama cron`` in a direct message (Section 12.1)."""
+        if not channel.startswith("D"):
+            return "Scheduled jobs work in a direct message with the sama app."
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+
+        async def session_of() -> uuid.UUID | None:
+            async with self._locks.hold((place.channel, place.thread_ts)):
+                bound = await self._session(place, target, grants, create=True)
+            return None if bound is None else bound.session_id
+
+        return await cron_reply(self._jobs, target, rest, session_of, command="/sama cron")
 
     async def _stop(self, sender: str, channel: str, identity: Any) -> str:
         """Stops the open runs of the direct message, or of all threads of the channel."""

@@ -126,6 +126,10 @@ class ControlPlaneSettings:
     github: GitHubAppConfig | None = None
     """The sama GitHub App (``SAMA_GITHUB_*``). Without it, the git proxy and the pull request
     tools are off."""
+    sendgrid_key: SecretStr | None = None
+    """The SendGrid key for the ``email:`` delivery of jobs (``SAMA_SENDGRID_API_KEY``)."""
+    email_from: str | None = None
+    """The sender address of job emails (``SAMA_EMAIL_FROM``)."""
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -139,6 +143,7 @@ class ControlPlaneSettings:
             self.brave_key,
             self.composio_key,
             self.slack_webhook_url,
+            self.sendgrid_key,
         ]
         if self.langfuse is not None:
             secrets.append(self.langfuse.secret_key)
@@ -227,4 +232,6 @@ class ControlPlaneSettings:
             worker_concurrency=_count(env, "SAMA_WORKER_CONCURRENCY", 4),
             vault_key=vault_key,
             web_origins=web_origins,
+            sendgrid_key=_secret(env, "SAMA_SENDGRID_API_KEY"),
+            email_from=env.get("SAMA_EMAIL_FROM", "").strip() or None,
         )

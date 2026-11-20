@@ -2,10 +2,12 @@
 
 Org A has the workspaces ``a1`` and ``a2``. Org B has ``b1``.
 
-- ``alice``: org A member and member of ``a1``. Owns the private session ``a1-alice``.
+- ``alice``: org A member and member of ``a1``. Owns the private session ``a1-alice`` and the
+  job ``job:alice``.
 - ``carol``: org A admin. Sees every workspace of org A and the audit log.
 - ``dave``: org A member with no workspace.
-- ``bob``: org B owner and member of ``b1``. Owns the private session ``b1-bob``.
+- ``bob``: org B owner and member of ``b1``. Owns the private session ``b1-bob`` and the job
+  ``job:bob``.
 - ``stranger``: a Supabase Auth user with no sama user row.
 
 Each org has an org-wide tool policy rule. Alice and dave each have a personal rule. Each org
@@ -33,10 +35,13 @@ from sama.db.models import (
     ChannelIdentity,
     Connection,
     ContextPin,
+    Delivery,
     GitHubInstallation,
     GitHubPushGrant,
     GitHubRepo,
     Integration,
+    Job,
+    JobFire,
     Membership,
     Memory,
     MemoryRevision,
@@ -306,6 +311,40 @@ def plan(
             conversation="c-world",
             seq=0,
             item={"role": "user", "content": f"item of {session}"},
+        )
+    # One job for each owner, with a fire and a delivery. A job is private to its owner.
+    for user, org, workspace, profile in (
+        ("alice", "org-a", "a1", "profile-a"),
+        ("bob", "org-b", "b1", "profile-b"),
+    ):
+        add(
+            Job,
+            f"job:{user}",
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            owner_user_id=ids[user],
+            agent_profile_id=ids[profile],
+            name=f"job of {user}",
+            schedule={"kind": "interval", "expr": "3600"},
+            prompt=f"secret prompt of {user}",
+        )
+        add(
+            JobFire,
+            f"fire:{user}",
+            org_id=ids[org],
+            job_id=ids[f"job:{user}"],
+            job_version=1,
+            scheduled_for=text("now()"),
+        )
+        add(
+            Delivery,
+            f"delivery:{user}",
+            org_id=ids[org],
+            job_id=ids[f"job:{user}"],
+            fire_id=ids[f"fire:{user}"],
+            kind="result",
+            target="telegram:1",
+            text=f"secret result of {user}",
         )
     policies: tuple[tuple[str, str, str | None], ...] = (
         ("rule:org-a", "org-a", None),

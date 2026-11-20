@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -67,6 +68,9 @@ from sama.runtime.archive import ARCHIVE_PATH
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.runtime.session_items import SESSION_ITEMS_PATH
 from sama.sandbox.base import SandboxProvider
+from sama.scheduler.delivery import Deliverer, EmailConfig, Sender
+from sama.scheduler.jobs import JobService
+from sama.scheduler.service import Scheduler
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
 from sama.tasks.dispatcher import TaskDispatcher
@@ -245,6 +249,7 @@ def build(
     # One ledger for every spender of model money: a record that fails to write fences them all.
     ledger = UsageLedger(usage)
     prices = PriceTable.load()
+    jobs = JobService(engine, RunQueue(engine))
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),
@@ -289,6 +294,7 @@ def build(
         gate=gate,
         delegation=DelegationService(engine, queue),
         tasks=TaskTools(engine),
+        jobs=jobs,
     )
     proxy = ModelProxy(
         signer=signer,
@@ -309,15 +315,25 @@ def build(
             skills=library,
             reviews=reviews,
             connections=connections,
+            jobs=jobs,
         )
         if vault is not None
         else None
     )
     slack = (
-        SlackHub(engine, vault, gate=gate, skills=library, reviews=reviews, connections=connections)
+        SlackHub(
+            engine,
+            vault,
+            gate=gate,
+            skills=library,
+            reviews=reviews,
+            connections=connections,
+            jobs=jobs,
+        )
         if vault is not None
         else None
     )
+    scheduler = _scheduler(settings, engine, vault, sandboxed)
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack):
@@ -349,6 +365,7 @@ def build(
         reviews=reviews,
         github=github,
         connections=connections,
+        jobs=jobs,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -389,6 +406,8 @@ def build(
                 # or trace. A failed refresh stops the start.
                 await vault.refresh_redactor()
                 loops.append(vault)
+            stack.push_async_callback(scheduler.aclose)
+            loops.append(scheduler)
             plane.tasks = [
                 asyncio.create_task(worker.serve(stop, concurrency=settings.worker_concurrency)),
                 *(asyncio.create_task(loop.serve(stop)) for loop in loops),
@@ -446,6 +465,30 @@ def _ended(task: asyncio.Task[None], stop: asyncio.Event, exit_on_failure: bool)
     if exit_on_failure:
         # uvicorn stops on SIGTERM. The platform starts the process again.
         os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _scheduler(
+    settings: ControlPlaneSettings,
+    engine: AsyncEngine,
+    vault: Vault | None,
+    sandboxed: SandboxedRuntime | None,
+) -> Scheduler:
+    """The job scheduler of Section 12.1. It is a loop of this process, not a Fly process of
+    its own. Without the vault, Telegram and Slack deliveries fail; without the SendGrid key,
+    email deliveries fail."""
+
+    async def secret(org_id: uuid.UUID, name: SecretName) -> SecretStr | None:
+        return None if vault is None else await vault.get(org_id, name, fresh=True)
+
+    email = (
+        EmailConfig(settings.sendgrid_key, settings.email_from)
+        if settings.sendgrid_key is not None and settings.email_from
+        else None
+    )
+    queue = RunQueue(engine)
+    return Scheduler(
+        engine, queue, Deliverer(engine, Sender(secret, email=email)), scripts=sandboxed
+    )
 
 
 class _Loop(Protocol):

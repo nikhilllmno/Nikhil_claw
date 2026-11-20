@@ -136,12 +136,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| Cron jobs (`jobs.json`, 60 s tick) | `cron/`, `tools/cronjob_tools.py` | Postgres `jobs` table, 60 s tick with a leader lease (§12.1). | Adapt | M4 |
-| `cronjob_manage` actions | `tools/cronjob_tools.py` | Same name and actions. | Adapt | M4 |
-| Natural language schedules | `cron/` | The agent writes a cron expression with a time zone. Sama validates it and shows the next 3 fire times. | Adapt | M4 |
-| Delivery to any channel with receipts | `cron/delivery*.py` | Delivery targets and receipts. An unknown delivery result is not retried (§12.1). | Adapt | M4 |
-| No cron recursion | `toolsets.py` (`hermes-cron`) | A job run cannot create jobs. | Adapt | M4 |
-| Per-job model and script-only jobs | `cron/` | `model` pin and `mode: script`. | Adapt | M4 |
+| Cron jobs (`jobs.json`, 60 s tick) | `cron/`, `tools/cronjob_tools.py` | Postgres `jobs` table, 60 s tick in the control plane process with an advisory-lock leader lease (§12.1). Done in M4.1. | Adapt | M4 |
+| `cronjob_manage` actions | `tools/cronjob_tools.py` | Same name, plus `preview`. The same rows are in `/cron` (Telegram and Slack direct chats), the API, and the web page `/jobs`. Done in M4.2. | Adapt | M4 |
+| Natural language schedules | `cron/` | Sama reads simple English or a cron expression with a time zone, validates it, and shows the next 3 fire times. Done in M4.2. | Adapt | M4 |
+| Delivery to any channel with receipts | `cron/delivery*.py` | Targets `origin`, Slack, Telegram, email, and `none`, plus `failure_deliver`, with receipts. An unknown delivery result is not retried. Three failures pause the job with one alert (§12.1). Done in M4.3. | Adapt | M4 |
+| No cron recursion | `toolsets.py` (`hermes-cron`) | A job run cannot create jobs: the gate removes the `cron` toolset, and the job service refuses it. Done in M4.2. | Adapt | M4 |
+| Per-job model and script-only jobs | `cron/` | `model` pin (`runs.model`) and `mode: script` in the session sandbox. Done in M4.2. | Adapt | M4 |
 | Unattended approvals deny | `tools/approval*.py` | `ask` becomes `deny` unless a human approved a pre-approval for that tool in that job version (D13, §12.1). | Adapt | M1 |
 | Webhooks (restricted toolset) | `gateway/platforms/webhook*.py` | Signed webhook triggers with the `safe` toolset (§12.2). | Adapt | M4 |
 | Heartbeat, goals, loops | `gateway/run_goals.py` | A job with `attach_to_session` runs inside one session (heartbeat). | Adapt | M4 |

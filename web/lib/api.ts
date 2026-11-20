@@ -285,6 +285,112 @@ export interface StartedConnection {
   redirect_url: string | null;
 }
 
+// -- scheduled jobs (src/sama/scheduler) --------------------------------------------------------
+
+export type JobStatus = "active" | "paused" | "pending_approval" | "removed" | (string & {});
+
+/** A stored schedule. `cron` has `expr` and `tz`, `interval` has `every_s`, `once` has `at`. */
+export interface JobSchedule {
+  kind: "cron" | "interval" | "once" | (string & {});
+  expr?: string;
+  tz?: string;
+  every_s?: number;
+  at?: string;
+}
+
+export type FireStatus = "running" | "completed" | "failed" | "skipped" | (string & {});
+export type DeliveryStatus = "pending" | "sending" | "sent" | "failed" | "unknown" | (string & {});
+
+export interface JobDelivery {
+  kind: string;
+  target: string;
+  status: DeliveryStatus;
+  attempts?: number;
+  provider_message_id?: string | null;
+  error: string | null;
+  sent_at?: string | null;
+}
+
+export interface JobFire {
+  id: string;
+  scheduled_for: string;
+  status: FireStatus;
+  manual: boolean;
+  session_id?: string | null;
+  output: string | null;
+  error: string | null;
+  finished_at?: string | null;
+  deliveries: JobDelivery[];
+}
+
+/** A tool that a person approved for the job. `limits` maps an argument to its allowed values. */
+export interface PreapprovedTool {
+  tool: string;
+  connection?: string | null;
+  limits: Record<string, (string | number | boolean)[]>;
+}
+
+export interface Job {
+  id: string;
+  name: string;
+  status: JobStatus;
+  version: number;
+  approved_version: number | null;
+  needs_approval: boolean;
+  approval_reasons: string[];
+  schedule: JobSchedule;
+  schedule_text: string;
+  next_fire_at: string | null;
+  next_fires: string[];
+  last_fire_at: string | null;
+  prompt: string;
+  skills: string[];
+  model: string | null;
+  mode: "agent" | "script" | (string & {});
+  script: string | null;
+  deliver: string;
+  failure_deliver: string | null;
+  preapproved_tools: PreapprovedTool[];
+  attach_to_session: boolean;
+  workspace_id: string;
+  agent_profile_id: string;
+  consecutive_failures: number;
+  paused_reason: string | null;
+  created_by_kind: "user" | "agent" | (string & {});
+  created_at: string;
+  updated_at: string;
+  /** The last fires, newest first. Only `GET /orgs/{org_id}/jobs/{job_id}` fills it. */
+  fires: JobFire[];
+}
+
+/**
+ * The body of `POST` and `PATCH /orgs/{org_id}/jobs`. Each field is optional. A field that is
+ * not there does not change in an update.
+ */
+export interface JobInput {
+  name?: string;
+  schedule?: string | JobSchedule;
+  tz?: string;
+  prompt?: string;
+  skills?: string[];
+  model?: string;
+  mode?: "agent" | "script";
+  script?: string;
+  deliver?: string;
+  failure_deliver?: string;
+  preapproved_tools?: PreapprovedTool[];
+  attach_to_session?: boolean;
+  agent_profile_id?: string;
+  workspace_id?: string;
+}
+
+/** The answer of `POST /jobs/preview`. */
+export interface SchedulePreview {
+  schedule: JobSchedule;
+  text: string;
+  next_fires: string[];
+}
+
 // -- errors -------------------------------------------------------------------------------------
 
 /** The status of a card on the task board (docs/architecture.md, Section 12.4). */
@@ -572,6 +678,33 @@ export class ApiClient {
       `/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}/comments`,
       { method: "POST", body: { body } },
     );
+  previewSchedule = (schedule: string | JobSchedule, tz?: string, signal?: AbortSignal) =>
+    this.json<SchedulePreview>("/jobs/preview", {
+      method: "POST",
+      body: tz ? { schedule, tz } : { schedule },
+      signal,
+    });
+  listJobs = (orgId: string) => this.json<Job[]>(`/orgs/${orgId}/jobs`);
+  getJob = (orgId: string, jobId: string) => this.json<Job>(`/orgs/${orgId}/jobs/${jobId}`);
+  createJob = (orgId: string, body: JobInput) =>
+    this.json<Job>(`/orgs/${orgId}/jobs`, { method: "POST", body });
+  updateJob = (orgId: string, jobId: string, body: JobInput) =>
+    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}`, { method: "PATCH", body });
+  /** Approves one version of a job. The API refuses a version that is not the current one. */
+  approveJob = (orgId: string, jobId: string, version: number) =>
+    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/approve`, { method: "POST", body: { version } });
+  pauseJob = (orgId: string, jobId: string) =>
+    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/pause`, { method: "POST" });
+  resumeJob = (orgId: string, jobId: string) =>
+    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/resume`, { method: "POST" });
+  /** Starts a fire now, outside the schedule. */
+  runJob = (orgId: string, jobId: string) =>
+    this.json<{ fire_id: string }>(`/orgs/${orgId}/jobs/${jobId}/run`, { method: "POST" });
+  /** Cancels the runs of the job that are open. */
+  cancelJob = (orgId: string, jobId: string) =>
+    this.json<{ cancelled: number }>(`/orgs/${orgId}/jobs/${jobId}/cancel`, { method: "POST" });
+  deleteJob = (orgId: string, jobId: string) =>
+    this.json<null>(`/orgs/${orgId}/jobs/${jobId}`, { method: "DELETE" });
 }
 
 /** The public config of the API (no sign-in needed). */

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -22,7 +23,7 @@ from sama.gate import (
     effective_toolsets,
     policy_verdict,
 )
-from sama.gate.decide import CHILD_BLOCKED_TOOLSETS, TOOLSETS, tools_of
+from sama.gate.decide import CHILD_BLOCKED_TOOLSETS, TOOLSETS, Preapproval, connection_of, tools_of
 from sama.gate.hardline import MAX_COMMAND_CHARS
 from sama.gate.service import stored_arguments
 from sama.runtime.contract import ApprovalRequired
@@ -431,9 +432,48 @@ def test_an_unattended_run_keeps_allow() -> None:
     assert decide(context(unattended=True), "Read", {"file_path": "a"}).action == "allow"
 
 
-def test_a_pre_approval_keeps_ask_tools_in_an_unattended_run() -> None:
-    verdict = decide(context(unattended=True, preapproved=frozenset({"Bash"})), "Bash", ARGS)
-    assert verdict.action == "ask"
+def test_a_pre_approval_allows_an_ask_tool_in_an_unattended_run() -> None:
+    verdict = decide(context(unattended=True, preapproved=(Preapproval("Bash"),)), "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("allow", GateStep.CONTEXT)
+
+
+def test_a_pre_approval_is_bound_to_its_argument_limits() -> None:
+    slack = "mcp__slack__post_message"
+    item = Preapproval(slack, connection="slack", limits=(("channel", ("#eng",)),))
+    ctx = context(unattended=True, preapproved=(item,), toolsets=frozenset({"core", "x"}))
+    ctx = replace(ctx, catalog={**ctx.catalog, "x": frozenset({slack})})
+    assert decide(ctx, slack, {"channel": "#eng", "text": "hi"}).action == "allow"
+    assert decide(ctx, slack, {"channel": "#general", "text": "hi"}).action == "deny"
+    assert decide(ctx, slack, {"text": "hi"}).action == "deny"
+    # Without the arguments (a recorded call), a limit fails closed.
+    assert decide_recorded(ctx, slack, "digest").action == "deny"
+
+
+def test_a_pre_approval_is_bound_to_its_connection() -> None:
+    tool = "mcp__github__create_issue"
+    ctx = context(unattended=True, toolsets=frozenset({"x"}))
+    ctx = replace(ctx, catalog={**ctx.catalog, "x": frozenset({tool})})
+    wrong = replace(ctx, preapproved=(Preapproval(tool, connection="gitlab"),))
+    right = replace(ctx, preapproved=(Preapproval(tool, connection="github"),))
+    assert decide(wrong, tool, {}).action == "deny"
+    assert decide(right, tool, {}).action == "allow"
+    assert connection_of(tool) == "github"
+    assert connection_of("mcp__sama__todo") is None
+    assert connection_of("Bash") is None
+
+
+def test_a_pre_approval_does_not_cover_another_tool() -> None:
+    verdict = decide(context(unattended=True, preapproved=(Preapproval("Write"),)), "Bash", ARGS)
+    assert verdict.action == "deny"
+
+
+def test_a_job_run_does_not_have_cronjob_manage_without_the_cron_toolset() -> None:
+    assert "cron" in DEFAULT_TOOLSETS
+    assert decide(context(toolsets=frozenset({"cron"})), "cronjob_manage", {}).action == "allow"
+    verdict = decide(context(toolsets=frozenset({"core"})), "cronjob_manage", {})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+    shared = decide(context(toolsets=frozenset({"cron"}), shared=True), "cronjob_manage", {})
+    assert shared.action == "ask"
 
 
 def test_an_unattended_run_cannot_use_clarify() -> None:

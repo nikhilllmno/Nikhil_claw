@@ -70,6 +70,7 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
             "integrations",
             "delegation",
             "tasks",
+            "cron",
         ],
         list(DEFAULT_GROUP_TOOLSETS),
     )

@@ -45,10 +45,12 @@ from sama.db.models import (
 from sama.gate.approvers import SHARED_REFUSAL, approvers_of, may_decide_shared
 from sama.gate.decide import (
     ALWAYS_ASK,
+    JOB_TOOLSET,
     Action,
     GateContext,
     GateStep,
     PolicyRule,
+    Preapproval,
     Recorded,
     RuleLevel,
     ToolsetSource,
@@ -65,6 +67,7 @@ from sama.gate.decide import (
     tools_of,
 )
 from sama.review.policy import REVIEW_TOOLSETS
+from sama.scheduler.spec import job_of_run
 from sama.tenancy.access import load_grants
 from sama.tenancy.authority import budget_problem, load_authority, load_run_spend, run_user
 from sama.tenancy.run_token import RunTokenClaims
@@ -448,6 +451,13 @@ class GateService:
         if row.kind == "review":
             # A background review has the memory and skill tools and no other tool (Section 9.4).
             toolsets &= REVIEW_TOOLSETS
+        preapproved: tuple[Preapproval, ...] = ()
+        job = await job_of_run(connection, org_id, run_id)
+        if job is not None:
+            # A job run cannot create or change jobs (Section 12.1). Its pre-approvals apply
+            # only when a human approved this exact version of the job.
+            toolsets -= {JOB_TOOLSET}
+            preapproved = job.preapproved
         context = GateContext(
             toolsets=toolsets,
             rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
@@ -455,6 +465,7 @@ class GateService:
             shared=row.audience == "shared" and row.kind != "review",
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
             revoked=await self._revoked(connection, org_id, run_id),
+            preapproved=preapproved,
             catalog=merged_catalog(
                 self._extra_toolsets.toolsets() if self._extra_toolsets is not None else {}
             ),
