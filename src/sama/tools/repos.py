@@ -1,10 +1,17 @@
 """The ``github`` toolset: ``repo_clone`` (docs/architecture.md, Section 15.1).
 
-``repo_clone`` clones a public GitHub repository into the work folder of the session sandbox.
-The control plane runs ``git clone`` in the sandbox through the sandbox provider, so the clone
-uses the egress of the sandbox. The sandbox has no GitHub token, so only public repositories
-clone. The agent then reads, edits, and tests the code with its native tools. Pushing comes
-later, through the sama git proxy.
+``repo_clone`` clones a GitHub repository into the work folder of the session sandbox. The
+control plane runs ``git clone`` in the sandbox through the sandbox provider, so the clone uses
+the egress of the sandbox. The sandbox has no GitHub token.
+
+- A repository on the allowlist of the org clones through the sama git proxy
+  (``<public_url>/git``). The clone keeps a credential helper that gives the run token of the
+  current run (``$SAMA_RUN_TOKEN``) to the proxy. So the agent can fetch, and push
+  ``sama/*`` branches, with git in its shell.
+- Any other repository clones from GitHub without credentials, so only public repositories
+  clone. The agent cannot push them.
+
+The agent then reads, edits, and tests the code with its native tools.
 
 The result has the commit and the instruction files of the repository (``AGENTS.md`` and
 ``CLAUDE.md``). The prompt prefix of the session does not change during the session
@@ -17,7 +24,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 from urllib.parse import urlsplit
 
 from sama.prompt.assemble import prepare
@@ -43,6 +50,22 @@ _NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 _REGULAR_MODES: Final = frozenset({"100644", "100755"})
 _SHA = re.compile(r"[0-9a-f]{40}")
+
+
+RUN_TOKEN_ENV: Final = "SAMA_RUN_TOKEN"  # noqa: S105 -- the name of a variable
+"""The variable of the run token in the sandbox (``sama.runtime.runner.RUN_TOKEN_ENV``)."""
+PROXY_CREDENTIAL_HELPER: Final = (
+    '!f() { test "$1" = get || exit 0; echo username=sama; '
+    f'echo "password=${{{RUN_TOKEN_ENV}}}"; }}; f'
+)
+"""The credential helper of a proxy clone. It reads the run token when git runs, so a later
+run of the session pushes with its own token. The token is not in the git config."""
+
+
+class RepoAccess(Protocol):
+    """The allowlist of the org, normally ``sama.tools.github.GitHubTools``."""
+
+    async def allowed(self, org_id: str, owner: str, name: str) -> bool: ...
 
 
 class RepoError(Exception):
@@ -101,6 +124,7 @@ class Cloned:
     url: str
     path: str
     commit: str
+    proxied: bool
     branch: str | None
     """The branch of ``HEAD``, or ``None`` when ``HEAD`` is a tag (detached)."""
     instructions: tuple[tuple[str, str], ...]
@@ -111,13 +135,23 @@ class RepoCloner:
     """Clones repositories into the session sandbox.
 
     ``source`` is the base URL of the clone. It is ``https://github.com``, except in tests,
-    which use a ``file://`` folder of bare repositories.
+    which use a ``file://`` folder of bare repositories. ``proxy`` is the base URL of the sama
+    git proxy, and ``access`` is the allowlist. With both, a repository on the allowlist
+    clones through the proxy.
     """
 
-    def __init__(self, session_sandbox: SessionSandbox, *, source: str = GITHUB_URL) -> None:
+    def __init__(
+        self,
+        session_sandbox: SessionSandbox,
+        *,
+        source: str = GITHUB_URL,
+        proxy: str | None = None,
+        access: RepoAccess | None = None,
+    ) -> None:
         self._session_sandbox = session_sandbox
         self._source = source.rstrip("/")
-        self._scheme = urlsplit(self._source).scheme
+        self._proxy = proxy.rstrip("/") if proxy else None
+        self._access = access
 
     async def clone(
         self,
@@ -126,7 +160,9 @@ class RepoCloner:
         *,
         ref: str | None = None,
         folder: str | None = None,
+        token: str | None = None,
     ) -> Cloned:
+        """``token`` is the run token of the call. A clone through the proxy needs it."""
         target = parse_repo(repo)
         if ref is not None and not _valid_ref(ref):
             raise RepoError(f"{ref!r} is not a valid branch or tag name")
@@ -140,36 +176,62 @@ class RepoCloner:
         if sandbox is None:
             raise RepoError("the session has no sandbox yet")
         path = f"{sandbox.workdir.rstrip('/')}/{folder}"
+        proxied = await self._proxied(claims, target)
+        if proxied and token is None:
+            raise RepoError("the call has no run token, so the clone cannot use the git proxy")
         try:
             await _reserve(sandbox, path)
-            await self._clone(sandbox, target, ref, path)
+            await self._clone(sandbox, target, ref, path, token if proxied else None)
             commit, branch = await _head(sandbox, path)
             instructions = await _instructions(sandbox, path, claims)
         except SandboxError as error:
             raise RepoError(f"the sandbox failed: {error}") from None
-        return Cloned(target.url, path, commit, branch, instructions)
+        return Cloned(target.url, path, commit, proxied, branch, instructions)
 
-    async def _clone(self, sandbox: Sandbox, target: RepoRef, ref: str | None, path: str) -> None:
-        argv = [
-            "git",
-            # No credentials and no other protocol: the clone stays anonymous, and a
-            # submodule or a redirect cannot use ssh or a local path.
-            "-c",
-            "credential.helper=",
+    async def _proxied(self, claims: RunTokenClaims, target: RepoRef) -> bool:
+        if self._proxy is None or self._access is None:
+            return False
+        return await self._access.allowed(claims.org_id, target.owner, target.name)
+
+    async def _clone(
+        self, sandbox: Sandbox, target: RepoRef, ref: str | None, path: str, token: str | None
+    ) -> None:
+        source = self._proxy if token is not None and self._proxy else self._source
+        # No other protocol: a submodule or a redirect cannot use ssh or a local path.
+        protocol = [
             "-c",
             "protocol.allow=never",
             "-c",
-            f"protocol.{self._scheme}.allow=always",
-            "clone",
+            f"protocol.{urlsplit(source).scheme}.allow=always",
+        ]
+        env = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"}
+        if token is None:
+            # No credentials: the clone stays anonymous.
+            config = ["-c", "credential.helper=", *protocol, "clone"]
+        else:
+            # ``clone -c`` writes the values into the config of the clone, so later fetches
+            # and pushes use the proxy helper too. The empty value first removes every other
+            # helper.
+            config = [
+                *protocol,
+                "clone",
+                "-c",
+                "credential.helper=",
+                "-c",
+                f"credential.helper={PROXY_CREDENTIAL_HELPER}",
+            ]
+            env[RUN_TOKEN_ENV] = token
+        argv = [
+            "git",
+            *config,
             "--quiet",
             "--filter=blob:none",
             "--single-branch",
             *(["--branch", ref] if ref else []),
             "--",
-            f"{self._source}/{target.owner}/{target.name}.git",
+            f"{source}/{target.owner}/{target.name}.git",
             path,
         ]
-        env = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"}
         result = await sandbox.exec(argv, env=env, timeout_s=CLONE_TIMEOUT_S)
         if result.exit_code == 0:
             return
@@ -180,7 +242,7 @@ class RepoCloner:
         # A failed clone can leave a part of the folder. This call made the folder, so it can
         # remove it.
         await sandbox.exec(["rm", "-rf", "--", path], timeout_s=GIT_TIMEOUT_S)
-        raise RepoError(_clone_problem(target, ref, result.stderr))
+        raise RepoError(_clone_problem(target, ref, result.stderr, proxied=token is not None))
 
 
 _ALREADY_FILLED = "already exists and is not an empty directory"
@@ -209,10 +271,12 @@ def _last_line(stderr: str) -> str:
     return detail
 
 
-def _clone_problem(target: RepoRef, ref: str | None, stderr: str) -> str:
+def _clone_problem(target: RepoRef, ref: str | None, stderr: str, *, proxied: bool = False) -> str:
     lowered = stderr.lower()
     if "not found" in lowered and ref and ref.lower() in lowered:
         return f"{target.url} has no branch or tag {ref!r}"
+    if proxied:
+        return f"git clone through the sama git proxy failed: {_last_line(stderr)}"
     if (
         "repository not found" in lowered
         or "could not read username" in lowered
@@ -280,8 +344,21 @@ def render(cloned: Cloned) -> str:
     lines = [
         f"Cloned {cloned.url} ({at}, commit {cloned.commit}) into {cloned.path}.",
         "Use your file and shell tools in that folder to read, change, and test the code.",
-        "You cannot push. Sama has no push yet.",
     ]
+    if cloned.proxied:
+        lines += [
+            "The clone uses the sama git proxy, so git fetch and git push work in that folder. "
+            "Push only to a new branch named sama/<short-name> (git push origin "
+            "HEAD:sama/<short-name>). The proxy refuses other branches, tags, deletes, and "
+            "force-pushes. A push that changes a protected path (for example .github/workflows) "
+            "needs an approval: the push error tells you how to call repo_push_approval. Then "
+            "open a pull request with pr_create. A person reviews and merges it.",
+        ]
+    else:
+        lines.append(
+            "You cannot push this repository. Only a repository on the allowlist of the org can "
+            "get pushes."
+        )
     if cloned.instructions:
         lines += [
             "",

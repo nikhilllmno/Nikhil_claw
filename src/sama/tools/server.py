@@ -107,6 +107,13 @@ from sama.tools.deferred import (
 from sama.tools.deferred import (
     MAX_QUERY_CHARS as MAX_TOOL_QUERY_CHARS,
 )
+from sama.tools.github import (
+    PR_COMMENT,
+    PR_CREATE,
+    REPO_PUSH_APPROVAL,
+    GitHubToolError,
+    GitHubTools,
+)
 from sama.tools.outbound import OutboundClient
 from sama.tools.output import Spill, cap, untrusted
 from sama.tools.repos import RepoCloner, RepoError
@@ -160,6 +167,7 @@ _EXPECTED = (
     ConnectorError,
     DeferredToolError,
     DelegationError,
+    GitHubToolError,
     MemoryChangeError,
     RepoError,
     SearchError,
@@ -289,6 +297,8 @@ class ToolServer:
       tail.
     - ``repos``: clones repositories into the session sandbox. Without it, ``repo_clone`` is
       hidden.
+    - ``github``: the sama GitHub App (``pr_create``, ``pr_comment``,
+      ``repo_push_approval``). Without it, these tools are hidden.
     - ``memory``: the memory service. Without it, ``memory`` is hidden.
     - ``skills``: the skill library (``skills_list``, ``skill_view``, ``skill_manage``).
       Without it, these tools are hidden.
@@ -328,6 +338,7 @@ class ToolServer:
         clarify: ClarifyBroker | None = None,
         spill: Spill | None = None,
         repos: RepoCloner | None = None,
+        github: GitHubTools | None = None,
         memory: MemoryService | None = None,
         skills: SkillStore | None = None,
         sessions: SessionSearch | None = None,
@@ -356,6 +367,7 @@ class ToolServer:
         self.clarify = clarify
         self.spill = spill
         self.repos = repos
+        self.github = github
         self.memory = memory
         self.skills = skills
         self.sessions = sessions
@@ -703,11 +715,13 @@ class ToolServer:
             @server.tool(
                 name=REPO_CLONE,
                 description=(
-                    "Clone a public GitHub repository into the work folder of your sandbox. "
-                    "Then use your file and shell tools in its folder to read, change, and "
-                    "test the code. Give the repository as https://github.com/<owner>/<name>. "
-                    "ref is a branch or a tag (default: the default branch). folder is the "
-                    "folder name (default: the repository name). You cannot push."
+                    "Clone a GitHub repository into the work folder of your sandbox. Then use "
+                    "your file and shell tools in its folder to read, change, and test the "
+                    "code. Give the repository as https://github.com/<owner>/<name>. ref is a "
+                    "branch or a tag (default: the default branch). folder is the folder name "
+                    "(default: the repository name). A public repository clones read-only. A "
+                    "repository on the allowlist of the org clones through the sama git proxy, "
+                    "and you can push sama/* branches of it."
                 ),
                 annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
                 structured_output=False,
@@ -719,10 +733,15 @@ class ToolServer:
                 folder: Annotated[str | None, Field(min_length=1, max_length=100)] = None,
             ) -> str:
                 async def body(claims: RunTokenClaims) -> str:
-                    return render_clone(await repos.clone(claims, repo, ref=ref, folder=folder))
+                    token = bearer_of(ctx.headers)
+                    cloned = await repos.clone(claims, repo, ref=ref, folder=folder, token=token)
+                    return render_clone(cloned)
 
                 arguments = {"repo": repo, "ref": ref, "folder": folder}
                 return await self._call(ctx, REPO_CLONE, arguments, body)
+
+        if self.github is not None:
+            self._github_tools(server, self.github)
 
         if self.skills is not None:
             library = self.skills
@@ -838,6 +857,87 @@ class ToolServer:
         # A gate that cannot say what the run may use shows nothing: the search must not tell
         # a run the names and the schemas of tools that the gate may deny.
         return frozenset()
+
+    def _github_tools(self, server: MCPServer, github: GitHubTools) -> None:
+        @server.tool(
+            name=PR_CREATE,
+            description=(
+                "Open a pull request on GitHub from a sama/* branch that you pushed. repo is "
+                "<owner>/<name> of a repository on the allowlist of the org. head is the "
+                "sama/<name> branch. base is the branch to merge into, normally the default "
+                "branch. A person reviews and merges the pull request. You cannot merge it."
+            ),
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            structured_output=False,
+        )
+        async def pr_create(
+            repo: Annotated[str, Field(min_length=1, max_length=300)],
+            head: Annotated[str, Field(min_length=1, max_length=200)],
+            base: Annotated[str, Field(min_length=1, max_length=200)],
+            title: Annotated[str, Field(min_length=1, max_length=256)],
+            ctx: Context,
+            body: Annotated[str, Field(max_length=60_000)] = "",
+            draft: bool = False,
+        ) -> str:
+            async def run(claims: RunTokenClaims) -> str:
+                return await github.create_pull(
+                    claims, repo, head=head, base=base, title=title, body=body, draft=draft
+                )
+
+            arguments = {
+                "repo": repo,
+                "head": head,
+                "base": base,
+                "title": title,
+                "body": body,
+                "draft": draft,
+            }
+            return await self._call(ctx, PR_CREATE, arguments, run)
+
+        @server.tool(
+            name=PR_COMMENT,
+            description=(
+                "Add a comment to a pull request on GitHub. repo is <owner>/<name> of a "
+                "repository on the allowlist of the org. number is the number of the pull "
+                "request."
+            ),
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            structured_output=False,
+        )
+        async def pr_comment(
+            repo: Annotated[str, Field(min_length=1, max_length=300)],
+            number: Annotated[int, Field(gt=0)],
+            body: Annotated[str, Field(min_length=1, max_length=60_000)],
+            ctx: Context,
+        ) -> str:
+            async def run(claims: RunTokenClaims) -> str:
+                return await github.comment(claims, repo, number, body)
+
+            arguments = {"repo": repo, "number": number, "body": body}
+            return await self._call(ctx, PR_COMMENT, arguments, run)
+
+        @server.tool(
+            name=REPO_PUSH_APPROVAL,
+            description=(
+                "Ask a person to approve a push that changes a protected path, for example "
+                ".github/workflows. Call it only when git push says so, with the repo, the "
+                "branch, and the full commit id from that message. After the approval, push "
+                "the same commit again. The approval works once, for one hour."
+            ),
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            structured_output=False,
+        )
+        async def repo_push_approval(
+            repo: Annotated[str, Field(min_length=1, max_length=300)],
+            branch: Annotated[str, Field(min_length=1, max_length=200)],
+            commit: Annotated[str, Field(min_length=40, max_length=40)],
+            ctx: Context,
+        ) -> str:
+            async def run(claims: RunTokenClaims) -> str:
+                return await github.approve_push(claims, repo, branch, commit)
+
+            arguments = {"repo": repo, "branch": branch, "commit": commit}
+            return await self._call(ctx, REPO_PUSH_APPROVAL, arguments, run)
 
     def _connection_tools(self, server: MCPServer, connections: ConnectionService) -> None:
         """``connections_list``, ``connection_request``, and ``connection_test``

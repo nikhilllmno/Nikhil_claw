@@ -31,7 +31,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "todo": frozenset({"todo", "TodoWrite"}),
     "web": frozenset({"web_search", "web_extract"}),
     "clarify": frozenset({"clarify"}),
-    "github": frozenset({"repo_clone"}),
+    "github": frozenset({"repo_clone", "pr_create", "pr_comment", "repo_push_approval"}),
     "memory": frozenset({"memory"}),
     "skills": frozenset({"skills_list", "skill_view", "skill_manage"}),
     "sessions": frozenset({"session_search", "session_read"}),
@@ -124,8 +124,14 @@ none. ``cron`` stops a child that outlives its parent. ``connections`` and ``int
 out for the reason of sub-agents (Section 13.1): a connection acts with the authority of the
 user, and only a run that the user watches asks the user to connect (Section 10.3)."""
 
-NEEDS_A_HUMAN: Final = frozenset({"clarify"})
+NEEDS_A_HUMAN: Final = frozenset({"clarify", "repo_push_approval"})
 """Tools that wait for a human. Unattended runs cannot use them."""
+
+ALWAYS_ASK: Final = frozenset({"repo_push_approval"})
+"""Tools that always need the approval of a person for each call. An ``allow`` rule cannot
+remove the ask, and "always allow" writes no rule for them. A ``deny`` rule still wins. The
+approval of ``repo_push_approval`` is the approval of a push that changes a protected path
+(Section 15.1)."""
 
 SHARED_ASK: Final = frozenset({"memory"})
 """Tools that are in ``DEFAULT_ALLOW`` but get ``ask`` in a shared session (Section 11.3). Every
@@ -384,16 +390,18 @@ def policy_verdict(
     shared: bool = False,
     access: Mapping[str, ToolAccess] | None = None,
 ) -> Verdict:
-    """Step 4. A ``deny`` rule at any level wins. An org or profile ``ask`` rule cannot be
-    removed by a user rule. Otherwise a user rule wins, then the profile rule, then the org
-    rule. At one level an exact name wins over a prefix. Without a rule, the built-in
-    default applies, and the default for unknown tools is ``ask``. In a shared session, the
-    tools in ``SHARED_ASK`` also get ``ask`` by default. A deferred tool with an ``access``
-    gets the connector default: ``read`` is ``allow``, ``write`` and ``destructive`` are
-    ``ask`` (Section 10.3)."""
+    """Step 4. A ``deny`` rule at any level wins. A tool in ``ALWAYS_ASK`` gets ``ask``. An
+    org or profile ``ask`` rule cannot be removed by a user rule. Otherwise a user rule wins,
+    then the profile rule, then the org rule. At one level an exact name wins over a prefix.
+    Without a rule, the built-in default applies, and the default for unknown tools is
+    ``ask``. In a shared session, the tools in ``SHARED_ASK`` also get ``ask`` by default. A
+    deferred tool with an ``access`` gets the connector default: ``read`` is ``allow``,
+    ``write`` and ``destructive`` are ``ask`` (Section 10.3)."""
     matching = [rule for rule in rules if rule.matches(name)]
     if any(rule.action == "deny" for rule in matching):
         return Verdict("deny", GateStep.POLICY, f"a policy rule denies {name}")
+    if name in ALWAYS_ASK:
+        return Verdict("ask", GateStep.POLICY, f"{name} needs an approval for each call")
     admin = _most_specific(r for r in matching if r.level is not RuleLevel.USER)
     user = _most_specific(r for r in matching if r.level is RuleLevel.USER)
     if admin is not None and admin.action == "ask":

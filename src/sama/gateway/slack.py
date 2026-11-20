@@ -56,6 +56,7 @@ from sama.gateway.sessions import (
     find_session,
     follow_run,
     new_session,
+    offers_always,
     pin_reply,
     send_ending,
     stop_runs,
@@ -239,7 +240,7 @@ class _Outbox:
 def approval_blocks(row: Any) -> tuple[str, list[dict[str, Any]]]:
     """The fallback text and the Block Kit blocks of an approval card. A tool call also gets
     "Always allow for me", which writes a user policy rule (M3.2). A proposal does not: a rule
-    cannot approve a proposal."""
+    cannot approve a proposal. A tool in ``ALWAYS_ASK`` does not."""
     text = approval_text(row)[:MAX_CARD_CHARS]
     buttons: list[dict[str, Any]] = [
         {
@@ -257,7 +258,7 @@ def approval_blocks(row: Any) -> tuple[str, list[dict[str, Any]]]:
             "value": f"ap:{row.id.hex}:n",
         },
     ]
-    if not getattr(row, "proposal", False):
+    if offers_always(row):
         buttons.append(
             {
                 "type": "button",

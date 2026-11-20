@@ -92,6 +92,8 @@ CONNECTION_STATES: Final = ("pending", "initiated", "connected", "failed", "expi
 INTEGRATION_KINDS: Final = ("telegram", "slack")
 """The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
+GITHUB_ACCOUNT_TYPES: Final = ("User", "Organization", "Enterprise")
+"""The GitHub account types that can install the sama GitHub App (Section 15.1)."""
 SKILL_SCOPES: Final = ("org", "workspace", "user")
 """The stored scopes of a skill. The scope ``builtin`` is in the repo, not in the database."""
 SKILL_STATUSES: Final = ("active", "archived")
@@ -1604,6 +1606,99 @@ class TaskComment(Base):
     """The run of an agent comment. Not a foreign key: the comment outlives the run."""
     body: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = _created_at()
+
+
+class GitHubInstallation(Base):
+    """An installation of the sama GitHub App that an org connected (Section 15.1).
+
+    One installation belongs to one org. The row has no token: the control plane makes an
+    installation token with the key of the App when it needs one.
+    """
+
+    __tablename__ = "github_installations"
+    __table_args__ = (
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("installation_id"),
+        CheckConstraint(_one_of("account_type", GITHUB_ACCOUNT_TYPES), name="account_type"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    installation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """The id of the installation on GitHub."""
+    account_login: Mapped[str] = mapped_column(Text, nullable=False)
+    account_type: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class GitHubRepo(Base):
+    """A repository on the allowlist of an org (Section 15.1). Only these repositories go
+    through the sama git proxy and get pull requests."""
+
+    __tablename__ = "github_repos"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "installation_ref"],
+            ["github_installations.org_id", "github_installations.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("org_id", "full_name"),
+        CheckConstraint("full_name = lower(owner || '/' || name)", name="full_name"),
+        CheckConstraint("jsonb_typeof(protected_paths) = 'array'", name="protected_paths"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    installation_ref: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The ``github_installations`` row that reaches the repository."""
+    owner: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    full_name: Mapped[str] = mapped_column(Text, nullable=False)
+    """``owner/name`` in lower case. GitHub names do not depend on case."""
+    protected_paths: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    """The paths of the repository, in addition to the default ones, that a push can change
+    only with an approval. A path that ends with ``/`` is a folder."""
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class GitHubPushGrant(Base):
+    """An approval to push one commit to one ``sama/*`` branch that changes a protected path
+    (Section 15.1). A person approves a ``repo_push_approval`` call, and the git proxy uses
+    the grant once."""
+
+    __tablename__ = "github_push_grants"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "repo_id"], ["github_repos.org_id", "github_repos.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("commit_sha ~ '^[0-9a-f]{40}$'", name="commit_sha"),
+        CheckConstraint("ref LIKE 'refs/heads/sama/%'", name="ref"),
+        Index(None, "org_id", "repo_id", "ref", "commit_sha"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    repo_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    ref: Mapped[str] = mapped_column(Text, nullable=False)
+    commit_sha: Mapped[str] = mapped_column(Text, nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RuntimeSessionItem(Base):

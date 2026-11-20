@@ -8,7 +8,8 @@ Org A has the workspaces ``a1`` and ``a2``. Org B has ``b1``.
 - ``bob``: org B owner and member of ``b1``. Owns the private session ``b1-bob``.
 - ``stranger``: a Supabase Auth user with no sama user row.
 
-Each org has an org-wide tool policy rule. Alice and dave each have a personal rule.
+Each org has an org-wide tool policy rule. Alice and dave each have a personal rule. Each org
+has one GitHub installation, one allowlisted repository, and one push grant.
 """
 
 from __future__ import annotations
@@ -32,6 +33,9 @@ from sama.db.models import (
     ChannelIdentity,
     Connection,
     ContextPin,
+    GitHubInstallation,
+    GitHubPushGrant,
+    GitHubRepo,
     Integration,
     Membership,
     Memory,
@@ -447,6 +451,41 @@ def plan(
             action="add",
             entries=[f"note of {label}"],
             author_kind="agent",
+        )
+    # One GitHub installation, one repository, and one push grant for each org.
+    for user, org, session in (
+        ("alice", "org-a", "a1-shared"),
+        ("bob", "org-b", "b1-shared"),
+    ):
+        add(
+            GitHubInstallation,
+            f"gh-inst:{org}",
+            org_id=ids[org],
+            installation_id=uuid.uuid4().int % 10**9,
+            account_login=f"{org}-account",
+            account_type="Organization",
+            created_by_user_id=ids[user],
+        )
+        add(
+            GitHubRepo,
+            f"gh-repo:{org}",
+            org_id=ids[org],
+            installation_ref=ids[f"gh-inst:{org}"],
+            owner="Acme",
+            name=f"{org}-app",
+            full_name=f"acme/{org}-app",
+            created_by_user_id=ids[user],
+        )
+        add(
+            GitHubPushGrant,
+            f"gh-grant:{org}",
+            org_id=ids[org],
+            repo_id=ids[f"gh-repo:{org}"],
+            ref="refs/heads/sama/seed",
+            commit_sha="a" * 40,
+            session_id=ids[session],
+            run_id=ids[f"run:{session}"],
+            expires_at=text("now() + interval '1 hour'"),
         )
     for org in ("org-a", "org-b"):
         add(AuditEntry, org_id=ids[org], actor_kind="system", action=f"seed {org}")

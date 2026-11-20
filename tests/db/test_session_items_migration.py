@@ -1,4 +1,4 @@
-"""Migration 0024: the session items of the OpenAI runtime (docs/architecture.md, Section 5.3)."""
+"""Migration 0025: the session items of the OpenAI runtime (docs/architecture.md, Section 5.3)."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def test_the_migration_goes_down_and_up_with_items() -> None:
         assert [row["policyname"] for row in policies] == [f"{TABLE}_select"]
 
         config = alembic_config(url)
-        command.downgrade(config, "0023")
+        command.downgrade(config, "0024")
         assert not _exists(url)
         command.upgrade(config, "head")
         assert _exists(url)

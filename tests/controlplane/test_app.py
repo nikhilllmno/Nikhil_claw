@@ -21,6 +21,7 @@ from sama.connectors.manifest import Catalog
 from sama.controlplane import ControlPlane, ControlPlaneSettings, build
 from sama.controlplane.server import DrainingServer
 from sama.db.models import Run
+from sama.github.client import GitHubAppConfig
 from sama.runtime.contract import RunCompleted, RuntimeKind, TextDelta, Usage
 from sama.runtime.fake import FakeRuntime, FakeScript
 from sama.sandbox.local import LocalProvider
@@ -294,3 +295,31 @@ async def test_a_second_stop_cancels_the_drain(engine: AsyncEngine, tenant: Tena
         await serving
     assert all(task.done() for task in plane.tasks)
     assert await _status(engine, run_id) != "completed"
+
+
+async def test_the_github_app_turns_on_the_git_proxy_and_the_tools(engine: AsyncEngine) -> None:
+    app = GitHubAppConfig(
+        app_id="1",
+        slug="sama-test",
+        client_id="Iv1.test",
+        private_key=SecretStr(
+            "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----\n"
+        ),
+        client_secret=SecretStr("client-secret"),
+    )
+    plane = fake_plane(engine, github=app)
+    assert plane.tools.github is not None
+    async with running(plane) as client:
+        refs = await client.get("/git/acme/demo.git/info/refs?service=git-upload-pack")
+        assert refs.status_code == 401, "the proxy needs a run token"
+        setup = await client.get("/github/setup")
+        assert setup.status_code == 400, "the setup page needs the installation and the state"
+
+
+async def test_without_the_github_app_there_is_no_git_proxy(engine: AsyncEngine) -> None:
+    plane = fake_plane(engine)
+    assert plane.tools.github is None
+    async with running(plane) as client:
+        refs = await client.get("/git/acme/demo.git/info/refs?service=git-upload-pack")
+        assert refs.status_code == 404
+        assert (await client.get("/github/setup?installation_id=1")).status_code == 409

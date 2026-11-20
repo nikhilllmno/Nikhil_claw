@@ -41,6 +41,9 @@ from sama.db.engine import create_engine
 from sama.delegation import DelegationService
 from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
+from sama.github.client import GitHubClient
+from sama.github.proxy import GitHubUpstream, GitProxy
+from sama.github.service import GitHubService
 from sama.integrations.hub import TelegramHub
 from sama.integrations.service import Integrations
 from sama.integrations.slack_hub import SlackHub
@@ -71,6 +74,7 @@ from sama.tasks.runs import TaskTools
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
 from sama.tools.deferred import DeferredCatalog
+from sama.tools.github import GitHubTools
 from sama.tools.output import SandboxSpill
 from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
@@ -225,6 +229,18 @@ def build(
         if keys.available(SecretName.OPENAI_API_KEY)
         else None
     )
+    # The sama GitHub App (Section 15.1). The git proxy holds the installation tokens: a
+    # sandbox clones and pushes through ``<public_url>/git`` with its run token.
+    github: GitHubService | None = None
+    github_tools: GitHubTools | None = None
+    upstream: GitHubUpstream | None = None
+    if settings.github is not None:
+        github_client = GitHubClient(settings.github)
+        github = GitHubService(
+            engine, github_client, state_key=settings.run_token_key.get_secret_value().encode()
+        )
+        github_tools = GitHubTools(github)
+        upstream = GitHubUpstream(github_client, web_url=settings.github.web_url)
     usage = PostgresUsageStore(engine)
     # One ledger for every spender of model money: a record that fails to write fences them all.
     ledger = UsageLedger(usage)
@@ -239,7 +255,16 @@ def build(
         ),
         clarify=broker,
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
-        repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
+        repos=(
+            RepoCloner(
+                sandboxed.session_sandbox,
+                proxy=settings.git_url if github_tools is not None else None,
+                access=github_tools,
+            )
+            if sandboxed
+            else None
+        ),
+        github=github_tools,
         memory=MemoryService(memory_store, proposals),
         skills=skill_store,
         souls=SoulProposer(engine, proposals),
@@ -322,6 +347,7 @@ def build(
         integrations=integrations,
         skills=library,
         reviews=reviews,
+        github=github,
         connections=connections,
     )
     api_app = api.app()
@@ -348,6 +374,9 @@ def build(
             stack.push_async_callback(connections.aclose)
             if hub is not None:
                 stack.push_async_callback(hub.aclose)
+            if upstream is not None and github is not None:
+                stack.push_async_callback(github.client.aclose)
+                stack.push_async_callback(upstream.aclose)
             if slack is not None:
                 stack.push_async_callback(slack.aclose)
             loops = _monitor(settings, engine, stack)
@@ -375,16 +404,16 @@ def build(
                     "traces": settings.langfuse is not None,
                     "alerts": settings.slack_webhook_url is not None,
                     "vault": vault is not None,
+                    "github": github is not None,
                 },
             )
             yield
 
+    routes = [Mount("/tools", app=tools_app), Mount("/model", app=proxy_app)]
+    if github is not None and upstream is not None:
+        routes.append(Mount("/git", app=GitProxy(signer, github, upstream).app()))
     app = Starlette(
-        routes=[
-            Mount("/tools", app=tools_app),
-            Mount("/model", app=proxy_app),
-            Mount("", app=api_app),
-        ],
+        routes=[*routes, Mount("", app=api_app)],
         lifespan=lifespan,
     )
     plane = ControlPlane(
