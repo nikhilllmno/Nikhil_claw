@@ -19,6 +19,7 @@ from sama.gate.service import stored_arguments
 from sama.memory.core import Operation, Target
 from sama.memory.service import describe_operations
 from sama.review.policy import PROPOSAL_SUMMARY_MAX_CHARS
+from sama.review.proposals import proposal_reason
 from sama.vault.redact import default_redactor, redact
 
 
@@ -34,9 +35,15 @@ class ShownProposal:
     """The arguments of the approval, made from the redacted payload."""
 
 
-def shown_proposal(kind: str, scope: str, payload: Mapping[str, Any]) -> ShownProposal:
+def shown_proposal(
+    kind: str, scope: str, payload: Mapping[str, Any], origin: str = "review"
+) -> ShownProposal:
     clean: dict[str, Any] = default_redactor().json(dict(payload))
-    if kind == "memory":
+    if kind == "soul":
+        line = f"set the soul of the agent profile {clean.get('profile_name') or ''}".rstrip()
+        if clean.get("summary"):
+            line += f": {clean['summary']}"
+    elif kind == "memory":
         line = describe_operations(
             Target(clean["target"]), [Operation.model_validate(o) for o in clean["operations"]]
         )
@@ -48,6 +55,6 @@ def shown_proposal(kind: str, scope: str, payload: Mapping[str, Any]) -> ShownPr
     return ShownProposal(
         payload=clean,
         summary=summary,
-        reason=f"the background review proposes a change of {scope} {kind}: {summary}",
+        reason=proposal_reason(origin, kind, scope, summary),
         arguments=stored_arguments(clean),
     )

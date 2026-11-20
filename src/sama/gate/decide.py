@@ -38,6 +38,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "media": frozenset({"vision_analyze"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
+    "self": frozenset({"change_propose"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
@@ -72,6 +73,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "skills_list",
         "skill_view",
         "skill_manage",
+        "change_propose",
         "session_search",
         "session_read",
         "vision_analyze",
@@ -84,7 +86,8 @@ DEFAULT_ALLOW: Final = frozenset(
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
 rule, they are allowed. Every other tool gets ``ask``. ``skill_manage`` is here because the
 skill store checks the role of the user for the scope of each write (Section 9.2), and every
-write is a version that can be reverted."""
+write is a version that can be reverted. ``change_propose`` is here because it only stores a
+proposal: a person with the role decides it on an approval card (M3.2)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""

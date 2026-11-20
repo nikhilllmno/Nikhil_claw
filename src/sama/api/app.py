@@ -22,6 +22,7 @@ from collections import Counter
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from importlib import resources
 from typing import Annotated, Any, Final, Literal, Self
 
@@ -42,6 +43,7 @@ from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.types import ASGIApp, Lifespan
 
+from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.origins import check_origins
 from sama.context import (
@@ -107,6 +109,8 @@ from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
+from sama.workerbots import MAX_DAILY_BUDGET_USD
+from sama.workerbots import NAME_MAX_CHARS as BOT_NAME_MAX_CHARS
 
 log = logging.getLogger("sama.api")
 
@@ -228,6 +232,42 @@ class MemoryRevert(_Body):
     reason: str | None = Field(default=None, max_length=MAX_MEMORY_REASON_CHARS)
 
 
+_BotName = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=BOT_NAME_MAX_CHARS)
+]
+_BotChannel = Annotated[str, StringConstraints(pattern=r"^[CG][A-Z0-9]{2,31}$")]
+_BotBudget = Annotated[Decimal, Field(gt=0, le=MAX_DAILY_BUDGET_USD, decimal_places=4)]
+
+
+class NewWorkerBot(_Body):
+    """A worker bot (Section 11.6): an agent profile on one Slack channel of the org's Slack
+    app, with a daily budget in USD."""
+
+    name: _BotName
+    agent_profile_id: uuid.UUID
+    channel_id: _BotChannel
+    daily_budget_usd: _BotBudget
+
+
+class WorkerBotEdit(_Body):
+    """The fields to change. Every field is optional, and a body has at least one."""
+
+    name: _BotName | None = None
+    agent_profile_id: uuid.UUID | None = None
+    channel_id: _BotChannel | None = None
+    daily_budget_usd: _BotBudget | None = None
+    status: Literal["active", "disabled"] | None = None
+
+    @model_validator(mode="after")
+    def _has_a_field(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field to change")
+        for name in sorted(self.model_fields_set):
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
+
+
 class ProfileEdit(_Body):
     """The fields to change. Every field is optional, and a body has at least one."""
 
@@ -339,6 +379,7 @@ class SessionAccess:
 
 
 _ADMIN_ONLY: Final = "only an org owner or admin can do this"
+_BOT_ADMIN_ONLY: Final = "only a workspace admin or an org owner or admin can do this"
 
 
 class _CorsApp(FastAPI):
@@ -802,6 +843,61 @@ class SamaApi:
             await self._unlink(principal, channel, identity_id)
             return Response(status_code=204)
 
+        @app.get("/workspaces/{workspace_id}/worker-bots")
+        async def worker_bots(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
+            org_id, _ = await self._workspace_grants(principal, workspace_id)
+            return await workerbots.list_bots(self._engine, org_id, workspace_id)
+
+        @app.post("/workspaces/{workspace_id}/worker-bots", status_code=201)
+        async def new_worker_bot(
+            principal: Me, workspace_id: uuid.UUID, body: NewWorkerBot
+        ) -> dict[str, Any]:
+            org_id, grants = await self._bot_admin(principal, workspace_id)
+            fields = workerbots.BotFields(
+                name=body.name,
+                agent_profile_id=body.agent_profile_id,
+                channel_id=body.channel_id,
+                daily_budget_usd=body.daily_budget_usd,
+            )
+            try:
+                return await workerbots.create_bot(
+                    self._engine, org_id, workspace_id, grants.user_id, fields
+                )
+            except workerbots.WorkerBotError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+
+        @app.patch("/workspaces/{workspace_id}/worker-bots/{bot_id}")
+        async def edit_worker_bot(
+            principal: Me, workspace_id: uuid.UUID, bot_id: uuid.UUID, body: WorkerBotEdit
+        ) -> dict[str, Any]:
+            org_id, grants = await self._bot_admin(principal, workspace_id)
+            fields = workerbots.BotFields(
+                name=body.name,
+                agent_profile_id=body.agent_profile_id,
+                channel_id=body.channel_id,
+                daily_budget_usd=body.daily_budget_usd,
+                status=body.status,
+            )
+            try:
+                return await workerbots.update_bot(
+                    self._engine, org_id, workspace_id, bot_id, grants.user_id, fields
+                )
+            except workerbots.WorkerBotError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+
+        @app.delete("/workspaces/{workspace_id}/worker-bots/{bot_id}", status_code=204)
+        async def delete_worker_bot(
+            principal: Me, workspace_id: uuid.UUID, bot_id: uuid.UUID
+        ) -> Response:
+            org_id, grants = await self._bot_admin(principal, workspace_id)
+            try:
+                await workerbots.delete_bot(
+                    self._engine, org_id, workspace_id, bot_id, grants.user_id
+                )
+            except workerbots.WorkerBotError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return Response(status_code=204)
+
         @app.get("/workspaces/{workspace_id}/memory")
         async def memory_notes(
             principal: Me, workspace_id: uuid.UUID, agent_profile_id: uuid.UUID | None = None
@@ -1105,6 +1201,7 @@ class SamaApi:
                     ReviewProposal.kind.label("proposal_kind"),
                     ReviewProposal.scope.label("proposal_scope"),
                     ReviewProposal.payload.label("proposal_payload"),
+                    ReviewProposal.origin.label("proposal_origin"),
                 )
                 .outerjoin(
                     ReviewProposal,
@@ -1126,9 +1223,11 @@ class SamaApi:
     def _approval_entry(row: Any) -> dict[str, Any]:
         arguments, reason = row.arguments, row.reason
         if row.proposal_payload is not None:
-            # A proposal of a background review. The stored text is not shown: the redactor
-            # may know more secrets now (Section 9.4).
-            shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
+            # A proposal of a background review or a chat run. The stored text is not shown:
+            # the redactor may know more secrets now (Section 9.4).
+            shown = shown_proposal(
+                row.proposal_kind, row.proposal_scope, row.proposal_payload, row.proposal_origin
+            )
             arguments, reason = shown.arguments, shown.reason
         return {
             "id": str(row.id),
@@ -1452,6 +1551,37 @@ class SamaApi:
         if grants is None or not grants.org_member:
             raise _not_found("the org does not exist")
         return grants
+
+    async def _workspace_grants(
+        self, principal: Principal, workspace_id: uuid.UUID
+    ) -> tuple[uuid.UUID, Grants]:
+        """The org and the grants of the user. Raises ``404`` if the user cannot see the
+        workspace."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            org_id = (
+                await connection.execute(
+                    select(Workspace.org_id).where(Workspace.id == workspace_id)
+                )
+            ).scalar_one_or_none()
+            user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+            grants = (
+                None
+                if org_id is None or user_id is None
+                else await load_grants(connection, org_id, user_id)
+            )
+        if org_id is None or grants is None or not grants.sees_workspace(workspace_id):
+            raise _not_found("the workspace does not exist")
+        return org_id, grants
+
+    async def _bot_admin(
+        self, principal: Principal, workspace_id: uuid.UUID
+    ) -> tuple[uuid.UUID, Grants]:
+        """Like ``_workspace_grants``, and ``403`` for a user who is not a workspace admin, an
+        org admin, or the org owner."""
+        org_id, grants = await self._workspace_grants(principal, workspace_id)
+        if not workerbots.may_manage(grants, workspace_id):
+            raise HTTPException(status_code=403, detail=_BOT_ADMIN_ONLY)
+        return org_id, grants
 
     async def _org_admin(self, principal: Principal, org_id: uuid.UUID) -> Grants:
         """Raises ``404`` for a user who is not a member and ``403`` for a member who is not an
@@ -1793,6 +1923,7 @@ class SamaApi:
                     ReviewProposal.kind,
                     ReviewProposal.scope,
                     ReviewProposal.payload,
+                    ReviewProposal.origin,
                     Approval.id.label("approval_id"),
                     Approval.created_at,
                     Approval.expires_at,
@@ -1822,7 +1953,7 @@ class SamaApi:
             # The stored text is not shown. The redactor of the process may know more secrets
             # now, so the view is made again from the payload (Section 9.4).
             views = [
-                (row, shown_proposal(row.kind, row.scope, row.payload))
+                (row, shown_proposal(row.kind, row.scope, row.payload, row.origin))
                 for row in rows
                 if (
                     grants.org_owner

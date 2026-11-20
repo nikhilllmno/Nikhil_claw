@@ -41,6 +41,8 @@ from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBindin
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
+    ALWAYS_LABEL,
+    ALWAYS_OUTCOME,
     COMPACTING,
     PIN_COMMANDS,
     Bound,
@@ -73,9 +75,11 @@ from sama.media.images import (
     with_markers,
 )
 from sama.orchestrator.queue import QueueError, RunQueue
+from sama.review.apply import ReviewApplier
 from sama.skills import commands
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
+from sama.workerbots import BUDGET_WHISPER, bot_limit, channel_bot
 
 log: Final = logging.getLogger("sama.gateway.slack")
 
@@ -107,7 +111,7 @@ HELP: Final = (
     "/sama help - show this help"
 )
 
-_ACTION: Final = re.compile(r"ap:([0-9a-f]{32}):([yn])")
+_ACTION: Final = re.compile(r"ap:([0-9a-f]{32}):([yna])")
 _SLACK_ID: Final = re.compile(r"[A-Z0-9]{2,32}")
 
 
@@ -230,29 +234,38 @@ class _Outbox:
 
 
 def approval_blocks(row: Any) -> tuple[str, list[dict[str, Any]]]:
-    """The fallback text and the Block Kit blocks of an approval card."""
+    """The fallback text and the Block Kit blocks of an approval card. A tool call also gets
+    "Always allow for me", which writes a user policy rule (M3.2). A proposal does not: a rule
+    cannot approve a proposal."""
     text = approval_text(row)[:MAX_CARD_CHARS]
+    buttons: list[dict[str, Any]] = [
+        {
+            "type": "button",
+            "action_id": "sama_approve",
+            "style": "primary",
+            "text": {"type": "plain_text", "text": "Approve"},
+            "value": f"ap:{row.id.hex}:y",
+        },
+        {
+            "type": "button",
+            "action_id": "sama_deny",
+            "style": "danger",
+            "text": {"type": "plain_text", "text": "Deny"},
+            "value": f"ap:{row.id.hex}:n",
+        },
+    ]
+    if not getattr(row, "proposal", False):
+        buttons.append(
+            {
+                "type": "button",
+                "action_id": "sama_always",
+                "text": {"type": "plain_text", "text": ALWAYS_LABEL},
+                "value": f"ap:{row.id.hex}:a",
+            }
+        )
     blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "plain_text", "text": text, "emoji": False}},
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "action_id": "sama_approve",
-                    "style": "primary",
-                    "text": {"type": "plain_text", "text": "Approve"},
-                    "value": f"ap:{row.id.hex}:y",
-                },
-                {
-                    "type": "button",
-                    "action_id": "sama_deny",
-                    "style": "danger",
-                    "text": {"type": "plain_text", "text": "Deny"},
-                    "value": f"ap:{row.id.hex}:n",
-                },
-            ],
-        },
+        {"type": "actions", "elements": buttons},
     ]
     return text, blocks
 
@@ -303,6 +316,7 @@ class SlackGateway:
         queue: RunQueue | None = None,
         gate: GateService | None = None,
         skills: SkillLibrary | None = None,
+        reviews: ReviewApplier | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
         seen: SeenEvents | None = None,
@@ -317,6 +331,7 @@ class SlackGateway:
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
         self._skills = skills
+        self._reviews = reviews
         self._pins = pins or PinStore(engine)
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
@@ -453,6 +468,12 @@ class SlackGateway:
             log.warning("too many runs to follow; channel=%s must try again", place.channel)
             await self._say(place, BUSY)
             return
+        if target.worker_bot_id is not None:
+            async with self._engine.connect() as connection:
+                limit = await bot_limit(connection, target.org_id, target.worker_bot_id, None)
+            if limit.problem is not None:
+                await self._whisper(place, BUDGET_WHISPER)
+                return
         if text.startswith("/"):
             text = await self._expand(place, target, grants, text) or text
         images = await self._download_images(place, refs)
@@ -569,7 +590,20 @@ class SlackGateway:
             ).one_or_none()
 
     async def _group_target(self, channel: str, identity: Any) -> Target | None:
+        """The shared target of a channel: its worker bot (M3.10), else its group link."""
         async with self._engine.connect() as connection:
+            bot = await channel_bot(connection, self._app.integration_id, channel)
+            if bot is not None:
+                if bot.org_id != identity.org_id:
+                    return None
+                return Target(
+                    bot.org_id,
+                    identity.user_id,
+                    bot.workspace_id,
+                    bot.agent_profile_id,
+                    "shared",
+                    worker_bot_id=bot.id,
+                )
             row = (
                 await connection.execute(
                     select(ChannelGroup).where(
@@ -814,6 +848,9 @@ class SlackGateway:
                 return False
             grants = await load_grants(connection, target.org_id, target.user_id)
             return grants.sees_workspace(target.workspace_id)
+        if target.worker_bot_id is not None:
+            bot = await channel_bot(connection, self._app.integration_id, place.channel)
+            return bot is not None and bot.id == target.worker_bot_id
         linked = await connection.scalar(
             select(ChannelGroup.id).where(
                 ChannelGroup.integration_id == self._app.integration_id,
@@ -884,18 +921,23 @@ class SlackGateway:
                 org_id=identity.org_id,
                 user_id=identity.user_id,
                 approval_id=uuid.UUID(match.group(1)),
-                approve=match.group(2) == "y",
+                approve=match.group(2) in "ya",
+                always_allow=match.group(2) == "a",
+                reviews=self._reviews,
             )
         except ApprovalError as error:
             await self._whisper(place, str(error))
             return
+        outcome = decided.outcome
+        if match.group(2) == "a" and outcome == "Approved":
+            outcome = ALWAYS_OUTCOME
         card = _card_text(message) or f"Approval needed: {decided.tool_name}"
         ts = message.get("ts")
         if not ts:
             return
         try:
             await self._client.update_message(
-                channel, str(ts), f"{escape(card)}\n\n{decided.outcome} by <@{sender}>."
+                channel, str(ts), f"{escape(card)}\n\n{outcome} by <@{sender}>."
             )
         except SlackError as error:
             log.warning("an approval card update failed error=%s", error)
