@@ -258,7 +258,7 @@ class _Outbox:
 def _approval_card(row: Any) -> tuple[str, list[list[dict[str, str]]]]:
     """The text and the buttons of an approval card. A tool call also gets "Always allow for
     me", which writes a user policy rule (M3.2). A proposal does not: a rule cannot approve
-    a proposal, and a tool in ``ALWAYS_ASK`` does not."""
+    a proposal, and a tool that ``always_asks`` does not."""
     text = approval_text(row)
     buttons = [
         [
