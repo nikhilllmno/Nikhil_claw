@@ -3,18 +3,22 @@ Section 9.4)."""
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import SamaApi
 from sama.db.models import Message, Run
+from sama.gateway.sessions import approval_text, read_run
 from sama.memory import PostgresMemoryStore, Target
 from sama.review.apply import ReviewApplier
 from sama.runtime.contract import RunCompleted, RunRequest, TextDelta, Usage
 from sama.runtime.fake import FakeScript
 from sama.skills import ManageRequest
+from sama.vault.redact import default_redactor
 from tests.api.conftest import bearer
 from tests.api.test_app import sse
 from tests.orchestrator.conftest import Tenant
@@ -235,3 +239,62 @@ async def test_an_org_proposal_is_for_the_org_owner_only(
     approved = await client.post(f"/approvals/{proposal['approval_id']}/approve", headers=owner)
     assert approved.status_code == 200
     assert (await review.proposal_rows())[0].status == "applied"
+
+
+async def test_a_secret_that_the_redactor_learns_later_is_not_shown_again(
+    api: SamaApi, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    # No pattern matches this value, so it is stored as it is. Later the vault stores it.
+    secret = "plainvalue-" + "k7Qz" * 12
+    review = await start_review(engine, tenant, "mine")
+    await review.memory.write(
+        review.claims, Target.WORKSPACE, [add(f"the staging key is {secret} for deploys")], "why"
+    )
+    await review.skills.manage(
+        review.claims,
+        ManageRequest(
+            action="create",
+            name="deploy",
+            scope="workspace",
+            summary=f"uses {secret}",
+            content=md("deploy", body=f"Use the key {secret}."),
+        ),
+    )
+    url = f"/workspaces/{tenant.ids['ws']}/review-proposals"
+    admin = bearer(tenant.ids["admin_auth"])
+    owner = bearer(tenant.ids["mia_auth"])
+    stored = [a.reason + json.dumps(a.arguments) for a in await review.approvals()]
+    assert all(secret[:12] in text for text in stored), "the stored text has the value"
+    default_redactor().add(secret)
+    try:
+        listed = (await client.get(url, headers=admin)).json()
+        assert len(listed) == 2
+        text = json.dumps(listed)
+        assert secret[:12] not in text
+        assert secret[-12:] not in text
+        assert all("REDACTED" in item["summary"] for item in listed)
+        assert all(item["summary"].startswith("the background review") for item in listed)
+        # The owner of the session reads the open approvals of the session.
+        seen = (await client.get(f"/sessions/{tenant.ids['mine']}/approvals", headers=owner)).json()
+        assert len(seen) == 2
+        assert secret[:12] not in json.dumps(seen)
+        assert all("REDACTED" in item["reason"] for item in seen)
+        # The card of a chat gateway is made from the same view.
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(Run)
+                .where(Run.id == review.run.run_id)
+                .values(
+                    status="paused",
+                    pending_approval_id="review:x",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            )
+        read = await read_run(engine, tenant.org, review.run.run_id, 0)
+        assert len(read.pending) == 2
+        cards = "\n".join(approval_text(row) for row in read.pending)
+        assert secret[:12] not in cards
+        assert "REDACTED" in cards
+    finally:
+        default_redactor().forget(secret)

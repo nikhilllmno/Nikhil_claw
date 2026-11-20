@@ -153,6 +153,9 @@ def downgrade() -> None:
         " finished_at = COALESCE(finished_at, now())"
         " WHERE kind = 'review' AND status IN ('queued', 'running', 'paused')"
     )
+    # The old queue resumes a session from the newest completed run that has a runtime state,
+    # and it cannot tell a review run from a chat run. So no review run keeps a state.
+    op.execute("UPDATE public.runs SET runtime_state = NULL WHERE kind = 'review'")
     op.drop_constraint(op.f("uq_approvals_org_id_id"), "approvals", type_="unique")
     op.drop_index("ix_runs_one_queued_review_per_session", table_name="runs")
     op.drop_constraint(op.f("ck_runs_review_unattended"), "runs", type_="check")

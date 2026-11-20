@@ -72,6 +72,7 @@ from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.review.apply import ReviewApplier
+from sama.review.shown import shown_proposal
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -813,6 +814,16 @@ class SamaApi:
                     Approval.reason,
                     Approval.created_at,
                     Approval.expires_at,
+                    ReviewProposal.kind.label("proposal_kind"),
+                    ReviewProposal.scope.label("proposal_scope"),
+                    ReviewProposal.payload.label("proposal_payload"),
+                )
+                .outerjoin(
+                    ReviewProposal,
+                    and_(
+                        ReviewProposal.org_id == Approval.org_id,
+                        ReviewProposal.approval_id == Approval.id,
+                    ),
                 )
                 .where(
                     Approval.org_id == access.org_id,
@@ -821,19 +832,26 @@ class SamaApi:
                 )
                 .order_by(Approval.created_at, Approval.id)
             )
-            return [
-                {
-                    "id": str(row.id),
-                    "run_id": str(row.run_id),
-                    "call_id": row.call_id,
-                    "tool_name": row.tool_name,
-                    "arguments": row.arguments,
-                    "reason": row.reason,
-                    "created_at": row.created_at.isoformat(),
-                    "expires_at": row.expires_at.isoformat(),
-                }
-                for row in rows
-            ]
+            return [self._approval_entry(row) for row in rows]
+
+    @staticmethod
+    def _approval_entry(row: Any) -> dict[str, Any]:
+        arguments, reason = row.arguments, row.reason
+        if row.proposal_payload is not None:
+            # A proposal of a background review. The stored text is not shown: the redactor
+            # may know more secrets now (Section 9.4).
+            shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
+            arguments, reason = shown.arguments, shown.reason
+        return {
+            "id": str(row.id),
+            "run_id": str(row.run_id),
+            "call_id": row.call_id,
+            "tool_name": row.tool_name,
+            "arguments": arguments,
+            "reason": reason,
+            "created_at": row.created_at.isoformat(),
+            "expires_at": row.expires_at.isoformat(),
+        }
 
     async def _questions(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
         async with as_user(self._engine, principal.auth_user_id) as connection:
@@ -1422,7 +1440,6 @@ class SamaApi:
                     ReviewProposal.scope,
                     ReviewProposal.payload,
                     Approval.id.label("approval_id"),
-                    Approval.reason,
                     Approval.created_at,
                     Approval.expires_at,
                 )
@@ -1448,23 +1465,29 @@ class SamaApi:
                 )
                 .order_by(Approval.created_at, Approval.id)
             )
-            return [
-                {
-                    "id": str(row.id),
-                    "approval_id": str(row.approval_id),
-                    "kind": row.kind,
-                    "scope": row.scope,
-                    "summary": row.reason,
-                    "proposal": row.payload,
-                    "created_at": row.created_at.isoformat(),
-                    "expires_at": row.expires_at.isoformat(),
-                }
+            # The stored text is not shown. The redactor of the process may know more secrets
+            # now, so the view is made again from the payload (Section 9.4).
+            views = [
+                (row, shown_proposal(row.kind, row.scope, row.payload))
                 for row in rows
                 if (
                     grants.org_owner
                     if row.scope == "org"
                     else grants.admins_workspace(workspace_id)
                 )
+            ]
+            return [
+                {
+                    "id": str(row.id),
+                    "approval_id": str(row.approval_id),
+                    "kind": row.kind,
+                    "scope": row.scope,
+                    "summary": shown.reason,
+                    "proposal": shown.payload,
+                    "created_at": row.created_at.isoformat(),
+                    "expires_at": row.expires_at.isoformat(),
+                }
+                for row, shown in views
             ]
 
     async def _decide(

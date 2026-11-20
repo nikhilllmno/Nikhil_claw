@@ -52,7 +52,7 @@ def scope_of(
             return MemoryScope(org_id, target, workspace_id)
 
 
-def _describe(target: Target, operations: Sequence[Operation]) -> str:
+def describe_operations(target: Target, operations: Sequence[Operation]) -> str:
     """One line for the person who decides. Each text is redacted in full before it is cut,
     so a secret is never cut in the middle and shown in part. The text is not escaped
     (``repr``), because an escape would change a secret and hide it from the redaction."""
@@ -151,7 +151,7 @@ class MemoryService:
                     "operations": [step.model_dump(mode="json") for step in operations],
                     "reason": reason,
                 },
-                summary=_describe(target, operations),
+                summary=describe_operations(target, operations),
             )
         )
         return (

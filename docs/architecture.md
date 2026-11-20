@@ -1241,7 +1241,13 @@ proposal, and the times; no session, run, or message) and decides with
 `POST /approvals/{id}/approve` or `/deny`. `GateService.decide_approval` checks the role for a
 proposal, and the session visibility only for a normal approval. A plain member, also the owner
 of the session, cannot decide. A person who does not see the workspace gets `404`. This is done
-in the API and in the gate. It is not done with RLS on `approvals` and `review_proposals`,
+in the API and in the gate. The redactor can learn a secret after the proposal was stored (the
+vault stores a credential later). So each place that shows a proposal builds the view again from
+the stored payload, with the redactor of that moment: `GET /workspaces/{id}/review-proposals`,
+`GET /sessions/{id}/approvals`, and the approval cards of Telegram and Slack
+(`src/sama/review/shown.py`). The payload is redacted in full, and the summary is made from the
+redacted payload and cut after that. The stored `approvals.reason` and `approvals.arguments` of
+a proposal are never returned. It is not done with RLS on `approvals` and `review_proposals`,
 because the control plane is their only reader, and a policy for it would break the rule that
 every row of a session follows the access to the session.
 
@@ -1284,7 +1290,9 @@ name) is written. The review must propose again.
 - The downgrade of migration `0016` does not delete a review run, because the model calls of a
   run go with the run, and the budgets of the org and the user add up these calls. It cancels the
   review runs that are queued, running, or paused, deletes the pending approvals of the proposals,
-  and drops `review_proposals`. A completed or failed review run stays as an ended chat run
+  and drops `review_proposals`. It also sets `runtime_state` of every review run to `NULL`,
+  because the old queue resumes a session from the newest completed run with a state and cannot
+  tell a review from a chat run. A completed or failed review run stays as an ended chat run
   without a message.
 - An admin decides a proposal without access to the private session of its author, and sees only
   the redacted proposal.

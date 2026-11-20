@@ -91,12 +91,12 @@ async def _add_reviews(url: str) -> None:
             run_id = await connection.fetchval(
                 "INSERT INTO runs (org_id, session_id, agent_profile_id, runtime, unattended, kind,"
                 " review_from_seq, review_to_seq, status, lease_owner, lease_expires_at,"
-                " pending_approval_id, finished_at)"
+                " pending_approval_id, finished_at, runtime_state)"
                 " VALUES ($1, $2, $3, 'fake', true, 'review', 0, 1, $4,"
                 " CASE WHEN $4 = 'running' THEN 'w-1' END,"
                 " CASE WHEN $4 = 'running' THEN now() + interval '1 hour' END,"
                 " CASE WHEN $4 = 'paused' THEN 'review:1' END,"
-                " CASE WHEN $4 = 'completed' THEN now() END) RETURNING id",
+                " CASE WHEN $4 = 'completed' THEN now() END, 'review-state') RETURNING id",
                 session["org_id"],
                 session["id"],
                 session["agent_profile_id"],
@@ -298,3 +298,57 @@ def test_the_downgrade_keeps_the_spend_and_stops_the_waiting_reviews() -> None:
         command.upgrade(config, "0016")
         assert asyncio.run(_spend(url)) == before
         assert asyncio.run(_kinds(url)) == ["chat"]
+
+
+async def _add_chat_state(url: str) -> None:
+    """An older completed chat run with a runtime state, in the session of the completed
+    review (the fourth session). The review is newer."""
+    connection = await asyncpg.connect(url)
+    try:
+        row = await connection.fetchrow(
+            "SELECT org_id, id, agent_profile_id FROM sessions ORDER BY id OFFSET 3 LIMIT 1"
+        )
+        assert row is not None
+        await connection.execute(
+            "INSERT INTO runs (org_id, session_id, agent_profile_id, runtime, status,"
+            " runtime_state, finished_at) VALUES ($1, $2, $3, 'fake', 'completed', 'chat-state',"
+            " now() - interval '1 hour')",
+            row["org_id"],
+            row["id"],
+            row["agent_profile_id"],
+        )
+    finally:
+        await connection.close()
+
+
+async def _legacy_continuation(url: str) -> str | None:
+    """The query of the queue of migration 0015: the newest completed run of the session
+    that has a runtime state. It has no run kind."""
+    connection = await asyncpg.connect(url)
+    try:
+        value = await connection.fetchval(
+            "SELECT runtime_state FROM runs WHERE session_id ="
+            " (SELECT id FROM sessions ORDER BY id OFFSET 3 LIMIT 1)"
+            " AND runtime = 'fake' AND status = 'completed' AND runtime_state IS NOT NULL"
+            " ORDER BY finished_at DESC LIMIT 1"
+        )
+    finally:
+        await connection.close()
+    return None if value is None else str(value)
+
+
+def test_the_downgrade_leaves_no_runtime_state_on_a_review_run() -> None:
+    with migrated_database() as url:
+        asyncio.run(seed(url))
+        asyncio.run(_add_chat_state(url))
+        asyncio.run(_add_reviews(url))
+        before = asyncio.run(_spend(url))
+        # With the kind, the queue skips the review. Without it, the newest state would win.
+        assert asyncio.run(_legacy_continuation(url)) == "review-state"
+        config = alembic_config(url)
+        command.downgrade(config, "0015")
+        assert asyncio.run(_legacy_continuation(url)) == "chat-state"
+        assert asyncio.run(_spend(url)) == before, "the runs and the spend stay"
+        command.upgrade(config, "0016")
+        assert asyncio.run(_legacy_continuation(url)) == "chat-state"
+        assert asyncio.run(_spend(url)) == before

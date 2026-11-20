@@ -26,6 +26,7 @@ from sama.db.models import (
     Approval,
     AuditEntry,
     Message,
+    ReviewProposal,
     Run,
     RunEvent,
     Session,
@@ -33,6 +34,7 @@ from sama.db.models import (
 )
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.orchestrator.queue import RunQueue
+from sama.review.shown import shown_proposal
 from sama.tenancy.access import Grants, load_grants
 
 EVENTS_PER_READ: Final = 500
@@ -298,8 +300,20 @@ async def read_run(
             else (
                 await connection.execute(
                     select(
-                        Approval.id, Approval.tool_name, Approval.reason, Approval.arguments
-                    ).where(
+                        Approval.id,
+                        Approval.tool_name,
+                        Approval.reason,
+                        Approval.arguments,
+                        ReviewProposal.kind.label("proposal_kind"),
+                        ReviewProposal.scope.label("proposal_scope"),
+                        ReviewProposal.payload.label("proposal_payload"),
+                    )
+                    .outerjoin(
+                        ReviewProposal,
+                        (ReviewProposal.org_id == Approval.org_id)
+                        & (ReviewProposal.approval_id == Approval.id),
+                    )
+                    .where(
                         Approval.org_id == org_id,
                         Approval.run_id == run_id,
                         Approval.status == "pending",
@@ -307,7 +321,8 @@ async def read_run(
                 )
             ).all()
         )
-    return RunRead(status, list(events), list(pending))
+        shown = [_shown_approval(row) for row in pending]
+    return RunRead(status, list(events), shown)
 
 
 async def final_text(engine: AsyncEngine, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
@@ -336,6 +351,26 @@ async def failure_message(engine: AsyncEngine, org_id: uuid.UUID, run_id: uuid.U
             )
         ).scalar_one_or_none()
     return f"The run failed: {message or 'unknown'}"
+
+
+@dataclass(frozen=True, slots=True)
+class ShownApproval:
+    """``id``, ``tool_name``, ``reason``, and ``arguments`` for an approval card."""
+
+    id: uuid.UUID
+    tool_name: str
+    reason: str
+    arguments: Any
+
+
+def _shown_approval(row: Any) -> ShownApproval:
+    """The card of a proposal of a background review is made again from the payload with the
+    redactor of now, and not from the stored text (Section 9.4)."""
+    reason, arguments = row.reason, row.arguments
+    if row.proposal_payload is not None:
+        shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
+        reason, arguments = shown.reason, shown.arguments
+    return ShownApproval(row.id, row.tool_name, reason, arguments)
 
 
 def approval_text(row: Any) -> str:
