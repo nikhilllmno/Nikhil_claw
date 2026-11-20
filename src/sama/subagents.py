@@ -12,7 +12,8 @@ frozen with the config. The rules:
   none.
 - A spec cannot have a secret or an instruction to the model that the injection scan finds.
 
-``set_profile_subagents`` is the only function that writes the column.
+Two code paths write the column, and both use ``lock_profile`` and ``validate_subagents``:
+``set_profile_subagents`` (the admin CLI) and ``sama.profiles.update_profile`` (the web app).
 """
 
 from __future__ import annotations
@@ -20,12 +21,12 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Iterable, Sequence
-from typing import Any, Final, Self
+from typing import Any, Final, NamedTuple, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 from sqlalchemy import func, insert, select, update
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AgentProfile, AuditEntry
 from sama.gate.decide import TOOLSETS, tools_of
@@ -140,6 +141,23 @@ def parse_subagents(raw: Any) -> tuple[SubagentSpec, ...]:
     return tuple(specs)
 
 
+def model_provider(runtime: RuntimeKind) -> Provider:
+    """The provider of the models of a runtime. The fake runtime uses the Anthropic table."""
+    return Provider.OPENAI if runtime is RuntimeKind.OPENAI_AGENTS_SDK else Provider.ANTHROPIC
+
+
+def known_models(runtime: RuntimeKind) -> list[str]:
+    """The models with a known price for the runtime, sorted. A profile can use only these."""
+    table = PriceTable.load()
+    prices = table.openai if model_provider(runtime) is Provider.OPENAI else table.anthropic
+    return sorted(prices.models)
+
+
+def model_is_known(runtime: RuntimeKind, model: str) -> bool:
+    """True if the price table has a price for the model (a dated id uses its base id)."""
+    return PriceTable.load().lookup(model_provider(runtime), model) is not None
+
+
 def supports_subagents(runtime: RuntimeKind) -> bool:
     """True if the runtime has the capability ``native_subagents``. A runtime that the
     sandboxed runtime does not know has no sub-agents."""
@@ -170,7 +188,6 @@ def problems(
     if TOOLSET not in profile:
         found.append(f"the profile needs the toolset {TOOLSET}")
     allowed = _allowed_toolsets(profile)
-    prices = PriceTable.load()
     for spec in specs:
         label = f"sub-agent {spec.name}"
         for name in spec.toolsets:
@@ -183,7 +200,7 @@ def problems(
         if (
             spec.model is not None
             and spec.model != INHERIT
-            and prices.lookup(Provider.ANTHROPIC, spec.model) is None
+            and not model_is_known(runtime, spec.model)
         ):
             found.append(f"{label}: the model has no price in the price table")
         for field, text in (("description", spec.description), ("prompt", spec.prompt)):
@@ -228,6 +245,81 @@ def resolve(
     )
 
 
+def validate_subagents(
+    specs: Sequence[SubagentSpec], *, toolsets: Iterable[str], runtime: RuntimeKind
+) -> None:
+    """Checks the specs for a profile with these toolsets and this runtime.
+
+    Raises ``SubagentError`` with a text that is safe to show to the caller.
+    """
+    names = [spec.name for spec in specs]
+    if len(set(names)) != len(names):
+        raise SubagentError("two sub-agents have the same name")
+    if len(specs) > MAX_SUBAGENTS:
+        raise SubagentError(f"a profile has at most {MAX_SUBAGENTS} sub-agents")
+    found = problems(specs, profile_toolsets=toolsets, runtime=runtime)
+    if found:
+        raise SubagentError("; ".join(found))
+
+
+def subagents_value(specs: Sequence[SubagentSpec]) -> list[dict[str, Any]]:
+    """The JSON value of the column for the specs."""
+    return [spec.model_dump(mode="json") for spec in specs]
+
+
+class LockedProfile(NamedTuple):
+    """The columns that a write to a profile needs. The row is locked until the end of the
+    transaction."""
+
+    name: str
+    soul: str
+    runtime: RuntimeKind
+    model: str
+    toolsets: list[str]
+    group_toolsets: list[str]
+    subagents: Any
+    workspace_id: uuid.UUID | None
+
+
+async def lock_profile(
+    connection: AsyncConnection, org_id: uuid.UUID, profile_id: uuid.UUID
+) -> LockedProfile:
+    """Reads a profile with ``SELECT ... FOR UPDATE``. Use it in a transaction.
+
+    Raises ``SubagentError`` when the profile does not exist in the org.
+    """
+    row = (
+        await connection.execute(
+            select(
+                AgentProfile.name,
+                AgentProfile.soul,
+                AgentProfile.runtime,
+                AgentProfile.model,
+                AgentProfile.toolsets,
+                AgentProfile.group_toolsets,
+                AgentProfile.subagents,
+                AgentProfile.workspace_id,
+            )
+            .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        raise SubagentError("the profile does not exist")
+    return LockedProfile(
+        name=row.name,
+        soul=row.soul,
+        runtime=RuntimeKind(row.runtime),
+        model=row.model,
+        toolsets=[str(t) for t in row.toolsets] if isinstance(row.toolsets, list) else [],
+        group_toolsets=(
+            [str(t) for t in row.group_toolsets] if isinstance(row.group_toolsets, list) else []
+        ),
+        subagents=row.subagents,
+        workspace_id=row.workspace_id,
+    )
+
+
 async def set_profile_subagents(
     engine: AsyncEngine,
     org_id: uuid.UUID,
@@ -242,38 +334,18 @@ async def set_profile_subagents(
     Raises ``SubagentError`` when the profile does not exist or a spec is not valid for it.
     """
     names = [spec.name for spec in specs]
-    if len(set(names)) != len(names):
-        raise SubagentError("two sub-agents have the same name")
-    if len(specs) > MAX_SUBAGENTS:
-        raise SubagentError(f"a profile has at most {MAX_SUBAGENTS} sub-agents")
     async with engine.begin() as connection:
-        row = (
-            await connection.execute(
-                select(AgentProfile.toolsets, AgentProfile.runtime, AgentProfile.workspace_id)
-                .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
-                .with_for_update()
-            )
-        ).one_or_none()
-        if row is None:
-            raise SubagentError("the profile does not exist")
-        found = problems(
-            specs,
-            profile_toolsets=row.toolsets if isinstance(row.toolsets, list) else [],
-            runtime=RuntimeKind(row.runtime),
-        )
-        if found:
-            raise SubagentError("; ".join(found))
+        profile = await lock_profile(connection, org_id, profile_id)
+        validate_subagents(specs, toolsets=profile.toolsets, runtime=profile.runtime)
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
-            .values(
-                subagents=[spec.model_dump(mode="json") for spec in specs], updated_at=func.now()
-            )
+            .values(subagents=subagents_value(specs), updated_at=func.now())
         )
         await connection.execute(
             insert(AuditEntry).values(
                 org_id=org_id,
-                workspace_id=row.workspace_id,
+                workspace_id=profile.workspace_id,
                 actor_kind="user" if actor_user_id else "system",
                 actor_user_id=actor_user_id,
                 action="profile.subagents_set",

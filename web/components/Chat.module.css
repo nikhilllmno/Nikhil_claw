@@ -1,0 +1,123 @@
+.chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: var(--border-width) solid var(--border);
+  background: var(--bg);
+}
+
+.headerText {
+  min-width: 0;
+}
+
+.title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xl);
+}
+
+.meta {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.stream {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-4);
+}
+
+.skeletons {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.user {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--space-1) var(--radius-lg);
+  background: var(--user-bubble);
+}
+
+.userText {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.assistant {
+  min-width: 0;
+}
+
+.note {
+  font-size: var(--text-sm);
+  color: var(--text-subtle);
+  overflow-wrap: anywhere;
+}
+
+.working {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.caret {
+  display: inline-block;
+  width: var(--space-2);
+  height: 1em;
+  margin-left: var(--space-1);
+  vertical-align: text-bottom;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.dock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: 0 var(--space-4);
+}
+
+.banner {
+  margin: 0;
+}
+
+@media (max-width: 52rem) {
+  .header {
+    padding: var(--space-2) var(--space-4);
+  }
+}

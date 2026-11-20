@@ -1,0 +1,123 @@
+// The draft of the agent settings form and its change to a PATCH body.
+
+import type { AgentProfile, AgentProfilePatch, Subagent } from "./api";
+
+export interface DraftSubagent {
+  /** A key for React. It is not sent. */
+  uid: number;
+  name: string;
+  description: string;
+  prompt: string;
+  toolsets: string[];
+  /** Empty: inherit the model of the agent. */
+  model: string;
+  /** Text of the field. Empty: the default. */
+  maxTurns: string;
+}
+
+export interface Draft {
+  name: string;
+  soul: string;
+  model: string;
+  toolsets: string[];
+  subagents: DraftSubagent[];
+}
+
+let nextUid = 1;
+
+export function newSubagent(): DraftSubagent {
+  return {
+    uid: nextUid++,
+    name: "",
+    description: "",
+    prompt: "",
+    toolsets: [],
+    model: "",
+    maxTurns: "",
+  };
+}
+
+export function toDraft(profile: AgentProfile): Draft {
+  return {
+    name: profile.name,
+    soul: profile.soul,
+    model: profile.model,
+    toolsets: [...profile.toolsets],
+    subagents: profile.subagents.map((s) => ({
+      uid: nextUid++,
+      name: s.name,
+      description: s.description,
+      prompt: s.prompt,
+      toolsets: [...s.toolsets],
+      model: s.model ?? "",
+      maxTurns: s.max_turns === null ? "" : String(s.max_turns),
+    })),
+  };
+}
+
+export function toSubagent(draft: DraftSubagent): Subagent {
+  const turns = draft.maxTurns.trim();
+  return {
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    prompt: draft.prompt,
+    toolsets: draft.toolsets,
+    model: draft.model === "" ? null : draft.model,
+    max_turns: turns === "" ? null : Number(turns),
+  };
+}
+
+const sameList = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
+
+/** The fields of `draft` that differ from the saved profile. An empty object: no change. */
+export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatch {
+  const patch: AgentProfilePatch = {};
+  if (draft.name.trim() !== profile.name) patch.name = draft.name.trim();
+  if (draft.soul !== profile.soul) patch.soul = draft.soul;
+  if (draft.model !== profile.model) patch.model = draft.model;
+  if (!sameList(draft.toolsets, profile.toolsets)) patch.toolsets = draft.toolsets;
+  const subagents = draft.subagents.map(toSubagent);
+  if (JSON.stringify(subagents) !== JSON.stringify(profile.subagents)) patch.subagents = subagents;
+  return patch;
+}
+
+/** The first problem that the browser can see before it sends the form, or `null`. */
+export function validateDraft(draft: Draft, limits: AgentProfile["options"]["limits"]): string | null {
+  if (draft.name.trim() === "") return "The agent needs a name.";
+  if (limits.name_max_chars !== undefined && draft.name.trim().length > limits.name_max_chars) {
+    return `The name has at most ${limits.name_max_chars} characters.`;
+  }
+  if (limits.soul_max_chars !== undefined && draft.soul.length > limits.soul_max_chars) {
+    return `The soul has at most ${limits.soul_max_chars.toLocaleString()} characters.`;
+  }
+  const pattern = limits.subagent_name_pattern ? safeRegExp(limits.subagent_name_pattern) : null;
+  const names = new Set<string>();
+  for (const [index, sub] of draft.subagents.entries()) {
+    const label = sub.name.trim() || `Sub-agent ${index + 1}`;
+    if (sub.name.trim() === "") return `${label} needs a name.`;
+    if (pattern && !pattern.test(sub.name.trim())) {
+      return `${label}: use lowercase letters, digits, and single hyphens, and start with a letter.`;
+    }
+    if (names.has(sub.name.trim())) return `Two sub-agents have the name ${sub.name.trim()}.`;
+    names.add(sub.name.trim());
+    if (sub.description.trim() === "") return `${label} needs a description.`;
+    if (sub.prompt.trim() === "") return `${label} needs a prompt.`;
+    const turns = sub.maxTurns.trim();
+    if (turns !== "") {
+      const n = Number(turns);
+      if (!Number.isInteger(n) || n < 1 || (limits.subagent_max_turns !== undefined && n > limits.subagent_max_turns)) {
+        return `${label}: max turns is a whole number from 1 to ${limits.subagent_max_turns ?? "the limit"}.`;
+      }
+    }
+  }
+  return null;
+}
+
+function safeRegExp(source: string): RegExp | null {
+  try {
+    return new RegExp(source);
+  } catch {
+    return null;
+  }
+}

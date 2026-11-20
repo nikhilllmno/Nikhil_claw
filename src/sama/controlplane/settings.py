@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
+from sama.api.origins import parse_origins
 from sama.media.vision import DEFAULT_VISION_MODEL
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
 from sama.vault.crypto import VaultKey
@@ -96,6 +97,8 @@ class ControlPlaneSettings:
     trace_content: bool = True
     worker_concurrency: int = 4
     vault_key: VaultKey | None = None
+    web_origins: tuple[str, ...] = ()
+    """The origins of the web app that may call the API from a browser (``SAMA_WEB_ORIGINS``)."""
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -156,6 +159,10 @@ class ControlPlaneSettings:
                 vault_key = VaultKey.from_text(env["SAMA_VAULT_KEY"])
             except ValueError:
                 raise SettingsError("SAMA_VAULT_KEY must be 32 bytes in base64") from None
+        try:
+            web_origins = parse_origins(env.get("SAMA_WEB_ORIGINS", ""))
+        except ValueError as error:
+            raise SettingsError(f"SAMA_WEB_ORIGINS: {error}") from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
             public_url=_public_url(_required(env, "SAMA_PUBLIC_URL")),
@@ -176,4 +183,5 @@ class ControlPlaneSettings:
             trace_content=env.get("SAMA_TRACE_CONTENT", "on").strip().lower() != "off",
             worker_concurrency=_count(env, "SAMA_WORKER_CONCURRENCY", 4),
             vault_key=vault_key,
+            web_origins=web_origins,
         )

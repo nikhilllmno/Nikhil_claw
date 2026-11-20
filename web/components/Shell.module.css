@@ -1,0 +1,55 @@
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  height: 100dvh;
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.topbar {
+  display: none;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--topbar-height);
+  padding: 0 var(--space-2);
+  border-bottom: var(--border-width) solid var(--border);
+  background: var(--surface);
+}
+
+.topbarBrand {
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+}
+
+.overlay {
+  display: none;
+}
+
+@media (max-width: 52rem) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .topbar {
+    display: flex;
+  }
+
+  .overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-overlay);
+    background: var(--overlay);
+  }
+}

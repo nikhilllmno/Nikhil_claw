@@ -23,17 +23,27 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import resources
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, Self
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.types import Lifespan
 
 from sama.api.auth import AuthError, JwtVerifier, Principal
+from sama.api.origins import check_origins
 from sama.context import (
     MAX_PIN_CHARS,
     Pin,
@@ -80,10 +90,19 @@ from sama.memory import (
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
+from sama.profiles import (
+    NAME_MAX_CHARS,
+    SOUL_MAX_CHARS,
+    ProfileChanges,
+    ProfileError,
+    profile_options,
+    update_profile,
+)
 from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
-from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS
+from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS, RuntimeKind
 from sama.skills.service import SkillLibrary
+from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 
@@ -117,6 +136,14 @@ class ApiSettings(BaseModel):
     """The open event streams of this process. One more stream gets ``429``."""
     max_streams_per_user: int = Field(default=8, gt=0)
     """The open event streams of one user in this process."""
+    web_origins: tuple[str, ...] = ()
+    """The exact origins of the web app (``SAMA_WEB_ORIGINS``). With none, the API sends no CORS
+    headers."""
+
+    @field_validator("web_origins")
+    @classmethod
+    def _origins_are_exact(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return check_origins(value)
 
 
 # -- request and response bodies ------------------------------------------------------------
@@ -197,6 +224,32 @@ class MemoryEdit(_Body):
 class MemoryRevert(_Body):
     agent_profile_id: uuid.UUID | None = None
     reason: str | None = Field(default=None, max_length=MAX_MEMORY_REASON_CHARS)
+
+
+class ProfileEdit(_Body):
+    """The fields to change. Every field is optional, and a body has at least one."""
+
+    name: (
+        Annotated[
+            str, StringConstraints(strip_whitespace=True, min_length=1, max_length=NAME_MAX_CHARS)
+        ]
+        | None
+    ) = None
+    soul: Annotated[str, Field(max_length=SOUL_MAX_CHARS)] | None = None
+    model: Annotated[str, Field(min_length=1, max_length=100)] | None = None
+    toolsets: (
+        Annotated[list[Annotated[str, Field(max_length=100)]], Field(max_length=100)] | None
+    ) = None
+    subagents: list[Any] | None = None
+
+    @model_validator(mode="after")
+    def _has_a_field(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field to change")
+        for name in sorted(self.model_fields_set):
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
 
 
 class Answers(_Body):
@@ -483,6 +536,19 @@ class SamaApi:
             response.headers["Referrer-Policy"] = "no-referrer"
             return response
 
+        if settings.web_origins:
+            # The web app sends a Bearer token and no cookies, so credentials stay off. The
+            # middleware is added after the others, so it is the outermost: an error answer
+            # and the event stream get the headers, too.
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=list(settings.web_origins),
+                allow_credentials=False,
+                allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+                allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+                max_age=600,
+            )
+
         @app.get("/healthz")
         async def healthz() -> dict[str, str]:
             return {"status": "ok"}
@@ -629,6 +695,18 @@ class SamaApi:
         ) -> Response:
             await self._answer(principal, session_id, request_id, body.answers)
             return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/agent-profiles/{profile_id}")
+        async def get_agent_profile(
+            principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID
+        ) -> dict[str, Any]:
+            return await self._profile(principal, org_id, profile_id)
+
+        @app.patch("/orgs/{org_id}/agent-profiles/{profile_id}")
+        async def edit_agent_profile(
+            principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
+        ) -> dict[str, Any]:
+            return await self._edit_profile(principal, org_id, profile_id, body)
 
         @app.get("/orgs/{org_id}/integrations")
         async def list_integrations(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -809,6 +887,84 @@ class SamaApi:
                     }
                 )
         return result
+
+    async def _profile_access(
+        self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID
+    ) -> tuple[Any, Grants, uuid.UUID]:
+        """The row of the profile, the grants, and the user row. Raises ``404`` if the user is not
+        a member of the org or cannot see the profile (the rule of ``/me``)."""
+        missing = "the agent profile does not exist"
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            user_id = await _user_id(connection, principal, org_id)
+            grants = None if user_id is None else await load_grants(connection, org_id, user_id)
+            if user_id is None or grants is None or not grants.org_member:
+                raise _not_found(missing)
+            row = (
+                await connection.execute(
+                    select(
+                        AgentProfile.id,
+                        AgentProfile.org_id,
+                        AgentProfile.workspace_id,
+                        AgentProfile.name,
+                        AgentProfile.soul,
+                        AgentProfile.runtime,
+                        AgentProfile.model,
+                        AgentProfile.toolsets,
+                        AgentProfile.group_toolsets,
+                        AgentProfile.subagents,
+                        AgentProfile.updated_at,
+                    ).where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
+                )
+            ).one_or_none()
+        if row is None or not (row.workspace_id is None or grants.sees_workspace(row.workspace_id)):
+            raise _not_found(missing)
+        return row, grants, user_id
+
+    async def _profile(
+        self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID
+    ) -> dict[str, Any]:
+        row, grants, _ = await self._profile_access(principal, org_id, profile_id)
+        runtime = RuntimeKind(row.runtime)
+        return {
+            "id": str(row.id),
+            "org_id": str(row.org_id),
+            "workspace_id": None if row.workspace_id is None else str(row.workspace_id),
+            "name": row.name,
+            "soul": row.soul,
+            "runtime": row.runtime,
+            "model": row.model,
+            "toolsets": list(row.toolsets),
+            "group_toolsets": list(row.group_toolsets),
+            "subagents": [s.model_dump(mode="json") for s in parse_subagents(row.subagents)],
+            "updated_at": row.updated_at.isoformat(),
+            "editable": grants.org_admin,
+            "options": profile_options(runtime),
+        }
+
+    async def _edit_profile(
+        self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
+    ) -> dict[str, Any]:
+        """Changes the profile. A session keeps its frozen config: the change applies from the
+        next session."""
+        _, grants, user_id = await self._profile_access(principal, org_id, profile_id)
+        if not grants.org_admin:
+            raise HTTPException(status_code=403, detail="only an org owner or admin can do this")
+        changes = ProfileChanges(
+            name=body.name,
+            soul=body.soul,
+            model=body.model,
+            toolsets=body.toolsets,
+            subagents=body.subagents,
+        )
+        try:
+            await update_profile(self._engine, org_id, profile_id, changes, actor_user_id=user_id)
+        except ProfileError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        except SubagentError as error:
+            if str(error) == "the profile does not exist":
+                raise _not_found("the agent profile does not exist") from None
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        return await self._profile(principal, org_id, profile_id)
 
     async def _sessions(self, principal: Principal, limit: int) -> list[SessionOut]:
         async with as_user(self._engine, principal.auth_user_id) as connection:

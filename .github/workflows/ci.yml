@@ -114,3 +114,28 @@ jobs:
       # The provider tests and the claude-docker conformance target run the runner in the image.
       - name: Docker provider and claude-docker conformance target
         run: uv run pytest tests/sandbox tests/conformance -k docker -rs
+
+  web:
+    name: Web (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test
+      - name: Build
+        env:
+          NEXT_PUBLIC_SAMA_API_URL: https://sama-staging.fly.dev
+        run: npm run build

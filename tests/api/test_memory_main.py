@@ -83,3 +83,29 @@ async def test_the_standalone_api_serves_the_skill_routes(tenant: Tenant) -> Non
         )
     assert response.status_code == 200
     assert "code-review" in {skill["name"] for skill in response.json()}
+
+
+@pytest.mark.usefixtures("standalone_env")
+def test_the_standalone_api_refuses_a_bad_web_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SAMA_WEB_ORIGINS", "https://web.example.test,*")
+
+    with pytest.raises(SystemExit, match="SAMA_WEB_ORIGINS"):
+        build_app()
+
+
+@pytest.mark.usefixtures("standalone_env")
+async def test_the_standalone_api_allows_the_web_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SAMA_WEB_ORIGINS", "https://web.example.test")
+    transport = httpx.ASGITransport(app=build_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        response = await client.options(
+            "/me",
+            headers={
+                "Origin": "https://web.example.test",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://web.example.test"
