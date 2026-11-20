@@ -63,6 +63,60 @@ describe("applyStreamEvent", () => {
     }
   });
 
+  it("keeps the partial text of a stopped run and marks it", () => {
+    let state = applyStreamEvent(initialLive, "run", {
+      run_id: "r1",
+      status: "running",
+      failure_code: null,
+      failure_message: null,
+    }).state;
+    state = applyStreamEvent(state, "run_event", {
+      run_id: "r1",
+      seq: 1,
+      type: "text_delta",
+      payload: { text: "Once upon" },
+    }).state;
+    state = applyStreamEvent(state, "run_event", {
+      run_id: "r1",
+      seq: 2,
+      type: "run_failed",
+      payload: { code: "cancelled", message: "cancelled" },
+    }).state;
+    expect(state.text).toEqual({});
+    expect(state.stopped).toEqual({ r1: "Once upon" });
+    // The status event that follows does not lose the text, and shows no failure.
+    state = applyStreamEvent(state, "run", {
+      run_id: "r1",
+      status: "cancelled",
+      failure_code: "cancelled",
+      failure_message: "cancelled",
+    }).state;
+    expect(state.stopped).toEqual({ r1: "Once upon" });
+    expect(state.failure).toBeNull();
+  });
+
+  it("marks a run as stopped when only its status says so", () => {
+    let state = applyStreamEvent(initialLive, "run", {
+      run_id: "r1",
+      status: "running",
+      failure_code: null,
+      failure_message: null,
+    }).state;
+    state = applyStreamEvent(state, "run_event", {
+      run_id: "r1",
+      seq: 1,
+      type: "text_delta",
+      payload: { text: "Part" },
+    }).state;
+    state = applyStreamEvent(state, "run", {
+      run_id: "r1",
+      status: "cancelled",
+      failure_code: "cancelled",
+      failure_message: "cancelled",
+    }).state;
+    expect(state.stopped).toEqual({ r1: "Part" });
+  });
+
   it("tracks tool calls from start to finish", () => {
     let state = initialLive;
     state = applyStreamEvent(state, "run_event", {

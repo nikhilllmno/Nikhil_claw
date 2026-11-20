@@ -85,6 +85,12 @@
   font-size: var(--text-sm);
 }
 
+.stoppedNote {
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
 .caret {
   display: inline-block;
   width: var(--space-2);

@@ -332,6 +332,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
               <span className={styles.caret} aria-hidden="true" />
             </article>
           ))}
+          {Object.entries(live.stopped).map(([runId, text]) => (
+            <article key={`stopped-${runId}`} className={styles.assistant} aria-label="Assistant, stopped">
+              {text ? <Markdown text={text} /> : null}
+              <p className={styles.stoppedNote}>Stopped. This partial reply is not saved.</p>
+            </article>
+          ))}
           {working ? (
             <p className={styles.working}>
               <span className="spinner" aria-hidden="true" /> Working on it…

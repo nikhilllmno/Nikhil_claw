@@ -21,11 +21,16 @@ export interface LiveState {
   tools: Record<string, ToolCall[]>;
   /** Failure text of a run that ended in this view and failed. */
   failure: string | null;
+  /**
+   * The partial text of each run that a user stopped in this view. The server keeps no message
+   * for a stopped run, so the view keeps the text and marks it as stopped.
+   */
+  stopped: Record<string, string>;
 }
 
 export type Effect = "reload_messages" | "reload_approvals" | "reload_questions";
 
-export const initialLive: LiveState = { runs: {}, text: {}, tools: {}, failure: null };
+export const initialLive: LiveState = { runs: {}, text: {}, tools: {}, failure: null, stopped: {} };
 
 export function openRunIds(state: LiveState): string[] {
   return Object.values(state.runs)
@@ -44,8 +49,11 @@ function failureText(run: StreamRun): string | null {
   return null;
 }
 
-function dropRunText(state: LiveState, runId: string): Record<string, string> {
-  return Object.fromEntries(Object.entries(state.text).filter(([id]) => id !== runId));
+/** Ends the live text of a run. The text of a stopped run moves to `stopped`. */
+function endRunText(state: LiveState, runId: string, stopped: boolean): LiveState {
+  const text = Object.fromEntries(Object.entries(state.text).filter(([id]) => id !== runId));
+  if (!stopped || state.stopped[runId] !== undefined) return { ...state, text };
+  return { ...state, text, stopped: { ...state.stopped, [runId]: state.text[runId] ?? "" } };
 }
 
 /** A run changed its status. `wasOpen`: this view showed the run as open before. */
@@ -60,7 +68,8 @@ function applyRun(state: LiveState, run: StreamRun, effects: Effect[]): LiveStat
   if (OPEN_RUN_STATUSES.has(run.status)) return { ...next, failure: null };
   if (!wasOpen) return next; // The end of a run that this view never showed as open is old news.
   effects.push("reload_messages", "reload_approvals", "reload_questions");
-  return { ...next, text: dropRunText(next, run.run_id), failure: failureText(run) };
+  const ended = endRunText(next, run.run_id, run.status === "cancelled");
+  return { ...ended, failure: failureText(run) };
 }
 
 /** Applies one event of the stream. Returns the new state and what the caller must reload. */
@@ -138,7 +147,10 @@ export function applyStreamEvent(
     case "run_completed":
     case "run_failed":
       effects.push("reload_messages");
-      return { state: { ...state, text: dropRunText(state, event.run_id) }, effects };
+      return {
+        state: endRunText(state, event.run_id, payload.code === "cancelled"),
+        effects,
+      };
     default:
       return { state, effects };
   }

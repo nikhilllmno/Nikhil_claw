@@ -25,7 +25,8 @@ export function useDrawerFocus(
     const panel = drawer.current;
     if (!active || panel === null) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    focusable(panel)[0]?.focus();
+    // The next frame: the drawer is then visible, so the browser accepts the focus.
+    const frame = requestAnimationFrame(() => focusable(panel)[0]?.focus());
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         onClose();
@@ -42,6 +43,7 @@ export function useDrawerFocus(
     };
     document.addEventListener("keydown", onKey);
     return () => {
+      cancelAnimationFrame(frame);
       document.removeEventListener("keydown", onKey);
       opener?.focus();
     };

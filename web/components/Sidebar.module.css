@@ -131,9 +131,14 @@
       visibility var(--duration-base);
   }
 
+  /* The drawer is visible at once when it opens, so that it can take the focus. It stays
+     visible until the slide-out ends when it closes. */
   .open {
     transform: translateX(0);
     visibility: visible;
+    transition:
+      transform var(--duration-base) var(--ease-out),
+      visibility 0s;
   }
 
   .close {
