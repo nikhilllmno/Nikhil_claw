@@ -109,7 +109,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
           onArchived={() => back(`The skill ${open.name} is archived.`)}
           onSaved={(text) => {
             setNotice(text);
-            catalog.reload();
+            if (text) catalog.reload();
           }}
         />
       ) : (
@@ -246,13 +246,14 @@ function SkillList({
   );
 }
 
-function useWrite(workspaceId: string) {
+function useWrite(workspaceId: string, onStart?: () => void) {
   const api = useApi();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const write = async (label: string, body: SkillWriteBody) => {
     setBusy(label);
     setError(null);
+    onStart?.();
     try {
       return await api.writeSkill(workspaceId, body);
     } catch (e) {
@@ -371,7 +372,7 @@ function SkillView({
   onBack: () => void;
   onOpen: (scope: SkillScope) => void;
   onArchived: () => void;
-  onSaved: (text: string) => void;
+  onSaved: (text: string | null) => void;
 }) {
   const api = useApi();
   const load = useCallback(() => api.getSkill(workspaceId, name, scope), [api, workspaceId, name, scope]);
@@ -379,7 +380,8 @@ function SkillView({
   const [content, setContent] = useState<string | null>(null);
   const [summary, setSummary] = useState("");
   const [versionsTick, setVersionsTick] = useState(0);
-  const { busy, error, write } = useWrite(workspaceId);
+  // A new write ends the notice of the last one, so an old success never sits beside a new error.
+  const { busy, error, write } = useWrite(workspaceId, () => onSaved(null));
   const heading = useRef<HTMLHeadingElement>(null);
   // The skill is open when it has loaded: the focus goes to its name.
   useFocusWhen(detail.data !== null, heading);
@@ -517,7 +519,13 @@ function SkillView({
             </p>
           </>
         )}
-        <Files skill={skill} writable={writable} workspaceId={workspaceId} onChanged={changed} />
+        <Files
+          skill={skill}
+          writable={writable}
+          workspaceId={workspaceId}
+          onChanged={changed}
+          onWriteStart={() => onSaved(null)}
+        />
         {skill.id !== null ? (
           <Versions
             key={versionsTick}
@@ -546,15 +554,17 @@ function Files({
   writable,
   workspaceId,
   onChanged,
+  onWriteStart,
 }: {
   skill: SkillDetail;
   writable: boolean;
   workspaceId: string;
   onChanged: (version: number, what: string) => void;
+  onWriteStart: () => void;
 }) {
   const [open, setOpen] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ path: string; content: string; isNew: boolean } | null>(null);
-  const { busy, error, setError, write } = useWrite(workspaceId);
+  const { busy, error, setError, write } = useWrite(workspaceId, onWriteStart);
   const pathField = useRef<HTMLInputElement>(null);
   const contentField = useRef<HTMLTextAreaElement>(null);
   const addButton = useRef<HTMLButtonElement>(null);

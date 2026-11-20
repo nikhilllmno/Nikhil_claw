@@ -460,7 +460,7 @@ function SessionTools({ sessionId }: { sessionId: string }) {
         type="button"
         className="btn btn-quiet btn-small"
         disabled={busy !== null}
-        aria-label="Export the session as Markdown"
+        aria-label="Export .md: the session as Markdown"
         onClick={() => void download("markdown")}
       >
         {busy === "markdown" ? "Exporting" : "Export .md"}
@@ -469,7 +469,7 @@ function SessionTools({ sessionId }: { sessionId: string }) {
         type="button"
         className="btn btn-quiet btn-small"
         disabled={busy !== null}
-        aria-label="Export the session as JSON"
+        aria-label="Export .json: the session as JSON"
         onClick={() => void download("json")}
       >
         {busy === "json" ? "Exporting" : "Export .json"}
