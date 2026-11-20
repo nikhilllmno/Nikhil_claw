@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -216,3 +219,68 @@ def test_a_second_server_on_the_same_socket_exits(socket_path: str) -> None:
 def test_the_code_id_is_stable() -> None:
     assert warm.code_id() == warm.code_id()
     assert len(warm.code_id()) == 64
+
+
+def test_kill_stops_a_runner_that_has_no_process_group_yet() -> None:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    warm._kill(child.pid)  # its group does not exist, so only the direct kill works
+    assert child.wait(timeout=5) == -9
+
+
+def test_a_client_that_closes_at_once_leaves_no_runner(tmp_path: Path, socket_path: str) -> None:
+    _start_server(socket_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    job = RunnerJob(
+        op="run",
+        run=RunRequest(scope=make_scope("run-1"), input="hi", config=CONFIG),
+        fake_scripts=(_slow(),),
+    )
+    stdin_read, stdin_write = os.pipe()
+    os.write(stdin_write, (job.model_dump_json() + "\n").encode())
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        WORKDIR_ENV: str(work),
+        RUN_TOKEN_ENV: "token-1",
+        "PYTHONPATH": os.pathsep.join(sys.path),
+    }
+    request = json.dumps(
+        {"code": warm.code_id(), "env": env, "cwd": str(work), "started": time.time()}
+    ).encode()
+    with open(os.devnull, "wb") as sink, socket.socket(socket.AF_UNIX) as sock:
+        sock.connect(socket_path)
+        data = warm._HEADER.pack(len(request)) + request
+        sent = socket.send_fds(sock, [data], [stdin_read, sink.fileno(), sink.fileno()])
+        sock.sendall(data[sent:])
+    os.close(stdin_read)
+    try:
+        _wait_until(lambda: not _in_folder(work), timeout_s=5)
+    finally:
+        os.close(stdin_write)
+    assert len(warm_servers(socket_path)) == 1
+
+
+def test_a_lost_reply_does_not_run_the_job_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = str(tmp_path / "s")
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(path)
+        server.listen()
+
+        def take() -> None:
+            conn, _ = server.accept()
+            with conn:
+                _, fds, _, _ = socket.recv_fds(conn, 65536, 3)
+                for fd in fds:
+                    os.close(fd)
+
+        thread = threading.Thread(target=take)
+        thread.start()
+
+        def lost(_: socket.socket) -> bytes:
+            raise ConnectionResetError
+
+        monkeypatch.setattr(warm, "_read_reply", lost)
+        assert warm.run_warm(path, "code", time.time()) == 1
+        thread.join(timeout=5)

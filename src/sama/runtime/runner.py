@@ -306,9 +306,14 @@ def _open_lock(workdir: str) -> int | None:
         return None
 
 
+class LockBusyError(Exception):
+    """The runner of the last run of the session did not stop in ``LOCK_WAIT_S``."""
+
+
 async def _take_lock(workdir: str) -> int | None:
-    """Takes the runner lock and returns its file descriptor. It waits up to ``LOCK_WAIT_S``
-    for the runner of the last run. After that, the run goes on without the lock."""
+    """Takes the runner lock and returns its file descriptor, or None if the work folder does
+    not exist. It waits up to ``LOCK_WAIT_S`` for the runner of the last run, then raises
+    ``LockBusyError``: two Claude CLIs must never use the files of one session."""
     fd = _open_lock(workdir)
     if fd is None:
         return None
@@ -319,8 +324,8 @@ async def _take_lock(workdir: str) -> int | None:
             return fd
         except BlockingIOError:
             if time.monotonic() >= deadline:
-                log.warning("the runner of the last run did not stop; the run goes on")
-                return fd
+                os.close(fd)
+                raise LockBusyError from None
             await asyncio.sleep(0.02)
 
 
@@ -360,7 +365,12 @@ async def _serve(
     if not token:
         out.event(_failed(FailureCode.SANDBOX_ERROR, f"{RUN_TOKEN_ENV} is not set"))
         return 3
-    lock = await _take_lock(env.get(WORKDIR_ENV) or WORKDIR)
+    try:
+        lock = await _take_lock(env.get(WORKDIR_ENV) or WORKDIR)
+    except LockBusyError:
+        message = "the runner of the last run of this session did not stop"
+        out.event(RunFailed(code=FailureCode.SANDBOX_ERROR, message=message, retryable=True))
+        return 3
     timing.mark("lock")
     try:
         return await _run_job(job, lines, out, env, token, timing)

@@ -303,17 +303,27 @@ async def test_a_runner_waits_for_the_runner_lock(tmp_path: Path) -> None:
     os.close(fd)
 
 
-async def test_a_runner_goes_on_when_the_last_runner_does_not_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_a_runner_fails_when_the_last_runner_does_not_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(runner_module, "LOCK_WAIT_S", 0.1)
     first = await runner_module._take_lock(str(tmp_path))
     assert first is not None
-    fd = await runner_module._take_lock(str(tmp_path))
-    assert fd is not None
-    assert "did not stop" in caplog.text
-    os.close(fd)
-    os.close(first)
+    built: list[object] = []
+    monkeypatch.setattr(runner_module, "build_runtime", lambda *args: built.append(args))
+    env = {**ENV, WORKDIR_ENV: str(tmp_path)}
+    out = io.StringIO()
+    try:
+        code = await serve(_lines([_job(_reply("hi")).model_dump_json()]), Output(out), env)
+    finally:
+        os.close(first)
+    assert code == 3
+    assert not built  # no second runtime starts while the lock is held
+    [line] = out.getvalue().splitlines()
+    failed = run_event_adapter.validate_json(line)
+    assert isinstance(failed, RunFailed)
+    assert failed.code is FailureCode.SANDBOX_ERROR
+    assert failed.retryable
 
 
 async def test_no_lock_without_a_work_folder(tmp_path: Path) -> None:

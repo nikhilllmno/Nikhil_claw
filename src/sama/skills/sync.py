@@ -68,15 +68,20 @@ _CHECK: Final = (
     'mkdir -p "$sama"; rm -rf "$sama"/.skills-*; '
     'if [ -d "$final" ] && [ ! -L "$final" ] '
     '&& [ -z "$(cd "$final" && find . ! -type d ! -type f -print -quit)" ]; then '
-    'have=$(cd "$final" && find . -type f -print0 | LC_ALL=C sort -z '
-    '| xargs -0 -r sha256sum | sha256sum | cut -d" " -f1); '
-    'if [ "$have" = "$want" ]; then echo same; exit 0; fi; fi; '
+    'if sums=$(cd "$final" && find . -type f -exec sha256sum -- {} +); then '
+    'have=$(if [ -n "$sums" ]; then printf "%s\\n" "$sums"; fi '
+    '| LC_ALL=C sort -k 2 | sha256sum | cut -d" " -f1); '
+    'if [ "$have" = "$want" ]; then echo same; exit 0; fi; fi; fi; '
     "echo changed"
 )
 """Refuses a link in place of ``.sama``. Removes the staging folders and archives of an earlier
 sync that did not finish (``rm -rf`` removes a link and does not follow it). Then it says
 ``same`` if ``skills`` is a real folder that holds only regular files and folders, and the
-digest of its files is the wanted digest. Any other state says ``changed``."""
+digest of its files is the wanted digest. Any other state says ``changed``.
+
+``find`` exits with an error if it cannot read a folder or if ``sha256sum`` cannot read a
+file, so a file that the check cannot hash never gives ``same``. The sums are sorted by path
+(the second field), because the safe paths have no spaces."""
 
 _PUBLISH: Final = (
     'set -e; sama="$1"; stage="$2"; archive="$3"; final="$sama/skills"; '
@@ -103,9 +108,9 @@ async def _run(sandbox: Sandbox, script: str, *args: str) -> str:
 def digest(files: Mapping[str, str]) -> str:
     """The digest of a skills folder that holds exactly ``files``.
 
-    It is the output of ``find . -type f | sort | xargs sha256sum | sha256sum`` in the folder,
-    so the sandbox can compute the same value with standard tools. The safe paths are ASCII, so
-    the sort order of Python and of ``LC_ALL=C sort`` is the same.
+    It is the output of ``find . -type f -exec sha256sum {} + | sort -k 2 | sha256sum`` in the
+    folder, so the sandbox can compute the same value with standard tools. The safe paths are
+    ASCII, so the sort order of Python and of ``LC_ALL=C sort`` is the same.
     """
     lines = "".join(
         f"{hashlib.sha256(files[path].encode()).hexdigest()}  ./{path}\n" for path in sorted(files)

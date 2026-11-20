@@ -27,6 +27,9 @@ CHECK_S: Final = 30.0
 RETRY_S: Final = 5.0
 """How long the listener waits before it connects again after an error."""
 CHECK_TIMEOUT_S: Final = 10.0
+"""How long a database call of the listener can take: the LISTEN setup and each check."""
+STOP_WAIT_S: Final = 5.0
+"""How long ``run`` waits for the listener to end after ``stop``, before it cancels it."""
 
 
 class Ticket:
@@ -66,6 +69,8 @@ class QueueWakeup:
         self._event = asyncio.Event()
         self.listening = asyncio.Event()
         """Set while the connection listens. For tests and health checks."""
+        self.backend_pid: int | None = None
+        """The server process of the listen connection, while it listens. For tests."""
 
     def ticket(self) -> Ticket:
         return Ticket(self._event)
@@ -83,7 +88,7 @@ class QueueWakeup:
         warned = False
         while not stop.is_set():
             try:
-                await self._listen(engine, stop)
+                await self._listen_until_stop(engine, stop)
             except Exception as error:
                 # One warning for each outage. The poll finds the runs in the meantime.
                 if not warned:
@@ -96,6 +101,23 @@ class QueueWakeup:
             if not stop.is_set():
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=self._retry_s)
+
+    async def _listen_until_stop(self, engine: AsyncEngine, stop: asyncio.Event) -> None:
+        """Runs ``_listen``. A connect or a setup that hangs cannot hold the stop of the worker:
+        after ``stop`` the listener gets ``STOP_WAIT_S`` to end, and then it is cancelled."""
+        listen = asyncio.create_task(self._listen(engine, stop))
+        stopped = asyncio.ensure_future(stop.wait())
+        try:
+            await asyncio.wait({listen, stopped}, return_when="FIRST_COMPLETED")
+            if not listen.done():
+                await asyncio.wait({listen}, timeout=STOP_WAIT_S)
+        finally:
+            stopped.cancel()
+            if not listen.done():
+                listen.cancel()
+                await asyncio.wait({listen}, timeout=STOP_WAIT_S)
+        if listen.done() and not listen.cancelled():
+            listen.result()  # raises the error of the listener
 
     async def _listen(self, engine: AsyncEngine, stop: asyncio.Event) -> None:
         lost = asyncio.Event()
@@ -110,8 +132,9 @@ class QueueWakeup:
             raw = await connection.get_raw_connection()
             driver: Any = raw.driver_connection
             try:
-                await driver.add_listener(CHANNEL, on_notify)
+                await asyncio.wait_for(driver.add_listener(CHANNEL, on_notify), CHECK_TIMEOUT_S)
                 driver.add_termination_listener(on_lost)
+                self.backend_pid = driver.get_server_pid()
                 self.listening.set()
                 # A run can be queued while the connection was down: look once now.
                 self.notify()
@@ -123,6 +146,7 @@ class QueueWakeup:
                 if lost.is_set():
                     raise ConnectionError("the listen connection closed")
             finally:
+                self.backend_pid = None
                 # The pool must not get back a connection that listens.
                 with contextlib.suppress(Exception):
                     driver.remove_termination_listener(on_lost)

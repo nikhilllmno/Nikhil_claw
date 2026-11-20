@@ -709,6 +709,9 @@ class ClaudeRuntime:
         self._cancelled_runs = _BoundedSet()
         self._pumps: set[asyncio.Task[None]] = set()
         self._cleanups: set[asyncio.Task[None]] = set()
+        self._stopping: dict[str, asyncio.Task[None]] = {}
+        """The CLI stop of each SDK session, while it runs. The next run of the session waits
+        for it, because ``RunCompleted`` goes out before the stop ends."""
 
     @property
     def kind(self) -> RuntimeKind:
@@ -733,6 +736,17 @@ class ClaudeRuntime:
         check = self._settings.session_exists
         return check is None or check(session_id)
 
+    async def _wait_stopped(self, session_id: str) -> None:
+        """Waits until the CLI of the last run of the session has stopped.
+
+        The CLI writes the transcript while it stops. So a run that comes after an early
+        ``RunCompleted`` must not look for the transcript or start a CLI before that.
+        """
+        task = self._stopping.get(session_id)
+        if task is not None:
+            # asyncio.wait does not cancel the stop when this run is cancelled.
+            await asyncio.wait({task})
+
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         run_id = request.scope.run_id
         problem = self._check_config(request.config)
@@ -746,6 +760,8 @@ class ClaudeRuntime:
         if problem is not None:
             yield _invalid(problem)
             return
+        if previous is not None:
+            await self._wait_stopped(previous.session_id)
         if previous is not None and not self._session_exists(previous.session_id):
             # The sandbox is new (lost, or from another template), so the CLI has no
             # transcript of this session. Start a new SDK session; its counts start at zero.
@@ -789,6 +805,8 @@ class ClaudeRuntime:
                 problem = "runtime_state is not valid for the claude runtime"
         if problem is None:
             problem = self._check_resume(request, state)
+        if problem is None and state is not None:
+            await self._wait_stopped(state.session_id)
         if problem is None and state is not None and not self._session_exists(state.session_id):
             problem = "the sdk session of this run is gone, so the approval cannot resume it"
         if problem is not None or state is None or state.pending is None:
@@ -1030,7 +1048,7 @@ class ClaudeRuntime:
                     active.send(early)
         finally:
             active.client = None
-            await self._disconnect(client)
+            await self._disconnect(client, translator.session_id)
         # Map other results only after the CLI stopped, so the wall time in runtime_state
         # also counts the time to stop the CLI.
         if final is None:
@@ -1045,7 +1063,7 @@ class ClaudeRuntime:
             )
         return None
 
-    async def _disconnect(self, client: ClaudeClient) -> None:
+    async def _disconnect(self, client: ClaudeClient, session_id: str | None = None) -> None:
         """Stops the CLI process in a task of its own.
 
         The SDK stops the CLI in steps (close stdin, terminate, kill), and this can take about
@@ -1061,6 +1079,14 @@ class ClaudeRuntime:
         task = asyncio.create_task(stop())
         self._cleanups.add(task)
         task.add_done_callback(self._cleanups.discard)
+        if session_id is not None:
+            self._stopping[session_id] = task
+
+            def forget(done: asyncio.Task[None]) -> None:
+                if self._stopping.get(session_id) is done:
+                    del self._stopping[session_id]
+
+            task.add_done_callback(forget)
         # asyncio.wait does not cancel the task on a timeout or when this task is cancelled.
         await asyncio.wait({task}, timeout=self._settings.cancel_grace_s)
 

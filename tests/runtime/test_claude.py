@@ -986,6 +986,30 @@ async def test_a_completed_run_does_not_wait_for_the_cli_to_stop() -> None:
     assert factory.clients[0].disconnected
 
 
+async def test_a_follow_up_run_waits_for_the_cli_of_the_last_run_to_stop() -> None:
+    factory = Factory([delta("Hi"), result()], [result()], disconnect_s=0.5)
+    looked: list[bool] = []
+
+    def exists(_: str) -> bool:
+        # The transcript is complete only after the first CLI stopped.
+        looked.append(factory.clients[0].disconnected)
+        return True
+
+    runtime = ClaudeRuntime(
+        settings=ClaudeSettings(cancel_grace_s=2.0, session_exists=exists),
+        client_factory=factory,
+    )
+    first = await collect(runtime.run(request()))
+    completed = first[-1]
+    assert isinstance(completed, RunCompleted)
+    assert not factory.clients[0].disconnected
+    second = await collect(runtime.run(request(run_id="run-2", state=completed.runtime_state)))
+    assert isinstance(second[-1], RunCompleted)
+    assert looked == [True]
+    assert factory.clients[0].disconnected
+    await runtime.aclose()
+
+
 async def test_a_failed_run_still_waits_for_the_cli_to_stop() -> None:
     factory = Factory([result(subtype="error_during_execution", is_error=True)], disconnect_s=0.3)
     runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=2.0), client_factory=factory)

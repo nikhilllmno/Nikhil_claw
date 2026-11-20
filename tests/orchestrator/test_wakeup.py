@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable
+from types import SimpleNamespace
+from typing import Any, cast
 
 import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+import sama.orchestrator.wakeup as wakeup_module
 from sama.orchestrator.wakeup import CHANNEL, QueueWakeup
 from tests.orchestrator.conftest import Tenant
 from tests.orchestrator.test_worker import Harness, until
@@ -106,6 +109,79 @@ async def test_an_idle_worker_claims_a_new_run_before_its_poll(
             await server
 
 
+class _HangingDriver:
+    """A connection whose LISTEN setup never answers."""
+
+    def __init__(self) -> None:
+        self.setups = 0
+
+    async def add_listener(self, *_: Any) -> None:
+        self.setups += 1
+        await asyncio.Event().wait()
+
+    async def remove_listener(self, *_: Any) -> None:
+        return None
+
+    def remove_termination_listener(self, *_: Any) -> None:
+        return None
+
+
+class _HangingEngine:
+    def __init__(self) -> None:
+        self.driver = _HangingDriver()
+
+    @contextlib.asynccontextmanager
+    async def connect(self) -> AsyncIterator[Any]:
+        raw = SimpleNamespace(driver_connection=self.driver)
+
+        async def get_raw_connection() -> Any:
+            return raw
+
+        async def invalidate() -> None:
+            return None
+
+        yield SimpleNamespace(get_raw_connection=get_raw_connection, invalidate=invalidate)
+
+
+async def test_a_hanging_listen_setup_does_not_hold_the_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wakeup_module, "STOP_WAIT_S", 0.2)
+    engine = _HangingEngine()
+    wakeup = QueueWakeup(cast(AsyncEngine, engine))
+    stop = asyncio.Event()
+    task = asyncio.create_task(wakeup.run(stop))
+    await until(_async(lambda: engine.driver.setups == 1), timeout_s=5.0)
+    started = time.monotonic()
+    stop.set()
+    await asyncio.wait_for(task, 5.0)
+    assert time.monotonic() - started < 1.0
+    assert not wakeup.listening.is_set()
+
+
+async def test_a_hanging_listen_setup_times_out_and_connects_again(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(wakeup_module, "CHECK_TIMEOUT_S", 0.05)
+    engine = _HangingEngine()
+    wakeup = QueueWakeup(cast(AsyncEngine, engine), retry_s=0.05)
+    stop = asyncio.Event()
+    task = asyncio.create_task(wakeup.run(stop))
+    try:
+        await until(_async(lambda: engine.driver.setups >= 2), timeout_s=5.0)
+        assert "the run queue listener stopped" in caplog.text
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 5.0)
+
+
+def _async(check: Callable[[], bool]) -> Callable[[], Awaitable[bool]]:
+    async def wrapped() -> bool:
+        return check()
+
+    return wrapped
+
+
 async def test_the_listener_connects_again_after_an_error(
     engine: AsyncEngine, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -114,14 +190,11 @@ async def test_the_listener_connects_again_after_an_error(
     task = asyncio.create_task(wakeup.run(stop))
     try:
         await asyncio.wait_for(wakeup.listening.wait(), 10.0)
-        # End the listen connection from the server side.
+        # End the listen connection from the server side. Only that connection.
+        pid = wakeup.backend_pid
+        assert pid is not None
         async with engine.connect() as connection:
-            await connection.exec_driver_sql(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
-                " WHERE (query LIKE '%LISTEN%' || $1 || '%' OR query = 'SELECT 1')"
-                " AND pid <> pg_backend_pid()",
-                (CHANNEL,),
-            )
+            await connection.exec_driver_sql("SELECT pg_terminate_backend($1)", (pid,))
         await until(_cleared(wakeup), timeout_s=10.0)
         await asyncio.wait_for(wakeup.listening.wait(), 10.0)
         assert "the run queue listener stopped" in caplog.text

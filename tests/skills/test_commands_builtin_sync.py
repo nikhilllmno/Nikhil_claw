@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -17,7 +19,15 @@ from sama.skills import BuiltinSkills, ManageRequest, MemorySkillStore, SkillErr
 from sama.skills.builtin import ENV_DIRECTORY, builtin_directory, load
 from sama.skills.lint import MAX_DESCRIPTION_CHARS
 from sama.skills.render import render_list, render_view
-from sama.skills.sync import MAX_SYNC_FILES, ROOT, digest, sync_files, sync_skills
+from sama.skills.sync import (
+    _CHECK,
+    MAX_SYNC_FILES,
+    ROOT,
+    _run,
+    digest,
+    sync_files,
+    sync_skills,
+)
 from sama.tenancy import RunTokenClaims
 from tests.skills.helpers import actor, doc, md
 from tests.support import make_scope
@@ -408,3 +418,32 @@ def test_the_render_functions() -> None:
     assert render_view(skill, "references/n.md") == "Notes"
     with pytest.raises(SkillError, match="no file"):
         render_view(skill, "references/zz.md")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every file")
+@pytest.mark.parametrize("hidden", ["file", "folder"])
+async def test_a_file_that_the_check_cannot_read_never_gives_same(
+    tmp_path: Path, hidden: str
+) -> None:
+    box = _sandbox(tmp_path)
+    base = Path(box.workdir) / ROOT
+    files = {"a/SKILL.md": "A"}
+    assert await sync_files(box, files) == 1
+    if hidden == "file":
+        extra = base / "a/extra.sh"
+        extra.write_text("echo hidden")
+        extra.chmod(0)
+    else:
+        folder = base / "a/hidden"
+        folder.mkdir()
+        (folder / "x.sh").write_text("echo hidden")
+        folder.chmod(0)
+    try:
+        sama = str(Path(box.workdir) / ".sama")
+        assert await _run(box, _CHECK, sama, digest(files)) == "changed"
+    finally:
+        for path in base.rglob("*"):
+            with contextlib.suppress(OSError):
+                path.chmod(0o700)
+        with contextlib.suppress(OSError):
+            (base / "a/hidden").chmod(0o700)

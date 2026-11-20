@@ -369,7 +369,9 @@ before it reads the queue and then waits on that ticket, so a notification that 
 the read is not lost. The poll (`poll_s`, 1 second on the control plane) stays as the fallback:
 if the listen connection breaks (the listener connects again after 5 seconds), or if a
 connection pooler does not send notifications, each slot still finds the run on its next
-poll. A notification only starts a claim, so a lost or an extra notification cannot change the
+poll. The `LISTEN` setup and each check of the connection have a time limit of 10 seconds. At
+a worker stop, the listener gets 5 seconds to end, and then it is cancelled, so a database that
+does not answer cannot hold the stop. A notification only starts a claim, so a lost or an extra notification cannot change the
 queue rules. Before this change the wait from the enqueue to the claim was up to 1 second, on
 average about 0.5 second.
 
@@ -1477,7 +1479,8 @@ store, and the sync. The rules:
   a SHA-256 digest of the files in `.sama/skills` from inside the sandbox (`find`, `sort`, and
   `sha256sum`: the path and the content of each file), compares it with the digest of the
   library files, and writes `same` or `changed`. It writes `same` only when `.sama/skills` is a
-  real folder that holds only files and folders (no link) and the digests are equal. On
+  real folder that holds only files and folders (no link) and the digests are equal. If `find`
+  cannot read a folder or `sha256sum` cannot read a file, the check writes `changed`. On
   `same`, the sync stops, so a follow-up run with unchanged skills costs one sandbox call. A
   false `same` only keeps the files that the agent already had. (2) On `changed`, the sync
   writes all the library files as one tar archive
@@ -3241,8 +3244,13 @@ not change.
 - The warm server imports the runner and the Claude runtime once. For each client, it checks
   the user of the peer (`SO_PEERCRED`) and forks a watcher, which forks the runner process.
   The runner process takes the files, the environment, and the work folder of the client, so
-  it is the same as a cold runner. When the client stops (for example, a cancel kills it), the
-  watcher kills the process group of the runner.
+  it is the same as a cold runner. The watcher puts the runner in a new process group at once
+  (`setpgid`, before the runner starts its work). When the client stops (for example, a cancel
+  kills it), the watcher kills the runner process and its process group, so a stop at any time
+  leaves no runner.
+- After the client sent the job, it never runs the job a second time. If the connection to
+  the server breaks after the send, the client logs the error and exits with code 1, and the
+  orchestrator gets no terminal event (a sandbox error).
 - The warm server starts with a short allow list of variables (`SERVER_ENV`). It never gets
   the run token. Only a forked runner gets the environment of its client.
 - If there is no warm server, the client starts one (detached) for the next run and runs this
@@ -3257,9 +3265,13 @@ not change.
 
 **Runner lock.** A runner holds an exclusive `flock` on `.sama/runner.lock` in the work folder
 while it builds the runtime, streams, and closes it. The next runner of the session waits for
-the lock for at most 20 seconds, and then logs a warning and goes on. So the runner of a run
-that is still stopping (the Claude CLI writes its transcript at the stop) is never in the same
-session files as the runner of the next run.
+the lock for at most 20 seconds. If the lock is still busy, the runner builds no runtime and
+sends `RunFailed` (`sandbox_error`, retryable). So the runner of a run that is still stopping
+(the Claude CLI writes its transcript at the stop) is never in the same session files as the
+runner of the next run. The orchestrator kills a runner that does not stop in less time than
+this wait. In one process (a `ClaudeRuntime` that is not in a runner), the adapter does the
+same: a run or a resume of a session first waits until the CLI of the last run of that session
+has stopped.
 
 **Early terminal event.** The Claude adapter sends `RunCompleted` as soon as the result
 message comes, and then stops the Claude CLI (about 0.5 to 1 second). The orchestrator gives a

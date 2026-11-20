@@ -107,10 +107,17 @@ def run_warm(path: str, code: str, started: float) -> int | None:
         try:
             sent = socket.send_fds(sock, [data], [0, 1, 2])
             sock.sendall(data[sent:])
-            sock.settimeout(None)
-            reply = _read_reply(sock)
         except OSError:
+            # The server reads the whole request before it starts a runner, so no job started.
             return None
+        sock.settimeout(None)
+        try:
+            reply = _read_reply(sock)
+        except OSError as error:
+            # The server has the job, so the runner can have started. A cold run now could do
+            # the work of the job two times.
+            _log(f"the connection to the warm runner failed: {type(error).__name__}")
+            return 1
         if reply == _STALE:
             return None
         if reply.startswith(_EXIT):
@@ -257,14 +264,24 @@ def _watch(conn: socket.socket, code: str) -> int:
     if pid == 0:
         conn.close()
         _become_runner(request, fds)
+    # The runner gets its own process group. The child does the same, and the first call wins,
+    # so the group exists before the watcher can kill it.
+    with contextlib.suppress(OSError):
+        os.setpgid(pid, pid)
     for fd in fds:
         os.close(fd)
     status = _wait_or_kill(conn, pid)
-    with contextlib.suppress(OSError):
-        os.killpg(pid, signal.SIGKILL)  # child processes that the runner left
+    _kill(pid)  # child processes that the runner left
     with contextlib.suppress(OSError):
         conn.sendall(_EXIT + str(status).encode() + b"\n")
     return 0
+
+
+def _kill(pid: int) -> None:
+    """Kills the process group of the runner, and the runner itself."""
+    for kill in (os.killpg, os.kill):
+        with contextlib.suppress(OSError):
+            kill(pid, signal.SIGKILL)
 
 
 def _wait_or_kill(conn: socket.socket, pid: int) -> int:
@@ -278,8 +295,7 @@ def _wait_or_kill(conn: socket.socket, pid: int) -> int:
         ready, _, _ = select.select(watched, [], [], timeout)
         if conn.fileno() in ready and not conn.recv(1):
             watched.remove(conn.fileno())
-            with contextlib.suppress(OSError):
-                os.killpg(pid, signal.SIGKILL)
+            _kill(pid)
         done, status = os.waitpid(pid, os.WNOHANG)
         if done:
             if pidfd is not None:
@@ -293,7 +309,10 @@ def _become_runner(request: Mapping[str, Any], fds: list[int]) -> NoReturn:
     client, then run the runner."""
     exit_code = 1
     try:
-        os.setsid()
+        # Its own process group, so the watcher can kill the runner and its child processes.
+        # Not ``setsid``: the watcher can make the group first, and then ``setsid`` fails.
+        with contextlib.suppress(OSError):
+            os.setpgid(0, 0)
         for target, fd in enumerate(fds):
             os.dup2(fd, target)
             if fd != target:
