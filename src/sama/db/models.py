@@ -79,7 +79,14 @@ APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
 CHANNELS: Final = ("web", "slack", "telegram", "extension")
 ACTOR_KINDS: Final = ("user", "agent", "system")
 PROVIDERS: Final = ("anthropic", "openai")
-MODEL_ENDPOINTS: Final = ("messages", "count_tokens", "responses", "chat_completions")
+MODEL_ENDPOINTS: Final = (
+    "messages",
+    "count_tokens",
+    "responses",
+    "chat_completions",
+    "images",
+    "speech",
+)
 VAULT_NAMES: Final = (
     "anthropic_api_key",
     "openai_api_key",
@@ -119,6 +126,10 @@ ATTACHMENT_MIME_TYPES: Final = ("image/png", "image/jpeg", "image/gif", "image/w
 """The image types that a channel can attach to a message (docs/architecture.md, Section 11.7)."""
 MAX_ATTACHMENT_BYTES: Final = 10 * 1024 * 1024
 """The size limit of one attachment, for the database and for the gateways."""
+GENERATED_MEDIA_KINDS: Final = ("image", "audio")
+GENERATED_MEDIA_MIME_TYPES: Final = ("image/png", "audio/ogg")
+"""PNG images of ``image_generate`` and Ogg Opus voice notes of ``text_to_speech``."""
+MAX_GENERATED_MEDIA_BYTES: Final = 10 * 1024 * 1024
 SEARCH_VECTOR_CHARS: Final = 100_000
 """The full-text index covers the first characters of a message. A ``tsvector`` has a limit of
 1 MB, so the index must not take an unlimited text."""
@@ -1316,6 +1327,44 @@ class Attachment(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     sha256: Mapped[str] = mapped_column(Text, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class GeneratedMedia(Base):
+    """An image or a voice note that ``image_generate`` or ``text_to_speech`` made in a run
+    (docs/architecture.md, Section 11.8; roadmap M4.9). The bytes stay in the database. The
+    gateway of the run sends the file to the chat when the run ends and sets ``delivered_at``.
+    A member can read the metadata of the sessions that the member can see, never ``data``."""
+
+    __tablename__ = "generated_media"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(_one_of("kind", GENERATED_MEDIA_KINDS), name="kind"),
+        CheckConstraint(_one_of("mime_type", GENERATED_MEDIA_MIME_TYPES), name="mime_type"),
+        CheckConstraint(
+            f"size_bytes BETWEEN 1 AND {MAX_GENERATED_MEDIA_BYTES}"
+            " AND size_bytes = octet_length(data)",
+            name="size_bytes",
+        ),
+        Index(None, "org_id", "run_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    mime_type: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    caption: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    """A short text for the chat: the prompt of the image, or the start of the spoken text."""
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()
 
 

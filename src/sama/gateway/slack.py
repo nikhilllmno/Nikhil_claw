@@ -60,10 +60,12 @@ from sama.gateway.sessions import (
     offers_always,
     pin_reply,
     send_ending,
+    send_media,
     stop_runs,
     wait_for_tasks,
 )
 from sama.gateway.slack_client import SlackClient, SlackError
+from sama.media.generate import StoredMedia
 from sama.media.images import (
     MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_MESSAGE,
@@ -115,6 +117,7 @@ HELP: Final = (
     " message it is for you only; in a linked channel it is for the workspace\n"
     "/sama <skill> <request> - use a skill (direct messages). In a channel, mention the app"
     " and write /<skill> <request>\n"
+    "/sama learn <urls or topic> - make a draft skill from sources (direct messages)\n"
     "/sama help - show this help"
 )
 
@@ -224,6 +227,20 @@ class _Outbox:
     async def edit_message(self, message_id: Any, text: str) -> None:
         await self._call(
             lambda: self._client.update_message(self._place.channel, str(message_id), escape(text))
+        )
+
+    async def send_media(self, media: StoredMedia, *, reply_to: Any = None) -> None:
+        """Shares an image or a voice note in the conversation (Section 11.8)."""
+        image = media.kind == "image"
+        place = self._place
+        await self._call(
+            lambda: self._client.upload_file(
+                place.channel,
+                media.data,
+                filename="image.png" if image else "voice.ogg",
+                title="Image" if image else "Voice note",
+                thread_ts=place.thread_ts,
+            )
         )
 
     async def _call[T](self, send: Callable[[], Awaitable[T]]) -> T:
@@ -547,7 +564,7 @@ class SlackGateway:
 
     async def _expand(self, place: _Place, target: Target, grants: Grants, text: str) -> str | None:
         """The message text for a skill command, or ``None`` if ``text`` is not one."""
-        if self._skills is None or commands.parse(text) is None:
+        if self._skills is None or not commands.is_command(text):
             return None
         current = await self._session(place, target, grants, create=False)
         profile = target.agent_profile_id if current is None else current.agent_profile_id
@@ -568,7 +585,8 @@ class SlackGateway:
         """``/sama <skill> <request>``. Slack does not allow a new slash command for a skill,
         so a direct message starts the skill here, and a channel needs a mention."""
         text = f"/{name} {request}".strip()
-        if commands.parse(text) is None or self._skills is None:
+        learn = commands.parse_learn(text) is not None
+        if not commands.is_command(text) or self._skills is None:
             return HELP
         if identity is None:
             return PAIR_PROMPT if channel.startswith("D") else LINK_FIRST
@@ -586,7 +604,7 @@ class SlackGateway:
             return HELP
         async with self._locks.hold((place.channel, place.thread_ts)):
             await self._start(place, target, text)
-        return f"The skill {name} started."
+        return "The learn run started." if learn else f"The skill {name} started."
 
     async def _identity(self, sender: str) -> Any:
         """The ``channel_identities`` row of the Slack user, or None."""
@@ -932,6 +950,7 @@ class SlackGateway:
         try:
             status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
             await send_ending(self._engine, outbox, org_id, run_id, status, reply)
+            await send_media(self._engine, outbox, org_id, run_id)
         except _Unlinked:
             log.warning("the conversation lost its link; run=%s is not delivered", run_id)
         except SlackError as error:

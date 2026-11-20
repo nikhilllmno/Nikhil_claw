@@ -48,6 +48,8 @@ from sama.github.service import GitHubService
 from sama.integrations.hub import TelegramHub
 from sama.integrations.service import Integrations
 from sama.integrations.slack_hub import SlackHub
+from sama.media.generate import GeneratedMediaStore, ImageService, SpeechService
+from sama.media.meter import MediaMeter
 from sama.media.store import AttachmentStore
 from sama.media.vision import VisionService
 from sama.memory import MemoryService, PostgresMemoryStore
@@ -59,6 +61,7 @@ from sama.observability.alerts import ErrorRateAlerter, SlackWebhook
 from sama.observability.langfuse import LangfuseClient
 from sama.observability.traces import TraceExporter
 from sama.orchestrator import PostgresSandboxDirectory, RunQueue, Worker
+from sama.orchestrator.references import ReferenceExpander
 from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
@@ -73,12 +76,15 @@ from sama.scheduler.jobs import JobService
 from sama.scheduler.service import Scheduler
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
+from sama.skills.importer import SkillImporter
 from sama.tasks.dispatcher import TaskDispatcher
 from sama.tasks.runs import TaskTools
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
+from sama.tools.code import CodeRunner
 from sama.tools.deferred import DeferredCatalog
 from sama.tools.github import GitHubTools
+from sama.tools.outbound import OutboundClient
 from sama.tools.output import SandboxSpill
 from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
@@ -212,6 +218,9 @@ def build(
         registry.register(runtime)
 
     queue = RunQueue(engine)
+    # One outbound client for ``web_extract`` and ``@url`` references: the same address rules
+    # apply to both (Section 6.3). The tool server closes it.
+    outbound = OutboundClient()
     worker = Worker(
         queue,
         registry,
@@ -224,6 +233,11 @@ def build(
         ),
         gate=gate,
         reviews=reviews,
+        references=ReferenceExpander(
+            outbound=outbound,
+            sessions=SessionSearch(engine),
+            session_sandbox=sandboxed.session_sandbox if sandboxed else None,
+        ),
         poll_s=worker_poll_s,
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
@@ -250,6 +264,11 @@ def build(
     ledger = UsageLedger(usage)
     prices = PriceTable.load()
     jobs = JobService(engine, RunQueue(engine))
+    # The media tools use the OpenAI key of the org (Section 11.7). Without a key, they are
+    # hidden.
+    media = GeneratedMediaStore(engine)
+    openai_media = keys.available(SecretName.OPENAI_API_KEY)
+    meter = MediaMeter(usage=usage, prices=prices, ledger=ledger)
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),
@@ -270,6 +289,12 @@ def build(
             else None
         ),
         github=github_tools,
+        # The program reaches the tool server at the same URL as the agent runtime (M4.8).
+        code=(
+            CodeRunner(sandboxed.session_sandbox, f"{settings.tools_url}{MCP_PATH}")
+            if sandboxed
+            else None
+        ),
         memory=MemoryService(memory_store, proposals),
         skills=skill_store,
         souls=SoulProposer(engine, proposals),
@@ -287,8 +312,20 @@ def build(
             if keys.available(SecretName.ANTHROPIC_API_KEY)
             else None
         ),
+        images=(
+            ImageService(store=media, keys=keys, meter=meter, redactor=default_redactor())
+            if openai_media
+            else None
+        ),
+        speech=(
+            SpeechService(store=media, keys=keys, meter=meter, redactor=default_redactor())
+            if openai_media
+            else None
+        ),
         deferred=deferred,
         connections=connections,
+        importer=SkillImporter(skill_store),
+        outbound=outbound,
         archive=ContextArchive(engine),
         session_items=PostgresSessionItems(engine),
         gate=gate,

@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
 from importlib import resources
@@ -92,6 +92,7 @@ from sama.gateway.pairing import PairingError, create_code
 from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
+from sama.media.generate import GeneratedMediaStore
 from sama.memory import (
     CAPS,
     MemoryChangeError,
@@ -382,6 +383,19 @@ class PinOut(BaseModel):
     created_at: datetime
 
 
+class MediaOut(BaseModel):
+    """An image or a voice note that a run made (Section 11.8). ``GET .../media/{id}`` gives
+    the bytes."""
+
+    id: uuid.UUID
+    run_id: uuid.UUID
+    kind: str
+    mime_type: str
+    size_bytes: int
+    caption: str
+    created_at: datetime
+
+
 class CompactionOut(BaseModel):
     id: uuid.UUID
     run_id: uuid.UUID
@@ -644,6 +658,7 @@ class SamaApi:
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
         self._jobs = jobs
+        self._media = GeneratedMediaStore(engine)
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._board = TaskBoard(engine, self._queue)
@@ -789,6 +804,32 @@ class SamaApi:
             if not await self._pins.remove(access.org_id, session_id, pin_id):
                 raise _not_found("the pin does not exist")
             return Response(status_code=204)
+
+        @app.get("/sessions/{session_id}/media")
+        async def list_media(
+            principal: Me,
+            session_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        ) -> list[MediaOut]:
+            access = await self._access(principal, session_id)
+            files = await self._media.list(access.org_id, session_id, limit)
+            return [MediaOut(**asdict(media)) for media in files]
+
+        @app.get("/sessions/{session_id}/media/{media_id}")
+        async def get_media(principal: Me, session_id: uuid.UUID, media_id: uuid.UUID) -> Response:
+            access = await self._access(principal, session_id)
+            media = await self._media.load(access.org_id, session_id, media_id)
+            if media is None:
+                raise _not_found("the file does not exist")
+            name = "image.png" if media.kind == "image" else "voice.ogg"
+            return Response(
+                content=media.data,
+                media_type=media.mime_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{name}"',
+                    "Cache-Control": "private, max-age=3600",
+                },
+            )
 
         @app.get("/sessions/{session_id}/events")
         async def events(

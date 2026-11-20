@@ -241,6 +241,19 @@ async def test_a_skill_command_in_a_message_is_expanded(
     assert texts[1:] == ["/not-a-skill hello", "/usr/bin/env", "hello"]
 
 
+async def test_learn_in_a_message_asks_for_a_draft_skill(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    s1 = tenant.ids["s1"]
+    sent = await client.post(
+        f"/sessions/{s1}/messages", headers=mia(tenant), json={"text": "/learn pdf forms"}
+    )
+    assert sent.status_code == 202
+    (text,) = await stored_texts(engine, s1)
+    assert text.startswith("Learn from: pdf forms\n\n")
+    assert "skill_manage" in text
+
+
 async def test_a_skill_command_needs_the_skills_toolset(
     client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:

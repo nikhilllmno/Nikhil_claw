@@ -151,3 +151,18 @@ async def test_a_direct_message_with_slash_text_that_is_no_skill_stays_plain(
     await pair(gateway, engine, tenant)
     await gateway.handle_event(dm("/not-a-skill hello"))
     assert await user_texts(engine, f":dm:{DM}") == ["/not-a-skill hello"]
+
+
+async def test_sama_learn_starts_a_learn_run_in_a_direct_message(
+    gateway: SlackGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+) -> None:
+    assert "/sama learn" in HELP
+    await pair(gateway, engine, tenant)
+    assert await gateway.command(command("learn https://docs.example.com/a")) == (
+        "The learn run started."
+    )
+    (text,) = await user_texts(engine, f":dm:{DM}")
+    assert text.startswith("Learn from: https://docs.example.com/a\n\n")
+    assert "skill_manage" in text

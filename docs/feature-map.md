@@ -53,12 +53,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `x_search` | `tools/x_search_tool.py` | Through an integration if needed. | Defer | — |
 | `vision_analyze` | `tools/vision_tools.py` | Sama `media` tool. Images from Telegram and Slack are stored, and a vision model answers questions about them (§11.7). | Adapt | M2 (done) |
 | `video_analyze`, `video_generate` | `tools/vision_tools.py`, `tools/video_generation_tool.py` | Not planned. | Defer | — |
-| `image_generate` | `tools/image_generation_tool.py` | Sama `media` tool with the OpenAI image model, behind `tool_search`. | Adapt | M4 |
-| `text_to_speech` | `tools/tts_tool.py` | Sama `media` tool. Telegram sends a voice note. | Adapt | M4 |
+| `image_generate` | `tools/image_generation_tool.py` | Sama `media` tool with the OpenAI image model. Telegram sends a photo, Slack uploads a file, and the API lists the file (§11.8). | Adapt | M4 (M4.9 done) |
+| `text_to_speech` | `tools/tts_tool.py` | Sama `media` tool. Telegram sends a voice note, and Slack uploads the audio file (§11.8). | Adapt | M4 (M4.9 done) |
 | Speech to text for voice memos | `tools/transcription_tools.py` | Gateway transcribes inbound voice with the OpenAI transcription model before the run (§11). | Adapt | M1 |
 | `todo_list` | `tools/todo_tool.py` | Sama `todo` tool for both runtimes. On Claude, native `TodoWrite` calls map to the same list. The web app shows it (§10.2). | Adapt | M1 |
 | `clarify` | `tools/clarify_tool.py` | Sama tool, rendered as buttons per channel. Denied in unattended runs. | Adapt | M1 |
-| `execute_code` (RPC to tools) | `tools/code_execution_tool.py` | Sama `code_exec`: Python in the sandbox with a stub that calls sama tools over MCP. | Adapt | M4 |
+| `execute_code` (RPC to tools) | `tools/code_execution_tool.py` | Sama `code_exec`: Python in the sandbox with a stub that calls sama tools over MCP. Only stdout returns to the model (§10.2). | Adapt | M4 (M4.8 done) |
 | `computer_use` (desktop control) | `tools/computer_use_tool.py` | Browser vision mode (§14) covers web apps. Full desktop control is not planned. | Defer | — |
 | `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` (a link to the Connections page), `connection_test`. Add, change, and remove happen in the web app. `/connect` gives a link, so secrets never enter chat (§10.3). | Adapt | M3 (M3.4 done) |
 | Discord and Feishu tools | `tools/discord_tool.py`, `tools/feishu_*.py` | Through Composio toolkits when needed. | Defer | — |
@@ -77,7 +77,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Skill scopes (builtin, user dir, project) | `agent/skill_*.py` | builtin, org, workspace, user. User scope applies at once. Shared scopes need approval (§9). | Adapt | M2 (done) |
 | Skills as slash commands (`/<skill>`) | `gateway/slash_commands.py` | `/<skill-name>` in every channel (§11.1). | Adapt | M2 (done) |
 | Bundled skills (44) and optional skills (141) | `skills/`, `optional-skills/` | We write a small set of our own builtin skills. We do not copy Hermes skill text without attribution. | Adapt | M2 (done) |
-| Skills Hub install with quarantine and scan | `tools/skills_hub*.py`, `skills_guard.py` | Import from a Git URL or `agentskills.io` with a lint and injection scan, then approval. | Adapt | M4 |
+| Skills Hub install with quarantine and scan | `tools/skills_hub*.py`, `skills_guard.py` | `skill_import` from a public GitHub URL with an import scan, the skill lint and injection scan, and an approval (§9.6). `agentskills.io` is later. | Adapt | M4 (M4.10 done) |
 | Conditional activation (`requires_toolsets`, platforms) | frontmatter | Same frontmatter keys. Skills whose tools are missing are hidden. | Adapt | M2 (done) |
 | Per-skill config | `skills.config` | Skill settings per workspace, filled in the web app. | Adapt | M3 |
 | Skill bundles | `agent/skill_bundles.py` | Agent profiles list skills. | Adapt | M2 (done) |
@@ -115,7 +115,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Tool output cap (50,000 bytes) and spill to file | `tools/tool_result_storage*.py` | Sama tools cap at 50 KB and spill to a sandbox file with a preview and path. | Adapt | M1 |
 | Tool search (`tool_search`, `tool_describe`, `tool_call`) | `tools/tool_search*.py` | Same three tools for deferred tools and integrations. The gate judges `tool_call` as a call of the tool that it names (§6.3, §16.1). The Claude native `ToolSearch` stays a loader that the gate allows. | Adapt | M2 (M2.6 done) |
 | Token accounting | `agent/usage*.py` | Model proxy records tokens and cost per call (§18). | Adapt | M1 |
-| `@file`, `@url` references | `agent/context_references.py` | `@file`, `@url`, `@session` in a message. | Adapt | M4 |
+| `@file`, `@url` references | `agent/context_references.py` | `@file`, `@url`, `@session` in a message. The worker attaches them to the run input as untrusted data (§6.4). | Adapt | M4 (M4.9 done) |
 | `/compress` | slash command | `/compact [focus]` asks the runtime to compact now, in the API, Telegram, and Slack direct messages (§6.3). | Adapt | M2 (M2.6 done) |
 | Context pins | none | A user pins a text or a message. Sama injects the pins and injects them again after a compaction (§6.3). Files are not pinnable yet. | New | M2 (M2.6 done) |
 
@@ -125,7 +125,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 |---|---|---|---|---|
 | Background review fork (memory and skills) | `agent/background_review.py` | A separate review run after the main run, with a cheap model, recursion off, and only `memory` and `skills` tools (§9.4.1). | Adapt | M2 (M2.4 done) |
 | Skill creation nudge (10 tool iterations) | `agent/agent_init.py` | Same default (§9.4.1). | Adapt | M2 (M2.4 done) |
-| `/learn` (skill from sources) | `learn_prompt.py` | `/learn <url or files>` creates a draft skill for review. | Adapt | M4 |
+| `/learn` (skill from sources) | `learn_prompt.py` | `/learn <urls or topic>` asks the agent to read the sources and write one draft skill with `skill_manage` (§9.6). | Adapt | M4 (M4.10 done) |
 | Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace. Archive, never delete. Pins (§9). | Adapt | M6 |
 | Checkpoints and `/rollback`, `/undo` | `agent/checkpoints/` | Shadow git in the sandbox or Claude file checkpointing. User commands, not model tools (§15.3). | Adapt | M6 |
 | Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). The SOUL target is done in M3.2 (§9.4.2). | Adapt | M6 |

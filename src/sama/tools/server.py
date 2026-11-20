@@ -36,6 +36,17 @@ from sama.context.compaction import ArchiveError
 from sama.delegation import DelegationError, DelegationService
 from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, Verdict
 from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
+from sama.media.generate import (
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_VOICE,
+    MAX_PROMPT_CHARS,
+    MAX_SPEECH_CHARS,
+    ImageService,
+    ImageSize,
+    SpeechService,
+    Voice,
+)
+from sama.media.meter import MediaError
 from sama.media.vision import (
     DEFAULT_QUESTION,
     LATEST,
@@ -98,6 +109,8 @@ from sama.tools.clarify import (
     ClarifyQuestion,
     render_answers,
 )
+from sama.tools.code import DEFAULT_TIMEOUT_S, MAX_CODE_CHARS, MAX_TIMEOUT_S, CodeError, CodeRunner
+from sama.tools.code import render as render_code
 from sama.tools.cron import CRONJOB_MANAGE, CronAction, CronRequest, job_input
 from sama.tools.cron import DESCRIPTION as CRON_DESCRIPTION
 from sama.tools.cron import manage as manage_jobs
@@ -138,6 +151,7 @@ from sama.vault.redact import redact
 
 if TYPE_CHECKING:
     from sama.connectors.service import ConnectionService
+    from sama.skills.importer import SkillImporter
 
 log = logging.getLogger("sama.tools")
 
@@ -160,10 +174,14 @@ REPO_CLONE: Final = "repo_clone"
 SKILLS_LIST: Final = "skills_list"
 SKILL_VIEW: Final = "skill_view"
 SKILL_MANAGE: Final = "skill_manage"
+SKILL_IMPORT: Final = "skill_import"
 VISION_ANALYZE: Final = "vision_analyze"
 CONNECTIONS_LIST: Final = "connections_list"
 CONNECTION_REQUEST: Final = "connection_request"
 CONNECTION_TEST: Final = "connection_test"
+EXECUTE_CODE: Final = "execute_code"
+IMAGE_GENERATE: Final = "image_generate"
+TEXT_TO_SPEECH: Final = "text_to_speech"
 
 MAX_ERROR_CHARS: Final = 2_000
 """An error result is cut to this length. Argument errors of the SDK can be long."""
@@ -172,9 +190,11 @@ _EXPECTED = (
     ClarifyError,
     ConnectorError,
     JobError,
+    CodeError,
     DeferredToolError,
     DelegationError,
     GitHubToolError,
+    MediaError,
     MemoryChangeError,
     RepoError,
     SearchError,
@@ -308,10 +328,17 @@ class ToolServer:
       ``repo_push_approval``). Without it, these tools are hidden.
     - ``memory``: the memory service. Without it, ``memory`` is hidden.
     - ``skills``: the skill library (``skills_list``, ``skill_view``, ``skill_manage``).
+    - ``importer``: ``skill_import`` (M4.10), in the ``skills`` toolset. It is not allowed by
+      default, so a person approves each import.
       Without it, these tools are hidden.
     - ``sessions``: session search. Without it, ``session_search`` and ``session_read`` are
       hidden.
     - ``vision``: image analysis (``vision_analyze``). Without it, the tool is hidden.
+    - ``images`` and ``speech``: make an image (``image_generate``) or a voice note
+      (``text_to_speech``) that the gateway sends with the reply (Section 11.8). Without one,
+      its tool is hidden.
+    - ``code``: runs a Python program in the session sandbox (``execute_code``, Section 10.2).
+      Without it, the tool is hidden.
     - ``souls``: proposes a new soul for the profile of the run (``change_propose``, toolset
       ``self``). Without it, the tool is hidden.
     - ``deferred``: the catalog of deferred tools. With at least one tool in it when the app
@@ -359,8 +386,16 @@ class ToolServer:
         tasks: TaskTools | None = None,
         session_items: SessionItemsBackend | None = None,
         jobs: JobService | None = None,
+        code: CodeRunner | None = None,
+        images: ImageService | None = None,
+        speech: SpeechService | None = None,
+        importer: SkillImporter | None = None,
     ) -> None:
         self.signer = signer
+        self.importer = importer
+        self.code = code
+        self.images = images
+        self.speech = speech
         self.souls = souls
         self.session_items = session_items
         self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
@@ -386,8 +421,9 @@ class ToolServer:
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
-        if self.vision is not None:
-            await self.vision.aclose()
+        for service in (self.vision, self.images, self.speech, self.importer):
+            if service is not None:
+                await service.aclose()
         close = getattr(self.search, "aclose", None)
         if close is not None:
             await close()
@@ -712,6 +748,58 @@ class ToolServer:
                 arguments = {"attachment_id": attachment_id, "question": question}
                 return await self._call(ctx, VISION_ANALYZE, arguments, body)
 
+        if self.images is not None:
+            images = self.images
+
+            @server.tool(
+                name=IMAGE_GENERATE,
+                description=(
+                    "Make an image from a text description. sama sends the image to the user "
+                    "with your reply, so do not describe its bytes or paste a link. prompt "
+                    "says what the image shows: the subject, the style, and the colours. size "
+                    "is 1024x1024 (square), 1536x1024 (wide), or 1024x1536 (tall). Each call "
+                    "costs money: make one image unless the user asks for more."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+                structured_output=False,
+            )
+            async def image_generate(
+                ctx: Context,
+                prompt: Annotated[str, Field(min_length=1, max_length=MAX_PROMPT_CHARS)],
+                size: ImageSize = DEFAULT_IMAGE_SIZE,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return (await images.generate(claims, prompt, size)).text
+
+                arguments = {"prompt": prompt, "size": size}
+                return await self._call(ctx, IMAGE_GENERATE, arguments, body)
+
+        if self.speech is not None:
+            speech = self.speech
+
+            @server.tool(
+                name=TEXT_TO_SPEECH,
+                description=(
+                    "Read a text aloud as a voice note. sama sends the voice note to the user "
+                    "with your reply (in Telegram, a voice message). Use it when the user asks "
+                    "for audio. text is what the voice says, in plain words without Markdown. "
+                    "voice is one of alloy, echo, fable, onyx, nova, or shimmer."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+                structured_output=False,
+            )
+            async def text_to_speech(
+                ctx: Context,
+                text: Annotated[str, Field(min_length=1, max_length=MAX_SPEECH_CHARS)],
+                voice: Voice = DEFAULT_VOICE,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    result = await speech.speak(claims, text, voice)
+                    return result.text
+
+                arguments = {"text": text, "voice": voice}
+                return await self._call(ctx, TEXT_TO_SPEECH, arguments, body)
+
         if self.deferred is not None and len(self.deferred) > 0:
             self._deferred_tools(server, self.deferred)
 
@@ -751,6 +839,36 @@ class ToolServer:
 
         if self.github is not None:
             self._github_tools(server, self.github)
+        if self.code is not None:
+            runner = self.code
+
+            @server.tool(
+                name=EXECUTE_CODE,
+                description=(
+                    "Run a Python 3 program in your sandbox and get its standard output. Use it "
+                    "to call many sama tools in one step and give back only a short result. In "
+                    "the program, `import sama_tools`, then call a tool as "
+                    '`sama_tools.call("web_search", query="...")` or '
+                    '`sama_tools.web_search(query="...")`. A call returns the text result or '
+                    "raises sama_tools.ToolError. Print what you need: only standard output "
+                    "comes back. The program runs in your work folder. timeout_s is the time "
+                    f"limit (default {DEFAULT_TIMEOUT_S}, at most {MAX_TIMEOUT_S}). Tools that "
+                    "need an approval are refused unless a person approved the same call."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+                structured_output=False,
+            )
+            async def execute_code(
+                code: Annotated[str, Field(min_length=1, max_length=MAX_CODE_CHARS)],
+                ctx: Context,
+                timeout_s: Annotated[int, Field(ge=1, le=MAX_TIMEOUT_S)] = DEFAULT_TIMEOUT_S,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    token = bearer_of(ctx.headers) or ""
+                    return render_code(await runner.run(claims, token, code, timeout_s))
+
+                arguments = {"code": code, "timeout_s": timeout_s}
+                return await self._call(ctx, EXECUTE_CODE, arguments, body)
 
         if self.skills is not None:
             library = self.skills
@@ -854,6 +972,51 @@ class ToolServer:
             register_tasks(server, self._call, self.tasks)
         if self.jobs is not None:
             self._cron_tool(server, self.jobs)
+        if self.importer is not None:
+            importer = self.importer
+
+            @server.tool(
+                name=SKILL_IMPORT,
+                description=(
+                    "Import a skill from a public GitHub repository. url is "
+                    "https://github.com/<owner>/<repo> or "
+                    "https://github.com/<owner>/<repo>/tree/<ref>/<folder>; path is the folder "
+                    "of the SKILL.md (default: the root), and ref a branch, tag, or commit. "
+                    "The import reads SKILL.md and the files in references/, templates/, "
+                    "scripts/, and assets/, scans them, and creates the skill. A person "
+                    "approves the call first. scope is like in skill_manage. name replaces "
+                    "the name of the SKILL.md."
+                ),
+                annotations=ToolAnnotations(
+                    read_only_hint=False, destructive_hint=False, open_world_hint=True
+                ),
+                structured_output=False,
+            )
+            async def skill_import(
+                url: Annotated[str, Field(min_length=1, max_length=500)],
+                ctx: Context,
+                path: Annotated[str | None, Field(max_length=200)] = None,
+                ref: Annotated[str | None, Field(min_length=1, max_length=100)] = None,
+                name: Annotated[str | None, Field(min_length=1, max_length=64)] = None,
+                scope: Literal["user", "workspace", "org"] | None = None,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return await importer.run(
+                        claims, url, path=path, ref=ref, name=name, scope=scope
+                    )
+
+                arguments = {
+                    k: v
+                    for k, v in {
+                        "url": url,
+                        "path": path,
+                        "ref": ref,
+                        "name": name,
+                        "scope": scope,
+                    }.items()
+                    if v is not None
+                }
+                return await self._call(ctx, SKILL_IMPORT, arguments, body)
 
         return server
 

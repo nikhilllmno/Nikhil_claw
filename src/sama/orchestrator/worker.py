@@ -33,7 +33,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from sama.gate.service import GateService
 from sama.observability.logs import log_context
@@ -64,6 +64,9 @@ from sama.runtime.contract import (
     is_terminal,
 )
 from sama.vault.redact import redact
+
+if TYPE_CHECKING:
+    from sama.orchestrator.references import ReferenceExpander
 
 log: Final = logging.getLogger("sama.orchestrator")
 
@@ -141,6 +144,7 @@ class Worker:
         gate: GateService | None = None,
         on_run_end: Sequence[RunEndHook] = (),
         reviews: ReviewApplier | None = None,
+        references: ReferenceExpander | None = None,
         heartbeat_s: float | None = None,
         poll_s: float = 1.0,
         maintenance_s: float = 30.0,
@@ -153,6 +157,7 @@ class Worker:
         self._gate = gate or GateService(queue.engine)
         self._on_run_end = tuple(on_run_end)
         self._reviews = reviews
+        self._references = references
         self._heartbeat_s = heartbeat_s or queue.lease.total_seconds() / 3
         self._poll_s = poll_s
         self._maintenance_s = maintenance_s
@@ -265,6 +270,7 @@ class Worker:
         # The check comes before the dispatch: the dispatch then checks the lease just before
         # the start, so a slow check cannot start a run that another attempt owns now.
         run = await self._reconfirm(run)
+        run = await self._expand(run)
         if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
@@ -303,6 +309,21 @@ class Worker:
         steps.mark("finish")
         # One line per run with the end time of each step (Section 18.1).
         log.info("worker steps run=%s %s", run.run_id, steps)
+
+    async def _expand(self, run: ClaimedRun) -> ClaimedRun:
+        """Attaches the content of the ``@`` references of a new chat message (Section 6.3,
+        M4.9). Only the input of this run changes: the stored message stays as it was. The
+        dispatch after this checks the lease, so a slow read cannot start a lost run."""
+        if self._references is None or run.resume is not None or run.compact:
+            return run
+        if run.kind != "chat":
+            return run
+        try:
+            text = await self._references.expand(run)
+        except Exception as error:  # a reference must not fail the run
+            log.warning("the references failed run=%s: %r", run.run_id, error)
+            return run
+        return replace(run, input=text)
 
     async def _reconfirm(self, run: ClaimedRun) -> ClaimedRun:
         """Checks an approved call again before the resume (Section 5.1). Authority is live,

@@ -150,6 +150,9 @@ class ManageRequest:
     file_path: str | None = None
     file_content: str | None = None
     summary: str | None = None
+    files: dict[str, str] | None = None
+    """The files of a new skill, for ``create``. ``skill_import`` sets it (M4.10). The
+    ``skill_manage`` tool does not: the agent adds a file with ``write_file``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,7 +200,7 @@ def _content(target: SkillDoc | None, request: ManageRequest) -> tuple[str, Mapp
     """The new ``SKILL.md`` and the new files."""
     action = request.action
     if action == "create":
-        return _need(request.content, "content", action), {}
+        return _need(request.content, "content", action), dict(request.files or {})
     if target is None:
         raise SkillError("There is no such skill.")
     files = dict(target.files)
@@ -232,6 +235,8 @@ def plan_write(candidates: Sequence[SkillDoc], actor: Actor, request: ManageRequ
     ``SkillError`` for a request that cannot work."""
     if request.action not in ACTIONS:
         raise SkillError(f"The action must be one of: {', '.join(ACTIONS)}.")
+    if request.files and request.action != "create":
+        raise SkillError("Only the action create takes files.")
     name = request.name
     if request.action == "create":
         if (problem := name_problem(name)) is not None:

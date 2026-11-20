@@ -40,6 +40,7 @@ from sama.db.models import (
 from sama.gate.approvers import Approvers, approvers_of
 from sama.gate.decide import ALWAYS_ASK, canonical_name
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
+from sama.media.generate import GeneratedMediaStore, StoredMedia
 from sama.orchestrator.queue import RunQueue
 from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
@@ -139,6 +140,12 @@ class Outbox(Protocol):
     async def send_message(self, text: str, *, reply_to: Any = None) -> Any: ...
 
     async def edit_message(self, message_id: Any, text: str) -> None: ...
+
+
+class MediaOutbox(Protocol):
+    """An outbox that also sends files (Section 11.8)."""
+
+    async def send_media(self, media: StoredMedia, *, reply_to: Any = None) -> None: ...
 
 
 class Reply:
@@ -596,6 +603,23 @@ async def send_ending(
         await outbox.send_message(await failure_message(engine, org_id, run_id))
     elif status == "cancelled":
         await outbox.send_message("The run stopped.")
+
+
+async def send_media(
+    engine: AsyncEngine,
+    outbox: MediaOutbox,
+    org_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    reply_to: Any = None,
+) -> None:
+    """Sends the images and voice notes that the run made (``image_generate`` and
+    ``text_to_speech``, Section 11.8), oldest first, and marks each one sent. An error of the
+    outbox stops the rest; the files that did not go stay pending."""
+    store = GeneratedMediaStore(engine)
+    for media in await store.pending(org_id, run_id):
+        await outbox.send_media(media, reply_to=reply_to)
+        await store.delivered(org_id, media.id)
 
 
 @dataclass(frozen=True, slots=True)

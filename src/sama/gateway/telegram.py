@@ -56,11 +56,13 @@ from sama.gateway.sessions import (
     offers_always,
     pin_reply,
     send_ending,
+    send_media,
     stop_runs,
     wait_for_tasks,
 )
 from sama.gateway.telegram_client import TelegramClient, TelegramError
 from sama.gateway.transcribe import TranscribeError, Transcriber
+from sama.media.generate import StoredMedia
 from sama.media.images import (
     MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_MESSAGE,
@@ -103,7 +105,8 @@ HELP: Final = (
     "/pair <code> - link this account, or link a group with a group code\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
     "/connect <name> - get a link to connect a tool such as gmail or github\n"
-    "/cron - list and make scheduled jobs. /cron help shows more"
+    "/cron - list and make scheduled jobs. /cron help shows more\n"
+    "/learn <urls or topic> - make a draft skill from sources"
 )
 
 OWN_COMMANDS: Final = frozenset(
@@ -232,6 +235,11 @@ class _Outbox:
 
     async def edit_message(self, message_id: int, text: str) -> None:
         await self._call(lambda: self._client.edit_message(self._chat_id, message_id, text))
+
+    async def send_media(self, media: StoredMedia, *, reply_to: Any = None) -> None:
+        """An image goes as a photo and a voice note as a voice message (Section 11.8)."""
+        send = self._client.send_photo if media.kind == "image" else self._client.send_voice
+        await self._call(lambda: send(self._chat_id, media.data, reply_to=reply_to))
 
     async def _call[T](self, send: Callable[[], Awaitable[T]]) -> T:
         for attempt in range(1, self._max_tries + 1):
@@ -885,6 +893,7 @@ class TelegramGateway:
                 await self._client.typing(chat_id)
             status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
             await send_ending(self._engine, outbox, org_id, run_id, status, reply)
+            await send_media(self._engine, outbox, org_id, run_id, reply_to=reply_to)
         except _Unlinked:
             log.warning("the chat lost its link; run=%s is not delivered", run_id)
         except TelegramError as error:

@@ -66,6 +66,7 @@ SLACK_SCOPES: Final = (
     "chat:write",
     "commands",
     "files:read",
+    "files:write",
     "im:history",
     "im:read",
     "im:write",

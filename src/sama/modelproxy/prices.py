@@ -76,6 +76,9 @@ class ModelPrice(Rates):
 class ProviderPrices(_Frozen):
     web_search_per_1k: Decimal = Field(default=Decimal(0), ge=0)
     models: dict[str, ModelPrice]
+    media: dict[str, ModelPrice] = Field(default_factory=dict)
+    """The models of the media tools (Section 11.8). The proxy does not allow them: a run cannot
+    call them as chat models."""
 
 
 class PriceTable(_Frozen):
@@ -97,10 +100,23 @@ class PriceTable(_Frozen):
         dated = _DATED_ID.match(model)
         return models.get(dated["base"]) if dated else None
 
+    def media(self, provider: Provider, model: str) -> ModelPrice | None:
+        """The price of a media model, for example ``gpt-image-2.6-flare``."""
+        return self._prices(provider).media.get(model)
+
     def cost(self, provider: Provider, model: str, counts: TokenCounts) -> Decimal:
         price = self.lookup(provider, model)
         if price is None:
             raise KeyError(f"no price for the model {model!r}")
+        return self._cost(provider, price, counts)
+
+    def media_cost(self, provider: Provider, model: str, counts: TokenCounts) -> Decimal:
+        price = self.media(provider, model)
+        if price is None:
+            raise KeyError(f"no price for the media model {model!r}")
+        return self._cost(provider, price, counts)
+
+    def _cost(self, provider: Provider, price: ModelPrice, counts: TokenCounts) -> Decimal:
         rates = price.rates_for(counts)
         tokens = (
             rates.input * counts.input
