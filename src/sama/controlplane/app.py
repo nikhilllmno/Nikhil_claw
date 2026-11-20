@@ -51,6 +51,7 @@ from sama.orchestrator.sandboxed import SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.sandbox.base import SandboxProvider
+from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
 from sama.tools.output import SandboxSpill
@@ -135,6 +136,7 @@ def build(
     signer = RunTokenSigner(settings.run_token_key.get_secret_value().encode())
     gate = GateService(engine)
     broker = ClarifyBroker()
+    library = SkillLibrary(engine, BuiltinSkills().all())
 
     registry = RuntimeRegistry()
     sandboxed: SandboxedRuntime | None = None
@@ -154,6 +156,7 @@ def build(
                 allow_out=settings.allow_out,
             ),
             directory=PostgresSandboxDirectory(engine),
+            skills=SessionSkillSource(engine, library),
         )
         runtimes = (sandboxed,)
     for runtime in runtimes:
@@ -167,6 +170,7 @@ def build(
             mcp_servers=(
                 McpServerConfig(name=MCP_SERVER_NAME, url=f"{settings.tools_url}{MCP_PATH}"),
             ),
+            skills=library,
         ),
         gate=gate,
         poll_s=worker_poll_s,
@@ -183,6 +187,7 @@ def build(
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
         memory=MemoryService(PostgresMemoryStore(engine)),
+        skills=PostgresSkillStore(engine, library.builtin),
         gate=gate,
     )
     proxy = ModelProxy(
@@ -194,8 +199,12 @@ def build(
         ),
         keys=keys,
     )
-    hub = TelegramHub(engine, vault, keys=keys, gate=gate) if vault is not None else None
-    slack = SlackHub(engine, vault, gate=gate) if vault is not None else None
+    hub = (
+        TelegramHub(engine, vault, keys=keys, gate=gate, skills=library)
+        if vault is not None
+        else None
+    )
+    slack = SlackHub(engine, vault, gate=gate, skills=library) if vault is not None else None
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack):
@@ -221,6 +230,7 @@ def build(
             supabase_anon_key=settings.supabase_anon_key,
         ),
         integrations=integrations,
+        skills=library,
     )
     api_app = api.app()
     tools_app = tools.app()

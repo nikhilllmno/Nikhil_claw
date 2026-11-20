@@ -20,7 +20,10 @@ from sama.orchestrator.worker import Worker
 from sama.prompt import MAX_CONTEXT_FILES, SYSTEM_PROMPT, PromptAssembler
 from sama.runtime.contract import McpServerConfig, RunConfig, RuntimeKind, RuntimeRegistry
 from sama.runtime.fake import FakeRuntime
+from sama.skills import ManageRequest, PostgresSkillStore, SkillLibrary
+from sama.tenancy import RunTokenClaims
 from tests.orchestrator.conftest import Tenant
+from tests.skills.helpers import doc, md
 
 OWNER = "w-prompt"
 
@@ -340,3 +343,90 @@ async def test_the_snapshot_is_frozen_with_the_session_config(
     assert "added later" not in after.memory_snapshot
     assert after.memory_snapshot == before.memory_snapshot
     assert after.fingerprint() == before.fingerprint()
+
+
+# -- the skill index (Section 6.1, Section 9.2) ---------------------------------------------------
+
+
+async def set_toolsets(engine: AsyncEngine, tenant: Tenant, toolsets: list[str]) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(toolsets=toolsets)
+        )
+
+
+def skill_library(engine: AsyncEngine) -> SkillLibrary:
+    return SkillLibrary(
+        engine,
+        {
+            "summarize": doc("summarize", description="Summarize a text"),
+            "needs-web": doc("needs-web", description="Needs the web", requires=("web",)),
+            "xxx": doc("xxx", description="d" * 60),
+        },
+    )
+
+
+async def test_the_skill_index_is_frozen_in_the_config(engine: AsyncEngine, tenant: Tenant) -> None:
+    await set_toolsets(engine, tenant, ["core", "skills"])
+    assembler = PromptAssembler(engine, skills=skill_library(engine))
+    run = await claimed(engine, tenant)
+    config = await assembler(run)
+    # needs-web is hidden: the profile has no web toolset.
+    assert [(e.name, len(e.description)) for e in config.skill_index] == [
+        ("summarize", 16),
+        ("xxx", 60),
+    ]
+    assert RunConfig.model_validate((await stored(engine, tenant)).run_config) == config
+    await end(engine, run)
+
+    # A new skill and a new toolset do not change a session that has started.
+    await set_toolsets(engine, tenant, ["core", "skills", "web"])
+    again = await claimed(engine, tenant)
+    assert (await assembler(again)).skill_index == config.skill_index
+    await end(engine, again)
+    # A new session sees them.
+    other = await claimed(engine, tenant, "s2")
+    names = [e.name for e in (await assembler(other)).skill_index]
+    assert names == ["needs-web", "summarize", "xxx"]
+    await end(engine, other)
+
+
+async def test_the_index_is_empty_without_the_skills_toolset_or_the_library(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    run = await claimed(engine, tenant)
+    assert (await PromptAssembler(engine, skills=skill_library(engine))(run)).skill_index == ()
+    await end(engine, run)
+    await set_toolsets(engine, tenant, ["core", "skills"])
+    other = await claimed(engine, tenant, "s2")
+    assert (await PromptAssembler(engine)(other)).skill_index == ()
+    await end(engine, other)
+
+
+async def test_a_user_skill_is_in_the_index_of_a_private_session_only(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await set_toolsets(engine, tenant, ["core", "skills"])
+    library = SkillLibrary(engine, {})
+    store = PostgresSkillStore(engine, {})
+    private = await claimed(engine, tenant, "mine")
+    claims = RunTokenClaims(
+        org_id=str(tenant.org),
+        workspace_id=str(tenant.ids["ws"]),
+        session_id=str(tenant.ids["mine"]),
+        run_id=str(private.run_id),
+        user_id=str(tenant.ids["mia"]),
+        token_id="t-1",
+        expires_at=2_000_000_000,
+    )
+    await store.manage(
+        claims, ManageRequest(action="create", name="mine-only", content=md("mine-only", "Mine"))
+    )
+    assembler = PromptAssembler(engine, skills=library)
+    assert [e.name for e in (await assembler(private)).skill_index] == ["mine-only"]
+    await end(engine, private)
+    shared = await claimed(engine, tenant, "s1")
+    assert (await assembler(shared)).skill_index == ()
+    await end(engine, shared)

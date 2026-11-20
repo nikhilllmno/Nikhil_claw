@@ -67,6 +67,7 @@ from sama.sandbox.base import (
     SandboxProvider,
     SandboxSpec,
 )
+from sama.skills.sync import SkillSource, sync_skills
 from sama.tenancy import RUN_TOKEN_MAX_TTL_S, RunTokenSigner
 
 log: Final = logging.getLogger("sama.orchestrator")
@@ -188,6 +189,7 @@ class SandboxedRuntime:
         settings: SandboxSettings,
         gate: GatePolicy | None = None,
         directory: SandboxDirectory | None = None,
+        skills: SkillSource | None = None,
     ) -> None:
         if kind not in CAPABILITIES:
             raise ValueError(f"the runner does not support runtime {kind}")
@@ -199,6 +201,7 @@ class SandboxedRuntime:
         self._settings = settings
         self._gate = gate or GatePolicy()
         self._directory = directory
+        self._skills = skills
         self._sandbox_ids: dict[tuple[str, str], str] = {}
         self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._session_runs: dict[tuple[str, str], int] = {}
@@ -458,6 +461,8 @@ class SandboxedRuntime:
                 if active.cancelled.is_set():
                     events.put_nowait(_cancelled(usage))
                     return
+                if self._skills is not None:
+                    await sync_skills(sandbox, self._skills, scope)
                 ttl = min(_wall_time_s(budget) + TOKEN_MARGIN_S, RUN_TOKEN_MAX_TTL_S)
                 env = {
                     WORKDIR_ENV: sandbox.workdir,

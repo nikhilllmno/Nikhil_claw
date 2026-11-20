@@ -29,6 +29,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "clarify": frozenset({"clarify"}),
     "github": frozenset({"repo_clone"}),
     "memory": frozenset({"memory"}),
+    "skills": frozenset({"skills_list", "skill_view", "skill_manage"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
@@ -52,10 +53,15 @@ DEFAULT_ALLOW: Final = frozenset(
         "clarify",
         "repo_clone",
         "memory",
+        "skills_list",
+        "skill_view",
+        "skill_manage",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
-rule, they are allowed. Every other tool gets ``ask``."""
+rule, they are allowed. Every other tool gets ``ask``. ``skill_manage`` is here because the
+skill store checks the role of the user for the scope of each write (Section 9.2), and every
+write is a version that can be reverted."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""

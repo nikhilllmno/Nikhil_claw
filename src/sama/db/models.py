@@ -71,6 +71,11 @@ VAULT_NAMES: Final = (
 INTEGRATION_KINDS: Final = ("telegram", "slack")
 """The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
+SKILL_SCOPES: Final = ("org", "workspace", "user")
+"""The stored scopes of a skill. The scope ``builtin`` is in the repo, not in the database."""
+SKILL_STATUSES: Final = ("active", "archived")
+SKILL_CHANGES: Final = ("create", "patch", "edit", "write_file", "remove_file", "archive")
+SKILL_AUTHOR_KINDS: Final = ("user", "agent", "system")
 
 
 def _one_of(column: str, values: tuple[str, ...]) -> str:
@@ -662,6 +667,94 @@ class StoredContextFile(Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
+
+
+class Skill(Base):
+    """A skill of the org, of a workspace, or of a user (docs/architecture.md, Section 9.2).
+
+    The row holds the name and the status. The text and the files are in ``skill_versions``.
+    A skill is never deleted: ``archive`` sets the status.
+    """
+
+    __tablename__ = "skills"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint(
+            "org_id", "scope", "workspace_id", "user_id", "name", postgresql_nulls_not_distinct=True
+        ),
+        CheckConstraint(_one_of("scope", SKILL_SCOPES), name="scope"),
+        CheckConstraint(_one_of("status", SKILL_STATUSES), name="status"),
+        CheckConstraint(
+            "(scope = 'org' AND workspace_id IS NULL AND user_id IS NULL)"
+            " OR (scope = 'workspace' AND workspace_id IS NOT NULL AND user_id IS NULL)"
+            " OR (scope = 'user' AND workspace_id IS NULL AND user_id IS NOT NULL)",
+            name="scope_columns",
+        ),
+        CheckConstraint("current_version >= 1", name="current_version"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'active'"))
+    current_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class SkillVersion(Base):
+    """One version of a skill. A version never changes (docs/architecture.md, Section 9.2).
+
+    ``files`` maps a relative path to its text. ``author_user_id``, ``session_id``, and
+    ``run_id`` are not foreign keys: the provenance outlives a deleted user, session, or run.
+    """
+
+    __tablename__ = "skill_versions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "skill_id"], ["skills.org_id", "skills.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("org_id", "skill_id", "version_no"),
+        CheckConstraint(_one_of("change", SKILL_CHANGES), name="change"),
+        CheckConstraint(_one_of("author_kind", SKILL_AUTHOR_KINDS), name="author_kind"),
+        CheckConstraint("jsonb_typeof(files) = 'object'", name="files_object"),
+        CheckConstraint("jsonb_typeof(tags) = 'array'", name="tags_array"),
+        CheckConstraint(
+            "jsonb_typeof(requires_toolsets) = 'array'", name="requires_toolsets_array"
+        ),
+        CheckConstraint("version_no >= 1", name="version_no"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    skill_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    skill_md: Mapped[str] = mapped_column(Text, nullable=False)
+    files: Mapped[dict[str, Any]] = _json()
+    tags: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    requires_toolsets: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    change: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    author_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
 
 
 PAIRING_KINDS: Final = ("user", "group")

@@ -46,6 +46,8 @@ from sama.db.models import (
     Run,
     RunEvent,
     Session,
+    Skill,
+    SkillVersion,
     User,
     Workspace,
 )
@@ -68,6 +70,7 @@ from sama.memory import (
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
+from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 
@@ -348,11 +351,15 @@ class SamaApi:
         settings: ApiSettings | None = None,
         integrations: Integrations | None = None,
         memory: MemoryService | None = None,
+        skills: SkillLibrary | None = None,
     ) -> None:
-        """Without ``integrations`` the integration routes answer ``409``."""
+        """Without ``integrations`` the integration routes answer ``409``. Without ``skills``,
+        the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
+        command."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
+        self._skills = skills
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
@@ -552,6 +559,16 @@ class SamaApi:
             if not gone:
                 raise _not_found("the org has no such integration")
             return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/skills")
+        async def list_skills(
+            principal: Me, org_id: uuid.UUID, workspace_id: uuid.UUID
+        ) -> list[dict[str, Any]]:
+            return await self._skills_of(principal, org_id, workspace_id)
+
+        @app.get("/skills/{skill_id}/versions")
+        async def skill_versions(principal: Me, skill_id: uuid.UUID) -> list[dict[str, Any]]:
+            return await self._skill_versions(principal, skill_id)
 
         @app.post("/channels/{channel}/pairing-codes", status_code=201)
         async def pairing_code(
@@ -1180,14 +1197,101 @@ class SamaApi:
                 )
             )
 
+    async def _skills_of(
+        self, principal: Principal, org_id: uuid.UUID, workspace_id: uuid.UUID
+    ) -> list[dict[str, Any]]:
+        """The skills that the user sees in a workspace: builtin, org, workspace, and user."""
+        if self._skills is None:
+            raise HTTPException(status_code=409, detail="skills are not set up")
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            user_id = await _user_id(connection, principal, org_id)
+            grants = None if user_id is None else await load_grants(connection, org_id, user_id)
+            if user_id is None or grants is None or not grants.sees_workspace(workspace_id):
+                raise _not_found()
+            docs = await self._skills.catalog(
+                connection, org_id=org_id, workspace_id=workspace_id, user_id=user_id
+            )
+        return [
+            {
+                "id": None if doc.skill_id is None else str(doc.skill_id),
+                "name": doc.name,
+                "description": doc.description,
+                "scope": doc.scope,
+                "version": doc.version,
+                "tags": list(doc.tags),
+            }
+            for doc in docs
+        ]
+
+    async def _skill_versions(
+        self, principal: Principal, skill_id: uuid.UUID
+    ) -> list[dict[str, Any]]:
+        """The versions of a skill, with who changed it and in which run. RLS hides the skills
+        that the user cannot read."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            # The skill comes first, under RLS. Its org then bounds the version rows.
+            org_id = (
+                await connection.execute(select(Skill.org_id).where(Skill.id == skill_id))
+            ).scalar_one_or_none()
+            if org_id is None:
+                raise _not_found("the skill does not exist")
+            rows = (
+                await connection.execute(
+                    select(
+                        SkillVersion.version_no,
+                        SkillVersion.description,
+                        SkillVersion.change,
+                        SkillVersion.summary,
+                        SkillVersion.author_kind,
+                        SkillVersion.author_user_id,
+                        SkillVersion.session_id,
+                        SkillVersion.run_id,
+                        SkillVersion.created_at,
+                    )
+                    .where(SkillVersion.org_id == org_id, SkillVersion.skill_id == skill_id)
+                    .order_by(SkillVersion.version_no.desc())
+                )
+            ).all()
+        return [
+            {
+                "version": row.version_no,
+                "description": row.description,
+                "change": row.change,
+                "summary": row.summary,
+                "author_kind": row.author_kind,
+                "author_user_id": None if row.author_user_id is None else str(row.author_user_id),
+                "session_id": None if row.session_id is None else str(row.session_id),
+                "run_id": None if row.run_id is None else str(row.run_id),
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in rows
+        ]
+
+    async def _expand_skill(self, access: SessionAccess, text: str) -> str:
+        """The text of a skill command (Section 9.5), or ``text`` if it is not one."""
+        if self._skills is None or not text.lstrip().startswith("/"):
+            return text
+        session = access.session
+        async with self._engine.connect() as connection:
+            actor = await self._skills.actor(
+                connection,
+                org_id=session.org_id,
+                workspace_id=session.workspace_id,
+                profile_id=session.agent_profile_id,
+                user_id=access.user_id,
+                private=session.audience == "private",
+            )
+        return await self._skills.expand(actor, text.strip()) or text
+
     async def _send(
         self, principal: Principal, session_id: uuid.UUID, body: NewMessage
     ) -> JSONResponse:
         async with as_user(self._engine, principal.auth_user_id) as connection:
             access = await session_access(connection, principal, session_id)
+        text = await self._expand_skill(access, body.text)
         try:
             run_id = await self._queue.enqueue(
-                org_id=access.org_id, session_id=session_id, text=body.text, user_id=access.user_id
+                org_id=access.org_id, session_id=session_id, text=text, user_id=access.user_id
             )
         except RateLimitedError as error:
             return JSONResponse(
