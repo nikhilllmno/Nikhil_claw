@@ -206,6 +206,7 @@ class ScriptedGate:
     def __init__(self, decision: GateDecision | Exception) -> None:
         self.decision = decision
         self.calls: list[tuple[str, Mapping[str, Any]]] = []
+        self.children: list[bool] = []
 
     async def check(
         self,
@@ -214,8 +215,10 @@ class ScriptedGate:
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision:
         self.calls.append((tool_name, arguments))
+        self.children.append(child)
         if isinstance(self.decision, Exception):
             raise self.decision
         return self.decision

@@ -142,7 +142,11 @@ class GateDecision:
 class ToolGate(Protocol):
     """Decides each tool call (architecture Section 16.1). ``call_id`` is the tool use id. In
     the sandbox the runner uses ``RemoteGate``, which asks the ``GateService`` of the control
-    plane."""
+    plane.
+
+    ``child`` is true for a call of a sub-agent. A sub-agent cannot pause the run, so the gate
+    must not answer ``ask`` for it, and it must not record an approval for it: it gives ``deny``
+    instead."""
 
     async def check(
         self,
@@ -151,6 +155,7 @@ class ToolGate(Protocol):
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision: ...
 
 
@@ -164,6 +169,7 @@ class AllowAllGate:
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision:
         return GateDecision("allow")
 
@@ -1167,12 +1173,15 @@ class ClaudeRuntime:
                 decision = GateDecision("allow", "approved by the user")
             else:
                 try:
-                    decision = await gate.check(scope, tool_name, arguments, call_id=call_id)
+                    decision = await gate.check(
+                        scope, tool_name, arguments, call_id=call_id, child="agent_id" in raw
+                    )
                 except Exception as exc:
                     decision = GateDecision("deny", f"the tool gate failed: {type(exc).__name__}")
             action: Literal["allow", "deny", "defer"]
             if decision.action == "ask" and "agent_id" in raw:
-                # A sub-agent cannot pause the run. It gets deny.
+                # A sub-agent cannot pause the run. The gate maps ``ask`` to ``deny`` for a
+                # child call itself (``child``). This stays for a gate that does not.
                 action = "deny"
             elif decision.action == "ask":
                 action = "defer"

@@ -149,7 +149,13 @@ class GateBackend(Protocol):
     """The tool gate of the control plane, normally ``sama.gate.service.GateService``."""
 
     async def check(
-        self, claims: RunTokenClaims, call_id: str, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        claims: RunTokenClaims,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        child: bool = False,
     ) -> Verdict: ...
 
     async def screen(
@@ -858,7 +864,9 @@ class ToolServer:
         except ValidationError:
             return JSONResponse({"error": "the gate request is not valid"}, status_code=422)
         try:
-            verdict = await self.gate.check(claims, body.call_id, body.tool_name, body.arguments)
+            verdict = await self.gate.check(
+                claims, body.call_id, body.tool_name, body.arguments, child=body.child
+            )
             answer = GateAnswer(
                 action=verdict.action, reason=verdict.reason, step=str(verdict.step)
             )

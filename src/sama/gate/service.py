@@ -169,8 +169,14 @@ class GateService:
         call_id: str,
         tool_name: str,
         arguments: Mapping[str, Any],
+        *,
+        child: bool = False,
     ) -> Verdict:
-        """The verdict for one tool call id. Each step is recorded."""
+        """The verdict for one tool call id. Each step is recorded.
+
+        ``child`` is true for a call of a sub-agent. A sub-agent cannot pause the run, so an
+        ``ask`` becomes ``deny`` before the gate records anything: no pending approval and no
+        ``approval.requested`` entry for a call that no human can answer."""
         if not call_id:
             return Verdict("deny", GateStep.TOOLSET, "the tool call has no id")
         # A ``tool_call`` is recorded as the deferred tool that it names (Section 16.1).
@@ -190,6 +196,10 @@ class GateService:
                 )
             else:
                 verdict = decide(run.context, tool_name, original)
+                if child and verdict.action == "ask":
+                    verdict = Verdict(
+                        "deny", GateStep.POLICY, "a sub-agent cannot ask for an approval"
+                    )
                 await self._record(connection, run, call_id, name, effective, digest, verdict)
         log.info(
             "gate org=%s run=%s call=%s tool=%s action=%s step=%s",

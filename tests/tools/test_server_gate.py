@@ -23,15 +23,23 @@ from tests.tools.test_server import connect, text_of
 class FakeGate:
     verdict: Verdict = field(default_factory=lambda: Verdict("allow", GateStep.POLICY, "ok"))
     fail: bool = False
+    children: list[bool] = field(default_factory=list)
     checks: list[tuple[str, str, str, dict[str, Any]]] = field(default_factory=list)
     screens: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
     async def check(
-        self, claims: RunTokenClaims, call_id: str, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        claims: RunTokenClaims,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        child: bool = False,
     ) -> Verdict:
         if self.fail:
             raise RuntimeError("database down")
         self.checks.append((claims.run_id, call_id, tool_name, dict(arguments)))
+        self.children.append(child)
         return self.verdict
 
     async def screen(
@@ -81,6 +89,12 @@ async def test_the_gate_returns_the_verdict(server: Server) -> None:
     assert response.status_code == 200
     assert response.json() == {"action": "ask", "reason": "Bash needs a human", "step": "policy"}
     assert server.gate.checks == [("run-7", "toolu_1", "Bash", {"command": "ls"})]
+
+
+async def test_the_child_flag_reaches_the_gate(server: Server) -> None:
+    await post_gate(server.base, server.token(), CALL)
+    await post_gate(server.base, server.token(), {**CALL, "child": True})
+    assert server.gate.children == [False, True]
 
 
 @pytest.mark.parametrize("token", [None, "nope"])

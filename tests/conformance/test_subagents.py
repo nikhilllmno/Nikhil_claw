@@ -53,6 +53,7 @@ class RecordingGate:
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision:
         self.calls.append((tool_name, call_id))
         if tool_name == tool_id(SEND_NOTE):

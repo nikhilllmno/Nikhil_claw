@@ -40,6 +40,19 @@ async def test_the_gate_posts_the_call_with_the_run_token() -> None:
     assert (body.call_id, body.tool_name, body.arguments) == ("toolu_1", "Bash", {"command": "ls"})
 
 
+async def test_the_child_flag_goes_to_the_control_plane() -> None:
+    seen: list[GateRequest] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(GateRequest.model_validate(json.loads(request.content)))
+        return httpx.Response(200, json={"action": "deny", "reason": "no", "step": "policy"})
+
+    gate = gate_with(httpx.MockTransport(handler))
+    await gate.check(make_scope(), "Bash", {}, call_id="toolu_1")
+    await gate.check(make_scope(), "Bash", {}, call_id="toolu_2", child=True)
+    assert [request.child for request in seen] == [False, True]
+
+
 @pytest.mark.parametrize(
     "response",
     [

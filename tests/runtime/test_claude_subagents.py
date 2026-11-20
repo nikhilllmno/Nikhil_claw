@@ -146,6 +146,19 @@ async def test_a_call_inside_a_subagent_that_the_gate_asks_for_is_denied() -> No
     assert len(gate.calls) == 1, "the gate judges the call of a sub-agent"
 
 
+async def test_the_hook_tells_the_gate_which_calls_are_of_a_subagent() -> None:
+    factory = Factory(
+        [
+            call_hook("mcp__sama__send_note", "t1"),
+            call_hook("mcp__sama__send_note", "t2", subagent=True),
+            result(),
+        ]
+    )
+    gate = ScriptedGate(GateDecision("allow"))
+    await collect(ClaudeRuntime(gate=gate, client_factory=factory).run(with_subagents(RESEARCHER)))
+    assert gate.children == [False, True]
+
+
 # -- the events --------------------------------------------------------------------------------
 
 

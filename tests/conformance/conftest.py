@@ -127,6 +127,7 @@ def _suite_gate() -> ToolGate:
             arguments: Mapping[str, Any],
             *,
             call_id: str,
+            child: bool = False,
         ) -> GateDecision:
             if is_gated(tool_name):
                 return GateDecision("ask", "the suite gates this tool")

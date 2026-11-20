@@ -45,8 +45,11 @@ class RemoteGate:
         arguments: Mapping[str, Any],
         *,
         call_id: str,
+        child: bool = False,
     ) -> GateDecision:
-        body = GateRequest(call_id=call_id, tool_name=tool_name, arguments=dict(arguments))
+        body = GateRequest(
+            call_id=call_id, tool_name=tool_name, arguments=dict(arguments), child=child
+        )
         async with httpx.AsyncClient(
             timeout=self._timeout_s, transport=self._transport, follow_redirects=False
         ) as client:
