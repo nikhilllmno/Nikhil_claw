@@ -192,7 +192,7 @@ async def test_the_skills_of_the_session_are_written_before_the_run(
         assert sandbox is not None
         base = f"{sandbox.workdir}/.sama/skills"
         assert await sandbox.read_file(f"{base}/notes/scripts/a.py") == b"x"
-        assert b"notes/SKILL.md" in await sandbox.read_file(f"{base}/.manifest.json")
+        assert await sandbox.read_file(f"{base}/notes/SKILL.md") == b"---\nname: notes\n---\n"
         # The next run syncs again and removes a file that left the library.
         skills.files_by_scope = {"notes/SKILL.md": "---\nname: notes\n---\n"}
         runtime.fake_scripts.append(_reply("ok"))

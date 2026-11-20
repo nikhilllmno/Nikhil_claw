@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from pathlib import PurePosixPath
 from typing import Final
 
 from sama.prompt.scan import scan
@@ -22,6 +21,7 @@ MAX_FILE_CHARS: Final = 50_000
 MAX_FILES: Final = 20
 MAX_TOTAL_CHARS: Final = 200_000
 MAX_PATH_CHARS: Final = 200
+MAX_SUMMARY_CHARS: Final = 500
 FILE_FOLDERS: Final = ("references", "templates", "scripts", "assets")
 SKILL_FILE: Final = "SKILL.md"
 
@@ -68,23 +68,24 @@ def name_problem(name: str) -> str | None:
 
 
 def path_problem(path: str) -> str | None:
-    """Why ``path`` cannot be the path of a skill file, or ``None``."""
+    """Why ``path`` cannot be the path of a skill file, or ``None``.
+
+    The path must be canonical: segments split by single ``/``, none empty, ``.``, or ``..``,
+    no leading ``/``, no backslash. So two different paths never name the same file.
+    """
     if path == SKILL_FILE:
         return "Use the action edit or patch for SKILL.md."
-    pure = PurePosixPath(path)
-    parts = pure.parts
+    parts = path.split("/")
     if (
         not path
         or len(path) > MAX_PATH_CHARS
-        or "\\" in path
-        or "\x00" in path
-        or pure.is_absolute()
         or len(parts) < 2
         or any(_SEGMENT.fullmatch(part) is None or part in {".", ".."} for part in parts)
     ):
         return (
-            f"A file path is relative, has at most {MAX_PATH_CHARS} characters, and has a "
-            f"folder and a file name, for example references/notes.md."
+            f"A file path is canonical: folders and a file name split by single /, at most "
+            f"{MAX_PATH_CHARS} characters, with no ., .., empty part, leading /, or backslash. "
+            "An example is references/notes.md."
         )
     if parts[0] not in FILE_FOLDERS:
         return f"A file must be in one of the folders: {', '.join(FILE_FOLDERS)}."
@@ -96,6 +97,19 @@ def _findings(label: str, text: str) -> list[str]:
     if redact(text) != text:
         found.append("secret")
     return [f"{label}: {', '.join(found)}"] if found else []
+
+
+def summary_problem(summary: str | None) -> str | None:
+    """Why ``summary`` (the note of a version) cannot be stored, or ``None``. The summary is
+    stored and shown by the API, so it gets the scan of the text of a skill."""
+    if not summary:
+        return None
+    if len(summary) > MAX_SUMMARY_CHARS:
+        return f"The summary has at most {MAX_SUMMARY_CHARS} characters."
+    if "\x00" in summary:
+        return "The summary has a NUL character."
+    found = _findings("The summary", summary)
+    return found[0] if found else None
 
 
 def problems(
@@ -120,8 +134,12 @@ def problems(
     found += _findings(SKILL_FILE, skill_md)
     if parsed is not None:
         found += _findings("description", parsed.meta.description)
+        for tag in parsed.meta.tags:
+            found += _findings("a tag", tag)
     for path, text in files.items():
-        found += _findings(path, text)
+        # The label is not the path: a secret in a path must not go into the message.
+        found += _findings("a file path", path)
+        found += _findings(redact(path), text)
     return found, parsed
 
 
@@ -155,12 +173,16 @@ def _file_problems(files: Mapping[str, str]) -> list[str]:
     if len(files) > MAX_FILES:
         found.append(f"A skill has at most {MAX_FILES} files.")
     for path, text in files.items():
+        shown = redact(path)
         if (problem := path_problem(path)) is not None:
-            found.append(f"{path}: {problem}")
+            found.append(f"{shown}: {problem}")
         if len(text) > MAX_FILE_CHARS:
-            found.append(f"{path} is longer than {MAX_FILE_CHARS} characters.")
+            found.append(f"{shown} is longer than {MAX_FILE_CHARS} characters.")
         if "\x00" in text:
-            found.append(f"{path} has a NUL character.")
+            found.append(f"{shown} has a NUL character.")
+    folded = [path.casefold() for path in files]
+    if len(set(folded)) != len(folded):
+        found.append("Two file paths are the same file when the case is ignored.")
     if sum(map(len, files.values())) > MAX_TOTAL_CHARS:
         found.append(f"The files of a skill have at most {MAX_TOTAL_CHARS} characters together.")
     return found

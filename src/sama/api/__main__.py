@@ -36,6 +36,7 @@ from sama.api.auth import JwtVerifier, issuer, jwks_url
 from sama.db.engine import create_engine
 from sama.integrations.service import Integrations
 from sama.observability.logs import configure_logging
+from sama.skills import BuiltinSkills, SkillLibrary
 from sama.vault.crypto import VaultKey
 from sama.vault.redact import default_redactor, env_secrets
 from sama.vault.store import Vault
@@ -100,6 +101,7 @@ def build_app() -> FastAPI:
             supabase_anon_key=_required("SAMA_SUPABASE_ANON_KEY"),
         ),
         integrations=integrations,
+        skills=SkillLibrary(engine, BuiltinSkills().all()),
     )
     return api.app(lifespan=lifespan)
 

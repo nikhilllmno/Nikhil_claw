@@ -8,11 +8,12 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
-from sama.db.models import AgentProfile, Membership, Message
+from sama.db.models import AgentProfile, Membership, Message, SkillVersion
 from sama.orchestrator.queue import RunQueue
 from sama.skills import ManageRequest, PostgresSkillStore, SkillLibrary
 from sama.tenancy.run_token import RunTokenClaims
@@ -182,6 +183,37 @@ async def test_the_versions_of_a_hidden_skill_are_404(
     assert (await client.get(f"/skills/{skill_id}/versions", headers=eve)).status_code == 404
     unknown = await client.get(f"/skills/{uuid.uuid4()}/versions", headers=mia(tenant))
     assert unknown.status_code == 404
+
+
+async def test_the_versions_are_bounded_by_the_org_of_the_skill(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await write(engine, tenant, "mine", "my-notes")
+    other = await add_tenant(engine)
+    listed = await client.get(
+        f"/orgs/{tenant.org}/skills",
+        headers=mia(tenant),
+        params={"workspace_id": str(tenant.ids["ws"])},
+    )
+    skill_id = next(s["id"] for s in listed.json() if s["name"] == "my-notes")
+    # A version row of another org cannot point at this skill: the foreign key holds both ids.
+    async with engine.begin() as connection:
+        with pytest.raises(IntegrityError, match="skill_versions"):
+            await connection.execute(
+                insert(SkillVersion).values(
+                    org_id=other.org,
+                    skill_id=uuid.UUID(skill_id),
+                    version_no=9,
+                    name="my-notes",
+                    description="x",
+                    skill_md="x",
+                    files={},
+                    change="edit",
+                    author_kind="agent",
+                )
+            )
+    response = await client.get(f"/skills/{skill_id}/versions", headers=mia(tenant))
+    assert [v["version"] for v in response.json()] == [1]
 
 
 async def stored_texts(engine: AsyncEngine, session: uuid.UUID) -> list[str]:

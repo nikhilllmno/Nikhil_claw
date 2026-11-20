@@ -69,3 +69,17 @@ async def test_the_standalone_api_learns_the_vault_values_at_start(
             assert redact(value) == REDACTED
     finally:
         default_redactor().forget(value, key)
+
+
+@pytest.mark.usefixtures("tenant", "standalone_env")
+async def test_the_standalone_api_serves_the_skill_routes(tenant: Tenant) -> None:  # noqa: F811
+    app = build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        response = await client.get(
+            f"/orgs/{tenant.org}/skills",
+            headers=mia(tenant),
+            params={"workspace_id": str(tenant.ids["ws"])},
+        )
+    assert response.status_code == 200
+    assert "code-review" in {skill["name"] for skill in response.json()}

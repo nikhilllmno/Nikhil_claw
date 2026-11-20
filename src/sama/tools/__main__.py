@@ -25,6 +25,7 @@ from starlette.applications import Starlette
 
 from sama.memory import InProcessMemoryStore, MemoryService, MemoryStore, PostgresMemoryStore
 from sama.observability.logs import configure_logging
+from sama.skills import BuiltinSkills, PostgresSkillStore, SkillStore
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.server import ToolServer, quiet_dependency_logs
 from sama.tools.todo import MemoryTodoStore, PostgresTodoStore, TodoStore
@@ -40,6 +41,7 @@ def build_app(store_kind: str) -> Starlette:
         raise SystemExit("set SAMA_RUN_TOKEN_KEY")
     todos: TodoStore
     memories: MemoryStore
+    skills: SkillStore | None = None
     gate = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
@@ -51,9 +53,12 @@ def build_app(store_kind: str) -> Starlette:
         engine = create_engine(url)
         todos = PostgresTodoStore(engine)
         memories = PostgresMemoryStore(engine)
+        skills = PostgresSkillStore(engine, BuiltinSkills().all())
         gate = GateService(engine)
     else:
-        log.warning("the task lists are in memory only, and there is no tool gate")
+        log.warning(
+            "the task lists are in memory only, there is no tool gate, and the skills tools are off"
+        )
         todos = MemoryTodoStore()
         memories = InProcessMemoryStore()
     brave_key = os.environ.get("BRAVE_API_KEY", "")
@@ -67,6 +72,7 @@ def build_app(store_kind: str) -> Starlette:
         todos=todos,
         search=search,
         memory=MemoryService(memories),
+        skills=skills,
         gate=gate,
     )
     return server.app()

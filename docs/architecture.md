@@ -945,23 +945,26 @@ store, and the sync. The rules:
   toolset; the profile list `agent_profiles.skills` is empty (all skills) or has the name;
   each `requires_toolsets` entry is in `agent_profiles.toolsets`; and, in a shared session,
   the scope is not `user`. The index has at most 200 skills, sorted by name.
-- Migration `0013` adds `skills` to the toolsets of every existing profile, because the new
-  tools would have no effect without it. `python -m sama.admin bootstrap` gives the toolset
-  to new profiles.
-
-### 9.3 Progressive disclosure and tools
-
-- Level 0: the index (name and description) is in the prompt.
-- Level 1: the agent loads `SKILL.md` (native Skill tool on Claude, `skill_view` or the
-  Skills capability on OpenAI).
-- Level 2: the agent reads a linked file or runs a script from the skill folder. Sama writes
-  the session's skills into the sandbox at start, so scripts can run.
-- `skills_list`, `skill_view`, and `skill_manage` (`create`, `patch`, `edit`, `write_file`,
-  `remove_file`, `archive`) are sama tools. All writes go through `skill_manage`, so every
-  write is versioned and scanned.
-- Slash command per skill (`/<skill-name>`) in every channel (Section 9.5).
-
-**Code (M2.2).**
+- Migration `0013` adds `skills` to the toolsets of a profile only when its toolsets are
+  exactly the previous default list (`core`, `todo`, `web`, `clarify`, `github`, `memory`).
+  This is the default profile that bootstrap made, and it is the same rule as migration
+  `0012`. A profile that an admin changed does not change. An admin adds `skills` to it.
+  `python -m sama.admin bootstrap` gives the toolset to new profiles. The standalone
+  processes `python -m sama.api` and `python -m sama.tools --store postgres` also have the
+  skill library, so their skill routes and tools work.
+- Metadata is scanned like text. Sama refuses a write when a file path, the `summary`, the
+  description, or a tag has a secret (the redactor) or a prompt injection (Section 6.1). The
+  check runs for every action, `archive` too. The summary has at most 500 characters. The
+  error text does not repeat the secret.
+- File paths are canonical. A path has folders and a file name that are split by a single
+  `/`. It has no `.`, `..`, empty part, leading or trailing `/`, backslash, or NUL character.
+  Two paths that differ only in case are refused, so two paths never name one file.
+- A `patch` with `replace_all` computes the new length before it replaces. A result over the
+  limit of `SKILL.md` or of one file, or over the total limit of the skill, is refused and no
+  big text is built.
+- `GET /skills/{skill_id}/versions` first reads the skill under RLS. A skill that the user
+  cannot see gives `404`. The version rows are then selected with the `org_id` and the
+  `skill_id` of that skill.
 
 - `skills_list` takes an optional `query` and returns the index of the run: name,
   description, scope, and version. It is the same list as the prompt, but fresh. A skill that
@@ -979,14 +982,21 @@ store, and the sync. The rules:
   text that the model can act on. They do not stop the run.
 - The gate allows the three tools without a policy rule, in the toolset `skills`. The role
   check is in the store, because it depends on the scope.
-- Sync into the sandbox. Before a run starts the runner, `SandboxedRuntime` writes the
-  files of the visible skills to `.sama/skills/<name>/` in the work folder of the sandbox.
-  It also writes `.sama/skills/.manifest.json` (path and SHA-256). A later run writes only
-  the changed files and removes the files that are no longer in the library. A failed sync
-  logs a warning and does not fail the run. The tools of the run do not depend on the
-  files, because `skill_view` reads from the database. The sync is for scripts. It does not
-  use `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and
-  the gate does not allow it.
+- Sync into the sandbox. Before a run starts the runner, `SandboxedRuntime` makes
+  `.sama/skills/` in the work folder of the sandbox hold exactly the files of the visible
+  skills (`.sama/skills/<name>/...`). There is no manifest, and the sync reads nothing from
+  the sandbox, because the agent and its scripts can change that folder. Each sync runs one
+  command in the sandbox that removes `.sama/skills/` (`rm -rf` removes a link and does not
+  follow it; a link in place of `.sama` is removed first). Then the sync writes every file
+  again from the library. So a file that the agent changed or deleted is restored, a file
+  that left the library is gone, and a link cannot make a write or a removal leave the
+  folder. The cost is one write for each skill file in every run. The sync refuses more than
+  2,000 files or 20 million characters, and it only writes paths of the form
+  `<name>/SKILL.md` or `<name>/<folder>/<path>` that are canonical. A failed sync logs a
+  warning and does not fail the run. The tools of the run do not depend on the files,
+  because `skill_view` reads from the database. The sync is for scripts. It does not use
+  `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and the
+  gate does not allow it.
 
 ### 9.4 Self-improvement loop
 

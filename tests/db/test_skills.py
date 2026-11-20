@@ -308,3 +308,35 @@ async def test_authenticated_cannot_write_skills(engine: AsyncEngine, world: Wor
     with pytest.raises(DBAPIError):
         async with as_user(engine, world.auth["bob"]) as connection:
             await connection.execute(text("DELETE FROM skills"))
+
+
+KEY = "sk-ant-api03-" + "A1b2C3d4" * 6
+
+
+async def test_metadata_with_a_secret_is_refused_and_nothing_is_stored(
+    engine: AsyncEngine, world: World
+) -> None:
+    store = PostgresSkillStore(engine, BUILTIN)
+    mine = claims(world, "a1-alice")
+    await store.manage(mine, create("notes"))
+    attempts = [
+        ManageRequest(
+            action="write_file",
+            name="notes",
+            file_path=f"references/{KEY}.md",
+            file_content="x",
+        ),
+        ManageRequest(
+            action="patch", name="notes", old_string="Do it.", new_string="Do.", summary=KEY
+        ),
+        ManageRequest(action="archive", name="notes", summary=f"because {KEY}"),
+    ]
+    for attempt in attempts:
+        with pytest.raises(SkillError, match="secret"):
+            await store.manage(mine, attempt)
+    async with engine.connect() as connection:
+        rows = (await connection.execute(select(SkillVersion))).all()
+        skill = (await connection.execute(select(Skill.status))).scalar_one()
+    assert [(row.version_no, row.summary) for row in rows] == [(1, None)]
+    assert all(KEY not in str(row.files) for row in rows)
+    assert skill == "active"

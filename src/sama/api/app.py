@@ -46,6 +46,7 @@ from sama.db.models import (
     Run,
     RunEvent,
     Session,
+    Skill,
     SkillVersion,
     User,
     Workspace,
@@ -1228,6 +1229,12 @@ class SamaApi:
         """The versions of a skill, with who changed it and in which run. RLS hides the skills
         that the user cannot read."""
         async with as_user(self._engine, principal.auth_user_id) as connection:
+            # The skill comes first, under RLS. Its org then bounds the version rows.
+            org_id = (
+                await connection.execute(select(Skill.org_id).where(Skill.id == skill_id))
+            ).scalar_one_or_none()
+            if org_id is None:
+                raise _not_found("the skill does not exist")
             rows = (
                 await connection.execute(
                     select(
@@ -1241,12 +1248,10 @@ class SamaApi:
                         SkillVersion.run_id,
                         SkillVersion.created_at,
                     )
-                    .where(SkillVersion.skill_id == skill_id)
+                    .where(SkillVersion.org_id == org_id, SkillVersion.skill_id == skill_id)
                     .order_by(SkillVersion.version_no.desc())
                 )
             ).all()
-        if not rows:
-            raise _not_found("the skill does not exist")
         return [
             {
                 "version": row.version_no,

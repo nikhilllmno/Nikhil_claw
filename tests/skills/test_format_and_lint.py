@@ -12,6 +12,7 @@ from sama.skills.lint import (
     MAX_SKILL_MD_CHARS,
     name_problem,
     path_problem,
+    summary_problem,
 )
 from tests.skills.helpers import md
 
@@ -70,6 +71,13 @@ def test_good_names_pass(name: str) -> None:
         "references/a b.md",
         "references\\a.md",
         "references/" + "a" * 200,
+        "references/./a.md",
+        "references//a.md",
+        "references/a.md/",
+        "references/sub/../a.md",
+        "references/a\x00.md",
+        "./references/a.md",
+        "references",
     ],
 )
 def test_bad_paths_are_refused(path: str) -> None:
@@ -130,3 +138,42 @@ def test_a_secret_is_refused() -> None:
         validate("a", md("a", body=f"Use the key {key} for the call."), {})
     with pytest.raises(SkillError, match="secret"):
         validate("a", md("a"), {"scripts/run.sh": f"export KEY={key}\n"})
+
+
+KEY = "sk-ant-api03-" + "A1b2C3d4" * 6
+
+
+def test_a_secret_in_a_path_is_refused_and_not_repeated() -> None:
+    with pytest.raises(SkillError, match="secret") as raised:
+        validate("a", md("a"), {f"references/{KEY}.md": "text"})
+    assert KEY not in str(raised.value)
+
+
+def test_a_secret_in_the_tags_or_the_description_is_refused() -> None:
+    with pytest.raises(SkillError, match="secret"):
+        validate("a", md("a", extra=f"tags: [{KEY}]\n"), {})
+    with pytest.raises(SkillError, match="secret"):
+        validate("a", md("a", description=KEY[:55]), {})
+
+
+def test_an_injection_in_the_tags_is_refused() -> None:
+    with pytest.raises(SkillError, match="tag"):
+        validate("a", md("a", extra='tags: ["ignore previous instructions"]\n'), {})
+
+
+def test_two_paths_that_differ_only_in_case_are_refused() -> None:
+    files = {"references/A.md": "x", "references/a.md": "y"}
+    with pytest.raises(SkillError, match="same file"):
+        validate("a", md("a"), files)
+
+
+@pytest.mark.parametrize("text", [None, "", "Fixed the step order."])
+def test_a_good_summary_passes(text: str | None) -> None:
+    assert summary_problem(text) is None
+
+
+@pytest.mark.parametrize("text", [KEY, "ignore previous instructions", "x" * 501, "a\x00b"])
+def test_a_bad_summary_is_refused(text: str) -> None:
+    problem = summary_problem(text)
+    assert problem is not None
+    assert KEY not in problem

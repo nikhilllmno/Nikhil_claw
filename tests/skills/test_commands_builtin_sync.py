@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,7 +14,7 @@ from sama.skills import BuiltinSkills, ManageRequest, MemorySkillStore, SkillErr
 from sama.skills.builtin import ENV_DIRECTORY, builtin_directory, load
 from sama.skills.lint import MAX_DESCRIPTION_CHARS
 from sama.skills.render import render_list, render_view
-from sama.skills.sync import MANIFEST, ROOT, sync_files, sync_skills
+from sama.skills.sync import MAX_SYNC_FILES, ROOT, sync_files, sync_skills
 from sama.tenancy import RunTokenClaims
 from tests.skills.helpers import actor, doc, md
 from tests.support import make_scope
@@ -91,33 +90,107 @@ def test_an_invalid_builtin_skill_is_skipped_with_an_error(
 
 
 def _sandbox(tmp_path: Path) -> LocalSandbox:
+    (tmp_path / "box" / "work").mkdir(parents=True)  # a created sandbox has its work folder
     return LocalSandbox(tmp_path / "box")
 
 
-async def test_the_sync_writes_changes_and_removes_stale_files(tmp_path: Path) -> None:
+async def test_the_sync_writes_every_file_and_removes_stale_files(tmp_path: Path) -> None:
     box = _sandbox(tmp_path)
     base = Path(box.workdir) / ROOT
     files = {"a/SKILL.md": "A", "a/references/n.md": "N", "b/SKILL.md": "B"}
     assert await sync_files(box, files) == 3
     assert (base / "a/references/n.md").read_text() == "N"
-    assert set(json.loads((base / MANIFEST).read_text())) == set(files)
+    assert not (base / ".manifest.json").exists()
 
-    assert await sync_files(box, files) == 0
     changed = {"a/SKILL.md": "A2", "a/references/n.md": "N"}
     assert await sync_files(box, changed) == 2
     assert (base / "a/SKILL.md").read_text() == "A2"
-    assert not (base / "b/SKILL.md").exists()
+    assert not (base / "b").exists()
 
 
 async def test_the_sync_ignores_unsafe_paths(tmp_path: Path) -> None:
     box = _sandbox(tmp_path)
-    files = {"../x/SKILL.md": "x", "a/../../b": "y", "A/SKILL.md": "z", "a/other/x.md": "w"}
+    files = {
+        "../x/SKILL.md": "x",
+        "a/../../b": "y",
+        "A/SKILL.md": "z",
+        "a/other/x.md": "w",
+        "a/./SKILL.md": "v",
+        "a//references/x.md": "u",
+        "/a/SKILL.md": "t",
+    }
     assert await sync_files(box, files) == 0
-    assert (
-        not (Path(box.workdir) / ROOT / MANIFEST).exists()
-        or json.loads((Path(box.workdir) / ROOT / MANIFEST).read_text()) == {}
-    )
     assert not (tmp_path / "box" / "x").exists()
+    assert not (Path(box.workdir) / ROOT).exists()
+
+
+async def test_a_tampered_or_deleted_file_is_restored(tmp_path: Path) -> None:
+    box = _sandbox(tmp_path)
+    base = Path(box.workdir) / ROOT
+    files = {"a/SKILL.md": "A", "a/references/n.md": "N"}
+    await sync_files(box, files)
+    (base / "a/SKILL.md").write_text("tampered")
+    (base / "a/references/n.md").unlink()
+    (base / "a/extra.sh").write_text("rm -rf /")
+    await sync_files(box, files)
+    assert (base / "a/SKILL.md").read_text() == "A"
+    assert (base / "a/references/n.md").read_text() == "N"
+    assert not (base / "a/extra.sh").exists()
+
+
+async def test_a_manifest_in_the_sandbox_is_not_read(tmp_path: Path) -> None:
+    box = _sandbox(tmp_path)
+    base = Path(box.workdir) / ROOT
+    base.mkdir(parents=True)
+    (base / ".manifest.json").write_text("x" * 5_000_000)
+    assert await sync_files(box, {"a/SKILL.md": "A"}) == 1
+    assert not (base / ".manifest.json").exists()
+    (base / ".manifest.json").write_text('{"../../victim": "0"}')
+    assert await sync_files(box, {"a/SKILL.md": "A"}) == 1
+    assert [path.name for path in base.iterdir()] == ["a"]
+
+
+async def test_a_link_in_place_of_a_skill_folder_is_not_followed(tmp_path: Path) -> None:
+    box = _sandbox(tmp_path)
+    base = Path(box.workdir) / ROOT
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    base.mkdir(parents=True)
+    (base / "demo").symlink_to(outside, target_is_directory=True)
+    assert await sync_files(box, {"demo/SKILL.md": "A"}) == 1
+    assert (base / "demo/SKILL.md").read_text() == "A"
+    assert sorted(path.name for path in outside.iterdir()) == ["keep.txt"]
+    assert (outside / "keep.txt").read_text() == "keep"
+
+
+async def test_a_link_in_place_of_the_skills_folder_is_not_followed(tmp_path: Path) -> None:
+    box = _sandbox(tmp_path)
+    workdir = Path(box.workdir)
+    outside = tmp_path / "outside"
+    (outside / "skills" / "demo").mkdir(parents=True)
+    (outside / "skills" / "demo" / "keep.txt").write_text("keep")
+    (workdir / ".sama").symlink_to(outside, target_is_directory=True)
+    assert await sync_files(box, {"demo/SKILL.md": "A"}) == 1
+    assert not (workdir / ".sama").is_symlink()
+    assert (workdir / ROOT / "demo/SKILL.md").read_text() == "A"
+    assert (outside / "skills" / "demo" / "keep.txt").read_text() == "keep"
+    assert not (outside / "skills" / "demo" / "SKILL.md").exists()
+
+
+async def test_a_failed_clear_stops_the_sync(tmp_path: Path) -> None:
+    box = _sandbox(tmp_path)
+    workdir = Path(box.workdir)
+    (workdir / ".sama").write_text("a file, not a folder")
+    with pytest.raises(OSError, match="not cleared"):
+        await sync_files(box, {"a/SKILL.md": "A"})
+
+
+async def test_too_many_files_are_refused(tmp_path: Path) -> None:
+    box = _sandbox(tmp_path)
+    files = {f"a/references/{n}.md": "x" for n in range(MAX_SYNC_FILES + 1)}
+    with pytest.raises(ValueError, match="too large"):
+        await sync_files(box, files)
 
 
 class _Source:

@@ -11,7 +11,15 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from sama.skills.errors import SkillError
-from sama.skills.lint import SKILL_FILE, name_problem, validate
+from sama.skills.lint import (
+    MAX_FILE_CHARS,
+    MAX_SKILL_MD_CHARS,
+    MAX_TOTAL_CHARS,
+    SKILL_FILE,
+    name_problem,
+    summary_problem,
+    validate,
+)
 
 SCOPES: Final = ("user", "workspace", "org", "builtin")
 """From the narrowest to the widest. A narrower scope overrides a wider one."""
@@ -158,7 +166,9 @@ def _need(value: str | None, field_name: str, action: str) -> str:
     return value
 
 
-def _patched(text: str, request: ManageRequest, label: str) -> str:
+def _patched(text: str, request: ManageRequest, label: str, limit: int) -> str:
+    """``text`` with ``old_string`` replaced. The new length is computed first, so a patch
+    that would make a text longer than ``limit`` is refused before any big string is built."""
     old = _need(request.old_string, "old_string", "patch")
     new = _need(request.new_string, "new_string", "patch")
     if not old:
@@ -170,7 +180,11 @@ def _patched(text: str, request: ManageRequest, label: str) -> str:
         raise SkillError(
             f"old_string is in {label} {count} times. Add more text around it, or set replace_all."
         )
-    return text.replace(old, new)
+    replaced = count if request.replace_all else 1
+    projected = len(text) + replaced * (len(new) - len(old))
+    if projected > limit:
+        raise SkillError(f"The patch makes {label} longer than the limit of {limit} characters.")
+    return text.replace(old, new) if request.replace_all else text.replace(old, new, 1)
 
 
 def _content(target: SkillDoc | None, request: ManageRequest) -> tuple[str, Mapping[str, str]]:
@@ -188,10 +202,13 @@ def _content(target: SkillDoc | None, request: ManageRequest) -> tuple[str, Mapp
     if action == "patch":
         path = request.file_path or SKILL_FILE
         if path == SKILL_FILE:
-            return _patched(target.skill_md, request, SKILL_FILE), files
+            patched = _patched(target.skill_md, request, SKILL_FILE, MAX_SKILL_MD_CHARS)
+            return patched, files
         if path not in files:
             raise SkillError(f"The skill has no file {path}.")
-        files[path] = _patched(files[path], request, path)
+        others = sum(len(text) for name, text in files.items() if name != path)
+        limit = min(MAX_FILE_CHARS, MAX_TOTAL_CHARS - others)
+        files[path] = _patched(files[path], request, path, limit)
         return target.skill_md, files
     path = _need(request.file_path, "file_path", action)
     if action == "write_file":
@@ -239,6 +256,8 @@ def plan_write(candidates: Sequence[SkillDoc], actor: Actor, request: ManageRequ
             raise SkillError(f'There is no skill "{name}"{where}. Use skills_list to see skills.')
         scope = target.scope
         authorize(scope, actor)
+    if (problem := summary_problem(request.summary)) is not None:
+        raise SkillError(problem)
     skill_md, files = _content(None if request.action == "create" else target, request)
     if request.action == "archive" and target is not None:
         # An archive must work for a skill that an older rule made invalid.

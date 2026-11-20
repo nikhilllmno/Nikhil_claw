@@ -6,6 +6,7 @@ import pytest
 
 from sama.skills import ManageRequest, SkillError, index
 from sama.skills.library import authorize, default_scope, plan_write, resolve
+from sama.skills.lint import MAX_FILE_CHARS
 from tests.skills.helpers import actor, doc, md
 
 
@@ -181,3 +182,88 @@ def test_archive_works_for_a_skill_that_is_not_valid_now() -> None:
 def test_an_unknown_action_is_refused() -> None:
     with pytest.raises(SkillError, match="action"):
         plan_write([], actor(), ManageRequest(action="drop", name="a"))
+
+
+KEY = "sk-ant-api03-" + "A1b2C3d4" * 6
+
+
+@pytest.mark.parametrize("action", ["create", "edit", "archive", "write_file"])
+def test_a_summary_with_a_secret_is_refused_for_every_action(action: str) -> None:
+    target = doc("a", "user")
+    request = ManageRequest(
+        action=action,
+        name="a",
+        content=md("a"),
+        file_path="references/n.md",
+        file_content="text",
+        summary=f"used {KEY}",
+    )
+    candidates = [] if action == "create" else [target]
+    with pytest.raises(SkillError, match="secret") as raised:
+        plan_write(candidates, actor(), request)
+    assert KEY not in str(raised.value)
+
+
+def test_a_long_summary_is_refused() -> None:
+    with pytest.raises(SkillError, match="summary"):
+        plan_write([], actor(), _create(summary="x" * 501))
+    assert plan_write([], actor(), _create(summary="x" * 500)).change == "create"
+
+
+def test_a_path_that_is_not_canonical_is_refused() -> None:
+    target = doc("a", "user")
+    for path in ("references/./n.md", "references//n.md", "references/n.md/"):
+        write = ManageRequest(action="write_file", name="a", file_path=path, file_content="x")
+        with pytest.raises(SkillError, match="canonical"):
+            plan_write([target], actor(), write)
+
+
+def _replace_all(target: str, old: str, new: str, path: str | None = None) -> ManageRequest:
+    return ManageRequest(
+        action="patch",
+        name="a",
+        file_path=path,
+        old_string=old,
+        new_string=new,
+        replace_all=True,
+    )
+
+
+def test_replace_all_is_refused_before_it_builds_a_big_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Guard(str):
+        __slots__ = ()
+
+        def replace(self, *args: object, **kwargs: object) -> str:
+            raise AssertionError("replace ran before the size check")
+
+    small = "x" * 10_000
+    target = doc("a", "user", files={"references/n.md": Guard(small)})
+    request = _replace_all("a", "x", "y" * MAX_FILE_CHARS, "references/n.md")
+    with pytest.raises(SkillError, match="longer than the limit"):
+        plan_write([target], actor(), request)
+    # The same for SKILL.md.
+    object.__setattr__(target, "skill_md", Guard(md("a", body=small)))
+    request = _replace_all("a", "x", "y" * MAX_FILE_CHARS)
+    with pytest.raises(SkillError, match="longer than the limit"):
+        plan_write([target], actor(), request)
+
+
+def test_replace_all_keeps_the_limit_of_the_text_and_of_the_skill() -> None:
+    body = "x" * 100
+    target = doc("a", "user", files={"references/n.md": body})
+    # Within the limit: 100 x 400 = 40,000 characters.
+    request = _replace_all("a", "x", "y" * 400, "references/n.md")
+    assert len(plan_write([target], actor(), request).files["references/n.md"]) == 40_000
+    # Over the limit of one file.
+    request = _replace_all("a", "x", "y" * 501, "references/n.md")
+    with pytest.raises(SkillError, match="longer than the limit"):
+        plan_write([target], actor(), request)
+    # Within the limit of the file but over the total of the skill.
+    others = {f"references/o{n}.md": "z" * MAX_FILE_CHARS for n in range(3)}
+    others["references/o3.md"] = "z" * 30_000
+    crowded = doc("a", "user", files={"references/n.md": body, **others})
+    request = _replace_all("a", "x", "y" * 400, "references/n.md")
+    with pytest.raises(SkillError, match="longer than the limit"):
+        plan_write([crowded], actor(), request)
