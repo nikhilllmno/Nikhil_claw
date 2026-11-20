@@ -359,6 +359,20 @@ queues the decided runs, and reaps runs. The worker makes a `GateService` on the
 when the caller gives none. `Worker.serve(stop, concurrency=n)` runs `n` runs at
 the same time and the maintenance loop. When `stop` is set, the current runs end first.
 
+**Wakeup (migration `0020`).** An idle worker slot does not only poll the queue. Migration `0020`
+adds the trigger function `sama_private.notify_run_queue()`. It sends `NOTIFY sama_runs` when a
+run becomes `queued` (an insert or an update) and when a `running` or `paused` run changes to
+another status, because the end of a run can free the next run of its session. The notification
+has no payload. `QueueWakeup` (`sama.orchestrator.wakeup`) holds one database connection that
+listens on the channel, and it wakes all idle slots on each notification. A slot takes a ticket
+before it reads the queue and then waits on that ticket, so a notification that comes during
+the read is not lost. The poll (`poll_s`, 1 second on the control plane) stays as the fallback:
+if the listen connection breaks (the listener connects again after 5 seconds), or if a
+connection pooler does not send notifications, each slot still finds the run on its next
+poll. A notification only starts a claim, so a lost or an extra notification cannot change the
+queue rules. Before this change the wait from the enqueue to the claim was up to 1 second, on
+average about 0.5 second.
+
 **Migration.** Before migration `0005`, a `running` or `paused` run had no lease and no
 approval id. No worker can continue such a run, so the upgrade ends each one as `failed` with
 `internal`.
@@ -1456,25 +1470,37 @@ store, and the sync. The rules:
   check is in the store, because it depends on the scope.
 - Sync into the sandbox. Before a run starts the runner, `SandboxedRuntime` makes
   `.sama/skills/` in the work folder of the sandbox hold exactly the files of the visible
-  skills (`.sama/skills/<name>/...`). There is no manifest, and the sync reads nothing from
-  the sandbox, because the agent and its scripts can change that folder. Each sync does three
-  steps. (1) One command refuses a link in place of `.sama`, removes the staging folders of
-  an earlier sync that did not finish, and makes a new staging folder
-  `.sama/.skills-<32 random hex characters>` with `mkdir`, which fails if the name exists.
-  (2) The sync writes every file of the library into the staging folder. (3) One command
-  refuses a link in place of `.sama` again, removes the old `.sama/skills` (`rm -rf` removes
-  a link and does not follow it), and moves the staging folder to `.sama/skills`. So a file
-  that the agent changed or deleted is restored, a file that left the library is gone, and a
-  link that a process makes at `.sama/skills` while the files are written does not redirect a
-  write, because no write goes to that path. A failed sync removes its staging folder. The
-  cost is one write for each skill file in every run. The sync refuses more than 2,000 files
-  or 20 million characters, and it only writes paths of the form `<name>/SKILL.md` or
-  `<name>/<folder>/<path>` that are canonical.
+  skills (`.sama/skills/<name>/...`). There is no manifest, because the agent and its scripts
+  can change that folder. The sync reads only one thing from the sandbox: the answer of a
+  check. Each sync does these steps. (1) One command (the check) refuses a link in place of
+  `.sama` and removes the staging files of an earlier sync that did not finish. Then it makes
+  a SHA-256 digest of the files in `.sama/skills` from inside the sandbox (`find`, `sort`, and
+  `sha256sum`: the path and the content of each file), compares it with the digest of the
+  library files, and writes `same` or `changed`. It writes `same` only when `.sama/skills` is a
+  real folder that holds only files and folders (no link) and the digests are equal. On
+  `same`, the sync stops, so a follow-up run with unchanged skills costs one sandbox call. A
+  false `same` only keeps the files that the agent already had. (2) On `changed`, the sync
+  writes all the library files as one tar archive
+  `.sama/.skills-<32 random hex characters>.tar`. (3) One command refuses a link in place of
+  `.sama` again, extracts the archive into a new staging folder (made with `mkdir`, which fails
+  if the name exists), removes the old `.sama/skills` (`rm -rf` removes a link and does not
+  follow it), and moves the staging folder to `.sama/skills`. So a file that the agent
+  changed, added, linked, or deleted makes the check say `changed`, and the sync restores the
+  folder. A file that left the library is gone, and a link that a process makes at
+  `.sama/skills` while the files are written does not redirect a write, because no write goes
+  to that path. A failed sync removes its staging files. The cost is one call when the skills
+  did not change, and three calls (one of them a file write) when they changed. Before this
+  change the cost was one write for each skill file in every run (about 1.5 seconds for 15
+  files on E2B). The sync refuses more than 2,000 files or 20 million characters, and it only
+  writes paths of the form
+  `<name>/SKILL.md` or `<name>/<folder>/<path>` that are canonical. Each sync logs
+  `skill sync run=<id> files=<n> duration_s=<s>`.
 - The limit of this protection. The agent can write anywhere in its own sandbox, and it runs
   in the same sandbox as the sync. The staging name and the single publish command protect the
   sync from accident and from simple tampering (a stray link or a script that changes the
   folder). They do not protect it from the agent itself: an agent that is determined can
-  change `.sama` between the steps, or change the files after the sync. The files are a
+  change `.sama` between the steps, change the files after the sync, or replace the tools
+  that the check uses, so that the check says `same`. The files are a
   convenience for scripts. They are not a trust boundary, and no tool of the run reads them.
   A failed sync logs a warning and does not fail the run. The sync does not use
   `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and the
@@ -3148,6 +3174,7 @@ gives no deferred tool: the search fails closed (Section 6.3).
 | Image | `sandbox/Dockerfile` | Python 3.12, git, ripgrep, the runner, and the Claude runtime (the SDK bundles the Claude CLI). Docker uses it, and `python -m sama.sandbox.template` builds the E2B template from it. |
 | Run token | `src/sama/tenancy/run_token.py` | HS256 JWT, issuer `sama`, audience `sama-run`. Claims: run, org, workspace, session, and user (private runs only). Lifetime at most 2 hours. |
 | Runner | `src/sama/runtime/runner.py` | `python -m sama.runtime.runner` in the sandbox. One process per run or resume. |
+| Warm runner | `src/sama/warm.py` | `python -m sama.warm` in the sandbox: the same protocol, with the imports already done in a warm server. The control plane uses it (`WARM_RUNNER_ARGV`). |
 | Orchestrator | `src/sama/orchestrator/sandboxed.py` | `SandboxedRuntime` implements `AgentRuntime`. It gets the session sandbox, issues the run token, starts the runner, and streams its events. |
 
 **Runner protocol.** One JSON object per line.
@@ -3201,9 +3228,51 @@ sandbox, the orchestrator creates a new one. The files of the old one are then l
 orchestrator logs the time to the first runner event (`sama.orchestrator`). On E2B we measured
 0.34 s for a create, 0.2 s for a pause, and 0.24 s for a resume (2026-11, `ap-south-1` client).
 
+**Warm runner.** A cold runner process spends most of its start on imports: on E2B (2 vCPU),
+about 1.3 seconds to import the runner and the Claude SDK in a resumed sandbox, and 2.4 to 3.4
+seconds in a new one. The control plane therefore starts `python -m sama.warm`
+(`WARM_RUNNER_ARGV`) and not the runner module. The protocol on stdin, stdout, and stderr does
+not change.
+
+- The client (`sama.warm`) imports only the standard library. It connects to the warm server
+  on a Unix socket (`SAMA_RUNNER_SOCKET`, else `/tmp/sama-runner.sock`) and sends its stdin,
+  stdout, and stderr (`SCM_RIGHTS`), its environment, and its work folder. It then waits for
+  the exit code of the runner and exits with it.
+- The warm server imports the runner and the Claude runtime once. For each client, it checks
+  the user of the peer (`SO_PEERCRED`) and forks a watcher, which forks the runner process.
+  The runner process takes the files, the environment, and the work folder of the client, so
+  it is the same as a cold runner. When the client stops (for example, a cancel kills it), the
+  watcher kills the process group of the runner.
+- The warm server starts with a short allow list of variables (`SERVER_ENV`). It never gets
+  the run token. Only a forked runner gets the environment of its client.
+- If there is no warm server, the client starts one (detached) for the next run and runs this
+  job in its own process (cold). The code id (a hash of the Python executable and the sama
+  source files) must be the same in the client and the server. If it is not, the server
+  stops, and the client runs cold and starts a new server. A Unix socket and a detached
+  process in `/tmp` stay through an E2B pause and resume, so a follow-up run of a session is
+  warm.
+- Each runner logs one line on stderr at its end:
+  `runner timing mode=<cold|warm> job_s= lock_s= runtime_s= first_event_s= terminal_s= exit_s=`.
+  The orchestrator logs this line with `run=<id>` (Section 18.1).
+
+**Runner lock.** A runner holds an exclusive `flock` on `.sama/runner.lock` in the work folder
+while it builds the runtime, streams, and closes it. The next runner of the session waits for
+the lock for at most 20 seconds, and then logs a warning and goes on. So the runner of a run
+that is still stopping (the Claude CLI writes its transcript at the stop) is never in the same
+session files as the runner of the next run.
+
+**Early terminal event.** The Claude adapter sends `RunCompleted` as soon as the result
+message comes, and then stops the Claude CLI (about 0.5 to 1 second). The orchestrator gives a
+terminal event to the caller at once, and then waits for the runner to exit before the
+session ends its run (the idle timeout and the session record). Other terminal events
+(`RunFailed`, `ApprovalRequired`) still come after the stop, so the elapsed time of an approval
+counts the stop. The runner lock keeps the next run of the session from starting the CLI
+before this stop ends.
+
 **Tests.** `tests/sandbox/` runs the same provider tests on `local`, `docker` (with
-`SAMA_DOCKER_IMAGE`), and `e2b` (live). The conformance suite has two more targets:
-`claude-runner` (local provider) and `claude-docker` (sama image). The tool server of the
+`SAMA_DOCKER_IMAGE`), and `e2b` (live). The conformance suite has three more targets:
+`claude-runner` (local provider), `claude-warm` (local provider with the warm runner), and
+`claude-docker` (sama image). The tool server of the
 suite accepts only run tokens that it signed. CI builds the image and runs the Docker tests.
 The nightly job builds the E2B template from `main` and runs the E2B tests.
 
@@ -3652,6 +3721,16 @@ also become keys. A field never replaces `ts`, `level`, `logger`, or `msg`.
 - `httpx` and `httpcore` log only warnings, because a Telegram URL holds the bot token.
 - Uvicorn uses the same handler (`log_config=None`).
 
+**Run timing.** These lines show where the time of a run goes:
+
+| Line | Logger | What it measures |
+|---|---|---|
+| `sandbox start provider= kind= ... duration_s=` | `sama.sandbox` | The create or the resume of the session sandbox. |
+| `skill sync run= files= duration_s=` | `sama.skills.sync` | The skill sync (Section 9.3). |
+| `first runner event run= after_s=` | `sama.orchestrator` | From the runner start to its first event. |
+| `runner timing mode= ... run=` | `sama.orchestrator` | The phases of the runner, from its stderr (Section 16.2). |
+| `model call ...` | `sama.modelproxy` | Each model call through the proxy. |
+
 ### 18.2 Langfuse traces (M1.14)
 
 The runner in the sandbox has no Langfuse key (D6). So the control plane builds the trace of
@@ -3823,7 +3902,7 @@ The provider and search keys are the defaults. An org key in the vault comes fir
 
 - Both apps run in `sin` (Singapore), the Fly.io region nearest to `ap-south-1` (Q4). Each app
   has one machine with `shared-cpu-1x` and 1 GB of memory. The machine does not stop when it is
-  idle, because the worker must poll the queue.
+  idle, because the worker must listen on the queue (Section 4.3).
 - `kill_timeout` is 180 seconds, longer than the whole stop of Section 19.1 (about 130
   seconds).
 - `deploy/Dockerfile` builds the control plane image. It holds no agent runtime, because the
