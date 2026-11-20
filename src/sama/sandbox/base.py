@@ -38,6 +38,10 @@ class SandboxNotFoundError(SandboxError):
     """The provider has no sandbox with this id. The caller creates a new sandbox."""
 
 
+class SandboxFileTooLargeError(SandboxError):
+    """The file has more bytes than ``max_bytes`` of ``Sandbox.read_file``."""
+
+
 class SandboxOutdatedError(SandboxNotFoundError):
     """The sandbox was made from another template, so its runner can be of another version.
     The caller creates a new sandbox, moves the state that must stay (``SandboxSettings.
@@ -167,8 +171,10 @@ class Sandbox(Protocol):
 
     async def write_file(self, path: str, data: bytes) -> None: ...
 
-    async def read_file(self, path: str) -> bytes:
-        """Raises ``FileNotFoundError`` if the file does not exist."""
+    async def read_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Raises ``FileNotFoundError`` if the file does not exist. With ``max_bytes``, it
+        reads at most one byte more than that and raises ``SandboxFileTooLargeError`` for a
+        larger file, so a file that the sandbox changes cannot make the read unbounded."""
         ...
 
     async def remove_file(self, path: str) -> None:

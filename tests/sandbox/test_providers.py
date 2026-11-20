@@ -28,6 +28,7 @@ from sama.runtime.runner import forbidden_env
 from sama.sandbox import (
     Sandbox,
     SandboxError,
+    SandboxFileTooLargeError,
     SandboxNotFoundError,
     SandboxOutdatedError,
     SandboxProvider,
@@ -133,6 +134,17 @@ async def test_files_round_trip(harness: Harness) -> None:
     await sandbox.remove_file(path)
     with pytest.raises(FileNotFoundError):
         await sandbox.read_file(path)
+
+
+async def test_a_bounded_read_stops_after_the_limit(harness: Harness) -> None:
+    sandbox = await harness.create(harness.spec())
+    path = f"{sandbox.workdir}/ten.bin"
+    await sandbox.write_file(path, b"0123456789")
+    assert await sandbox.read_file(path, max_bytes=10) == b"0123456789"
+    with pytest.raises(SandboxFileTooLargeError):
+        await sandbox.read_file(path, max_bytes=9)
+    with pytest.raises(FileNotFoundError):
+        await sandbox.read_file(f"{sandbox.workdir}/none.bin", max_bytes=9)
 
 
 async def test_pause_and_resume_keep_the_files(harness: Harness) -> None:

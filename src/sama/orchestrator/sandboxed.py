@@ -323,12 +323,9 @@ class SandboxedRuntime:
             return None
         try:
             return await self._provider.resume(sandbox_id, self._spec(org_id, session_id))
-        except SandboxOutdatedError as error:
-            # The next run moves its state and kills it. Until then it pauses again.
-            with contextlib.suppress(Exception):
-                await error.sandbox.pause()
-            return None
         except SandboxNotFoundError:
+            # Also an outdated sandbox. It is not paused here: a run can move its state at
+            # this time (``acquire``). The next run kills it; E2B pauses it when it is idle.
             return None
 
     async def wait_for_cleanup(self) -> None:
@@ -430,7 +427,8 @@ class SandboxedRuntime:
                 )
                 return
             target = f"{new.workdir}/{CARRY_FILE}"
-            await new.write_file(target, await old.read_file(source))
+            data = await old.read_file(source, max_bytes=CARRY_MAX_BYTES)
+            await new.write_file(target, data)
             unpacked = await new.exec(
                 ["sh", "-c", _CARRY_UNPACK], env={"CARRY": target}, timeout_s=120
             )

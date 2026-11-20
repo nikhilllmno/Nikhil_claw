@@ -3035,8 +3035,11 @@ gives no deferred tool: the search fails closed (Section 6.3).
   3. kills the old sandbox, also when the move fails.
 
   Other files of the old sandbox, for example in the work folder, do not stay. Skills sync
-  again on the next run. When `session_sandbox()` finds an outdated sandbox (for example, for
-  a tool that reads files), it pauses it again and returns nothing.
+  again on the next run. The control plane reads the archive with `read_file(max_bytes=...)`,
+  which stops after the limit, so an archive that the sandbox changes after the size check
+  cannot make the read unbounded. When `session_sandbox()` finds an outdated sandbox (for
+  example, for a tool that reads files), it returns nothing and does not pause the sandbox,
+  because a run can move its state at that time. E2B pauses it when it is idle.
 - **A lost CLI session.** The runner gives the Claude adapter `cli_session_exists`. It looks
   for `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/<session>.jsonl`. When the transcript of
   the saved session is not there (the move failed, or the sandbox was lost), a run starts a
