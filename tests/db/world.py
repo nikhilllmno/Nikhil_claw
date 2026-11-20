@@ -69,6 +69,11 @@ from sama.db.models import (
     User,
     VaultSecret,
     WorkerBot,
+    Workflow,
+    WorkflowInstance,
+    WorkflowReceipt,
+    WorkflowStep,
+    WorkflowVersion,
     Workspace,
 )
 
@@ -360,6 +365,61 @@ def plan(
             kind="result",
             target="telegram:1",
             text=f"secret result of {user}",
+        )
+    # One workflow for each owner, with a version, an instance, a step, and a receipt. A
+    # workflow is private to its owner (M4.5).
+    for user, org, workspace, profile in (
+        ("alice", "org-a", "a1", "profile-a"),
+        ("bob", "org-b", "b1", "profile-b"),
+    ):
+        add(
+            Workflow,
+            f"workflow:{user}",
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            owner_user_id=ids[user],
+            agent_profile_id=ids[profile],
+            name=f"flow-of-{user}",
+        )
+        add(
+            WorkflowVersion,
+            f"workflow-version:{user}",
+            org_id=ids[org],
+            workflow_id=ids[f"workflow:{user}"],
+            version=1,
+            source=f"secret source of {user}",
+            definition={"name": f"flow-of-{user}", "steps": []},
+            hash="0" * 64,
+        )
+        add(
+            WorkflowInstance,
+            f"workflow-instance:{user}",
+            org_id=ids[org],
+            workflow_id=ids[f"workflow:{user}"],
+            version=1,
+            owner_user_id=ids[user],
+            workspace_id=ids[workspace],
+            agent_profile_id=ids[profile],
+        )
+        add(
+            WorkflowStep,
+            f"workflow-step:{user}",
+            org_id=ids[org],
+            instance_id=ids[f"workflow-instance:{user}"],
+            step_id="post",
+            kind="tool",
+        )
+        add(
+            WorkflowReceipt,
+            f"workflow-receipt:{user}",
+            org_id=ids[org],
+            instance_id=ids[f"workflow-instance:{user}"],
+            step_row_id=ids[f"workflow-step:{user}"],
+            step_id="post",
+            operation_id=f"op-of-{user}",
+            attempt=1,
+            tool="notes_write",
+            request_digest="0" * 64,
         )
     policies: tuple[tuple[str, str, str | None], ...] = (
         ("rule:org-a", "org-a", None),

@@ -38,8 +38,18 @@ MAX_LIMIT_VALUES: Final = 20
 MAX_LIMIT_VALUE_CHARS: Final = 500
 MAX_NAME_CHARS: Final = 200
 
-NO_PREAPPROVAL: Final = frozenset({"cronjob_manage", *NEEDS_A_HUMAN, *META_TOOLS, *TOOL_LOADERS})
-"""Tools that a job cannot pre-approve: the job tool itself (a job run cannot create jobs),
+NO_PREAPPROVAL: Final = frozenset(
+    {
+        "cronjob_manage",
+        "workflow_manage",
+        "workflow_run",
+        *NEEDS_A_HUMAN,
+        *META_TOOLS,
+        *TOOL_LOADERS,
+    }
+)
+"""Tools that a job cannot pre-approve: the job and workflow tools (a job run or a workflow
+run cannot create jobs or workflows),
 tools that wait for a human, and the meta tools (a pre-approval names the real tool)."""
 
 _SLACK_CHANNEL: Final = re.compile(r"#?[A-Za-z0-9._-]{1,80}")

@@ -81,6 +81,7 @@ from sama.db.models import (
     Run,
     RunEvent,
     Session,
+    WorkflowInstance,
 )
 from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
@@ -129,28 +130,41 @@ def _lock(name: str, org_id: uuid.UUID) -> Any:
 
 def _rate_columns(org_id: uuid.UUID, user_id: uuid.UUID | None) -> list[Any]:
     """The columns that ``_check_rate`` reads: the limits of the org and, for the org and for
-    the user, the count of chat runs in the last 60 seconds and the seconds until the oldest
-    of them leaves the window. Use them in a statement after the rate lock."""
+    the user, the count of messages in the last 60 seconds and the seconds until the oldest
+    of them leaves the window. A message is a chat run or a workflow instance that a trigger
+    started (Section 12.2). Use them in a statement after the rate lock."""
 
-    def window(name: str, *scope: Any) -> list[Any]:
-        recent = (
-            Run.org_id == org_id,
-            Run.kind == "chat",
-            Run.created_at > func.now() - RATE_WINDOW,
-            *scope,
-        )
+    def window(name: str, column: Any, *scope: Any) -> list[Any]:
         return [
-            select(func.count()).where(*recent).scalar_subquery().label(f"{name}_count"),
-            select(func.extract("epoch", func.min(Run.created_at) + RATE_WINDOW - func.now()))
-            .where(*recent)
+            select(func.count()).where(*scope).scalar_subquery().label(f"{name}_count"),
+            select(func.extract("epoch", func.min(column) + RATE_WINDOW - func.now()))
+            .where(*scope)
             .scalar_subquery()
             .label(f"{name}_retry"),
         ]
 
+    def recent(name: str, user: bool) -> list[Any]:
+        runs: list[Any] = [
+            Run.org_id == org_id,
+            Run.kind == "chat",
+            Run.created_at > func.now() - RATE_WINDOW,
+        ]
+        starts: list[Any] = [
+            WorkflowInstance.org_id == org_id,
+            WorkflowInstance.trigger == "trigger",
+            WorkflowInstance.created_at > func.now() - RATE_WINDOW,
+        ]
+        if user:
+            runs.append(Run.triggered_by_user_id == user_id)
+            starts.append(WorkflowInstance.owner_user_id == user_id)
+        return window(name, Run.created_at, *runs) + window(
+            f"{name}_flow", WorkflowInstance.created_at, *starts
+        )
+
     columns = [select(Org.limits).where(Org.id == org_id).scalar_subquery().label("limits")]
-    columns += window("org")
+    columns += recent("org", user=False)
     if user_id is not None:
-        columns += window("user", Run.triggered_by_user_id == user_id)
+        columns += recent("user", user=True)
     return columns
 
 
@@ -159,12 +173,15 @@ def _check_rate(row: Any) -> None:
     lock puts the enqueues of one org in a sequence, so two messages at the same time cannot
     both take the last place."""
     limits = QueueLimits.from_json(row.limits)
-    checks = [(row.org_count, row.org_retry, limits.org_messages_per_minute, "the org")]
+    checks = [("org", limits.org_messages_per_minute, "the org")]
     if "user_count" in row._fields:
-        checks.append((row.user_count, row.user_retry, limits.user_messages_per_minute, "you"))
-    for count, retry_s, limit, who in checks:
+        checks.append(("user", limits.user_messages_per_minute, "you"))
+    for name, limit, who in checks:
+        count = getattr(row, f"{name}_count") + getattr(row, f"{name}_flow_count")
         if count >= limit:
-            retry = max(1, math.ceil(float(retry_s or 1)))
+            waits = [getattr(row, f"{name}_retry"), getattr(row, f"{name}_flow_retry")]
+            retry_s = min((float(wait) for wait in waits if wait is not None), default=1.0)
+            retry = max(1, math.ceil(retry_s))
             raise RateLimitedError(
                 f"{who} sent {limit} messages in the last minute. Try again in {retry} s.",
                 retry,
@@ -564,6 +581,15 @@ class RunQueue:
                 )
             )
         return run_id
+
+    async def check_rate_in(
+        self, connection: AsyncConnection, *, org_id: uuid.UUID, user_id: uuid.UUID
+    ) -> None:
+        """Takes the rate lock and raises ``RateLimitedError`` when the user or the org is over
+        its message rate. A trigger calls it before it starts a workflow instance, in the same
+        transaction, so the instance counts as a message (Section 12.2)."""
+        await self._rate_lock(connection, org_id)
+        _check_rate((await connection.execute(select(*_rate_columns(org_id, user_id)))).one())
 
     @staticmethod
     async def _rate_lock(connection: AsyncConnection, org_id: uuid.UUID) -> None:

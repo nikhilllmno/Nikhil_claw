@@ -146,8 +146,8 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Webhooks (restricted toolset) | `gateway/platforms/webhook*.py` | Signed webhook triggers (Standard Webhooks) with the `safe` toolset (§12.2). | Adapt | M4 (M4.4 done) |
 | Heartbeat, goals, loops | `gateway/run_goals.py` | A job with `attach_to_session` runs inside one session (heartbeat). | Adapt | M4 |
 | Automation blueprints | `cron/blueprint_catalog.py` | Workflow templates (§12.3). | Adapt | M4 |
-| Workflows (multi-step, approvals, durable) | none | YAML workflows with tool, agent, approval, branch, parallel, wait steps on the Postgres queue (§12.3). | New | M4 |
-| Composio triggers | none | Composio triggers start runs (workflows with M4.5) with the `safe` toolset (§12.2). | New | M4 (M4.4 done) |
+| Workflows (multi-step, approvals, durable) | none | Versioned YAML workflows with tool, agent, approval, branch, parallel, wait, and workflow steps. Durable step rows in Postgres, operation ids, idempotency keys, receipts, reconcile, and owner approval of versions that write. `workflow_manage`, `workflow_run`, and the `session-to-workflow` skill (§12.3). | New | M4 (M4.5 done) |
+| Composio triggers | none | Composio triggers start runs or workflows with the `safe` toolset (§12.2). | New | M4 (M4.4 and M4.5 done) |
 
 ## 9. Channels
 
@@ -247,7 +247,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Two runtimes behind one contract with a conformance suite | §5 | M1, M3 (M3.6 done) |
 | Multi-user orgs, workspaces, roles, RLS | §17 | M1 |
 | Model proxy with budgets and no keys in the sandbox | D6, §18 | M1 |
-| Workflows with approval steps | §12.3 | M4 |
+| Workflows with approval steps | §12.3 | M4 (M4.5 done) |
 | Chrome extension: click, type, cursor in the user's browser | §14.2 | M5 |
 | Versioned and revertible self-improvement | D14 | M2 |
 | GitHub App and git proxy: no token in the sandbox, `sama/*` branches only, no force-push or delete, pull requests by tool | §15.1 | M3 (M3.7 done) |

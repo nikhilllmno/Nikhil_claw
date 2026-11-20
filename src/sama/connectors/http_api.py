@@ -60,7 +60,13 @@ class FormDriver(Protocol):
         ...
 
     async def call(
-        self, manifest: Manifest, tool: ToolSpec, values: Mapping[str, str], arguments: Any
+        self,
+        manifest: Manifest,
+        tool: ToolSpec,
+        values: Mapping[str, str],
+        arguments: Any,
+        *,
+        idempotency_key: str | None = None,
     ) -> str: ...
 
 
@@ -81,11 +87,22 @@ class HttpApiDriver:
         await self._send(http, http.test, values, {})
 
     async def call(
-        self, manifest: Manifest, tool: ToolSpec, values: Mapping[str, str], arguments: Any
+        self,
+        manifest: Manifest,
+        tool: ToolSpec,
+        values: Mapping[str, str],
+        arguments: Any,
+        *,
+        idempotency_key: str | None = None,
     ) -> str:
+        """Runs a tool. With ``idempotency_key`` and a manifest with
+        ``http.idempotency_header``, the request sends the key in that header."""
         if tool.request is None:
             raise DriverError("the connector has no request for this")
-        return await self._send(_http(manifest), tool.request, values, dict(arguments or {}))
+        http = _http(manifest)
+        return await self._send(
+            http, tool.request, values, dict(arguments or {}), idempotency_key=idempotency_key
+        )
 
     async def _send(
         self,
@@ -93,6 +110,8 @@ class HttpApiDriver:
         request: HttpRequest,
         values: Mapping[str, str],
         arguments: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
     ) -> str:
         path = request.path
         for name in path_params(path):
@@ -110,6 +129,8 @@ class HttpApiDriver:
             http.auth.header: http.auth.prefix + credential,
             "Accept": "application/json",
         }
+        if idempotency_key is not None and http.idempotency_header is not None:
+            headers[http.idempotency_header] = idempotency_key
         in_query = request.method in ("GET", "DELETE")
         try:
             answer = await self._http.request(

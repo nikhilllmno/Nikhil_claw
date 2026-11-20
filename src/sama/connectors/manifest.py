@@ -94,6 +94,10 @@ class HttpApi(_Strict):
     auth: HttpAuth
     headers: Mapping[str, str] = Field(default_factory=dict)
     test: HttpRequest
+    idempotency_header: Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9-]{0,63}$")] | None = None
+    """The request header for an idempotency key, when the API has one. A workflow sends the
+    operation id of a tool step in it, so the tools of the connector are idempotent
+    (docs/architecture.md, Section 12.3)."""
 
 
 McpAuth = Literal["oauth", "bearer", "header", "none"]

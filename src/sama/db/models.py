@@ -63,6 +63,23 @@ RUN_KINDS: Final = ("chat", "review")
 JOB_STATUSES: Final = ("active", "paused", "pending_approval", "removed")
 JOB_MODES: Final = ("agent", "script")
 JOB_CREATORS: Final = ("user", "agent")
+WORKFLOW_STATUSES: Final = ("active", "paused", "pending_approval", "removed")
+WORKFLOW_INSTANCE_STATUSES: Final = ("running", "waiting", "completed", "failed", "cancelled")
+ENDED_WORKFLOW_INSTANCE_STATUSES: Final = ("completed", "failed", "cancelled")
+WORKFLOW_TRIGGERS: Final = ("manual", "schedule", "trigger", "workflow")
+WORKFLOW_STEP_KINDS: Final = ("tool", "agent", "approval", "branch", "parallel", "wait", "workflow")
+WORKFLOW_STEP_STATUSES: Final = (
+    "pending",
+    "running",
+    "waiting",
+    "needs_reconcile",
+    "waiting_human",
+    "completed",
+    "failed",
+    "skipped",
+    "cancelled",
+)
+RECEIPT_STATUSES: Final = ("intent", "done", "failed", "unknown")
 FIRE_STATUSES: Final = ("running", "completed", "failed", "skipped")
 DELIVERY_KINDS: Final = ("result", "failure", "alert")
 DELIVERY_STATUSES: Final = ("pending", "sending", "sent", "failed", "unknown")
@@ -107,7 +124,7 @@ TRIGGER_SECRET_PATTERN: Final = "^trigger:[0-9a-f-]{36}$"  # noqa: S105 (a name 
 """The vault name of the signing secret of one webhook trigger (Section 12.2): ``trigger:<id>``."""
 TRIGGER_KINDS: Final = ("webhook", "composio")
 TRIGGER_STATUSES: Final = ("active", "disabled")
-TRIGGER_TARGETS: Final = ("run",)
+TRIGGER_TARGETS: Final = ("run", "workflow")
 """What an event starts (Section 12.2). Workflows (M4.5) add ``workflow``."""
 SAFE_TOOLSETS: Final = ("web", "media", "clarify")
 """The ``safe`` preset (Section 10.2): the default toolsets of an event-triggered run."""
@@ -1983,12 +2000,14 @@ class Delivery(Base):
 
 
 class Trigger(Base):
-    """An event source that starts a run (docs/architecture.md, Section 12.2).
+    """An event source that starts a run or a workflow (docs/architecture.md, Section 12.2).
 
     A ``webhook`` trigger has its own URL, and its signing secret is in the vault under the name
     ``trigger:<id>``. A ``composio`` trigger is a Composio trigger instance on the account of
-    ``connection_id``. Each event starts an unattended run in a new private session of
-    ``owner_user_id`` with only ``toolsets``. Only the control plane writes the table."""
+    ``connection_id``. With the target ``run``, each event starts an unattended run in a new
+    private session of ``owner_user_id`` with only ``toolsets``. With the target ``workflow``,
+    each event starts an instance of ``workflow_id`` (M4.5), limited to ``toolsets``. Only the
+    control plane writes the table."""
 
     __tablename__ = "triggers"
     __table_args__ = (
@@ -2009,11 +2028,20 @@ class Trigger(Base):
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        ForeignKeyConstraint(
+            ["org_id", "workflow_id"],
+            ["workflows.org_id", "workflows.id"],
+            name="fk_triggers_workflow",
+            ondelete="CASCADE",
+        ),
         UniqueConstraint("org_id", "id"),
         UniqueConstraint("composio_trigger_id"),
         CheckConstraint(_one_of("kind", TRIGGER_KINDS), name="kind"),
         CheckConstraint(_one_of("status", TRIGGER_STATUSES), name="status"),
         CheckConstraint(_one_of("target", TRIGGER_TARGETS), name="target"),
+        CheckConstraint(
+            "(target = 'workflow') = (workflow_id IS NOT NULL)", name="workflow_target"
+        ),
         CheckConstraint("char_length(name) BETWEEN 1 AND 80", name="name"),
         CheckConstraint("char_length(prompt) BETWEEN 1 AND 8000", name="prompt"),
         CheckConstraint("jsonb_typeof(toolsets) = 'array'", name="toolsets_array"),
@@ -2028,6 +2056,7 @@ class Trigger(Base):
             "last_error IS NULL OR char_length(last_error) <= 500", name="last_error_length"
         ),
         Index(None, "org_id", "workspace_id"),
+        Index(None, "workflow_id"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -2045,6 +2074,8 @@ class Trigger(Base):
     )
     """The toolsets of the runs. The default is the ``safe`` preset (Section 10.2)."""
     target: Mapped[str] = mapped_column(Text, nullable=False, server_default="run")
+    workflow_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """For the target ``workflow``: the workflow that each event starts (M4.5)."""
     connection_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     """For a ``composio`` trigger: the connection whose account has the trigger instance."""
     composio_trigger_id: Mapped[str | None] = mapped_column(Text)
@@ -2060,7 +2091,8 @@ class Trigger(Base):
 
 
 class TriggerEvent(Base):
-    """One accepted event of a trigger and the run that it started (Section 12.2).
+    """One accepted event of a trigger and the run or the workflow instance that it started
+    (Section 12.2).
 
     The unique ``(trigger_id, delivery_id)`` rejects a replay of the same delivery. Only the
     control plane writes the table."""
@@ -2078,9 +2110,21 @@ class TriggerEvent(Base):
             ["runs.org_id", "runs.session_id", "runs.id"],
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ["org_id", "workflow_instance_id"],
+            ["workflow_instances.org_id", "workflow_instances.id"],
+            name="fk_trigger_events_workflow_instance",
+            ondelete="CASCADE",
+        ),
         UniqueConstraint("trigger_id", "delivery_id"),
         CheckConstraint("char_length(delivery_id) BETWEEN 1 AND 200", name="delivery_id"),
+        CheckConstraint(
+            "(run_id IS NULL) = (session_id IS NULL)"
+            " AND (run_id IS NULL) <> (workflow_instance_id IS NULL)",
+            name="one_target",
+        ),
         Index(None, "org_id", "session_id"),
+        Index(None, "workflow_instance_id"),
         Index(None, "received_at"),
     )
 
@@ -2089,6 +2133,296 @@ class TriggerEvent(Base):
     trigger_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     delivery_id: Mapped[str] = mapped_column(Text, nullable=False)
     """The ``webhook-id`` of the delivery. A sender sends the same id again on a retry."""
-    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    workflow_instance_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The workflow instance of an event of a ``workflow`` trigger (M4.5). Such an event has no
+    session and no run."""
     received_at: Mapped[datetime] = _created_at()
+
+
+class Workflow(Base):
+    """A durable workflow (docs/architecture.md, Section 12.3). Each change of the YAML makes a
+    new ``version`` in ``workflow_versions``. Only the control plane writes the table."""
+
+    __tablename__ = "workflows"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "owner_user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"], ["agent_profiles.org_id", "agent_profiles.id"]
+        ),
+        ForeignKeyConstraint(["org_id", "origin_session_id"], ["sessions.org_id", "sessions.id"]),
+        CheckConstraint(_one_of("status", WORKFLOW_STATUSES), name="status"),
+        CheckConstraint(_one_of("created_by_kind", JOB_CREATORS), name="created_by_kind"),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 100", name="name_length"),
+        CheckConstraint("version >= 1", name="version"),
+        Index(None, "org_id", "owner_user_id"),
+        Index(
+            "ix_workflows_owner_name",
+            "org_id",
+            "owner_user_id",
+            "name",
+            unique=True,
+            postgresql_where=text("status <> 'removed'"),
+        ),
+        Index("ix_workflows_due", "next_fire_at", postgresql_where=text("status = 'active'")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    """The latest version. A new instance uses it."""
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    origin_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_by_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
+    created_by_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class WorkflowVersion(Base):
+    """One version of a workflow: the YAML text, the checked definition, and its hash. A
+    version that needs approval runs only when ``approved_hash`` is ``hash``."""
+
+    __tablename__ = "workflow_versions"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("org_id", "workflow_id", "version"),
+        ForeignKeyConstraint(
+            ["org_id", "workflow_id"], ["workflows.org_id", "workflows.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "approved_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint("version >= 1", name="version"),
+        CheckConstraint("jsonb_typeof(definition) = 'object'", name="definition_is_object"),
+        CheckConstraint(_one_of("created_by_kind", JOB_CREATORS), name="created_by_kind"),
+        CheckConstraint(
+            "(approved_hash IS NULL) = (approved_at IS NULL)", name="approved_has_time"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    hash: Mapped[str] = mapped_column(Text, nullable=False)
+    needs_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    approved_hash: Mapped[str | None] = mapped_column(Text)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
+    created_by_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class WorkflowInstance(Base):
+    """One run of a workflow. ``(workflow_id, scheduled_for)`` is unique, so a schedule fire
+    starts one instance. The version stays the same for the whole instance."""
+
+    __tablename__ = "workflow_instances"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("workflow_id", "scheduled_for"),
+        ForeignKeyConstraint(
+            ["org_id", "workflow_id"], ["workflows.org_id", "workflows.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workflow_id", "version"],
+            [
+                "workflow_versions.org_id",
+                "workflow_versions.workflow_id",
+                "workflow_versions.version",
+            ],
+            name="fk_workflow_instances_version",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "owner_user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"], ["agent_profiles.org_id", "agent_profiles.id"]
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "parent_instance_id"],
+            ["workflow_instances.org_id", "workflow_instances.id"],
+            name="fk_workflow_instances_parent",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(_one_of("status", WORKFLOW_INSTANCE_STATUSES), name="status"),
+        CheckConstraint(_one_of("trigger", WORKFLOW_TRIGGERS), name="trigger"),
+        CheckConstraint(_one_of("started_by_kind", ACTOR_KINDS), name="started_by_kind"),
+        CheckConstraint("depth BETWEEN 0 AND 3", name="depth"),
+        CheckConstraint("jsonb_typeof(inputs) = 'object'", name="inputs_is_object"),
+        CheckConstraint(
+            "toolsets IS NULL OR jsonb_typeof(toolsets) = 'array'", name="toolsets_array"
+        ),
+        CheckConstraint(
+            "(parent_instance_id IS NULL) = (parent_step_id IS NULL)", name="parent_has_step"
+        ),
+        Index(None, "org_id", "workflow_id", "created_at"),
+        Index(None, "org_id", "owner_user_id", "created_at"),
+        Index(None, "parent_instance_id"),
+        Index(
+            "ix_workflow_instances_open",
+            "checked_at",
+            postgresql_where=text("status IN ('running', 'waiting')"),
+        ),
+        Index(
+            "ix_workflow_instances_trigger_starts",
+            "org_id",
+            "created_at",
+            postgresql_where=text("trigger = 'trigger'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="running")
+    inputs: Mapped[dict[str, Any]] = _json()
+    output: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    parent_instance_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    parent_step_id: Mapped[str | None] = mapped_column(Text)
+    depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    trigger: Mapped[str] = mapped_column(Text, nullable=False, server_default="manual")
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_by_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
+    started_by_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    toolsets: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    """The toolset limit of the agent and tool steps: the toolsets of the trigger that started
+    the instance (Section 12.2). Null: no limit beyond the profile. A child keeps the limit."""
+    checked_at: Mapped[datetime] = _created_at()
+    """When the engine last advanced the instance. The engine advances the oldest first."""
+    created_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowStep(Base):
+    """The durable state of one step of an instance. ``(instance_id, step_id)`` is unique."""
+
+    __tablename__ = "workflow_steps"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("instance_id", "step_id"),
+        ForeignKeyConstraint(
+            ["org_id", "instance_id"],
+            ["workflow_instances.org_id", "workflow_instances.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "session_id"], ["sessions.org_id", "sessions.id"]),
+        ForeignKeyConstraint(["org_id", "run_id"], ["runs.org_id", "runs.id"]),
+        ForeignKeyConstraint(
+            ["org_id", "child_instance_id"],
+            ["workflow_instances.org_id", "workflow_instances.id"],
+        ),
+        ForeignKeyConstraint(["org_id", "resolved_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("kind", WORKFLOW_STEP_KINDS), name="kind"),
+        CheckConstraint(_one_of("status", WORKFLOW_STEP_STATUSES), name="status"),
+        CheckConstraint("attempts >= 0", name="attempts"),
+        CheckConstraint("char_length(step_id) BETWEEN 1 AND 64", name="step_id_length"),
+        Index(None, "run_id"),
+        Index(None, "child_instance_id"),
+        Index(
+            "ix_workflow_steps_due",
+            "next_attempt_at",
+            postgresql_where=text("status = 'pending' AND kind = 'tool'"),
+        ),
+        Index(
+            "ix_workflow_steps_leased",
+            "lease_expires_at",
+            postgresql_where=text("status = 'running' AND kind = 'tool'"),
+        ),
+        Index(
+            "ix_workflow_steps_reconcile",
+            "created_at",
+            postgresql_where=text("status = 'needs_reconcile'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    instance_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    step_id: Mapped[str] = mapped_column(Text, nullable=False)
+    parent_step_id: Mapped[str | None] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    input: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    """The rendered arguments of a tool step, or the rendered prompt of an agent step."""
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_attempt_at: Mapped[datetime] = _created_at()
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operation_id: Mapped[str | None] = mapped_column(Text)
+    output: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    child_instance_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    wake_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    event: Mapped[str | None] = mapped_column(Text)
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowReceipt(Base):
+    """The receipt of one external call of a tool step. Sama writes ``intent`` before the call
+    and ``done``, ``failed``, or ``unknown`` after it."""
+
+    __tablename__ = "workflow_receipts"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("step_row_id", "attempt"),
+        ForeignKeyConstraint(
+            ["org_id", "instance_id"],
+            ["workflow_instances.org_id", "workflow_instances.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "step_row_id"],
+            ["workflow_steps.org_id", "workflow_steps.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(_one_of("status", RECEIPT_STATUSES), name="status"),
+        CheckConstraint("attempt >= 1", name="attempt"),
+        Index(None, "org_id", "instance_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    instance_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    step_row_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    step_id: Mapped[str] = mapped_column(Text, nullable=False)
+    operation_id: Mapped[str] = mapped_column(Text, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="intent")
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
+    request_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    """The SHA-256 of the arguments. The receipt keeps no arguments, which can hold data."""
+    response: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

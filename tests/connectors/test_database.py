@@ -9,7 +9,7 @@ import ssl
 import uuid
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -268,3 +268,16 @@ def test_database_execute_always_asks() -> None:
     assert verdict.action == "ask"
     deny = (*allow, PolicyRule(level=RuleLevel.ORG, tool="db_*", action="deny"))
     assert policy_verdict(deny, "db_postgres_execute").action == "deny"
+
+
+async def test_a_workflow_tool_step_cannot_call_a_database_tool() -> None:
+    """A database tool saves files in the session of its run. A workflow tool step has no
+    run, so ``call_as`` without claims refuses it before it reads a connection."""
+    from sama.connectors.service import ConnectionService, ConnectorError, RunScope
+
+    catalog = Catalog.load(ROOT / "connectors" / "catalog")
+    service = ConnectionService(cast(Any, None), catalog)
+    scope = RunScope(org_id=uuid.uuid4(), workspace_id=uuid.uuid4(), user_id=None, shared=False)
+    with pytest.raises(ConnectorError, match="Use an agent step"):
+        await service.call_as(scope, "db_postgres_query", {"sql": "select 1"})
+    await service.aclose()

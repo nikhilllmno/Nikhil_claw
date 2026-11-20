@@ -154,6 +154,8 @@ from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.triggers import router as trigger_routes
 from sama.triggers import service as triggers
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
+from sama.workflows.service import WorkflowService
+from sama.workflows.spec import WorkflowError, WorkflowNotFoundError
 
 log = logging.getLogger("sama.api")
 
@@ -439,16 +441,19 @@ _TriggerToolsets = Annotated[list[Annotated[str, Field(max_length=100)]], Field(
 
 class NewTriggerBody(_Body):
     """An event trigger (Section 12.2). Without ``toolsets``, the runs get the ``safe`` preset.
-    A ``composio`` trigger needs ``connection_id`` and ``composio_slug``."""
+    A ``composio`` trigger needs ``connection_id`` and ``composio_slug``. With ``workflow_id``,
+    each event starts the workflow (M4.5), and ``prompt`` and ``agent_profile_id`` are optional.
+    Without it, each event starts a run, and they are required."""
 
     kind: Literal["webhook", "composio"]
     name: _TriggerName
-    prompt: _TriggerPrompt
-    agent_profile_id: uuid.UUID
+    prompt: _TriggerPrompt | None = None
+    agent_profile_id: uuid.UUID | None = None
     toolsets: _TriggerToolsets | None = None
     connection_id: uuid.UUID | None = None
     composio_slug: Annotated[str, Field(max_length=100)] | None = None
     composio_config: dict[str, Any] | None = None
+    workflow_id: uuid.UUID | None = None
 
 
 class TriggerEdit(_Edit):
@@ -497,6 +502,56 @@ class SessionOut(BaseModel):
 
 
 JobAction = Literal["pause", "resume", "run", "cancel"]
+WorkflowAction = Literal["pause", "resume"]
+
+
+class WorkflowSource(BaseModel):
+    """The YAML text of a workflow (Section 12.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    yaml: str = Field(min_length=1, max_length=50_000)
+    workspace_id: uuid.UUID | None = None
+    agent_profile_id: uuid.UUID | None = None
+
+
+class WorkflowApproval(BaseModel):
+    """The version that the person saw. An approval of another version fails."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1)
+
+
+class WorkflowStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event: str = Field(min_length=1, max_length=100)
+    data: Any = None
+
+
+class WorkflowDecision(BaseModel):
+    """The decision of the owner for an approval step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approve: bool
+
+
+class WorkflowResolution(BaseModel):
+    """The decision of the owner for a tool step whose result is not known: ``done`` (the
+    write happened; ``output`` is its output), ``retry``, or ``fail``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["done", "retry", "fail"]
+    output: Any = None
 
 
 class SchedulePreview(BaseModel):
@@ -760,6 +815,16 @@ async def _job_call[T](call: Awaitable[T]) -> T:
         raise HTTPException(status_code=400, detail=str(error)) from None
 
 
+async def _workflow_call[T](call: Awaitable[T]) -> T:
+    """Maps the errors of the workflow service to HTTP answers."""
+    try:
+        return await call
+    except WorkflowNotFoundError as error:
+        raise _not_found(str(error)) from None
+    except WorkflowError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
 # -- the service ----------------------------------------------------------------------------
 
 
@@ -786,10 +851,12 @@ class SamaApi:
         triggers: triggers.TriggerService | None = None,
         skill_store: PostgresSkillStore | None = None,
         search: SessionSearch | None = None,
+        workflows: WorkflowService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
-        ``409``. Without ``jobs``, the job routes answer ``409``. Without ``skills``,
+        ``409``. Without ``jobs``, the job routes answer ``409``, and without ``workflows``, the
+        workflow routes answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command. Without ``search``, the session search of the web app uses full-text search
         only."""
@@ -803,6 +870,7 @@ class SamaApi:
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
         self._jobs = jobs
+        self._workflows = workflows
         self._media = GeneratedMediaStore(engine)
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
@@ -1362,6 +1430,8 @@ class SamaApi:
             jobs, actor = await self._job_actor(principal, org_id)
             await _job_call(jobs.remove(actor, job_id))
             return Response(status_code=204)
+
+        self._workflow_routes(app)
 
         @app.get("/skills/{skill_id}/versions")
         async def skill_versions(principal: Me, skill_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -2303,6 +2373,154 @@ class SamaApi:
         if not (grants.org_admin or grants.admins_workspace(workspace_id)):
             raise HTTPException(status_code=403, detail=_BOT_ADMIN_ONLY)
         return org_id, grants
+
+    def _workflow_routes(self, app: FastAPI) -> None:
+        """The workflow routes of Section 12.3. A user sees and changes only the workflows that
+        the user owns."""
+
+        @app.post("/workflows/validate")
+        async def validate_workflow(principal: Me, body: WorkflowSource) -> dict[str, Any]:
+            workflows = self._require_workflows()
+            try:
+                return workflows.validate(body.yaml)
+            except WorkflowError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from None
+
+        @app.get("/orgs/{org_id}/workflows")
+        async def list_workflows(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await workflows.list(actor)
+
+        @app.post("/orgs/{org_id}/workflows", status_code=201)
+        async def create_workflow(
+            principal: Me, org_id: uuid.UUID, body: WorkflowSource
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(
+                workflows.create(
+                    actor,
+                    body.yaml,
+                    workspace_id=body.workspace_id,
+                    agent_profile_id=body.agent_profile_id,
+                )
+            )
+
+        @app.get("/orgs/{org_id}/workflows/{workflow_id}")
+        async def get_workflow(
+            principal: Me, org_id: uuid.UUID, workflow_id: uuid.UUID
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(workflows.get(actor, workflow_id))
+
+        @app.put("/orgs/{org_id}/workflows/{workflow_id}")
+        async def update_workflow(
+            principal: Me, org_id: uuid.UUID, workflow_id: uuid.UUID, body: WorkflowSource
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(workflows.update(actor, workflow_id, body.yaml))
+
+        @app.post("/orgs/{org_id}/workflows/{workflow_id}/approve")
+        async def approve_workflow(
+            principal: Me, org_id: uuid.UUID, workflow_id: uuid.UUID, body: WorkflowApproval
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(workflows.approve(actor, workflow_id, body.version))
+
+        @app.post("/orgs/{org_id}/workflows/{workflow_id}/start", status_code=201)
+        async def start_workflow(
+            principal: Me, org_id: uuid.UUID, workflow_id: uuid.UUID, body: WorkflowStart
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(workflows.start(actor, workflow_id, body.inputs))
+
+        @app.post("/orgs/{org_id}/workflows/{workflow_id}/{action}")
+        async def workflow_action(
+            principal: Me, org_id: uuid.UUID, workflow_id: uuid.UUID, action: WorkflowAction
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            if action == "pause":
+                return await _workflow_call(workflows.pause(actor, workflow_id))
+            return await _workflow_call(workflows.resume(actor, workflow_id))
+
+        @app.delete("/orgs/{org_id}/workflows/{workflow_id}", status_code=204)
+        async def remove_workflow(
+            principal: Me, org_id: uuid.UUID, workflow_id: uuid.UUID
+        ) -> Response:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            await _workflow_call(workflows.remove(actor, workflow_id))
+            return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/workflow-instances")
+        async def list_workflow_instances(
+            principal: Me,
+            org_id: uuid.UUID,
+            workflow_id: uuid.UUID | None = None,
+            limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        ) -> list[dict[str, Any]]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await workflows.instances(actor, workflow_id, limit=limit)
+
+        @app.get("/orgs/{org_id}/workflow-instances/{instance_id}")
+        async def get_workflow_instance(
+            principal: Me, org_id: uuid.UUID, instance_id: uuid.UUID
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(workflows.instance(actor, instance_id))
+
+        @app.post("/orgs/{org_id}/workflow-instances/{instance_id}/cancel")
+        async def cancel_workflow_instance(
+            principal: Me, org_id: uuid.UUID, instance_id: uuid.UUID
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(workflows.cancel(actor, instance_id))
+
+        @app.post("/orgs/{org_id}/workflow-instances/{instance_id}/signal")
+        async def signal_workflow_instance(
+            principal: Me, org_id: uuid.UUID, instance_id: uuid.UUID, body: WorkflowSignal
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            ended = await _workflow_call(
+                workflows.signal(actor, instance_id, body.event, body.data)
+            )
+            return {"ended": ended}
+
+        @app.post("/orgs/{org_id}/workflow-instances/{instance_id}/steps/{step_id}/decide")
+        async def decide_workflow_step(
+            principal: Me,
+            org_id: uuid.UUID,
+            instance_id: uuid.UUID,
+            step_id: str,
+            body: WorkflowDecision,
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(
+                workflows.decide(actor, instance_id, step_id, approve=body.approve)
+            )
+
+        @app.post("/orgs/{org_id}/workflow-instances/{instance_id}/steps/{step_id}/resolve")
+        async def resolve_workflow_step(
+            principal: Me,
+            org_id: uuid.UUID,
+            instance_id: uuid.UUID,
+            step_id: str,
+            body: WorkflowResolution,
+        ) -> dict[str, Any]:
+            workflows, actor = await self._workflow_actor(principal, org_id)
+            return await _workflow_call(
+                workflows.resolve(actor, instance_id, step_id, body.action, body.output)
+            )
+
+    def _require_workflows(self) -> WorkflowService:
+        if self._workflows is None:
+            raise HTTPException(status_code=409, detail="workflows are off in this process")
+        return self._workflows
+
+    async def _workflow_actor(
+        self, principal: Principal, org_id: uuid.UUID
+    ) -> tuple[WorkflowService, JobActor]:
+        workflows = self._require_workflows()
+        grants = await self._org_grants(principal, org_id)
+        return workflows, JobActor(org_id=org_id, user_id=grants.user_id, kind="user")
 
     def _require_jobs(self) -> JobService:
         if self._jobs is None:

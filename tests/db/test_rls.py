@@ -69,6 +69,11 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "jobs": {"job:alice"},
         "job_fires": {"fire:alice"},
         "deliveries": {"delivery:alice"},
+        "workflows": {"workflow:alice"},
+        "workflow_versions": {"workflow-version:alice"},
+        "workflow_instances": {"workflow-instance:alice"},
+        "workflow_steps": {"workflow-step:alice"},
+        "workflow_receipts": {"workflow-receipt:alice"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -92,6 +97,11 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "jobs": set(),
         "job_fires": set(),
         "deliveries": set(),
+        "workflows": set(),
+        "workflow_versions": set(),
+        "workflow_instances": set(),
+        "workflow_steps": set(),
+        "workflow_receipts": set(),
     },
     "dave": {
         "orgs": {"org-a"},
@@ -115,6 +125,11 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "jobs": set(),
         "job_fires": set(),
         "deliveries": set(),
+        "workflows": set(),
+        "workflow_versions": set(),
+        "workflow_instances": set(),
+        "workflow_steps": set(),
+        "workflow_receipts": set(),
     },
     "bob": {
         "orgs": {"org-b"},
@@ -138,6 +153,11 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "jobs": {"job:bob"},
         "job_fires": {"fire:bob"},
         "deliveries": {"delivery:bob"},
+        "workflows": {"workflow:bob"},
+        "workflow_versions": {"workflow-version:bob"},
+        "workflow_instances": {"workflow-instance:bob"},
+        "workflow_steps": {"workflow-step:bob"},
+        "workflow_receipts": {"workflow-receipt:bob"},
     },
     "stranger": {
         "orgs": set(),
@@ -161,6 +181,11 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "jobs": set(),
         "job_fires": set(),
         "deliveries": set(),
+        "workflows": set(),
+        "workflow_versions": set(),
+        "workflow_instances": set(),
+        "workflow_steps": set(),
+        "workflow_receipts": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.
@@ -509,3 +534,51 @@ async def test_a_review_proposal_follows_the_visibility_of_its_session(
         with pytest.raises(DBAPIError) as error:
             await connection.execute(text("UPDATE review_proposals SET status = 'applied'"))
     assert sqlstate(error.value) == INSUFFICIENT_PRIVILEGE
+
+
+async def test_a_workflow_trigger_event_shows_with_its_workflow_instance(
+    engine: AsyncEngine, world: World
+) -> None:
+    """The event of a trigger with the target ``workflow`` has no session. It shows to the
+    users who see its workflow instance: only the owner (M4.5)."""
+    trigger_id = uuid.uuid4()
+    ids = world.ids
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO triggers (id, org_id, workspace_id, owner_user_id, agent_profile_id,"
+                " kind, name, prompt, target, workflow_id, created_by_user_id) VALUES (:id, :org,"
+                " :ws, :alice, :profile, 'webhook', 'w', 'p', 'workflow', :workflow, :alice)"
+            ),
+            {
+                "id": trigger_id,
+                "org": ids["org-a"],
+                "ws": ids["a1"],
+                "alice": ids["alice"],
+                "profile": ids["profile-a"],
+                "workflow": ids["workflow:alice"],
+            },
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO trigger_events (org_id, trigger_id, delivery_id,"
+                " workflow_instance_id) VALUES (:org, :trigger, 'msg_w', :instance)"
+            ),
+            {
+                "org": ids["org-a"],
+                "trigger": trigger_id,
+                "instance": ids["workflow-instance:alice"],
+            },
+        )
+    try:
+        where = "workflow_instance_id IS NOT NULL"
+        seen = {}
+        for user in ("alice", "carol", "dave", "bob"):
+            async with as_user(engine, world.auth[user]) as connection:
+                seen[user] = await count(connection, "trigger_events", where)
+        assert seen == {"alice": 1, "carol": 0, "dave": 0, "bob": 0}
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM triggers WHERE id = :id"), {"id": trigger_id}
+            )

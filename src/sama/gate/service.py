@@ -45,6 +45,7 @@ from sama.db.models import (
 from sama.gate.approvers import SHARED_REFUSAL, approvers_of, may_decide_shared
 from sama.gate.decide import (
     JOB_TOOLSET,
+    WORKFLOW_TOOLSET,
     Action,
     GateContext,
     GateStep,
@@ -74,6 +75,7 @@ from sama.tenancy.access import load_grants
 from sama.tenancy.authority import budget_problem, load_authority, load_run_spend, run_user
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import default_redactor, redact
+from sama.workflows.store import workflow_of_run
 
 log = logging.getLogger("sama.gate")
 
@@ -482,6 +484,13 @@ class GateService:
             # only when a human approved this exact version of the job.
             toolsets -= {JOB_TOOLSET}
             preapproved = job.preapproved
+        workflow = await workflow_of_run(connection, org_id, run_id)
+        if workflow is not None:
+            # The run of an agent step cannot create, change, or start workflows or jobs
+            # (Section 12.3). Its pre-approvals apply only when a human approved this exact
+            # version of the workflow.
+            toolsets -= {JOB_TOOLSET, WORKFLOW_TOOLSET}
+            preapproved = workflow.preapproved
         extra = dict(self._extra_toolsets.toolsets()) if self._extra_toolsets is not None else {}
         access = dict(self._extra_toolsets.access()) if self._extra_toolsets is not None else {}
         if self._run_tools is not None:

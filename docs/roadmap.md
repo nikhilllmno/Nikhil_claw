@@ -180,8 +180,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
   the account of a connection. Sama checks the signature, rejects a replay (one row per
   delivery id), and reads at most 1 MiB. Each event starts an unattended run in a new private
   session of the trigger owner, with the `safe` toolsets unless an admin gave more. Not in
-  M4.4: workflows as targets (M4.5), delivery of the answer to a channel (M4.3), channel
-  events, and a web page for triggers.
+  M4.4: delivery of the answer to a channel (M4.3), channel events, and a web page for
+  triggers. M4.5 added workflows as targets.
 - M3.5: remote MCP connections in `src/sama/connectors/mcp_remote.py`, `oauth.py`, and
   `mcp_driver.py` (architecture Section 10.3, "What M3.5 builds"). The catalog has `deepwiki`,
   `neon-mcp`, `stripe`, `sentry`, and `supabase-mcp` (`neon` and `supabase` are the M3.11
@@ -198,6 +198,19 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
   hidden. Not in M3.5:
   `policy_overrides` in the gate, MCP resources and prompts, a refresh lock across processes,
   and an MCP `listChanged` notice (sama reads the list again at a check or after 6 hours).
+- M4.5: durable workflows in `src/sama/workflows/` (architecture Section 12.3). Migration
+  `0029` adds `workflows`, `workflow_versions`, `workflow_instances`, `workflow_steps`, and
+  `workflow_receipts` with RLS (only the owner reads them), the toolset `workflows` in the
+  default profile, and the trigger target `workflow` (`triggers.workflow_id`,
+  `trigger_events.workflow_instance_id`, `workflow_instances.toolsets`). A YAML definition
+  has the steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, and `workflow`, and
+  each change makes a new version. The engine is a control-plane loop. Tool steps have stable
+  operation ids and receipts. A write that is not idempotent and has an unknown result waits
+  for a reconcile or the owner, and sama does not write it again. A version that writes
+  externally needs the approval of its owner before it runs. The tools are `workflow_manage`
+  and `workflow_run`, and the skill `session-to-workflow` turns a session into a workflow.
+  Not in M4.5: a web page for workflows, and a reconcile check for connector tools (the owner
+  resolves such a step).
 - M3.4: connections in `src/sama/connectors/` and `connectors/catalog/` (architecture Section
   10.3). Migration `0022` adds `connections` with RLS, the vault names `composio_api_key` and
   `connection:<uuid>`, and the toolsets `connections` and `integrations` in the default
@@ -399,8 +412,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
 | M4.1 | Scheduler | `scheduler` service with a 60-second tick and leader lease. A fire runs once, also when two schedulers run. Done. |
 | M4.2 | Cron jobs | `jobs` table, `cronjob_manage`, `/cron`, and a web page. Natural language to cron with validation and the next 3 fire times. Model pin, `mode: script`, `preapproved_tools`, `attach_to_session`. A job run cannot create jobs. Adding or widening a pre-approval needs a human approval bound to the job version, connection, and argument limits. A test shows that a job created by the agent cannot run a write tool without that approval. Done. |
 | M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. Done. |
-| M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. Done (runs; workflows come with M4.5). |
-| M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
+| M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. Done. |
+| M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. Done. |
 | M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. Done. |
 | M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. Done. |
 | M4.8 | Code execution | `execute_code` with a stub that calls sama tools over MCP. Only stdout returns to the model. Done (architecture §10.2.1). |

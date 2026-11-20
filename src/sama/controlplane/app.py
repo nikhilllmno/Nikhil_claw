@@ -95,6 +95,8 @@ from sama.tools.web import BraveSearch
 from sama.triggers.service import TriggerService
 from sama.vault.redact import default_redactor
 from sama.vault.store import OrgKeys, SecretName, Vault
+from sama.workflows.engine import ConnectorStepTools, WorkflowEngine
+from sama.workflows.service import WorkflowService
 
 log = logging.getLogger("sama.controlplane")
 
@@ -285,6 +287,9 @@ def build(
     ledger = UsageLedger(usage)
     prices = PriceTable.load()
     jobs = JobService(engine, RunQueue(engine))
+    # The workflow engine of Section 12.3 runs tool steps with the connector tools.
+    workflows = WorkflowService(engine, RunQueue(engine), connections.tool_access)
+    workflow_engine = WorkflowEngine(engine, RunQueue(engine), ConnectorStepTools(connections))
     # The media tools use the OpenAI key of the org (Section 11.7). Without a key, they are
     # hidden.
     media = GeneratedMediaStore(engine)
@@ -353,6 +358,7 @@ def build(
         delegation=DelegationService(engine, queue),
         tasks=TaskTools(engine),
         jobs=jobs,
+        workflows=workflows,
     )
     proxy = ModelProxy(
         signer=signer,
@@ -431,9 +437,11 @@ def build(
             connections=connections,
             public_url=settings.public_url,
             composio_secret=settings.composio_webhook_secret,
+            workflows=workflows,
         ),
         skill_store=skill_store,
         search=sessions,
+        workflows=workflows,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -476,6 +484,7 @@ def build(
                 loops.append(vault)
             stack.push_async_callback(scheduler.aclose)
             loops.append(scheduler)
+            loops.append(workflow_engine)
             plane.tasks = [
                 asyncio.create_task(worker.serve(stop, concurrency=settings.worker_concurrency)),
                 *(asyncio.create_task(loop.serve(stop)) for loop in loops),

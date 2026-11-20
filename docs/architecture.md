@@ -2039,10 +2039,12 @@ A profile also has a **group set**: the toolsets that a chat run in a shared ses
 default profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
-(M4.2), and `code_exec` since migration `0027` (M4.8). The default group set has no
+(M4.2), `code_exec` since migration `0027` (M4.8), and `workflows` since migration `0029`
+(M4.5). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
-Migrations `0022`, `0023`, `0026`, and `0027` change only the lists that are equal to the old defaults.
+Migrations `0022`, `0023`, `0026`, `0027`, and `0029` change only the lists that are equal to
+the old defaults.
 Sub-agents (Section 13.1) do not get `connections` or `integrations`.
 
 ### 10.2.1 Code execution (M4.8)
@@ -3611,7 +3613,7 @@ are untrusted. Event-triggered runs use the `safe` toolset unless the trigger sa
   `trigger_events` (one row for each accepted delivery), both with `org_id` and RLS. A member of
   the workspace or an org admin sees its triggers. An event row shows to the users who can read
   its session. The migration also adds `runs.toolsets` and the vault names `trigger:<uuid>` and
-  `composio_webhook_secret`. The field `target` takes only `run`. Workflows (M4.5) add a value.
+  `composio_webhook_secret`. The field `target` is `run` or, since M4.5, `workflow`.
 - **Kinds.** A `webhook` trigger has its own URL, `<SAMA_PUBLIC_URL>/triggers/<id>/webhook`,
   and its own secret `whsec_<base64>` in the vault entry `trigger:<id>`. Sama shows the secret
   one time, when it makes or rotates it. A `composio` trigger is a Composio trigger instance
@@ -3644,8 +3646,8 @@ are untrusted. Event-triggered runs use the `safe` toolset unless the trigger sa
   event for a trigger that is gone at that time gets `200` with `ignored`. `runs.toolsets`
   limits the run to the toolsets of the trigger and of the profile, in the gate, the prompt,
   and the skills. The default is `safe`. Only a workspace admin, an org admin, or the org owner
-  can give more than `safe`. A trigger cannot have `delegation`, `tasks`, or `cron`, the
-  toolsets that start other runs. A run that another run starts (a delegated child, a steer, or a task card)
+  can give more than `safe`. A trigger cannot have `delegation`, `tasks`, `cron`, or
+  `workflows`, the toolsets that start other runs. A run that another run starts (a delegated child, a steer, or a task card)
   also keeps the `runs.toolsets` limit of the run that started it. Unattended rules
   apply (Section 12.1): `ask` becomes `deny`, and `clarify` gets no answer. If the owner cannot
   see the workspace now, the event gets `410` and the trigger gets `last_error`.
@@ -3657,7 +3659,24 @@ are untrusted. Event-triggered runs use the `safe` toolset unless the trigger sa
   `PUT /orgs/{id}/composio/webhook` (org admin) subscribes the Composio project of an org with
   its own `composio_api_key` to `<SAMA_PUBLIC_URL>/composio/webhook` and keeps the secret in the
   vault. The operator subscribes the project of sama and sets `SAMA_COMPOSIO_WEBHOOK_SECRET`.
-- **Not in M4.4.** Workflows as targets (M4.5), delivery of the answer to a channel (M4.3; the
+- **Workflow targets (M4.5).** A trigger with `workflow_id` has the target `workflow`. Each
+  accepted event starts an instance of that workflow (Section 12.3) with the trigger
+  `trigger`, not a run. The workflow must be in the workspace of the trigger, it must have the
+  same owner (else `403`), and it must not be removed (else `404`). The trigger uses the
+  profile of the workflow, and its prompt is optional (the default is `Start the workflow
+  <name>.`). One transaction starts the instance and writes the event row, which points to
+  the instance (`trigger_events.workflow_instance_id`) and has no session and no run. When
+  the workflow defines the input `event`, the instance gets the payload in it: the redacted
+  compact JSON, cut at 9,000 bytes so the inputs stay under their limit. The toolsets of the
+  trigger go to `workflow_instances.toolsets`, and each agent step run of the instance and of
+  its child instances gets them as its `runs.toolsets` limit. Tool steps do not take the
+  limit: the owner approved their tools and arguments with the version. A workflow that is
+  paused or that waits for an approval refuses the event with `409`, sets `last_error` on the
+  trigger, and writes no row, so the sender can try again. Each instance that a trigger
+  starts counts toward the message rate of the owner and of the org, with the chat runs. Over
+  the rate, the event gets `429` with `Retry-After`, and sama writes no row. Such an event row
+  shows to the users who see its workflow instance (the owner).
+- **Not in M4.4.** Delivery of the answer to a channel (M4.3; the
   answer stays in the trigger session), channel events, and a web page. A follow-up message
   in a trigger session is a normal run with the toolsets of the profile. A late Composio
   event for a deleted trigger of an org with its own Composio project gets `401`, not `200`:
@@ -3671,19 +3690,21 @@ repeatable process.
 
 ```yaml
 name: weekly-github-digest
+inputs:
+  repo: { default: Nikhil_claw }
 triggers:
   - cron: "0 9 * * MON"
     tz: Asia/Kolkata
 steps:
   - id: fetch
-    tool: composio.GITHUB_LIST_REPOSITORY_ISSUES   # tool step: no LLM
-    args: { owner: nikhilllmno, repo: Nikhil_claw, state: open }
+    tool: github_list_repository_issues   # tool step: one connector tool call, no LLM
+    args: { owner: nikhilllmno, repo: "{{inputs.repo}}", state: open }
   - id: summarise
-    agent: { profile: assistant, prompt: "Summarise {{steps.fetch.output}} by priority." }
+    agent: { prompt: "Summarise {{steps.fetch.output}} by priority." }
   - id: approve
-    approval: { prompt: "Post this digest to #eng?", approvers: [owner] }
+    approval: { prompt: "Post this digest to #eng?" }
   - id: post
-    tool: composio.SLACK_SEND_MESSAGE
+    tool: slack_send_message
     args: { channel: "#eng", text: "{{steps.summarise.output}}" }
 ```
 
@@ -3702,6 +3723,128 @@ steps:
   is a built-in skill. New or changed workflows that write to external systems need an
   approval before their first run.
 - The web app shows each workflow instance with its steps, outputs, and approvals.
+
+Definition (M4.5):
+
+- **Fields.** `name` (letters, digits, `-` and `_`, unique for the owner), `description`,
+  `inputs` (a map of names to `{default, required, description}`), `triggers` (at most 5,
+  each `{cron, tz}` or `{schedule, tz}` with the schedule rules of Section 12.1), and `steps`.
+  The YAML text is at most 50 KB. A workflow has at most 50 steps in all.
+- **Step ids.** Each step has an `id` (`[a-z0-9_-]`, at most 64 characters). An id is unique
+  in the whole workflow, also in branches. Each step has exactly one step key.
+- **Templates.** `{{inputs.<name>}}` and `{{steps.<id>.output}}` (and `.output.<key>` for a
+  field of an object output). A value that is one template keeps its JSON type. A template in
+  a longer text becomes text. A template must name a known input or step.
+- **`tool`.** `tool: <name>` and `args`. In M4.5 a tool step runs a connector tool of the
+  catalog (Section 10.3). Other tools run in an `agent` step.
+- **`agent`.** `{prompt, profile, model, skills, preapproved_tools}`. The run is an
+  unattended run (Section 16.1) in a new private session of the owner. Its final answer is the
+  output of the step. `preapproved_tools` has the form of Section 12.1.
+- **`approval`.** `{prompt}`. The step waits until the owner approves or rejects it in the
+  API or the web app. A rejection fails the instance. An agent cannot decide an approval step.
+- **`branch`.** `{when, then, else}`. `when` is `{value, equals | not_equals | contains |
+  empty}`. Sama does not evaluate code: a condition is a fixed comparison. The output is the
+  output of the last step of the branch that ran.
+- **`parallel`.** `{branches: {<name>: [steps]}}`, at most 10 branches. The output is a map of
+  the branch names to the output of the last step of each branch. One failed branch fails
+  the step.
+- **`wait`.** `{seconds}`, `{until}` (an ISO time), or `{event, timeout_seconds}`. The longest
+  wait is 30 days. `workflow_run signal` or the API sends an event. The data of the event is
+  the output of the step. An event wait that times out fails.
+- **`workflow`.** `{name, inputs}`. It starts an instance of another workflow of the owner
+  and waits for it. The output is the output of that instance. The depth is at most 3.
+
+Execution (M4.5):
+
+- **Tables.** `workflows` (one row for each workflow, with its current version and status),
+  `workflow_versions` (the YAML text, the checked definition, its SHA-256 hash, and the
+  approval of the version), `workflow_instances` (one row for each run of a workflow),
+  `workflow_steps` (one row for each step of an instance, unique on
+  `(instance_id, step_id)`), and `workflow_receipts` (one row for each external call).
+  Only the owner reads them (RLS). Only the control plane writes them.
+- **Process.** The workflow engine is a loop in the control plane process, as the scheduler
+  is (`sama.workflows.engine`). It ticks every 60 seconds under the leader lease
+  `sama.workflows.tick` and starts the due schedules. An instance is unique on
+  `(workflow_id, scheduled_for)`, so a schedule fire starts once. Each 2 seconds the loop
+  advances the instances, runs the tool steps, takes back expired leases, and reconciles.
+- **Advance.** The engine locks one instance row (`FOR UPDATE SKIP LOCKED`), reads the
+  step rows, and walks the step tree in order. A step that has no row gets one: a tool step
+  is `pending` with its rendered arguments, an agent step gets its session and run in the
+  same transaction, and a sub-workflow step gets its child instance in the same transaction.
+  The engine evaluates `branch` and `parallel` steps during the walk. A crash between two
+  transactions loses nothing: the next walk reads the same rows.
+- **The version is fixed.** An instance runs the version that it started with. A later
+  change of the workflow does not change an instance that started.
+- **Tool steps.** A worker claims a `pending` step with `FOR UPDATE SKIP LOCKED`, sets
+  `running` with a lease of 120 seconds, and writes the receipt `intent` in the same
+  transaction, before the call. After the call, one transaction writes the receipt (`done`
+  with the clipped, redacted answer, or `failed`, or `unknown`) and the step.
+  - The operation id is `<instance id>:<step id>`. It does not change between attempts.
+  - Each attempt sends the idempotency key of the first attempt, from its receipt. When the
+    first attempt sent no key, no attempt sends a key: a key that comes later cannot stop a
+    second write of a call without a key. A retry after an unknown result is safe only for a
+    read tool, or when the call sent a key and the tool still takes keys.
+  - An `http_api` connector with `http.idempotency_header` in its manifest sends the
+    operation id in that header, so the tool is idempotent. A Composio tool has no
+    idempotency key, so sama treats a Composio write as not idempotent.
+  - A definite failure (a 4xx answer, a refusal, a missing connection) retries after
+    10 s x 2^attempts, for at most 3 attempts. Then the step fails, and the instance fails.
+  - An unknown result (a network error, a time limit, a 5xx, 408, or 429 answer, or a lost
+    lease) of a read tool or of an idempotent tool retries with the same operation id. The
+  reap of a lost lease reads the key from the receipt of the attempt, not from the catalog of
+  now.
+  - An unknown result of a write that is not idempotent is not retried. The receipt becomes
+    `unknown`, and the step becomes `needs_reconcile`.
+  - A worker that crashes leaves the step `running` with the receipt `intent`. When the lease
+    ends, the engine treats the step as an unknown result with the rules above.
+- **Reconcile.** For a `needs_reconcile` step, the engine asks the tool runner to check the
+  result with the operation id. When the write happened, the step completes with the found
+  output. When it did not happen, the step retries. When the runner cannot tell (the default
+  for connector tools in M4.5), the step becomes `waiting_human`. The owner then marks it
+  `done` (with an optional output), `retry`, or `fail`
+  (`POST /orgs/{org_id}/workflow-instances/{id}/steps/{step_id}/resolve`). A reconcile result
+  applies only to the attempt that it checked: it changes the step only while the step is
+  still `needs_reconcile` with the same `attempts`, so a late result cannot change a newer
+  attempt.
+- **Authority of a tool step.** A tool step runs as the owner, with the connections of a
+  private session of the owner in the workspace of the workflow. A `deny` policy rule for the
+  tool, or a profile without the `integrations` toolset, fails the step. A database tool
+  (M3.11) saves files in the session of its run, so a tool step cannot call it: use an agent
+  step. A remote MCP tool (M3.5), a hosted MCP tool (M4.11), and a tool of a custom HTTP API
+  connection (M4.12) are not in the connector catalog, so a tool step cannot call them
+  either: use an agent step. The approval of the version stands in for the `ask` of a write
+  tool. At each claim, the engine hashes the definition again and compares it with the
+  approved hash. At each advance and each claim,
+  it checks that the owner still sees the workspace of the workflow. An owner who lost the
+  workspace fails the instance, and the start of a sub-workflow checks the workspace of the
+  child workflow.
+- **Agent steps.** The gate removes the `workflows` and `cron` toolsets from an agent step
+  run, and `WorkflowService` refuses a change from such a run (the recursion guard). An
+  instance that a trigger started also limits its agent step runs to the toolsets of the
+  trigger (Section 12.2). The
+  `preapproved_tools` of the step apply only when the owner approved the version of the
+  instance and its stored hash matches.
+- **Approval.** A version needs the approval of its owner when it has a tool step with
+  `write` or `destructive` access, or an agent step with `preapproved_tools`. Such a version
+  is `pending_approval` until the owner approves that version, also when a person wrote it.
+  The approval names the version that the owner saw, and it stores the hash of the
+  definition. An agent cannot approve. A version that does not need approval is `active` at
+  once.
+- **Cancel.** A cancel of an instance cancels its open steps, the runs of its agent steps,
+  and its child instances, in one transaction. It locks the runs first, so a requeue of a
+  run with an expired lease cannot slip between its updates. A crash after the commit cannot
+  leave an agent run alive. The answer of a tool call that is still in flight writes its
+  receipt, but it does not change the cancelled step.
+- **Interfaces.** The tools `workflow_manage` (create, update, validate, list, get, pause,
+  resume, remove) and `workflow_run` (start, status, list, cancel, signal), the API, and the
+  triggers of M4.4 (`WorkflowService.start_in`) all use `WorkflowService`. The API routes are
+  `POST /workflows/validate`, `GET` and `POST /orgs/{org_id}/workflows`, `GET`, `PUT`, and
+  `DELETE /orgs/{org_id}/workflows/{id}`, `POST .../{id}/approve`, `.../start`, `.../pause`,
+  and `.../resume`, `GET /orgs/{org_id}/workflow-instances` and `.../{id}`, and `POST
+  .../{id}/cancel`, `.../signal`, `.../steps/{step_id}/decide`, and
+  `.../steps/{step_id}/resolve`. A user has at most 50
+  workflows. The gate gives both tools `ask` in a shared session, and a delegated child does
+  not have them.
 
 ### 12.4 Task board (M4.7)
 
@@ -5173,6 +5316,9 @@ engine, one run token signer, one gate service, and one clarify broker.
   (Section 18).
 - The scheduler of the jobs (Section 12.1) is a loop in the process. Each machine runs the
   loop, and the leader lease lets one machine tick at a time. It adds no Fly.io process.
+- The workflow engine (Section 12.3) is a loop in the process too, with its own leader lease
+  for the schedule tick. Its step claims use `FOR UPDATE SKIP LOCKED`, so each machine can
+  run steps.
 - When a background loop ends with an error, the process logs it and stops, so that Fly.io
   starts it again.
 - A stop (SIGTERM or SIGINT) has this order, because the runs in the sandboxes need the model

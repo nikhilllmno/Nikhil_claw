@@ -1,6 +1,7 @@
 """Event triggers (docs/architecture.md, Section 12.2, M4.4).
 
-A trigger starts an unattended run when an event comes in:
+A trigger starts an unattended run, or an instance of a workflow (M4.5), when an event comes
+in:
 
 - A ``webhook`` trigger has its own URL, ``POST /triggers/<id>/webhook``. The sender signs each
   delivery with the secret of the trigger (Standard Webhooks, ``sama.triggers.signature``).
@@ -17,7 +18,11 @@ The event, the session, and the run are one transaction. A second delivery with 
 finds the event row and starts nothing. When the owner is over the message rate, the
 transaction rolls back and the answer is ``429``, so the sender tries again later.
 
-The ``target`` column is ``run`` today. A workflow target comes with M4.5.
+A trigger with the target ``workflow`` starts an instance of its workflow instead of a run
+(Section 12.3). The workflow must have the same owner and workspace as the trigger, and it must
+be active. The toolsets of the trigger limit the agent steps of the instance. When the workflow
+defines the input ``event``, the instance gets the redacted and bounded payload in it. The
+event and the instance are one transaction too.
 """
 
 from __future__ import annotations
@@ -41,7 +46,15 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.connectors.composio import TRIGGER_EVENT as COMPOSIO_EVENT
 from sama.connectors.service import ConnectionService
-from sama.db.models import SAFE_TOOLSETS, AgentProfile, AuditEntry, Session, Trigger, TriggerEvent
+from sama.db.models import (
+    SAFE_TOOLSETS,
+    AgentProfile,
+    AuditEntry,
+    Session,
+    Trigger,
+    TriggerEvent,
+    Workflow,
+)
 from sama.gate.decide import TOOLSETS
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.tenancy.access import Grants, load_grants
@@ -49,6 +62,8 @@ from sama.tools.output import untrusted
 from sama.triggers import signature
 from sama.vault.redact import redact
 from sama.vault.store import SecretName, Vault, trigger_secret
+from sama.workflows.service import WorkflowService
+from sama.workflows.spec import WorkflowError
 
 log: Final = logging.getLogger("sama.triggers")
 
@@ -61,10 +76,10 @@ EVENT_MAX_DEPTH: Final = 64
 CONFIG_MAX_CHARS: Final = 4000
 """The largest Composio trigger config, as JSON."""
 SLUG_PATTERN: Final = r"^[A-Z][A-Z0-9_]{0,99}$"
-SPAWNING_TOOLSETS: Final = frozenset({"delegation", "tasks", "cron"})
-"""The toolsets that start other runs (a child, a task card, or a cron job). A trigger cannot
-have them, so each run that a trigger starts stays in the toolset limit of the trigger
-(Section 12.2)."""
+SPAWNING_TOOLSETS: Final = frozenset({"delegation", "tasks", "cron", "workflows"})
+"""The toolsets that start other runs (a child, a task card, a cron job, or a workflow). A
+trigger cannot have them, so each run that a trigger starts stays in the toolset limit of the
+trigger (Section 12.2)."""
 NOT_SIGNED: Final = "the delivery is not signed for this trigger"
 INSTANCE_USED: Final = "another trigger uses this Composio trigger (the same type and config)"
 INSTANCE_BUSY: Final = "another change of this Composio trigger is in progress; try again"
@@ -72,6 +87,9 @@ INSTANCE_LOCK_WAIT_S: Final = 30.0
 INSTANCE_LOCK_POLL_S: Final = 0.05
 TRIGGER_GONE: Final = "the trigger is disabled"
 OWNER_GONE: Final = "the owner of the trigger cannot see the workspace"
+NO_WORKFLOWS: Final = "workflows are not set up"
+WORKFLOW_NOT_FOUND: Final = "the workflow does not exist in this workspace"
+WORKFLOW_OWNER: Final = "a trigger can start only a workflow of the same owner"
 ADMIN_ONLY: Final = (
     "only a workspace admin or an org owner or admin can give a trigger more than the safe toolsets"
 )
@@ -93,13 +111,17 @@ class TriggerError(ValueError):
 class NewTrigger:
     kind: str
     name: str
-    prompt: str
-    agent_profile_id: uuid.UUID
+    prompt: str | None = None
+    """Required for a run trigger. A workflow trigger gets a default text."""
+    agent_profile_id: uuid.UUID | None = None
+    """Required for a run trigger. A workflow trigger uses the profile of the workflow."""
     toolsets: Sequence[str] | None = None
     """``None`` is the ``safe`` preset."""
     connection_id: uuid.UUID | None = None
     composio_slug: str | None = None
     composio_config: Mapping[str, Any] | None = None
+    workflow_id: uuid.UUID | None = None
+    """Set: the trigger starts this workflow (the target ``workflow``)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +208,8 @@ def event_message(prompt: str, body: str, source: str) -> str:
 class TriggerService:
     """The triggers of the orgs. ``vault`` keeps the signing secrets: without it, sama cannot
     make a webhook trigger. ``connections`` makes Composio trigger instances: without it, sama
-    cannot make a Composio trigger."""
+    cannot make a Composio trigger. ``workflows`` starts workflow instances: without it, sama
+    cannot make a workflow trigger."""
 
     def __init__(
         self,
@@ -197,8 +220,10 @@ class TriggerService:
         connections: ConnectionService | None = None,
         public_url: str | None = None,
         composio_secret: SecretStr | None = None,
+        workflows: WorkflowService | None = None,
     ) -> None:
         self._engine = engine
+        self._workflows = workflows
         self._queue = queue
         self._vault = vault
         self._connections = connections
@@ -234,18 +259,27 @@ class TriggerService:
             list(SAFE_TOOLSETS) if fields.toolsets is None else fields.toolsets
         )
         _check_widening(grants, workspace_id, toolsets)
+        if fields.workflow_id is None:
+            if fields.prompt is None or fields.agent_profile_id is None:
+                raise TriggerError("a run trigger needs prompt and agent_profile_id")
+            target: dict[str, Any] = {
+                "target": "run",
+                "prompt": fields.prompt,
+                "agent_profile_id": fields.agent_profile_id,
+            }
+        else:
+            target = await self._workflow_target(org_id, workspace_id, grants, fields)
         trigger_id = uuid.uuid4()
         values: dict[str, Any] = {
             "id": trigger_id,
             "org_id": org_id,
             "workspace_id": workspace_id,
             "owner_user_id": grants.user_id,
-            "agent_profile_id": fields.agent_profile_id,
             "kind": fields.kind,
             "name": fields.name,
-            "prompt": fields.prompt,
             "toolsets": toolsets,
             "created_by_user_id": grants.user_id,
+            **target,
         }
         secret: str | None = None
         if fields.kind == "webhook":
@@ -270,7 +304,9 @@ class TriggerService:
             instance = values.get("composio_trigger_id")
             try:
                 async with self._engine.begin() as connection:
-                    await _check_profile(connection, org_id, workspace_id, fields.agent_profile_id)
+                    await _check_profile(
+                        connection, org_id, workspace_id, values["agent_profile_id"]
+                    )
                     if instance is not None and await _instance_used(connection, instance):
                         raise TriggerError(INSTANCE_USED, 409)
                     try:
@@ -299,7 +335,7 @@ class TriggerService:
                         grants.user_id,
                         "trigger.created",
                         trigger_id,
-                        {"kind": fields.kind, "toolsets": toolsets},
+                        {"kind": fields.kind, "target": values["target"], "toolsets": toolsets},
                     )
             except BaseException:
                 # Composio gives the same instance for the same account, type, and config, so
@@ -525,8 +561,9 @@ class TriggerService:
             ).first()
         if seen is not None:
             return {"duplicate": True}
+        if row.target == "workflow" and self._workflows is None:
+            raise TriggerError(NO_WORKFLOWS, 409)
         body = event_body(payload)
-        session_id = uuid.uuid4()
         try:
             async with self._engine.begin() as connection:
                 # The trigger again, with a share lock: a change or a disable that commits
@@ -543,40 +580,20 @@ class TriggerService:
                 grants = await load_grants(connection, row.org_id, row.owner_user_id)
                 if not grants.sees_workspace(row.workspace_id):
                     raise _OwnerGone
-                await connection.execute(
-                    insert(Session).values(
-                        id=session_id,
-                        org_id=row.org_id,
-                        workspace_id=row.workspace_id,
-                        agent_profile_id=row.agent_profile_id,
-                        audience="private",
-                        owner_user_id=row.owner_user_id,
-                        title=f"Trigger: {row.name}",
+                if row.target == "workflow":
+                    # The instance counts as a message of the owner, like a run (12.2).
+                    await self._queue.check_rate_in(
+                        connection, org_id=row.org_id, user_id=row.owner_user_id
                     )
-                )
-                run_id = await self._queue.enqueue_in(
-                    connection,
-                    org_id=row.org_id,
-                    session_id=session_id,
-                    text=event_message(row.prompt, body, source),
-                    user_id=row.owner_user_id,
-                    unattended=True,
-                    toolsets=list(row.toolsets),
-                )
-                event_id = (
-                    await connection.execute(
-                        pg_insert(TriggerEvent)
-                        .values(
-                            org_id=row.org_id,
-                            trigger_id=row.id,
-                            delivery_id=delivery,
-                            session_id=session_id,
-                            run_id=run_id,
-                        )
-                        .on_conflict_do_nothing(index_elements=["trigger_id", "delivery_id"])
-                        .returning(TriggerEvent.id)
+                    started = await self._start_workflow(connection, row, body)
+                    event_id = await _insert_event(
+                        connection, row, delivery, workflow_instance_id=started
                     )
-                ).scalar_one_or_none()
+                else:
+                    session_id, started = await self._start_run(connection, row, body, source)
+                    event_id = await _insert_event(
+                        connection, row, delivery, session_id=session_id, run_id=started
+                    )
                 if event_id is None:
                     raise _Duplicate
         except _Duplicate:
@@ -594,8 +611,91 @@ class TriggerService:
             ) from None
         except QueueError as error:
             raise TriggerError(str(error), 409) from None
-        log.info("trigger=%s started run=%s", row.id, run_id)
+        except WorkflowError as error:
+            # The workflow is paused, removed, or waits for an approval. The sender can try
+            # again; the owner sees the reason on the trigger.
+            await self._set_error(row, str(error))
+            raise TriggerError(str(error), 409) from None
+        log.info("trigger=%s started %s=%s", row.id, row.target, started)
         return {"accepted": True, "event_id": str(event_id)}
+
+    async def _start_run(
+        self, connection: AsyncConnection, row: Any, body: str, source: str
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        """A new private session of the owner and an unattended run in it."""
+        session_id = uuid.uuid4()
+        await connection.execute(
+            insert(Session).values(
+                id=session_id,
+                org_id=row.org_id,
+                workspace_id=row.workspace_id,
+                agent_profile_id=row.agent_profile_id,
+                audience="private",
+                owner_user_id=row.owner_user_id,
+                title=f"Trigger: {row.name}",
+            )
+        )
+        run_id = await self._queue.enqueue_in(
+            connection,
+            org_id=row.org_id,
+            session_id=session_id,
+            text=event_message(row.prompt, body, source),
+            user_id=row.owner_user_id,
+            unattended=True,
+            toolsets=list(row.toolsets),
+        )
+        return session_id, run_id
+
+    async def _start_workflow(self, connection: AsyncConnection, row: Any, body: str) -> uuid.UUID:
+        """An instance of the workflow of the trigger. The toolsets of the trigger limit its
+        agent steps."""
+        if self._workflows is None:
+            raise WorkflowError(NO_WORKFLOWS)
+        instance_id = await self._workflows.start_in(
+            connection,
+            org_id=row.org_id,
+            workflow_id=row.workflow_id,
+            inputs=None,
+            trigger="trigger",
+            toolsets=list(row.toolsets),
+            event=body,
+        )
+        if instance_id is None:  # Only a schedule fire can find an instance.
+            raise WorkflowError("the workflow did not start")
+        return instance_id
+
+    async def _workflow_target(
+        self, org_id: uuid.UUID, workspace_id: uuid.UUID, grants: Grants, fields: NewTrigger
+    ) -> dict[str, Any]:
+        """The target columns of a workflow trigger. The workflow must be in the workspace and
+        have the owner of the trigger, so a trigger cannot act with the approvals of another
+        user. A workflow that waits for an approval or is paused is allowed here: its events
+        fail with ``409`` until it is active."""
+        if self._workflows is None:
+            raise TriggerError(NO_WORKFLOWS, 409)
+        async with self._engine.connect() as connection:
+            workflow = (
+                await connection.execute(
+                    select(Workflow).where(
+                        Workflow.org_id == org_id,
+                        Workflow.id == fields.workflow_id,
+                        Workflow.workspace_id == workspace_id,
+                        Workflow.status != "removed",
+                    )
+                )
+            ).one_or_none()
+        if workflow is None:
+            raise TriggerError(WORKFLOW_NOT_FOUND, 404)
+        if workflow.owner_user_id != grants.user_id:
+            raise TriggerError(WORKFLOW_OWNER, 403)
+        if fields.agent_profile_id not in (None, workflow.agent_profile_id):
+            raise TriggerError("a workflow trigger uses the agent profile of the workflow")
+        return {
+            "target": "workflow",
+            "workflow_id": workflow.id,
+            "agent_profile_id": workflow.agent_profile_id,
+            "prompt": fields.prompt or f"Start the workflow {workflow.name}."[:PROMPT_MAX_CHARS],
+        }
 
     async def _set_error(self, row: Any, message: str) -> None:
         async with self._engine.begin() as connection:
@@ -665,6 +765,7 @@ class TriggerService:
             "prompt": row.prompt,
             "toolsets": list(row.toolsets),
             "target": row.target,
+            "workflow_id": str(row.workflow_id) if row.workflow_id else None,
             "status": row.status,
             "last_error": row.last_error,
             "created_at": row.created_at.isoformat(),
@@ -720,6 +821,34 @@ async def _row(
     if row is None:
         raise TriggerError("the trigger does not exist", 404)
     return row
+
+
+async def _insert_event(
+    connection: AsyncConnection,
+    row: Any,
+    delivery: str,
+    *,
+    session_id: uuid.UUID | None = None,
+    run_id: uuid.UUID | None = None,
+    workflow_instance_id: uuid.UUID | None = None,
+) -> uuid.UUID | None:
+    """The event row, or ``None`` when another request wrote the same delivery first."""
+    event_id: uuid.UUID | None = (
+        await connection.execute(
+            pg_insert(TriggerEvent)
+            .values(
+                org_id=row.org_id,
+                trigger_id=row.id,
+                delivery_id=delivery,
+                session_id=session_id,
+                run_id=run_id,
+                workflow_instance_id=workflow_instance_id,
+            )
+            .on_conflict_do_nothing(index_elements=["trigger_id", "delivery_id"])
+            .returning(TriggerEvent.id)
+        )
+    ).scalar_one_or_none()
+    return event_id
 
 
 async def _instance_used(connection: AsyncConnection, instance: str) -> bool:
