@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict
@@ -70,6 +71,8 @@ from sama.runtime.session_items import (
     SessionItemsRequest,
     parse_session_items,
 )
+from sama.scheduler.jobs import JobService
+from sama.scheduler.spec import JobError
 from sama.search import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -95,6 +98,9 @@ from sama.tools.clarify import (
     ClarifyQuestion,
     render_answers,
 )
+from sama.tools.cron import CRONJOB_MANAGE, CronAction, CronRequest, job_input
+from sama.tools.cron import DESCRIPTION as CRON_DESCRIPTION
+from sama.tools.cron import manage as manage_jobs
 from sama.tools.deferred import (
     DEFAULT_SEARCH_LIMIT,
     MAX_SEARCH_LIMIT,
@@ -165,6 +171,7 @@ MAX_ERROR_CHARS: Final = 2_000
 _EXPECTED = (
     ClarifyError,
     ConnectorError,
+    JobError,
     DeferredToolError,
     DelegationError,
     GitHubToolError,
@@ -351,11 +358,13 @@ class ToolServer:
         delegation: DelegationService | None = None,
         tasks: TaskTools | None = None,
         session_items: SessionItemsBackend | None = None,
+        jobs: JobService | None = None,
     ) -> None:
         self.signer = signer
         self.souls = souls
         self.session_items = session_items
         self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
+        self.jobs = jobs
         self.deferred = deferred
         self.connections = connections
         self.archive = archive
@@ -843,8 +852,63 @@ class ToolServer:
             register_delegation(server, self._call, self.delegation)
         if self.tasks is not None:
             register_tasks(server, self._call, self.tasks)
+        if self.jobs is not None:
+            self._cron_tool(server, self.jobs)
 
         return server
+
+    def _cron_tool(self, server: MCPServer, jobs: JobService) -> None:
+        @server.tool(
+            name=CRONJOB_MANAGE,
+            description=CRON_DESCRIPTION,
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
+            structured_output=False,
+        )
+        async def cronjob_manage(
+            action: CronAction,
+            ctx: Context,
+            job_id: uuid.UUID | None = None,
+            name: Annotated[str | None, Field(max_length=200)] = None,
+            schedule: Annotated[str | None, Field(max_length=200)] = None,
+            tz: Annotated[str | None, Field(max_length=64)] = None,
+            prompt: Annotated[str | None, Field(max_length=20_000)] = None,
+            skills: list[str] | None = None,
+            model: Annotated[str | None, Field(max_length=100)] = None,
+            mode: Literal["agent", "script"] | None = None,
+            script: Annotated[str | None, Field(max_length=20_000)] = None,
+            deliver: Annotated[str | None, Field(max_length=300)] = None,
+            failure_deliver: Annotated[str | None, Field(max_length=300)] = None,
+            preapproved_tools: list[dict[str, Any]] | None = None,
+            attach_to_session: bool | None = None,
+        ) -> str:
+            arguments = {
+                "action": action,
+                "job_id": str(job_id) if job_id else None,
+                "name": name,
+                "schedule": schedule,
+                "tz": tz,
+                "prompt": prompt,
+                "skills": skills,
+                "model": model,
+                "mode": mode,
+                "script": script,
+                "deliver": deliver,
+                "failure_deliver": failure_deliver,
+                "preapproved_tools": preapproved_tools,
+                "attach_to_session": attach_to_session,
+            }
+
+            async def body(claims: RunTokenClaims) -> str:
+                fields = {
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in ("action", "job_id")
+                }
+                request = CronRequest(action=action, job_id=job_id, fields=job_input(**fields))
+                return await manage_jobs(jobs, claims, request)
+
+            present = {key: value for key, value in arguments.items() if value is not None}
+            return await self._call(ctx, CRONJOB_MANAGE, present, body)
 
     async def _visible(self, claims: RunTokenClaims, catalog: DeferredCatalog) -> frozenset[str]:
         """The deferred tools that the run can use now."""

@@ -62,6 +62,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "github_installations": {"gh-inst:org-a"},
         "github_repos": {"gh-repo:org-a"},
         "github_push_grants": set(),
+        "jobs": {"job:alice"},
+        "job_fires": {"fire:alice"},
+        "deliveries": {"delivery:alice"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -81,6 +84,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "github_installations": {"gh-inst:org-a"},
         "github_repos": {"gh-repo:org-a"},
         "github_push_grants": {"gh-grant:org-a"},
+        "jobs": set(),
+        "job_fires": set(),
+        "deliveries": set(),
     },
     "dave": {
         "orgs": {"org-a"},
@@ -100,6 +106,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "github_installations": {"gh-inst:org-a"},
         "github_repos": {"gh-repo:org-a"},
         "github_push_grants": set(),
+        "jobs": set(),
+        "job_fires": set(),
+        "deliveries": set(),
     },
     "bob": {
         "orgs": {"org-b"},
@@ -119,6 +128,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "github_installations": {"gh-inst:org-b"},
         "github_repos": {"gh-repo:org-b"},
         "github_push_grants": {"gh-grant:org-b"},
+        "jobs": {"job:bob"},
+        "job_fires": {"fire:bob"},
+        "deliveries": {"delivery:bob"},
     },
     "stranger": {
         "orgs": set(),
@@ -138,6 +150,9 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "github_installations": set(),
         "github_repos": set(),
         "github_push_grants": set(),
+        "jobs": set(),
+        "job_fires": set(),
+        "deliveries": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

@@ -266,10 +266,12 @@ flowchart LR
 6. **Execute.** The runner starts the adapter. The SDK calls the model through the model
    proxy and calls sama tools through the MCP server. Here the agent calls
    `cronjob_manage(action="create", ...)`.
-7. **Gate.** The tool gate checks the policy. Creating a job without pre-approved tools is
-   `allow` for the owner of the chat, so the call runs. If the job asks for pre-approved
-   tools, those tools stay off until the user approves them (Section 12.1). A risky call (send an email to a customer, push code) gets `ask`:
-   the run pauses with `ApprovalRequired`, and an approval card goes to Telegram.
+7. **Gate.** The tool gate checks the policy. `cronjob_manage` is `allow` in a private
+   session and `ask` in a shared session, so here the call runs. If the job pre-approves
+   tools, runs a script, or sends to another place, it waits in `pending_approval` and does
+   not fire until the owner approves that version with `/cron approve` or on the jobs page
+   (Section 12.1). A risky call (send an email to a customer, push code) gets `ask`: the run
+   pauses with `ApprovalRequired`, and an approval card goes to Telegram.
 8. **Finish.** The run ends with `RunCompleted` or `RunFailed`. The sandbox pauses.
 9. **Learn.** A background review may propose memory or skill updates (Section 9.4).
 10. **Record.** Transcript, tool calls, usage, cost, and approvals are in Postgres. The trace
@@ -1932,7 +1934,7 @@ Section 15.1) also has Approve and Deny only.
 | `subagents` | `Task` and `Agent`, the native tool of Claude that starts a sub-agent (since M2.7, Section 13.1). It is separate from `delegation`. | Runtime, in the sandbox |
 | `delegation` | `delegate_task`, `delegate_status` (since M4.6, Section 13.2) | Sama MCP |
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
-| `cron` | `cronjob_manage` (create, list, update, pause, resume, remove, run, cancel) | Sama MCP |
+| `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
@@ -2979,16 +2981,84 @@ or not available.
 | `preapproved_tools` | Tools that may run without a human in this job, each bound to a connection and optional argument limits (for example "Slack post to `#eng` only"). Everything else that needs `ask` is denied. Adding or widening a pre-approval needs a human approval, which is bound to that job version. A change to the job's prompt, schedule, or target creates a new version, and write pre-approvals then need approval again. |
 | `attach_to_session` | Run inside one long-lived session (heartbeat) instead of a fresh session. |
 
-Execution:
+Execution (M4.1 to M4.3):
 
-- The scheduler ticks every 60 seconds (as in Hermes) with a leader lease and claims due fires with
-  `FOR UPDATE SKIP LOCKED`. Each fire has a unique id, so a fire runs once.
-- Each fire is a run with the `cron` toolset. **A job run cannot create jobs** (Hermes
-  recursion guard).
-- Deliveries have receipts. A delivery with an unknown result is not retried, so a message is
-  never sent twice.
-- Repeated failures pause the job and alert the owner once.
-- The `cronjob_manage` tool, `/cron` commands, and the web app all edit the same rows.
+- **Process.** The scheduler is a loop in the control plane process (`sama.scheduler.service`,
+  Section 19.1). It is not a separate Fly.io process, because a loop costs nothing more and
+  the lease below makes more than one machine safe. The loop ticks every 60 seconds (as in
+  Hermes). Between ticks it polls every 5 seconds for ended runs, script fires, and
+  deliveries.
+- **Leader lease.** A tick takes the transaction advisory lock
+  `pg_try_advisory_xact_lock(hashtextextended('sama.scheduler.tick', 0))`. A process that does
+  not get it skips the tick. The lock ends with the transaction, so a crashed leader holds
+  nothing.
+- **A fire runs once.** The tick locks the due `jobs` rows with `FOR UPDATE SKIP LOCKED`,
+  writes the `job_fires` row, and moves `next_fire_at` in the same transaction. `job_fires`
+  has a unique key on `(job_id, scheduled_for)`. Two schedulers therefore write one fire, and a
+  test runs two ticks at the same time to show it.
+- **Missed and busy fires.** After downtime, a job fires once for the missed time, then
+  follows its schedule. When the last fire of a job still runs, the new fire is `skipped`.
+  A `once` job pauses after its fire.
+- **Agent fires.** A fire is an unattended run (Section 16.1) in a new private session of the
+  owner. With `attach_to_session`, the job keeps one session and uses it while it is active.
+  `runs.model` (migration `0026`) holds the model pin. The worker uses
+  `coalesce(runs.model, agent_profiles.model)`.
+- **Script fires.** `mode: script` runs the script with `bash -c` in the session sandbox,
+  with no LLM, no run token, and no secret. The time limit is 10 minutes. A script fire that
+  has no result 5 minutes after its limit fails and does not run again. Script mode needs the
+  sandbox runtime. A prompt or a script that holds a known secret is refused when the job is
+  made or changed, and a script fire that holds one does not run.
+- **The fire keeps its version.** A `job_fires` row copies `deliver`, `failure_deliver`, and
+  (in script mode) the script when the fire starts. A later change to the job does not
+  change a fire that already started. A fire of a version that is not cleared (for example a
+  `skipped` fire) keeps `origin` and no script.
+- **Recursion guard.** A job run cannot create or change jobs. The gate removes the `cron`
+  toolset in a job run, and `JobService` refuses a change from a run that a job started.
+- **Approval.** A job version needs the approval of its owner when it has
+  `preapproved_tools`, uses `mode: script`, or sends to a target that is not the owner
+  (`origin`, `none`, and the owner's own email do not count). A job that a person makes or
+  changes is approved by that change only when the version before it was approved or did not
+  need approval. Thus a person's change (also a change of the name only) does not approve an
+  agent version that the person did not see. A resume never approves: a job with a version
+  that needs approval goes back to `pending_approval`. A job that the agent makes or changes
+  waits in `pending_approval` and does not fire. Only the owner approves, and the approval names the
+  version that the owner saw. It stores `approved_version` and `approved_hash` (a digest of the
+  fields that the version covers). A pre-approval is `{tool, connection, limits}`. The
+  connection comes from the tool name (`mcp__<connection>__<tool>`). The caps are 20
+  pre-approvals, 10 limited arguments, and 20 values for each argument. Some tools cannot be
+  pre-approved: `cronjob_manage`, `clarify`, `tool_search`, `tool_describe`, `tool_call`,
+  and `ToolSearch`.
+- **Delivery (`deliveries` table).** A fire writes one `result` delivery, or one `failure`
+  delivery to `failure_deliver` (else to `deliver`). A sender claims a row with a 120-second
+  lease and records `sent` with a receipt (the provider message id, or `session:<id>` for an
+  origin with no chat), `failed`, or `unknown`. The sender claims one row at a time, so a
+  row does not wait behind other sends while its lease runs. A `sent` result that comes after
+  the lease is lost still writes its receipt over `unknown`.
+  - A definite failure (no connection, a refusal, no token) tries again after 30 s x
+    2^attempts, for at most 3 attempts.
+  - A result that is not known (a timeout after the request went out, a 5xx answer, a lost
+    lease) is `unknown` and is never sent again, so a message never goes out twice.
+  - `origin` sends to the Telegram chat or the Slack DM or thread of the session that made
+    the job. A job from the web app keeps the result in its fire session.
+  - Slack and Telegram use the bot token of the org from the vault. Email uses SendGrid with
+    `SAMA_SENDGRID_API_KEY` and `SAMA_EMAIL_FROM` (Section 19.2).
+- **Failures.** The third failed fire in a row pauses the job and writes one `alert`
+  delivery to `failure_deliver` (else to `deliver`, else to `origin` when the target is
+  `none`). `alerted_at` makes sure the alert goes out once. A resume clears the count.
+- **Interfaces.** The `cronjob_manage` tool, the `/cron` command (Telegram, and `/sama cron`
+  in Slack, both only in a direct chat), the API (`/orgs/{org_id}/jobs`, `/jobs/preview`), and
+  the web page `/jobs` all use `JobService` and edit the same rows. Each shows the checked
+  schedule and the next 3 fire times. A user has at most 50 jobs. Only the owner sees a job
+  (RLS on `jobs`, `job_fires`, and `deliveries`).
+- **Schedules.** A schedule is a 5-field cron expression with an IANA time zone, an interval
+  (at least 5 minutes), or one time. The parser reads simple English ("every weekday at 9am",
+  "every 2 hours", "monthly on the 1st at 8am", "tomorrow at 7pm") and refuses what it cannot
+  read. A cron schedule must fire no more often than every 5 minutes. Sama checks the gaps
+  between the daily fire times as a cycle: it assumes that each day matches, so the gap from
+  the last time of a day to the first time of the next day also counts. This is strict for a
+  schedule whose days never follow each other, but no day-of-month or day-of-week case can
+  get past it. Sama also checks the real times around each daylight saving change in the
+  next 400 days.
 
 ### 12.2 Event triggers
 
@@ -3595,8 +3665,13 @@ Rules of the steps:
   sandbox. Every other tool gets `ask`. `repo_push_approval` is in `ALWAYS_ASK`: it gets `ask`
   even with an `allow` rule, and only a `deny` rule changes that (Section 15.1). The classifier comes later.
 - **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
-  `deny`, and `ask` becomes `deny`. Job pre-approvals come with jobs (M3); until then the set
-  is empty.
+  `deny`, and `ask` becomes `deny`. In the run of a job fire (M4.2), the gate loads the job
+  of the run. When the fire ran the approved version and the stored fields still have the
+  approved digest, an `ask` call that a pre-approval covers becomes `allow`. A pre-approval
+  covers a call when the tool name is the same, the MCP connection is the same, and each limited
+  argument has one of the allowed values with the same type (`true` is not `1`). A call with no
+  arguments does not match a limit. The gate also removes the toolset `cron` from a job run,
+  so a job run cannot call `cronjob_manage` (Section 12.1).
 
 Records, all in the transaction of the verdict:
 
@@ -4469,6 +4544,8 @@ engine, one run token signer, one gate service, and one clarify broker.
   in the same process.
 - The trace export and the error rate alerts run in the process when their settings exist
   (Section 18).
+- The scheduler of the jobs (Section 12.1) is a loop in the process. Each machine runs the
+  loop, and the leader lease lets one machine tick at a time. It adds no Fly.io process.
 - When a background loop ends with an error, the process logs it and stops, so that Fly.io
   starts it again.
 - A stop (SIGTERM or SIGINT) has this order, because the runs in the sandboxes need the model
@@ -4503,6 +4580,7 @@ the start with a message that names the variable but not its value.
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_GITHUB_APP_ID`, `SAMA_GITHUB_APP_SLUG`, `SAMA_GITHUB_CLIENT_ID`, `SAMA_GITHUB_APP_PRIVATE_KEY`, `SAMA_GITHUB_CLIENT_SECRET` | No | The sama GitHub App (Section 19.5). With `SAMA_GITHUB_APP_ID`, all five are required. The private key can have `\n` in place of its line breaks. Without them, the git proxy and the pull request tools are off. |
+| `SAMA_SENDGRID_API_KEY`, `SAMA_EMAIL_FROM` | No | Email delivery of jobs (Section 12.1). Without both, an `email:` delivery fails. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first

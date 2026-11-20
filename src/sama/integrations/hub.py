@@ -39,6 +39,7 @@ from sama.gateway.transcribe import OpenAITranscriber, Transcriber
 from sama.integrations.service import TelegramClientFactory, secret_hash
 from sama.orchestrator.queue import RunQueue
 from sama.review.apply import ReviewApplier
+from sama.scheduler.jobs import JobService
 from sama.skills.service import SkillLibrary
 from sama.vault.crypto import VaultError
 from sama.vault.store import OrgKeys, SecretName, Vault
@@ -132,6 +133,7 @@ class TelegramHub(GatewayCache[_Bot]):
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
         connections: ConnectionService | None = None,
+        jobs: JobService | None = None,
     ) -> None:
         """``keys`` gives the OpenAI key of an org for voice notes: the vault entry of the
         org, then the default key of the process. Without a key voice notes are off."""
@@ -147,6 +149,7 @@ class TelegramHub(GatewayCache[_Bot]):
         self._skills = skills
         self._reviews = reviews
         self._connections = connections
+        self._jobs = jobs
         self._lockout = Lockout()
         self._followers: set[object] = set()
 
@@ -239,6 +242,7 @@ class TelegramHub(GatewayCache[_Bot]):
             skills=self._skills,
             reviews=self._reviews,
             connections=self._connections,
+            jobs=self._jobs,
             transcriber=transcriber,
             lockout=self._lockout,
             followers=self._followers,

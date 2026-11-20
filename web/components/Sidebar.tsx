@@ -167,6 +167,21 @@ export function Sidebar({
       </nav>
 
       <div className={styles.foot}>
+        <nav aria-label="Scheduled work">
+          <h2 className={styles.group}>Scheduled</h2>
+          <ul className={styles.list}>
+            <li>
+              <Link
+                href="/jobs"
+                className={styles.item}
+                aria-current={pathname === "/jobs" ? "page" : undefined}
+              >
+                <span className={styles.itemTitle}>Jobs</span>
+                <span className={styles.itemMeta}>Run the agent on a schedule</span>
+              </Link>
+            </li>
+          </ul>
+        </nav>
         {profiles.length > 0 ? (
           <nav aria-label="Agents">
             <h2 className={styles.group}>Agents</h2>

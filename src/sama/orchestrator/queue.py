@@ -385,11 +385,16 @@ class RunQueue:
         unattended: bool = False,
         attachments: Sequence[NewAttachment] = (),
         budget: Mapping[str, Any] | None = None,
+        model: str | None = None,
+        check_rate: bool = True,
     ) -> uuid.UUID:
         """``enqueue`` in the transaction of the caller. A caller that makes the session in
         the same transaction (delegation, the task dispatcher) gets the session and the run
-        together, or neither. ``budget`` can only make the profile budget smaller
-        (``narrow_budget``)."""
+        together, or neither. The scheduler uses it to write the fire and its run in one
+        transaction (Section 12.1). ``budget`` can only make the profile budget smaller
+        (``narrow_budget``). ``model`` pins the model of the run; without it, the run uses the
+        model of the profile. ``check_rate=False`` keeps the lock order but does not apply the
+        message rate: a job fire is not a message of a person."""
         await self._rate_lock(connection, org_id)  # the lock order of all enqueues
         # One statement reads the session, the limits, and the rate counts. It comes
         # after the lock statement, so its snapshot has every enqueue before the lock.
@@ -418,7 +423,8 @@ class RunQueue:
             raise QueueError("the session does not exist")
         if session.status != "active":
             raise QueueError("the session is not active")
-        _check_rate(session)
+        if check_rate:
+            _check_rate(session)
         run_id = uuid.uuid4()
         # The run and the message go in one statement: the run insert is a CTE.
         message_id = (
@@ -444,6 +450,7 @@ class RunQueue:
                         runtime=session.runtime,
                         budget=narrow_budget(session.budget, budget),
                         unattended=unattended,
+                        model=model,
                     )
                     .cte("new_run")
                 )
@@ -812,7 +819,7 @@ class RunQueue:
                     Session.audience,
                     Session.owner_user_id,
                     Session.lineage,
-                    AgentProfile.model,
+                    func.coalesce(Run.model, AgentProfile.model).label("model"),
                     AgentProfile.soul,
                     AgentProfile.review_model,
                     select(Message.content)

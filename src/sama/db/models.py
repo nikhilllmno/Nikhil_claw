@@ -60,6 +60,12 @@ RESUME_DECISIONS: Final = ("approve", "reject")
 RUN_KINDS: Final = ("chat", "review")
 """``chat`` answers a user message. ``review`` is the background review of a session
 (docs/architecture.md, Section 9.4)."""
+JOB_STATUSES: Final = ("active", "paused", "pending_approval", "removed")
+JOB_MODES: Final = ("agent", "script")
+JOB_CREATORS: Final = ("user", "agent")
+FIRE_STATUSES: Final = ("running", "completed", "failed", "skipped")
+DELIVERY_KINDS: Final = ("result", "failure", "alert")
+DELIVERY_STATUSES: Final = ("pending", "sending", "sent", "failed", "unknown")
 PROPOSAL_KINDS: Final = ("memory", "skill", "soul")
 PROPOSAL_ORIGINS: Final = ("review", "chat")
 """``review``: a background review proposed the change. ``chat``: the agent proposed it in a chat
@@ -475,6 +481,8 @@ class Run(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     trace_exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     """When the control plane sent the trace of the ended run to Langfuse (Section 18.2)."""
+    model: Mapped[str | None] = mapped_column(Text)
+    """The model pin of a job run (Section 12.1). Null: the model of the profile."""
 
 
 class Message(Base):
@@ -1729,3 +1737,179 @@ class RuntimeSessionItem(Base):
     run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     """The run that wrote the item. No foreign key: a compaction rewrites the items."""
     created_at: Mapped[datetime] = _created_at()
+
+
+class Job(Base):
+    """A scheduled job (docs/architecture.md, Section 12.1). Each change of a field that
+    changes what the job does makes a new ``version``. A version that needs a human approval
+    fires only when ``approved_version`` is that version and ``approved_hash`` matches it.
+    Only the control plane writes the table."""
+
+    __tablename__ = "jobs"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "owner_user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"], ["agent_profiles.org_id", "agent_profiles.id"]
+        ),
+        ForeignKeyConstraint(["org_id", "session_id"], ["sessions.org_id", "sessions.id"]),
+        ForeignKeyConstraint(["org_id", "origin_session_id"], ["sessions.org_id", "sessions.id"]),
+        ForeignKeyConstraint(["org_id", "approved_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("status", JOB_STATUSES), name="status"),
+        CheckConstraint(_one_of("mode", JOB_MODES), name="mode"),
+        CheckConstraint(_one_of("created_by_kind", JOB_CREATORS), name="created_by_kind"),
+        CheckConstraint("(mode = 'script') = (script IS NOT NULL)", name="script"),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 200", name="name_length"),
+        CheckConstraint("jsonb_typeof(schedule) = 'object'", name="schedule_is_object"),
+        CheckConstraint("jsonb_typeof(skills) = 'array'", name="skills_is_array"),
+        CheckConstraint(
+            "jsonb_typeof(preapproved_tools) = 'array'", name="preapproved_tools_is_array"
+        ),
+        CheckConstraint("version >= 1", name="version"),
+        CheckConstraint(
+            "approved_version IS NULL OR approved_version BETWEEN 1 AND version",
+            name="approved_version",
+        ),
+        CheckConstraint(
+            "(approved_version IS NULL) = (approved_hash IS NULL)", name="approved_has_hash"
+        ),
+        CheckConstraint("consecutive_failures >= 0", name="consecutive_failures"),
+        Index(None, "org_id", "owner_user_id"),
+        Index("ix_jobs_due", "next_fire_at", postgresql_where=text("status = 'active'")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule: Mapped[dict[str, Any]] = _json()
+    """``{"kind": "cron" | "interval" | "once", "expr": ..., "tz": ...}``."""
+    prompt: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    skills: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    model: Mapped[str | None] = mapped_column(Text)
+    mode: Mapped[str] = mapped_column(Text, nullable=False, server_default="agent")
+    script: Mapped[str | None] = mapped_column(Text)
+    deliver: Mapped[str] = mapped_column(Text, nullable=False, server_default="origin")
+    failure_deliver: Mapped[str | None] = mapped_column(Text)
+    preapproved_tools: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    attach_to_session: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The long-lived session of a job with ``attach_to_session``."""
+    origin_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The session that created the job. The target ``origin`` is its chat."""
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    approved_version: Mapped[int | None] = mapped_column(Integer)
+    approved_hash: Mapped[str | None] = mapped_column(Text)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    paused_reason: Mapped[str | None] = mapped_column(Text)
+    alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the scheduler sent the alert of the last pause. It sends one alert per pause."""
+    created_by_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
+    created_by_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class JobFire(Base):
+    """One fire of a job. ``(job_id, scheduled_for)`` is unique, so a fire runs once, also
+    when two schedulers tick at the same time (Section 12.1)."""
+
+    __tablename__ = "job_fires"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("job_id", "scheduled_for"),
+        ForeignKeyConstraint(["org_id", "job_id"], ["jobs.org_id", "jobs.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "run_id"], ["runs.org_id", "runs.id"]),
+        CheckConstraint(_one_of("status", FIRE_STATUSES), name="status"),
+        CheckConstraint("job_version >= 1", name="job_version"),
+        Index(None, "run_id"),
+        Index(None, "org_id", "job_id", "created_at"),
+        Index("ix_job_fires_running", "created_at", postgresql_where=text("status = 'running'")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    job_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    manual: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="running")
+    deliver: Mapped[str] = mapped_column(Text, nullable=False, server_default="none")
+    """The result target of the job version that started the fire. A later change of the job
+    does not change where the result of this fire goes."""
+    failure_deliver: Mapped[str | None] = mapped_column(Text)
+    script: Mapped[str | None] = mapped_column(Text)
+    """The script of the job version that started the fire. A script fire runs this text, not
+    the text of a later version that has no approval."""
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    output: Mapped[str | None] = mapped_column(Text)
+    """The redacted result of the fire."""
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the work of the fire started. A script fire waits with ``NULL`` until one scheduler
+    claims it, so the script runs once."""
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Delivery(Base):
+    """One message that a job sends, with its receipt (Section 12.1). The scheduler writes
+    ``sending`` before it calls the provider. A ``sending`` row whose lease expired has an
+    unknown result: it becomes ``unknown`` and is never sent again."""
+
+    __tablename__ = "deliveries"
+    __table_args__ = (
+        UniqueConstraint("org_id", "fire_id", "kind"),
+        ForeignKeyConstraint(["org_id", "job_id"], ["jobs.org_id", "jobs.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["org_id", "fire_id"], ["job_fires.org_id", "job_fires.id"], ondelete="CASCADE"
+        ),
+        CheckConstraint(_one_of("kind", DELIVERY_KINDS), name="kind"),
+        CheckConstraint(_one_of("status", DELIVERY_STATUSES), name="status"),
+        CheckConstraint("attempts >= 0", name="attempts"),
+        CheckConstraint("(status = 'sending') = (lease_expires_at IS NOT NULL)", name="lease"),
+        Index(None, "org_id", "job_id", "created_at"),
+        Index("ix_deliveries_due", "next_attempt_at", postgresql_where=text("status = 'pending'")),
+        Index(
+            "ix_deliveries_sending",
+            "lease_expires_at",
+            postgresql_where=text("status = 'sending'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    fire_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    """The redacted message."""
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_attempt_at: Mapped[datetime] = _created_at()
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_message_id: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -288,6 +288,19 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
   skills and starts the runner (Section 9.3), and the create or the resume sets the run timeout
   of the sandbox (Section 16.2). The run timing lines, with the step lines of the worker and
   the sandbox, are in Section 18.1. The target is 4 to 5 seconds.
+- M4.1 to M4.3: scheduled jobs in `src/sama/scheduler/` (architecture Section 12.1).
+  Migration `0026` adds `jobs`, `job_fires`, and `deliveries` (RLS: only the owner reads),
+  `runs.model` (the model pin), and the toolset `cron` for profiles with the old default list.
+  The scheduler is a loop in the control plane process, with no new Fly.io process. A
+  transaction advisory lock is the leader lease, and a unique `(job_id, scheduled_for)` makes
+  a fire run once. Interfaces: the `cronjob_manage` tool, `/cron` in a Telegram direct chat and
+  `/sama cron` in a Slack DM, the API under `/orgs/{org_id}/jobs`, and the web page `/jobs`.
+  A job version that pre-approves tools, runs a script, or sends to another place needs the
+  approval of its owner, bound to the version and a digest of its fields. Deliveries go to
+  `origin`, Slack, Telegram, email (SendGrid), or `none`, with receipts. An `unknown` result is
+  not sent again. Three failed fires in a row pause the job with one alert. Not in M4.1 to
+  M4.3: an approval card for a job in a chat, email from a provider other than SendGrid, and
+  an admin view of the jobs of other users.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
@@ -345,9 +358,9 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
 
 | # | Item | Acceptance criteria |
 |---|---|---|
-| M4.1 | Scheduler | `scheduler` service with a 60-second tick and leader lease. A fire runs once, also when two schedulers run. |
-| M4.2 | Cron jobs | `jobs` table, `cronjob_manage`, `/cron`, and a web page. Natural language to cron with validation and the next 3 fire times. Model pin, `mode: script`, `preapproved_tools`, `attach_to_session`. A job run cannot create jobs. Adding or widening a pre-approval needs a human approval bound to the job version, connection, and argument limits. A test shows that a job created by the agent cannot run a write tool without that approval. |
-| M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. |
+| M4.1 | Scheduler | `scheduler` service with a 60-second tick and leader lease. A fire runs once, also when two schedulers run. Done. |
+| M4.2 | Cron jobs | `jobs` table, `cronjob_manage`, `/cron`, and a web page. Natural language to cron with validation and the next 3 fire times. Model pin, `mode: script`, `preapproved_tools`, `attach_to_session`. A job run cannot create jobs. Adding or widening a pre-approval needs a human approval bound to the job version, connection, and argument limits. A test shows that a job created by the agent cannot run a write tool without that approval. Done. |
+| M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. Done. |
 | M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. |
 | M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
 | M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. Done. |
