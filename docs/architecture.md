@@ -515,8 +515,10 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   (Section 10.3) does this job.
 - **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
   16.1). `allow` and `deny` go to the CLI.
-  `ask` becomes `defer`. A sub-agent cannot pause the run, so `ask` inside a sub-agent becomes
-  `deny`. If the gate fails, the call gets `deny`.
+  `ask` becomes `defer`. A sub-agent cannot pause the run, so the hook tells the gate that a
+  call is of a sub-agent (`child`, from the `agent_id` of the hook input). The gate gives `deny`
+  for it in place of `ask`, and it records no approval (Section 13.1). If the gate fails, the
+  call gets `deny`.
 - **Pause.** On `defer`, the CLI ends the turn with `stop_reason` `tool_deferred` and
   `deferred_tool_use`. The adapter yields `ApprovalRequired`. The approval id is the tool use
   id. `runtime_state` holds the SDK session id, the run id, the usage, and the pending call.
@@ -568,7 +570,10 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   `run_in_background` is set. Messages with a `parent_tool_use_id` become `SubagentEvent`s
   with the id of the `Agent` call in `call_id`. The system messages `task_started` and
   `task_notification` of a sub-agent give a start event and an end event (`done`, and
-  `tokens` when the CLI reports them).
+  `tokens` when the CLI reports them). The adapter never cuts the text of an event, because it
+  has no redactor and a cut can split a secret. A text over 100,000 characters stays out, and a
+  fixed marker takes its place. The control plane redacts the text and then cuts it to 2,000
+  characters (Section 13.1).
   `compact_boundary` system messages become `Compacted`. The `trigger` of its
   `compact_metadata` (`manual` or `auto`) goes into the event (M2.6).
 - **Compaction (M2.6).** With an `archiver`, the adapter adds a `PreCompact` hook next to the
@@ -2621,12 +2626,16 @@ It is empty by default. A spec has:
 **Write.** `set_profile_subagents` is the only code that writes the column. It locks the
 profile and checks the specs. It rejects the specs when: the runtime of the profile has no
 `native_subagents`; the profile has no `subagents` toolset; a spec uses a toolset that the
-profile does not have, or `subagents` or `clarify`; a model has no price; or the description
+profile does not have, or `subagents`, `clarify`, or `tool_search`; a model has no price; or the description
 or the prompt has a secret or a finding of the injection scan (Section 6.1). The error text
-has the names of fields and never the text of a spec. The function writes an audit entry
+has only the names of the fields of the schema and fixed messages. It never has the text of a
+spec, and it never has the name of an unknown key: such a key shows as `unknown field`. The function writes an audit entry
 `profile.subagents_set` with the names of the sub-agents only. The admin command
 `python -m sama.admin subagents show|set --org <id> --profile <id> [--file <path>]` calls it.
-There is no HTTP API for it yet.
+The command first gives the redactor the secrets of the environment and the vault of
+the org, so a secret that no pattern matches is also found in a spec. It fails closed: it stops
+when the vault cannot be read, and when the org has vault entries but `SAMA_VAULT_KEY` is not
+set. There is no HTTP API for it yet.
 
 **Build.** The prompt assembler (Section 6.1) turns the specs into `SubagentDefinition`
 objects and puts them in `RunConfig.subagents`. The config is frozen with the session (D9),
@@ -2640,8 +2649,9 @@ fingerprint of a config without sub-agents does not change.
 
 **Rules at run time.**
 
-- A sub-agent cannot start a sub-agent, and it cannot ask a person. The toolsets `subagents`
-  and `clarify` are never in a definition, and the adapter adds `Task` and `Agent` to
+- A sub-agent cannot start a sub-agent, and it cannot ask a person. The toolsets `subagents`,
+  `clarify`, and `tool_search` are never in a definition (`tool_search` reaches each deferred
+  tool of the run with the authority of the run), and the adapter adds `Task` and `Agent` to
   `disallowedTools`.
 - The model can start only the sub-agents of the config. The hook denies the built-in agents
   of the CLI (`general-purpose`, `Explore`, `Plan`) and every call without a known
@@ -2649,8 +2659,9 @@ fingerprint of a config without sub-agents does not change.
 - The tool gate judges the `Agent` call, and it judges each tool call inside the sub-agent
   with its own call id. `Agent` and `Task` are allowed without a rule when the run has the
   toolset `subagents`. A rule can still deny them.
-- A sub-agent cannot pause the run. A gate `ask` inside a sub-agent becomes `deny` (Section
-  5.3). A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it.
+- A sub-agent cannot pause the run. The gate gets `child` for a call inside a sub-agent. For
+  such a call, it changes `ask` to `deny` before it records anything: the `tool_calls` row is
+  `denied`, and there is no pending approval and no `approval.requested` entry. A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it.
 - A sub-agent runs in the foreground. The adapter turns off the background tasks of the CLI.
 
 **Budget.** The model calls of a sub-agent go through the model proxy (D6) with the run
@@ -2670,13 +2681,14 @@ the root and not of the sub-agent span, because the gate does not receive the su
 | # | Assumption |
 |---|---|
 | A1 | Sub-agents belong to the agent profile and are frozen with the session config (D9). |
-| A2 | A spec uses toolsets, not tools. The profile must have each toolset, and the build uses only the toolsets that the run has. `subagents` and `clarify` are never given. Deferred and connector tools are not given. |
-| A3 | A gate `ask` inside a sub-agent is `deny`, because nobody can approve it. |
+| A2 | A spec uses toolsets, not tools. The profile must have each toolset, and the build uses only the toolsets that the run has. `subagents`, `clarify`, and `tool_search` are never given. Deferred and connector tools are not given. |
+| A3 | A gate `ask` inside a sub-agent is `deny`, because nobody can approve it. The gate does this when it gets `child`, before it records an approval. The adapter also maps `ask` to `deny` for a gate that does not. |
 | A4 | `Task` and `Agent` are allowed by default and need the `subagents` toolset. The default profile of the first org has it. The default group set does not. |
 | A5 | The built-in agents of the CLI and background sub-agents are not allowed. The adapter sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for a config with sub-agents. |
 | A6 | A runtime without `native_subagents` ignores sub-agents. The assembler logs a warning, and the write rejects them. A review run has none. |
 | A7 | The model of a sub-agent is `inherit` or a priced Anthropic model id. |
 | A8 | The spend of a sub-agent is limited by the budgets of the run and by `max_turns`. The tokens of one sub-agent come from the CLI task message when the CLI reports them. |
+| A9 | The runner never cuts the text of a `SubagentEvent`. The control plane redacts it and then cuts it, so a secret cannot lose a part to a cut before the redaction (same rule as the archive, M2.6 A6). |
 
 ---
 
