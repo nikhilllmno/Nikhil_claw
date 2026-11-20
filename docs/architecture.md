@@ -791,7 +791,11 @@ The redactor must know the secrets of the process, or the check only finds the k
 The control plane gives it the settings and refreshes the vault values. The standalone API
 (`python -m sama.api`) does the same: it adds `SAMA_DATABASE_URL`, `SAMA_SUPABASE_JWT_SECRET`,
 and `SAMA_VAULT_KEY` when it builds the app. With `SAMA_VAULT_KEY` it refreshes the vault values
-before the first request (a failed refresh stops the start) and then every few minutes.
+before the first request (a failed refresh stops the start) and then every few minutes. The
+standalone tool server (`python -m sama.tools --store postgres`) writes memory and skills, so it
+does the same with the same helper (`sama.vault.standalone`): it adds `SAMA_VAULT_KEY` to the
+secrets, refreshes the vault values before it serves (a failed refresh stops the start), and
+refreshes them in the background. Without `SAMA_VAULT_KEY` there are no vault values to learn.
 
 **Who may write.** The service checks the rules in this order:
 
@@ -985,16 +989,26 @@ store, and the sync. The rules:
 - Sync into the sandbox. Before a run starts the runner, `SandboxedRuntime` makes
   `.sama/skills/` in the work folder of the sandbox hold exactly the files of the visible
   skills (`.sama/skills/<name>/...`). There is no manifest, and the sync reads nothing from
-  the sandbox, because the agent and its scripts can change that folder. Each sync runs one
-  command in the sandbox that removes `.sama/skills/` (`rm -rf` removes a link and does not
-  follow it; a link in place of `.sama` is removed first). Then the sync writes every file
-  again from the library. So a file that the agent changed or deleted is restored, a file
-  that left the library is gone, and a link cannot make a write or a removal leave the
-  folder. The cost is one write for each skill file in every run. The sync refuses more than
-  2,000 files or 20 million characters, and it only writes paths of the form
-  `<name>/SKILL.md` or `<name>/<folder>/<path>` that are canonical. A failed sync logs a
-  warning and does not fail the run. The tools of the run do not depend on the files,
-  because `skill_view` reads from the database. The sync is for scripts. It does not use
+  the sandbox, because the agent and its scripts can change that folder. Each sync does three
+  steps. (1) One command refuses a link in place of `.sama`, removes the staging folders of
+  an earlier sync that did not finish, and makes a new staging folder
+  `.sama/.skills-<32 random hex characters>` with `mkdir`, which fails if the name exists.
+  (2) The sync writes every file of the library into the staging folder. (3) One command
+  refuses a link in place of `.sama` again, removes the old `.sama/skills` (`rm -rf` removes
+  a link and does not follow it), and moves the staging folder to `.sama/skills`. So a file
+  that the agent changed or deleted is restored, a file that left the library is gone, and a
+  link that a process makes at `.sama/skills` while the files are written does not redirect a
+  write, because no write goes to that path. A failed sync removes its staging folder. The
+  cost is one write for each skill file in every run. The sync refuses more than 2,000 files
+  or 20 million characters, and it only writes paths of the form `<name>/SKILL.md` or
+  `<name>/<folder>/<path>` that are canonical.
+- The limit of this protection. The agent can write anywhere in its own sandbox, and it runs
+  in the same sandbox as the sync. The staging name and the single publish command protect the
+  sync from accident and from simple tampering (a stray link or a script that changes the
+  folder). They do not protect it from the agent itself: an agent that is determined can
+  change `.sama` between the steps, or change the files after the sync. The files are a
+  convenience for scripts. They are not a trust boundary, and no tool of the run reads them.
+  A failed sync logs a warning and does not fail the run. The sync does not use
   `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and the
   gate does not allow it.
 

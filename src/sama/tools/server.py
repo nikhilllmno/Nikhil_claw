@@ -12,6 +12,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict
 from typing import Annotated, Any, Final, Literal, Protocol
 
@@ -541,7 +542,11 @@ class ToolServer:
 
     # -- ASGI -------------------------------------------------------------------------------
 
-    def app(self) -> Starlette:
+    def app(
+        self, around: Callable[[], AbstractAsyncContextManager[None]] | None = None
+    ) -> Starlette:
+        """``around`` opens before the server starts and closes after it stops. A start-up step
+        that raises stops the process."""
         inner = self.mcp().streamable_http_app(
             streamable_http_path=MCP_PATH,
             stateless_http=True,
@@ -553,7 +558,8 @@ class ToolServer:
 
         @contextlib.asynccontextmanager
         async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-            async with inner.router.lifespan_context(inner):
+            outer = around() if around is not None else contextlib.nullcontext()
+            async with outer, inner.router.lifespan_context(inner):
                 try:
                     yield
                 finally:

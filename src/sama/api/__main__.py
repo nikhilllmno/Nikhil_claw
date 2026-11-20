@@ -21,8 +21,6 @@ server.
 from __future__ import annotations
 
 import argparse
-import asyncio
-import contextlib
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -37,9 +35,8 @@ from sama.db.engine import create_engine
 from sama.integrations.service import Integrations
 from sama.observability.logs import configure_logging
 from sama.skills import BuiltinSkills, SkillLibrary
-from sama.vault.crypto import VaultKey
 from sama.vault.redact import default_redactor, env_secrets
-from sama.vault.store import Vault
+from sama.vault.standalone import keep_redactor_current, vault_from_env
 
 
 def _required(name: str) -> str:
@@ -63,35 +60,18 @@ def build_app() -> FastAPI:
         issuer=issuer(supabase_url),
     )
     engine = create_engine(_required("SAMA_DATABASE_URL"))
-    vault_key = os.environ.get("SAMA_VAULT_KEY", "").strip()
+    vault = vault_from_env(engine)
     public_url = os.environ.get("SAMA_PUBLIC_URL", "").strip()
     integrations = None
-    vault: Vault | None = None
-    if vault_key:
-        try:
-            vault = Vault(engine, VaultKey.from_text(vault_key))
-        except ValueError as error:
-            raise SystemExit(f"SAMA_VAULT_KEY: {error}") from None
-        if public_url:
-            integrations = Integrations(engine, vault, public_url=public_url)
+    if vault is not None and public_url:
+        integrations = Integrations(engine, vault, public_url=public_url)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        if vault is None:
-            yield
-            return
         # The redactor must know every vault value before the first request. A failed refresh
-        # stops the start. Later refreshes pick up values that another process writes.
-        await vault.refresh_redactor()
-        stop = asyncio.Event()
-        refresh = asyncio.create_task(vault.serve(stop))
-        try:
+        # stops the start.
+        async with keep_redactor_current(vault):
             yield
-        finally:
-            stop.set()
-            refresh.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await refresh
 
     api = SamaApi(
         engine,

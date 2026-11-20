@@ -8,6 +8,9 @@ Environment:
   variable in M1.17.
 - ``SAMA_DATABASE_URL``: used only with ``--store postgres``. Then the server also has the
   tool gate (``POST /gate``, M1.9). Without it, the runner denies every tool call.
+- ``SAMA_VAULT_KEY``: optional, used only with ``--store postgres``. It opens the vault, so that
+  the redactor knows the vault values. Memory and skill text with a secret is refused
+  (Section 8.1). The server does not start when the first load of the values fails.
 
 This process has no sandbox provider and no API, so large outputs keep only their head and
 tail, and ``clarify`` is hidden. The control plane process (M1.12) adds both.
@@ -31,6 +34,7 @@ from sama.tools.server import ToolServer, quiet_dependency_logs
 from sama.tools.todo import MemoryTodoStore, PostgresTodoStore, TodoStore
 from sama.tools.web import BraveSearch
 from sama.vault.redact import default_redactor, env_secrets
+from sama.vault.standalone import keep_redactor_current, vault_from_env
 
 log = logging.getLogger("sama.tools")
 
@@ -43,6 +47,7 @@ def build_app(store_kind: str) -> Starlette:
     memories: MemoryStore
     skills: SkillStore | None = None
     gate = None
+    vault = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
         from sama.gate.service import GateService
@@ -55,6 +60,7 @@ def build_app(store_kind: str) -> Starlette:
         memories = PostgresMemoryStore(engine)
         skills = PostgresSkillStore(engine, BuiltinSkills().all())
         gate = GateService(engine)
+        vault = vault_from_env(engine)
     else:
         log.warning(
             "the task lists are in memory only, there is no tool gate, and the skills tools are off"
@@ -75,7 +81,7 @@ def build_app(store_kind: str) -> Starlette:
         skills=skills,
         gate=gate,
     )
-    return server.app()
+    return server.app(around=lambda: keep_redactor_current(vault))
 
 
 def main() -> None:
@@ -85,7 +91,9 @@ def main() -> None:
     parser.add_argument("--store", choices=("memory", "postgres"), default="memory")
     args = parser.parse_args()
     configure_logging("tools")
-    default_redactor().add(*env_secrets("SAMA_RUN_TOKEN_KEY", "SAMA_DATABASE_URL", "BRAVE_API_KEY"))
+    default_redactor().add(
+        *env_secrets("SAMA_RUN_TOKEN_KEY", "SAMA_DATABASE_URL", "BRAVE_API_KEY", "SAMA_VAULT_KEY")
+    )
     quiet_dependency_logs()
     uvicorn.run(build_app(args.store), host=args.host, port=args.port, log_config=None)
 

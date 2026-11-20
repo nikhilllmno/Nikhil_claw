@@ -121,7 +121,7 @@ async def test_the_sync_ignores_unsafe_paths(tmp_path: Path) -> None:
     }
     assert await sync_files(box, files) == 0
     assert not (tmp_path / "box" / "x").exists()
-    assert not (Path(box.workdir) / ROOT).exists()
+    assert list((Path(box.workdir) / ROOT).iterdir()) == []
 
 
 async def test_a_tampered_or_deleted_file_is_restored(tmp_path: Path) -> None:
@@ -164,25 +164,95 @@ async def test_a_link_in_place_of_a_skill_folder_is_not_followed(tmp_path: Path)
     assert (outside / "keep.txt").read_text() == "keep"
 
 
-async def test_a_link_in_place_of_the_skills_folder_is_not_followed(tmp_path: Path) -> None:
+async def test_a_link_in_place_of_the_sama_folder_is_refused(tmp_path: Path) -> None:
     box = _sandbox(tmp_path)
     workdir = Path(box.workdir)
     outside = tmp_path / "outside"
     (outside / "skills" / "demo").mkdir(parents=True)
     (outside / "skills" / "demo" / "keep.txt").write_text("keep")
     (workdir / ".sama").symlink_to(outside, target_is_directory=True)
-    assert await sync_files(box, {"demo/SKILL.md": "A"}) == 1
-    assert not (workdir / ".sama").is_symlink()
-    assert (workdir / ROOT / "demo/SKILL.md").read_text() == "A"
-    assert (outside / "skills" / "demo" / "keep.txt").read_text() == "keep"
-    assert not (outside / "skills" / "demo" / "SKILL.md").exists()
+    with pytest.raises(OSError, match="is a link"):
+        await sync_files(box, {"demo/SKILL.md": "A"})
+    assert sorted(path.name for path in outside.iterdir()) == ["skills"]
+    assert [path.name for path in (outside / "skills" / "demo").iterdir()] == ["keep.txt"]
 
 
-async def test_a_failed_clear_stops_the_sync(tmp_path: Path) -> None:
+class _Racy(LocalSandbox):
+    """A sandbox in which a process makes links while the sync writes its files."""
+
+    def __init__(self, root: Path, outside: Path) -> None:
+        super().__init__(root)
+        self.outside = outside
+        self.written: list[str] = []
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        if not self.written:
+            base = Path(self.workdir) / ROOT
+            for link in (base, Path(self.workdir) / ".sama/skills-new"):
+                link.unlink(missing_ok=True)
+            base.symlink_to(self.outside, target_is_directory=True)
+        self.written.append(path)
+        await super().write_file(path, data)
+
+
+async def test_a_link_made_at_the_final_path_during_the_sync_does_not_redirect(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "box" / "work").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "demo").mkdir(parents=True)
+    (outside / "demo" / "keep.txt").write_text("keep")
+    box = _Racy(tmp_path / "box", outside)
+    files = {"demo/SKILL.md": "A", "demo/references/n.md": "N"}
+    assert await sync_files(box, files) == 2
+    base = Path(box.workdir) / ROOT
+    assert not base.is_symlink()
+    assert (base / "demo/SKILL.md").read_text() == "A"
+    assert (base / "demo/references/n.md").read_text() == "N"
+    # Every write went to a staging folder with a random name, never to the final path.
+    assert all("/.sama/.skills-" in path for path in box.written)
+    assert sorted(path.name for path in outside.rglob("*")) == ["demo", "keep.txt"]
+    assert (outside / "demo" / "keep.txt").read_text() == "keep"
+    assert [path.name for path in (Path(box.workdir) / ".sama").iterdir()] == ["skills"]
+
+
+async def test_the_staging_folder_has_a_new_random_name_for_each_sync(tmp_path: Path) -> None:
+    (tmp_path / "box" / "work").mkdir(parents=True)
+    box = _Racy(tmp_path / "box", tmp_path)
+    box.written.append("skip the link")
+    await sync_files(box, {"a/SKILL.md": "A"})
+    await sync_files(box, {"a/SKILL.md": "A"})
+    names = {path.split("/")[-3] for path in box.written[1:]}
+    assert len(names) == 2
+    assert all(len(name) == len(".skills-") + 32 for name in names)
+
+
+async def test_old_staging_folders_are_removed_and_a_failed_sync_leaves_none(
+    tmp_path: Path,
+) -> None:
+    box = _sandbox(tmp_path)
+    sama = Path(box.workdir) / ".sama"
+    (sama / ".skills-dead").mkdir(parents=True)
+    (sama / ".skills-dead" / "x").write_text("x")
+    assert await sync_files(box, {"a/SKILL.md": "A"}) == 1
+    assert [path.name for path in sama.iterdir()] == ["skills"]
+
+    class Failing(LocalSandbox):
+        async def write_file(self, path: str, data: bytes) -> None:
+            raise OSError("disk full")
+
+    failing = Failing(tmp_path / "box")
+    with pytest.raises(OSError, match="disk full"):
+        await sync_files(failing, {"a/SKILL.md": "A"})
+    assert [path.name for path in sama.iterdir()] == ["skills"]
+    assert (sama / "skills/a/SKILL.md").read_text() == "A"
+
+
+async def test_a_failed_prepare_stops_the_sync(tmp_path: Path) -> None:
     box = _sandbox(tmp_path)
     workdir = Path(box.workdir)
     (workdir / ".sama").write_text("a file, not a folder")
-    with pytest.raises(OSError, match="not cleared"):
+    with pytest.raises(OSError, match="not updated"):
         await sync_files(box, {"a/SKILL.md": "A"})
 
 
