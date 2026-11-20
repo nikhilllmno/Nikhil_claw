@@ -150,11 +150,43 @@ async def test_the_installations_of_the_user(fake: Fake) -> None:
         items = [{"id": page * 1000 + i} for i in range(count)]
         return httpx.Response(200, json={"installations": items})
 
+    def membership(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer ghu_user"
+        return httpx.Response(200, json={"state": "active", "role": "admin"})
+
     fake.routes["POST /login/oauth/access_token"] = token
+    fake.routes["GET /user"] = lambda _: httpx.Response(200, json={"login": "octo"})
     fake.routes["GET /user/installations"] = installations
-    found = await fake.client().user_installation_ids("c")
-    assert len(found) == 103
-    assert 2002 in found
+    fake.routes["GET /user/memberships/orgs/acme"] = membership
+    access = await fake.client().user_access("c")
+    assert access.login == "octo"
+    assert len(access.installation_ids) == 103
+    assert 2002 in access.installation_ids
+    assert access.org_admin is False
+    assert (await fake.client().user_access("c", org="acme")).org_admin is True
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "admin"),
+    [
+        (200, {"state": "active", "role": "member"}, False),
+        (200, {"state": "pending", "role": "admin"}, False),
+        (404, {"message": "Not Found"}, False),
+        (403, {"message": "Forbidden"}, False),
+    ],
+)
+async def test_only_an_active_org_admin_counts(
+    fake: Fake, status: int, body: dict[str, str], admin: bool
+) -> None:
+    fake.routes["POST /login/oauth/access_token"] = lambda _: httpx.Response(
+        200, json={"access_token": "ghu_user"}
+    )
+    fake.routes["GET /user"] = lambda _: httpx.Response(200, json={"login": "octo"})
+    fake.routes["GET /user/installations"] = lambda _: httpx.Response(
+        200, json={"installations": [{"id": 1}]}
+    )
+    fake.routes["GET /user/memberships/orgs/acme"] = lambda _: httpx.Response(status, json=body)
+    assert (await fake.client().user_access("c", org="acme")).org_admin is admin
 
 
 async def test_a_bad_oauth_code_is_refused(fake: Fake) -> None:
@@ -162,7 +194,7 @@ async def test_a_bad_oauth_code_is_refused(fake: Fake) -> None:
         200, json={"error": "bad_verification_code"}
     )
     with pytest.raises(GitHubError) as caught:
-        await fake.client().user_installation_ids("bad")
+        await fake.client().user_access("bad")
     assert caught.value.status_code == 400
 
 
@@ -234,7 +266,7 @@ async def test_a_network_error_has_no_token() -> None:
         await client.installation(1)
     assert str(caught.value) == "GitHub cannot be reached: ConnectError"
     with pytest.raises(GitHubError):
-        await client.user_installation_ids("c")
+        await client.user_access("c")
 
 
 def test_the_manifest_asks_for_the_least_permissions() -> None:
@@ -244,10 +276,11 @@ def test_the_manifest_asks_for_the_least_permissions() -> None:
         "contents": "write",
         "pull_requests": "write",
         "metadata": "read",
+        "members": "read",
     }
     assert "administration" not in manifest["default_permissions"]
     assert "workflows" not in manifest["default_permissions"]
-    assert manifest["public"] is False
+    assert manifest["public"] is True
     assert manifest["redirect_url"] == "https://sama.example.test/github/app/created"
     assert manifest["callback_urls"] == ["https://sama.example.test/github/setup"]
     assert manifest["request_oauth_on_install"] is True

@@ -16,8 +16,16 @@ from pydantic import SecretStr
 from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import AuditEntry, GitHubInstallation, GitHubPushGrant, GitHubRepo, Org, Run
-from sama.github.client import GitHubAppConfig, GitHubClient, GitHubError
+from sama.db.models import (
+    AuditEntry,
+    GitHubInstallation,
+    GitHubPushGrant,
+    GitHubRepo,
+    Membership,
+    Org,
+    Run,
+)
+from sama.github.client import GitHubAppConfig, GitHubClient, GitHubError, UserAccess
 from sama.github.service import (
     DEFAULT_PROTECTED_PATHS,
     MAX_PATH_CHARS,
@@ -67,6 +75,11 @@ class FakeGitHub:
         self.repos: dict[str, dict[str, Any]] = {}
         """The answer of ``repo`` for each repository (key in lower case)."""
         self.forgotten: list[int] = []
+        self.logins: dict[str, str] = {}
+        """The GitHub login of each OAuth code (default ``acme``)."""
+        self.not_org_admin: set[str] = set()
+        """The OAuth codes of people who are not an admin of the GitHub organization."""
+        self.asked_orgs: list[str | None] = []
 
     def as_client(self) -> GitHubClient:
         return self  # type: ignore[return-value]
@@ -83,12 +96,19 @@ class FakeGitHub:
         owner, _, name = (canonical or full_name).partition("/")
         self.repos[key] = {"owner": {"login": owner}, "name": name}
 
-    async def user_installation_ids(self, code: str) -> set[int]:
+    async def user_access(self, code: str, org: str | None = None) -> UserAccess:
         if code in self.code_errors:
             raise self.code_errors[code]
-        return self.visible.get(code, set())
+        self.asked_orgs.append(org)
+        return UserAccess(
+            self.logins.get(code, "acme"),
+            frozenset(self.visible.get(code, set())),
+            org is not None and code not in self.not_org_admin,
+        )
 
     async def installation(self, installation_id: int) -> dict[str, Any]:
+        if installation_id not in self.installs:
+            raise GitHubError("GitHub answered 404: Not Found", 404)
         return self.installs[installation_id]
 
     async def repo_installation(self, owner: str, name: str) -> int | None:
@@ -122,18 +142,35 @@ def clock() -> Clock:
     return Clock()
 
 
+async def make_admin(engine: AsyncEngine, tenant: Tenant, role: str = "admin") -> None:
+    """Gives mia an org role. Only an org admin makes an install link."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(
+                Membership.org_id == tenant.org,
+                Membership.user_id == tenant.ids["mia"],
+                Membership.workspace_id.is_(None),
+            )
+            .values(role=role)
+        )
+
+
 @pytest.fixture
-def service(
+async def service(
     engine: AsyncEngine,
     github: FakeGitHub,
     clock: Clock,
+    tenant: Tenant,
 ) -> GitHubService:
+    await make_admin(engine, tenant)
     return GitHubService(engine, github.as_client(), state_key=b"k" * 32, clock=clock)
 
 
 @pytest.fixture
 async def other(engine: AsyncEngine) -> AsyncIterator[Tenant]:
     second = await add_tenant(engine)
+    await make_admin(engine, second)
     yield second
     async with engine.begin() as connection:
         await connection.execute(text("SET LOCAL sama.audit_purge = 'on'"))
@@ -499,6 +536,7 @@ async def test_a_failed_oauth_exchange_is_a_bad_request(
     service: GitHubService, github: FakeGitHub, tenant: Tenant
 ) -> None:
     github.code_errors["bad"] = GitHubError("GitHub did not accept the code", 400)
+    github.install(7)
     with pytest.raises(GitHubSetupError, match="did not accept the code") as caught:
         await service.finish_install(state_of(service, tenant), 7, "bad")
     assert caught.value.status_code == 400
@@ -538,12 +576,97 @@ async def test_a_second_install_updates_the_row(
     installation_id = await connect(service, github, tenant)
     first = (await service.installations(tenant.org))[0]
     github.install(installation_id, login="renamed", kind="User")
+    github.logins[CODE] = "Renamed"
     await service.finish_install(state_of(service, tenant), installation_id, CODE)
     listed = await service.installations(tenant.org)
     assert len(listed) == 1
     assert listed[0]["id"] == first["id"], "the upsert keeps the row"
     assert (listed[0]["account"], listed[0]["account_type"]) == ("renamed", "User")
     assert await actions(engine, tenant.org) == ["github.installed", "github.installed"]
+
+
+async def test_only_an_owner_of_the_github_organization_can_connect_it(
+    service: GitHubService, github: FakeGitHub, tenant: Tenant, engine: AsyncEngine
+) -> None:
+    """A collaborator with read access to one repository sees the installation too. That is
+    not enough to connect the whole installation to a sama org."""
+    installation_id = new_installation_id()
+    github.install(installation_id, login="acme", kind="Organization")
+    github.not_org_admin.add(CODE)
+    with pytest.raises(GitHubSetupError, match="only an owner") as caught:
+        await service.finish_install(state_of(service, tenant), installation_id, CODE)
+    assert caught.value.status_code == 403
+    assert github.asked_orgs == ["acme"]
+    assert await service.installations(tenant.org) == []
+    assert await actions(engine, tenant.org) == []
+
+
+async def test_only_the_github_user_can_connect_a_personal_account(
+    service: GitHubService, github: FakeGitHub, tenant: Tenant
+) -> None:
+    installation_id = new_installation_id()
+    github.install(installation_id, login="octo", kind="User")
+    github.logins[CODE] = "someone-else"
+    with pytest.raises(GitHubSetupError, match="only the GitHub user octo") as caught:
+        await service.finish_install(state_of(service, tenant), installation_id, CODE)
+    assert caught.value.status_code == 403
+    assert github.asked_orgs == [None]
+    github.logins[CODE] = "OCTO"
+    linked = await service.finish_install(state_of(service, tenant), installation_id, CODE)
+    assert linked["account"] == "octo"
+
+
+@pytest.mark.parametrize("role", ["member", "removed"])
+async def test_the_link_stops_working_when_its_maker_is_not_an_org_admin(
+    service: GitHubService, github: FakeGitHub, tenant: Tenant, engine: AsyncEngine, role: str
+) -> None:
+    installation_id = new_installation_id()
+    github.install(installation_id)
+    state = state_of(service, tenant)
+    if role == "removed":
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(Membership).where(
+                    Membership.org_id == tenant.org, Membership.user_id == tenant.ids["mia"]
+                )
+            )
+    else:
+        await make_admin(engine, tenant, role)
+    with pytest.raises(GitHubSetupError, match="not an org admin now") as caught:
+        await service.preview_install(state, installation_id)
+    assert caught.value.status_code == 403
+    with pytest.raises(GitHubSetupError, match="not an org admin now"):
+        await service.finish_install(state, installation_id, CODE)
+    assert await service.installations(tenant.org) == []
+
+
+async def test_the_preview_names_the_org_and_the_account(
+    service: GitHubService, github: FakeGitHub, tenant: Tenant, engine: AsyncEngine
+) -> None:
+    installation_id = new_installation_id()
+    github.install(installation_id, login="octo", kind="User")
+    preview = await service.preview_install(state_of(service, tenant), installation_id)
+    async with engine.connect() as connection:
+        name = await connection.scalar(select(Org.name).where(Org.id == tenant.org))
+    assert (preview.org_name, preview.account, preview.account_type) == (name, "octo", "User")
+    assert github.asked_orgs == [], "the preview does not use the OAuth code"
+    assert await service.installations(tenant.org) == []
+    with pytest.raises(GitHubSetupError) as caught:
+        await service.preview_install(state_of(service, tenant), new_installation_id())
+    assert caught.value.status_code == 404
+
+
+async def test_run_problem_follows_the_run(
+    service: GitHubService, tenant: Tenant, engine: AsyncEngine
+) -> None:
+    assert await service.run_problem(tenant.org, uuid.uuid4()) is not None, "an unknown run"
+    run_id = await make_run(engine, tenant)
+    assert await service.run_problem(tenant.org, run_id) is None
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.org_id == tenant.org, Run.id == run_id).values(status="cancelled")
+        )
+    assert await service.run_problem(tenant.org, run_id) is not None, "an ended run"
 
 
 async def test_another_org_cannot_take_an_installation(

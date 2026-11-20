@@ -44,7 +44,7 @@ def test_the_form_posts_the_manifest_to_the_personal_account() -> None:
     assert manifest["callback_urls"] == ["https://sama.example.test/github/setup"]
     assert manifest["request_oauth_on_install"] is True
     assert manifest["hook_attributes"]["active"] is False
-    assert manifest["public"] is False
+    assert manifest["public"] is True
 
 
 def test_the_form_can_post_to_an_organization_and_escapes_the_name() -> None:

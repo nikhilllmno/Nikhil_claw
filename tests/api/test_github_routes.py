@@ -93,17 +93,31 @@ async def install(
     github.install(installation_id, login=login)
     response = await http.post(f"/orgs/{tenant.org}/github/install", headers=admin)
     assert response.status_code == 200, response.text
+    state = state_from(response.json()["url"])
     page = await http.get(
         "/github/setup",
         params={
             "installation_id": installation_id,
             "setup_action": "install",
             "code": CODE,
-            "state": state_from(response.json()["url"]),
+            "state": state,
         },
     )
     assert page.status_code == 200, page.text
+    assert "Confirm the GitHub connection" in page.text
+    done = await confirm(http, state, installation_id)
+    assert done.status_code == 200, done.text
     return installation_id
+
+
+async def confirm(
+    http: httpx.AsyncClient, state: str, installation_id: int, code: str = CODE
+) -> httpx.Response:
+    """Sends the form of the confirm page."""
+    return await http.post(
+        "/github/setup",
+        data={"installation_id": str(installation_id), "code": code, "state": state},
+    )
 
 
 # -- the admin routes ----------------------------------------------------------------------
@@ -309,16 +323,19 @@ async def test_the_ids_in_the_paths_must_be_uuids(
 # -- the public pages ----------------------------------------------------------------------
 
 
-async def test_the_created_page_shows_the_code_escaped(http: httpx.AsyncClient) -> None:
-    response = await http.get("/github/app/created", params={"code": "<script>alert(1)</script>&x"})
-    assert response.status_code == 200
+@pytest.mark.parametrize(
+    "code", ["<script>alert(1)</script>&x", "abc; touch /tmp/x", "$(id)", "a b", "`id`"]
+)
+async def test_the_created_page_refuses_a_code_with_other_characters(
+    http: httpx.AsyncClient, code: str
+) -> None:
+    """The page shows a shell command, so a code must not add a second command."""
+    response = await http.get("/github/app/created", params={"code": code})
+    assert response.status_code == 400
     assert response.headers["content-type"].startswith("text/html")
     assert response.headers["cache-control"] == "no-store"
     assert "<script>" not in response.text
-    assert (
-        "python -m sama.admin github-app convert &lt;script&gt;alert(1)&lt;/script&gt;&amp;x"
-        in (response.text)
-    )
+    assert "github-app convert" not in response.text
 
 
 async def test_the_created_page_shows_a_plain_code_in_the_command(
@@ -391,10 +408,7 @@ async def test_the_setup_page_shows_the_error_status_of_the_service(
         return state_from(response.json()["url"])
 
     async def finish(state: str, installation_id: int, code: str = CODE) -> httpx.Response:
-        return await http.get(
-            "/github/setup",
-            params={"installation_id": installation_id, "code": code, "state": state},
-        )
+        return await confirm(http, state, installation_id, code)
 
     seen = new_installation_id()
     github.install(seen)
@@ -436,7 +450,7 @@ async def test_the_setup_page_shows_that_github_is_connected(
     state = state_from(
         (await http.post(f"/orgs/{tenant.org}/github/install", headers=admin)).json()["url"]
     )
-    response = await http.get(
+    preview = await http.get(
         "/github/setup",
         params={
             "installation_id": installation_id,
@@ -445,12 +459,43 @@ async def test_the_setup_page_shows_that_github_is_connected(
             "state": state,
         },
     )
+    assert preview.status_code == 200
+    assert "<h1>Confirm the GitHub connection</h1>" in preview.text
+    assert "&lt;b&gt;acme&lt;/b&gt;" in preview.text
+    assert "<b>acme</b>" not in preview.text
+    assert '<form method="post" action="/github/setup">' in preview.text
+    assert github.asked_orgs == [], "the GET does not use the OAuth code"
+    assert (await http.get(f"/orgs/{tenant.org}/github/installations", headers=admin)).json() == []
+
+    response = await confirm(http, state, installation_id)
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert "<h1>GitHub is connected</h1>" in response.text
     assert "&lt;b&gt;acme&lt;/b&gt;" in response.text
-    assert "<b>acme</b>" not in response.text
     assert CODE not in response.text
     assert state not in response.text
     listed = (await http.get(f"/orgs/{tenant.org}/github/installations", headers=admin)).json()
     assert [row["installation_id"] for row in listed] == [installation_id]
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        {},
+        {"installation_id": "x", "code": CODE, "state": "s"},
+        {"installation_id": "1", "code": "", "state": "s"},
+        {"installation_id": "1", "code": CODE},
+        {"installation_id": "1", "code": "c" * 201, "state": "s"},
+    ],
+)
+async def test_the_confirm_form_needs_all_the_fields(
+    http: httpx.AsyncClient, form: dict[str, str]
+) -> None:
+    response = await http.post("/github/setup", data=form)
+    assert response.status_code == 400
+    assert "Start the install from sama" in response.text
+
+
+async def test_the_confirm_form_answers_409_without_the_app(off: httpx.AsyncClient) -> None:
+    response = await off.post("/github/setup", data={"installation_id": "1"})
+    assert response.status_code == 409

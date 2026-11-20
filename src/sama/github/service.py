@@ -28,8 +28,10 @@ from sqlalchemy import delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AuditEntry, GitHubInstallation, GitHubPushGrant, GitHubRepo
+from sama.db.models import AuditEntry, GitHubInstallation, GitHubPushGrant, GitHubRepo, Org
 from sama.github.client import GitHubClient, GitHubError
+from sama.tenancy.access import load_grants
+from sama.tenancy.authority import load_authority
 
 log = logging.getLogger("sama.github")
 
@@ -160,6 +162,13 @@ class InstallState:
     user_id: uuid.UUID
 
 
+@dataclass(frozen=True, slots=True)
+class InstallPreview:
+    org_name: str
+    account: str
+    account_type: str
+
+
 class GitHubService:
     """The installations, the allowlist, and the push grants of the orgs."""
 
@@ -200,27 +209,61 @@ class GitHubService:
         except (ValueError, KeyError, TypeError):
             raise GitHubSetupError("the install link is not valid") from None
 
-    async def finish_install(self, state: str, installation_id: int, code: str) -> dict[str, Any]:
-        """Links the installation to the org of the state, after the OAuth check."""
+    async def preview_install(self, state: str, installation_id: int) -> InstallPreview:
+        """What a confirmed install connects: the sama org and the GitHub account. The page
+        shows both, so the person who installed the App sees where the access goes."""
         who = self.read_state(state)
-        try:
-            visible = await self.client.user_installation_ids(code)
-        except GitHubError as error:
-            raise GitHubSetupError(str(error), 400) from None
-        if installation_id not in visible:
-            # The id in the URL is not proof: anyone can type an id. The person who installs
-            # must see the installation with their own GitHub sign-in.
-            raise GitHubSetupError("your GitHub account cannot see this installation", 403)
+        login, kind = await self._account(installation_id)
+        async with self._engine.connect() as connection:
+            org_name = await self._org_of_admin(connection, who)
+        return InstallPreview(org_name, login, kind)
+
+    async def _account(self, installation_id: int) -> tuple[str, str]:
         try:
             found = await self.client.installation(installation_id)
         except GitHubError as error:
-            raise GitHubSetupError(str(error), 502) from None
+            raise GitHubSetupError(str(error), 404 if error.status_code == 404 else 502) from None
         account = found.get("account") or {}
         login = str(account.get("login") or "")
         kind = str(account.get("type") or "User")
         if not login:
             raise GitHubSetupError("GitHub gave no account for the installation", 502)
+        return login, kind
+
+    async def _org_of_admin(self, connection: AsyncConnection, who: InstallState) -> str:
+        """The name of the org. The person who made the install link must still be an org
+        admin: a link stops working when that person loses the role."""
+        grants = await load_grants(connection, who.org_id, who.user_id)
+        name = await connection.scalar(select(Org.name).where(Org.id == who.org_id))
+        if name is None or not grants.org_admin:
+            raise GitHubSetupError(
+                "the person who made the install link is not an org admin now", 403
+            )
+        return str(name)
+
+    async def finish_install(self, state: str, installation_id: int, code: str) -> dict[str, Any]:
+        """Links the installation to the org of the state, after the OAuth check."""
+        who = self.read_state(state)
+        login, kind = await self._account(installation_id)
+        organization = kind == "Organization"
+        try:
+            access = await self.client.user_access(code, org=login if organization else None)
+        except GitHubError as error:
+            raise GitHubSetupError(str(error), 400) from None
+        if installation_id not in access.installation_ids:
+            # The id in the URL is not proof: anyone can type an id. The person who installs
+            # must see the installation with their own GitHub sign-in.
+            raise GitHubSetupError("your GitHub account cannot see this installation", 403)
+        # To see an installation is not enough: a collaborator with read access to one
+        # repository sees it too. Only the owner of the GitHub account can connect it.
+        if organization and not access.org_admin:
+            raise GitHubSetupError(
+                f"only an owner of the GitHub organization {login} can connect it", 403
+            )
+        if not organization and access.login.lower() != login.lower():
+            raise GitHubSetupError(f"only the GitHub user {login} can connect this account", 403)
         async with self._engine.begin() as connection:
+            await self._org_of_admin(connection, who)
             owner = await connection.scalar(
                 select(GitHubInstallation.org_id).where(
                     GitHubInstallation.installation_id == installation_id
@@ -333,6 +376,11 @@ class GitHubService:
                 )
             ).first()
         return None if row is None else _allowed(row)
+
+    async def run_problem(self, org_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
+        """Why the run has no authority now, else ``None`` (the rule of the model proxy)."""
+        async with self._engine.connect() as connection:
+            return (await load_authority(connection, org_id, run_id)).problem
 
     async def add_repo(
         self,

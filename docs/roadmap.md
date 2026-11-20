@@ -153,10 +153,11 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
 - M3.7: the GitHub App, the git proxy, and pull requests in `src/sama/github/` and
   `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0021` adds
   `github_installations`, `github_repos`, and `github_push_grants` with RLS. An org admin
-  installs the App with a signed state and an OAuth check, and puts repos on the allowlist.
+  installs the App with a signed state, a confirm page, and an OAuth check that the person
+  owns the GitHub account. The admin puts repos on the allowlist.
   `repo_clone` clones those repos through the proxy at `/git`, with the run token in a
   credential helper. The proxy refuses pushes to refs that are not `sama/*` branches,
-  deletes, and force-pushes. A push that changes a protected path needs a
+  deletes, and force-pushes, and it refuses a run that ended. A push that changes a protected path needs a
   `repo_push_approval` grant. `pr_create` and `pr_comment` run on the control plane.
   `python -m sama.admin github-app` makes the manifest form and converts the code. Not in
   M3.7: the real App and the rulesets (a person makes them, architecture Section 19.5), a

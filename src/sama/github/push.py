@@ -18,6 +18,7 @@ bases, without blobs, from GitHub. If a check cannot read an object, the proxy r
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import tempfile
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
@@ -39,6 +40,12 @@ MAX_PUSH_COMMITS: Final = 2_000
 MAX_BOUNDARY: Final = 20
 """The most parent commits outside the pack that one ref update can have."""
 GIT_TIMEOUT_S: Final = 120.0
+MAX_COMMIT_BYTES: Final = 1024 * 1024
+"""The largest commit or tag object in a push."""
+MAX_TREE_BYTES: Final = 16 * 1024 * 1024
+"""The largest tree object in a push."""
+MAX_GIT_OUTPUT_BYTES: Final = 64 * 1024 * 1024
+"""The most output that the proxy reads from one git command."""
 MAX_LISTED_PATHS: Final = 10
 DEFAULT_BASE: Final = "refs/sama/default"
 
@@ -65,13 +72,7 @@ class GrantStore(Protocol):
 @dataclass(slots=True)
 class PushVerdict:
     rejected: dict[str, str] = field(default_factory=dict)
-    """The reason for each refused ref."""
-    granted: list[RefUpdate] = field(default_factory=list)
-    """The updates that used a grant."""
-
-    @property
-    def ok(self) -> bool:
-        return not self.rejected
+    """The reason for each refused ref. An empty dict lets the push through."""
 
 
 def ref_problem(update: RefUpdate) -> str | None:
@@ -171,9 +172,7 @@ async def check_push(
         paths = touched.get(update.ref, [])
         if not paths:
             continue
-        if await grants.take_grant(repo, update.ref, update.new):
-            verdict.granted.append(update)
-        else:
+        if not await grants.take_grant(repo, update.ref, update.new):
             verdict.rejected[update.ref] = approval_hint(repo, update, paths)
     return verdict
 
@@ -270,36 +269,48 @@ async def _fast_forward(
 
 
 async def _commits(git_dir: Path) -> dict[str, tuple[str, ...]]:
-    """The commits of the repository and their parents."""
+    """The commits of the pack and their parents.
+
+    Git itself reads the parents (``rev-list --parents``): only the ``parent`` lines just
+    after the ``tree`` line count, as in each git client and on GitHub. A ``parent`` line
+    later in the header is not a parent. A commit or a tag that is larger than
+    ``MAX_COMMIT_BYTES`` and a tree that is larger than ``MAX_TREE_BYTES`` stop the check, so
+    a small pack cannot make the control plane read a very large object."""
     listed = await _git(
         git_dir,
         "cat-file",
         "--batch-all-objects",
-        "--batch-check=%(objectname) %(objecttype)",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
     )
-    commits = [
-        line.split(" ")[0] for line in listed.decode().splitlines() if line.endswith(" commit")
-    ]
+    commits: list[str] = []
+    for line in listed.decode().splitlines():
+        name, kind, size = line.split(" ")
+        if kind in {"commit", "tag"} and int(size) > MAX_COMMIT_BYTES:
+            raise PushCheckError(
+                f"the push has a {kind} that is larger than {MAX_COMMIT_BYTES} bytes"
+            )
+        if kind == "tree" and int(size) > MAX_TREE_BYTES:
+            raise PushCheckError(f"the push has a tree that is larger than {MAX_TREE_BYTES} bytes")
+        if kind == "commit":
+            commits.append(name)
     if len(commits) > MAX_PUSH_COMMITS:
         raise PushCheckError(f"the push has more than {MAX_PUSH_COMMITS} new commits")
     if not commits:
         return {}
-    raw = await _git(git_dir, "cat-file", "--batch", stdin="\n".join(commits).encode() + b"\n")
+    raw = await _git(
+        git_dir,
+        "rev-list",
+        "--parents",
+        "--no-walk=unsorted",
+        "--stdin",
+        stdin="\n".join(commits).encode() + b"\n",
+    )
     parents: dict[str, tuple[str, ...]] = {}
-    offset = 0
-    while offset < len(raw):
-        end = raw.index(b"\n", offset)
-        header = raw[offset:end].decode().split(" ")
-        size = int(header[2])
-        body = raw[end + 1 : end + 1 + size]
-        offset = end + 1 + size + 1
-        found: list[str] = []
-        for line in body.split(b"\n"):
-            if not line:
-                break
-            if line.startswith(b"parent "):
-                found.append(line[7:].decode())
-        parents[header[0]] = tuple(found)
+    for line in raw.decode().splitlines():
+        commit, *found = line.split(" ")
+        parents[commit] = tuple(found)
+    if set(parents) != set(commits):
+        raise PushCheckError("git did not read every commit of the push")
     return parents
 
 
@@ -347,6 +358,8 @@ async def run_git(
     stdin: bytes | None = None,
     env: Mapping[str, str] | None = None,
 ) -> bytes:
+    """Runs git and returns its output. More than ``MAX_GIT_OUTPUT_BYTES`` of output stops
+    git, so a bad pack cannot fill the memory of the control plane."""
     process = await asyncio.create_subprocess_exec(
         "git",
         "-c",
@@ -358,15 +371,49 @@ async def run_git(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    if process.stdout is None or process.stderr is None:  # pragma: no cover
+        raise PushCheckError("git has no output pipes")
+
+    async def feed() -> None:
+        if process.stdin is None:
+            return
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            process.stdin.write(stdin or b"")
+            await process.stdin.drain()
+        process.stdin.close()
+
+    async def read(stream: asyncio.StreamReader, limit: int) -> bytes:
+        out = bytearray()
+        while chunk := await stream.read(64 * 1024):
+            out += chunk
+            if len(out) > limit:
+                raise PushCheckError(f"git {args[0]} gave too much output")
+        return bytes(out)
+
     try:
         async with asyncio.timeout(GIT_TIMEOUT_S):
-            out, err = await process.communicate(stdin)
+            _, out, err = await asyncio.gather(
+                feed(),
+                read(process.stdout, MAX_GIT_OUTPUT_BYTES),
+                read(process.stderr, 1024 * 1024),
+            )
+            await process.wait()
     except TimeoutError:
-        process.kill()
+        _kill(process)
         await process.wait()
         raise PushCheckError(f"git {args[0]} took too long") from None
+    except PushCheckError:
+        _kill(process)
+        await process.wait()
+        raise
     if process.returncode != 0:
         detail = err.decode("utf-8", "replace").strip().splitlines()
         last = detail[-1][:300] if detail else "no output"
         raise PushCheckError(f"git {args[0]} failed: {last}")
     return out
+
+
+def _kill(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()

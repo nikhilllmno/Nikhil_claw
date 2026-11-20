@@ -31,10 +31,12 @@ APP_PERMISSIONS: Final[Mapping[str, str]] = {
     "contents": "write",
     "pull_requests": "write",
     "metadata": "read",
+    "members": "read",
 }
 """The App has no ``workflows`` permission, so GitHub also refuses a push that changes a file
 in ``.github/workflows``. It has no ``administration`` permission, so it cannot change a
-branch rule or a ruleset."""
+branch rule or a ruleset. ``members: read`` lets sama check that the person who connects an
+installation is an owner of the GitHub organization."""
 
 
 class GitHubError(Exception):
@@ -43,6 +45,16 @@ class GitHubError(Exception):
     def __init__(self, message: str, status_code: int = 502) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+@dataclass(frozen=True, slots=True)
+class UserAccess:
+    """What one GitHub user can do, from their OAuth sign-in."""
+
+    login: str
+    installation_ids: frozenset[int]
+    org_admin: bool
+    """True if the user is an active admin (owner) of the asked GitHub organization."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +81,9 @@ def app_manifest(public_url: str, *, name: str = "sama") -> dict[str, Any]:
 
     The webhook is off: sama does not need events. ``request_oauth_on_install`` makes GitHub
     send the person who installs the App to ``/github/setup`` with an OAuth code, so sama can
-    check that this person can see the installation.
+    check that this person owns the GitHub account of the installation. The App is public, so
+    each sama org can install it on its own GitHub account. An installation does nothing in
+    sama until an org admin connects it with a signed install link.
     """
     base = public_url.rstrip("/")
     return {
@@ -77,7 +91,7 @@ def app_manifest(public_url: str, *, name: str = "sama") -> dict[str, Any]:
         "url": base,
         "description": "Sama clones repositories, pushes sama/* branches, and opens pull "
         "requests for the agents of an org.",
-        "public": False,
+        "public": True,
         "redirect_url": f"{base}/github/app/created",
         "callback_urls": [f"{base}/github/setup"],
         "request_oauth_on_install": True,
@@ -168,8 +182,10 @@ class GitHubClient:
     def _app(self) -> str:
         return f"Bearer {self.app_jwt()}"
 
-    async def user_installation_ids(self, code: str) -> set[int]:
-        """The installations of the App that the person who gave the OAuth code can see."""
+    async def user_access(self, code: str, org: str | None = None) -> UserAccess:
+        """What the person who gave the OAuth code can do: their login, the installations of
+        the App that they can see, and, for ``org``, if they are an active admin of that
+        GitHub organization. The user token stays in this method."""
         try:
             response = await self._http.post(
                 f"{self.config.web_url}/login/oauth/access_token",
@@ -186,18 +202,33 @@ class GitHubClient:
         token = str(body.get("access_token") or "") if response.status_code == 200 else ""
         if not token:
             raise GitHubError("GitHub did not accept the sign-in code", 400)
+        auth = f"Bearer {token}"
+        login = str((await self._json("GET", "/user", auth=auth)).get("login") or "")
+        if not login:
+            raise GitHubError("GitHub gave no login for the sign-in code")
         found: set[int] = set()
         for page in range(1, MAX_INSTALLATION_PAGES + 1):
             listed = await self._json(
-                "GET",
-                f"/user/installations?per_page=100&page={page}",
-                auth=f"Bearer {token}",
+                "GET", f"/user/installations?per_page=100&page={page}", auth=auth
             )
             items = listed.get("installations") or []
             found.update(int(item["id"]) for item in items)
             if len(items) < 100:
                 break
-        return found
+        org_admin = False
+        if org is not None:
+            try:
+                membership = await self._json(
+                    "GET", f"/user/memberships/orgs/{_path(org)}", auth=auth
+                )
+            except GitHubError as error:
+                if error.status_code not in {403, 404}:
+                    raise
+            else:
+                org_admin = (
+                    membership.get("state") == "active" and membership.get("role") == "admin"
+                )
+        return UserAccess(login, frozenset(found), org_admin)
 
     # -- an installation --------------------------------------------------------------------
 

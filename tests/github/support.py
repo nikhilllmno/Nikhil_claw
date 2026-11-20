@@ -143,12 +143,16 @@ class Grant:
 class MemoryStore:
     repos: dict[tuple[uuid.UUID, str], AllowedRepo] = field(default_factory=dict)
     grants: list[Grant] = field(default_factory=list)
+    ended_runs: set[uuid.UUID] = field(default_factory=set)
 
     def add(self, repo: AllowedRepo) -> None:
         self.repos[(repo.org_id, repo.full_name.lower())] = repo
 
     async def allowed(self, org_id: uuid.UUID, owner: str, name: str) -> AllowedRepo | None:
         return self.repos.get((org_id, f"{owner}/{name}".lower()))
+
+    async def run_problem(self, org_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
+        return "the run ended" if run_id in self.ended_runs else None
 
     async def take_grant(self, repo: AllowedRepo, ref: str, commit: str) -> bool:
         for grant in self.grants:

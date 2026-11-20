@@ -2941,7 +2941,9 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
 | Tables | migration `0021` | `github_installations`, `github_repos`, `github_push_grants` (below). |
 
 - **The App.** One sama GitHub App serves one deployment. Its permissions are `contents:
-  write`, `pull_requests: write`, and `metadata: read`. It has no `workflows` permission, so
+  write`, `pull_requests: write`, `metadata: read`, and `members: read`. `members: read` lets
+  sama read the role of a person in a GitHub organization during the install. The App is
+  public, so each sama org can install it on its own GitHub account. It has no `workflows` permission, so
   GitHub also refuses a push that changes `.github/workflows`. It has no `administration`
   permission, so it cannot change a branch rule or a ruleset. The webhook is off, because sama
   needs no events. A person creates the App from the manifest (Section 19.5). Only the control
@@ -2950,11 +2952,20 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
   `https://github.com/apps/<slug>/installations/new?state=<state>`. The state is signed with
   the run token key, has the org and the admin, and lives 30 minutes. The App has "request
   user authorization (OAuth) during installation" on. So GitHub sends the person to
-  `/github/setup` with `installation_id`, `code`, `setup_action`, and the same `state`. The
-  installation id in the URL alone proves nothing, so sama changes the code into a user token
-  and checks that this person can see the installation (`GET /user/installations`). Then it
-  writes the installation for the org. One installation belongs to one org: another org gets
-  `409`. `setup_action=request` shows that a GitHub owner must approve the install first.
+  `/github/setup` with `installation_id`, `code`, `setup_action`, and the same `state`.
+  - The `GET` changes nothing. It shows a confirm page with the sama org and the GitHub
+    account, and a "Connect" button. The button sends a `POST` to `/github/setup`. A link from
+    another person thus cannot connect an account without a click on the page.
+  - The `POST` checks the state again. The admin in the state must be an org admin now.
+  - The installation id in the URL alone proves nothing. Sama changes the code into a user
+    token and checks that this person can see the installation (`GET /user/installations`).
+  - To see an installation is not enough: a collaborator with read access to one repo also
+    sees it. For an organization account, the person must be an active `admin` of that GitHub
+    organization (`GET /user/memberships/orgs/{org}`). For a user account, the person must
+    be that user.
+  - Then sama writes the installation for the org, in a transaction that checks the org
+    admin again. One installation belongs to one org: another org gets `409`.
+  - `setup_action=request` shows that a GitHub owner must approve the install first.
 - **Allowlist.** An org admin adds a repo with `POST /orgs/{org_id}/github/repos`
   (`repo` is `<owner>/<name>`, `protected_paths` is optional). Sama asks GitHub for the
   installation of the repo, and the installation must belong to the org. The default protected
@@ -2969,12 +2980,16 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
   of the session uses its own token. The runner process in the sandbox has the run token in
   its environment, and the shell of the agent gets it from that environment.
 - **Proxy.** The proxy reads the run token from HTTP Basic auth (the password) and checks it.
-  The repo must be on the allowlist of the org of the token, else `404`. The proxy takes only
+  The run must be live: a run that ended, or a run whose user lost access to the session, gets
+  `403`. The repo must be on the allowlist of the org of the token, else `404`. Before it
+  sends a push to GitHub, the proxy checks the run and the allowlist again. The proxy takes only
   the smart protocol. It removes the push capabilities `side-band`, `side-band-64k`,
   `report-status-v2`, `push-cert`, and `push-options`, and adds `no-thin`. So the push has
   only the commands and a full pack, and the proxy writes the push result itself. A refused
   push gets a `report-status` that refuses every ref with the reason, so `git push` shows the
-  reason to the agent. A push is at most 100 MB. At most 4 push checks run at one time.
+  reason to the agent. A push is at most 100 MB. The limit counts the bytes that arrive, also
+  for a gzip body, and the inflated body too. A gzip body must end once, with no data after it.
+  At most 4 push checks run at one time.
 - **Push checks.** The proxy sends a push to GitHub only when every ref update passes:
   - The ref is a branch `refs/heads/sama/<name>`. Other branches, tags, and other refs are
     refused.
@@ -2989,6 +3004,11 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
     is a change. `git index-pack` reads the pack in an empty temporary repo, and the proxy
     fetches the trees of the bases from GitHub without blobs. If a check cannot read an
     object, the proxy refuses the push.
+  - The proxy finds the commits and their parents with `git rev-list --parents`, which reads
+    only the real parent headers of a commit. A `parent` line after the `committer` line does
+    not make a fast-forward.
+  - Before git reads an object, the proxy checks its size: a commit or a tag is at most 1 MB
+    and a tree at most 16 MB. The proxy reads at most 64 MB of output from each git command.
 - **Approval of protected paths.** The refusal tells the agent to call
   `repo_push_approval(repo, branch, commit)`. This tool is in `ALWAYS_ASK` (Section 16.1): a
   person approves each call, an `allow` rule does not remove the ask, and "always allow"
@@ -3015,6 +3035,12 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
     push, the agent needs a new approval.
   - A push larger than 100 MB is refused. A push with more than 2,000 new commits is refused.
   - The tree check trusts the default branch of GitHub at the time of the push.
+  - A sama org admin can send an install link to a person who owns another GitHub account.
+    That person sees the sama org name on the confirm page and must click "Connect".
+  - In its 30 minutes, a state works again. A second install of the same installation for
+    the same org changes the same row.
+  - The git commands of the proxy have no memory limit of their own. The size caps above limit
+    what they read.
   - Not verified live: that the Claude Code `Bash` tool in an E2B sandbox sees
     `SAMA_RUN_TOKEN`. The proxy tests run `git` with that variable on the local machine.
 
@@ -4115,9 +4141,11 @@ A person must do these steps. Sama cannot create a GitHub App or a ruleset by it
 4. In the App settings on GitHub, keep the webhook off. Keep "Request user authorization
    (OAuth) during installation" on: the manifest sets it, and the install needs it.
 5. For each sama org, an org admin calls `POST /orgs/{org_id}/github/install` and opens the
-   URL of the answer. On GitHub, the person installs the App on the GitHub account, with
-   "Only select repositories". GitHub sends the person back to `<public_url>/github/setup`,
-   which shows "GitHub is connected".
+   URL of the answer. The same person must own the GitHub account: an owner of the GitHub
+   organization, or the GitHub user. On GitHub, the person installs the App on the GitHub
+   account, with "Only select repositories". GitHub sends the person back to
+   `<public_url>/github/setup`, which shows the sama org and the GitHub account. Check them and
+   click "Connect". The page then shows "GitHub is connected".
 6. **Required: a ruleset on the default branch of each repo.** In the repo (or the GitHub
    organization) settings, open Rules, then Rulesets, and add a branch ruleset:
    - Target: the default branch.

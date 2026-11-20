@@ -35,7 +35,13 @@ from starlette.responses import PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from sama.github.client import WEB_URL, GitHubClient, GitHubError
-from sama.github.pktline import PktLineError, parse_push, report, rewrite_advertisement
+from sama.github.pktline import (
+    REMOVED_PUSH_CAPABILITIES,
+    PktLineError,
+    parse_push,
+    report,
+    rewrite_advertisement,
+)
 from sama.github.push import GrantStore, PushCheckError, TreeSource, check_push, run_git
 from sama.github.service import AllowedRepo
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
@@ -59,6 +65,11 @@ _USER_AGENT = re.compile(r"git/[ -~]{1,100}")
 
 class RepoStore(GrantStore, Protocol):
     async def allowed(self, org_id: uuid.UUID, owner: str, name: str) -> AllowedRepo | None: ...
+
+    async def run_problem(self, org_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
+        """Why the run has no authority now (it ended, or its user lost access), else
+        ``None``. A run token stays valid until it expires, so the proxy asks each time."""
+        ...
 
 
 @dataclass(slots=True)
@@ -186,6 +197,11 @@ class GitProxy:
                     media_type=f"application/x-{RECEIVE}-result",
                     headers={"cache-control": "no-cache"},
                 )
+            # The checks can take minutes: the run must still have access, and the repo must
+            # still be on the allowlist, when the push goes to GitHub.
+            await self._check_run(uuid.UUID(claims.org_id), uuid.UUID(claims.run_id))
+            if await self._store.allowed(repo.org_id, repo.owner, repo.name) is None:
+                raise ProxyError(404, f"{repo.full_name} is not on the allowlist of the org")
             log.info(
                 "push sent", extra={"repo": repo.full_name, "refs": refs, "run_id": claims.run_id}
             )
@@ -211,14 +227,25 @@ class GitProxy:
             raise ProxyError(404, "no such repository")
         try:
             org_id = uuid.UUID(claims.org_id)
+            run_id = uuid.UUID(claims.run_id)
         except ValueError:
             raise ProxyError(401, "the run token is not valid") from None
+        await self._check_run(org_id, run_id)
         repo = await self._store.allowed(org_id, owner, name)
         if repo is None:
             raise ProxyError(
                 404, f"{owner}/{name} is not on the allowlist of the org. Ask an org admin"
             )
         return claims, repo
+
+    async def _check_run(self, org_id: uuid.UUID, run_id: uuid.UUID) -> None:
+        try:
+            problem = await self._store.run_problem(org_id, run_id)
+        except Exception:
+            log.exception("the git proxy cannot read the run")
+            raise ProxyError(503, "sama cannot check the run. Try again") from None
+        if problem is not None:
+            raise ProxyError(403, f"the run has no access: {problem}")
 
 
 def _check_capabilities(capabilities: frozenset[str]) -> None:
@@ -228,7 +255,7 @@ def _check_capabilities(capabilities: frozenset[str]) -> None:
         name, _, value = capability.partition("=")
         if name == "object-format" and value != "sha1":
             raise ProxyError(400, "sama supports only SHA-1 repositories")
-        if name in {"push-options", "push-cert", "side-band", "side-band-64k", "report-status-v2"}:
+        if name in REMOVED_PUSH_CAPABILITIES:
             raise ProxyError(400, f"sama does not support the {name} capability")
 
 
@@ -260,7 +287,12 @@ async def _body(request: Request, service: str, limit: int) -> bytes:
         raise ProxyError(415, "sama supports only gzip request bodies")
     inflate = zlib.decompressobj(wbits=31) if encoding == "gzip" else None
     out = bytearray()
+    received = 0
     async for chunk in request.stream():
+        # The limit applies to the bytes that arrive and to the bytes after gzip.
+        received += len(chunk)
+        if received > limit:
+            raise ProxyError(413, "the request is too large")
         if inflate is None:
             out += chunk
         else:
@@ -270,8 +302,12 @@ async def _body(request: Request, service: str, limit: int) -> bytes:
                 raise ProxyError(400, "the gzip body is not valid") from None
             if inflate.unconsumed_tail:
                 raise ProxyError(413, "the request is too large")
+            if inflate.unused_data:
+                raise ProxyError(400, "the request has data after the gzip body")
         if len(out) > limit:
             raise ProxyError(413, "the request is too large")
+    if inflate is not None and not inflate.eof:
+        raise ProxyError(400, "the gzip body is not complete")
     return bytes(out)
 
 

@@ -220,6 +220,37 @@ def test_force_push_to_an_older_commit_is_refused(world: World) -> None:
     assert world.upstream_ref("refs/heads/sama/fix") == tip
 
 
+def test_a_forged_parent_line_does_not_make_a_fast_forward(world: World) -> None:
+    """A ``parent`` line after the ``committer`` line is not a parent for git. The proxy must
+    read the parents as git does, so the push is a force-push."""
+    work = world.clone()
+    run(work, "checkout", "-q", "-b", "sama/fix")
+    tip = commit(work, {"app.py": "print(2)\n"})
+    assert world.push(work, "sama/fix").returncode == 0
+    tree = run(work, "rev-parse", "HEAD^{tree}")
+    raw = work / "forged.txt"
+    raw.write_text(
+        f"tree {tree}\nauthor a <a@example.com> 1 +0000\n"
+        f"committer a <a@example.com> 1 +0000\nparent {tip}\n\nforged\n"
+    )
+    forged = run(work, "hash-object", "-t", "commit", "-w", "--literally", str(raw))
+    _refused(world.push(work, "--force", f"{forged}:refs/heads/sama/fix"), "sama cannot force-push")
+    assert world.upstream_ref("refs/heads/sama/fix") == tip
+
+
+def test_a_large_commit_stops_the_check(world: World) -> None:
+    work = world.clone()
+    run(work, "checkout", "-q", "-b", "sama/big")
+    (work / "app.py").write_text("print(2)\n")
+    run(work, "add", "-A")
+    message = work / "message.txt"
+    message.write_text("x" * (2 * 1024 * 1024))
+    run(work, "commit", "-q", "-F", str(message))
+    _refused(world.push(work, "sama/big"), "larger than")
+    assert world.upstream_ref("refs/heads/sama/big") is None
+    assert world.upstream.pushes == 0
+
+
 @pytest.mark.parametrize(
     "files",
     [
@@ -345,6 +376,59 @@ def test_a_token_of_another_org_cannot_clone(world: World) -> None:
 def test_a_repo_off_the_allowlist_cannot_clone(world: World) -> None:
     with pytest.raises(subprocess.CalledProcessError):
         world.clone(repo="acme/secret")
+
+
+def test_an_ended_run_cannot_fetch_or_push(world: World) -> None:
+    work = world.clone()
+    run(work, "checkout", "-q", "-b", "sama/late")
+    commit(work, {"app.py": "print(2)\n"})
+    claims = world.signer.verify(world.token)
+    world.store.ended_runs.add(uuid.UUID(claims.run_id))
+    done = world.push(work, "sama/late")
+    assert done.returncode != 0
+    assert world.upstream_ref("refs/heads/sama/late") is None
+    with pytest.raises(subprocess.CalledProcessError):
+        world.clone("again")
+
+
+def _receive(world: World, body: bytes, encoding: str = "gzip") -> int:
+    import httpx
+
+    answer = httpx.post(
+        f"{world.url}/acme/demo.git/git-receive-pack",
+        content=body,
+        headers={
+            "authorization": f"Bearer {world.token}",
+            "content-type": "application/x-git-receive-pack-request",
+            "content-encoding": encoding,
+        },
+    )
+    return answer.status_code
+
+
+def test_data_after_a_gzip_body_is_refused(world: World) -> None:
+    import gzip
+
+    assert _receive(world, gzip.compress(b"0000") + b"junk" * 1000) == 400
+    assert world.upstream.pushes == 0
+
+
+def test_a_gzip_body_that_is_not_complete_is_refused(world: World) -> None:
+    import gzip
+
+    assert _receive(world, gzip.compress(b"0000" * 100)[:-6]) == 400
+
+
+def test_the_size_limit_counts_the_bytes_that_arrive(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gzip
+
+    from sama.github import proxy
+
+    monkeypatch.setattr(proxy, "MAX_PUSH_BYTES", 1000)
+    body = gzip.compress(b"0000") + bytes(5000)
+    assert _receive(world, body) == 413
 
 
 def test_a_dumb_http_request_is_refused(world: World) -> None:
