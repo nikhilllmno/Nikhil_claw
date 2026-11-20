@@ -2645,8 +2645,9 @@ pages of the web app. They use the same guards as the session routes (code and R
   `model_calls` (at most 500). Adjacent `text_delta` events become one step with at most 20,000
   characters. The redactor runs again on each payload and on the whole joined text, because a
   secret can span two deltas. The cut comes after the redaction and ends at a space. When the
-  events are cut, the last text step also loses its last word. Thus a trace never shows the
-  start of a secret. The trace never has `runtime_state`.
+  events are cut and the last step is text, that step is not in the trace, because the rest of
+  its text is not there and the redactor cannot see a whole secret. Thus a trace never shows
+  the start of a secret. The trace never has `runtime_state`.
 - **Skill editor.** `GET /workspaces/{id}/skills` lists the skills that the user sees in the
   workspace (Section 9.4) with `can_edit` and `writable_scopes`. `GET .../skills/{name}` gives
   the `SKILL.md`, the files, and the other scopes that have the same name. `POST .../skills`

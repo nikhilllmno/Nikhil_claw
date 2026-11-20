@@ -169,12 +169,27 @@ def test_the_text_cut_never_shows_the_start_of_a_split_secret() -> None:
     assert FAKE_KEY[:8] not in text
 
 
-def test_the_event_cut_drops_the_last_word_of_the_text() -> None:
-    # The run has more events than the trace shows: the rest of the secret is not here.
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "the key is " + FAKE_KEY[:30],
+        "the password is alphaBravo charlieDelta ec",
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nBKcwggSjAgEAAoIBAQ",
+    ],
+)
+def test_the_event_cut_drops_the_last_text_step(prefix: str) -> None:
+    # The run has more events than the trace shows: the rest of the secret is not here, so
+    # the redactor cannot see it. The last text step goes, but the steps before it stay.
     steps = merge_steps(
-        [_Event(1, "text_delta", {"text": "the key is " + FAKE_KEY[:30]})], more=True
+        [
+            _Event(1, "text_delta", {"text": "first answer"}),
+            _Event(2, "tool_started", {"name": "search"}),
+            _Event(3, "text_delta", {"text": prefix}),
+        ],
+        more=True,
     )
-    assert steps[0].payload["text"] == "the key is "
+    assert [step.type for step in steps] == ["text", "tool_started"]
+    assert steps[0].payload["text"] == "first answer"
     whole = merge_steps([_Event(1, "text_delta", {"text": "done"})])
     assert whole[0].payload["text"] == "done"
 

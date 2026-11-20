@@ -506,7 +506,8 @@ def merge_steps(events: Sequence[Any], *, more: bool = False) -> list[TraceStep]
 
     Each delta was redacted alone, but a secret can span two deltas. Thus the whole joined
     text is redacted before the cut. If the last step is text and ``more`` is true, the text
-    goes on in an event that is not here, so its last word is dropped too.
+    goes on in an event that is not here. Then the redactor cannot see the whole secret, so
+    that step is not in the result.
     """
     steps: list[TraceStep] = []
     parts: dict[int, list[str]] = {}
@@ -526,10 +527,9 @@ def merge_steps(events: Sequence[Any], *, more: bool = False) -> list[TraceStep]
             TraceStep(seq=event.seq, type=event.type, created_at=event.created_at, payload=payload)
         )
     for index, texts in parts.items():
-        text = redact("".join(texts))
-        if more and index == len(steps) - 1:
-            text = _drop_last_word(text)
-        steps[index].payload["text"] = _cut(text, MAX_TRACE_TEXT_CHARS)
+        steps[index].payload["text"] = _cut(redact("".join(texts)), MAX_TRACE_TEXT_CHARS)
+    if more and steps and steps[-1].type == "text":
+        steps.pop()
     return steps
 
 
