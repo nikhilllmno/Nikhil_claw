@@ -810,6 +810,17 @@ function AddApi({ onAdd }: { onAdd: (draft: ApiDraft) => Promise<void> }) {
               onChange={(e) => edit({ oauthScope: e.target.value })}
             />
           </label>
+          <label className="field">
+            <span className="label">The client sends its id and secret in</span>
+            <select
+              className="input"
+              value={draft.clientAuth}
+              onChange={(e) => edit({ clientAuth: e.target.value as ApiDraft["clientAuth"] })}
+            >
+              <option value="basic">Basic auth</option>
+              <option value="body">The body of the token request</option>
+            </select>
+          </label>
         </>
       ) : null}
       <ScopeSelect value={draft.scope} onChange={(scope) => edit({ scope })} />

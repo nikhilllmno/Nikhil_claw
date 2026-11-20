@@ -18,6 +18,7 @@ import secrets
 from collections.abc import Mapping
 from typing import Any, Final
 
+from sama.connectors.errors import short_error
 from sama.connectors.host_bridge import MEMORY_EXIT, SETUP_EXIT
 from sama.connectors.mcp_remote import (
     CLIENT_INFO,
@@ -61,6 +62,12 @@ class McpNotSentError(McpUnavailableError):
     """The request did not reach the server, so it is safe to send it again."""
 
 
+class McpSendFailedError(McpUnavailableError):
+    """The write of the request failed. The transport can fail after the server got the
+    request (for example, a lost acknowledgement), so sama does not know if the server ran it.
+    A ``tools/call`` is not sent again."""
+
+
 class StdioMcpClient:
     """One MCP session with one server process. Requests can run at the same time."""
 
@@ -86,7 +93,9 @@ class StdioMcpClient:
         result = await self.request("initialize", params, timeout_s=timeout_s)
         version = result.get("protocolVersion")
         if version not in SUPPORTED_VERSIONS:
-            raise McpError(f"the server uses an MCP version that sama does not know: {version}")
+            raise McpError(
+                short_error(f"the server uses an MCP version that sama does not know: {version}")
+            )
         await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return str(version)
 
@@ -135,7 +144,8 @@ class StdioMcpClient:
         error = answer.get("error")
         if error is not None:
             message = error.get("message") if isinstance(error, Mapping) else None
-            raise McpError(f"the server refused {method}: {str(message or 'no details')[:200]}")
+            # The message can echo a secret of the server: redact it before it is cut.
+            raise McpError(short_error(f"the server refused {method}: {message or 'no details'}"))
         result = answer.get("result")
         if not isinstance(result, dict):
             raise McpError("the server sent a result that is not valid")
@@ -158,7 +168,9 @@ class StdioMcpClient:
             await self._process.write(json.dumps(message, separators=(",", ":")) + "\n")
         except SandboxError:
             self._ended = self._ended or McpProcessEndedError(None)
-            raise McpNotSentError("the server is not running") from None
+            raise McpSendFailedError(
+                "the request to the server failed, and it can have reached the server"
+            ) from None
 
     async def _read(self) -> None:
         try:

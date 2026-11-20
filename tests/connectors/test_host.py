@@ -13,7 +13,7 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,9 +33,10 @@ from sama.connectors.host import (
 from sama.connectors.host_bridge import MEMORY_EXIT
 from sama.connectors.manifest import McpHosted
 from sama.connectors.mcp_remote import McpError, render_result
-from sama.connectors.mcp_stdio import McpProcessEndedError
+from sama.connectors.mcp_stdio import McpProcessEndedError, McpSendFailedError
 from sama.sandbox.base import SandboxError, SandboxProcess, SandboxSpec
 from sama.sandbox.local import LocalProvider, LocalSandbox
+from sama.vault.redact import default_redactor
 
 SERVER = Path(__file__).with_name("stdio_server.py")
 SECRET = "demo-secret-value-4242"
@@ -61,13 +62,47 @@ class HostSandbox(LocalSandbox):
     ) -> SandboxProcess:
         assert self.backend is not None
         self.backend.started.append((list(argv), dict(env or {})))
-        return await super().start(
+        process = await super().start(
             [self._map(a) for a in argv], env=env, cwd=self._map(cwd) if cwd else None
         )
+        return HookedProcess(process, self.backend, len(self.backend.started))
 
     async def pause(self) -> None:
         assert self.backend is not None
         self.backend.paused.append(self.id)
+
+    async def keep_alive(self, seconds: int) -> None:
+        assert self.backend is not None
+        self.backend.kept.append(seconds)
+
+
+class HookedProcess:
+    """A process whose stdin writes go through ``LocalHosts.on_write``."""
+
+    def __init__(self, inner: SandboxProcess, backend: LocalHosts, number: int) -> None:
+        self._inner = inner
+        self._backend = backend
+        self.number = number
+
+    async def write(self, data: str) -> None:
+        await self._inner.write(data)
+        if self._backend.on_write is not None:
+            await self._backend.on_write(self.number)
+
+    async def close_stdin(self) -> None:
+        await self._inner.close_stdin()
+
+    def lines(self) -> AsyncIterator[str]:
+        return self._inner.lines()
+
+    async def wait(self) -> int:
+        return await self._inner.wait()
+
+    async def kill(self) -> None:
+        await self._inner.kill()
+
+    def stderr_tail(self) -> str:
+        return self._inner.stderr_tail()
 
 
 @dataclass
@@ -80,6 +115,9 @@ class LocalHosts:
     paused: list[str] = field(default_factory=list)
     killed: list[str] = field(default_factory=list)
     started: list[tuple[list[str], dict[str, str]]] = field(default_factory=list)
+    kept: list[int] = field(default_factory=list)
+    on_write: Callable[[int], Awaitable[None]] | None = None
+    """Runs after each stdin write, with the number of the process (1 is the first)."""
 
     @property
     def provider(self) -> LocalProvider:
@@ -122,13 +160,14 @@ def server(
     env: Mapping[str, str] | None = None,
     egress: tuple[str, ...] = ("api.demo.test",),
     memory_mb: int = 256,
+    idle_s: int = 120,
 ) -> HostedServer:
     hosted = McpHosted(
         command=(sys.executable, str(SERVER)),
         env={"DEMO_TOKEN": "demo_token"},
         egress=egress,
         memory_mb=memory_mb,
-        idle_s=120,
+        idle_s=idle_s,
     )
     return HostedServer(connection_id, ORG, hosted, {"DEMO_TOKEN": SECRET} if env is None else env)
 
@@ -310,3 +349,90 @@ async def test_calls_at_the_same_time_start_one_server(
     assert len({pid_of(a) for a in answers}) == 1
     assert len(backend.created) == 1
     assert len(backend.started) == 1
+
+
+async def test_a_failed_write_of_a_tool_call_is_not_sent_again(
+    backend: LocalHosts, hosts: tuple[ConnectorHosts, Clock]
+) -> None:
+    """The write reached the server, but its acknowledgement was lost: the call fails and is
+    not sent again, because the server can have run it."""
+    connector_hosts, _ = hosts
+    srv = server()
+    await echo(connector_hosts, srv)
+
+    async def lost(number: int) -> None:
+        raise SandboxError("stdin write failed: TimeoutException")
+
+    backend.on_write = lost
+    with pytest.raises(McpSendFailedError):
+        await connector_hosts.call(srv, "echo", {"text": "once"})
+    assert len(backend.started) == 1
+    backend.on_write = None
+    await echo(connector_hosts, srv)
+    assert len(backend.started) == 2
+
+
+async def test_a_late_failure_does_not_reset_the_server_of_another_call(
+    backend: LocalHosts, hosts: tuple[ConnectorHosts, Clock]
+) -> None:
+    connector_hosts, _ = hosts
+    srv = server()
+    await echo(connector_hosts, srv)
+    release = asyncio.Event()
+    waiting = asyncio.Event()
+
+    async def fail(number: int) -> None:
+        if number != 1:
+            return
+        if not waiting.is_set():
+            # The first failed write to the first server waits, then fails.
+            waiting.set()
+            await release.wait()
+        raise SandboxError("stdin write failed")
+
+    backend.on_write = fail
+    late = asyncio.create_task(connector_hosts.call(srv, "echo", {"text": "late"}))
+    await waiting.wait()
+    # A second call fails on the first server too, and starts no new one (not sent again).
+    with pytest.raises(McpSendFailedError):
+        await connector_hosts.call(srv, "echo", {"text": "first"})
+    # A third call starts the second server.
+    fresh = await echo(connector_hosts, srv, "new")
+    assert len(backend.started) == 2
+    release.set()
+    with pytest.raises(McpSendFailedError):
+        await late
+    # The late failure did not close the second server or forget its host.
+    again = await echo(connector_hosts, srv, "again")
+    assert pid_of(again) == pid_of(fresh)
+    assert len(backend.started) == 2
+    assert len(backend.created) == 1
+
+
+async def test_e2b_does_not_pause_a_host_while_its_server_starts(
+    backend: LocalHosts, hosts: tuple[ConnectorHosts, Clock]
+) -> None:
+    connector_hosts, _ = hosts
+    srv = server(idle_s=60)
+    # The E2B timeout covers the start time (240 s), not only the idle time.
+    assert connector_hosts.spec(srv).idle_timeout_s == 360
+    await echo(connector_hosts, srv)
+    assert backend.kept == []
+    await connector_hosts.restart(srv.connection_id)
+    await echo(connector_hosts, srv)
+    # The server starts again in the same host: first the host gets the lease.
+    assert backend.kept == [360]
+    assert len(backend.started) == 2
+
+
+async def test_an_error_of_the_server_does_not_show_a_secret(
+    hosts: tuple[ConnectorHosts, Clock],
+) -> None:
+    connector_hosts, _ = hosts
+    default_redactor().add(SECRET)  # The vault adds each secret that it reads.
+    try:
+        with pytest.raises(McpError, match="refused tools/call: bad token") as refused:
+            await connector_hosts.call(server(), "leak", {})
+        assert SECRET not in str(refused.value)
+    finally:
+        default_redactor().forget(SECRET)

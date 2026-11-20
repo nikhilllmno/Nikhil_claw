@@ -31,7 +31,12 @@ from typing import Any, Final, Protocol, TypeVar
 
 from sama.connectors.manifest import McpHosted
 from sama.connectors.mcp_remote import McpUnavailableError, RemoteTool
-from sama.connectors.mcp_stdio import START_TIMEOUT_S, McpNotSentError, StdioMcpClient
+from sama.connectors.mcp_stdio import (
+    START_TIMEOUT_S,
+    McpNotSentError,
+    McpSendFailedError,
+    StdioMcpClient,
+)
 from sama.sandbox.base import (
     Sandbox,
     SandboxError,
@@ -58,6 +63,13 @@ REAPER_EVERY_S: Final = 30.0
 E2B_MARGIN_S: Final = 120
 """The E2B timeout is the idle time plus this margin. E2B pauses the host if the reaper does
 not."""
+
+
+def _lease(idle_s: int) -> int:
+    """The E2B timeout of a host: the idle time, but at least the start time of a server, plus
+    the margin. So E2B does not pause a host while its server starts. E2B caps it at 3600."""
+    return int(max(idle_s, START_TIMEOUT_S)) + E2B_MARGIN_S
+
 
 T = TypeVar("T")
 
@@ -211,7 +223,7 @@ class ConnectorHosts:
             session_id=f"host-{server.connection_id}",
             template=self._template,
             memory_mb=max(512, server.hosted.memory_mb),
-            idle_timeout_s=server.hosted.idle_s + E2B_MARGIN_S,
+            idle_timeout_s=_lease(server.hosted.idle_s),
             allow_out=server.hosted.allow_out,
             metadata={
                 KIND_LABEL: KIND,
@@ -250,11 +262,16 @@ class ConnectorHosts:
             except McpUnavailableError as error:
                 if not client.alive:
                     async with host.lock:
+                        # Only the call that sees the failed client first resets the host.
+                        # A later call must not close or forget a server that another call
+                        # started after the failure.
                         if host.client is client:
                             await self._close_client(host)
-                    if isinstance(error, McpNotSentError):
-                        # The host can be paused or gone: find it again on the retry.
-                        host.sandbox = None
+                            if isinstance(error, McpNotSentError | McpSendFailedError):
+                                # The host can be paused or gone: find it again.
+                                host.sandbox = None
+                # A failed write can have reached the server, so only a request that did not
+                # leave sama (or an action that is safe to repeat) is sent again.
                 if (
                     attempt == 1
                     and not client.alive
@@ -277,16 +294,22 @@ class ConnectorHosts:
             if host.sandbox_id is not None:
                 await self._kill(host.sandbox_id)
             host.sandbox, host.sandbox_id = None, None
-        if host.sandbox is None:
+        sandbox = host.sandbox
+        fresh = sandbox is None
+        if sandbox is None:
             await self._close_client(host)
-            host.sandbox = await self._sandbox(host, server, box_hash)
+            sandbox = host.sandbox = await self._sandbox(host, server, box_hash)
             host.box_hash = box_hash
             host.kept_alive = self._clock()
         process_hash = server.process_hash()
         if host.client is not None and (not host.client.alive or host.process_hash != process_hash):
             await self._close_client(host)
         if host.client is None:
-            host.client = await self._start_server(host.sandbox, server)
+            if not fresh:
+                # A start can take START_TIMEOUT_S: E2B must not pause the host before it ends.
+                await sandbox.keep_alive(_lease(host.idle_s))
+                host.kept_alive = self._clock()
+            host.client = await self._start_server(sandbox, server)
             host.process_hash = process_hash
         return host.client
 
@@ -341,7 +364,7 @@ class ConnectorHosts:
             return
         host.kept_alive = now
         try:
-            await host.sandbox.keep_alive(host.idle_s + E2B_MARGIN_S)
+            await host.sandbox.keep_alive(_lease(host.idle_s))
         except SandboxError as error:
             log.info("connector host keep_alive failed: %s", error)
 

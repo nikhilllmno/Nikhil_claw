@@ -1,7 +1,8 @@
 """A fake stdio MCP server for the connector host tests (Section 10.3.2). Standard library only.
 
 Tools: ``echo`` (read only), ``has_secret`` (tells if ``DEMO_TOKEN`` is set and its length,
-not its value), ``grow`` (uses ``mb`` MB of memory), and ``crash`` (exits with code 3). A log
+not its value), ``grow`` (uses ``mb`` MB of memory), ``crash`` (exits with code 3), and
+``leak`` (an error that holds the value of ``DEMO_TOKEN``, as a careless server can send). A log
 line on stdout before ``initialize`` checks that the client skips lines that are not JSON.
 """
 
@@ -78,6 +79,12 @@ def main() -> None:
                 reply(message_id, text("grew"))
             elif name == "crash":
                 sys.exit(3)
+            elif name == "leak":
+                error = {"code": -2, "message": f"bad token {os.environ.get('DEMO_TOKEN', '')}"}
+                sys.stdout.write(
+                    json.dumps({"jsonrpc": "2.0", "id": message_id, "error": error}) + "\n"
+                )
+                sys.stdout.flush()
             else:
                 sys.stdout.write(
                     json.dumps(

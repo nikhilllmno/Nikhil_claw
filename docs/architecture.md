@@ -2337,7 +2337,10 @@ gets one notice per change.
 
 - **Manifest.** A manifest of kind `mcp_hosted` has a `hosted` block:
   - `package`: `registry` (`npm` or `pypi`), `name`, `version`, `bin` (optional), and `args`.
-    The version is one exact version. sama refuses a range, a tag, and `latest`.
+    The version is one exact version. For npm, it is a full semver version (`1.2.3`, with an
+    optional pre-release or build part), because npm reads `1`, `1.2`, and `1.x` as ranges.
+    For PyPI, it is a PEP 440 release such as `1.2` or `1.2.3rc1`. sama refuses a range, a
+    tag, and `latest`.
   - or `command`: the program and its arguments. Only a server that an admin adds can have a
     command, not a catalog manifest.
   - `env`: the environment variables of the server. Each variable is one secret field of the
@@ -2348,8 +2351,9 @@ gets one notice per change.
   - `memory_mb` (64 to 4096, default 384) and `idle_s` (60 to 3600, default 600).
   - `include`, `exclude`, and `access`, as for a remote server.
 - **Servers that an admin adds.** `POST /workspaces/{id}/connections/stdio` adds a server.
-  A workspace `admin` or the org `owner` can add a pinned package. Only the org `owner` can
-  add a custom command, because a command runs any program. The rules of a name are the rules
+  A workspace `admin` or the org `owner` can add a pinned package with its default program and
+  no arguments. Only the org `owner` can add a custom command, or a package with a `bin` or
+  `args`, because a program such as `python` or `bash` with arguments runs any code. The rules of a name are the rules
   of a server by URL. The server goes into `config.hosted` of the row. A new program, new
   egress, or a new list of variables deletes the stored values. If E2B is not
   set up, the route answers `409`.
@@ -2371,11 +2375,17 @@ gets one notice per change.
   The first start can take up to 240 seconds, because the install runs. A call has a
   60-second limit.
 - **Life cycle.** A host starts on the first call or check. After `idle_s` seconds without a
-  call, a reaper task of the control plane pauses the host. The E2B timeout is `idle_s` plus
-  120 seconds, so E2B pauses the host if the control plane cannot. The next call resumes the
+  call, a reaper task of the control plane pauses the host. The E2B timeout is `idle_s`
+  (at least 240 seconds, the start time of a server) plus 120 seconds, so E2B pauses the host
+  if the control plane cannot, and not while a server starts. E2B caps it at 3600 seconds. The next call resumes the
   host and starts the server again. The bridge reads the memory of the process group each
   second. Above `memory_mb`, it stops the group and exits with code 86. A server that stops,
   for any reason, starts again on the next call. A remove of the connection removes the host.
+  A tool list that is older than 6 hours is read again in the background, as for a remote
+  server (Section 10.3.1). This check starts the host if it is paused.
+- **No second send of a tool call.** sama sends a `tools/call` again only if the request did
+  not leave sama (the server had stopped before the write). If the write to the stdin of the
+  bridge fails, the server can have the request, so the call fails and is not sent again.
 - **No commands from the agent.** The agent reaches the host only through the
   `mcp_<connection>_<tool>` tools and the tool gate. No sama tool runs a command in a host.
 - **Tools and access.** The same as a remote server (Section 10.3.1): the tool list is in
@@ -2397,9 +2407,11 @@ gets one notice per change.
 - **Parser.** The parser does not run code and does not follow a remote `$ref`. It follows a
   local `$ref` to a depth of 10, stops at a cycle, and refuses YAML aliases, so a small document
   cannot expand. It reads path, query, and JSON body parameters. It ignores header and cookie
-  parameters (sama sets the headers) and a body that is not JSON. It skips an operation that it
-  cannot use (for example a path template without a path parameter, or a bad parameter name)
-  and counts it in `skipped`. At most 200 operations. The base URL is the `base_url` of the request,
+  parameters (sama sets the headers) and a body that is not JSON. An operation parameter
+  replaces a path-item parameter with the same name and place, also its `required`. It skips an
+  operation that it cannot use and counts it in `skipped`. Examples: a path template without a
+  path parameter, a bad parameter name, or a query parameter that is an object, a nested
+  array, or not the `form` style with `explode` (the OpenAPI default). At most 200 operations. The base URL is the `base_url` of the request,
   else the first `https` server of the document.
 - **Tools.** Each operation is one tool `api_<connection>_<tool>`. The tool name comes from the
   `operationId`, else from the method and the path, in lower case with `_`. A second tool with
@@ -2413,18 +2425,24 @@ gets one notice per change.
   sends its id and secret with basic auth or in the body), or `none`. The form asks for the
   values, and the vault entry `connection:<id>` holds them. sama keeps an OAuth 2 token in
   memory until 60 seconds before it expires. After a `401`, sama gets a new token and sends the
-  request again once. sama refuses an API key header that it sets itself (for example
+  request again once. One lock for each connection lets only one request get a token at a
+  time. A request that gets a `401` replaces only the token that it used, so it uses a token
+  that another request got after it. sama refuses an API key header that it sets itself (for example
   `Content-Type`).
 - **Calls.** sama quotes a path argument into one path segment, so the agent cannot leave the
   base URL. It refuses a path argument of `.` or `..`, and an argument that the operation does
-  not have. A query argument goes into the query. `body` is the JSON body. Every request goes
+  not have. A query argument goes into the query. A list goes in as one pair for each item
+  (`tag=a&tag=b`). `body` is the JSON body. Every request goes
   through the outbound client (Section 16.4) without redirects. An answer of `2xx` comes back
   to the agent as text. Another status comes back as an error with the status and the start of
   the answer. An error text never holds a secret.
 - **Health check.** The `test` operation of the request, else the first `GET` operation without
-  required arguments. A new base URL or auth deletes the stored values.
+  required arguments. A check runs without approval, so the `test` operation must be a `GET`
+  or `HEAD` operation. sama refuses another method when an admin adds the API and when the
+  check runs. A new base URL or auth deletes the stored values.
 - **Web app.** The Connections page has a form to add an API: paste a document, give its
-  address, or write one endpoint on each line (`GET /items?limit,cursor list_items`). The tool
+  address, or write one endpoint on each line (`GET /items?limit,cursor list_items`). For
+  `oauth2`, the form asks how the client sends its id and secret (basic auth or the body). The tool
   list shows the method and the path of each tool.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can

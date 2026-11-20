@@ -47,6 +47,7 @@ from sama.tools.outbound import (
     UrlPolicy,
     system_resolver,
 )
+from sama.vault.redact import default_redactor
 
 TOKEN_MARGIN_S: Final = 60.0
 DEFAULT_TOKEN_S: Final = 3600.0
@@ -83,9 +84,9 @@ class ApiDriver:
         await self._documents.aclose()
 
     def forget(self, connection_id: uuid.UUID) -> None:
-        """Drops the OAuth 2 token of the connection (new values, or a delete)."""
+        """Drops the OAuth 2 token of the connection (new values, or a delete). The lock stays,
+        so that two refreshes of one connection never run at the same time."""
         self._tokens.pop(connection_id, None)
-        self._locks.pop(connection_id, None)
 
     async def check_url(self, url: str) -> None:
         """Raises ``BlockedUrlError`` or ``FetchError`` if the policy refuses the URL."""
@@ -115,8 +116,10 @@ class ApiDriver:
         """The health check: an OAuth 2 token, then the test operation (else the first
         ``GET`` without required arguments). Without such an operation, only the URL."""
         if api.auth.type == "oauth2":
-            self.forget(connection_id)
-            await self._token(connection_id, api, values)
+            cached = self._tokens.get(connection_id)
+            await self._token(
+                connection_id, api, values, stale=None if cached is None else cached.value
+            )
         operation = _test_operation(api, operations)
         if operation is None:
             try:
@@ -137,11 +140,14 @@ class ApiDriver:
         arguments: Mapping[str, Any],
     ) -> str:
         url, params, body = _request(api, operation, arguments)
-        answer = await self._send(connection_id, api, operation, values, url, params, body)
-        if answer.status_code == 401 and api.auth.type == "oauth2":
-            # The token can be revoked before it expires. A 401 did not run the request.
-            self.forget(connection_id)
-            answer = await self._send(connection_id, api, operation, values, url, params, body)
+        oauth = api.auth.type == "oauth2"
+        token = await self._token(connection_id, api, values) if oauth else None
+        answer = await self._send(api, operation, values, token, url, params, body)
+        if answer.status_code == 401 and oauth:
+            # The token can be revoked before it expires. A 401 did not run the request. Only
+            # this token is stale: a token that another call got after it is used again.
+            token = await self._token(connection_id, api, values, stale=token)
+            answer = await self._send(api, operation, values, token, url, params, body)
         text = answer.content.decode("utf-8", errors="replace")
         if answer.status_code in UNAVAILABLE_CODES or answer.status_code >= 500:
             raise DriverUnavailableError(
@@ -155,30 +161,31 @@ class ApiDriver:
 
     async def _send(
         self,
-        connection_id: uuid.UUID,
         api: ApiSpec,
         operation: ApiOperation,
         values: Mapping[str, str],
+        token: str | None,
         url: str,
-        params: dict[str, str],
+        params: list[tuple[str, str]],
         body: Any,
     ) -> FetchResult:
         headers = {"Accept": "application/json"}
-        query = dict(params)
+        query = list(params)
         auth = api.auth
         if auth.type == "api_key":
             key = _value(values, "api_key")
             if auth.location == "header":
                 headers[str(auth.name)] = key
             else:
-                query[str(auth.name)] = key
+                # The key wins over an argument with its name.
+                query = [pair for pair in query if pair[0] != auth.name]
+                query.append((str(auth.name), key))
         elif auth.type == "bearer":
             headers["Authorization"] = f"Bearer {_value(values, 'token')}"
         elif auth.type == "basic":
             pair = f"{_value(values, 'username')}:{_value(values, 'password')}"
             headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
-        elif auth.type == "oauth2":
-            token = await self._token(connection_id, api, values)
+        elif auth.type == "oauth2" and token is not None:
             headers["Authorization"] = f"Bearer {token}"
         try:
             return await self._http.request(
@@ -194,9 +201,15 @@ class ApiDriver:
             raise DriverUnavailableError(f"the API cannot be reached: {error}") from None
 
     async def _token(
-        self, connection_id: uuid.UUID, api: ApiSpec, values: Mapping[str, str]
+        self,
+        connection_id: uuid.UUID,
+        api: ApiSpec,
+        values: Mapping[str, str],
+        *,
+        stale: str | None = None,
     ) -> str:
-        """An OAuth 2 token from the client credentials grant, from memory if it is valid."""
+        """An OAuth 2 token from the client credentials grant, from memory if it is valid and
+        is not ``stale`` (a token that the API refused)."""
         client_id, secret = _value(values, "client_id"), _value(values, "client_secret")
         key = hashlib.sha256(
             json.dumps([api.auth.token_url, api.auth.scope, client_id, secret]).encode()
@@ -204,7 +217,12 @@ class ApiDriver:
         lock = self._locks.setdefault(connection_id, asyncio.Lock())
         async with lock:
             cached = self._tokens.get(connection_id)
-            if cached is not None and cached.key == key and cached.expires > self._clock():
+            if (
+                cached is not None
+                and cached.key == key
+                and cached.value != stale
+                and cached.expires > self._clock()
+            ):
                 return cached.value
             form = {"grant_type": "client_credentials"}
             if api.auth.scope:
@@ -229,15 +247,20 @@ class ApiDriver:
                 data = json.loads(answer.content)
             except ValueError:
                 data = None
-            token = data.get("access_token") if isinstance(data, dict) else None
+            if not isinstance(data, dict):
+                data = {}
+            token = data.get("access_token")
             if answer.status_code >= 400 or not isinstance(token, str) or not token:
                 # The OAuth error code is safe to show. The body can echo the client id only.
-                code = data.get("error") if isinstance(data, dict) else None
-                reason = f" ({str(code)[:60]})" if isinstance(code, str) else ""
+                code = data.get("error")
+                reason = f" ({short_error(code)[:60]})" if isinstance(code, str) else ""
                 raise DriverError(
                     f"the token URL refused the client credentials: {answer.status_code}{reason}"
                 )
-            lifetime = data.get("expires_in") if isinstance(data, dict) else None
+            # The issued token is not in the vault: tell the redactor, so that an API that
+            # echoes it in an answer or an error does not show it.
+            default_redactor().add(token)
+            lifetime = data.get("expires_in")
             seconds = float(lifetime) if isinstance(lifetime, int | float) else DEFAULT_TOKEN_S
             self._tokens[connection_id] = _Token(
                 token, self._clock() + max(0.0, seconds - TOKEN_MARGIN_S), key
@@ -252,11 +275,17 @@ def _value(values: Mapping[str, str], name: str) -> str:
     return value
 
 
+TEST_METHODS: Final = frozenset({"GET", "HEAD"})
+"""The methods of a test operation. A check runs without approval, so it must only read."""
+
+
 def _test_operation(api: ApiSpec, operations: Sequence[ApiOperation]) -> ApiOperation | None:
     if api.test is not None:
         found = next((op for op in operations if op.tool.name == api.test), None)
         if found is None:
             raise DriverError(f"the API has no operation {api.test} for the test")
+        if found.method not in TEST_METHODS:
+            raise DriverError(f"the test operation {api.test} must be a GET or HEAD operation")
         return found
     for operation in operations:
         required = operation.tool.input_schema.get("required") or ()
@@ -267,13 +296,13 @@ def _test_operation(api: ApiSpec, operations: Sequence[ApiOperation]) -> ApiOper
 
 def _request(
     api: ApiSpec, operation: ApiOperation, arguments: Mapping[str, Any]
-) -> tuple[str, dict[str, str], Any]:
+) -> tuple[str, list[tuple[str, str]], Any]:
     """The URL, the query, and the JSON body of one call."""
     known = {name for name, _ in operation.params} | ({BODY} if operation.body else set())
     if unknown := sorted(set(arguments) - known):
         raise DriverError(f"unknown arguments: {', '.join(unknown)[:200]}")
     path = operation.path
-    query: dict[str, str] = {}
+    query: list[tuple[str, str]] = []
     for name, where in operation.params:
         value = arguments.get(name)
         if where == "path":
@@ -287,14 +316,21 @@ def _request(
                 raise DriverError(f"not a valid value for {name}")
             path = path.replace("{" + name + "}", quote(str(value), safe=""))
         elif value is not None:
-            query[name] = _param(value)
+            query.extend((name, item) for item in _param(name, value))
     body = arguments.get(BODY) if operation.body else None
     return api.base_url.rstrip("/") + path, query, body
 
 
-def _param(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str | int | float):
-        return str(value)
-    return json.dumps(value, separators=(",", ":"))
+def _param(name: str, value: Any) -> list[str]:
+    """The values of one query parameter: a scalar, or each item of a list (``tag=a&tag=b``,
+    the OpenAPI ``form`` style with ``explode``)."""
+    items = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, bool):
+            out.append("true" if item else "false")
+        elif isinstance(item, str | int | float):
+            out.append(str(item))
+        elif item is not None:
+            raise DriverError(f"not a valid value for {name}: use a text, a number, or a list")
+    return out

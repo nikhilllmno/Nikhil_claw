@@ -31,6 +31,8 @@ BODY: Final = "body"
 """The argument of the request body."""
 
 Method = Literal["GET", "PUT", "POST", "DELETE", "PATCH", "HEAD"]
+Where = Literal["path", "query"]
+"""Where an argument goes in the request."""
 _PATH: Final = re.compile(r"/[A-Za-z0-9_.~!$&'()*+,;=:@%{}/-]*")
 _TEMPLATE: Final = re.compile(r"\{([^{}/]+)\}")
 _NAME_CHARS: Final = re.compile(r"[^a-z0-9]+")
@@ -49,7 +51,7 @@ class ApiOperation:
     tool: RemoteTool
     method: Method
     path: str
-    params: tuple[tuple[str, Literal["path", "query"]], ...]
+    params: tuple[tuple[str, Where], ...]
     body: bool
 
     def stored(self) -> dict[str, Any]:
@@ -73,7 +75,7 @@ class ApiOperation:
         path = request.get("path")
         if method.lower() not in METHODS or not isinstance(path, str):
             return None
-        params: list[tuple[str, Literal["path", "query"]]] = []
+        params: list[tuple[str, Where]] = []
         for item in request.get("params") or []:
             if (
                 isinstance(item, list | tuple)
@@ -81,7 +83,7 @@ class ApiOperation:
                 and isinstance(item[0], str)
                 and item[1] in ("path", "query")
             ):
-                params.append((item[0], cast(Literal["path", "query"], item[1])))
+                params.append((item[0], cast(Where, item[1])))
         return cls(tool, cast(Method, method), path, tuple(params), bool(request.get("body")))
 
 
@@ -224,9 +226,10 @@ def _operation(
             return None
     properties: dict[str, Any] = {}
     required: list[str] = []
-    params: dict[tuple[str, str], tuple[str, Literal["path", "query"]]] = {}
-    own = _list(operation.get("parameters"))
-    for raw in [*shared, *own]:  # An operation parameter wins over a path parameter.
+    # Merge first: an operation parameter replaces a path-item parameter with its name and
+    # place, also its ``required``.
+    merged: dict[tuple[str, Where], Mapping[str, Any]] = {}
+    for raw in [*shared, *_list(operation.get("parameters"))]:
         param = refs.resolve(raw)
         if not isinstance(param, Mapping):
             continue
@@ -235,17 +238,21 @@ def _operation(
             continue  # sama sets the headers and sends no cookies.
         if _PARAM.fullmatch(pname) is None or pname == BODY:
             return None
-        params[(pname, where)] = (pname, cast(Literal["path", "query"], where))
+        merged[(pname, cast(Where, where))] = param
+    for (pname, where), param in merged.items():
         prop = refs.inline(param.get("schema")) or {"type": "string"}
+        if where == "query" and not _plain_query(param, prop):
+            return None  # sama sends only a scalar or a list of scalars, as form and explode.
         if isinstance(param.get("description"), str):
             prop = {**prop, "description": _cut(param["description"])}
         properties[pname] = prop
         if where == "path" or param.get("required") is True:
             required.append(pname)
+    params = dict.fromkeys(merged)
     templated = set(_TEMPLATE.findall(path))
-    if templated != {n for n, w in params.values() if w == "path"}:
+    if templated != {n for n, w in params if w == "path"}:
         return None  # Each path template must be one path argument.
-    if len({n for n, _ in params.values()}) != len(params):
+    if len({n for n, _ in params}) != len(params):
         return None  # A path and a query argument with one name.
     body = False
     request_body = refs.resolve(operation.get("requestBody"))
@@ -284,9 +291,27 @@ def _operation(
         tool=tool,
         method=cast(Method, method.upper()),
         path=path,
-        params=tuple(params.values()),
+        params=tuple(params),
         body=body,
     )
+
+
+def _plain_query(param: Mapping[str, Any], schema: Mapping[str, Any]) -> bool:
+    """True if sama can send the query parameter: the ``form`` style with ``explode`` (the
+    OpenAPI default), and a scalar or an array of scalars (``tag=a&tag=b``). sama does not send
+    an object, a nested array, or another style."""
+    if param.get("style", "form") != "form" or param.get("explode", True) is not True:
+        return False
+    if "content" in param:
+        return False
+    kind = schema.get("type")
+    if kind == "object" or "properties" in schema:
+        return False
+    if kind == "array":
+        items = schema.get("items")
+        inner = items.get("type") if isinstance(items, Mapping) else None
+        return inner not in ("object", "array")
+    return True
 
 
 def _smaller(schema: dict[str, Any]) -> dict[str, Any]:
@@ -304,20 +329,21 @@ def _smaller(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _server(document: Mapping[str, Any]) -> str | None:
-    servers = document.get("servers")
-    if not isinstance(servers, list) or not servers or not isinstance(servers[0], Mapping):
-        return None
-    url = servers[0].get("url")
-    if not isinstance(url, str):
-        return None
-    variables = servers[0].get("variables")
-    if isinstance(variables, Mapping):
-        for key, value in variables.items():
-            default = value.get("default") if isinstance(value, Mapping) else None
-            if isinstance(default, str):
-                url = url.replace("{" + str(key) + "}", default)
-    url = url.rstrip("/")
-    return url if url.startswith("https://") and "{" not in url else None
+    """The first ``https`` server, with the defaults of its variables."""
+    for server in _list(document.get("servers")):
+        if not isinstance(server, Mapping) or not isinstance(server.get("url"), str):
+            continue
+        url = str(server["url"])
+        variables = server.get("variables")
+        if isinstance(variables, Mapping):
+            for key, value in variables.items():
+                default = value.get("default") if isinstance(value, Mapping) else None
+                if isinstance(default, str):
+                    url = url.replace("{" + str(key) + "}", default)
+        url = url.rstrip("/")
+        if url.startswith("https://") and "{" not in url:
+            return url
+    return None
 
 
 def _list(value: Any) -> list[Any]:

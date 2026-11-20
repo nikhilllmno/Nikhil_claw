@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.connectors.api import ApiDriver
@@ -197,6 +197,9 @@ async def test_a_list_of_endpoints_without_auth_connects_at_once(org: Org1, worl
         ),
         ({"base_url": "https://private.remote.test"}, 422, "cannot use this URL"),
         ({"test": "nothing"}, 422, "no operation nothing"),
+        # A check runs without approval, so the test operation must only read.
+        ({"test": "create_item"}, 422, "GET or HEAD"),
+        ({"test": "drop_item"}, 422, "GET or HEAD"),
         ({"auth": {"type": "api_key"}}, 422, "name"),
         ({"name": "neon"}, 409, "catalog connector"),
         ({"name": "Bad Name"}, 422, "the name has"),
@@ -208,6 +211,34 @@ async def test_a_bad_api_is_refused(
     with pytest.raises(ConnectorError, match=message) as refused:
         await add_demo_api(world, org, **changes)
     assert refused.value.status_code == status
+
+
+async def test_an_error_that_echoes_a_secret_is_redacted(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    view = (await add_demo_api(world, org)).connection
+    # The API puts the token of the request in its error.
+    world.api.status, world.api.echo_auth = 400, True
+    failed = await world.service.submit_form(
+        org.ids["org"], view.id, {"token": TOKEN}, actor=org.ids["mia"]
+    )
+    assert failed.state == "failed"
+    assert failed.last_error is not None
+    assert "answered 400" in failed.last_error
+    assert TOKEN not in failed.last_error
+    assert TOKEN not in json.dumps(failed.public())
+    row = await row_of(engine, view.id)
+    assert TOKEN not in (row.last_error or "")
+    # An old row can hold a value that the redactor learned later: public() redacts again.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Connection)
+            .where(Connection.id == view.id)
+            .values(last_error=f"the API answered 400: {TOKEN}")
+        )
+    stored = await world.service.get(org.ids["org"], view.id)
+    assert stored is not None
+    assert TOKEN not in json.dumps(stored.public())
 
 
 async def test_only_a_workspace_admin_adds_an_api(org: Org1, world: World) -> None:
@@ -299,6 +330,11 @@ async def test_a_command_needs_the_owner_and_a_package_needs_an_admin(
     with pytest.raises(ConnectorError) as not_admin:
         await add_hosted(world, org, member(org, "mia"), command=None, package=PACKAGE)
     assert not_admin.value.status_code == 403
+    # A program name and arguments run any code, for example ``python -c ...``.
+    for extra in ({"bin": "python"}, {"args": ["-c", "print(1)"]}):
+        with pytest.raises(ConnectorError, match="custom bin or args") as custom:
+            await add_hosted(world, org, admin, command=None, package={**PACKAGE, **extra})
+        assert custom.value.status_code == 403
     started = await add_hosted(world, org, admin, command=None, package=PACKAGE)
     assert started.connection.state == "pending"
     public = started.connection.public()["mcp"]["custom"]

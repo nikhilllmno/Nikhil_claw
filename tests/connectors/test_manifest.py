@@ -237,6 +237,10 @@ def test_a_hosted_manifest_pins_its_package_and_allows_the_registry() -> None:
     [
         (("version: 2025.9.25", "version: ^2025.9.25"), "exact version"),
         (("version: 2025.9.25", "version: latest"), "exact version"),
+        (("version: 2025.9.25", "version: '2025'"), "exact version"),
+        (("version: 2025.9.25", "version: '2025.9'"), "exact version"),
+        (("version: 2025.9.25", "version: 2025.x"), "exact version"),
+        (("version: 2025.9.25", "version: 2025.9.x"), "exact version"),
         (("DEMO_TOKEN: demo_token", "PATH: demo_token"), "cannot set PATH"),
         (("DEMO_TOKEN: demo_token", "LD_PRELOAD: demo_token"), "LD_PRELOAD"),
         (("DEMO_TOKEN: demo_token", "DEMO_TOKEN: other"), "no such field"),

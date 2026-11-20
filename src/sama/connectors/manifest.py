@@ -192,8 +192,17 @@ DEFAULT_HOST_MEMORY_MB: Final = 384
 DEFAULT_HOST_IDLE_S: Final = 600
 _NPM_NAME: Final = re.compile(r"(@[a-z0-9][a-z0-9._-]{0,100}/)?[a-z0-9][a-z0-9._-]{0,100}")
 _PYPI_NAME: Final = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]{0,98}[A-Za-z0-9])?")
-_EXACT_VERSION: Final = re.compile(r"[0-9]+(\.[0-9]+){0,3}([.+-]?[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?")
-"""One version. A range (``^``, ``~``, ``*``, ``>=``, ``x``, a space) does not match."""
+_EXACT_VERSION: Final[Mapping[str, re.Pattern[str]]] = {
+    # Full semver: npm reads ``1``, ``1.2``, and ``1.x`` as ranges.
+    "npm": re.compile(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
+    ),
+    # A PEP 440 release with an optional pre, post, or dev part. ``==`` pins it.
+    "pypi": re.compile(r"[0-9]+(\.[0-9]+){0,3}((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?"),
+}
+"""One version for each registry. A range (``^``, ``~``, ``*``, ``>=``, ``x``, a space) or a
+tag does not match."""
 _BIN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
 
@@ -222,7 +231,7 @@ class McpPackage(_Strict):
         pattern = _NPM_NAME if self.registry == "npm" else _PYPI_NAME
         if pattern.fullmatch(self.name) is None:
             raise ValueError(f"not a valid {self.registry} package name: {self.name!r}")
-        if _EXACT_VERSION.fullmatch(self.version) is None:
+        if _EXACT_VERSION[self.registry].fullmatch(self.version) is None:
             raise ValueError(f"the version must be one exact version, not {self.version!r}")
         if self.bin is not None and _BIN.fullmatch(self.bin) is None:
             raise ValueError(f"not a valid program name: {self.bin!r}")
@@ -304,8 +313,9 @@ def hosted_fields(env: tuple[str, ...]) -> tuple[FormField, ...]:
 
 ApiAuthType = Literal["api_key", "bearer", "basic", "oauth2", "none"]
 API_RESERVED_HEADERS: Final = frozenset(
-    {"host", "content-length", "content-type", "accept-encoding", "transfer-encoding"}
+    {"accept", "accept-encoding", "content-length", "content-type", "host", "transfer-encoding"}
 )
+_HTTPS_URL: Final = r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s#?]*)?$"
 
 
 class ApiAuth(_Strict):
@@ -315,9 +325,7 @@ class ApiAuth(_Strict):
     name: Annotated[str | None, Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")] = None
     """The header or the query parameter of the API key (``api_key``)."""
     location: Literal["header", "query"] = "header"
-    token_url: Annotated[
-        str | None, Field(pattern=r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s#?]*)?$")
-    ] = None
+    token_url: Annotated[str | None, Field(pattern=_HTTPS_URL)] = None
     """The token endpoint (``oauth2``, the client credentials grant)."""
     scope: Annotated[str | None, Field(max_length=400)] = None
     client_auth: Literal["basic", "body"] = "basic"
@@ -334,7 +342,7 @@ class ApiAuth(_Strict):
         if (
             self.name is not None
             and self.location == "header"
-            and (self.name.lower() in API_RESERVED_HEADERS or self.name.lower() == "accept")
+            and self.name.lower() in API_RESERVED_HEADERS
         ):
             raise ValueError(f"sama sets the header {self.name}")
         return self
@@ -343,9 +351,7 @@ class ApiAuth(_Strict):
 class ApiSpec(_Strict):
     """A custom HTTP API: the base URL and the auth. The operations are the tools."""
 
-    base_url: Annotated[
-        str, Field(pattern=r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s#?]*)?$", max_length=500)
-    ]
+    base_url: Annotated[str, Field(pattern=_HTTPS_URL, max_length=500)]
     """Only https. A path is allowed. A tool path goes after it."""
     auth: ApiAuth
     test: Annotated[str | None, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")] = None

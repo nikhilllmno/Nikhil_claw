@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import uuid
@@ -18,6 +19,7 @@ from sama.connectors.api import ApiDriver
 from sama.connectors.http_api import DriverError, DriverUnavailableError
 from sama.connectors.manifest import ApiSpec
 from sama.connectors.openapi import parse_endpoints
+from sama.vault.redact import default_redactor, redact
 from tests.connectors.fake_mcp import public
 from tests.support import wire_transport
 
@@ -34,6 +36,9 @@ class FakeApi:
         self.tokens_issued = 0
         self.valid: set[str] = set()
         self.expires_in: int | None = 3600
+        self.prefix = "tok-"
+        self.echo_auth = False
+        self.error_code = "invalid_client"
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -46,9 +51,9 @@ class FakeApi:
                 pair,
                 body_pair,
             ):
-                return httpx.Response(401, json={"error": "invalid_client", "echo": "csecret"})
+                return httpx.Response(401, json={"error": self.error_code, "echo": "csecret"})
             self.tokens_issued += 1
-            token = f"tok-{self.tokens_issued}"
+            token = f"{self.prefix}{self.tokens_issued}"
             self.valid = {token}
             answer: dict[str, Any] = {"access_token": token, "token_type": "Bearer"}
             if self.expires_in is not None:
@@ -58,7 +63,8 @@ class FakeApi:
         if auth.startswith("Bearer tok-") and auth.removeprefix("Bearer ") not in self.valid:
             return httpx.Response(401, json={"error": "expired"})
         if self.status != 200:
-            return httpx.Response(self.status, json={"message": "nope"})
+            echo = f" {auth}" if self.echo_auth else ""
+            return httpx.Response(self.status, json={"message": f"nope{echo}"})
         if request.method == "DELETE":
             return httpx.Response(204)
         return httpx.Response(200, json={"path": request.url.path, "ok": True})
@@ -219,3 +225,101 @@ async def test_a_document_is_fetched(driver: ApiDriver, fake: FakeApi) -> None:
     fake.status = 404
     with pytest.raises(DriverError, match="answered 404"):
         await driver.fetch_document(f"https://{HOST}/openapi.json")
+
+
+class HeldTransport(httpx.AsyncBaseTransport):
+    """Holds the requests with a revoked token until ``count`` of them are in flight, so that
+    all their 401 answers arrive at the same time."""
+
+    def __init__(self, fake: FakeApi, count: int) -> None:
+        self._inner = wire_transport(fake)
+        self._fake = fake
+        self._count = count
+        self._held = 0
+        self._all_in = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if token.startswith("tok-") and token not in self._fake.valid:
+            self._held += 1
+            if self._held >= self._count:
+                self._all_in.set()
+            await self._all_in.wait()
+        else:
+            await asyncio.sleep(0)  # Let the other calls run, as on a real connection.
+        return await self._inner.handle_async_request(request)
+
+
+async def test_overlapping_401s_get_one_new_token(fake: FakeApi) -> None:
+    calls = 4
+    driver = ApiDriver(transport=HeldTransport(fake, calls), resolver=public)
+    spec = api({"type": "oauth2", "token_url": TOKEN_URL})
+    values = {"client_id": "cid", "client_secret": "csecret"}
+    op = OPS["list_items"]
+    await driver.call(CONN, spec, op, values, {})
+    assert fake.tokens_issued == 1
+    # The server revokes tok-1. The calls all get a 401 with tok-1 at the same time, but only
+    # one of them gets a new token: the others use it and do not throw it away.
+    fake.valid = set()
+    answers = await asyncio.gather(*(driver.call(CONN, spec, op, values, {}) for _ in range(calls)))
+    assert all('"ok":true' in answer for answer in answers)
+    assert fake.tokens_issued == 2
+    await driver.aclose()
+
+
+async def test_the_issued_token_and_the_oauth_error_are_redacted(
+    driver: Any, fake: FakeApi
+) -> None:
+    fake.prefix = "tok-issued-only-by-the-server-"
+    spec = api({"type": "oauth2", "token_url": TOKEN_URL})
+    values = {"client_id": "cid", "client_secret": "csecret"}
+    await driver.call(CONN, spec, OPS["list_items"], values, {})
+    token = fake.requests[-1].headers["authorization"].removeprefix("Bearer ")
+    try:
+        # The vault does not know the token, but the redactor does now.
+        assert token not in redact(f"the API echoed {token}")
+        # The API echoes the token in an error: the error text does not show it.
+        fake.status, fake.echo_auth = 400, True
+        with pytest.raises(DriverError) as refused:
+            await driver.call(CONN, spec, OPS["list_items"], values, {})
+        assert token not in str(refused.value)
+    finally:
+        default_redactor().forget(token)
+    # A token URL that puts a known secret in its OAuth error code.
+    secret = "known-client-secret-value-7"
+    default_redactor().add(secret)
+    try:
+        fake.error_code = f"invalid_client {secret}"
+        driver.forget(CONN)
+        with pytest.raises(DriverError) as refused:
+            await driver.call(
+                CONN, spec, OPS["list_items"], {"client_id": "cid", "client_secret": "x"}, {}
+            )
+        assert secret not in str(refused.value)
+        assert "invalid_client" in str(refused.value)
+    finally:
+        default_redactor().forget(secret)
+
+
+async def test_the_test_operation_must_only_read(driver: ApiDriver, fake: FakeApi) -> None:
+    ops = list(OPS.values())
+    for name in ("add_item", "drop_item"):
+        with pytest.raises(DriverError, match="GET or HEAD"):
+            await driver.test(CONN, api({"type": "none"}, test=name), ops, {})
+    assert fake.requests == []
+    await driver.test(CONN, api({"type": "none"}, test="list_items"), ops, {})
+    assert fake.requests[-1].method == "GET"
+
+
+async def test_a_list_goes_into_the_query_as_one_pair_for_each_item(
+    driver: ApiDriver, fake: FakeApi
+) -> None:
+    spec = api({"type": "api_key", "name": "full", "location": "query"})
+    await driver.call(CONN, spec, OPS["get_item"], {"api_key": "k"}, {"id": 1, "full": ["x"]})
+    # The key wins over an argument with its name.
+    assert fake.requests[-1].url.params.get_list("full") == ["k"]
+    spec = api({"type": "none"})
+    await driver.call(CONN, spec, OPS["get_item"], {}, {"id": 1, "full": ["a", 2, True]})
+    assert fake.requests[-1].url.params.get_list("full") == ["a", "2", "true"]
+    with pytest.raises(DriverError, match="not a valid value for full"):
+        await driver.call(CONN, spec, OPS["get_item"], {}, {"id": 1, "full": {"a": 1}})

@@ -239,11 +239,12 @@ export const EMPTY_SERVER: ServerDraft = {
   scope: "workspace",
 };
 
+const NAME_PROBLEM =
+  "The name has 1 to 40 lower-case letters, digits, _ and -, and starts with a letter.";
+
 /** The text of the first problem of a new server, or `null` if the form can be sent. */
 export function serverProblem(draft: ServerDraft): string | null {
-  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) {
-    return "The name has 1 to 40 lower-case letters, digits, _ and -, and starts with a letter.";
-  }
+  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) return NAME_PROBLEM;
   let url: URL;
   try {
     url = new URL(draft.url.trim());
@@ -452,8 +453,12 @@ export function patternProblem(patterns: readonly string[]): string | null {
 
 const ENV_NAME = /^[A-Z][A-Z0-9_]{0,39}$/;
 const HOST_NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
-/** One exact version: not a range, a tag, or `latest`. */
-const EXACT_VERSION = /^[0-9]+(\.[0-9]+){0,3}([.+-]?[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$/;
+/** One exact version for each registry: not a range, a tag, or `latest`. npm needs full semver,
+ * because npm reads `1`, `1.2`, and `1.x` as ranges. */
+const EXACT_VERSION: Record<"npm" | "pypi", RegExp> = {
+  npm: /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/,
+  pypi: /^[0-9]+(\.[0-9]+){0,3}((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$/,
+};
 
 /** The form of a new stdio server, as the user types it. */
 export type StdioDraft = {
@@ -505,16 +510,20 @@ function whole(text: string): number | null {
   return /^[0-9]{1,6}$/.test(value) ? Number(value) : null;
 }
 
+/** `true` if the text is not empty and is not a whole number from `min` to `max`. */
+function outside(text: string, min: number, max: number): boolean {
+  const value = whole(text);
+  return text.trim() !== "" && (value === null || value < min || value > max);
+}
+
 /** The text of the first problem of a new stdio server, or `null` if the form can be sent. */
 export function stdioProblem(draft: StdioDraft): string | null {
-  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) {
-    return "The name has 1 to 40 lower-case letters, digits, _ and -, and starts with a letter.";
-  }
+  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) return NAME_PROBLEM;
   if (draft.source === "command") {
     if (lines(draft.command).length === 0) return "Give the command: the program on the first line.";
   } else {
     if (draft.packageName.trim() === "") return "Give the name of the package.";
-    if (!EXACT_VERSION.test(draft.version.trim())) {
+    if (!EXACT_VERSION[draft.source].test(draft.version.trim())) {
       return "Give one exact version of the package, for example 1.2.3. A range or latest is not permitted.";
     }
   }
@@ -522,14 +531,8 @@ export function stdioProblem(draft: StdioDraft): string | null {
   if (bad !== undefined) return `"${bad}" is not a variable name. Use A to Z, 0 to 9, and _.`;
   const host = parsePatterns(draft.egress).find((h) => !HOST_NAME.test(h.toLowerCase()));
   if (host !== undefined) return `"${host}" is not a host name, for example api.example.com.`;
-  const memory = draft.memoryMb.trim();
-  if (memory !== "" && ((whole(memory) ?? 0) < 64 || (whole(memory) ?? 0) > 4096)) {
-    return "The memory limit is 64 to 4096 MB.";
-  }
-  const idle = draft.idleS.trim();
-  if (idle !== "" && ((whole(idle) ?? 0) < 60 || (whole(idle) ?? 0) > 3600)) {
-    return "The idle time is 60 to 3600 seconds.";
-  }
+  if (outside(draft.memoryMb, 64, 4096)) return "The memory limit is 64 to 4096 MB.";
+  if (outside(draft.idleS, 60, 3600)) return "The idle time is 60 to 3600 seconds.";
   return null;
 }
 
@@ -587,6 +590,8 @@ export type ApiDraft = {
   keyLocation: "header" | "query";
   tokenUrl: string;
   oauthScope: string;
+  /** How an OAuth 2 client sends its id and secret to the token URL. */
+  clientAuth: "basic" | "body";
   /** Where the operations come from. */
   source: "openapi" | "openapi_url" | "endpoints";
   openapi: string;
@@ -605,6 +610,7 @@ export const EMPTY_API: ApiDraft = {
   keyLocation: "header",
   tokenUrl: "",
   oauthScope: "",
+  clientAuth: "basic",
   source: "openapi",
   openapi: "",
   openapiUrl: "",
@@ -648,9 +654,7 @@ function httpsProblem(text: string, what: string): string | null {
 
 /** The text of the first problem of a new HTTP API, or `null` if the form can be sent. */
 export function apiProblem(draft: ApiDraft): string | null {
-  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) {
-    return "The name has 1 to 40 lower-case letters, digits, _ and -, and starts with a letter.";
-  }
+  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) return NAME_PROBLEM;
   if (draft.baseUrl.trim() !== "" || draft.source === "endpoints") {
     const problem = httpsProblem(draft.baseUrl, "base address");
     if (problem !== null) return problem;
@@ -688,6 +692,7 @@ export function apiBody(draft: ApiDraft): ApiAdd {
     auth.token_url = draft.tokenUrl.trim();
     const scope = draft.oauthScope.trim();
     if (scope !== "") auth.scope = scope;
+    auth.client_auth = draft.clientAuth;
   }
   const body: ApiAdd = {
     name: draft.name.trim().toLowerCase(),

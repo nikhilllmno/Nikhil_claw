@@ -400,6 +400,12 @@ describe("stdio MCP servers (M4.11)", () => {
     expect(stdioProblem({ ...good, packageName: " " })).toMatch(/package/);
     expect(stdioProblem({ ...good, version: "^1.2.0" })).toMatch(/exact version/);
     expect(stdioProblem({ ...good, version: "latest" })).toMatch(/exact version/);
+    for (const version of ["1", "1.2", "1.x", "1.2.x"]) {
+      expect(stdioProblem({ ...good, version })).toMatch(/exact version/);
+    }
+    expect(stdioProblem({ ...good, version: "1.2.3-beta.1+build.5" })).toBeNull();
+    expect(stdioProblem({ ...good, source: "pypi", packageName: "mcp-server-fetch", version: "1.2" })).toBeNull();
+    expect(stdioProblem({ ...good, source: "pypi", packageName: "mcp-server-fetch", version: "1.*" })).toMatch(/exact version/);
     expect(stdioProblem({ ...good, env: "GITHUB_TOKEN, lower" })).toMatch(/"lower" is not a variable/);
     expect(stdioProblem({ ...good, egress: "api.github.com\nhttps://x.test" })).toMatch(/not a host name/);
     expect(stdioProblem({ ...good, egress: "localhost" })).toMatch(/not a host name/);
@@ -497,7 +503,14 @@ describe("HTTP APIs (M4.12)", () => {
       endpoints: "GET /a",
       baseUrl: "https://x.test",
     });
-    expect(oauth.auth).toEqual({ type: "oauth2", token_url: "https://auth.test/token", scope: "read" });
+    expect(oauth.auth).toEqual({
+      type: "oauth2",
+      token_url: "https://auth.test/token",
+      scope: "read",
+      client_auth: "basic",
+    });
+    const inBody = apiBody({ ...good, auth: "oauth2", tokenUrl: "https://auth.test/token", clientAuth: "body" });
+    expect(inBody.auth).toEqual({ type: "oauth2", token_url: "https://auth.test/token", client_auth: "body" });
     expect(oauth.endpoints).toHaveLength(1);
     expect(oauth.openapi).toBeUndefined();
     expect(apiBody({ ...good, auth: "bearer" }).auth).toEqual({ type: "bearer" });

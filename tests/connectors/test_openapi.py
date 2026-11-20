@@ -199,3 +199,68 @@ def test_a_list_of_endpoints_gives_tools_with_path_query_and_body() -> None:
     assert ops["get_item"].tool.input_schema["required"] == ["id"]
     assert ops["add_item"].body is True
     assert ops["add_item"].tool.read_only is False
+
+
+def test_an_operation_parameter_replaces_the_path_parameter_also_its_required() -> None:
+    document = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/items": {
+                "parameters": [{"name": "page", "in": "query", "required": True}],
+                "get": {
+                    "operationId": "list",
+                    "parameters": [
+                        {"name": "page", "in": "query", "required": False},
+                        {"name": "tag", "in": "query", "schema": {"type": "array"}},
+                    ],
+                },
+                "post": {"operationId": "add"},
+            }
+        },
+    }
+    imported = parse_openapi(json.dumps(document), max_name=50)
+    by_name = {op.tool.name: op for op in imported.operations}
+    assert "required" not in by_name["list"].tool.input_schema
+    assert by_name["list"].params == (("page", "query"), ("tag", "query"))
+    # The shared parameter stays required where no operation parameter replaces it.
+    assert by_name["add"].tool.input_schema["required"] == ["page"]
+
+
+@pytest.mark.parametrize(
+    "param",
+    [
+        {"schema": {"type": "object", "properties": {"a": {"type": "string"}}}},
+        {"schema": {"type": "array", "items": {"type": "object"}}},
+        {"schema": {"type": "array"}, "explode": False},
+        {"schema": {"type": "array"}, "style": "pipeDelimited"},
+        {"style": "deepObject"},
+        {"content": {"application/json": {"schema": {"type": "object"}}}},
+    ],
+)
+def test_a_query_parameter_that_sama_cannot_send_skips_the_operation(
+    param: dict[str, Any],
+) -> None:
+    document = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/ok": {"get": {"parameters": [{"name": "q", "in": "query"}]}},
+            "/bad": {"get": {"parameters": [{"name": "f", "in": "query", **param}]}},
+        },
+    }
+    imported = parse_openapi(json.dumps(document), max_name=50)
+    assert [op.tool.name for op in imported.operations] == ["get_ok"]
+    assert imported.skipped == 1
+
+
+def test_the_base_url_is_the_first_https_server() -> None:
+    document = {
+        "openapi": "3.0.0",
+        "servers": [
+            {"url": "/relative"},
+            {"url": "http://plain.test"},
+            {"url": "https://{host}/v2/", "variables": {"host": {"default": "api.test"}}},
+            {"url": "https://second.test"},
+        ],
+        "paths": {"/ok": {"get": {}}},
+    }
+    assert parse_openapi(json.dumps(document), max_name=50).base_url == "https://api.test/v2"

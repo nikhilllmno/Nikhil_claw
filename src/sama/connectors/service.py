@@ -38,7 +38,7 @@ from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.connectors.api import ApiDriver
+from sama.connectors.api import TEST_METHODS, ApiDriver
 from sama.connectors.composio import (
     ACTIVE,
     EXPIRED_STATUSES,
@@ -47,7 +47,7 @@ from sama.connectors.composio import (
     ComposioError,
 )
 from sama.connectors.database import DatabaseGateway
-from sama.connectors.errors import ConnectorError
+from sama.connectors.errors import ConnectorError, short_error
 from sama.connectors.host import ConnectorHosts, HostedServer
 from sama.connectors.http_api import (
     DriverError,
@@ -73,6 +73,7 @@ from sama.connectors.manifest import (
 from sama.connectors.mcp_driver import McpDriver, McpNotReadyError, McpStateError
 from sama.connectors.mcp_remote import (
     TOOL_PREFIX,
+    ExposedTool,
     McpAuthError,
     McpError,
     McpUnavailableError,
@@ -102,6 +103,7 @@ from sama.tools.deferred import DeferredCatalog, DeferredTool
 from sama.tools.outbound import BlockedUrlError, FetchError
 from sama.tools.output import untrusted
 from sama.vault.crypto import VaultError
+from sama.vault.redact import redact
 from sama.vault.store import OrgKeys, SecretName, Vault, connection_secret
 
 log: Final = logging.getLogger("sama.connectors")
@@ -249,11 +251,6 @@ class ConnectionView:
             out.append(McpTool(name, remote, cast(ToolAccess, access), enabled, operation))
         return out
 
-    def custom_mcp(self) -> Mapping[str, Any] | None:
-        """The server of a connection that a workspace admin added by URL."""
-        custom = self.config.get("mcp")
-        return custom if self.kind == "mcp_remote" and isinstance(custom, Mapping) else None
-
     def public(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "id": str(self.id),
@@ -263,7 +260,8 @@ class ConnectionView:
             "scope": self.scope,
             "owner_user_id": None if self.owner_user_id is None else str(self.owner_user_id),
             "state": self.state,
-            "last_error": self.last_error,
+            # Redacted again: the vault can know a secret now that it did not know at write time.
+            "last_error": None if self.last_error is None else redact(self.last_error),
             "last_health_at": _iso(self.last_health_at),
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
@@ -1041,15 +1039,23 @@ class ConnectionService:
         idle_s: int | None = None,
     ) -> Started:
         """Adds a stdio MCP server that sama runs in its own connector host (Section 10.3.2).
-        A workspace admin can add a pinned package. Only the org owner can add a custom
-        command, because a command runs any program. Each ``env`` name becomes a secret field
-        of the form, and the server gets the value as that environment variable."""
+        A workspace admin can add a pinned package with its default program and no arguments.
+        Only the org owner can add a custom command, or a package with a ``bin`` or ``args``,
+        because a program name such as ``python`` or ``bash`` with arguments runs any code.
+        Each ``env`` name becomes a secret field of the form, and the server gets the value as
+        that environment variable."""
         _require_admin(grants, workspace_id, "add a stdio MCP server")
-        if command is not None and not grants.org_owner:
-            raise ConnectorError(
-                "only the org owner can add a stdio MCP server with a custom command",
-                status_code=403,
-            )
+        if not grants.org_owner:
+            if command is not None:
+                raise ConnectorError(
+                    "only the org owner can add a stdio MCP server with a custom command",
+                    status_code=403,
+                )
+            if package is not None and (package.get("bin") or package.get("args")):
+                raise ConnectorError(
+                    "only the org owner can add a stdio MCP server with a custom bin or args",
+                    status_code=403,
+                )
         if self._hosts is None:
             raise ConnectorError(
                 "this sama cannot run stdio MCP servers: E2B is not set up", status_code=409
@@ -1066,16 +1072,7 @@ class ConnectionService:
                     **({} if idle_s is None else {"idle_s": idle_s}),
                 }
             )
-            manifest = Manifest(
-                name=name,
-                title=(title or "").strip() or name,
-                description=_hosted_description(hosted),
-                kind="mcp_hosted",
-                scopes=(scope,),
-                hosted=hosted,
-                fields=hosted_fields(tuple(hosted.env)),
-                custom=True,
-            )
+            manifest = _hosted_manifest(name, (title or "").strip() or name, scope, hosted)
         except ValidationError as error:
             raise _invalid(error) from None
         return await self.start(org_id, workspace_id, grants, name, scope, custom=manifest)
@@ -1129,20 +1126,18 @@ class ConnectionService:
             )
         try:
             spec = ApiSpec.model_validate({"base_url": url, "auth": auth, "test": test})
-            manifest = Manifest(
-                name=name,
-                title=(title or "").strip() or name,
-                description=f"An HTTP API at {urlsplit(spec.base_url).hostname}.",
-                kind="http_api",
-                scopes=(scope,),
-                api=spec,
-                fields=api_fields(spec.auth),
-                custom=True,
-            )
+            manifest = _api_manifest(name, (title or "").strip() or name, scope, spec)
         except ValidationError as error:
             raise _invalid(error) from None
-        if test is not None and all(op.tool.name != test for op in imported.operations):
-            raise ConnectorError(f"the import has no operation {test}", status_code=422)
+        if test is not None:
+            chosen = next((op for op in imported.operations if op.tool.name == test), None)
+            if chosen is None:
+                raise ConnectorError(f"the import has no operation {test}", status_code=422)
+            # A check runs without approval, so the test operation must only read.
+            if chosen.method not in TEST_METHODS:
+                raise ConnectorError(
+                    f"the test operation {test} must be a GET or HEAD operation", status_code=422
+                )
         await self._check_url(spec.base_url, api=True)
         if spec.auth.token_url is not None:
             await self._check_url(spec.auth.token_url, api=True)
@@ -1432,7 +1427,8 @@ class ConnectionService:
             view = _pick([v for v in views if v.connector == connector], connected=True)
             if view is None or not view.has_tool_list:
                 continue
-            if refresh_org is not None and view.kind == "mcp_remote":
+            # An imported HTTP API has a fixed tool list, so only MCP servers refresh.
+            if refresh_org is not None and view.kind in ("mcp_remote", "mcp_hosted"):
                 self._refresh_if_stale(refresh_org, view)
             found.extend((view, tool) for tool in view.mcp_tools() if tool.enabled)
         owners: dict[str, set[uuid.UUID]] = {}
@@ -1908,7 +1904,8 @@ class ConnectionService:
         vault entry of the row."""
         values: dict[str, Any] = {
             "state": state,
-            "last_error": None if error is None else error[:MAX_ERROR_CHARS],
+            # A provider can echo a credential in its error: redact it before the row has it.
+            "last_error": None if error is None else short_error(error),
         }
         if touch:
             values["updated_at"] = func.now()
@@ -1963,7 +1960,7 @@ def _invalid(error: ValidationError) -> ConnectorError:
     return ConnectorError(text, status_code=422)
 
 
-def _cache(exposed: list[Any]) -> dict[str, Any]:
+def _cache(exposed: list[ExposedTool]) -> dict[str, Any]:
     """The ``tool_cache`` of a check: the tools that a run can use, with their access."""
     return {
         "discovered_at": datetime.now(UTC).isoformat(),
@@ -1971,10 +1968,38 @@ def _cache(exposed: list[Any]) -> dict[str, Any]:
     }
 
 
-def _hosted_description(hosted: McpHosted) -> str:
+def _hosted_manifest(name: str, title: str, scope: Scope, hosted: McpHosted) -> Manifest:
+    """The manifest of a stdio MCP server that a workspace admin added."""
     if hosted.package is not None:
-        return f"A stdio MCP server: the {hosted.package.registry} package {hosted.package.pinned}."
-    return "A stdio MCP server with a custom command."
+        description = (
+            f"A stdio MCP server: the {hosted.package.registry} package {hosted.package.pinned}."
+        )
+    else:
+        description = "A stdio MCP server with a custom command."
+    return Manifest(
+        name=name,
+        title=title,
+        description=description,
+        kind="mcp_hosted",
+        scopes=(scope,),
+        hosted=hosted,
+        fields=hosted_fields(tuple(hosted.env)),
+        custom=True,
+    )
+
+
+def _api_manifest(name: str, title: str, scope: Scope, api: ApiSpec) -> Manifest:
+    """The manifest of an HTTP API that a workspace admin added."""
+    return Manifest(
+        name=name,
+        title=title,
+        description=f"An HTTP API at {urlsplit(api.base_url).hostname}.",
+        kind="http_api",
+        scopes=(scope,),
+        api=api,
+        fields=api_fields(api.auth),
+        custom=True,
+    )
 
 
 def _target(kind: str, spec: object) -> object:
@@ -1989,31 +2014,12 @@ def _target(kind: str, spec: object) -> object:
 def _stored_manifest(view: ConnectionView, custom: Mapping[str, Any]) -> Manifest:
     """The manifest of a stored hosted server or API (``add_stdio``, ``add_api``)."""
     title = str(custom.get("title") or view.connector)[:60]
-    scopes = (cast(Scope, view.scope),)
+    scope = cast(Scope, view.scope)
+    spec = custom.get("spec")
     try:
         if view.kind == "mcp_hosted":
-            hosted = McpHosted.model_validate(custom.get("spec"))
-            return Manifest(
-                name=view.connector,
-                title=title,
-                description=_hosted_description(hosted),
-                kind="mcp_hosted",
-                scopes=scopes,
-                hosted=hosted,
-                fields=hosted_fields(tuple(hosted.env)),
-                custom=True,
-            )
-        api = ApiSpec.model_validate(custom.get("spec"))
-        return Manifest(
-            name=view.connector,
-            title=title,
-            description=f"An HTTP API at {urlsplit(api.base_url).hostname}.",
-            kind="http_api",
-            scopes=scopes,
-            api=api,
-            fields=api_fields(api.auth),
-            custom=True,
-        )
+            return _hosted_manifest(view.connector, title, scope, McpHosted.model_validate(spec))
+        return _api_manifest(view.connector, title, scope, ApiSpec.model_validate(spec))
     except ValidationError:
         raise ConnectorError(
             f"the stored spec of {view.connector} is not valid", status_code=500
