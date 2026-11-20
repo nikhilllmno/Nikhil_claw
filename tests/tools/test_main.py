@@ -103,6 +103,7 @@ async def test_build_app_with_postgres_serves_vision_and_hides_it_in_memory_mode
     monkeypatch.setenv("SAMA_DATABASE_URL", "postgresql://u:p@localhost:1/none")
     monkeypatch.delenv("SAMA_VAULT_KEY", raising=False)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
     build_app("postgres")
     assert isinstance(seen["vision"], VisionService)
     names = {tool.name for tool in await real(**seen).mcp().list_tools()}  # type: ignore[arg-type]
