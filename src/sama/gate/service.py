@@ -257,7 +257,10 @@ class GateService:
         return frozenset(
             name
             for name in tools_of(context.toolsets, context.catalog)
-            if policy_verdict(context.rules, name, shared=context.shared).action != "deny"
+            if policy_verdict(
+                context.rules, name, shared=context.shared, access=context.access
+            ).action
+            != "deny"
         )
 
     async def reconfirm(self, *, org_id: uuid.UUID, run_id: uuid.UUID, call_id: str) -> Verdict:
@@ -452,6 +455,7 @@ class GateService:
             catalog=merged_catalog(
                 self._extra_toolsets.toolsets() if self._extra_toolsets is not None else {}
             ),
+            access=self._extra_toolsets.access() if self._extra_toolsets is not None else {},
         )
         call = None
         if call_id:

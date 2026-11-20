@@ -36,9 +36,11 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBinding
 from sama.gate.service import ApprovalError, GateService
+from sama.gateway.connect import connect_answer
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
@@ -105,6 +107,8 @@ HELP: Final = (
     "/sama pin TEXT - keep a text in the context. /sama pins lists the pins. /sama unpin NUMBER"
     " removes one (direct messages)\n"
     "/sama pair CODE - link your account, or link this channel with a group code\n"
+    "/sama connect NAME - get a link to connect a tool such as gmail or github. In a direct"
+    " message it is for you only; in a linked channel it is for the workspace\n"
     "/sama <skill> <request> - use a skill (direct messages). In a channel, mention the app"
     " and write /<skill> <request>\n"
     "/sama help - show this help"
@@ -316,6 +320,7 @@ class SlackGateway:
         gate: GateService | None = None,
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
+        connections: ConnectionService | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
         seen: SeenEvents | None = None,
@@ -331,6 +336,7 @@ class SlackGateway:
         self._gate = gate or GateService(engine)
         self._skills = skills
         self._reviews = reviews
+        self._connections = connections
         self._pins = pins or PinStore(engine)
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
@@ -662,7 +668,7 @@ class SlackGateway:
             identity = await self._identity(sender)
             if name == "pair" and rest:
                 return await self._pair(sender, channel, rest, identity)
-            if name not in ("new", "stop", "compact", *PIN_COMMANDS):
+            if name not in ("new", "stop", "compact", "connect", *PIN_COMMANDS):
                 if name not in ("help", "pair"):
                     return await self._skill(sender, channel, identity, name, rest)
                 return HELP
@@ -674,6 +680,8 @@ class SlackGateway:
                 return await self._compact(sender, channel, identity, rest)
             if name in PIN_COMMANDS:
                 return await self._pin(sender, channel, identity, name, rest)
+            if name == "connect":
+                return await self._connect(channel, identity, rest)
             return await self._stop(sender, channel, identity)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
@@ -745,6 +753,22 @@ class SlackGateway:
         return await pin_reply(
             self._pins, target, None if current is None else current.session_id, name, rest
         )
+
+    async def _connect(self, channel: str, identity: Any, name: str) -> str:
+        """``/sama connect``: a link to the web page that connects the connector. The answer
+        is visible only to the sender. A linked channel gets a workspace connection."""
+        if channel.startswith("D"):
+            target = Target.private(identity)
+        else:
+            group = await self._group_target(channel, identity)
+            if group is None:
+                return "This channel is not linked to sama."
+            target = group
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        return connect_answer(self._connections, target, grants, name)
 
     async def _stop(self, sender: str, channel: str, identity: Any) -> str:
         """Stops the open runs of the direct message, or of all threads of the channel."""

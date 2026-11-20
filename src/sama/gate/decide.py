@@ -39,9 +39,16 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
     "self": frozenset({"change_propose"}),
+    "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
+    "integrations": frozenset(),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
-has no tools yet."""
+has no tools yet. ``integrations`` has no fixed tools: the connector tools are deferred tools
+that the catalog of the tool server adds (Section 10.3)."""
+
+ToolAccess = Literal["read", "write", "destructive"]
+"""What a deferred tool does, for its default policy (Section 10.3): ``read`` gets ``allow``,
+``write`` and ``destructive`` get ``ask``. ``destructive`` has a stronger reason on the card."""
 
 TOOL_SEARCH: Final = "tool_search"
 TOOL_DESCRIBE: Final = "tool_describe"
@@ -81,13 +88,17 @@ DEFAULT_ALLOW: Final = frozenset(
         "tool_describe",
         "Task",
         "Agent",
+        "connections_list",
+        "connection_request",
+        "connection_test",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
 rule, they are allowed. Every other tool gets ``ask``. ``skill_manage`` is here because the
 skill store checks the role of the user for the scope of each write (Section 9.2), and every
 write is a version that can be reverted. ``change_propose`` is here because it only stores a
-proposal: a person with the role decides it on an approval card (M3.2)."""
+proposal: a person with the role decides it on an approval card (M3.2). ``connection_request``
+only sends a link, and the agent cannot give credentials with it (Section 10.3)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""
@@ -154,6 +165,11 @@ class ToolsetSource(Protocol):
 
     def toolsets(self) -> Mapping[str, frozenset[str]]: ...
 
+    def access(self) -> Mapping[str, ToolAccess]:
+        """What each extra tool does, for its default policy. A tool that is not here gets the
+        default of an unknown tool: ``ask``."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class GateContext:
@@ -172,6 +188,8 @@ class GateContext:
     ``sama.tenancy.authority``."""
     catalog: Mapping[str, frozenset[str]] = field(default_factory=lambda: TOOLSETS)
     """The tools of each toolset. The default is the fixed table."""
+    access: Mapping[str, ToolAccess] = field(default_factory=dict)
+    """What each deferred tool does, for its default policy (``ToolsetSource.access``)."""
 
 
 def canonical_name(tool_name: str) -> str:
@@ -270,7 +288,7 @@ def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdi
     early = _authority_and_toolset(context, TOOL_CALL)
     if early is not None:
         return early
-    own = policy_verdict(context.rules, TOOL_CALL, shared=context.shared)
+    own = policy_verdict(context.rules, TOOL_CALL, shared=context.shared, access=context.access)
     if own.action == "deny":
         return own
     wrapped = wrapped_call(arguments)
@@ -302,7 +320,7 @@ def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
 
 def _after_hardline(context: GateContext, name: str, digest: str) -> Verdict:
     # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
-    policy = policy_verdict(context.rules, name, shared=context.shared)
+    policy = policy_verdict(context.rules, name, shared=context.shared, access=context.access)
     if policy.action == "deny":
         return policy
     verdict = _recorded(context.recorded, name, digest) or policy
@@ -325,12 +343,20 @@ def _recorded(recorded: Recorded | None, name: str, digest: str) -> Verdict | No
             return Verdict("ask", GateStep.RECORDED, "the approval is still open")
 
 
-def policy_verdict(rules: Iterable[PolicyRule], name: str, *, shared: bool = False) -> Verdict:
+def policy_verdict(
+    rules: Iterable[PolicyRule],
+    name: str,
+    *,
+    shared: bool = False,
+    access: Mapping[str, ToolAccess] | None = None,
+) -> Verdict:
     """Step 4. A ``deny`` rule at any level wins. An org or profile ``ask`` rule cannot be
     removed by a user rule. Otherwise a user rule wins, then the profile rule, then the org
     rule. At one level an exact name wins over a prefix. Without a rule, the built-in
     default applies, and the default for unknown tools is ``ask``. In a shared session, the
-    tools in ``SHARED_ASK`` also get ``ask`` by default."""
+    tools in ``SHARED_ASK`` also get ``ask`` by default. A deferred tool with an ``access``
+    gets the connector default: ``read`` is ``allow``, ``write`` and ``destructive`` are
+    ``ask`` (Section 10.3)."""
     matching = [rule for rule in rules if rule.matches(name)]
     if any(rule.action == "deny" for rule in matching):
         return Verdict("deny", GateStep.POLICY, f"a policy rule denies {name}")
@@ -347,7 +373,17 @@ def policy_verdict(rules: Iterable[PolicyRule], name: str, *, shared: bool = Fal
         return Verdict("ask", GateStep.POLICY, f"{name} needs an approval in a shared session")
     if name in DEFAULT_ALLOW:
         return Verdict("allow", GateStep.POLICY, f"{name} is allowed by default")
-    return Verdict("ask", GateStep.POLICY, f"{name} needs an approval")
+    match (access or {}).get(name):
+        case "read":
+            return Verdict("allow", GateStep.POLICY, f"{name} only reads, so it is allowed")
+        case "destructive":
+            return Verdict(
+                "ask",
+                GateStep.POLICY,
+                f"{name} can delete or change data that cannot be restored. It needs an approval",
+            )
+        case _:
+            return Verdict("ask", GateStep.POLICY, f"{name} needs an approval")
 
 
 def _most_specific(rules: Iterable[PolicyRule]) -> PolicyRule | None:

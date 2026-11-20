@@ -39,6 +39,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.connectors.service import ConnectionService
 from sama.db.models import Integration
 from sama.gate.service import GateService
 from sama.gateway.pairing import Lockout
@@ -84,6 +85,7 @@ class SlackHub(GatewayCache[_App]):
         gate: GateService | None = None,
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
+        connections: ConnectionService | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__()
@@ -95,6 +97,7 @@ class SlackHub(GatewayCache[_App]):
         self._gate = gate or GateService(engine)
         self._skills = skills
         self._reviews = reviews
+        self._connections = connections
         self._clock = clock
         self._lockout = Lockout()
         self._followers: set[object] = set()
@@ -237,6 +240,7 @@ class SlackHub(GatewayCache[_App]):
             gate=self._gate,
             skills=self._skills,
             reviews=self._reviews,
+            connections=self._connections,
             lockout=self._lockout,
             followers=self._followers,
             seen=self._seen,

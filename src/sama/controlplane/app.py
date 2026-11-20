@@ -32,6 +32,8 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.connectors.manifest import Catalog
+from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
 from sama.controlplane.settings import ControlPlaneSettings
 from sama.db.engine import create_engine
@@ -141,12 +143,22 @@ def build(
             SecretName.ANTHROPIC_API_KEY: settings.anthropic_key,
             SecretName.OPENAI_API_KEY: settings.openai_key,
             SecretName.BRAVE_API_KEY: settings.brave_key,
+            SecretName.COMPOSIO_API_KEY: settings.composio_key,
         },
     )
     signer = RunTokenSigner(settings.run_token_key.get_secret_value().encode())
     # The deferred tools are in one catalog. The gate reads their toolsets from it, and the tool
-    # server runs them (Section 10.3). The catalog is empty until a feature adds tools.
+    # server runs them (Section 10.3). The connector tools of the catalog in
+    # ``connectors/catalog/`` are deferred tools of the toolset ``integrations``.
     deferred = DeferredCatalog()
+    connections = ConnectionService(
+        engine,
+        Catalog.load(),
+        keys=keys,
+        vault=vault,
+        web_base=settings.web_base,
+    )
+    connections.register_tools(deferred)
     gate = GateService(engine, extra_toolsets=deferred)
     broker = ClarifyBroker()
     library = SkillLibrary(engine, BuiltinSkills().all())
@@ -238,6 +250,7 @@ def build(
             else None
         ),
         deferred=deferred,
+        connections=connections,
         archive=ContextArchive(engine),
         gate=gate,
     )
@@ -252,12 +265,20 @@ def build(
         ledger=ledger,
     )
     hub = (
-        TelegramHub(engine, vault, keys=keys, gate=gate, skills=library, reviews=reviews)
+        TelegramHub(
+            engine,
+            vault,
+            keys=keys,
+            gate=gate,
+            skills=library,
+            reviews=reviews,
+            connections=connections,
+        )
         if vault is not None
         else None
     )
     slack = (
-        SlackHub(engine, vault, gate=gate, skills=library, reviews=reviews)
+        SlackHub(engine, vault, gate=gate, skills=library, reviews=reviews, connections=connections)
         if vault is not None
         else None
     )
@@ -289,6 +310,7 @@ def build(
         integrations=integrations,
         skills=library,
         reviews=reviews,
+        connections=connections,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -311,6 +333,7 @@ def build(
                 stack.push_async_callback(_close_sandboxes, sandboxed)
             await stack.enter_async_context(proxy_app.router.lifespan_context(proxy_app))
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
+            stack.push_async_callback(connections.aclose)
             if hub is not None:
                 stack.push_async_callback(hub.aclose)
             if slack is not None:

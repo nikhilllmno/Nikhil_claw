@@ -5,11 +5,12 @@ from __future__ import annotations
 import secrets
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import pytest
 
+from sama.connectors.errors import ConnectorError
 from sama.gate import GateStep, Verdict
 from sama.runtime.archive import (
     MAX_ARCHIVE_BODY_BYTES,
@@ -29,6 +30,9 @@ from sama.tools.deferred import (
 from tests.conformance.scripted_model import serve
 from tests.support import make_scope
 from tests.tools.test_server import connect, text_of
+
+if TYPE_CHECKING:
+    from sama.connectors.service import ConnectionService
 
 
 async def echo(claims: RunTokenClaims, arguments: Mapping[str, Any]) -> str:
@@ -498,3 +502,71 @@ async def test_only_a_few_archives_are_processed_at_the_same_time() -> None:
     assert busy.status_code == 429
     assert [r.status_code for r in done] == [200] * MAX_CONCURRENT_ARCHIVES
     assert after.status_code == 200
+
+
+# -- the connection tools ----------------------------------------------------------------------
+
+
+@dataclass
+class FakeConnections:
+    """The parts of ``ConnectionService`` that the tool server uses (Section 10.3)."""
+
+    connected: frozenset[str] = frozenset({"mail_read"})
+    calls: list[tuple[str, Any]] = field(default_factory=list)
+
+    async def list_for_agent(self, claims: RunTokenClaims) -> str:
+        self.calls.append(("list", claims.run_id))
+        return "Connectors:\n- gmail (Gmail): connected (personal)."
+
+    async def request_for_agent(
+        self, claims: RunTokenClaims, connector: str, scope: str | None
+    ) -> str:
+        self.calls.append(("request", (connector, scope)))
+        return f"Give the user this link: https://app.test/connections?connect={connector}"
+
+    async def test_for_agent(self, claims: RunTokenClaims, connector: str) -> str:
+        if connector == "boom":
+            raise ConnectorError("sama has no connector boom", status_code=404)
+        return f"{connector}: connected."
+
+    async def usable_tools(self, claims: RunTokenClaims, names: Any) -> frozenset[str]:
+        return frozenset(n for n in names if n != "mail_send" or n in self.connected)
+
+
+async def test_the_connection_tools_answer_through_the_gate() -> None:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    gate = VisibleGate()
+    connections = FakeConnections()
+    tools = ToolServer(
+        signer=signer,
+        todos=MemoryTodoStore(),
+        deferred=DeferredCatalog(mail_tools()),
+        gate=gate,
+        connections=cast("ConnectionService", connections),
+    )
+    with serve(tools.app()) as base:
+        async with connect(base + "/mcp", signer.issue(make_scope("run-9"), ttl_s=600)) as client:
+            listed = await client.list_tools()
+            names = {tool.name for tool in listed.tools}
+            assert {"connections_list", "connection_request", "connection_test"} <= names
+            assert "connected (personal)" in text_of(await client.call_tool("connections_list", {}))
+            link = await client.call_tool(
+                "connection_request", {"connector": "gmail", "scope": "workspace"}
+            )
+            assert "connect=gmail" in text_of(link)
+            assert "gmail: connected." in text_of(
+                await client.call_tool("connection_test", {"connector": "gmail"})
+            )
+            failed = await client.call_tool("connection_test", {"connector": "boom"})
+            assert failed.is_error
+            assert "no connector boom" in text_of(failed)
+            # A connector tool without a usable connection is not in the search.
+            found = await client.call_tool("tool_search", {"query": "mail"})
+    assert "mail_read" in text_of(found)
+    assert "mail_send" not in text_of(found)
+    assert connections.calls == [("list", "run-9"), ("request", ("gmail", "workspace"))]
+    assert [name for name, _ in gate.screens][:3] == [
+        "connections_list",
+        "connection_request",
+        "connection_test",
+    ]

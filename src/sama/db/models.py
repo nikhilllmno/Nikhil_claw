@@ -81,7 +81,14 @@ VAULT_NAMES: Final = (
     "telegram_bot_token",
     "slack_bot_token",
     "slack_signing_secret",
+    "composio_api_key",
 )
+CONNECTION_SECRET_PATTERN: Final = "^connection:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
+"""The vault name of the secret fields of one connection (Section 10.3): ``connection:<id>``."""
+CONNECTION_SCOPES: Final = ("personal", "workspace")
+CONNECTION_KINDS: Final = ("composio", "mcp_remote", "mcp_hosted", "database", "http_api", "plugin")
+CONNECTION_STATES: Final = ("pending", "initiated", "connected", "failed", "expired", "disabled")
+"""The states of a connection (Section 10.3). Only the backend sets ``connected``."""
 INTEGRATION_KINDS: Final = ("telegram", "slack")
 """The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
@@ -1100,7 +1107,9 @@ class VaultSecret(Base):
     __tablename__ = "vault_secrets"
     __table_args__ = (
         UniqueConstraint("org_id", "name"),
-        CheckConstraint(_one_of("name", VAULT_NAMES), name="name"),
+        CheckConstraint(
+            f"{_one_of('name', VAULT_NAMES)} OR name ~ '{CONNECTION_SECRET_PATTERN}'", name="name"
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -1404,3 +1413,61 @@ class ContextPin(Base):
     injected_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     """The run that got the pin. A claim of the same run again gets the pin again."""
     created_at: Mapped[datetime] = _created_at()
+
+
+class Connection(Base):
+    """One configured account or endpoint of a connector in a workspace (docs/architecture.md,
+    Section 10.3). A ``personal`` connection belongs to ``owner_user_id``. A ``workspace``
+    connection is shared. The row has no secret: ``secret_ref`` names the vault entry of the
+    secret fields of a form connection, and a Composio connection keeps its credentials at
+    Composio. Only the control plane writes the table."""
+
+    __tablename__ = "connections"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "owner_user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint(
+            "org_id",
+            "workspace_id",
+            "connector",
+            "owner_user_id",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(_one_of("scope", CONNECTION_SCOPES), name="scope"),
+        CheckConstraint(_one_of("kind", CONNECTION_KINDS), name="kind"),
+        CheckConstraint(_one_of("state", CONNECTION_STATES), name="state"),
+        CheckConstraint("(scope = 'personal') = (owner_user_id IS NOT NULL)", name="owner"),
+        CheckConstraint("connector ~ '^[a-z][a-z0-9_-]{0,39}$'", name="connector"),
+        CheckConstraint(
+            "secret_ref IS NULL OR secret_ref = 'connection:' || id::text", name="secret_ref"
+        ),
+        CheckConstraint(
+            "last_error IS NULL OR char_length(last_error) <= 500", name="last_error_length"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    connector: Mapped[str] = mapped_column(Text, nullable=False)
+    """The name of the catalog manifest."""
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    config: Mapped[dict[str, Any]] = _json()
+    """Non-secret settings, for example the Composio account id and entity id."""
+    secret_ref: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    tool_cache: Mapped[dict[str, Any]] = _json()
+    policy_overrides: Mapped[dict[str, Any]] = _json()
+    last_health_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()

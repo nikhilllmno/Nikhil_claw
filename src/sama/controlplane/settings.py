@@ -91,6 +91,9 @@ class ControlPlaneSettings:
     anthropic_key: SecretStr | None = None
     openai_key: SecretStr | None = None
     brave_key: SecretStr | None = None
+    composio_key: SecretStr | None = None
+    """The Composio API key of the process (``COMPOSIO_API_KEY``). An org can set its own key
+    in the vault (``composio_api_key``)."""
     langfuse: LangfuseConfig | None = None
     slack_webhook_url: SecretStr | None = None
     environment: str | None = None
@@ -110,6 +113,7 @@ class ControlPlaneSettings:
             self.anthropic_key,
             self.openai_key,
             self.brave_key,
+            self.composio_key,
             self.slack_webhook_url,
         ]
         if self.langfuse is not None:
@@ -124,6 +128,12 @@ class ControlPlaneSettings:
                 base64.urlsafe_b64encode(self.vault_key.secret).decode(),
             ]
         return values
+
+    @property
+    def web_base(self) -> str:
+        """The address of the web app, for the links of the Connections page: the first
+        origin of ``SAMA_WEB_ORIGINS``, else ``public_url``."""
+        return self.web_origins[0] if self.web_origins else self.public_url
 
     @property
     def model_url(self) -> str:
@@ -177,6 +187,7 @@ class ControlPlaneSettings:
             anthropic_key=_secret(env, "ANTHROPIC_API_KEY"),
             openai_key=_secret(env, "OPENAI_API_KEY"),
             brave_key=_secret(env, "BRAVE_API_KEY"),
+            composio_key=_secret(env, "COMPOSIO_API_KEY"),
             langfuse=langfuse,
             slack_webhook_url=_secret(env, "SAMA_ALERT_SLACK_WEBHOOK_URL"),
             environment=env.get("SAMA_ENVIRONMENT", "").strip() or None,
