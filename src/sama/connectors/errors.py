@@ -22,5 +22,6 @@ class ConnectorError(Exception):
 def short_error(text: str) -> str:
     """A provider error message for a row, a log, or the agent: redacted, on one line, and at
     most ``MAX_ERROR_CHARS`` characters."""
-    text = redact(" ".join(text.split()))
+    # Redact first: a secret with two spaces or a tab in it does not match after the join.
+    text = " ".join(redact(text).split())
     return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 3] + "..."

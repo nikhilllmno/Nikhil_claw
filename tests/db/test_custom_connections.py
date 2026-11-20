@@ -233,7 +233,7 @@ async def test_an_error_that_echoes_a_secret_is_redacted(
     async with engine.begin() as connection:
         await connection.execute(
             update(Connection)
-            .where(Connection.id == view.id)
+            .where(Connection.org_id == org.ids["org"], Connection.id == view.id)
             .values(last_error=f"the API answered 400: {TOKEN}")
         )
     stored = await world.service.get(org.ids["org"], view.id)

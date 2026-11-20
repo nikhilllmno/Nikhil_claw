@@ -457,7 +457,7 @@ const HOST_NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61
  * because npm reads `1`, `1.2`, and `1.x` as ranges. */
 const EXACT_VERSION: Record<"npm" | "pypi", RegExp> = {
   npm: /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/,
-  pypi: /^[0-9]+(\.[0-9]+){0,3}((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$/,
+  pypi: /^v?([0-9]+!)?[0-9]+(\.[0-9]+)*([-_.]?(alpha|a|beta|b|preview|pre|c|rc)[-_.]?[0-9]*)?(-[0-9]+|[-_.]?(post|rev|r)[-_.]?[0-9]*)?([-_.]?dev[-_.]?[0-9]*)?(\+[a-z0-9]+([-_.][a-z0-9]+)*)?$/i,
 };
 
 /** The form of a new stdio server, as the user types it. */

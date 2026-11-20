@@ -235,6 +235,13 @@ def test_an_operation_parameter_replaces_the_path_parameter_also_its_required() 
         {"schema": {"type": "array"}, "style": "pipeDelimited"},
         {"style": "deepObject"},
         {"content": {"application/json": {"schema": {"type": "object"}}}},
+        # An object or a nested array in a type list, a composition, or an untyped schema.
+        {"schema": {"type": ["object", "null"], "additionalProperties": {"type": "string"}}},
+        {"schema": {"allOf": [{"type": "object", "properties": {"a": {"type": "string"}}}]}},
+        {"schema": {"anyOf": [{"type": "string"}, {"properties": {"a": {}}}]}},
+        {"schema": {"type": "array", "items": {"type": ["array", "null"]}}},
+        {"schema": {"type": "array", "items": {"properties": {"a": {"type": "string"}}}}},
+        {"schema": {"oneOf": [{"type": "array", "items": {"type": "object"}}]}},
     ],
 )
 def test_a_query_parameter_that_sama_cannot_send_skips_the_operation(

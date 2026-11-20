@@ -15,6 +15,7 @@ from sama.connectors.manifest import (
     Catalog,
     Manifest,
     ManifestError,
+    McpPackage,
     api_fields,
     catalog_directory,
     hosted_fields,
@@ -230,6 +231,36 @@ def test_a_hosted_manifest_pins_its_package_and_allows_the_registry() -> None:
     assert pypi.hosted.allow_out == ("api.demo.test", "files.pythonhosted.org", "pypi.org")
     public = manifest.public()
     assert public["hosted"]["package"]["name"] == "@modelcontextprotocol/server-everything"
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "1.2.3",
+        "2025.9.25",
+        "1.2",
+        "1.2.3.4.5",
+        "1.2.3post1",
+        "1.2.3.post1",
+        "1.2.3-1",
+        "1.2.3preview1",
+        "1.0rc1",
+        "1.0.dev0",
+        "1!2.0",
+        "1.0+local.7",
+        "V1.0",
+    ],
+)
+def test_a_pypi_package_takes_any_one_pep_440_version(version: str) -> None:
+    assert McpPackage(registry="pypi", name="mcp-server-fetch", version=version).pinned == (
+        f"mcp-server-fetch=={version}"
+    )
+
+
+@pytest.mark.parametrize("version", ["1.*", "1.2.*", ">=1.0", "~=1.0", "latest", "1.0 2", "1..2"])
+def test_a_pypi_range_is_refused(version: str) -> None:
+    with pytest.raises(ValidationError, match="exact version"):
+        McpPackage(registry="pypi", name="mcp-server-fetch", version=version)
 
 
 @pytest.mark.parametrize(

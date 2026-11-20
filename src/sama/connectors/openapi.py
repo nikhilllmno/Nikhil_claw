@@ -304,14 +304,56 @@ def _plain_query(param: Mapping[str, Any], schema: Mapping[str, Any]) -> bool:
         return False
     if "content" in param:
         return False
-    kind = schema.get("type")
-    if kind == "object" or "properties" in schema:
+    kinds = _kinds(schema)
+    if "object" in kinds:
         return False
-    if kind == "array":
-        items = schema.get("items")
-        inner = items.get("type") if isinstance(items, Mapping) else None
-        return inner not in ("object", "array")
-    return True
+    return all(not _kinds(items) & {"object", "array"} for items in _items(schema))
+
+
+_COMPOSED: Final = ("allOf", "anyOf", "oneOf")
+
+
+def _parts(schema: Any, depth: int = 0) -> list[Any]:
+    """The schema and each schema of its ``allOf``, ``anyOf``, and ``oneOf``, at all depths."""
+    parts = [schema]
+    if isinstance(schema, Mapping) and depth < MAX_REF_DEPTH:
+        for key in _COMPOSED:
+            subs = schema.get(key)
+            for sub in subs if isinstance(subs, list) else []:
+                parts.extend(_parts(sub, depth + 1))
+    return parts
+
+
+def _kinds(schema: Any) -> set[str]:
+    """The JSON types that a value of the schema can have. A schema that sama cannot read
+    (not an object, a ``$ref`` that stays, or a composition that is too deep) counts as an
+    object, so the operation is skipped."""
+    kinds: set[str] = set()
+    for part in _parts(schema):
+        if not isinstance(part, Mapping) or "$ref" in part:
+            return {"object"}
+        kind = part.get("type")
+        if isinstance(kind, str):
+            kinds.add(kind)
+        elif isinstance(kind, list):
+            kinds.update(k for k in kind if isinstance(k, str))
+        if any(k in part for k in ("properties", "additionalProperties", "patternProperties")):
+            kinds.add("object")
+        if "items" in part or "prefixItems" in part:
+            kinds.add("array")
+    return kinds
+
+
+def _items(schema: Any) -> list[Any]:
+    """The item schemas of an array schema, from all of its parts."""
+    out: list[Any] = []
+    for part in _parts(schema):
+        if isinstance(part, Mapping):
+            if "items" in part:
+                out.append(part["items"])
+            prefix = part.get("prefixItems")
+            out.extend(prefix if isinstance(prefix, list) else [])
+    return out
 
 
 def _smaller(schema: dict[str, Any]) -> dict[str, Any]:

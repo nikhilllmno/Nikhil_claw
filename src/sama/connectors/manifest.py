@@ -198,8 +198,15 @@ _EXACT_VERSION: Final[Mapping[str, re.Pattern[str]]] = {
         r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
         r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
     ),
-    # A PEP 440 release with an optional pre, post, or dev part. ``==`` pins it.
-    "pypi": re.compile(r"[0-9]+(\.[0-9]+){0,3}((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?"),
+    # One PEP 440 version (epoch, release, pre, post, dev, local). ``==`` pins it.
+    "pypi": re.compile(
+        r"v?([0-9]+!)?[0-9]+(\.[0-9]+)*"
+        r"([-_.]?(alpha|a|beta|b|preview|pre|c|rc)[-_.]?[0-9]*)?"
+        r"(-[0-9]+|[-_.]?(post|rev|r)[-_.]?[0-9]*)?"
+        r"([-_.]?dev[-_.]?[0-9]*)?"
+        r"(\+[a-z0-9]+([-_.][a-z0-9]+)*)?",
+        re.IGNORECASE,
+    ),
 }
 """One version for each registry. A range (``^``, ``~``, ``*``, ``>=``, ``x``, a space) or a
 tag does not match."""

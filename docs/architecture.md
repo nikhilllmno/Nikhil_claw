@@ -2339,8 +2339,8 @@ gets one notice per change.
   - `package`: `registry` (`npm` or `pypi`), `name`, `version`, `bin` (optional), and `args`.
     The version is one exact version. For npm, it is a full semver version (`1.2.3`, with an
     optional pre-release or build part), because npm reads `1`, `1.2`, and `1.x` as ranges.
-    For PyPI, it is a PEP 440 release such as `1.2` or `1.2.3rc1`. sama refuses a range, a
-    tag, and `latest`.
+    For PyPI, it is one PEP 440 version such as `1.2`, `1.2.3rc1`, `1.2.3.post1`, or
+    `1!2.0+local`. sama refuses a range, a wildcard (`1.*`), a tag, and `latest`.
   - or `command`: the program and its arguments. Only a server that an admin adds can have a
     command, not a catalog manifest.
   - `env`: the environment variables of the server. Each variable is one secret field of the
@@ -2411,8 +2411,10 @@ gets one notice per change.
   replaces a path-item parameter with the same name and place, also its `required`. It skips an
   operation that it cannot use and counts it in `skipped`. Examples: a path template without a
   path parameter, a bad parameter name, or a query parameter that is an object, a nested
-  array, or not the `form` style with `explode` (the OpenAPI default). At most 200 operations. The base URL is the `base_url` of the request,
-  else the first `https` server of the document.
+  array, or not the `form` style with `explode` (the OpenAPI default). The check reads a type
+  list (`["object", "null"]`), `allOf`, `anyOf`, `oneOf`, and the item schemas. A schema with
+  `properties` or `additionalProperties` is an object. At most 200 operations. The base URL is
+  the `base_url` of the request, else the first `https` server of the document.
 - **Tools.** Each operation is one tool `api_<connection>_<tool>`. The tool name comes from the
   `operationId`, else from the method and the path, in lower case with `_`. A second tool with
   the same name gets `_2`, `_3`, and so on. A name longer than 64 characters is cut. The tool

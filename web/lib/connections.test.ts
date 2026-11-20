@@ -406,6 +406,12 @@ describe("stdio MCP servers (M4.11)", () => {
     expect(stdioProblem({ ...good, version: "1.2.3-beta.1+build.5" })).toBeNull();
     expect(stdioProblem({ ...good, source: "pypi", packageName: "mcp-server-fetch", version: "1.2" })).toBeNull();
     expect(stdioProblem({ ...good, source: "pypi", packageName: "mcp-server-fetch", version: "1.*" })).toMatch(/exact version/);
+    for (const version of ["1.2.3.4.5", "1.2.3post1", "1.2.3preview1", "1!2.0", "1.0+local.7", "1.0.dev0"]) {
+      expect(stdioProblem({ ...good, source: "pypi", packageName: "mcp-server-fetch", version })).toBeNull();
+    }
+    for (const version of [">=1.0", "~=1.0", "latest", "1..2"]) {
+      expect(stdioProblem({ ...good, source: "pypi", packageName: "mcp-server-fetch", version })).toMatch(/exact version/);
+    }
     expect(stdioProblem({ ...good, env: "GITHUB_TOKEN, lower" })).toMatch(/"lower" is not a variable/);
     expect(stdioProblem({ ...good, egress: "api.github.com\nhttps://x.test" })).toMatch(/not a host name/);
     expect(stdioProblem({ ...good, egress: "localhost" })).toMatch(/not a host name/);
