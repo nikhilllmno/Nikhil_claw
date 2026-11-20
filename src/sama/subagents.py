@@ -23,6 +23,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any, Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_core import ErrorDetails
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -80,6 +81,38 @@ class SubagentSpec(BaseModel):
         return self
 
 
+_FIELDS: Final = frozenset(SubagentSpec.model_fields)
+
+_MESSAGES: Final = {
+    "missing": "is required",
+    "extra_forbidden": "is an unknown field",
+    "string_too_short": "is too short",
+    "string_too_long": "is too long",
+    "string_pattern_mismatch": "does not match the pattern",
+    "too_long": "has too many items",
+    "greater_than": "is too small",
+    "less_than_equal": "is too large",
+    "string_type": "must be a string",
+    "int_type": "must be an integer",
+    "int_parsing": "must be an integer",
+    "model_type": "must be an object",
+    "dict_type": "must be an object",
+    "tuple_type": "must be a list",
+    "value_error": "has a value that is not valid",
+}
+
+
+def _describe(error: ErrorDetails) -> str:
+    """One problem as text for the caller. A name is in the text only when it is a field of the
+    schema, and the message is fixed: the key of an extra field is not in it."""
+    loc = error["loc"]
+    field = loc[0] if loc else None
+    if error["type"] == "extra_forbidden" or (field is not None and field not in _FIELDS):
+        return "unknown field"
+    name = str(field) if field is not None else "value"
+    return f"{name}: {_MESSAGES.get(error['type'], 'is not valid')}"
+
+
 def parse_subagents(raw: Any) -> tuple[SubagentSpec, ...]:
     """The specs from the JSON value of the column or of a file.
 
@@ -95,11 +128,9 @@ def parse_subagents(raw: Any) -> tuple[SubagentSpec, ...]:
         try:
             specs.append(SubagentSpec.model_validate(item))
         except ValidationError as error:
-            # Only the field names and the messages: the input can hold text of the prompt.
-            problems = "; ".join(
-                f"{'.'.join(str(part) for part in e['loc']) or 'value'}: {e['msg']}"
-                for e in error.errors(include_input=False, include_url=False)
-            )
+            # Only the names of the schema fields and fixed messages. The key of an extra field
+            # and the input can be secret: pydantic puts both in ``loc`` and in ``msg``.
+            problems = "; ".join(_describe(e) for e in error.errors(include_input=False))
             raise SubagentError(f"sub-agent {index} is not valid ({problems})") from None
     names = [spec.name for spec in specs]
     if len(set(names)) != len(names):

@@ -103,6 +103,23 @@ def test_an_error_gives_exit_code_1_and_no_spec_text(
     assert captured.out == ""
 
 
+def test_the_name_of_an_extra_field_is_not_printed(
+    queue_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    key = "sk-ant-api03-keyname0123456789abcdef"
+    org, profile = asyncio.run(_new_profile(queue_database_url))
+    monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps([{**SPEC, key: 1}])))
+    assert main(["subagents", "set", "--org", str(org), "--profile", str(profile)]) == 1
+    captured = capsys.readouterr()
+    assert "unknown field" in captured.err
+    assert key not in captured.err
+    assert "sk-ant" not in captured.err
+    assert captured.out == ""
+
+
 def test_a_missing_file_or_profile_gives_exit_code_1(
     queue_database_url: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

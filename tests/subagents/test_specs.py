@@ -66,6 +66,35 @@ def test_an_invalid_spec_gives_the_field_and_not_the_input() -> None:
     assert secret not in text
 
 
+KEY_WITH_SECRET = "sk-ant-api03-keyname0123456789abcdef"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {KEY_WITH_SECRET: 1},
+        {"toolsets": ["web"], KEY_WITH_SECRET: {"nested": 1}},
+    ],
+)
+def test_the_name_of_an_extra_field_is_not_in_the_error(extra: dict[str, Any]) -> None:
+    with pytest.raises(SubagentError) as caught:
+        parse_subagents([spec(**extra)])
+    text = str(caught.value)
+    assert KEY_WITH_SECRET not in text
+    assert "sk-ant" not in text
+    assert "sub-agent 1" in text
+    assert "unknown field" in text
+
+
+def test_a_nested_extra_key_and_a_bad_value_have_only_schema_names() -> None:
+    with pytest.raises(SubagentError) as caught:
+        parse_subagents([spec(toolsets=[KEY_WITH_SECRET, 5], max_turns=KEY_WITH_SECRET)])
+    text = str(caught.value)
+    assert KEY_WITH_SECRET not in text
+    assert "toolsets" in text
+    assert "max_turns" in text
+
+
 @pytest.mark.parametrize(
     "bad",
     [
