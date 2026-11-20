@@ -1744,9 +1744,9 @@ user of the profile, so a new SOUL is always a proposal, also for an admin. The 
 SHA-256 digest of the SOUL that the run saw: the frozen SOUL of the session
 (`sessions.run_config.soul`), or the live SOUL of the profile when the session has no frozen
 SOUL. When a person approves it, the applier writes the new SOUL only if the live SOUL still has
-that digest; else the proposal is `failed` with "the soul changed after the proposal". A
-proposal from a session that started before a SOUL change is refused at once: "the soul changed
-after the agent saw it. Ask for a new proposal". The applier adds the audit row `profile.updated`. A session keeps its frozen
+that digest; else the proposal is `failed` with "the soul changed after the agent saw it. Ask
+for a new proposal". Thus a proposal from a session that started before a SOUL change also
+fails when a person approves it. The applier adds the audit row `profile.updated`. A session keeps its frozen
 SOUL, so the new SOUL applies from the next session. The tool server hides the tool when it has
 no proposer. The bootstrap presets do not have `self` (Section 10.2), so an admin adds it to a
 profile on purpose.
