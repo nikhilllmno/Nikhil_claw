@@ -67,6 +67,10 @@ from sama.vault.redact import redact
 log = logging.getLogger("sama.search")
 
 SEARCH_ROLES: Final = ("user", "assistant")
+# An archive keeps the tool calls and the tool results too (Section 6.3).
+ARCHIVE_ROLES: Final = ("user", "assistant", "tool", "system")
+ARCHIVE_LINEAGE: Final = "compaction"
+MAX_ARCHIVES_SHOWN: Final = 20
 EMBED_TIMEOUT_S: Final = 3.0
 """The wait for the embedding of the query. A slower call gives a full-text result."""
 NOT_FOUND: Final = "session not found"
@@ -145,17 +149,22 @@ class SessionSearch:
         limit = max(1, min(limit, MAX_LIMIT))
         org_id = _uuid(claims.org_id)
         current = _uuid(claims.session_id)
+        # An archive repeats the messages of its live session. The search skips it, and
+        # ``session_read`` of the live session names its archives.
+        not_archive = or_(Session.lineage.is_(None), Session.lineage != ARCHIVE_LINEAGE)
         if not text_query:
             async with self._engine.connect() as connection:
                 visible = await self.visible(connection, claims)
-                return await self._recent(connection, and_(visible, Session.id != current), limit)
+                return await self._recent(
+                    connection, and_(visible, not_archive, Session.id != current), limit
+                )
         tsquery = func.websearch_to_tsquery(_SIMPLE, text_query)
         # The query embedding is a slow call. It runs before the grants load, so that a grant
         # that changes during the call counts: every read below uses the fresh rule.
         vector = await self._query_vector(org_id, text_query)
         async with self._engine.connect() as connection:
             visible = await self.visible(connection, claims)
-            others = and_(visible, Session.id != current)
+            others = and_(visible, not_archive, Session.id != current)
             ranked = [await self._full_text(connection, others, tsquery)]
             if vector is not None:
                 ranked.append(await self._by_meaning(connection, others, vector))
@@ -324,10 +333,11 @@ class SessionSearch:
             ).first()
             if row is None:
                 raise SessionSearchError(NOT_FOUND)
+            roles = ARCHIVE_ROLES if row.lineage == ARCHIVE_LINEAGE else SEARCH_ROLES
             counted = and_(
                 Message.org_id == row.org_id,
                 Message.session_id == wanted,
-                Message.role.in_(SEARCH_ROLES),
+                Message.role.in_(roles),
             )
             total = (
                 await connection.execute(select(func.count()).select_from(Message).where(counted))
@@ -347,7 +357,20 @@ class SessionSearch:
             page = tuple(
                 PageMessage(m.seq, m.role, m.created_at, redact(m.body or "")) for m in messages
             )
-        return SessionPage(_hit(row), total, offset, page)
+            archives = tuple(
+                found.id
+                for found in await connection.execute(
+                    select(Session.id)
+                    .where(
+                        visible,
+                        Session.parent_session_id == wanted,
+                        Session.lineage == ARCHIVE_LINEAGE,
+                    )
+                    .order_by(Session.created_at, Session.id)
+                    .limit(MAX_ARCHIVES_SHOWN)
+                )
+            )
+        return SessionPage(_hit(row), total, offset, page, archives)
 
 
 def _session_columns() -> tuple[Any, ...]:
@@ -359,6 +382,8 @@ def _session_columns() -> tuple[Any, ...]:
         Session.audience,
         Session.created_at,
         Session.updated_at,
+        Session.lineage,
+        Session.parent_session_id,
     )
 
 
@@ -371,4 +396,6 @@ def _hit(row: Any, snippets: tuple[Snippet, ...] = ()) -> SessionHit:
         row.created_at,
         row.updated_at,
         snippets,
+        row.lineage,
+        row.parent_session_id,
     )

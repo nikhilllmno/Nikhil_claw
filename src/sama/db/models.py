@@ -86,6 +86,8 @@ SKILL_SCOPES: Final = ("org", "workspace", "user")
 SKILL_STATUSES: Final = ("active", "archived")
 SKILL_CHANGES: Final = ("create", "patch", "edit", "write_file", "remove_file", "archive")
 SKILL_AUTHOR_KINDS: Final = ("user", "agent", "system")
+COMPACTION_TRIGGERS: Final = ("auto", "manual")
+PIN_SOURCES: Final = ("user", "message")
 EMBEDDING_DIMENSIONS: Final = 1536
 """The size of a message embedding: the output of ``text-embedding-3-small``
 (docs/architecture.md, Section 7.1)."""
@@ -343,6 +345,9 @@ class Run(Base):
             name="review_range",
         ),
         CheckConstraint("kind <> 'review' OR unattended", name="review_unattended"),
+        # A compact run is a chat run of a person (Section 6.3).
+        CheckConstraint("NOT compact OR kind = 'chat'", name="compact_is_chat"),
+        CheckConstraint("compact OR compact_focus IS NULL", name="compact_focus"),
         Index(None, "org_id", "session_id"),
         Index(None, "status", "created_at"),
         # The per-org message rate and concurrency limit (migration 0007, Section 4.3).
@@ -393,6 +398,11 @@ class Run(Base):
     """For a review: the messages after this ``messages.seq`` are new for it."""
     review_to_seq: Mapped[int | None] = mapped_column(BigInteger)
     """For a review: the last ``messages.seq`` that it reads."""
+    compact: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True for a ``/compact`` run (docs/architecture.md, Section 6.3). It is a chat run with
+    no user message: the runtime compacts the context of the session and does not answer."""
+    compact_focus: Mapped[str | None] = mapped_column(Text)
+    """What the person asked the summary to keep, for a compact run. Redacted."""
     unattended: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     """True for a run that no human watches, for example a cron job or a webhook. The tool
     gate turns ``ask`` into ``deny`` in these runs (docs/architecture.md, Section 16.1)."""
@@ -1252,3 +1262,86 @@ class ReviewProposal(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SessionCompaction(Base):
+    """One compaction of a session (docs/architecture.md, Section 6.3). The PreCompact hook of
+    the runtime makes the row with the archive session. The ``compacted`` event of the runtime
+    sets the token counts. A row without ``completed_at`` is an archive whose compaction did
+    not finish. Only the control plane writes the table."""
+
+    __tablename__ = "session_compactions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "archive_session_id"], ["sessions.org_id", "sessions.id"]),
+        UniqueConstraint("archive_session_id"),
+        CheckConstraint(_one_of("trigger", COMPACTION_TRIGGERS), name="trigger"),
+        CheckConstraint(
+            "(completed_at IS NULL) = (tokens_before IS NULL AND tokens_after IS NULL)",
+            name="completed",
+        ),
+        CheckConstraint(
+            "(tokens_before IS NULL OR tokens_before >= 0)"
+            " AND (tokens_after IS NULL OR tokens_after >= 0)",
+            name="tokens",
+        ),
+        CheckConstraint("archive_entries >= 0", name="archive_entries"),
+        Index(None, "org_id", "session_id", "created_at"),
+        Index(None, "run_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    tokens_before: Mapped[int | None] = mapped_column(Integer)
+    tokens_after: Mapped[int | None] = mapped_column(Integer)
+    archive_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The session that holds the transcript before the compaction. It is a child of the
+    session with the lineage ``compaction``."""
+    archive_entries: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    archive_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True when the archive has a cut: sama kept the start and the end of a long transcript."""
+    created_at: Mapped[datetime] = _created_at()
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ContextPin(Base):
+    """A text that a person pinned to a session so that compaction keeps it (docs/architecture.md,
+    Section 6.3). The next run of the session gets the pin in its input, until a compaction
+    makes the runtime forget it: then the next run gets it again. Only the control plane
+    writes the table."""
+
+    __tablename__ = "context_pins"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("source", PIN_SOURCES), name="source"),
+        CheckConstraint("char_length(text) BETWEEN 1 AND 2000", name="text_length"),
+        CheckConstraint("(injected_at IS NULL) = (injected_run_id IS NULL)", name="injected"),
+        Index(None, "org_id", "session_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    """The redacted text of the pin."""
+    source: Mapped[str] = mapped_column(Text, nullable=False, server_default="user")
+    injected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When a run got the pin in its input. Null: no run has it yet, or a compaction made the
+    runtime forget it."""
+    injected_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The run that got the pin. A claim of the same run again gets the pin again."""
+    created_at: Mapped[datetime] = _created_at()

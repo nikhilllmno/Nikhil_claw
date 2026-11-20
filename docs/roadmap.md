@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.5 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -157,6 +157,23 @@ Done: M1.1 to M1.19, M2.1 to M2.5 (below the list of M1 notes).
   `workspace` notes, and unattended and delegated runs cannot write. Not in M2.1: approval cards
   for workspace writes (M3.2) and the web editor. The review (M2.4) proposes `agent` and
   `workspace` writes as approvals.
+- M2.6: context management in `src/sama/context/`, `src/sama/runtime/archive.py`, and
+  `src/sama/tools/deferred.py` (architecture Section 6.3). Migration `0018` adds `session_compactions`
+  and `context_pins` (both with RLS that follows the session), the columns `compact` and
+  `compact_focus` on `runs`, and the toolset `tool_search` in the default profile. The Claude
+  adapter has a `PreCompact` hook that sends the transcript to `POST /archive` of the tool
+  server. The control plane stores it as an archive session, a child of the live session with
+  the lineage `compaction` and the audience of the live session, and it stores each `Compacted`
+  event as a `session_compactions` row. A failed archive does not stop the compaction.
+  `/compact` (API, Telegram, and Slack direct messages) queues a compact run. It refuses a busy
+  session. Context pins (at most 10 for each session) go in front of the next message and again
+  after each compaction. `tool_search`, `tool_describe`, and `tool_call` give access to the
+  deferred tools in the `DeferredCatalog`. The gate judges `tool_call` as a call of the tool that
+  it names, so a deferred call has the same toolset check, rules, approval, and ticket as a
+  direct call. Capability flags `manual_compaction` and `compaction_archive` keep the adapter
+  parts apart for the OpenAI adapter. Not in M2.6: a live test of `/compact` and of the hook
+  against the Claude API, a deferred tool in production (M3.4 is the first), a pin of a file, a pin
+  by the agent, pins in a Slack channel, a search of archives, and a web UI.
 - M2.5: session search in `src/sama/search/` (architecture Section 7.1). Migration `0014` makes
   the `vector` extension, adds a generated full-text column and `embedded_at` to `messages`, and
   adds `message_embeddings` (HNSW index, RLS). The tools `session_search` and `session_read` are
@@ -217,7 +234,7 @@ Done: M1.1 to M1.19, M2.1 to M2.5 (below the list of M1 notes).
 | M2.3 | Builtin skills | At least 10 builtin skills of our own (for example research, writing, code review, spreadsheet, PDF, meeting notes). `/<skill-name>` works in Telegram and web. Done (Slack too). |
 | M2.4 | Background review | When a run ends and 10 user turns or 10 tool iterations passed since the last review, sama queues one review and resets the counters. At most one review runs and one waits per session. The review run with a cheap model may write memory and skills. Recursion is off. User-scope writes apply. Workspace and org writes create an approval. Done. |
 | M2.5 | Session search | Full-text plus pgvector index on messages. `session_search` and `session_read`. No LLM call in the tool. Done. |
-| M2.6 | Context management | Compaction events from the Claude SDK, transcript archive, session lineage. `tool_search`, `tool_describe`, `tool_call` for deferred tools. Context pins. `/compact`. |
+| M2.6 | Context management | Compaction events from the Claude SDK, transcript archive, session lineage. `tool_search`, `tool_describe`, `tool_call` for deferred tools. Context pins. `/compact`. Done. |
 | M2.7 | Native sub-agents | Claude `agents` option configured from the agent profile. Sub-agent events appear in traces. |
 | M2.8 | Media tools | `vision_analyze` for images from channels. Telegram photos and Slack files are stored (PNG, JPEG, GIF, WebP, 10 MB), and the tool asks a vision model about one image of the session. Done. |
 

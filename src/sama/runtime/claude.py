@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -57,6 +58,8 @@ from claude_agent_sdk.types import (
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from sama.runtime.archive import Archiver, TranscriptArchive
+from sama.runtime.claude_transcript import read_transcript
 from sama.runtime.contract import (
     ApprovalDecision,
     ApprovalRequired,
@@ -80,6 +83,8 @@ from sama.runtime.contract import (
     Usage,
     is_terminal,
 )
+
+log: Final = logging.getLogger("sama.runtime.claude")
 
 DROP_DEFERRED_ENV: Final = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL"
 """CLI switch: drop a deferred tool call when the tool is not available on resume."""
@@ -246,6 +251,13 @@ class _Phase:
     approved_call: str | None = None
 
 
+def _compact_prompt(focus: str) -> str:
+    """The prompt that makes the CLI compact the session (``/compact``). The focus is the
+    custom instruction of the summary."""
+    focus = focus.strip()
+    return f"/compact {focus}" if focus else "/compact"
+
+
 def _reject_prompt(tool_name: str, reason: str | None) -> str:
     text = f"The user rejected the {tool_name} tool call. Do not run it again."
     if reason:
@@ -354,7 +366,12 @@ class _Translator:
         metadata = message.data.get("compact_metadata") or {}
         before = _non_negative_int(metadata.get("pre_tokens"))
         after = _non_negative_int(metadata.get("post_tokens"))
-        return [Compacted(tokens_before=before, tokens_after=after, usage=self.usage)]
+        trigger: Literal["auto", "manual"] = (
+            "manual" if metadata.get("trigger") == "manual" else "auto"
+        )
+        return [
+            Compacted(tokens_before=before, tokens_after=after, trigger=trigger, usage=self.usage)
+        ]
 
     def add_result_usage(self, result: ResultMessage) -> None:
         raw = result.usage or {}
@@ -531,8 +548,10 @@ class ClaudeRuntime:
         gate: ToolGate | None = None,
         settings: ClaudeSettings | None = None,
         client_factory: ClientFactory = _sdk_client,
+        archiver: Archiver | None = None,
     ) -> None:
         self._gate = gate or AllowAllGate()
+        self._archiver = archiver
         self._settings = settings or ClaudeSettings()
         self._client_factory = client_factory
         self._active: dict[str, _ActiveRun] = {}
@@ -555,6 +574,8 @@ class ClaudeRuntime:
             native_file_checkpoints=True,
             resumable_sessions=True,
             mcp_client=True,
+            manual_compaction=True,
+            compaction_archive=True,
         )
 
     # -- the protocol ----------------------------------------------------------------------
@@ -572,12 +593,18 @@ class ClaudeRuntime:
         if problem is not None:
             yield _invalid(problem)
             return
+        if request.compact is not None and previous is None:
+            yield _invalid("there is nothing to compact")
+            return
         phases: list[_Phase] = []
         if previous is not None and previous.pending is not None:
             # A new message after an unanswered approval. Drop the deferred call first, or
             # the CLI runs it on resume.
             phases.append(_Phase(prompt=None, drop_tool=previous.pending.tool_name))
-        phases.append(_Phase(prompt=request.input))
+        if request.compact is not None:
+            phases.append(_Phase(prompt=_compact_prompt(request.compact.focus)))
+        else:
+            phases.append(_Phase(prompt=request.input))
         translator = _Translator(
             run_id=run_id,
             usage=Usage(),
@@ -906,12 +933,55 @@ class ClaudeRuntime:
             max_turns=_remaining_turns(budget, translator),
             max_budget_usd=_remaining_cost(budget, translator),
             include_partial_messages=True,
-            hooks={"PreToolUse": [HookMatcher(hooks=[self._hook(scope, phase, translator)])]},
+            hooks=self._hooks(scope, phase, translator),
             can_use_tool=_can_use_tool(translator),
             env=env,
             cwd=settings.cwd,
             cli_path=settings.cli_path,
         )
+
+    def _hooks(
+        self, scope: RunScope, phase: _Phase, translator: _Translator
+    ) -> dict[Any, list[HookMatcher]]:
+        hooks: dict[Any, list[HookMatcher]] = {
+            "PreToolUse": [HookMatcher(hooks=[self._hook(scope, phase, translator)])]
+        }
+        if self._archiver is not None:
+            hooks["PreCompact"] = [HookMatcher(hooks=[self._archive_hook(scope, self._archiver)])]
+        return hooks
+
+    def _archive_hook(self, scope: RunScope, archiver: Archiver) -> HookCallback:
+        """The ``PreCompact`` hook: gives the transcript to the archiver before the CLI
+        compacts it (Section 6.3). A failed archive does not stop the compaction, because a
+        session that is full must still be able to make room."""
+
+        async def pre_compact(
+            data: HookInput, tool_use_id: str | None, context: HookContext
+        ) -> SyncHookJSONOutput:
+            raw = cast(Mapping[str, Any], data)
+            if raw.get("hook_event_name") != "PreCompact":
+                return {}
+            trigger: Literal["auto", "manual"] = (
+                "manual" if raw.get("trigger") == "manual" else "auto"
+            )
+            path = raw.get("transcript_path")
+            try:
+                entries = (
+                    await asyncio.to_thread(read_transcript, path)
+                    if isinstance(path, str) and path
+                    else []
+                )
+                if entries:
+                    await archiver.archive(
+                        scope, TranscriptArchive(trigger=trigger, entries=entries)
+                    )
+            except Exception as exc:
+                log.warning(
+                    "the transcript archive failed run=%s: %s", scope.run_id, type(exc).__name__
+                )
+            return {}
+
+        return pre_compact
 
     def _hook(self, scope: RunScope, phase: _Phase, translator: _Translator) -> HookCallback:
         gate = self._gate

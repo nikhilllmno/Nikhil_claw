@@ -34,6 +34,15 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.types import Lifespan
 
 from sama.api.auth import AuthError, JwtVerifier, Principal
+from sama.context import (
+    MAX_PIN_CHARS,
+    Pin,
+    PinError,
+    PinStore,
+    ancestors,
+    children,
+    list_compactions,
+)
 from sama.db.engine import as_user
 from sama.db.models import (
     AgentProfile,
@@ -73,6 +82,7 @@ from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
+from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -125,6 +135,18 @@ class NewSession(_Body):
 
 class NewMessage(_Body):
     text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+
+class Compact(_Body):
+    focus: str = Field(default="", max_length=MAX_COMPACT_FOCUS_CHARS)
+    """What the summary must keep. Empty for the default summary."""
+
+
+class NewPin(_Body):
+    """Give ``text`` or ``message_id``, not both."""
+
+    text: str | None = Field(default=None, min_length=1, max_length=MAX_PIN_CHARS)
+    message_id: uuid.UUID | None = None
 
 
 class Decision(_Body):
@@ -190,6 +212,45 @@ class SessionOut(BaseModel):
     title: str | None
     status: str
     created_at: datetime
+    lineage: str | None = None
+    """``compaction`` for the archive of a transcript, else ``None`` (Section 6.3)."""
+    parent_session_id: uuid.UUID | None = None
+
+
+class PinOut(BaseModel):
+    id: uuid.UUID
+    text: str
+    source: str
+    created_at: datetime
+
+
+class CompactionOut(BaseModel):
+    id: uuid.UUID
+    run_id: uuid.UUID
+    trigger: str
+    tokens_before: int | None
+    tokens_after: int | None
+    archive_session_id: uuid.UUID | None
+    archive_entries: int
+    archive_truncated: bool
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class LinkOut(BaseModel):
+    session_id: uuid.UUID
+    parent_session_id: uuid.UUID | None
+    lineage: str | None
+    title: str | None
+    status: str
+    created_at: datetime
+
+
+class LineageOut(BaseModel):
+    ancestors: list[LinkOut]
+    """The parents of the session, nearest first."""
+    children: list[LinkOut]
+    """The sessions that start from this session: archives of compactions, and branches."""
 
 
 class RunOut(BaseModel):
@@ -248,6 +309,8 @@ _SESSION_COLUMNS: Final = (
     Session.title,
     Session.status,
     Session.created_at,
+    Session.lineage,
+    Session.parent_session_id,
 )
 
 
@@ -268,6 +331,10 @@ async def session_access(
     if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
         raise _not_found()
     return SessionAccess(row, user_id)
+
+
+def _pin_out(pin: Pin) -> PinOut:
+    return PinOut(id=pin.id, text=pin.text, source=pin.source, created_at=pin.created_at)
 
 
 def _session_out(row: Any) -> SessionOut:
@@ -362,6 +429,7 @@ class SamaApi:
         memory: MemoryService | None = None,
         skills: SkillLibrary | None = None,
         reviews: ReviewApplier | None = None,
+        pins: PinStore | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
@@ -371,6 +439,7 @@ class SamaApi:
         self._integrations = integrations
         self._skills = skills
         self._reviews = reviews
+        self._pins = pins or PinStore(engine)
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
@@ -464,6 +533,43 @@ class SamaApi:
             principal: Me, session_id: uuid.UUID, body: NewMessage
         ) -> JSONResponse:
             return await self._send(principal, session_id, body)
+
+        @app.post("/sessions/{session_id}/compact", status_code=202)
+        async def compact(
+            principal: Me, session_id: uuid.UUID, body: Compact | None = None
+        ) -> JSONResponse:
+            return await self._compact(principal, session_id, body.focus if body else "")
+
+        @app.get("/sessions/{session_id}/compactions")
+        async def compactions(
+            principal: Me,
+            session_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        ) -> list[CompactionOut]:
+            return await self._compactions(principal, session_id, limit)
+
+        @app.get("/sessions/{session_id}/lineage")
+        async def lineage(principal: Me, session_id: uuid.UUID) -> LineageOut:
+            return await self._lineage(principal, session_id)
+
+        @app.get("/sessions/{session_id}/pins")
+        async def list_pins(principal: Me, session_id: uuid.UUID) -> list[PinOut]:
+            access = await self._access(principal, session_id)
+            pins = await self._pins.list(access.org_id, session_id)
+            return [
+                PinOut(id=p.id, text=p.text, source=p.source, created_at=p.created_at) for p in pins
+            ]
+
+        @app.post("/sessions/{session_id}/pins", status_code=201)
+        async def add_pin(principal: Me, session_id: uuid.UUID, body: NewPin) -> PinOut:
+            return await self._add_pin(principal, session_id, body)
+
+        @app.delete("/sessions/{session_id}/pins/{pin_id}", status_code=204)
+        async def remove_pin(principal: Me, session_id: uuid.UUID, pin_id: uuid.UUID) -> Response:
+            access = await self._access(principal, session_id)
+            if not await self._pins.remove(access.org_id, session_id, pin_id):
+                raise _not_found("the pin does not exist")
+            return Response(status_code=204)
 
         @app.get("/sessions/{session_id}/events")
         async def events(
@@ -1338,6 +1444,72 @@ class SamaApi:
         except QueueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         return JSONResponse(status_code=202, content={"run_id": str(run_id)})
+
+    async def _access(self, principal: Principal, session_id: uuid.UUID) -> SessionAccess:
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            return await session_access(connection, principal, session_id)
+
+    async def _compact(
+        self, principal: Principal, session_id: uuid.UUID, focus: str
+    ) -> JSONResponse:
+        """``POST /sessions/{id}/compact``: the busy rules of a message apply (Section 6.3)."""
+        access = await self._access(principal, session_id)
+        try:
+            run_id = await self._queue.enqueue_compact(
+                org_id=access.org_id, session_id=session_id, user_id=access.user_id, focus=focus
+            )
+        except RateLimitedError as error:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": str(error)},
+                headers={"Retry-After": str(error.retry_after_s)},
+            )
+        except QueueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return JSONResponse(status_code=202, content={"run_id": str(run_id)})
+
+    async def _lineage(self, principal: Principal, session_id: uuid.UUID) -> LineageOut:
+        """The links of a session. The connection runs as the user, so a linked session that
+        the user may not read is not in the answer."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            up = await ancestors(connection, access.org_id, session_id)
+            down = await children(connection, access.org_id, session_id)
+        return LineageOut(
+            ancestors=[LinkOut.model_validate(link, from_attributes=True) for link in up],
+            children=[LinkOut.model_validate(link, from_attributes=True) for link in down],
+        )
+
+    async def _compactions(
+        self, principal: Principal, session_id: uuid.UUID, limit: int
+    ) -> list[CompactionOut]:
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            rows = await list_compactions(connection, access.org_id, session_id, limit)
+        return [CompactionOut.model_validate(row, from_attributes=True) for row in rows]
+
+    async def _add_pin(self, principal: Principal, session_id: uuid.UUID, body: NewPin) -> PinOut:
+        if (body.text is None) == (body.message_id is None):
+            raise HTTPException(status_code=422, detail="give either text or message_id")
+        access = await self._access(principal, session_id)
+        try:
+            if body.message_id is not None:
+                pin = await self._pins.add_message(
+                    org_id=access.org_id,
+                    session_id=session_id,
+                    user_id=access.user_id,
+                    message_id=body.message_id,
+                )
+            else:
+                pin = await self._pins.add(
+                    org_id=access.org_id,
+                    session_id=session_id,
+                    user_id=access.user_id,
+                    text=body.text or "",
+                )
+        except PinError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return _pin_out(pin)
 
     async def _cancel(self, principal: Principal, run_id: uuid.UUID) -> dict[str, str]:
         async with as_user(self._engine, principal.auth_user_id) as connection:

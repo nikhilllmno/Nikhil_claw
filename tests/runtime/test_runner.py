@@ -261,3 +261,25 @@ def test_a_job_has_a_gate_url_or_a_static_gate() -> None:
     with pytest.raises(ValidationError, match="gate_url or a static gate"):
         RunnerJob(op="run", run=request, gate=GatePolicy(ask=("Bash",)), gate_url="http://x/gate")
     assert RunnerJob(op="run", run=request, gate_url="http://x/gate").gate_url
+
+
+def test_the_claude_runtime_gets_an_archiver_when_the_job_has_an_archive_url(
+    tmp_path: object,
+) -> None:
+    pytest.importorskip("claude_agent_sdk")
+    from sama.runtime.archive import RemoteArchiver
+
+    request = RunRequest(
+        scope=make_scope(), input="hi", config=make_config(RuntimeKind.CLAUDE_AGENT_SDK)
+    )
+    env = {**ENV, "SAMA_WORKDIR": str(tmp_path)}
+    plain = build_runtime(RunnerJob(op="run", run=request, gate_url="http://t/gate"), env)
+    assert plain._archiver is None  # type: ignore[attr-defined]
+    job = RunnerJob(op="run", run=request, gate_url="http://t/gate", archive_url="http://t/archive")
+    archiver = build_runtime(job, env)._archiver  # type: ignore[attr-defined]
+    assert isinstance(archiver, RemoteArchiver)
+    assert "http://t/archive" in repr(archiver)
+    static = build_runtime(
+        RunnerJob(op="run", run=request, gate=GatePolicy(), archive_url="http://t/archive"), env
+    )
+    assert isinstance(static._archiver, RemoteArchiver)  # type: ignore[attr-defined]

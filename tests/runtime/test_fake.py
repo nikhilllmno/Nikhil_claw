@@ -9,6 +9,7 @@ import pytest
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
+    Compacted,
     ContractViolation,
     FailureCode,
     FakeRuntime,
@@ -17,6 +18,7 @@ from sama.runtime import (
     RunCompleted,
     RunEvent,
     RunFailed,
+    RunRequest,
     RuntimeKind,
     TextDelta,
     ToolCallFinished,
@@ -24,6 +26,7 @@ from sama.runtime import (
     Usage,
     validate_event_stream,
 )
+from sama.runtime.contract import CompactRequest
 from tests.support import collect, make_config, make_request, make_scope
 
 
@@ -301,3 +304,48 @@ async def test_cancel_of_a_paused_run_makes_its_approval_invalid() -> None:
     assert len(events) == 1
     assert isinstance(events[0], RunFailed)
     assert events[0].code is FailureCode.INVALID_REQUEST
+
+
+# -- /compact ----------------------------------------------------------------------------------
+
+
+def _compact_request(state: bytes | None, focus: str = "") -> RunRequest:
+    return RunRequest(
+        scope=make_scope(),
+        input="",
+        config=make_config(),
+        runtime_state=state,
+        compact=CompactRequest(focus=focus),
+    )
+
+
+async def test_a_compact_request_halves_the_pretend_context_and_keeps_the_state() -> None:
+    runtime = FakeRuntime()
+    assert runtime.capabilities().manual_compaction
+    assert not runtime.capabilities().compaction_archive
+    first = (await collect(runtime.run(make_request("hello"))))[-1]
+    assert isinstance(first, RunCompleted)
+    events = await collect(runtime.run(_compact_request(first.runtime_state, "the plan")))
+    validate_event_stream(events)
+    assert isinstance(events[0], Compacted)
+    assert (events[0].tokens_before, events[0].tokens_after, events[0].trigger) == (
+        1000,
+        500,
+        "manual",
+    )
+    assert isinstance(events[-1], RunCompleted)
+    assert (events[-1].output, events[-1].runtime_state) == ("", first.runtime_state)
+
+
+async def test_a_compact_request_without_state_is_invalid() -> None:
+    events = await collect(FakeRuntime().run(_compact_request(None)))
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].code is FailureCode.INVALID_REQUEST
+
+
+async def test_a_script_wins_over_the_default_compaction() -> None:
+    runtime = FakeRuntime()
+    runtime.add_script(FakeScript(events=[RunCompleted(output="scripted")]))
+    events = await collect(runtime.run(_compact_request(b"{}")))
+    assert isinstance(events[-1], RunCompleted)
+    assert events[-1].output == "scripted"

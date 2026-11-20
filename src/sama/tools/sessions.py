@@ -28,13 +28,16 @@ def _when(moment: datetime) -> str:
 
 def _header(hit: SessionHit) -> str:
     title = " ".join((hit.title or "(no title)").split())
-    return (
+    header = (
         f"session_id: {hit.session_id}\n"
         f"title: {title}\n"
         f"audience: {hit.audience}\n"
         f"started: {_when(hit.created_at)}\n"
         f"last activity: {_when(hit.updated_at)}"
     )
+    if hit.lineage is not None and hit.parent_session_id is not None:
+        header += f"\n{hit.lineage} of session: {hit.parent_session_id}"
+    return header
 
 
 def format_sessions(hits: Sequence[SessionHit], *, query: str | None) -> str:
@@ -74,6 +77,9 @@ def format_page(page: SessionPage) -> str:
         used += len(entry)
     end = page.offset + len(shown)
     lines = [_header(page.session)]
+    if page.archives:
+        archives = ", ".join(str(archive) for archive in page.archives)
+        lines.append(f"archives of the transcript before a compaction: {archives}")
     lines.append(f"messages: {page.offset + 1 if shown else 0} to {end} of {page.total}")
     if end < page.total:
         lines.append(f"more: call session_read again with offset {end}")

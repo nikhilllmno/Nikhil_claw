@@ -52,6 +52,10 @@ class SessionHit:
     created_at: datetime
     updated_at: datetime
     snippets: tuple[Snippet, ...] = ()
+    # How the session links to another one (Section 6.3). Both are ``None`` for a session that
+    # started on its own.
+    lineage: str | None = None
+    parent_session_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +72,8 @@ class SessionPage:
     total: int
     offset: int
     messages: tuple[PageMessage, ...] = field(default=())
+    # The archives of the transcript before each compaction of this session, oldest first.
+    archives: tuple[uuid.UUID, ...] = field(default=())
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,6 +21,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.context import Pin, PinError, PinStore
 from sama.db.models import (
     ENDED_RUN_STATUSES,
     AgentProfile,
@@ -32,6 +33,7 @@ from sama.db.models import (
     RunEvent,
     Session,
     SessionBinding,
+    SessionCompaction,
     User,
 )
 from sama.gate.approvers import Approvers, approvers_of
@@ -364,6 +366,32 @@ async def final_text(engine: AsyncEngine, org_id: uuid.UUID, run_id: uuid.UUID) 
     return str((output or {}).get("text") or "")
 
 
+async def compaction_text(engine: AsyncEngine, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
+    """The result of a ``/compact`` run for a chat, or an empty text for a run that did not
+    compact."""
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                select(SessionCompaction.tokens_before, SessionCompaction.tokens_after)
+                .where(
+                    SessionCompaction.org_id == org_id,
+                    SessionCompaction.run_id == run_id,
+                    SessionCompaction.completed_at.is_not(None),
+                )
+                .order_by(SessionCompaction.created_at.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+    if row is None:
+        return ""
+    if row.tokens_before is not None and row.tokens_after is not None:
+        return (
+            f"The context is compacted: {row.tokens_before} tokens before and "
+            f"{row.tokens_after} tokens now."
+        )
+    return "The context is compacted."
+
+
 async def failure_message(engine: AsyncEngine, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
     async with engine.connect() as connection:
         message = (
@@ -511,8 +539,10 @@ async def send_ending(
     """The last messages of a run: the stored answer when no text showed, the failure, or the
     stop."""
     if status == "completed" and not reply.sent_any:
-        # A runtime that sends no text deltas: show the stored answer.
+        # A runtime that sends no text deltas: show the stored answer. A ``/compact`` run has
+        # no answer, so it shows the result of the compaction.
         text = (await final_text(engine, org_id, run_id))[:MAX_FINAL_CHARS]
+        text = text or await compaction_text(engine, org_id, run_id)
         for start in range(0, len(text), SPLIT_AT):
             await outbox.send_message(text[start : start + SPLIT_AT])
     elif status == "failed":
@@ -611,3 +641,46 @@ class KeyedLocks:
 
     def __len__(self) -> int:
         return len(self._held)
+
+
+PIN_COMMANDS: Final = frozenset({"pin", "pins", "unpin"})
+PIN_USAGE: Final = "Write the text to pin after the command."
+COMPACTING: Final = "Compacting the context. This can take a minute."
+
+
+def _pin_line(number: int, pin: Pin) -> str:
+    text = " ".join(pin.text.split())
+    return f"{number}. {text[:120]}{'...' if len(text) > 120 else ''}"
+
+
+async def pin_reply(
+    pins: PinStore, target: Target, session_id: uuid.UUID | None, name: str, rest: str
+) -> str:
+    """The answer to ``pin``, ``pins``, or ``unpin`` from a chat. ``session_id`` is the session
+    of the chat. It is ``None`` when the chat has none yet."""
+    if name == "pins" or (name == "unpin" and not rest.strip()):
+        listed = [] if session_id is None else await pins.list(target.org_id, session_id)
+        if not listed:
+            return "This session has no pins."
+        return "Pins:\n" + "\n".join(_pin_line(n, pin) for n, pin in enumerate(listed, start=1))
+    if name == "pin":
+        if not rest.strip():
+            return PIN_USAGE
+        if session_id is None:
+            return "Send a message first. Then you can pin."
+        try:
+            await pins.add(
+                org_id=target.org_id, session_id=session_id, user_id=target.user_id, text=rest
+            )
+        except PinError as error:
+            return str(error)
+        return "Pinned. The pin stays in the context after a compaction."
+    # unpin
+    if session_id is None or not rest.strip().isdecimal():
+        return "Write the number of the pin after the command. The pin list shows the numbers."
+    listed = await pins.list(target.org_id, session_id)
+    number = int(rest.strip())
+    if not 1 <= number <= len(listed):
+        return "No pin has this number. The pin list shows the numbers."
+    await pins.remove(target.org_id, session_id, listed[number - 1].id)
+    return "Removed."

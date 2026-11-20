@@ -17,6 +17,7 @@ from sama.orchestrator.sandboxed import CAPABILITIES, SandboxedRuntime, SandboxS
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
+    Compacted,
     FailureCode,
     ResumeRequest,
     RunCompleted,
@@ -30,6 +31,7 @@ from sama.runtime import (
     Usage,
     validate_event_stream,
 )
+from sama.runtime.contract import CompactRequest
 from sama.runtime.fake import FakeRuntime, FakeScript
 from sama.sandbox import SandboxError, SandboxSpec
 from sama.sandbox.local import LocalProvider, LocalSandbox
@@ -593,3 +595,38 @@ def test_an_unsupported_kind_is_refused(provider: CountingProvider) -> None:
             signer=RunTokenSigner(KEY),
             settings=SandboxSettings(template="local"),
         )
+
+
+async def test_a_compact_request_reaches_the_runner(runtime: SandboxedRuntime) -> None:
+    first = await collect(runtime.run(_request(make_scope("run-1"))))
+    done = first[-1]
+    assert isinstance(done, RunCompleted)
+    assert done.runtime_state is not None
+    compact = RunRequest(
+        scope=make_scope("run-2"),
+        input="",
+        config=CONFIG,
+        runtime_state=done.runtime_state,
+        compact=CompactRequest(focus="keep the plan"),
+    )
+    events = await collect(runtime.run(compact))
+    validate_event_stream(events)
+    assert [type(event) for event in events] == [Compacted, RunCompleted]
+    assert isinstance(events[0], Compacted)
+    assert (events[0].tokens_before, events[0].tokens_after, events[0].trigger) == (
+        1000,
+        500,
+        "manual",
+    )
+
+
+def test_the_capabilities_of_the_sandboxed_runtimes_name_the_compaction_features() -> None:
+    assert CAPABILITIES[RuntimeKind.FAKE].manual_compaction
+    assert not CAPABILITIES[RuntimeKind.FAKE].compaction_archive
+    assert CAPABILITIES[RuntimeKind.CLAUDE_AGENT_SDK].manual_compaction
+    assert CAPABILITIES[RuntimeKind.CLAUDE_AGENT_SDK].compaction_archive
+
+
+def test_the_settings_can_name_the_archive_endpoint() -> None:
+    assert SandboxSettings(template="t").archive_url is None
+    assert SandboxSettings(template="t", archive_url="http://tools/archive").archive_url

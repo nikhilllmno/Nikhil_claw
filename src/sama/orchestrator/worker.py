@@ -43,6 +43,7 @@ from sama.runtime.contract import (
     ApprovalRequired,
     Audience,
     Budget,
+    CompactRequest,
     FailureCode,
     ResumeRequest,
     RunCompleted,
@@ -239,6 +240,8 @@ class Worker:
         try:
             runtime = self._runtimes.get(RuntimeKind(run.runtime))
             budget = Budget.model_validate(dict(run.budget))
+            if run.compact and not runtime.capabilities().manual_compaction:
+                raise ValueError(f"the runtime {run.runtime} cannot compact on request")
             config = await self._config(run)
             scope = _scope(run)
         except Exception as error:
@@ -425,10 +428,12 @@ async def _stream(
         events = runtime.run(
             RunRequest(
                 scope=scope,
-                input=run.input,
+                # A compact run has no message: its input is the focus of the summary.
+                input="" if run.compact else run.input,
                 config=config,
                 budget=budget,
                 runtime_state=run.runtime_state,
+                compact=CompactRequest(focus=run.input) if run.compact else None,
             )
         )
     try:

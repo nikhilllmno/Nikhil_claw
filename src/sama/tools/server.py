@@ -14,7 +14,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict
-from typing import Annotated, Any, Final, Literal, Protocol
+from typing import Annotated, Any, Final, Literal, Protocol, runtime_checkable
 
 import anyio
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
@@ -29,7 +29,8 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from sama.gate.decide import Verdict
+from sama.context.compaction import ArchiveError
+from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, Verdict
 from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
 from sama.media.vision import (
     DEFAULT_QUESTION,
@@ -49,6 +50,12 @@ from sama.memory.core import (
     Target,
 )
 from sama.memory.service import MemoryService
+from sama.runtime.archive import (
+    ARCHIVE_PATH,
+    MAX_ARCHIVE_BODY_BYTES,
+    ArchiveAnswer,
+    TranscriptArchive,
+)
 from sama.search import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -70,6 +77,18 @@ from sama.tools.clarify import (
     ClarifyError,
     ClarifyQuestion,
     render_answers,
+)
+from sama.tools.deferred import (
+    DEFAULT_SEARCH_LIMIT,
+    MAX_SEARCH_LIMIT,
+    DeferredCatalog,
+    DeferredToolError,
+    format_describe,
+    format_search,
+    missing_arguments,
+)
+from sama.tools.deferred import (
+    MAX_QUERY_CHARS as MAX_TOOL_QUERY_CHARS,
 )
 from sama.tools.outbound import OutboundClient
 from sama.tools.output import Spill, cap, untrusted
@@ -110,6 +129,7 @@ MAX_ERROR_CHARS: Final = 2_000
 
 _EXPECTED = (
     ClarifyError,
+    DeferredToolError,
     MemoryChangeError,
     RepoError,
     SearchError,
@@ -131,6 +151,20 @@ class GateBackend(Protocol):
     async def screen(
         self, claims: RunTokenClaims, tool_name: str, arguments: Mapping[str, Any]
     ) -> Verdict: ...
+
+
+@runtime_checkable
+class ToolVisibility(Protocol):
+    """A gate that knows which tools a run can use. ``GateService`` has it. The tool search
+    shows only these tools. Without it, the search shows every deferred tool."""
+
+    async def visible_tools(self, claims: RunTokenClaims) -> frozenset[str]: ...
+
+
+class ArchiveBackend(Protocol):
+    """Stores the transcript of a compaction, normally ``sama.context.ContextArchive``."""
+
+    async def archive(self, claims: RunTokenClaims, body: TranscriptArchive) -> ArchiveAnswer: ...
 
 
 def bearer_of(headers: Mapping[str, str] | None) -> str | None:
@@ -206,6 +240,12 @@ class ToolServer:
     - ``sessions``: session search. Without it, ``session_search`` and ``session_read`` are
       hidden.
     - ``vision``: image analysis (``vision_analyze``). Without it, the tool is hidden.
+    - ``deferred``: the catalog of deferred tools. With at least one tool in it when the app
+      is built, the server has ``tool_search``, ``tool_describe``, and ``tool_call``
+      (Section 10.3). Without it, these tools are hidden.
+    - ``archive``: stores the transcript before a compaction (Section 6.3). With it, the
+      server answers ``POST /archive`` for the runner. Without it, ``/archive`` answers
+      ``503`` and the runtime compacts without an archive.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -225,9 +265,13 @@ class ToolServer:
         skills: SkillStore | None = None,
         sessions: SessionSearch | None = None,
         vision: VisionService | None = None,
+        deferred: DeferredCatalog | None = None,
+        archive: ArchiveBackend | None = None,
         gate: GateBackend | None = None,
     ) -> None:
         self.signer = signer
+        self.deferred = deferred
+        self.archive = archive
         self.gate = gate
         self.todos = todos
         self.outbound = outbound or OutboundClient()
@@ -539,6 +583,9 @@ class ToolServer:
                 arguments = {"attachment_id": attachment_id, "question": question}
                 return await self._call(ctx, VISION_ANALYZE, arguments, body)
 
+        if self.deferred is not None and len(self.deferred) > 0:
+            self._deferred_tools(server, self.deferred)
+
         if self.repos is not None:
             repos = self.repos
 
@@ -664,6 +711,86 @@ class ToolServer:
 
         return server
 
+    async def _visible(self, claims: RunTokenClaims, catalog: DeferredCatalog) -> frozenset[str]:
+        """The deferred tools that the run can use now."""
+        if isinstance(self.gate, ToolVisibility):
+            return await self.gate.visible_tools(claims)
+        return catalog.names()
+
+    def _deferred_tools(self, server: MCPServer, catalog: DeferredCatalog) -> None:
+        """``tool_search``, ``tool_describe``, and ``tool_call`` (Section 10.3)."""
+        read = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+
+        @server.tool(
+            name=TOOL_SEARCH,
+            description=(
+                "Search the tools that are not in your tool list. Give some words for what you "
+                "want to do. The result has tool names and short descriptions. Then use "
+                "tool_describe for the arguments, and tool_call to run a tool."
+            ),
+            annotations=read,
+            structured_output=False,
+        )
+        async def tool_search(
+            ctx: Context,
+            query: Annotated[str | None, Field(max_length=MAX_TOOL_QUERY_CHARS)] = None,
+            limit: Annotated[int, Field(ge=1, le=MAX_SEARCH_LIMIT)] = DEFAULT_SEARCH_LIMIT,
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                allowed = await self._visible(claims, catalog)
+                found = catalog.search(query, allowed, limit)
+                return format_search(found, query=(query or "").strip() or None)
+
+            return await self._call(ctx, TOOL_SEARCH, {"query": query, "limit": limit}, body)
+
+        @server.tool(
+            name=TOOL_DESCRIBE,
+            description=(
+                "Show the description and the arguments (a JSON schema) of one tool that "
+                "tool_search found."
+            ),
+            annotations=read,
+            structured_output=False,
+        )
+        async def tool_describe(
+            name: Annotated[str, Field(min_length=1, max_length=64)], ctx: Context
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                tool = catalog.get(name)
+                if tool is None or name not in await self._visible(claims, catalog):
+                    raise DeferredToolError(f"no tool has the name {name}")
+                return format_describe(tool)
+
+            return await self._call(ctx, TOOL_DESCRIBE, {"name": name}, body)
+
+        @server.tool(
+            name=TOOL_CALL,
+            description=(
+                "Run a tool that tool_search found. Give the tool name and its arguments as an "
+                "object, as tool_describe shows. The call goes through the same checks and "
+                "approvals as a call of the tool itself."
+            ),
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            structured_output=False,
+        )
+        async def tool_call(
+            name: Annotated[str, Field(min_length=1, max_length=64)],
+            ctx: Context,
+            arguments: dict[str, Any] | None = None,
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                # The gate judged the tool that this call names, with these arguments, in
+                # ``_call``. The catalog gives no authority of its own.
+                tool = catalog.get(name)
+                if tool is None:
+                    raise DeferredToolError(f"no tool has the name {name}")
+                given = arguments or {}
+                if missing := missing_arguments(tool, given):
+                    raise DeferredToolError(f"missing arguments: {', '.join(missing)}")
+                return await tool.handler(claims, given)
+
+            return await self._call(ctx, TOOL_CALL, {"name": name, "arguments": arguments}, body)
+
     # -- ASGI -------------------------------------------------------------------------------
 
     def app(
@@ -696,6 +823,7 @@ class ToolServer:
             routes=[
                 Route("/healthz", healthz, methods=["GET"]),
                 Route(GATE_PATH, self._gate_endpoint, methods=["POST"]),
+                Route(ARCHIVE_PATH, self._archive_endpoint, methods=["POST"]),
                 Mount("", app=_RunTokenGate(inner, self.signer)),
             ],
             lifespan=lifespan,
@@ -726,6 +854,32 @@ class ToolServer:
         except Exception as error:
             log.error("gate failed run=%s error=%s", claims.run_id, type(error).__name__)
             answer = GateAnswer(action="deny", reason="the tool gate failed")
+        return JSONResponse(answer.model_dump())
+
+    async def _archive_endpoint(self, request: Request) -> Response:
+        """``POST /archive``: the transcript before a compaction of the run of the token."""
+        try:
+            claims = verify_bearer(self.signer, request.headers)
+        except InvalidRunTokenError as error:
+            return _unauthorized(error)
+        if self.archive is None:
+            return JSONResponse({"error": "the archive is not configured"}, status_code=503)
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > MAX_ARCHIVE_BODY_BYTES:
+                return JSONResponse({"error": "the archive is too large"}, status_code=413)
+        try:
+            body = TranscriptArchive.model_validate_json(bytes(raw))
+        except ValidationError:
+            return JSONResponse({"error": "the archive is not valid"}, status_code=422)
+        try:
+            answer = await self.archive.archive(claims, body)
+        except ArchiveError as error:
+            return JSONResponse({"error": str(error)}, status_code=409)
+        except Exception as error:
+            log.error("archive failed run=%s error=%s", claims.run_id, type(error).__name__)
+            return JSONResponse({"error": "the archive failed"}, status_code=503)
         return JSONResponse(answer.model_dump())
 
 

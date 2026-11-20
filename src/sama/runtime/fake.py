@@ -18,6 +18,7 @@ from sama.runtime.contract import (
     ApprovalDecision,
     ApprovalRequired,
     Capabilities,
+    Compacted,
     FailureCode,
     ResumeRequest,
     RunCompleted,
@@ -104,6 +105,8 @@ class FakeRuntime:
             native_file_checkpoints=False,
             resumable_sessions=True,
             mcp_client=False,
+            manual_compaction=True,
+            compaction_archive=False,
         )
 
     def add_script(self, script: FakeScript) -> None:
@@ -118,7 +121,12 @@ class FakeRuntime:
         if run_id in self._active or any(p.run_id == run_id for p in self._pending.values()):
             yield _invalid(f"run {run_id} is already active")
             return
-        script = self._queue.popleft() if self._queue else _echo_script(request)
+        if self._queue:
+            script = self._queue.popleft()
+        elif request.compact is not None:
+            script = _compact_script(request)
+        else:
+            script = _echo_script(request)
         async for event in self._stream(run_id, script.events, script.delay_s, Usage()):
             if isinstance(event, ApprovalRequired):
                 self._pending[event.approval_id] = _Pending(run_id, script, event.usage)
@@ -205,3 +213,16 @@ def _echo_script(request: RunRequest) -> FakeScript:
     final_usage = Usage(input_tokens=input_tokens, output_tokens=len(words))
     events.append(RunCompleted(output=reply, runtime_state=state, usage=final_usage))
     return FakeScript(events=events)
+
+
+def _compact_script(request: RunRequest) -> FakeScript:
+    """A ``compact`` request with no script: the fake halves a pretend context of 1,000 tokens.
+    Without a runtime state, there is nothing to compact."""
+    if request.runtime_state is None:
+        return FakeScript(events=[_invalid("there is nothing to compact")])
+    return FakeScript(
+        events=[
+            Compacted(tokens_before=1_000, tokens_after=500, trigger="manual"),
+            RunCompleted(output="", runtime_state=request.runtime_state),
+        ]
+    )

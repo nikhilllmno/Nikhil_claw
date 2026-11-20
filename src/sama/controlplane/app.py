@@ -32,6 +32,7 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.context import ContextArchive
 from sama.controlplane.settings import ControlPlaneSettings
 from sama.db.engine import create_engine
 from sama.gate.service import GateService
@@ -54,12 +55,14 @@ from sama.orchestrator.sandboxed import SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
 from sama.review.proposals import PostgresProposalStore
+from sama.runtime.archive import ARCHIVE_PATH
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.sandbox.base import SandboxProvider
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
+from sama.tools.deferred import DeferredCatalog
 from sama.tools.output import SandboxSpill
 from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
@@ -140,7 +143,10 @@ def build(
         },
     )
     signer = RunTokenSigner(settings.run_token_key.get_secret_value().encode())
-    gate = GateService(engine)
+    # The deferred tools are in one catalog. The gate reads their toolsets from it, and the tool
+    # server runs them (Section 10.3). The catalog is empty until a feature adds tools.
+    deferred = DeferredCatalog()
+    gate = GateService(engine, extra_toolsets=deferred)
     broker = ClarifyBroker()
     library = SkillLibrary(engine, BuiltinSkills().all())
     # A background review proposes the changes of shared memory and shared skills. A person
@@ -165,6 +171,7 @@ def build(
                 template=settings.sandbox_template,
                 model_url=settings.model_url,
                 gate_url=f"{settings.tools_url}{GATE_PATH}",
+                archive_url=f"{settings.tools_url}{ARCHIVE_PATH}",
                 allow_out=settings.allow_out,
             ),
             directory=PostgresSandboxDirectory(engine),
@@ -226,6 +233,8 @@ def build(
             if keys.available(SecretName.ANTHROPIC_API_KEY)
             else None
         ),
+        deferred=deferred,
+        archive=ContextArchive(engine),
         gate=gate,
     )
     proxy = ModelProxy(
