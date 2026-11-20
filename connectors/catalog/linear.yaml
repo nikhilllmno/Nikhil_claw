@@ -1,0 +1,193 @@
+# The Linear connector (docs/architecture.md, Section 10.3). Composio holds the
+# credential. The tool schemas are a trimmed copy of the Composio tool schemas.
+name: linear
+title: Linear
+description: Read and write issues and comments in Linear.
+kind: composio
+scopes:
+- personal
+- workspace
+composio:
+  toolkit: linear
+tools:
+- name: linear_list_linear_issues
+  slug: LINEAR_LIST_LINEAR_ISSUES
+  access: read
+  description: Lists non-archived linear issues; if project id is not specified, issues from all accessible
+    projects are returned. can also filter by assignee id to get issues assigned to a specific user.
+  input_schema:
+    type: object
+    properties:
+      after:
+        type: string
+        description: Cursor for pagination. Use the `endCursor` from the previous response's `page_info`
+          to fetch the next set of issues.
+      first:
+        type: integer
+        description: Number of issues to return.
+        default: 10
+        minimum: 1
+        maximum: 250
+      project_id:
+        type: string
+        description: ID of the project to filter issues by. If provided, only issues belonging to this
+          project will be returned.
+      assignee_id:
+        type: string
+        description: ID of the user to filter issues by assignee. If provided, only issues assigned to
+          this user will be returned.
+- name: linear_get_linear_issue
+  slug: LINEAR_GET_LINEAR_ISSUE
+  access: read
+  description: Retrieves an existing linear issue's comprehensive details, including title, description,
+    attachments, and comments.
+  input_schema:
+    type: object
+    properties:
+      issue_id:
+        type: string
+        description: The unique identifier of the Linear issue.
+    required:
+    - issue_id
+- name: linear_list_linear_teams
+  slug: LINEAR_LIST_LINEAR_TEAMS
+  access: read
+  description: Retrieves all teams, including their members, and filters each team's associated projects
+    by the provided 'project id'.
+  input_schema:
+    type: object
+    properties:
+      project_id:
+        type: string
+        description: The unique identifier of a project. This ID is used to filter the list of projects
+          associated with each retrieved team. If a team is not associated with this project ID, its 'projects'
+          list in the response will be empty.
+    required:
+    - project_id
+- name: linear_create_linear_issue
+  slug: LINEAR_CREATE_LINEAR_ISSUE
+  access: write
+  description: Creates a new issue in a specified linear project and team, requiring a title and description,
+    and allowing for optional properties like assignee, state, priority, cycle, and due date.
+  input_schema:
+    type: object
+    properties:
+      title:
+        type: string
+        description: The title of the new issue.
+      team_id:
+        type: string
+        description: Identifier of the team responsible for this issue.
+      cycle_id:
+        type: string
+        description: Identifier of the cycle (sprint) to assign this issue to. Cycles are time-bound periods
+          used to organize and prioritize work. Only applicable if the team has cycles feature enabled.
+      due_date:
+        type: string
+        description: 'The target completion date for the issue, formatted as ''YYYY,MM,DD,hh,mm,ss''.
+          For example: ''2024,10,27,12,58,00''.'
+      estimate:
+        type: integer
+        description: The estimated complexity or effort for the issue, represented as a numerical point
+          value (e.g., 1, 2, 3, 5, 8). The specific scale used (e.g., Fibonacci, Linear, T-shirt sizes
+          mapped to numbers) is defined by the team's settings. This field only applies if the estimates
+          feature is enabled for the...
+        default: 0
+      priority:
+        type: integer
+        description: Priority of the issue. 0 indicates no priority, 1 is Urgent, 2 is High, 3 is Normal,
+          and 4 is Low.
+        default: 0
+      state_id:
+        type: string
+        description: Identifier of the workflow state to assign to the issue (e.g., backlog, to do, in
+          progress, done).
+      label_ids:
+        type: array
+        description: A list of identifiers for labels to be added to this issue.
+        default: []
+        items:
+          type: string
+      parent_id:
+        type: string
+        description: Identifier of an existing issue to set as the parent of this new issue, creating
+          a sub-issue relationship.
+      project_id:
+        type: string
+        description: Identifier of the project to which this issue will be associated.
+      assignee_id:
+        type: string
+        description: Identifier of the user to assign to this issue.
+      description:
+        type: string
+        description: A detailed description of the issue, which can include markdown formatting.
+    required:
+    - team_id
+    - title
+- name: linear_create_linear_comment
+  slug: LINEAR_CREATE_LINEAR_COMMENT
+  access: write
+  description: Creates a new comment on a specified linear issue.
+  input_schema:
+    type: object
+    properties:
+      body:
+        type: string
+        description: Non-empty comment content, in plain text or Markdown.
+      issue_id:
+        type: string
+        description: Identifier of the existing Linear issue for the comment.
+    required:
+    - issue_id
+    - body
+- name: linear_update_issue
+  slug: LINEAR_UPDATE_ISSUE
+  access: write
+  description: Updates an existing linear issue using its `issue id`; requires at least one other attribute
+    for modification, and all provided entity ids (for state, assignee, labels, etc.) must be valid.
+  input_schema:
+    type: object
+    properties:
+      title:
+        type: string
+        description: New title for the issue.
+      team_id:
+        type: string
+        description: Identifier of the team to associate with the issue.
+      due_date:
+        type: string
+        description: New due date in 'YYYY,MM,DD,hh,mm,ss' format (e.g., '2024,10,27,12,58,00').
+      estimate:
+        type: integer
+        description: New time estimate in minutes.
+      issue_id:
+        type: string
+        description: Identifier of the issue to update.
+      priority:
+        type: integer
+        description: 'Priority: 0 (No), 1 (Urgent), 2 (High), 3 (Normal), 4 (Low).'
+        minimum: 0
+        maximum: 4
+      state_id:
+        type: string
+        description: Identifier of the new state (e.g., To Do, In Progress, Done).
+      label_ids:
+        type: array
+        description: List of label identifiers to set; replaces all existing labels. An empty list removes
+          all labels.
+        items:
+          type: string
+      parent_id:
+        type: string
+        description: Identifier of an existing issue to set as parent.
+      project_id:
+        type: string
+        description: Identifier of the project to associate with the issue.
+      assignee_id:
+        type: string
+        description: Identifier of the user to assign to the issue.
+      description:
+        type: string
+        description: New Markdown description for the issue.
+    required:
+    - issue_id

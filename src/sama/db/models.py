@@ -60,7 +60,11 @@ RESUME_DECISIONS: Final = ("approve", "reject")
 RUN_KINDS: Final = ("chat", "review")
 """``chat`` answers a user message. ``review`` is the background review of a session
 (docs/architecture.md, Section 9.4)."""
-PROPOSAL_KINDS: Final = ("memory", "skill")
+PROPOSAL_KINDS: Final = ("memory", "skill", "soul")
+PROPOSAL_ORIGINS: Final = ("review", "chat")
+"""``review``: a background review proposed the change. ``chat``: the agent proposed it in a chat
+run, because the user of the run does not have the role for the change (Section 9.4)."""
+WORKER_BOT_STATUSES: Final = ("active", "disabled")
 PROPOSAL_SCOPES: Final = ("agent", "workspace", "org")
 PROPOSAL_STATUSES: Final = ("pending", "applied", "failed", "discarded")
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
@@ -77,7 +81,14 @@ VAULT_NAMES: Final = (
     "telegram_bot_token",
     "slack_bot_token",
     "slack_signing_secret",
+    "composio_api_key",
 )
+CONNECTION_SECRET_PATTERN: Final = "^connection:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
+"""The vault name of the secret fields of one connection (Section 10.3): ``connection:<id>``."""
+CONNECTION_SCOPES: Final = ("personal", "workspace")
+CONNECTION_KINDS: Final = ("composio", "mcp_remote", "mcp_hosted", "database", "http_api", "plugin")
+CONNECTION_STATES: Final = ("pending", "initiated", "connected", "failed", "expired", "disabled")
+"""The states of a connection (Section 10.3). Only the backend sets ``connected``."""
 INTEGRATION_KINDS: Final = ("telegram", "slack")
 """The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
@@ -292,12 +303,16 @@ class Session(Base):
         ),
         Index(None, "org_id", "workspace_id"),
         Index(None, "owner_user_id"),
+        Index(None, "org_id", "worker_bot_id", postgresql_where=text("worker_bot_id IS NOT NULL")),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     org_id: Mapped[uuid.UUID] = _org_id()
     workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    worker_bot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The worker bot that answers in the session (Section 11.6). A plain column, not a foreign
+    key: a deleted bot leaves its sessions, and they stop counting for any budget."""
     audience: Mapped[str] = mapped_column(Text, nullable=False)
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     parent_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -1001,6 +1016,48 @@ class ChannelGroup(Base):
     updated_at: Mapped[datetime] = _created_at()
 
 
+class WorkerBot(Base):
+    """An agent profile that is bound to one Slack channel, with a daily budget (Section 11.6).
+
+    A mention of the app in the channel starts a shared session with the profile of the bot. The
+    model cost of the sessions of the bot in one UTC day must stay below ``daily_budget_usd``.
+    Only the control plane writes the table."""
+
+    __tablename__ = "worker_bots"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        _integration_fk(),
+        UniqueConstraint("integration_id", "external_id"),
+        CheckConstraint(_one_of("status", WORKER_BOT_STATUSES), name="status"),
+        CheckConstraint("daily_budget_usd > 0", name="daily_budget_usd"),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 80", name="name"),
+        Index(None, "org_id", "workspace_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    integration_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The Slack integration (the app) that the channel uses."""
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """The Slack channel id."""
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    daily_budget_usd: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
 class PairingCode(Base):
     """A single-use code that links a chat account or a group chat (Section 11.3).
 
@@ -1052,7 +1109,9 @@ class VaultSecret(Base):
     __tablename__ = "vault_secrets"
     __table_args__ = (
         UniqueConstraint("org_id", "name"),
-        CheckConstraint(_one_of("name", VAULT_NAMES), name="name"),
+        CheckConstraint(
+            f"{_one_of('name', VAULT_NAMES)} OR name ~ '{CONNECTION_SECRET_PATTERN}'", name="name"
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -1247,6 +1306,7 @@ class ReviewProposal(Base):
         UniqueConstraint("approval_id"),
         CheckConstraint(_one_of("kind", PROPOSAL_KINDS), name="kind"),
         CheckConstraint(_one_of("scope", PROPOSAL_SCOPES), name="scope"),
+        CheckConstraint(_one_of("origin", PROPOSAL_ORIGINS), name="origin"),
         CheckConstraint(_one_of("status", PROPOSAL_STATUSES), name="status"),
         CheckConstraint("(status = 'applied') = (applied_at IS NOT NULL)", name="applied_at"),
         Index(None, "org_id", "session_id"),
@@ -1264,8 +1324,10 @@ class ReviewProposal(Base):
     """The user of the session when the review proposed the change, if there was one."""
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     scope: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False, server_default="review")
     payload: Mapped[dict[str, Any]] = _json()
-    """The full change: the memory target and operations, or the ``skill_manage`` request."""
+    """The full change: the memory target and operations, the ``skill_manage`` request, or the
+    new soul of the profile."""
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
@@ -1353,6 +1415,64 @@ class ContextPin(Base):
     injected_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     """The run that got the pin. A claim of the same run again gets the pin again."""
     created_at: Mapped[datetime] = _created_at()
+
+
+class Connection(Base):
+    """One configured account or endpoint of a connector in a workspace (docs/architecture.md,
+    Section 10.3). A ``personal`` connection belongs to ``owner_user_id``. A ``workspace``
+    connection is shared. The row has no secret: ``secret_ref`` names the vault entry of the
+    secret fields of a form connection, and a Composio connection keeps its credentials at
+    Composio. Only the control plane writes the table."""
+
+    __tablename__ = "connections"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "owner_user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint(
+            "org_id",
+            "workspace_id",
+            "connector",
+            "owner_user_id",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(_one_of("scope", CONNECTION_SCOPES), name="scope"),
+        CheckConstraint(_one_of("kind", CONNECTION_KINDS), name="kind"),
+        CheckConstraint(_one_of("state", CONNECTION_STATES), name="state"),
+        CheckConstraint("(scope = 'personal') = (owner_user_id IS NOT NULL)", name="owner"),
+        CheckConstraint("connector ~ '^[a-z][a-z0-9_-]{0,39}$'", name="connector"),
+        CheckConstraint(
+            "secret_ref IS NULL OR secret_ref = 'connection:' || id::text", name="secret_ref"
+        ),
+        CheckConstraint(
+            "last_error IS NULL OR char_length(last_error) <= 500", name="last_error_length"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    connector: Mapped[str] = mapped_column(Text, nullable=False)
+    """The name of the catalog manifest."""
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    config: Mapped[dict[str, Any]] = _json()
+    """Non-secret settings, for example the Composio account id and entity id."""
+    secret_ref: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    tool_cache: Mapped[dict[str, Any]] = _json()
+    policy_overrides: Mapped[dict[str, Any]] = _json()
+    last_health_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
 
 
 class GitHubInstallation(Base):

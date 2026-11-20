@@ -31,6 +31,7 @@ from sama.db.models import (
     AuditEntry,
     ChannelGroup,
     ChannelIdentity,
+    Connection,
     ContextPin,
     GitHubInstallation,
     GitHubPushGrant,
@@ -56,6 +57,7 @@ from sama.db.models import (
     ToolPolicy,
     User,
     VaultSecret,
+    WorkerBot,
     Workspace,
 )
 
@@ -319,6 +321,27 @@ def plan(
             name=f"{org}_bot",
             created_by_user_id=ids[user],
         )
+    # Connections: a workspace connection shows to the workspace, a personal connection only to
+    # its owner (Section 10.3).
+    connections: tuple[tuple[str, str, str, str | None, str], ...] = (
+        ("conn:a1", "org-a", "a1", None, "alice"),
+        ("conn:a1-alice", "org-a", "a1", "alice", "alice"),
+        ("conn:a2", "org-a", "a2", None, "carol"),
+        ("conn:b1", "org-b", "b1", None, "bob"),
+        ("conn:b1-bob", "org-b", "b1", "bob", "bob"),
+    )
+    for label, org, workspace, owner, creator in connections:
+        add(
+            Connection,
+            label,
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            scope="personal" if owner else "workspace",
+            owner_user_id=ids[owner] if owner else None,
+            connector="gmail",
+            kind="composio",
+            created_by_user_id=ids[creator],
+        )
     # Telegram links: each user reads only their own; a group shows to the workspace.
     for user, org, workspace, profile in (
         ("alice", "org-a", "a1", "profile-a"),
@@ -344,6 +367,18 @@ def plan(
             created_by_user_id=ids[user],
             external_id=f"-{uuid.uuid4().int % 10**12}",
             **links,
+        )
+        add(
+            WorkerBot,
+            f"bot:{workspace}",
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            agent_profile_id=ids[profile],
+            integration_id=ids[f"int:{org}"],
+            external_id=f"C{uuid.uuid4().hex[:10].upper()}",
+            name=f"bot {workspace}",
+            daily_budget_usd=5,
+            created_by_user_id=ids[user],
         )
         add(
             PairingCode,

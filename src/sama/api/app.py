@@ -22,10 +22,13 @@ from collections import Counter
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from importlib import resources
 from typing import Annotated, Any, Final, Literal, Self
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,8 +45,10 @@ from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.types import ASGIApp, Lifespan
 
+from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.origins import check_origins
+from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
     Pin,
@@ -71,6 +76,7 @@ from sama.db.models import (
     User,
     Workspace,
 )
+from sama.db.models import Connection as ConnectionRow
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.gateway.pairing import PairingError, create_code
 from sama.github.routes import setup_router
@@ -153,8 +159,24 @@ class ApiSettings(BaseModel):
 # -- request and response bodies ------------------------------------------------------------
 
 
+MAX_FORM_FIELDS: Final = 20
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class _Edit(_Body):
+    """A body of optional fields to change. It has at least one field, and no field is null."""
+
+    @model_validator(mode="after")
+    def _has_a_field(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field to change")
+        for name in sorted(self.model_fields_set):
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
 
 
 class NewSession(_Body):
@@ -216,6 +238,17 @@ class GitHubRepoAdd(_Body):
         return paths
 
 
+class ConnectionStart(_Body):
+    connector: str = Field(min_length=1, max_length=40)
+    scope: Literal["personal", "workspace"] = "personal"
+
+
+class ConnectionForm(_Body):
+    values: dict[str, SecretStr] = Field(max_length=MAX_FORM_FIELDS)
+    """The fields of the form of the connector. Each value is secret here: the service keeps
+    the non-secret fields in the row and the secret fields in the vault."""
+
+
 class SlackConnect(_Body):
     bot_token: SecretStr = Field(min_length=1, max_length=300)
     """The bot token of the Slack app (``xoxb-``), from OAuth & Permissions."""
@@ -244,7 +277,35 @@ class MemoryRevert(_Body):
     reason: str | None = Field(default=None, max_length=MAX_MEMORY_REASON_CHARS)
 
 
-class ProfileEdit(_Body):
+_BotName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=workerbots.NAME_MAX_CHARS),
+]
+_BotChannel = Annotated[str, StringConstraints(pattern=r"^[CG][A-Z0-9]{2,31}$")]
+_BotBudget = Annotated[Decimal, Field(gt=0, le=workerbots.MAX_DAILY_BUDGET_USD, decimal_places=4)]
+
+
+class NewWorkerBot(_Body):
+    """A worker bot (Section 11.6): an agent profile on one Slack channel of the org's Slack
+    app, with a daily budget in USD."""
+
+    name: _BotName
+    agent_profile_id: uuid.UUID
+    channel_id: _BotChannel
+    daily_budget_usd: _BotBudget
+
+
+class WorkerBotEdit(_Edit):
+    """The fields to change. Every field is optional, and a body has at least one."""
+
+    name: _BotName | None = None
+    agent_profile_id: uuid.UUID | None = None
+    channel_id: _BotChannel | None = None
+    daily_budget_usd: _BotBudget | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class ProfileEdit(_Edit):
     """The fields to change. Every field is optional, and a body has at least one."""
 
     name: (
@@ -259,15 +320,6 @@ class ProfileEdit(_Body):
         Annotated[list[Annotated[str, Field(max_length=100)]], Field(max_length=100)] | None
     ) = None
     subagents: list[Any] | None = None
-
-    @model_validator(mode="after")
-    def _has_a_field(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("send at least one field to change")
-        for name in sorted(self.model_fields_set):
-            if getattr(self, name) is None:
-                raise ValueError(f"{name} cannot be null")
-        return self
 
 
 class Answers(_Body):
@@ -355,6 +407,7 @@ class SessionAccess:
 
 
 _ADMIN_ONLY: Final = "only an org owner or admin can do this"
+_BOT_ADMIN_ONLY: Final = "only a workspace admin or an org owner or admin can do this"
 
 
 class _CorsApp(FastAPI):
@@ -529,15 +582,18 @@ class SamaApi:
         reviews: ReviewApplier | None = None,
         pins: PinStore | None = None,
         github: GitHubService | None = None,
+        connections: ConnectionService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
-        the GitHub routes answer ``409``. Without ``skills``,
+        the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
+        ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._github = github
+        self._connections = connections
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -569,6 +625,17 @@ class SamaApi:
         app = _CorsApp(title="sama", docs_url=None, redoc_url=None, lifespan=lifespan)
         app.state.sama_api = self
         settings = self._settings
+
+        @app.exception_handler(RequestValidationError)
+        async def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
+            # The default answer repeats the input of each error. A body can hold a secret (a
+            # bot token, a connection form), so the answer says only where and why.
+            detail = [{k: v for k, v in e.items() if k != "input"} for e in error.errors()]
+            return JSONResponse({"detail": jsonable_encoder(detail)}, status_code=422)
+
+        @app.exception_handler(ConnectorError)
+        async def connector_error(request: Request, error: ConnectorError) -> JSONResponse:
+            return JSONResponse({"detail": str(error)}, status_code=error.status_code)
 
         @app.middleware("http")
         async def security_headers(request: Request, call_next: Any) -> Response:
@@ -602,6 +669,7 @@ class SamaApi:
                 "supabase_url": settings.supabase_url,
                 "supabase_anon_key": settings.supabase_anon_key,
                 "integrations": self._integrations is not None and self._integrations.enabled,
+                "connections": self._connections is not None,
             }
 
         @app.get("/me")
@@ -843,6 +911,57 @@ class SamaApi:
                 raise _not_found("the allowlist of the org has no such repository")
             return Response(status_code=204)
 
+        @app.get("/connectors")
+        async def connectors(principal: Me) -> list[dict[str, Any]]:
+            return [m.public() for m in self._require_connections().catalog]
+
+        @app.get("/workspaces/{workspace_id}/connections")
+        async def list_connections(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            views = await self._require_connections().list_connections(
+                org_id, workspace_id, grants.user_id
+            )
+            return [view.public() for view in views]
+
+        @app.post("/workspaces/{workspace_id}/connections", status_code=201)
+        async def start_connection(
+            principal: Me, workspace_id: uuid.UUID, body: ConnectionStart
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            service = self._require_connections()
+            started = await service.start(org_id, workspace_id, grants, body.connector, body.scope)
+            return started.public()
+
+        @app.post("/connections/{connection_id}/check")
+        async def check_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=False)
+            checked = await self._require_connections().check(org_id, view.id, actor=grants.user_id)
+            return checked.public()
+
+        @app.put("/connections/{connection_id}/form")
+        async def connection_form(
+            principal: Me, connection_id: uuid.UUID, body: ConnectionForm
+        ) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            values = {k: v.get_secret_value() for k, v in body.values.items()}
+            saved = await self._require_connections().submit_form(
+                org_id, view.id, values, actor=grants.user_id
+            )
+            return saved.public()
+
+        @app.post("/connections/{connection_id}/disable")
+        async def disable_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            done = await self._require_connections().disable(org_id, view.id, actor=grants.user_id)
+            return done.public()
+
+        @app.delete("/connections/{connection_id}", status_code=204)
+        async def delete_connection(principal: Me, connection_id: uuid.UUID) -> Response:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            if not await self._require_connections().delete(org_id, view.id, actor=grants.user_id):
+                raise _not_found("the connection does not exist")
+            return Response(status_code=204)
+
         @app.get("/orgs/{org_id}/skills")
         async def list_skills(
             principal: Me, org_id: uuid.UUID, workspace_id: uuid.UUID
@@ -866,6 +985,54 @@ class SamaApi:
         @app.delete("/channels/{channel}/identities/{identity_id}", status_code=204)
         async def unlink(principal: Me, channel: Channel, identity_id: uuid.UUID) -> Response:
             await self._unlink(principal, channel, identity_id)
+            return Response(status_code=204)
+
+        @app.exception_handler(workerbots.WorkerBotError)
+        async def worker_bot_error(_: Request, error: workerbots.WorkerBotError) -> JSONResponse:
+            return JSONResponse({"detail": str(error)}, status_code=error.status_code)
+
+        @app.get("/workspaces/{workspace_id}/worker-bots")
+        async def worker_bots(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
+            org_id, _ = await self._workspace_grants(principal, workspace_id)
+            return await workerbots.list_bots(self._engine, org_id, workspace_id)
+
+        @app.post("/workspaces/{workspace_id}/worker-bots", status_code=201)
+        async def new_worker_bot(
+            principal: Me, workspace_id: uuid.UUID, body: NewWorkerBot
+        ) -> dict[str, Any]:
+            org_id, grants = await self._bot_admin(principal, workspace_id)
+            fields = workerbots.BotFields(
+                name=body.name,
+                agent_profile_id=body.agent_profile_id,
+                channel_id=body.channel_id,
+                daily_budget_usd=body.daily_budget_usd,
+            )
+            return await workerbots.create_bot(
+                self._engine, org_id, workspace_id, grants.user_id, fields
+            )
+
+        @app.patch("/workspaces/{workspace_id}/worker-bots/{bot_id}")
+        async def edit_worker_bot(
+            principal: Me, workspace_id: uuid.UUID, bot_id: uuid.UUID, body: WorkerBotEdit
+        ) -> dict[str, Any]:
+            org_id, grants = await self._bot_admin(principal, workspace_id)
+            fields = workerbots.BotFields(
+                name=body.name,
+                agent_profile_id=body.agent_profile_id,
+                channel_id=body.channel_id,
+                daily_budget_usd=body.daily_budget_usd,
+                status=body.status,
+            )
+            return await workerbots.update_bot(
+                self._engine, org_id, workspace_id, bot_id, grants.user_id, fields
+            )
+
+        @app.delete("/workspaces/{workspace_id}/worker-bots/{bot_id}", status_code=204)
+        async def delete_worker_bot(
+            principal: Me, workspace_id: uuid.UUID, bot_id: uuid.UUID
+        ) -> Response:
+            org_id, grants = await self._bot_admin(principal, workspace_id)
+            await workerbots.delete_bot(self._engine, org_id, workspace_id, bot_id, grants.user_id)
             return Response(status_code=204)
 
         @app.get("/workspaces/{workspace_id}/memory")
@@ -1171,6 +1338,7 @@ class SamaApi:
                     ReviewProposal.kind.label("proposal_kind"),
                     ReviewProposal.scope.label("proposal_scope"),
                     ReviewProposal.payload.label("proposal_payload"),
+                    ReviewProposal.origin.label("proposal_origin"),
                 )
                 .outerjoin(
                     ReviewProposal,
@@ -1192,9 +1360,11 @@ class SamaApi:
     def _approval_entry(row: Any) -> dict[str, Any]:
         arguments, reason = row.arguments, row.reason
         if row.proposal_payload is not None:
-            # A proposal of a background review. The stored text is not shown: the redactor
-            # may know more secrets now (Section 9.4).
-            shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
+            # A proposal of a background review or a chat run. The stored text is not shown:
+            # the redactor may know more secrets now (Section 9.4).
+            shown = shown_proposal(
+                row.proposal_kind, row.proposal_scope, row.proposal_payload, row.proposal_origin
+            )
             arguments, reason = shown.arguments, shown.reason
         return {
             "id": str(row.id),
@@ -1510,6 +1680,41 @@ class SamaApi:
             raise HTTPException(status_code=409, detail="the GitHub App is off in this process")
         return self._github
 
+    def _require_connections(self) -> ConnectionService:
+        if self._connections is None:
+            raise HTTPException(status_code=409, detail="connections are off in this process")
+        return self._connections
+
+    async def _connection(
+        self, principal: Principal, connection_id: uuid.UUID, *, manage: bool
+    ) -> tuple[uuid.UUID, ConnectionView, Grants]:
+        """The connection and the grants of the user. The row is read as the user, so row
+        level security hides the connections of other orgs and the personal connections of
+        other users. Raises ``404`` for a connection that the user cannot see, and ``403``
+        for a change that the user cannot make."""
+        service = self._require_connections()
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            org_id = (
+                await connection.execute(
+                    select(ConnectionRow.org_id).where(ConnectionRow.id == connection_id)
+                )
+            ).scalar_one_or_none()
+            user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+            grants = (
+                None
+                if org_id is None or user_id is None
+                else await load_grants(connection, org_id, user_id)
+            )
+        view = None if org_id is None else await service.get(org_id, connection_id)
+        if org_id is None or grants is None or view is None or not service.can_see(view, grants):
+            raise _not_found("the connection does not exist")
+        if manage and not service.can_manage(view, grants):
+            raise HTTPException(
+                status_code=403,
+                detail="only the owner, a workspace admin, or the org owner can change it",
+            )
+        return org_id, view, grants
+
     def _require_integrations(self) -> Integrations:
         if self._integrations is None:
             raise HTTPException(status_code=409, detail="integrations are off in this process")
@@ -1523,6 +1728,35 @@ class SamaApi:
         if grants is None or not grants.org_member:
             raise _not_found("the org does not exist")
         return grants
+
+    async def _workspace_grants(
+        self, principal: Principal, workspace_id: uuid.UUID
+    ) -> tuple[uuid.UUID, Grants]:
+        """The org and the grants of the user. Raises ``404`` if the user cannot see the
+        workspace."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            org_id = (
+                await connection.execute(
+                    select(Workspace.org_id).where(Workspace.id == workspace_id)
+                )
+            ).scalar_one_or_none()
+            user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+            if org_id is None or user_id is None:
+                raise _not_found("the workspace does not exist")
+            grants = await load_grants(connection, org_id, user_id)
+        if not grants.sees_workspace(workspace_id):
+            raise _not_found("the workspace does not exist")
+        return org_id, grants
+
+    async def _bot_admin(
+        self, principal: Principal, workspace_id: uuid.UUID
+    ) -> tuple[uuid.UUID, Grants]:
+        """Like ``_workspace_grants``, and ``403`` for a user who is not a workspace admin, an
+        org admin, or the org owner."""
+        org_id, grants = await self._workspace_grants(principal, workspace_id)
+        if not (grants.org_admin or grants.admins_workspace(workspace_id)):
+            raise HTTPException(status_code=403, detail=_BOT_ADMIN_ONLY)
+        return org_id, grants
 
     async def _org_admin(self, principal: Principal, org_id: uuid.UUID) -> Grants:
         """Raises ``404`` for a user who is not a member and ``403`` for a member who is not an
@@ -1864,6 +2098,7 @@ class SamaApi:
                     ReviewProposal.kind,
                     ReviewProposal.scope,
                     ReviewProposal.payload,
+                    ReviewProposal.origin,
                     Approval.id.label("approval_id"),
                     Approval.created_at,
                     Approval.expires_at,
@@ -1893,7 +2128,7 @@ class SamaApi:
             # The stored text is not shown. The redactor of the process may know more secrets
             # now, so the view is made again from the payload (Section 9.4).
             views = [
-                (row, shown_proposal(row.kind, row.scope, row.payload))
+                (row, shown_proposal(row.kind, row.scope, row.payload, row.origin))
                 for row in rows
                 if (
                     grants.org_owner

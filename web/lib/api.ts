@@ -11,6 +11,8 @@ export interface PublicConfig {
   supabase_url: string | null;
   supabase_anon_key: string | null;
   integrations: boolean;
+  /** True when the API has the connection routes. */
+  connections?: boolean;
 }
 
 export interface Workspace {
@@ -210,6 +212,68 @@ export interface AgentProfilePatch {
   subagents?: Subagent[];
 }
 
+export type ConnectionScope = "personal" | "workspace";
+
+export type ConnectionState =
+  | "pending"
+  | "initiated"
+  | "connected"
+  | "failed"
+  | "expired"
+  | "disabled"
+  | (string & {});
+
+export interface ConnectorField {
+  name: string;
+  label: string;
+  /** A secret field goes to the vault. The API never returns its value. */
+  secret: boolean;
+  required: boolean;
+  help: string;
+}
+
+export interface ConnectorTool {
+  name: string;
+  description: string;
+  access: "read" | "write" | "destructive";
+}
+
+/** A connector of the catalog (`GET /connectors`). */
+export interface Connector {
+  name: string;
+  title: string;
+  description: string;
+  /** `composio`: a sign-in link. `http_api`: a form. */
+  kind: string;
+  scopes: ConnectionScope[];
+  fields: ConnectorField[];
+  tools: ConnectorTool[];
+}
+
+/** A connection without secrets. Only the backend sets the state `connected`. */
+export interface Connection {
+  id: string;
+  workspace_id: string;
+  connector: string;
+  kind: string;
+  scope: ConnectionScope;
+  owner_user_id: string | null;
+  state: ConnectionState;
+  last_error: string | null;
+  last_health_at: string | null;
+  created_at: string;
+  updated_at: string;
+  /** The values of the fields that are not secret. */
+  fields: Record<string, string>;
+  has_secret: boolean;
+}
+
+/** The answer to a new connection: the sign-in link of Composio, or `null` for a form. */
+export interface StartedConnection {
+  connection: Connection;
+  redirect_url: string | null;
+}
+
 // -- errors -------------------------------------------------------------------------------------
 
 export class ApiError extends Error {
@@ -399,6 +463,22 @@ export class ApiClient {
       method: "PATCH",
       body: patch,
     });
+  listConnectors = () => this.json<Connector[]>("/connectors");
+  listConnections = (workspaceId: string) =>
+    this.json<Connection[]>(`/workspaces/${workspaceId}/connections`);
+  startConnection = (workspaceId: string, connector: string, scope: ConnectionScope) =>
+    this.json<StartedConnection>(`/workspaces/${workspaceId}/connections`, {
+      method: "POST",
+      body: { connector, scope },
+    });
+  checkConnection = (id: string) =>
+    this.json<Connection>(`/connections/${id}/check`, { method: "POST" });
+  /** Sends the form. The secret values go only to this call, never to the chat. */
+  submitConnectionForm = (id: string, values: Record<string, string>) =>
+    this.json<Connection>(`/connections/${id}/form`, { method: "PUT", body: { values } });
+  disableConnection = (id: string) =>
+    this.json<Connection>(`/connections/${id}/disable`, { method: "POST" });
+  deleteConnection = (id: string) => this.json<null>(`/connections/${id}`, { method: "DELETE" });
 }
 
 /** The public config of the API (no sign-in needed). */

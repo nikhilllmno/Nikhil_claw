@@ -391,3 +391,49 @@ async def test_viewing_an_unknown_skill_or_file_is_a_tool_error() -> None:
     assert unknown.is_error
     assert no_file.is_error
     assert "no file x.md" in text_of(no_file)
+
+
+class FakeSouls:
+    """Records the soul proposals; a soul with the word ``bad`` is refused."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def propose(self, claims: object, soul: str, summary: str) -> str:
+        from sama.review.soul import SoulError
+
+        if "bad" in soul:
+            raise SoulError("the soul contains a secret. Remove it")
+        self.calls.append((getattr(claims, "run_id", ""), soul, summary))
+        return "Proposed a new soul."
+
+
+async def test_change_propose_is_hidden_without_a_proposer() -> None:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    server = ToolServer(signer=signer, todos=MemoryTodoStore())
+    names = {tool.name for tool in await server.mcp().list_tools()}
+    assert "change_propose" not in names
+
+
+async def test_change_propose_sends_the_soul_to_the_proposer() -> None:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    souls = FakeSouls()
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), souls=souls)  # type: ignore[arg-type]
+    with serve(server.app()) as base:
+        token = signer.issue(make_scope("run-7"), ttl_s=600)
+        async with connect(base + "/mcp", token) as client:
+            ok = await client.call_tool(
+                "change_propose", {"target": "soul", "content": "Be kind.", "summary": "kind"}
+            )
+            refused = await client.call_tool(
+                "change_propose", {"target": "soul", "content": "bad", "summary": "x"}
+            )
+            wrong = await client.call_tool(
+                "change_propose", {"target": "toolsets", "content": "x", "summary": "x"}
+            )
+    assert not ok.is_error
+    assert text_of(ok) == "Proposed a new soul."
+    assert souls.calls == [("run-7", "Be kind.", "kind")]
+    assert refused.is_error
+    assert "secret" in text_of(refused)
+    assert wrong.is_error

@@ -1030,7 +1030,9 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 - **A deferred call never bypasses the gate.** Section 16.1 has the rule: the gate judges a
   `tool_call` as a call of the tool that it names.
 - The tool server shows the three tools only when the catalog has a tool when the app starts.
-  No product registers a deferred tool in M2.6. M3.4 (connections) is the first user. The
+  No product registers a deferred tool in M2.6. M3.4 (connections) is the first user: the
+  connector tools of the catalog are deferred tools in the toolset `integrations`, and the
+  search shows only the tools of a connection that the run can use (Section 10.3). The
   catalog is the only extension point: a tool registers a name, a toolset, a description, a
   JSON schema of the arguments, and an async handler that gets the run token claims. The
   server checks only that the required arguments are present. The handler validates the rest.
@@ -1311,8 +1313,10 @@ refreshes them in the background. Without `SAMA_VAULT_KEY` there are no vault va
 3. `user`: only in a private session, for its owner. A shared session has no `user` target.
 4. `workspace`: the user of the run must be a workspace admin: the org `owner`, or a member
    with the workspace role `admin` or `owner` (Q5). An org `admin` with no workspace role is
-   not enough. Other users get an error that tells the agent to ask an admin. Approval
-   cards for this case come in M3.2.
+   not enough. Since M3.2, the write of another user in an attended chat run is a chat
+   proposal: a workspace admin or the org owner approves it on an approval card (Section
+   9.4.2). Without a proposal store, the user gets an error that tells the agent to ask an
+   admin.
 5. `agent`: any run that can write. The agent notes belong to the profile of the run in the
    workspace of the run.
 
@@ -1358,8 +1362,8 @@ The memory row, the revision, and the audit row are one transaction (`after` hoo
 
 **Assumptions in M2.1.**
 
-- A workspace write of a user who is not an admin returns an error. Approval cards that let an
-  admin approve it come in M3.2.
+- A workspace write of a user who is not an admin returned an error. Since M3.2 it is a chat
+  proposal that a workspace admin or the org owner approves (Section 9.4.2).
 - The `user` target works in private sessions only. A person edits their own notes in the API.
 - Any user who can see the workspace can edit the `agent` notes in the API, like the tool.
 - Unattended and delegated runs cannot write. The only exception is the background review
@@ -1443,8 +1447,9 @@ store, and the sync. The rules:
   session. A `user` write applies at once, but only in a private
   session, because a shared session has no single owner. A `workspace` write applies when
   the user of the run is a workspace `admin` or `owner`, or the org `owner`. Other users get
-  an error that says an admin must make the change. Approval cards for these writes come in
-  M3.2. An `org` write needs the org `owner`. A `builtin` skill is read-only. To change one,
+  an error that says an admin must make the change. Since M3.2, such a write in an attended
+  chat run is a chat proposal with an approval card (Section 9.4.2). An `org` write needs the
+  org `owner`: the write of another user is a chat proposal that only the org owner decides. A `builtin` skill is read-only. To change one,
   the agent makes a skill with the same name in a narrower scope.
 - Every write locks the row of the skill, adds the next version, and adds the audit entry
   `skill.<change>` (agent actor, user, run). Two writes at the same time get two versions
@@ -1703,6 +1708,77 @@ name) is written. The review must propose again.
 - The only MCP server of a review run is the sama tool server.
 - A skill proposal that became stale is `failed`, and sama does not resolve it again.
 
+### 9.4.2 Chat proposals and approvals over chat (M3.2)
+
+Code: `src/sama/memory/service.py`, `src/sama/skills/store.py`, `src/sama/review/soul.py`,
+`src/sama/gateway/`. Migration `0021`.
+
+**Chat proposals.** A chat run can ask for a shared change that the user of the run has no role
+for. The change does not apply. It becomes a proposal with `origin` `chat` (the column
+`review_proposals.origin`; a background review has `review`). The proposal uses the same table,
+approval card, applier, and timeout as a proposal of the background review (Section 9.4.1).
+
+| Change | Who writes it at once | Else: a chat proposal that this role decides |
+|---|---|---|
+| `workspace` memory | a workspace `admin` or `owner`, or the org `owner` | a workspace admin or the org owner |
+| `workspace` skill | a workspace `admin` or `owner`, or the org `owner` | a workspace admin or the org owner |
+| `org` skill | the org `owner` | the org owner |
+| SOUL of a workspace profile | nobody: it is always a proposal | a workspace admin or the org owner |
+| SOUL of an org profile (no workspace) | nobody: it is always a proposal | the org owner |
+
+- Only an attended chat run proposes. An unattended run (cron, workflow, webhook) and a delegated
+  child run get an error, as before.
+- `user` memory and user skills never become a proposal.
+- The card names the source of a proposal: "the agent proposes a change of ..." for a chat
+  proposal, and "the background review proposes ..." for a review proposal.
+- The tool result tells the agent that the change is not saved, who must approve it, and that it
+  must not propose it again.
+- The chat run does not pause. The approval is a row with the run of the chat, and the card goes
+  to the channel of the session. The run ends normally, and the proposal stays open until a
+  person decides it or it times out.
+- The role decides, not the access to the session. The gate checks the role again when a person
+  decides (`GateService.decide_approval`). The card says who may decide:
+  "A workspace admin or the org owner can decide this." or "Only the org owner can decide this."
+
+**`change_propose`.** The toolset `self` has the tool `change_propose` (target `soul`, the full
+new `content`, and a `summary` of at most 200 characters). A SOUL changes the agent for every
+user of the profile, so a new SOUL is always a proposal, also for an admin. The proposal keeps a
+SHA-256 digest of the SOUL that the run saw: the frozen SOUL of the session
+(`sessions.run_config.soul`), or the live SOUL of the profile when the session has no frozen
+SOUL. When a person approves it, the applier writes the new SOUL only if the live SOUL still has
+that digest; else the proposal is `failed` with "the soul changed after the agent saw it. Ask
+for a new proposal". Thus a proposal from a session that started before a SOUL change also
+fails when a person approves it. The applier adds the audit row `profile.updated`. A session keeps its frozen
+SOUL, so the new SOUL applies from the next session. The tool server hides the tool when it has
+no proposer. The bootstrap presets do not have `self` (Section 10.2), so an admin adds it to a
+profile on purpose.
+
+**Approvals over chat.** A Slack card and a Telegram card have three buttons for a tool call:
+Approve, Deny, and "Always allow for me". A proposal card has Approve and Deny only, because a
+policy rule cannot approve a proposal. A card for a tool in `ALWAYS_ASK` (`repo_push_approval`,
+Section 15.1) also has Approve and Deny only.
+
+- "Always allow for me" approves the call and writes a user rule `allow` for the tool and the
+  profile of the run (Section 16.1). The card then shows "Always allowed by <user>".
+- A click after `expires_at` counts as deny. The approval becomes `expired`, the run resumes as
+  `reject`, and the card shows "Expired by <user>". A timeout without a click is also a deny:
+  the worker maintenance expires the approval (Section 16.1), and the applier discards an expired
+  proposal with "the approval timed out".
+- After a decision on a proposal, the gateway asks the applier to apply the decided proposals of
+  the run at once. The worker maintenance applies them too, so a failure only delays the change.
+- The chat gateway checks first that the person can see the session (Section 11.3). So an admin
+  who cannot read a private direct message decides its proposal in the web app
+  (`/workspaces/{id}/review-proposals`), and not on the card.
+
+**Assumptions in M3.2.**
+
+- `change_propose` has only the target `soul`. The targets profile, toolsets, and policy, the
+  diff on the card, the history, and the revert come in M6.1.
+- The tool description says that a workspace admin or the org owner approves. For an org profile
+  only the org owner can approve; the card and the gate say so.
+- A proposal of a shared session goes to the card in the channel of the session. Sama does not
+  send a copy to the direct messages of the admins.
+
 ### 9.5 Skills as slash commands (M2.3)
 
 - `/<skill-name> <request>` makes a normal message that runs with that skill. The gateway
@@ -1760,10 +1836,10 @@ name) is written. The review must propose again.
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
-| `connections` | `connections_list`, `connection_request` (sends the user a link or a form), `connection_test` | Sama MCP |
-| `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Sama MCP (Composio, MCP proxy, database gateway) |
+| `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
+| `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Later: MCP, database, plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
-| `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15) | Sama MCP |
+| `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
@@ -1773,8 +1849,10 @@ A profile also has a **group set**: the toolsets that a chat run in a shared ses
 (Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`, and
 `media`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`, `browser`,
 `workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The default
-profile of the first org has `tool_search` since migration `0018` (M2.6) and `subagents`
-since migration `0019` (M2.7). The default group set has no `subagents`.
+profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
+since migration `0019` (M2.7), and `connections` and `integrations` since migration `0022`
+(M3.4). The default group set has no `subagents`, `connections`, or `integrations`. Sub-agents
+(Section 13.1) do not get `connections` or `integrations`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -1868,10 +1946,12 @@ gets one notice per change.
 **Tool naming and exposure**
 
 - Connector tools have a prefix for the kind and the connection name, as in Hermes:
-  `mcp_<connection>_<tool>` for MCP, `db_<connection>_<tool>` for databases, and
-  `api_<connection>_<tool>` for HTTP APIs. Composio tools keep the Composio slug (for
-  example `GMAIL_SEND_EMAIL`). If a name is longer than 64 characters, sama shortens it and
-  adds a short hash. Each connection is also a toolset `conn-<connection>`.
+  `mcp_<connection>_<tool>` for MCP and `db_<connection>_<tool>` for databases. Since M3.4,
+  the tools of a catalog connector start with the connector name, for example
+  `gmail_send_email` and `notion_search`. A Composio tool keeps its Composio slug (for example
+  `GMAIL_SEND_EMAIL`) in the manifest, and the control plane uses the slug for the call. The
+  control plane rejects a tool name that is longer than 64 characters. Each connection is also
+  a toolset `conn-<connection>` (later).
 - Connector tools are deferred behind `tool_search` by default. An agent profile can pin a
   connection so that its tools are always visible. The mechanism is in M2.6: a connector
   registers its tools in the `DeferredCatalog`, each with a toolset (Section 6.3).
@@ -1885,6 +1965,66 @@ gets one notice per change.
   workspace `admin` or the org `owner` can create, change, or remove it.
 - Default policies: read tools `allow`, write tools `ask`, destructive tools `ask` with a
   stronger warning. Admins can change this per tool. Unattended runs follow Section 12.1.
+
+**What M3.4 builds**
+
+- **Table.** Migration `0022` adds `connections` with the fields of the connection record, an
+  RLS policy, and one row per `(org, workspace, connector, owner)` (`NULLS NOT DISTINCT`, so
+  one workspace connection per connector). A member sees the workspace connections and only
+  their own personal connections. The vault takes the names `composio_api_key` and
+  `connection:<uuid>`.
+- **Catalog.** `connectors/catalog/` has `gmail`, `googlecalendar`, `github`, `slack`, and
+  `linear` (kind `composio`), and `notion` (kind `http_api`, a form with an API key). The
+  tool schemas are a trimmed copy of the Composio schemas. Each tool has `access`: `read`,
+  `write`, or `destructive`. The control plane checks each manifest when it starts. It rejects
+  unknown keys, a tool name that does not start with the connector name, an `http_api` base URL
+  that is not `https` or has a path, and two connectors with the same tool name.
+  `SAMA_CONNECTORS_DIR` changes the folder.
+- **Composio.** Sama uses the Composio v3 API. The key is the vault entry
+  `composio_api_key` of the org, else `COMPOSIO_API_KEY` of the control plane. Sama finds or
+  makes one auth config per toolkit (Composio-managed OAuth first) and keeps it in memory.
+  Every auth scheme uses the Composio link flow: the user signs in on a Composio page, never in
+  sama. The Composio user ID (the entity) is `sama-<org>-u-<user>` for a personal connection
+  and `sama-<org>-w-<workspace>` for a workspace connection: one entity per user and one per
+  workspace. `secret_ref` is empty for a Composio connection, because Composio keeps the
+  token. A new link deletes the old Composio account of the connection, and so does a delete.
+- **Forms (`http_api`).** The secret fields go to the vault entry `connection:<id>` as one JSON
+  value. The other fields go to `config.fields`. The API never returns a secret. Sama tests
+  the form with the `test` request of the manifest before it sets `connected`. Sama rejects a
+  path value of `.` or `..`. A form that the API rejects (HTTP 422) does not echo the values
+  in the answer. The `http_api` requests go through the outbound client of Section 16.4: the
+  address must be public, sama does not follow a redirect, and an answer has at most 2 MB.
+- **States.** Only a backend check sets `connected`: the Composio account status `ACTIVE`, or a
+  good test request. An `initiated` connection becomes `expired` after 30 minutes, when sama
+  next reads it. A check does not start an `expired` sign-in again, but a late Composio `ACTIVE`
+  still connects it. A Composio 404 gives `expired`. A network error, a timeout, or an HTTP 408,
+  429, or 5xx keeps the state and stores the error. A check writes its result only if the row
+  did not change during the check, so a `disable` or a remove during a check wins. A check does
+  not change a `disabled` connection. `policy_overrides` is stored but not
+  used yet. Discovery and `tool_cache` come later: the tools come from the manifest.
+- **Web app.** The Connections page (`/connections`) lists the connectors of the catalog with a
+  row per scope. It starts a connection, sends the user to the Composio link, checks the
+  connection when Composio sends the user back (`?connection=<id>`), shows the form of an
+  `http_api` connector, and disables or removes a connection. The page shows only the
+  connections of the current workspace, and it ignores a callback connection of another
+  workspace. It goes only to an `https` sign-in link without a user name or a password. The API routes are
+  `GET /connectors`, `GET` and `POST /workspaces/{id}/connections`,
+  `POST /connections/{id}/check`, `PUT /connections/{id}/form`,
+  `POST /connections/{id}/disable`, and `DELETE /connections/{id}`. A form has at most 20
+  fields. The links of the page and the Composio callback use the first origin of
+  `SAMA_WEB_ORIGINS`, else `SAMA_PUBLIC_URL`. A user who is not signed in signs in and opens
+  the link again.
+- **Channels.** `/connect <name>` in Telegram and `/sama connect <name>` in Slack answer with a
+  link to the Connections page and a warning not to send secrets in chat. In a private chat
+  the link is for a personal connection. In a group chat or a linked channel it is for a
+  workspace connection. They never take a secret.
+- **Agent tools.** `connections_list`, `connection_request`, and `connection_test` are in the
+  default `allow` list. `connection_request` gives a link only. The connector tools are
+  deferred tools in the toolset `integrations`. `tool_search` shows a connector tool only when
+  the run has a connected connection that it can use. A private session uses the personal
+  connection of its user first, then the workspace connection. A shared session uses only the
+  workspace connection. Default policy: `read` is `allow`, `write` is `ask`, and
+  `destructive` is `ask` with a stronger reason. An admin rule wins over the default.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
 start runs or workflows (Section 12).
@@ -2225,8 +2365,11 @@ The rules of an update:
   row of the admin (`FOR SHARE`) until the end of the transaction. An admin who loses the role
   while the write waits for the lock gets `403`, and nothing is written.
 
-In-place edits by an admin are the M3.8 interim. When `change_propose` (M6.1) exists, a change
-to a profile goes through an approval card, and the history and the revert are in the web app.
+In-place edits by an admin are the M3.8 interim. Since M3.2, the agent proposes a new SOUL with
+`change_propose`, and the SOUL changes when a person approves the card (Section 9.4.2). The other
+fields of a profile have no proposal yet. When `change_propose` gets the targets profile and
+toolsets (M6.1), a change to a profile goes through an approval card, and the history and the
+revert are in the web app.
 
 **Telegram pairing.** `POST /channels/telegram/pairing-codes` with `workspace_id`,
 `agent_profile_id`, and `kind` (`user` or `group`) makes a pairing code (Section 11.5). It does
@@ -2485,7 +2628,23 @@ answer that only the sender sees.
   `/sama pin TEXT`, `/sama pins`, and `/sama unpin NUMBER` work in direct messages (Section 6.3);
 - the gateway escapes `&`, `<`, and `>` in all text that it sends, so the text of a model
   cannot mention people or channels. Approval cards use `plain_text` blocks;
-- before each send it checks the link again, as the Telegram gateway does (Section 11.3).
+- before each send it checks the link again, as the Telegram gateway does (Section 11.3). In a
+  worker bot channel it checks that the same bot still has the channel;
+- approval cards have the buttons Approve, Deny, and "Always allow for me" (a proposal card and
+  a card for a tool in `ALWAYS_ASK` have no "Always allow for me"). Section 9.4.2 has the rules.
+
+**Shared sessions in Slack (M3.3).** A channel thread is a `shared` session (Section 11.3), and
+the same rules hold as for a Telegram group:
+
+- the run of a shared session has no user in its run token. So it does not load `user` memory,
+  user skills, or personal connections, and `session_search` and `session_read` see only the
+  shared sessions of its workspace (Section 7.1). A direct message is a `private` session of the
+  linked user, and it gets the `user` memory of that user;
+- the answer of a run goes only to the thread of the session, and only while the channel is still
+  linked to the same workspace (or has the same worker bot). A run of a private session goes
+  only to the direct message of its user, while the account is still linked;
+- a test (`tests/gateway/test_slack_m3.py`) shows that the `user` memory of a member is in the
+  frozen prefix of the direct message and not in the frozen prefix of a channel thread.
 
 The Telegram and Slack gateways share the session, follow, and approval code
 (`sama.gateway.sessions`).
@@ -2499,6 +2658,48 @@ the image.
 **Limits.** Slack has no voice notes and no `/model` command. In a channel thread, each message
 to the app needs a mention. The pairing lockout and the limit of 200 followed runs are for each
 hub: the Telegram hub and the Slack hub each have their own.
+
+**Worker bots (M3.10).** A worker bot is an agent profile that is bound to one Slack channel, with
+a daily budget in USD. Code: `src/sama/workerbots.py`. Migration `0021`.
+
+| Column of `worker_bots` | Meaning |
+|---|---|
+| `org_id`, `workspace_id` | The workspace of the bot. Its sessions are shared sessions of this workspace. |
+| `agent_profile_id` | The profile of the bot: a profile of the workspace or of the org. |
+| `integration_id`, `external_id` | The Slack integration of the org and the channel id. One bot per channel (unique). |
+| `name`, `daily_budget_usd`, `status` | A name of 1 to 80 characters, a budget above 0 and at most 10000, and `active` or `disabled`. |
+| `created_by_user_id`, `created_at`, `updated_at` | The admin and the times. |
+
+- RLS: a user who can see the workspace reads its bots (`sama_private.can_see_workspace`).
+  Writes go through the API as the table owner.
+- API: `GET /workspaces/{id}/worker-bots` (each member of the workspace; each bot has
+  `spent_today_usd`), `POST` (`name`, `agent_profile_id`, `channel_id`, `daily_budget_usd`),
+  `PATCH /{bot_id}` (any of these fields and `status`), and `DELETE /{bot_id}`. Only a workspace
+  admin, the org owner, or an org admin writes; another member gets `403`. The org needs an
+  active Slack integration (`409`). A second bot for the same channel gets `409`. Each write adds
+  an audit row `worker_bot.created`, `worker_bot.updated`, or `worker_bot.deleted`.
+- A mention of the app in the channel of an `active` bot starts a shared session with the profile
+  and the workspace of the bot, also when a group pairing links the channel: the bot wins. The
+  sender must be a linked user who can see the workspace. The session keeps the id of the bot
+  (`sessions.worker_bot_id`).
+- The bot also wins for delivery. When a channel has a bot, the gateway posts only the output of
+  the sessions of that bot to the channel. A run that started from the group pairing before an
+  admin bound the bot posts nothing more to the channel. A session of a bot that is removed or
+  bound to another channel also posts nothing.
+- The cost of a bot in one day is the sum of `model_calls.cost_usd` of the sessions of the bot
+  since 00:00 UTC. The gateway does not start a run when the bot spent its budget. The sender
+  gets a message that only the sender sees: "This worker bot reached its daily budget. It works
+  again after 00:00 UTC."
+- `load_authority` lowers the cost limit of a run of a bot session to the rest of the budget
+  (Section 16.1), so the model proxy and the gate stop a run at the limit. The rest is the budget
+  less the cost of the other runs of the bot today. A run that started before 00:00 UTC also
+  keeps its cost from before 00:00 UTC: the limit adds that cost, because the run limit compares
+  with all the cost of the run. So the run gets the full budget of the new day.
+- The model proxy writes its pending usage records before it reads the authority of a call. So
+  the cost of a call of one bot run applies to the next call of every run of that bot. A bot that is disabled or removed, or that
+  spent its budget, stops its runs ("the worker bot is disabled or removed", "the worker bot
+  reached its daily budget").
+- `/sama stop` in a bot channel stops the runs of the bot threads.
 
 **Not in this step.** Integrations for each workspace, more than one app of a kind per org,
 Slack OAuth distribution (one app for many Slack workspaces), and a check that the webhook still
@@ -2938,7 +3139,7 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
 | Clone | `src/sama/tools/repos.py` | A repo on the allowlist clones through the proxy. Other repos clone from GitHub with no credentials. |
 | API | `src/sama/api/app.py`, `src/sama/github/routes.py` | The org routes and the two public pages of the install (below). |
 | Admin | `src/sama/admin/github_app.py` | `python -m sama.admin github-app manifest` and `convert` (Section 19.5). |
-| Tables | migration `0021` | `github_installations`, `github_repos`, `github_push_grants` (below). |
+| Tables | migration `0023` | `github_installations`, `github_repos`, `github_push_grants` (below). |
 
 - **The App.** One sama GitHub App serves one deployment. Its permissions are `contents:
   write`, `pull_requests: write`, `metadata: read`, and `members: read`. `members: read` lets
@@ -3017,7 +3218,7 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
 - **Approval of protected paths.** The refusal tells the agent to call
   `repo_push_approval(repo, branch, commit)`. This tool is in `ALWAYS_ASK` (Section 16.1): a
   person approves each call, an `allow` rule does not remove the ask, and "always allow"
-  writes no rule. It is in `NEEDS_A_HUMAN`, so an unattended run gets `deny`. The tool server
+  writes no rule. The Slack and Telegram cards for it have no "Always allow for me" button. It is in `NEEDS_A_HUMAN`, so an unattended run gets `deny`. The tool server
   checks the gate itself before it runs a sama tool, so the sandbox cannot call the tool with
   only the run token. The approved call writes a push grant for one repo, one branch, and one
   commit. The grant lives 1 hour. The proxy uses it once (`FOR UPDATE SKIP LOCKED`), then the
@@ -3087,7 +3288,9 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
    mode. The default for unknown tools is `ask`. In a shared session, `memory` also has the
-   default `ask` (Section 11.3).
+   default `ask` (Section 11.3). Since M3.4, a deferred tool gets its default from the access
+   of the tool in the catalog: `read` is `allow`, `write` and `destructive` are `ask`
+   (Section 10.3). A policy rule wins over this default.
 5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
    pre-approval for this tool in this job version, and the call fits its connection and
    argument limits (Section 12.1).
@@ -3201,7 +3404,9 @@ Approvals:
   the admins, and the listed approvers decide (Section 11.3). A decision after `expires_at` raises
   `ApprovalExpiredError` and the approval becomes `expired`.
 - With "always allow", it writes a user rule (`allow`) for the tool and the run profile, and
-  the audit row `tool_policy.set`.
+  the audit row `tool_policy.set`. Since M3.2 the chat cards have the button "Always allow for
+  me" (Section 9.4.2). The gate ignores "always allow" for a proposal: a rule cannot approve a
+  proposal.
 - `GateService.expire()` times out due approvals in batches of 500. The worker maintenance
   calls it (Section 4.3). The gate also times out an approval when it reads it.
 - The API (M1.12, Section 11.4) and the channels (M1.13) call `decide_approval` and then
@@ -3219,13 +3424,17 @@ authority of a run: the run status, the access of the run user (the rule of
 `session_visible`, with `load_grants`), and the live budget. The run user is
 `runs.triggered_by_user_id`, or the owner of a private session. The live budget is the lower
 of `runs.budget` and the budget of the agent profile, for `max_tokens` and `max_cost_usd`.
+Since M3.10, a run of a worker bot session also stays below the rest of the daily budget of the
+bot, and a disabled, removed, or spent bot is a problem of the authority (Section 11.6).
 
 - `GateService.check` and `screen` give `deny` at the authority step when the run ended, the
   run user lost access, or the recorded model calls of the run reached the live budget.
 - The model proxy refuses a call with `403` (`permission_error`) when the run ended or the
   run user lost access. This applies to every route, also to the free `count_tokens` route.
   A store that cannot read the authority gives `503`. It uses the lower of the token budget and the live budget, so a lower
-  budget applies at the next call.
+  budget applies at the next call. Before it reads the authority, the proxy writes its pending
+  usage records (Section 16.6), so a live budget that more than one run shares (a worker bot)
+  includes all the recorded calls.
 - Before an approve resume, the worker calls `GateService.reconfirm(org_id, run_id,
   call_id)`. It runs `decide_recorded`: all steps except the hardline step, which ran at the
   first check. The user rules are the rules of the run user, as for the live authority. A
@@ -3685,6 +3894,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
 | `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start. Otherwise the three tools are hidden. |
+| `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
@@ -3788,7 +3998,7 @@ migrated schema.
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `group_toolsets` (migration `0017`), `subagents` (migration `0019`), `skills`, `policy`, `budget` |
-| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
+| `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1), `worker_bot_id` (migration `0021`, Section 11.6) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content`, `search_vector` (generated, GIN index) and `embedded_at` (migration `0014`, Section 7.1) |
 | `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2), `compact` and `compact_focus` (migration `0018`, Section 6.3) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
@@ -3804,6 +4014,7 @@ migrated schema.
 | `skill_versions` | One row per version of a skill: text, files, and provenance (migration `0013`, Section 9.2) |
 | `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
 | `integrations` | The chat apps of each org, for example its Telegram bot (migration `0011`, Section 11.6) |
+| `worker_bots` | One row for each worker bot: `org_id`, `workspace_id`, `agent_profile_id`, `integration_id`, `external_id` (the Slack channel; unique per integration), `name`, `daily_budget_usd`, `status`, `created_by_user_id`. A user who can see the workspace reads it (migration `0021`, Section 11.6) |
 | `memories` | The notes of one scope: `org_id`, `scope` (`agent`, `user`, `workspace`), `workspace_id`, `agent_profile_id`, `user_id`, `entries` (JSON list), `revision` (migration `0012`, Section 8.1) |
 | `message_embeddings` | One embedding for each embedded message: `org_id`, `session_id`, `message_id`, `embedding` (`vector(1536)`, HNSW index), `model` (migration `0014`, Section 7.1) |
 | `memory_revisions` | One row per memory write: `org_id`, `memory_id`, `seq`, `action`, `entries`, `session_id`, `run_id`, `author_kind`, `author_user_id`, `reason`, `reverted_to` (migration `0012`, Section 8.1) |
@@ -4070,6 +4281,8 @@ the start with a message that names the variable but not its value.
 | `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
+| `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
+| `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_GITHUB_APP_ID`, `SAMA_GITHUB_APP_SLUG`, `SAMA_GITHUB_CLIENT_ID`, `SAMA_GITHUB_APP_PRIVATE_KEY`, `SAMA_GITHUB_CLIENT_SECRET` | No | The sama GitHub App (Section 19.5). With `SAMA_GITHUB_APP_ID`, all five are required. The private key can have `\n` in place of its line breaks. Without them, the git proxy and the pull request tools are off. |
@@ -4217,7 +4430,7 @@ The owner answered these questions on 2026-11-18. The answers are binding for M1
 | Q2 | Python package and service name? | Package `sama`. Services `sama-api`, `sama-gateway`, `sama-worker`, and `sama-scheduler`. |
 | Q3 | Telegram: one shared bot or one bot per org? | One bot per org. An org admin connects it as an integration, and its token is in the org vault (Section 11.6). |
 | Q4 | Which region? | Supabase in `ap-south-1` (Mumbai), the same as vorflux. Fly.io in the region nearest to it. |
-| Q5 | Who may approve changes to workspace memory, workspace skills, and SOUL? | Workspace `admin` and org `owner`. Org-scope changes need the org `owner`. |
+| Q5 | Who may approve changes to workspace memory, workspace skills, and SOUL? | Workspace `admin` and org `owner`. Org-scope changes need the org `owner`. Since M3.2 the gate applies this rule to the proposals of chat runs and of the background review, and the chat cards name the role (Section 9.4.2). |
 | Q6 | When do we build the web app? | A minimal web chat and approvals page in M1. Web app v1 for the team in M3. The customer-ready web app in M6. |
 | Q7 | How do we start M1? | Foundations first. The first pull request has M1.1 (repo foundations) and M1.3 (runtime contract and fake runtime). Then one pull request per item or per small group. |
 | Q8 | Which Supabase project does sama use? | A new Supabase project for sama in `ap-south-1`. Sama tables do not share a project with other apps. |

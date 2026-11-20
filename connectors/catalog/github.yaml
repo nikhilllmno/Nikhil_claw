@@ -1,0 +1,244 @@
+# The GitHub connector (docs/architecture.md, Section 10.3). Composio holds the
+# credential. The tool schemas are a trimmed copy of the Composio tool schemas.
+name: github
+title: GitHub
+description: Read repositories, issues, and pull requests in GitHub, and write issues and comments.
+kind: composio
+scopes:
+- personal
+- workspace
+composio:
+  toolkit: github
+tools:
+- name: github_get_a_repository
+  slug: GITHUB_GET_A_REPOSITORY
+  access: read
+  description: Retrieves detailed information about an existing and accessible github repository.
+  input_schema:
+    type: object
+    properties:
+      repo:
+        type: string
+        description: The name of the repository, without the `.git` extension. This field is case-insensitive.
+      owner:
+        type: string
+        description: The username of the account that owns the repository. This field is case-insensitive.
+    required:
+    - owner
+    - repo
+- name: github_list_repository_issues
+  slug: GITHUB_LIST_REPOSITORY_ISSUES
+  access: read
+  description: Lists issues (which include pull requests) for a specified, existing github repository,
+    with options for filtering, sorting, and pagination.
+  input_schema:
+    type: object
+    properties:
+      page:
+        type: integer
+        description: Page number for the set of results. Refer to GitHub's REST API documentation for
+          pagination details.
+        default: 1
+      repo:
+        type: string
+        description: The name of the repository, without the `.git` extension. This name is not case-sensitive.
+      sort:
+        type: string
+        description: The field to sort the results by.
+        enum:
+        - created
+        - updated
+        - comments
+        default: created
+      owner:
+        type: string
+        description: The GitHub account owner of the repository. This name is not case-sensitive.
+      since:
+        type: string
+        description: Filters issues to include only those updated at or after the specified time. This
+          should be a timestamp in ISO 8601 format (e.g., `YYYY-MM-DDTHH:MM:SSZ`).
+      state:
+        type: string
+        description: Filters issues based on their state.
+        enum:
+        - open
+        - closed
+        - all
+        default: open
+      labels:
+        type: string
+        description: 'A comma-separated list of label names to filter issues by. Example: ''bug,ui,@high''.'
+      creator:
+        type: string
+        description: Filter issues by the username of the user who created the issue.
+      assignee:
+        type: string
+        description: Filter issues by assignee's username. Use 'none' for issues with no assignee, or
+          '*' for issues assigned to any user.
+      per_page:
+        type: integer
+        description: Number of results per page (max 100). Refer to GitHub's REST API documentation for
+          pagination details.
+        default: 1
+      direction:
+        type: string
+        description: The direction of the sort.
+        enum:
+        - asc
+        - desc
+        default: desc
+      mentioned:
+        type: string
+        description: Filter issues by a user mentioned in the issue's description or comments. Provide
+          the username.
+      milestone:
+        type: string
+        description: Filter issues by milestone. Provide the milestone `number` as a string, '*' for issues
+          with any milestone, or 'none' for issues without a milestone.
+    required:
+    - owner
+    - repo
+- name: github_get_a_pull_request
+  slug: GITHUB_GET_A_PULL_REQUEST
+  access: read
+  description: Retrieves a specific pull request from a github repository using its owner, repository
+    name, and pull request number.
+  input_schema:
+    type: object
+    properties:
+      repo:
+        type: string
+        description: The name of the repository, without the .git extension. This value is not case sensitive.
+      owner:
+        type: string
+        description: The username of the account that owns the repository. This value is not case sensitive.
+      pull_number:
+        type: integer
+        description: The number that identifies the specific pull request.
+    required:
+    - owner
+    - repo
+    - pull_number
+- name: github_search_issues_and_pull_requests
+  slug: GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS
+  access: read
+  description: 'Searches github for issues and pull requests. use qualifiers to scope searches: `repo:owner/name`
+    for specific repos, `org:orgname` for organizations, `user:username` for personal repos, `assignee:@me`
+    for your assignments. combine with `is:issue`, `is:pr`, `state:open`, `label:"name"` filters.'
+  input_schema:
+    type: object
+    properties:
+      q:
+        type: string
+        description: Search query using GitHub's specific syntax (keywords, qualifiers, operators). Refer
+          to GitHub's search documentation for query construction and available qualifiers.
+      page:
+        type: integer
+        description: Page number for results (starts at 1). Refer to GitHub's REST API documentation on
+          pagination for details.
+        default: 1
+      sort:
+        type: string
+        description: Field for sorting results. GitHub defaults to 'best match' if unspecified.
+        enum:
+        - comments
+        - reactions
+        - reactions-+1
+        - reactions--1
+        - reactions-smile
+        - reactions-thinking_face
+        - reactions-heart
+        - reactions-tada
+        - interactions
+        - created
+        - updated
+      order:
+        type: string
+        description: Order for sorted results (ascending/descending). Effective only if `sort` is also
+          provided.
+        enum:
+        - desc
+        - asc
+        default: desc
+      per_page:
+        type: integer
+        description: Number of results per page (maximum 100). Refer to GitHub's REST API documentation
+          on pagination for details.
+        default: 30
+      raw_response:
+        type: boolean
+        description: Return full API response if true, optimized response for AI agents if false.
+        default: false
+    required:
+    - q
+- name: github_create_an_issue
+  slug: GITHUB_CREATE_AN_ISSUE
+  access: write
+  description: Creates a new issue in a github repository, requiring the repository to exist and have
+    issues enabled; specific fields like assignees, milestone, or labels may require push access.
+  input_schema:
+    type: object
+    properties:
+      body:
+        type: string
+        description: The detailed textual contents of the new issue.
+      repo:
+        type: string
+        description: The name of the repository, without the `.git` extension (case-insensitive).
+      owner:
+        type: string
+        description: The GitHub account owner of the repository (case-insensitive).
+      title:
+        type: string
+        description: The title for the new issue.
+      labels:
+        type: array
+        description: 'Label names to associate with this issue (generally case-insensitive). NOTE: Only
+          users with push access can set labels; they are silently dropped otherwise. Pass an empty list
+          to clear all labels.'
+        items:
+          type: string
+      assignee:
+        type: string
+        description: 'Login for the user to whom this issue should be assigned. NOTE: Only users with
+          push access can set the assignee; it is silently dropped otherwise. **This field is deprecated
+          in favor of `assignees`.**'
+      assignees:
+        type: array
+        description: 'GitHub login names for users to assign to this issue. NOTE: Only users with push
+          access can set assignees; they are silently dropped otherwise.'
+        items:
+          type: string
+      milestone:
+        type: string
+        description: 'The ID of the milestone to associate this issue with (e.g., "5"). NOTE: Only users
+          with push access can set the milestone; it is silently dropped otherwise.'
+    required:
+    - owner
+    - repo
+    - title
+- name: github_create_an_issue_comment
+  slug: GITHUB_CREATE_AN_ISSUE_COMMENT
+  access: write
+  description: Creates a new comment on an existing github issue or pull request within the specified
+    repository.
+  input_schema:
+    type: object
+    properties:
+      body:
+        type: string
+        description: Comment content in GitHub Flavored Markdown.
+      repo:
+        type: string
+        description: Name of the repository (without `.git` extension); not case-sensitive.
+      owner:
+        type: string
+        description: Account owner of the repository (username or organization); not case-sensitive.
+      issue_number:
+        type: integer
+        description: Number identifying the issue or pull request for the comment.
+    required:
+    - owner
+    - repo
+    - issue_number
+    - body

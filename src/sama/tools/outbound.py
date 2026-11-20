@@ -19,7 +19,7 @@ import asyncio
 import http.cookiejar
 import ipaddress
 import socket
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -128,7 +128,8 @@ async def system_resolver(host: str, port: int) -> Sequence[IPAddress]:
 
 
 class OutboundClient:
-    """GET requests under a ``UrlPolicy``. Create one per policy. Close it with ``aclose``."""
+    """Requests under a ``UrlPolicy`` (``get`` follows checked redirects, ``request`` does
+    not). Create one per policy. Close it with ``aclose``."""
 
     def __init__(
         self,
@@ -215,19 +216,57 @@ class OutboundClient:
             current = result
         raise BlockedUrlError(f"more than {self.policy.max_redirects} redirects")
 
-    async def _send(self, parsed: httpx.URL, address: IPAddress) -> FetchResult | str:
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        params: Mapping[str, str] | None = None,
+        json: object = None,
+    ) -> FetchResult:
+        """Sends one request under the policy and does not follow a redirect: a redirect would
+        send the headers (for example a credential) to a URL that the caller did not choose.
+        Raises ``BlockedUrlError``, or ``FetchError`` for a redirect, a network error, or a
+        time limit. An error status is a result, not an error."""
+        try:
+            async with asyncio.timeout(self.policy.total_timeout_s):
+                target = str(httpx.URL(url, params=params)) if params else url
+                parsed, address = await self.check(target)
+                result = await self._send(parsed, address, method, headers, json)
+        except TimeoutError:
+            raise FetchError("the request took too long") from None
+        if isinstance(result, str):
+            raise FetchError(f"{parsed.raw_host.decode('ascii')} sent a redirect")
+        return result
+
+    async def _send(
+        self,
+        parsed: httpx.URL,
+        address: IPAddress,
+        method: str = "GET",
+        extra_headers: Mapping[str, str] | None = None,
+        json: object = None,
+    ) -> FetchResult | str:
         """Sends one request to the checked address. Returns the result, or the next URL of a
         redirect."""
         host = parsed.raw_host.decode("ascii")
         target = parsed.copy_with(host=str(address))
-        headers = {
-            "host": parsed.netloc.decode("ascii"),
-            "user-agent": USER_AGENT,
-            "accept": "text/html, text/plain, application/json, */*;q=0.5",
-            "accept-encoding": "identity",
-        }
+        headers = httpx.Headers(
+            {
+                "user-agent": USER_AGENT,
+                "accept": "text/html, text/plain, application/json, */*;q=0.5",
+            }
+        )
+        headers.update(extra_headers or {})
+        # The caller cannot change these two: the host is the checked host, and a compressed
+        # body could expand past the size limit.
+        headers["host"] = parsed.netloc.decode("ascii")
+        headers["accept-encoding"] = "identity"
         extensions = {"sni_hostname": host} if parsed.scheme == "https" else {}
-        request = self._client.build_request("GET", target, headers=headers, extensions=extensions)
+        request = self._client.build_request(
+            method, target, headers=headers, json=json, extensions=extensions
+        )
         try:
             response = await self._client.send(request, stream=True)
         except httpx.HTTPError as error:

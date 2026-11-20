@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Hashable
 from contextlib import asynccontextmanager
@@ -37,10 +38,14 @@ from sama.db.models import (
     User,
 )
 from sama.gate.approvers import Approvers, approvers_of
+from sama.gate.decide import ALWAYS_ASK, canonical_name
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.orchestrator.queue import RunQueue
+from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
 from sama.tenancy.access import Grants, load_grants
+
+log = logging.getLogger("sama.gateway")
 
 EVENTS_PER_READ: Final = 500
 MAX_ARGUMENT_CHARS: Final = 1500
@@ -76,6 +81,9 @@ class Target:
     agent_profile_id: uuid.UUID
     audience: str
     """``private`` for a direct chat, ``shared`` for a group, a channel, or a thread."""
+    worker_bot_id: uuid.UUID | None = None
+    """The worker bot of the channel (M3.10, Section 11.6), or ``None``. Its sessions carry
+    the id, so that the daily budget counts their model calls."""
 
     @classmethod
     def private(cls, identity: Any) -> Target:
@@ -195,6 +203,7 @@ async def find_session(
                     Session.owner_user_id,
                     Session.status,
                     Session.agent_profile_id,
+                    Session.worker_bot_id,
                 )
                 .join(
                     SessionBinding,
@@ -210,6 +219,7 @@ async def find_session(
         and row.org_id == target.org_id
         and row.workspace_id == target.workspace_id
         and row.audience == target.audience
+        and row.worker_bot_id == target.worker_bot_id
         and grants.sees_session(row.workspace_id, row.audience, row.owner_user_id)
     ):
         return Bound(row.id, row.agent_profile_id)
@@ -238,9 +248,13 @@ async def new_session(
                 owner_user_id=target.owner_user_id,
                 parent_session_id=parent,
                 lineage=None if parent is None else "branch",
+                worker_bot_id=target.worker_bot_id,
             )
         )
         await _bind(connection, channel, key, target, session_id)
+        details: dict[str, str] = {"audience": target.audience, "channel": channel}
+        if target.worker_bot_id is not None:
+            details["worker_bot_id"] = str(target.worker_bot_id)
         await connection.execute(
             insert(AuditEntry).values(
                 org_id=target.org_id,
@@ -250,7 +264,7 @@ async def new_session(
                 action="session.created",
                 target_type="session",
                 target_id=str(session_id),
-                details={"audience": target.audience, "channel": channel},
+                details=details,
             )
         )
     return Bound(session_id, agent_profile_id)
@@ -299,51 +313,51 @@ async def read_run(
                 .limit(EVENTS_PER_READ)
             )
         ).all()
-        pending = (
-            []
-            if status != "paused"
-            else (
-                await connection.execute(
-                    select(
-                        Approval.id,
-                        Approval.tool_name,
-                        Approval.reason,
-                        Approval.arguments,
-                        ReviewProposal.kind.label("proposal_kind"),
-                        ReviewProposal.scope.label("proposal_scope"),
-                        ReviewProposal.payload.label("proposal_payload"),
-                        Session.audience,
-                        AgentProfile.policy,
-                        User.display_name.label("requester_name"),
-                        Run.triggered_by_user_id.label("requester_id"),
-                    )
-                    .join(Run, (Run.org_id == Approval.org_id) & (Run.id == Approval.run_id))
-                    .join(
-                        Session,
-                        (Session.org_id == Approval.org_id) & (Session.id == Approval.session_id),
-                    )
-                    .join(
-                        AgentProfile,
-                        (AgentProfile.org_id == Run.org_id)
-                        & (AgentProfile.id == Run.agent_profile_id),
-                    )
-                    .outerjoin(
-                        User,
-                        (User.org_id == Run.org_id) & (User.id == Run.triggered_by_user_id),
-                    )
-                    .outerjoin(
-                        ReviewProposal,
-                        (ReviewProposal.org_id == Approval.org_id)
-                        & (ReviewProposal.approval_id == Approval.id),
-                    )
-                    .where(
-                        Approval.org_id == org_id,
-                        Approval.run_id == run_id,
-                        Approval.status == "pending",
-                    )
-                )
-            ).all()
+        # A paused run waits for its approvals. A run that is not paused can still have the
+        # open approval of a proposal of a chat run (M3.2): the card shows it, and the run goes
+        # on.
+        query = (
+            select(
+                Approval.id,
+                Approval.tool_name,
+                Approval.reason,
+                Approval.arguments,
+                ReviewProposal.kind.label("proposal_kind"),
+                ReviewProposal.scope.label("proposal_scope"),
+                ReviewProposal.payload.label("proposal_payload"),
+                ReviewProposal.origin.label("proposal_origin"),
+                Session.audience,
+                AgentProfile.policy,
+                User.display_name.label("requester_name"),
+                Run.triggered_by_user_id.label("requester_id"),
+            )
+            .join(Run, (Run.org_id == Approval.org_id) & (Run.id == Approval.run_id))
+            .join(
+                Session,
+                (Session.org_id == Approval.org_id) & (Session.id == Approval.session_id),
+            )
+            .join(
+                AgentProfile,
+                (AgentProfile.org_id == Run.org_id) & (AgentProfile.id == Run.agent_profile_id),
+            )
+            .outerjoin(
+                User,
+                (User.org_id == Run.org_id) & (User.id == Run.triggered_by_user_id),
+            )
+            .outerjoin(
+                ReviewProposal,
+                (ReviewProposal.org_id == Approval.org_id)
+                & (ReviewProposal.approval_id == Approval.id),
+            )
+            .where(
+                Approval.org_id == org_id,
+                Approval.run_id == run_id,
+                Approval.status == "pending",
+            )
         )
+        if status != "paused":
+            query = query.where(ReviewProposal.id.is_not(None))
+        pending = (await connection.execute(query)).all()
         shown = [_shown_approval(row) for row in pending]
     return RunRead(status, list(events), shown)
 
@@ -412,7 +426,31 @@ class ShownApproval:
     reason: str
     arguments: Any
     answerers: str | None = None
+    proposal: bool = False
+    """True for a proposal (M3.2). A proposal card has no "always allow" button: a policy rule
+    cannot approve a proposal."""
 
+
+def offers_always(row: Any) -> bool:
+    """True when an approval card gets "Always allow for me". A proposal does not: a rule cannot
+    approve a proposal. A tool in ``ALWAYS_ASK`` (such as ``repo_push_approval``) does not: the
+    gate asks for it each time and writes no rule for it (Section 15.1)."""
+    if getattr(row, "proposal", False):
+        return False
+    return canonical_name(str(getattr(row, "tool_name", ""))) not in ALWAYS_ASK
+
+
+ALWAYS_LABEL: Final = "Always allow for me"
+ALWAYS_OUTCOME: Final = "Always allowed"
+"""The outcome of "Always allow for me": the call is approved, and a user policy rule allows
+the tool for this user and profile from now on. The card shows "Always allowed by <user>"."""
+
+PROPOSAL_ANSWERERS: Final = {
+    "org": "Only the org owner can decide this.",
+    "workspace": "A workspace admin or the org owner can decide this.",
+    "agent": "A workspace admin or the org owner can decide this.",
+}
+"""Who may decide a proposal (Section 9.4). The gate checks the role again."""
 
 MAX_NAME_CHARS: Final = 60
 
@@ -437,12 +475,21 @@ def answerers_text(
 
 
 def _shown_approval(row: Any) -> ShownApproval:
-    """The card of a proposal of a background review is made again from the payload with the
-    redactor of now, and not from the stored text (Section 9.4)."""
+    """The card of a proposal is made again from the payload with the redactor of now, and not
+    from the stored text (Section 9.4)."""
     reason, arguments = row.reason, row.arguments
     if row.proposal_payload is not None:
-        shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
-        return ShownApproval(row.id, row.tool_name, shown.reason, shown.arguments)
+        shown = shown_proposal(
+            row.proposal_kind, row.proposal_scope, row.proposal_payload, row.proposal_origin
+        )
+        return ShownApproval(
+            row.id,
+            row.tool_name,
+            shown.reason,
+            shown.arguments,
+            PROPOSAL_ANSWERERS.get(row.proposal_scope),
+            proposal=True,
+        )
     answerers = (
         answerers_text(
             row.requester_name,
@@ -554,7 +601,7 @@ async def send_ending(
 @dataclass(frozen=True, slots=True)
 class Decided:
     outcome: str
-    """``Approved``, ``Denied``, or ``Expired``."""
+    """``Approved``, ``Always allowed``, ``Denied``, or ``Expired``."""
     tool_name: str
 
 
@@ -567,9 +614,15 @@ async def decide(
     user_id: uuid.UUID,
     approval_id: uuid.UUID,
     approve: bool,
+    always_allow: bool = False,
+    reviews: ReviewApplier | None = None,
 ) -> Decided:
     """Records the decision of a linked chat user on an approval of a session that the user can
-    see. Raises ``ApprovalError`` with a message that is safe to show."""
+    see. Raises ``ApprovalError`` with a message that is safe to show.
+
+    ``always_allow`` with ``approve`` also writes a user policy rule for the tool (M3.2). The
+    gate ignores it for a proposal. With ``reviews``, a decided proposal applies at once. The
+    worker applies it in its maintenance round too, so a failure here only delays it."""
     async with engine.connect() as connection:
         row = (
             await connection.execute(
@@ -580,10 +633,16 @@ async def decide(
                     Session.workspace_id,
                     Session.audience,
                     Session.owner_user_id,
+                    ReviewProposal.id.label("proposal_id"),
                 )
                 .join(
                     Session,
                     (Session.org_id == Approval.org_id) & (Session.id == Approval.session_id),
+                )
+                .outerjoin(
+                    ReviewProposal,
+                    (ReviewProposal.org_id == Approval.org_id)
+                    & (ReviewProposal.approval_id == Approval.id),
                 )
                 .where(Approval.org_id == org_id, Approval.id == approval_id)
             )
@@ -591,14 +650,32 @@ async def decide(
         grants = await load_grants(connection, org_id, user_id)
     if row is None or not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
         raise ApprovalError("You cannot decide this approval.")
+    # The gate ignores "always allow" for a proposal (a rule cannot approve a proposal) and for
+    # a tool in ALWAYS_ASK (the gate asks for it each time).
+    always = (
+        always_allow
+        and approve
+        and row.proposal_id is None
+        and canonical_name(row.tool_name) not in ALWAYS_ASK
+    )
     try:
         await gate.decide_approval(
-            org_id=org_id, run_id=row.run_id, call_id=row.call_id, user_id=user_id, approve=approve
+            org_id=org_id,
+            run_id=row.run_id,
+            call_id=row.call_id,
+            user_id=user_id,
+            approve=approve,
+            always_allow=always,
         )
-        outcome = "Approved" if approve else "Denied"
+        outcome = ALWAYS_OUTCOME if always else "Approved" if approve else "Denied"
     except ApprovalExpiredError:
         outcome = "Expired"
     await queue.release_decided(org_id=org_id, run_id=row.run_id)
+    if reviews is not None:
+        try:
+            await reviews.apply_decided(org_id=org_id, run_id=row.run_id)
+        except Exception:
+            log.exception("the proposals could not be applied run=%s", row.run_id)
     return Decided(outcome, row.tool_name)
 
 

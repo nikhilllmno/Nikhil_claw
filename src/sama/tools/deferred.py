@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-from sama.gate.decide import META_TOOLS, TOOLSETS, canonical_name, tools_of
+from sama.gate.decide import META_TOOLS, TOOLSETS, ToolAccess, canonical_name, tools_of
 from sama.tenancy.run_token import RunTokenClaims
 
 DEFAULT_SEARCH_LIMIT: Final = 5
@@ -59,7 +59,9 @@ class DeferredTool:
     handler: DeferredHandler
     input_schema: Mapping[str, Any] = field(default_factory=lambda: {"type": "object"})
     tags: tuple[str, ...] = ()
-    read_only: bool = False
+    access: ToolAccess = "write"
+    """What the tool does, for its default policy (Section 10.3). A ``destructive`` tool can
+    delete or change data that cannot be restored; the approval card says so."""
 
     def __post_init__(self) -> None:
         if _NAME.fullmatch(self.name) is None:
@@ -129,6 +131,11 @@ class DeferredCatalog:
             grouped.setdefault(tool.toolset, set()).add(tool.name)
         return {name: frozenset(tools) for name, tools in grouped.items()}
 
+    def access(self) -> Mapping[str, ToolAccess]:
+        """What each tool does, for the default policy of the gate: a tool that only reads
+        gets ``allow``, every other tool gets ``ask`` (Section 10.3)."""
+        return {name: tool.access for name, tool in self._tools.items()}
+
     def search(
         self, query: str | None, allowed: Collection[str], limit: int = DEFAULT_SEARCH_LIMIT
     ) -> list[DeferredTool]:
@@ -163,7 +170,11 @@ def format_search(tools: list[DeferredTool], *, query: str | None) -> str:
 def format_describe(tool: DeferredTool) -> str:
     """The result of ``tool_describe``."""
     schema = json.dumps(dict(tool.input_schema), ensure_ascii=False, indent=1)
-    kind = "reads only" if tool.read_only else "can change things"
+    kind = {
+        "read": "reads only",
+        "write": "can change things",
+        "destructive": "can delete things",
+    }[tool.access]
     return (
         f"{tool.name} ({kind})\n{tool.description}\n\nArguments (JSON schema):\n{schema}\n\n"
         f'Run it with tool_call: name="{tool.name}" and arguments as an object.'

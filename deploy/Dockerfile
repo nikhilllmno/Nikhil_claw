@@ -18,7 +18,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/opt/sama/.venv \
     PATH=/opt/sama/.venv/bin:$PATH \
-    SAMA_BUILTIN_SKILLS_DIR=/opt/sama/skills
+    SAMA_BUILTIN_SKILLS_DIR=/opt/sama/skills \
+    SAMA_CONNECTORS_DIR=/opt/sama/connectors/catalog
 
 RUN pip install --no-cache-dir uv==0.13.8
 
@@ -31,6 +32,7 @@ COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY skills ./skills
+COPY connectors ./connectors
 RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --no-editable \
     && pip uninstall --yes uv \
     && useradd --system --no-create-home sama

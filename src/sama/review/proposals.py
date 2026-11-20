@@ -1,10 +1,12 @@
-"""The proposals of a background review (docs/architecture.md, Section 9.4).
+"""The proposals of shared changes (docs/architecture.md, Section 9.4).
 
 A review run can change user memory and user skills at once. It cannot change shared memory
-or a shared skill alone: no person is in the run. It proposes the change instead. A proposal
-is one ``approvals`` row (the human decision, shown with the other approvals of the session)
-and one ``review_proposals`` row (the full change). ``sama.review.apply`` applies the change
-after a person with the right role approves it.
+or a shared skill alone: no person is in the run. It proposes the change instead. A chat run
+also proposes a change when its user does not have the role for it (a workspace write of a
+member who is not an admin, an org skill of a user who is not the org owner), and every change
+of a soul is a proposal (M3.2). A proposal is one ``approvals`` row (the human decision, shown
+with the other approvals of the session) and one ``review_proposals`` row (the full change).
+``sama.review.apply`` applies the change after a person with the right role approves it.
 """
 
 from __future__ import annotations
@@ -27,8 +29,20 @@ from sama.vault.redact import default_redactor, redact
 CALL_PREFIX: Final = "review:"
 """The ``call_id`` of the approval of a proposal starts with this text."""
 
-ProposalKind = Literal["memory", "skill"]
+ProposalKind = Literal["memory", "skill", "soul"]
 ProposalScope = Literal["agent", "workspace", "org"]
+ProposalOrigin = Literal["review", "chat"]
+TOOL_OF_KIND: Final[dict[str, str]] = {
+    "memory": "memory",
+    "skill": "skill_manage",
+    "soul": "change_propose",
+}
+
+
+def proposal_reason(origin: str, kind: str, scope: str, summary: str) -> str:
+    """The text of the approval of a proposal: who proposes it, and the change."""
+    who = "the background review" if origin == "review" else "the agent"
+    return f"{who} proposes a change of {scope} {kind}: {summary}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +60,7 @@ class NewProposal:
     fields of ``ManageRequest``."""
     summary: str
     """One line for the person who decides."""
+    origin: ProposalOrigin = "review"
 
 
 class ProposalSink(Protocol):
@@ -67,7 +82,7 @@ class PostgresProposalStore:
         payload = default_redactor().json(dict(proposal.payload))
         summary = redact(proposal.summary)[:PROPOSAL_SUMMARY_MAX_CHARS]
         proposal_id = uuid.uuid4()
-        tool_name = "memory" if proposal.kind == "memory" else "skill_manage"
+        tool_name = TOOL_OF_KIND[proposal.kind]
         async with self._engine.begin() as connection:
             approval_id = (
                 await connection.execute(
@@ -80,8 +95,9 @@ class PostgresProposalStore:
                         tool_name=tool_name,
                         arguments=stored_arguments(payload),
                         arguments_digest=arguments_digest(payload),
-                        reason=f"the background review proposes a change of {proposal.scope}"
-                        f" {proposal.kind}: {summary}",
+                        reason=proposal_reason(
+                            proposal.origin, proposal.kind, proposal.scope, summary
+                        ),
                         expires_at=func.now() + self._ttl,
                     )
                     .returning(Approval.id)
@@ -97,6 +113,7 @@ class PostgresProposalStore:
                     acting_user_id=proposal.acting_user_id,
                     kind=proposal.kind,
                     scope=proposal.scope,
+                    origin=proposal.origin,
                     payload=payload,
                 )
             )
@@ -113,6 +130,7 @@ class PostgresProposalStore:
                         "session_id": str(proposal.session_id),
                         "kind": proposal.kind,
                         "scope": proposal.scope,
+                        "origin": proposal.origin,
                         "summary": summary,
                     },
                 )

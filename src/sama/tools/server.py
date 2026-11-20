@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict
-from typing import Annotated, Any, Final, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, runtime_checkable
 
 import anyio
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
@@ -30,6 +30,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
 from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, Verdict
 from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, GateAnswer, GateRequest
@@ -51,6 +52,8 @@ from sama.memory.core import (
     Target,
 )
 from sama.memory.service import MemoryService
+from sama.profiles import SOUL_MAX_CHARS
+from sama.review.soul import SUMMARY_MAX_CHARS, SoulError, SoulProposer
 from sama.runtime.archive import (
     ARCHIVE_PATH,
     MAX_ARCHIVE_BODY_BYTES,
@@ -115,6 +118,9 @@ from sama.tools.web import (
 )
 from sama.vault.redact import redact
 
+if TYPE_CHECKING:
+    from sama.connectors.service import ConnectionService
+
 log = logging.getLogger("sama.tools")
 
 SERVER_NAME: Final = "sama"
@@ -127,6 +133,7 @@ WEB_EXTRACT: Final = "web_extract"
 CLARIFY: Final = "clarify"
 TODO: Final = "todo"
 MEMORY: Final = "memory"
+CHANGE_PROPOSE: Final = "change_propose"
 SESSION_SEARCH: Final = "session_search"
 SESSION_READ: Final = "session_read"
 REPO_CLONE: Final = "repo_clone"
@@ -134,12 +141,16 @@ SKILLS_LIST: Final = "skills_list"
 SKILL_VIEW: Final = "skill_view"
 SKILL_MANAGE: Final = "skill_manage"
 VISION_ANALYZE: Final = "vision_analyze"
+CONNECTIONS_LIST: Final = "connections_list"
+CONNECTION_REQUEST: Final = "connection_request"
+CONNECTION_TEST: Final = "connection_test"
 
 MAX_ERROR_CHARS: Final = 2_000
 """An error result is cut to this length. Argument errors of the SDK can be long."""
 
 _EXPECTED = (
     ClarifyError,
+    ConnectorError,
     DeferredToolError,
     GitHubToolError,
     MemoryChangeError,
@@ -147,6 +158,7 @@ _EXPECTED = (
     SearchError,
     SessionSearchError,
     SkillError,
+    SoulError,
     TodoError,
     VisionError,
 )
@@ -264,9 +276,15 @@ class ToolServer:
     - ``sessions``: session search. Without it, ``session_search`` and ``session_read`` are
       hidden.
     - ``vision``: image analysis (``vision_analyze``). Without it, the tool is hidden.
+    - ``souls``: proposes a new soul for the profile of the run (``change_propose``, toolset
+      ``self``). Without it, the tool is hidden.
     - ``deferred``: the catalog of deferred tools. With at least one tool in it when the app
       is built, the server has ``tool_search``, ``tool_describe``, and ``tool_call``
       (Section 10.3). Without it, these tools are hidden.
+    - ``connections``: the connections of the workspace (Section 10.3). With it, the server
+      has ``connections_list``, ``connection_request``, and ``connection_test``, and
+      ``tool_search`` shows a connector tool only when the run can use its connection.
+      Without it, these tools are hidden.
     - ``archive``: stores the transcript before a compaction (Section 6.3). With it, the
       server answers ``POST /archive`` for the runner. Without it, ``/archive`` answers
       ``503`` and the runtime compacts without an archive.
@@ -291,11 +309,15 @@ class ToolServer:
         sessions: SessionSearch | None = None,
         vision: VisionService | None = None,
         deferred: DeferredCatalog | None = None,
+        connections: ConnectionService | None = None,
         archive: ArchiveBackend | None = None,
         gate: GateBackend | None = None,
+        souls: SoulProposer | None = None,
     ) -> None:
         self.signer = signer
+        self.souls = souls
         self.deferred = deferred
+        self.connections = connections
         self.archive = archive
         self._archive_slots = asyncio.Semaphore(MAX_CONCURRENT_ARCHIVES)
         self.gate = gate
@@ -525,6 +547,35 @@ class ToolServer:
                 }
                 return await self._call(ctx, MEMORY, arguments, body)
 
+        if self.souls is not None:
+            souls = self.souls
+
+            @server.tool(
+                name=CHANGE_PROPOSE,
+                description=(
+                    "Propose a change of your own setup. The only target is soul: the "
+                    "instructions that set your persona and the way you work for every user of "
+                    "this agent profile. Give the full new soul in content, not a diff, and a "
+                    "short summary of the change. The change is not saved: a workspace admin "
+                    "or the org owner must approve it on an approval card. After the approval, "
+                    "it applies from the next session. Propose a change only when the user asks "
+                    "for it."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
+                structured_output=False,
+            )
+            async def change_propose_tool(
+                ctx: Context,
+                target: Literal["soul"],
+                content: Annotated[str, Field(max_length=SOUL_MAX_CHARS)],
+                summary: Annotated[str, Field(max_length=SUMMARY_MAX_CHARS)],
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return await souls.propose(claims, content, summary)
+
+                arguments = {"target": target, "content": content, "summary": summary}
+                return await self._call(ctx, CHANGE_PROPOSE, arguments, body)
+
         if self.sessions is not None:
             sessions = self.sessions
             past = ToolAnnotations(read_only_hint=True, open_world_hint=False)
@@ -612,6 +663,9 @@ class ToolServer:
 
         if self.deferred is not None and len(self.deferred) > 0:
             self._deferred_tools(server, self.deferred)
+
+        if self.connections is not None:
+            self._connection_tools(server, self.connections)
 
         if self.repos is not None:
             repos = self.repos
@@ -748,7 +802,11 @@ class ToolServer:
     async def _visible(self, claims: RunTokenClaims, catalog: DeferredCatalog) -> frozenset[str]:
         """The deferred tools that the run can use now."""
         if isinstance(self.gate, ToolVisibility):
-            return await self.gate.visible_tools(claims)
+            allowed = await self.gate.visible_tools(claims)
+            if self.connections is None:
+                return allowed
+            # A connector tool shows only when the run has a connection that it may use.
+            return await self.connections.usable_tools(claims, allowed)
         # A gate that cannot say what the run may use shows nothing: the search must not tell
         # a run the names and the schemas of tools that the gate may deny.
         return frozenset()
@@ -833,6 +891,66 @@ class ToolServer:
 
             arguments = {"repo": repo, "branch": branch, "commit": commit}
             return await self._call(ctx, REPO_PUSH_APPROVAL, arguments, run)
+
+    def _connection_tools(self, server: MCPServer, connections: ConnectionService) -> None:
+        """``connections_list``, ``connection_request``, and ``connection_test``
+        (Section 10.3). No tool takes or gives a credential."""
+
+        @server.tool(
+            name=CONNECTIONS_LIST,
+            description=(
+                "List the connectors (Gmail, GitHub, Notion, and more) and the state of their "
+                "connections for this session. A connected connector has tools: find them "
+                "with tool_search."
+            ),
+            annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+            structured_output=False,
+        )
+        async def connections_list(ctx: Context) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                return await connections.list_for_agent(claims)
+
+            return await self._call(ctx, CONNECTIONS_LIST, {}, body)
+
+        @server.tool(
+            name=CONNECTION_REQUEST,
+            description=(
+                "Get a link that the user opens to connect a connector. Give the connector "
+                "name from connections_list. scope is personal (for the user only) or "
+                "workspace (for all members; a workspace admin connects it). The default is "
+                "personal in a private session and workspace in a shared session. Give the "
+                "link to the user. Never ask for passwords, API keys, or tokens in the chat."
+            ),
+            annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+            structured_output=False,
+        )
+        async def connection_request(
+            connector: Annotated[str, Field(min_length=1, max_length=40)],
+            ctx: Context,
+            scope: Literal["personal", "workspace"] | None = None,
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                return await connections.request_for_agent(claims, connector, scope)
+
+            arguments = {"connector": connector, "scope": scope}
+            return await self._call(ctx, CONNECTION_REQUEST, arguments, body)
+
+        @server.tool(
+            name=CONNECTION_TEST,
+            description=(
+                "Check the connection of a connector that this session would use, and show "
+                "its state. Use it after the user connects."
+            ),
+            annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+            structured_output=False,
+        )
+        async def connection_test(
+            connector: Annotated[str, Field(min_length=1, max_length=40)], ctx: Context
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                return await connections.test_for_agent(claims, connector)
+
+            return await self._call(ctx, CONNECTION_TEST, {"connector": connector}, body)
 
     def _deferred_tools(self, server: MCPServer, catalog: DeferredCatalog) -> None:
         """``tool_search``, ``tool_describe``, and ``tool_call`` (Section 10.3)."""

@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AuditEntry, Skill, SkillVersion
-from sama.review.proposals import NewProposal, ProposalSink
+from sama.review.proposals import NewProposal, ProposalOrigin, ProposalSink
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, WritePlan, index, plan_write
 from sama.skills.sql import load_actor, load_docs, scope_filter
@@ -110,6 +110,10 @@ class PostgresSkillStore:
                 actor = await _actor(connection, claims)
                 if actor.review:
                     return await self._review(connection, actor, request)
+                if actor.attended and self._proposals is not None:
+                    proposed = await self._chat_proposal(connection, actor, request)
+                    if proposed is not None:
+                        return proposed
                 return await self._write(connection, actor, request)
         except IntegrityError:
             raise SkillError(
@@ -169,24 +173,54 @@ class PostgresSkillStore:
                 )
         return await self._save(connection, actor, plan, request)
 
+    async def _plan_as_owner(
+        self, connection: AsyncConnection, actor: Actor, request: ManageRequest
+    ) -> WritePlan:
+        """The plan with the roles of an org owner, to check the request and to learn the
+        scope. The real check runs again when a person approves the proposal."""
+        docs = await load_docs(connection, actor, names=[request.name], full=True)
+        builtin = self._builtin.get(request.name)
+        candidates = [*docs, *([builtin] if builtin else [])]
+        return plan_write(candidates, replace(actor, workspace_admin=True, org_owner=True), request)
+
     async def _review(
         self, connection: AsyncConnection, actor: Actor, request: ManageRequest
     ) -> Written:
         """A background review writes a user skill itself. For any other scope it proposes
-        the change, and a person approves it (Section 9.4). The plan runs with the roles of an
-        org owner, to check the request and to learn the scope. The real check runs again when
-        a person approves the proposal."""
-        docs = await load_docs(connection, actor, names=[request.name], full=True)
-        builtin = self._builtin.get(request.name)
-        candidates = [*docs, *([builtin] if builtin else [])]
-        plan = plan_write(candidates, replace(actor, workspace_admin=True, org_owner=True), request)
+        the change, and a person approves it (Section 9.4)."""
+        plan = await self._plan_as_owner(connection, actor, request)
         if plan.scope == "user":
             return await self._write(connection, actor, request)
-        target = plan.target
         if self._proposals is None or actor.session_id is None or actor.run_id is None:
             raise SkillError("A background review cannot change a shared skill here.")
         if plan.scope not in ("workspace", "org"):
             raise SkillError(f"A background review cannot change a {plan.scope} skill.")
+        return await self._propose(actor, request, plan, "review")
+
+    async def _chat_proposal(
+        self, connection: AsyncConnection, actor: Actor, request: ManageRequest
+    ) -> Written | None:
+        """A chat run whose user lacks the role for a workspace or org skill proposes the
+        change. A workspace admin or the org owner approves a workspace skill, and the org owner
+        approves an org skill (M3.2). Returns None when the user has the role, or when the
+        request is not a shared write: the normal write then runs and gives its own answer."""
+        try:
+            plan = await self._plan_as_owner(connection, actor, request)
+        except SkillError:
+            return None
+        has_role = actor.org_owner or (plan.scope == "workspace" and actor.workspace_admin)
+        if has_role or plan.scope not in ("workspace", "org"):
+            return None
+        if actor.session_id is None or actor.run_id is None:
+            return None
+        return await self._propose(actor, request, plan, "chat")
+
+    async def _propose(
+        self, actor: Actor, request: ManageRequest, plan: WritePlan, origin: ProposalOrigin
+    ) -> Written:
+        if self._proposals is None or actor.session_id is None or actor.run_id is None:
+            raise SkillError("This process cannot propose a shared skill.")
+        target = plan.target
         await self._proposals.propose(
             NewProposal(
                 org_id=actor.org_id,
@@ -205,6 +239,7 @@ class PostgresSkillStore:
                 },
                 summary=f"{request.action} the {plan.scope} skill {request.name}"
                 + (f": {request.summary}" if request.summary else ""),
+                origin=origin,
             )
         )
         return Written(request.name, plan.scope, 0, request.action, proposed=True)
