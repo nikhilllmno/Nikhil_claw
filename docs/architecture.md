@@ -3022,15 +3022,26 @@ gives no deferred tool: the search fails closed (Section 6.3).
   (`SAMA_SANDBOX_TEMPLATE`, Section 19.3). Without the setting, the template is `sama-runner`,
   which the nightly job builds from `main`. It pauses when idle and resumes on the next run,
   and the files stay.
-- **Template change.** Each sandbox has the label `sama.template`. When the label is not the
-  template of the control plane (a deploy of a new commit, or a sandbox from before the label),
-  `resume` removes the sandbox and raises `SandboxOutdatedError`. The orchestrator then
-  creates a new sandbox from its own template. A paused sandbox keeps the runner of the commit
-  that made it, and the runner and the control plane refuse unknown job and event fields, so
-  an old sandbox cannot run a job of a new commit. The files of the session sandbox do not
-  stay after such a deploy. Skills sync again on the next run. A run that waits for an
-  approval across the deploy cannot resume the CLI session, because that session was in the
-  old sandbox.
+- **Template change.** Each sandbox has the label `sama.template`. A paused sandbox keeps the
+  runner of the commit that made it, and the runner and the control plane refuse unknown job
+  and event fields. So the orchestrator does not resume a sandbox whose label is not the
+  template of the control plane (a deploy of a new commit, or a sandbox from before the
+  label). `resume` raises `SandboxOutdatedError` with the running sandbox. The orchestrator
+  then:
+  1. creates a new sandbox from its own template;
+  2. moves `SandboxSettings.carry_dirs` from the home folder of the old sandbox to the new
+     one, as one archive of at most 64 MB. The default is `.claude`, the folder of the Claude
+     CLI, which holds the transcripts that a run resumes;
+  3. kills the old sandbox, also when the move fails.
+
+  Other files of the old sandbox, for example in the work folder, do not stay. Skills sync
+  again on the next run. When `session_sandbox()` finds an outdated sandbox (for example, for
+  a tool that reads files), it pauses it again and returns nothing.
+- **A lost CLI session.** The runner gives the Claude adapter `cli_session_exists`. It looks
+  for `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/<session>.jsonl`. When the transcript of
+  the saved session is not there (the move failed, or the sandbox was lost), a run starts a
+  new SDK session, with its cost and token counts from zero, and the earlier conversation is
+  not in the CLI context. An approval resume of such a session fails with `invalid_request`.
 - Default limits: 2 vCPU, 4 GB RAM, 1 hour per run, 15 minutes of idle before E2B pauses the
   sandbox. Later, 24 hours of pause before the workspace is archived to Supabase Storage.
 - Egress: the sama API endpoints, package registries, GitHub, and a per-org allowlist. E2B
@@ -3056,7 +3067,7 @@ gives no deferred tool: the search fails closed (Section 6.3).
 | Part | Where | What it does |
 |---|---|---|
 | Interface | `src/sama/sandbox/base.py` | `SandboxProvider` (`create`, `resume`), `Sandbox` (`exec`, `start`, files, `keep_alive`, `pause`, `kill`), `SandboxProcess` (stdin, stdout lines, exit code). `SandboxSpec` holds the org, the session, the template, the limits, and `allow_out`. |
-| E2B | `src/sama/sandbox/e2b.py` | `lifecycle.on_timeout = "pause"`. Metadata `sama.org_id`, `sama.session_id`, and `sama.template`. `resume` connects and checks the metadata. It removes a sandbox of another template. |
+| E2B | `src/sama/sandbox/e2b.py` | `lifecycle.on_timeout = "pause"`. Metadata `sama.org_id`, `sama.session_id`, and `sama.template`. `resume` connects and checks the metadata. It gives a sandbox of another template to the caller in `SandboxOutdatedError`. |
 | Docker | `src/sama/sandbox/docker.py` | For local development and CI. One container per session. `pause` stops the container and `resume` starts it. A process runs under `setsid` in its own process group, and `kill` kills that group in the container, then the `docker exec` client on the host. The group kill also runs when the client has already ended. |
 | Local | `src/sama/sandbox/local.py` | A folder on the host, for tests only. No isolation, only a clean environment. |
 | Image | `sandbox/Dockerfile` | Python 3.12, git, ripgrep, the runner, and the Claude runtime (the SDK bundles the Claude CLI). Docker uses it, and `python -m sama.sandbox.template` builds the E2B template from it. |
@@ -3758,7 +3769,8 @@ The provider and search keys are the defaults. An org key in the vault comes fir
   `E2B_API_KEY`. The nightly job still builds `sama-runner` from `main` for the E2B tests and
   for local use (Section 16.2).
 - A template stays in E2B after its deploy. Old templates are removed by hand.
-- A paused session sandbox of an older template is replaced on its next run (Section 16.2).
+- A paused session sandbox of an older template is replaced on its next run. The CLI
+  transcripts move to the new sandbox, and other files do not (Section 16.2).
 
 ### 19.4 First org (M1.15)
 

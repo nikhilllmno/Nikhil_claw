@@ -246,11 +246,10 @@ class DockerProvider:
         labels = json.loads(out) or {}
         if not spec.owns(labels):
             raise SandboxError("the sandbox belongs to another session")
-        if spec.outdated(labels):
-            await DockerSandbox(sandbox_id).kill()
-            raise SandboxOutdatedError(sandbox_id)
         code, _, err = await _docker("start", sandbox_id)
         if code != 0:
             raise _failed("docker start", err)
+        if spec.outdated(labels):
+            raise SandboxOutdatedError(sandbox_id, DockerSandbox(sandbox_id))
         log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return DockerSandbox(sandbox_id)

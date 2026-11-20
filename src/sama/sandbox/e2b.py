@@ -278,7 +278,6 @@ class E2BProvider:
             raise SandboxError("the sandbox belongs to another session")
         result = E2BSandbox(sandbox)
         if spec.outdated(info.metadata or {}):
-            await result.kill()
-            raise SandboxOutdatedError(sandbox_id)
+            raise SandboxOutdatedError(sandbox_id, result)
         log_start(self.name, "resume", result.id, spec.session_id, started)
         return result

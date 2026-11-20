@@ -26,7 +26,7 @@ from sama.runtime.archive import (
     fit,
     parse_archive,
 )
-from sama.runtime.claude_transcript import parse_transcript, read_transcript
+from sama.runtime.claude_transcript import cli_session_exists, parse_transcript, read_transcript
 from tests.support import make_scope
 
 
@@ -472,3 +472,18 @@ def test_the_model_refuses_a_tool_name_that_is_too_long() -> None:
     with pytest.raises(ValueError, match="at most"):
         ArchiveEntry(role="assistant", tool_name="n" * (MAX_TOOL_NAME_CHARS + 1))
     assert ArchiveEntry(role="assistant", tool_name="n" * MAX_TOOL_NAME_CHARS)
+
+
+def test_a_cli_session_exists_only_with_its_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "projects" / "-workspace"
+    project.mkdir(parents=True)
+    (project / "abc-123.jsonl").write_text("{}\n")
+    assert cli_session_exists("abc-123", str(tmp_path))
+    assert not cli_session_exists("other", str(tmp_path))
+    assert not cli_session_exists("*", str(tmp_path)), "a glob is not a session"
+    assert not cli_session_exists("../projects/-workspace/abc-123", str(tmp_path))
+    assert not cli_session_exists("", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert cli_session_exists("abc-123")

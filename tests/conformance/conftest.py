@@ -165,6 +165,7 @@ async def target(
         return
 
     from sama.runtime.claude import ClaudeRuntime, ClaudeSettings
+    from sama.runtime.claude_transcript import cli_session_exists
 
     live = request.param == "claude-live"
     model_url = None
@@ -172,7 +173,14 @@ async def target(
         _, model_url = request.getfixturevalue("scripted_model")
     workdir = tmp_path / "work"
     workdir.mkdir()
-    settings = ClaudeSettings(cwd=str(workdir), env=claude_env(tmp_path / "claude", model_url))
+    config_dir = str(tmp_path / "claude")
+    settings = ClaudeSettings(
+        cwd=str(workdir),
+        env=claude_env(tmp_path / "claude", model_url),
+        # As in the runner: the resume tests then show that the check finds the transcript
+        # that the real CLI writes.
+        session_exists=lambda session: cli_session_exists(session, config_dir),
+    )
     runtime = ClaudeRuntime(gate=_suite_gate(), settings=settings)
     yield ClaudeTarget(
         name=request.param,

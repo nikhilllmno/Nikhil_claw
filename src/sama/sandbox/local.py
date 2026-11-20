@@ -126,7 +126,6 @@ class LocalProvider:
         if not spec.owns(labels):
             raise SandboxError("the sandbox belongs to another session")
         if spec.outdated(labels):
-            await LocalSandbox(root).kill()
-            raise SandboxOutdatedError(sandbox_id)
+            raise SandboxOutdatedError(sandbox_id, LocalSandbox(root))
         log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return LocalSandbox(root)

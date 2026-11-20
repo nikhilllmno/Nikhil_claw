@@ -152,13 +152,22 @@ async def test_resume_checks_the_session(harness: Harness) -> None:
         await harness.provider.resume(sandbox.id, harness.spec(session_id="sess-other"))
 
 
-async def test_resume_of_a_sandbox_from_another_template_removes_it(harness: Harness) -> None:
+async def test_resume_of_a_sandbox_from_another_template_gives_it_to_the_caller(
+    harness: Harness,
+) -> None:
+    """The provider does not resume an outdated sandbox as the session sandbox. It gives the
+    running sandbox to the caller, which moves the state and kills it (Section 16.2)."""
     spec = harness.spec()
-    sandbox = await harness.provider.create(spec)
+    sandbox = await harness.create(spec)
+    path = f"{sandbox.workdir}/kept.txt"
+    await sandbox.write_file(path, b"state")
     newer = dataclasses.replace(spec, template=f"{spec.template}-newer")
-    with pytest.raises(SandboxOutdatedError):
+    with pytest.raises(SandboxOutdatedError) as caught:
         await harness.provider.resume(sandbox.id, newer)
-    # The provider removed it, so no spec finds it again.
+    outdated = caught.value.sandbox
+    assert outdated.id == sandbox.id
+    assert await outdated.read_file(path) == b"state", "the sandbox still runs"
+    await outdated.kill()
     with pytest.raises(SandboxNotFoundError):
         await harness.provider.resume(sandbox.id, spec)
 

@@ -159,6 +159,7 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
         return FakeRuntime(scripts=job.fake_scripts)
     if kind is RuntimeKind.CLAUDE_AGENT_SDK:
         from sama.runtime.claude import ClaudeRuntime, ClaudeSettings, GateDecision
+        from sama.runtime.claude_transcript import cli_session_exists
 
         workdir = env.get(WORKDIR_ENV) or WORKDIR
         os.makedirs(workdir, exist_ok=True)
@@ -166,6 +167,7 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
             cwd=workdir,
             env=claude_cli_env(env[RUN_TOKEN_ENV], env.get(MODEL_URL_ENV)),
             cancel_grace_s=CANCEL_GRACE_S,
+            session_exists=cli_session_exists,
         )
         archiver = None
         if job.archive_url is not None:

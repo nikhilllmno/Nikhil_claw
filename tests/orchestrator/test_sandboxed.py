@@ -8,7 +8,7 @@ import sys
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -306,6 +306,80 @@ async def test_a_deploy_with_a_new_template_replaces_the_session_sandbox(
     second = new.sandbox_id("org-1", "sess-1")
     assert second not in (None, first)
     assert directory.ids == {("org-1", "sess-1"): second}
+    assert await old.session_sandbox("org-1", "sess-1") is None, "the old sandbox is removed"
+    await new.close_sandboxes(kill=True)
+
+
+def _two_templates(
+    provider: CountingProvider, directory: DictDirectory, **settings: Any
+) -> tuple[SandboxedRuntime, SandboxedRuntime]:
+    old, new = (
+        SandboxedRuntime(
+            kind=RuntimeKind.FAKE,
+            provider=provider,
+            signer=RunTokenSigner(KEY),
+            settings=SandboxSettings(template=template, runner_argv=RUNNER, **settings),
+            directory=directory,
+        )
+        for template in ("sama-runner-old", "sama-runner-new")
+    )
+    return old, new
+
+
+async def test_a_new_template_moves_the_cli_state_to_the_new_sandbox(
+    provider: CountingProvider,
+) -> None:
+    """The transcripts of the CLI go to the new sandbox, so the next run resumes the same
+    conversation. Other files stay behind."""
+    directory = DictDirectory()
+    old, new = _two_templates(provider, directory)
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = await old.session_sandbox("org-1", "sess-1")
+    assert first is not None
+    made = await first.exec(
+        [
+            "sh",
+            "-c",
+            'mkdir -p "$HOME/.claude/projects/w" && echo hello > "$HOME/.claude/projects/w/s.jsonl"'
+            ' && echo other > "$HOME/other.txt"',
+        ]
+    )
+    assert made.exit_code == 0, made.stderr
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    second = await new.session_sandbox("org-1", "sess-1")
+    assert second is not None
+    assert second.id != first.id
+    moved = await second.exec(
+        ["sh", "-c", 'cat "$HOME/.claude/projects/w/s.jsonl"; test ! -e "$HOME/other.txt"']
+    )
+    assert (moved.exit_code, moved.stdout) == (0, "hello\n")
+    with pytest.raises(FileNotFoundError):
+        await second.read_file(f"{second.workdir}/.sama-carry.tgz")
+    await new.close_sandboxes(kill=True)
+
+
+async def test_a_failed_move_of_the_cli_state_does_not_fail_the_run(
+    provider: CountingProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = DictDirectory()
+    old, new = _two_templates(provider, directory)
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = await old.session_sandbox("org-1", "sess-1")
+    assert first is not None
+    await first.exec(["sh", "-c", 'mkdir -p "$HOME/.claude" && echo x > "$HOME/.claude/a"'])
+
+    async def broken(self: LocalSandbox, path: str) -> bytes:
+        raise OSError("read failed")
+
+    monkeypatch.setattr(LocalSandbox, "read_file", broken)
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    assert provider.creates == 2
     assert await old.session_sandbox("org-1", "sess-1") is None, "the old sandbox is removed"
     await new.close_sandboxes(kill=True)
 

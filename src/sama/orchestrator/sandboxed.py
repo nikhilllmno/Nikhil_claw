@@ -156,6 +156,22 @@ class _Active:
         return max(0.0, self.cancelled_at + CANCEL_DEADLINE_S - time.monotonic())
 
 
+CARRY_DIRS: Final = (".claude",)
+CARRY_MAX_BYTES: Final = 64 * 1024 * 1024
+"""A larger archive of ``carry_dirs`` does not go to the new sandbox."""
+CARRY_FILE: Final = ".sama-carry.tgz"
+"""The archive, in the work folder of each sandbox, only for the time of the move."""
+_CARRY_PACK: Final = (
+    'cd "$HOME" || exit 1; '
+    'set -- $(for d in "$@"; do [ -e "$d" ] && echo "$d"; done); '
+    '[ "$#" -gt 0 ] || exit 3; '
+    'tar -czf "$CARRY" "$@" && stat -c %s "$CARRY"'
+)
+_CARRY_UNPACK: Final = (
+    'mkdir -p "$HOME" && tar -xzf "$CARRY" -C "$HOME"; code=$?; rm -f "$CARRY"; exit $code'
+)
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxSettings:
     """``template`` is the provider template or image. ``allow_out`` is the egress
@@ -175,6 +191,10 @@ class SandboxSettings:
     runner_argv: tuple[str, ...] = RUNNER_ARGV
     extra_env: Mapping[str, str] = field(default_factory=dict)
     """More variables for the runner. Never a secret."""
+    carry_dirs: tuple[str, ...] = CARRY_DIRS
+    """Folders in the home folder of the sandbox user that go to the new sandbox when the
+    session sandbox is from another template (Section 16.2). The default is the folder of
+    the Claude CLI, which holds the transcripts that a run resumes."""
 
 
 class SandboxDirectory(Protocol):
@@ -303,6 +323,11 @@ class SandboxedRuntime:
             return None
         try:
             return await self._provider.resume(sandbox_id, self._spec(org_id, session_id))
+        except SandboxOutdatedError as error:
+            # The next run moves its state and kills it. Until then it pauses again.
+            with contextlib.suppress(Exception):
+                await error.sandbox.pause()
+            return None
         except SandboxNotFoundError:
             return None
 
@@ -348,20 +373,29 @@ class SandboxedRuntime:
         async with self._session_locks.setdefault(key, asyncio.Lock()):
             spec = self._spec(*key)
             sandbox: Sandbox | None = None
+            outdated: Sandbox | None = None
             known = await self._known_sandbox(key)
             if known is not None:
                 try:
                     sandbox = await self._provider.resume(known, spec)
-                except SandboxOutdatedError:
+                except SandboxOutdatedError as error:
                     log.warning(
                         "the session sandbox is from another template; creating a new one"
                         " sandbox=%s",
                         known,
                     )
+                    outdated = error.sandbox
                 except SandboxNotFoundError:
                     log.warning("the session sandbox is gone; creating a new one sandbox=%s", known)
             if sandbox is None:
-                sandbox = await self._provider.create(spec)
+                try:
+                    sandbox = await self._provider.create(spec)
+                    if outdated is not None:
+                        await self._carry(outdated, sandbox)
+                finally:
+                    if outdated is not None:
+                        with contextlib.suppress(Exception):
+                            await outdated.kill()
                 self._sandbox_ids[key] = sandbox.id
                 if self._directory is not None:
                     try:
@@ -373,6 +407,39 @@ class SandboxedRuntime:
             await sandbox.keep_alive(int(_wall_time_s(budget) + TOKEN_MARGIN_S))
             self._session_runs[key] = self._session_runs.get(key, 0) + 1
             return sandbox
+
+    async def _carry(self, old: Sandbox, new: Sandbox) -> None:
+        """Moves ``carry_dirs`` from the outdated sandbox to the new one. A failure only logs:
+        the run goes on, and a runtime without its saved session starts a new one."""
+        dirs = self._settings.carry_dirs
+        if not dirs:
+            return
+        try:
+            source = f"{old.workdir}/{CARRY_FILE}"
+            packed = await old.exec(
+                ["sh", "-c", _CARRY_PACK, "sh", *dirs], env={"CARRY": source}, timeout_s=120
+            )
+            if packed.exit_code == 3:
+                return  # nothing to move
+            size = int(packed.stdout.strip() or -1) if packed.exit_code == 0 else -1
+            if not 0 < size <= CARRY_MAX_BYTES:
+                log.warning(
+                    "the state of the old sandbox does not move code=%s size=%s",
+                    packed.exit_code,
+                    size,
+                )
+                return
+            target = f"{new.workdir}/{CARRY_FILE}"
+            await new.write_file(target, await old.read_file(source))
+            unpacked = await new.exec(
+                ["sh", "-c", _CARRY_UNPACK], env={"CARRY": target}, timeout_s=120
+            )
+            if unpacked.exit_code != 0:
+                log.warning(
+                    "the state of the old sandbox did not unpack code=%s", unpacked.exit_code
+                )
+        except Exception:
+            log.exception("the state of the old sandbox did not move sandbox=%s", old.id)
 
     async def _known_sandbox(self, key: tuple[str, str]) -> str | None:
         known = self._sandbox_ids.get(key)

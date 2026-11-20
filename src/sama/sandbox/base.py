@@ -40,7 +40,13 @@ class SandboxNotFoundError(SandboxError):
 
 class SandboxOutdatedError(SandboxNotFoundError):
     """The sandbox was made from another template, so its runner can be of another version.
-    The provider removed it, and the caller creates a new sandbox (Section 16.2)."""
+    The caller creates a new sandbox, moves the state that must stay (``SandboxSettings.
+    carry_dirs``) from ``sandbox`` to it, and kills ``sandbox`` (Section 16.2). ``sandbox`` is
+    running when the provider raises this error."""
+
+    def __init__(self, sandbox_id: str, sandbox: Sandbox) -> None:
+        super().__init__(sandbox_id)
+        self.sandbox = sandbox
 
 
 @dataclass(frozen=True, slots=True)
