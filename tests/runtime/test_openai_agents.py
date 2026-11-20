@@ -25,8 +25,12 @@ from sama.runtime.openai_agents import (
     OpenAISettings,
     StoreFailure,
     _Job,
+    _kept_count,
     _new_conversation,
+    _PendingCall,
+    _State,
     _Store,
+    _WindowCompaction,
     archive_entries,
     compact_focus,
     reject_text,
@@ -183,3 +187,25 @@ def test_failures_map_to_the_contract_codes() -> None:
     unknown = runtime._failure(KeyError("secret"), job)
     assert unknown.code is FailureCode.INTERNAL
     assert "secret" not in unknown.message
+
+
+def test_the_window_of_a_manual_compaction_stays_whole() -> None:
+    user = {"type": "message", "role": "user", "content": "Remember the word kumquat"}
+    compaction = {"type": "compaction", "encrypted_content": "x"}
+    later = {"type": "message", "role": "user", "content": "And now?"}
+    context: list[Any] = [user, compaction, later]
+    # The first two items are the answer of /responses/compact: nothing is cut.
+    assert _WindowCompaction(floor=2).process_context(context) == context
+    # A compaction item after the window cuts the context, as the SDK capability does.
+    server = [*context, compaction, later]
+    assert _WindowCompaction(floor=2).process_context(server) == [compaction, later]
+    assert _WindowCompaction().process_context(context) == [compaction, later]
+
+
+def test_a_new_run_keeps_the_items_of_the_run_before() -> None:
+    assert _kept_count(None) == 0
+    done = _State(conversation="c-1", run_id="r-1", item_count=4)
+    assert _kept_count(done) == 4
+    pending = _PendingCall(call_id="call-1", tool_name="Bash")
+    paused = done.model_copy(update={"pending": pending, "paused_count": 7})
+    assert _kept_count(paused) == 7

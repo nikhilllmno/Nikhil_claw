@@ -30,6 +30,9 @@ MAX_WIRE_ITEMS: Final = 5_000
 MAX_SESSION_ITEMS: Final = 20_000
 """The most items of one session. The store refuses an ``add`` over this limit. A compaction
 replaces the items with a few items."""
+MAX_SESSION_ITEMS_BYTES: Final = 16_000_000
+"""The most bytes of the items of one conversation (``item_bytes``). The store refuses an
+``add`` or a ``replace`` over this limit, so a ``get`` answer is also at most this size."""
 SESSION_ITEMS_TIMEOUT_S: Final = 30.0
 CONVERSATION_PATTERN: Final = r"^[A-Za-z0-9_.:-]{1,100}$"
 
@@ -111,6 +114,18 @@ class SessionItems(Protocol):
     async def call(self, scope: RunScope, request: SessionItemsRequest) -> SessionItemsAnswer: ...
 
 
+def item_bytes(items: Sequence[dict[str, Any]]) -> int:
+    """The size of items as the stores count it: the UTF-8 bytes of the JSON text of each item,
+    with the separators of the Postgres ``jsonb`` text."""
+    return sum(len(json.dumps(item, ensure_ascii=False).encode()) for item in items)
+
+
+def check_size(stored: int, added: Sequence[dict[str, Any]]) -> None:
+    """Raises ``SessionItemsError`` if the items go over ``MAX_SESSION_ITEMS_BYTES``."""
+    if stored + item_bytes(added) > MAX_SESSION_ITEMS_BYTES:
+        raise SessionItemsError("the session items are too large")
+
+
 def apply(items: list[dict[str, Any]], request: SessionItemsRequest) -> SessionItemsAnswer:
     """Applies one operation to a list of items in place. The memory store and the tests of a
     database store use it as the reference."""
@@ -123,6 +138,7 @@ def apply(items: list[dict[str, Any]], request: SessionItemsRequest) -> SessionI
     elif request.op == "add":
         if len(items) + len(request.items) > MAX_SESSION_ITEMS:
             raise SessionItemsError("the session has too many items")
+        check_size(item_bytes(items), request.items)
         items.extend(request.items)
     elif request.op == "pop":
         if items:
@@ -130,6 +146,7 @@ def apply(items: list[dict[str, Any]], request: SessionItemsRequest) -> SessionI
     elif request.op == "clear":
         items.clear()
     elif request.op == "replace":
+        check_size(0, request.items)
         items[:] = list(request.items)
     else:
         assert request.count is not None  # noqa: S101 -- the model checks it

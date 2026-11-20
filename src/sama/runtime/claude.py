@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -89,6 +88,7 @@ from sama.runtime.contract import (
     is_terminal,
 )
 from sama.runtime.gating import AllowAllGate as AllowAllGate
+from sama.runtime.gating import BoundedSet
 from sama.runtime.gating import GateDecision as GateDecision
 from sama.runtime.gating import ToolGate as ToolGate
 
@@ -126,7 +126,6 @@ _NATIVE_TOOLS: Final = frozenset(
 server, and the CLI names it ``mcp__sama__<tool>``."""
 _SAMA_MCP_PREFIX: Final = "mcp__sama__"
 _PREVIEW_CHARS: Final = 2_000
-_MEMORY_SIZE: Final = 10_000
 
 
 # ---------------------------------------------------------------------------------------------
@@ -616,26 +615,6 @@ class _ActiveRun:
         self.queue.put_nowait(event)
 
 
-class _BoundedSet:
-    """Remembers the latest keys, up to a size. Old keys drop out first."""
-
-    def __init__(self, size: int = _MEMORY_SIZE) -> None:
-        self._size = size
-        self._keys: OrderedDict[str, None] = OrderedDict()
-
-    def add(self, key: str) -> None:
-        self._keys[key] = None
-        self._keys.move_to_end(key)
-        while len(self._keys) > self._size:
-            self._keys.popitem(last=False)
-
-    def discard(self, key: str) -> None:
-        self._keys.pop(key, None)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._keys
-
-
 class ClaudeRuntime:
     """The default runtime. See the module docstring for the approval flow.
 
@@ -664,9 +643,9 @@ class ClaudeRuntime:
         self._settings = settings or ClaudeSettings()
         self._client_factory = client_factory
         self._active: dict[str, _ActiveRun] = {}
-        self._paused = _BoundedSet()
-        self._used_approvals = _BoundedSet()
-        self._cancelled_runs = _BoundedSet()
+        self._paused = BoundedSet()
+        self._used_approvals = BoundedSet()
+        self._cancelled_runs = BoundedSet()
         self._pumps: set[asyncio.Task[None]] = set()
         self._cleanups: set[asyncio.Task[None]] = set()
         self._stopping: dict[str, asyncio.Task[None]] = {}

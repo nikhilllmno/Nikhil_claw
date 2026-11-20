@@ -646,19 +646,25 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
   the run token. The tool server takes the org, the session, and the run from the claims of the
   token. `PostgresSessionItems` (`src/sama/context/session_items.py`) checks that the run is
   `running`, that its user still has the authority of the run (Section 5.1), and that the
-  session is `active`. Then it applies the operation in one transaction under an advisory lock
-  for the conversation. The rows are in `runtime_session_items` (Section 17.1). The operations
+  session is `active`. It applies the operation in one transaction. The transaction first
+  takes an advisory lock for the conversation, and then does the checks with a `FOR SHARE`
+  lock on the run row. So an operation that waits for the advisory lock sees a cancel that
+  came while it waited, and the worker cannot end the run while an operation commits. The rows are in `runtime_session_items` (Section 17.1). The operations
   are `get` (with a `limit`), `add`, `pop`, `clear`, `replace`, and `trim`. `seq` starts at 0
   and has no gaps, because every operation removes items only from the end or removes all of
   them. Limits: a body has at most 8 MB and 5,000 items, and a conversation has at most
-  20,000 items. A store refusal is `409`, and the run fails with `internal`, not retryable.
+  20,000 items and 16 MB of items (`MAX_SESSION_ITEMS_BYTES`, the UTF-8 bytes of the JSON text
+  of each item). The store refuses an `add` or a `replace` over a limit, so a `get` answer is
+  also at most 16 MB. The tool server keeps at most a fixed number of bodies and answers in
+  memory at one time. A store refusal is `409`, and the run fails with `internal`, not retryable.
   A store fault fails the run with `internal`, retryable.
 - **Conversations.** `runtime_state` names the conversation of the session. A run with no
   `runtime_state` (the first chat run, or a background review run, Section 9.4) starts a new
   conversation, so a review run never changes the items of the chat. `item_count` in
   `runtime_state` is the count that the next run keeps. A run that failed or was cancelled
   keeps the count of the run before it, so the next run first trims the items of the failed
-  run.
+  run. This is also true for a failure before the trim, for example a store fault: the
+  failure state keeps the count of the run before it, so the items stay.
 - **Tool gate.** The adapter wraps each tool with `needs_approval`, which asks the sama
   `ToolGate` (Section 16.1). The shell call `exec_command` goes to the gate as a `Bash` call
   with a `command`, so one policy fits both runtimes. The adapter removes the SDK tool
@@ -675,8 +681,13 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
   Responses API. After a run, the adapter archives the items before the last `compaction`
   item, drops them from the store, and yields `Compacted` with the trigger `auto`. A compact
   request (`RunRequest.compact`, or the input `/compact [focus]`) calls
-  `POST /responses/compact` through the proxy, archives the items, replaces them with the
-  answer, and yields `Compacted` with the trigger `manual`. A compact request with no
+  `POST /responses/compact` through the proxy with all the items, archives them, replaces
+  them with the whole answer, and yields `Compacted` with the trigger `manual`. The answer is
+  the new context window: it can have user messages before its `compaction` item, and the
+  next calls must get all of it. `runtime_state.window` is the length of the answer. The
+  adapter uses a `Compaction` capability that does not cut the context at a `compaction` item
+  in the window. A server-side `compaction` item after the window cuts the context, and the
+  window goes back to 0. A compact request with no
   earlier state fails with `invalid_request`. Archive entries come from the message, function
   call, and function call output items. Reasoning and compaction items have no readable text,
   so they stay out.
@@ -807,8 +818,10 @@ Rules:
   at the same time. A change to the profile SOUL, model, or runtime, or to a context file,
   applies from the next session.
 - `RunQueue.enqueue` takes the runtime from the frozen config of the session, if there is
-  one. So a session does not change its runtime. The assembler fails a run whose runtime is
-  not the session runtime.
+  one. The claim of a chat run that starts sets the runtime again, from the frozen config or
+  else from the profile, because the profile can switch runtime while the run waits
+  (Section 11.4). So a session does not change its runtime. The assembler fails a run whose
+  runtime is not the session runtime.
 - The environment text has the session start time in UTC (`sessions.created_at`) and the
   audience. The time does not change during the session, so the prefix stays stable.
 - Context files come from the table `context_files`. A file has no workspace (the whole org)
@@ -2281,6 +2294,12 @@ The rules of an update:
   sub-agents must fit the new runtime: the OpenAI runtime has no native sub-agents, so an admin
   removes the sub-agents first. A review model that the new runtime does not know goes back to
   the default (null).
+- A switch applies to new sessions. A session keeps the runtime of its frozen config. A chat
+  run of a session with no frozen config takes the runtime of the profile when the worker
+  claims it, not when the API queues it, so its runtime and its model are from the same
+  profile. A review run keeps the runtime that it got in the queue. It uses the review model
+  of the profile only if that runtime knows the model, else the default review model of the
+  runtime.
 - `model` must be one of the models of the runtime (the new runtime on a switch). `toolsets` have no duplicates, and each one is in the
   fixed toolset table. `subagents` replaces the whole list. The same code as `python -m
   sama.admin subagents set` checks it (`sama.subagents.validate_subagents`), and its error text

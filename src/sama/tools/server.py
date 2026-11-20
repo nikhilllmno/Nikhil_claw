@@ -990,7 +990,8 @@ class ToolServer:
                     "session items failed run=%s error=%s", claims.run_id, type(error).__name__
                 )
                 return JSONResponse({"error": "the session items failed"}, status_code=503)
-        return Response(answer.model_dump_json(), media_type="application/json")
+            # The answer is in memory only inside the slot, as the body is.
+            return Response(answer.model_dump_json(), media_type="application/json")
 
 
 def _unauthorized(error: InvalidRunTokenError) -> Response:

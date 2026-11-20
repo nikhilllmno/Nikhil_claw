@@ -30,8 +30,7 @@ import contextlib
 import json
 import logging
 import uuid
-from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
@@ -49,7 +48,7 @@ from agents import (
 from agents import (
     RunConfig as SdkRunConfig,
 )
-from agents.items import ToolApprovalItem
+from agents.items import ToolApprovalItem, TResponseInputItem
 from agents.mcp import MCPServer, MCPServerStreamableHttp
 from agents.memory.session import SessionABC
 from agents.models.openai_responses import OpenAIResponsesModel
@@ -87,7 +86,7 @@ from sama.runtime.contract import (
     Usage,
     is_terminal,
 )
-from sama.runtime.gating import AllowAllGate, GateDecision, ToolGate
+from sama.runtime.gating import AllowAllGate, BoundedSet, GateDecision, ToolGate
 from sama.runtime.session_items import (
     MAX_WIRE_ITEMS,
     SessionItems,
@@ -108,7 +107,6 @@ _PROXY_BUDGET_STATUS: Final = 402
 """The model proxy refuses a call over a budget with HTTP 402 (Section 16.6)."""
 _RETRYABLE_STATUS: Final = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _PREVIEW_CHARS: Final = 2_000
-_MEMORY_SIZE: Final = 10_000
 _CLEANUP_S: Final = 10.0
 _NOT_RUN_OUTPUT: Final = "The call did not run: the run ended before it."
 
@@ -139,8 +137,8 @@ class OpenAISettings:
 class _PendingCall(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    approval_id: str
     call_id: str
+    """The id of the paused call. It is also the approval id."""
     tool_name: str
 
 
@@ -150,7 +148,10 @@ class _State(BaseModel):
     ``conversation`` names the item list of the session. ``item_count`` is the number of items
     that the next run keeps: a failed run keeps the count of the run before it, so the next run
     drops the items of the failed run. ``paused_count`` is the number of items when the run
-    paused. ``run_state`` is the SDK ``RunState`` of a paused run.
+    paused. ``run_state`` is the SDK ``RunState`` of a paused run. ``window`` is the number of
+    items at the start of the list that a manual compaction gave: the answer of
+    ``/responses/compact`` must stay whole, so a ``compaction`` item in it does not cut the
+    items before it.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -165,6 +166,7 @@ class _State(BaseModel):
     elapsed_s: float = Field(default=0.0, ge=0)
     pending: _PendingCall | None = None
     run_state: dict[str, Any] | None = None
+    window: int = Field(default=0, ge=0)
 
     def dump(self) -> bytes:
         return self.model_dump_json().encode()
@@ -183,8 +185,6 @@ class _State(BaseModel):
 
 def _plain(item: Any) -> dict[str, Any]:
     """An SDK input item as a JSON object."""
-    if isinstance(item, BaseModel):
-        item = item.model_dump(mode="json", exclude_unset=True, warnings=False)
     value = json.loads(json.dumps(item, default=_json_default))
     if not isinstance(value, dict):
         raise TypeError("a session item must be a JSON object")
@@ -202,13 +202,11 @@ class _Store(SessionABC):
 
     def __init__(self, items: SessionItems, scope: RunScope, conversation: str) -> None:
         self.session_id = conversation
-        self.session_settings = None
         self._items = items
         self._scope = scope
-        self._conversation = conversation
 
     async def _call(self, op: str, **fields: Any) -> Any:
-        request = SessionItemsRequest(op=op, conversation=self._conversation, **fields)  # type: ignore[arg-type]
+        request = SessionItemsRequest(op=op, conversation=self.session_id, **fields)  # type: ignore[arg-type]
         try:
             return await self._items.call(self._scope, request)
         except SessionItemsError as error:
@@ -349,21 +347,11 @@ class _GatedAgent(SandboxAgent[Any]):
 # ---------------------------------------------------------------------------------------------
 
 
-def sama_usage(usage: SdkUsage) -> Usage:
-    """The SDK counts the cached tokens in ``input_tokens``. Sama counts them apart, as the
-    model proxy does (``openai_counts``). The cost stays zero: the proxy record is the source
-    of truth for cost."""
-    details = getattr(usage, "input_tokens_details", None)
-    cached = int(getattr(details, "cached_tokens", 0) or 0)
-    return Usage(
-        input_tokens=max(0, int(usage.input_tokens) - cached),
-        output_tokens=max(0, int(usage.output_tokens)),
-        cache_read_tokens=max(0, cached),
-    )
-
-
-def _response_usage(usage: Any) -> Usage:
-    """The usage of a ``/responses/compact`` answer."""
+def sama_usage(usage: SdkUsage | Any) -> Usage:
+    """The usage of the SDK or of a ``/responses/compact`` answer. Both count the cached
+    tokens in ``input_tokens``. Sama counts them apart, as the model proxy does
+    (``openai_counts``). The cost stays zero: the proxy record is the source of truth for
+    cost."""
     if usage is None:
         return Usage()
     total = int(getattr(usage, "input_tokens", 0) or 0)
@@ -421,16 +409,14 @@ def compact_focus(text: str) -> str | None:
     return None
 
 
-def _cause(exc: BaseException, kind: type[BaseException]) -> BaseException | None:
-    """The first exception of type ``kind`` in the chain of ``exc``."""
+def _chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and its causes, each one time."""
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, kind):
-            return current
+        yield current
         current = current.__cause__ or current.__context__
-    return None
 
 
 class StoreFailure(Exception):
@@ -445,18 +431,6 @@ def _store_text(error: Exception) -> str:
     if isinstance(error, httpx.HTTPStatusError):
         return f"HTTP {error.response.status_code}"
     return type(error).__name__
-
-
-def _status_code(exc: BaseException) -> int | None:
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        status = getattr(current, "status_code", None)
-        if isinstance(status, int):
-            return status
-        current = current.__cause__ or current.__context__
-    return None
 
 
 def _text_of(content: Any) -> str:
@@ -504,11 +478,46 @@ def _estimate_tokens(items: Sequence[Mapping[str, Any]]) -> int:
     return len(json.dumps(list(items), default=str)) // 4
 
 
-def _last_compaction(items: Sequence[Mapping[str, Any]]) -> int | None:
+def _last_compaction(items: Sequence[Any]) -> int | None:
     for index in range(len(items) - 1, -1, -1):
-        if items[index].get("type") == "compaction":
+        if _field(items[index], "type") == "compaction":
             return index
     return None
+
+
+def _load(config: RunConfig, raw: bytes | None) -> tuple[_State | None, str | None]:
+    """The state of a request, or the problem of the request."""
+    if config.runtime is not RuntimeKind.OPENAI_AGENTS_SDK:
+        return None, f"config is for runtime {config.runtime}, not openai_agents_sdk"
+    try:
+        return _State.load(raw), None
+    except ValidationError:
+        return None, "runtime_state is not valid for the openai runtime"
+
+
+def _kept_count(previous: _State | None) -> int:
+    """The item count that a new run starts from. After an unanswered approval, the items of
+    the paused run up to the pause stay."""
+    if previous is None:
+        return 0
+    if previous.pending is not None and previous.paused_count is not None:
+        return previous.paused_count
+    return previous.item_count
+
+
+class _WindowCompaction(Compaction):
+    """The SDK ``Compaction`` cuts the context before the last ``compaction`` item. The first
+    ``floor`` items are the answer of a manual compaction, which must stay whole, so a
+    ``compaction`` item in them does not cut the context. A ``compaction`` item of a
+    server-side compaction comes after them, and it cuts the context as before."""
+
+    floor: int = 0
+
+    def process_context(self, context: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        index = _last_compaction(context)
+        if index is None or index < self.floor:
+            return context
+        return context[index:]
 
 
 def _invalid(message: str) -> RunFailed:
@@ -550,7 +559,8 @@ class _Job:
     elapsed_before_s: float = 0.0
     started_at: float = 0.0
     result: RunResultStreaming | None = None
-    gate: _RunGate | None = None
+    window: int = 0
+    """``_State.window`` of this run."""
 
     @property
     def usage(self) -> Usage:
@@ -572,6 +582,7 @@ class _Job:
             usage=self.usage,
             elapsed_s=self.elapsed_s(),
             pending=pending,
+            window=self.window,
             **extra,
         ).dump()
 
@@ -596,26 +607,6 @@ class _ActiveRun:
             event = event.model_copy(update={"runtime_state": self.job.failure_state()})
         self.sent_terminal = is_terminal(event)
         self.queue.put_nowait(event)
-
-
-class _BoundedSet:
-    """Remembers the latest keys, up to a size. Old keys drop out first."""
-
-    def __init__(self, size: int = _MEMORY_SIZE) -> None:
-        self._size = size
-        self._keys: OrderedDict[str, None] = OrderedDict()
-
-    def add(self, key: str) -> None:
-        self._keys[key] = None
-        self._keys.move_to_end(key)
-        while len(self._keys) > self._size:
-            self._keys.popitem(last=False)
-
-    def discard(self, key: str) -> None:
-        self._keys.pop(key, None)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._keys
 
 
 class _Failure(Exception):
@@ -652,9 +643,9 @@ class OpenAIRuntime:
         self._archiver = archiver
         self._client: AsyncOpenAI | None = None
         self._active: dict[str, _ActiveRun] = {}
-        self._paused = _BoundedSet()
-        self._used_approvals = _BoundedSet()
-        self._cancelled_runs = _BoundedSet()
+        self._paused = BoundedSet()
+        self._used_approvals = BoundedSet()
+        self._cancelled_runs = BoundedSet()
         self._pumps: set[asyncio.Task[None]] = set()
 
     def __repr__(self) -> str:
@@ -700,13 +691,7 @@ class OpenAIRuntime:
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         run_id = request.scope.run_id
-        problem = self._check_config(request.config)
-        previous: _State | None = None
-        if problem is None:
-            try:
-                previous = _State.load(request.runtime_state)
-            except ValidationError:
-                problem = "runtime_state is not valid for the openai runtime"
+        previous, problem = _load(request.config, request.runtime_state)
         if problem is None and (run_id in self._active or run_id in self._paused):
             problem = f"run {run_id} is already active"
         focus = request.compact.focus if request.compact is not None else None
@@ -722,7 +707,9 @@ class OpenAIRuntime:
             config=request.config,
             budget=request.budget,
             conversation=previous.conversation if previous else _new_conversation(run_id),
-            base_count=0,
+            # A failure before ``_prepare`` ends must keep the items of the run before.
+            base_count=_kept_count(previous),
+            window=previous.window if previous else 0,
             input=None if focus is not None else request.input,
             compact=focus,
         )
@@ -732,13 +719,7 @@ class OpenAIRuntime:
                 yield event
 
     async def resume(self, request: ResumeRequest) -> AsyncIterator[RunEvent]:
-        problem = self._check_config(request.config)
-        state: _State | None = None
-        if problem is None:
-            try:
-                state = _State.load(request.runtime_state)
-            except ValidationError:
-                problem = "runtime_state is not valid for the openai runtime"
+        state, problem = _load(request.config, request.runtime_state)
         # No await from here to the registration of the run in ``_stream``: the checks and the
         # use of the approval are one step.
         if problem is None:
@@ -754,6 +735,7 @@ class OpenAIRuntime:
             budget=request.budget,
             conversation=state.conversation,
             base_count=state.item_count,
+            window=state.window,
             resume=state,
             decision=request.decision,
             reason=request.reason,
@@ -788,16 +770,11 @@ class OpenAIRuntime:
 
     # -- checks ----------------------------------------------------------------------------
 
-    def _check_config(self, config: RunConfig) -> str | None:
-        if config.runtime is not RuntimeKind.OPENAI_AGENTS_SDK:
-            return f"config is for runtime {config.runtime}, not openai_agents_sdk"
-        return None
-
     def _check_resume(self, request: ResumeRequest, state: _State | None) -> str | None:
         run_id = request.scope.run_id
         if state is None or state.pending is None or state.run_state is None:
             return "runtime_state has no pending approval"
-        if state.pending.approval_id != request.approval_id:
+        if state.pending.call_id != request.approval_id:
             return f"unknown approval: {request.approval_id}"
         if state.run_id != run_id:
             return f"approval {request.approval_id} belongs to another run"
@@ -900,8 +877,9 @@ class OpenAIRuntime:
                 message="the run reached max_turns",
                 usage=job.usage,
             )
-        store = _cause(exc, StoreFailure)
-        if isinstance(store, StoreFailure):
+        chain = list(_chain(exc))
+        store = next((e for e in chain if isinstance(e, StoreFailure)), None)
+        if store is not None:
             log.warning("the session items failed run=%s: %s", job.scope.run_id, store)
             return RunFailed(
                 code=FailureCode.INTERNAL,
@@ -910,7 +888,9 @@ class OpenAIRuntime:
                 retryable=store.retryable,
                 usage=job.usage,
             )
-        status = _status_code(exc)
+        status = next(
+            (s for e in chain if isinstance(s := getattr(e, "status_code", None), int)), None
+        )
         if status == _PROXY_BUDGET_STATUS:
             return RunFailed(
                 code=FailureCode.BUDGET_EXCEEDED,
@@ -936,13 +916,8 @@ class OpenAIRuntime:
         run goes back to. The items of a run that did not complete go away. After an
         unanswered approval, the paused call gets an output, because the Responses API needs
         an output for each call."""
-        if previous is None:
-            return await store.trim(0)
-        keep = previous.item_count
-        if previous.pending is not None and previous.paused_count is not None:
-            keep = previous.paused_count
-        count = await store.trim(keep)
-        if previous.pending is None:
+        count = await store.trim(_kept_count(previous))
+        if previous is None or previous.pending is None:
             return count
         items = await store.get_items()
         answered = {i.get("call_id") for i in items if i.get("type") == "function_call_output"}
@@ -965,7 +940,7 @@ class OpenAIRuntime:
             mcp_servers=list(servers),
             capabilities=[
                 Shell(configure_tools=_shell_tools),
-                Compaction(),
+                _WindowCompaction(floor=job.window),
             ],
             sama_gate=gate,
         )
@@ -973,7 +948,6 @@ class OpenAIRuntime:
     async def _agent_run(self, active: _ActiveRun, store: _Store) -> None:
         job = active.job
         gate = _RunGate(self._gate, job.scope)
-        job.gate = gate
         servers = _mcp_servers(job.config)
         client = UnixLocalSandboxClient()
         sandbox: Any = None
@@ -1013,8 +987,10 @@ class OpenAIRuntime:
         self, job: _Job, agent: _GatedAgent, store: _Store, gate: _RunGate
     ) -> RunState[Any]:
         state = job.resume
-        if state is None or state.pending is None or state.run_state is None:
-            raise _Failure(_invalid("runtime_state has no pending approval"))
+        # ``_check_resume`` checked the state before the run started.
+        assert state is not None  # noqa: S101
+        assert state.pending is not None  # noqa: S101
+        assert state.run_state is not None  # noqa: S101
         if state.paused_count is not None:
             await store.trim(state.paused_count)
         run_state: RunState[Any] = await RunState.from_json(agent, state.run_state)
@@ -1080,7 +1056,7 @@ class OpenAIRuntime:
             sdk_name = str(item.tool_name or _field(raw, "name") or "")
             name = gate.sama_name(sdk_name)
             arguments = sama_arguments(sdk_name, _arguments(_field(raw, "arguments")))
-            pending = _PendingCall(approval_id=call_id, call_id=call_id, tool_name=name)
+            pending = _PendingCall(call_id=call_id, tool_name=name)
             paused_count = await store.count()
             state = job.state(
                 item_count=job.base_count,
@@ -1118,11 +1094,12 @@ class OpenAIRuntime:
         part of the context. The adapter archives them and drops them from the store."""
         items = await store.get_items()
         index = _last_compaction(items)
-        if index is None or index == 0:
+        if index is None or index == 0 or index < job.window:
             return None
         before = _estimate_tokens(items)
         await self._archive(job.scope, "auto", items[:index])
         await store.replace(items[index:])
+        job.window = 0
         return Compacted(
             tokens_before=before,
             tokens_after=_estimate_tokens(items[index:]),
@@ -1135,8 +1112,8 @@ class OpenAIRuntime:
         items = await store.get_items()
         if not items:
             raise _Failure(_invalid("there is nothing to compact"))
-        start = _last_compaction(items) or 0
-        context = items[start:]
+        # The store has only the context: each run drops the items before a compaction.
+        context = items
         await self._archive(job.scope, "manual", context)
         instructions = job.config.render_prefix()
         if focus:
@@ -1146,11 +1123,12 @@ class OpenAIRuntime:
             input=context,
             instructions=instructions or None,
         )
-        job.extra_usage = job.extra_usage + _response_usage(response.usage)
-        output = [_plain(item) for item in response.output]
-        index = _last_compaction(output)
-        kept = output[index:] if index is not None else output
+        job.extra_usage = job.extra_usage + sama_usage(response.usage)
+        # The answer is the whole new context window, also the user messages before its
+        # compaction item. It goes to the next call unchanged.
+        kept = [_plain(item) for item in response.output]
         count = await store.replace(kept)
+        job.window = len(kept)
         active.send(
             Compacted(
                 tokens_before=_estimate_tokens(context),

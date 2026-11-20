@@ -6,13 +6,17 @@ the runner, the remote gate, and each adapter can use it.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from sama.runtime.contract import RunScope
 
-__all__ = ["AllowAllGate", "GateDecision", "ToolGate"]
+__all__ = ["AllowAllGate", "BoundedSet", "GateDecision", "ToolGate"]
+
+MEMORY_SIZE: Final = 10_000
+"""How many paused runs, used approvals, and cancelled runs an adapter remembers."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,3 +60,24 @@ class AllowAllGate:
         child: bool = False,
     ) -> GateDecision:
         return GateDecision("allow")
+
+
+class BoundedSet:
+    """Remembers the latest keys, up to a size. Old keys drop out first. The adapters use it
+    for the paused runs, the used approvals, and the cancelled runs."""
+
+    def __init__(self, size: int = MEMORY_SIZE) -> None:
+        self._size = size
+        self._keys: OrderedDict[str, None] = OrderedDict()
+
+    def add(self, key: str) -> None:
+        self._keys[key] = None
+        self._keys.move_to_end(key)
+        while len(self._keys) > self._size:
+            self._keys.popitem(last=False)
+
+    def discard(self, key: str) -> None:
+        self._keys.pop(key, None)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._keys
