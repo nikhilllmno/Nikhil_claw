@@ -48,9 +48,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.CheckConstraint("current_version >= 1", name=op.f("ck_skills_current_version")),
-        sa.CheckConstraint(
-            "scope IN ('org', 'workspace', 'user')", name=op.f("ck_skills_scope")
-        ),
+        sa.CheckConstraint("scope IN ('org', 'workspace', 'user')", name=op.f("ck_skills_scope")),
         sa.CheckConstraint(
             "(scope = 'org' AND workspace_id IS NULL AND user_id IS NULL)"
             " OR (scope = 'workspace' AND workspace_id IS NOT NULL AND user_id IS NULL)"
