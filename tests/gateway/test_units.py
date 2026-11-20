@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 from typing import Any
@@ -21,7 +22,7 @@ from sama.gateway.pairing import (
     new_code,
     normalize,
 )
-from sama.gateway.sessions import SPLIT_AT, Reply, split_point
+from sama.gateway.sessions import SPLIT_AT, Reply, split_point, wait_for_tasks
 from sama.gateway.telegram import _Outbox, _Unlinked
 from sama.gateway.telegram_client import TelegramClient, TelegramError, bot_id
 from sama.gateway.transcribe import OpenAITranscriber, TranscribeError
@@ -329,3 +330,44 @@ async def test_the_telegram_download_cap_is_exact() -> None:
         else:
             with pytest.raises(TelegramError, match="too large"):
                 await tg.download("f1", max_bytes=10)
+
+
+def _spawn(tasks: set[asyncio.Task[None]], work: Any) -> asyncio.Task[None]:
+    task = asyncio.create_task(work)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
+async def test_the_drain_ends_when_a_done_task_is_still_in_the_set() -> None:
+    """The CI hang of the hub tests: a task ends, and the drain starts before the done
+    callback takes the task out of the set. A loop of ``gather`` never yielded then."""
+    tasks: set[asyncio.Task[None]] = set()
+
+    async def work() -> None:
+        return None
+
+    task = _spawn(tasks, work())
+    # The task ends in this loop step; its done callback is queued after this coroutine.
+    await asyncio.sleep(0)
+    assert task.done()
+    assert task in tasks
+    await wait_for_tasks(tasks)
+
+
+async def test_the_drain_waits_for_the_tasks_that_tasks_start() -> None:
+    tasks: set[asyncio.Task[None]] = set()
+    finished: list[str] = []
+
+    async def child() -> None:
+        await asyncio.sleep(0.01)
+        finished.append("child")
+
+    async def parent() -> None:
+        await asyncio.sleep(0)
+        _spawn(tasks, child())
+        finished.append("parent")
+
+    _spawn(tasks, parent())
+    await wait_for_tasks(tasks)
+    assert finished == ["parent", "child"]

@@ -480,6 +480,17 @@ async def decide(
     return Decided(outcome, row.tool_name)
 
 
+async def wait_for_tasks(tasks: set[asyncio.Task[None]]) -> None:
+    """Waits until every task in ``tasks`` is done, also the tasks that they start.
+
+    A task leaves such a set through a done callback, and that callback runs in a later loop
+    step. ``gather`` of tasks that are all done returns without a loop step, so a loop of
+    ``gather`` over the whole set never lets the callback run and never ends. So wait only
+    for the pending tasks."""
+    while pending := [task for task in tasks if not task.done()]:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 @dataclass(slots=True)
 class _Held:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
