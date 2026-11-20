@@ -52,6 +52,19 @@ from sama.gateway.sessions import (
 )
 from sama.gateway.telegram_client import TelegramClient, TelegramError
 from sama.gateway.transcribe import TranscribeError, Transcriber
+from sama.media.images import (
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES_PER_MESSAGE,
+    TOO_LARGE,
+    TOO_MANY,
+    UNREADABLE,
+    UNSUPPORTED,
+    ImageRejected,
+    NewAttachment,
+    check_image,
+    is_image,
+    with_markers,
+)
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
@@ -96,6 +109,55 @@ class TelegramBot:
 
 TelegramSettings = FollowSettings
 """The settings that all bots share."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageRef:
+    """An image in a message, before the download."""
+
+    file_id: str
+    mime_type: str
+    name: str
+    size: int
+
+
+def _image_refs(message: Mapping[str, Any]) -> list[_ImageRef]:
+    """The images of a message: the best photo size and a document of an image type.
+
+    A photo is a list of sizes of one picture. The gateway takes the largest size that fits
+    the size limit. Telegram always makes a photo a JPEG. A file that the sender sent as a
+    document keeps its type.
+    """
+    refs: list[_ImageRef] = []
+    sizes = [
+        size
+        for size in message.get("photo") or []
+        if isinstance(size, dict) and size.get("file_id")
+    ]
+    if sizes:
+        sizes.sort(key=lambda size: int(size.get("width") or 0) * int(size.get("height") or 0))
+        fitting = [s for s in sizes if int(s.get("file_size") or 0) <= MAX_IMAGE_BYTES]
+        best = (fitting or sizes)[-1]
+        refs.append(
+            _ImageRef(
+                str(best["file_id"]), "image/jpeg", "photo.jpg", int(best.get("file_size") or 0)
+            )
+        )
+    document = message.get("document")
+    if (
+        isinstance(document, dict)
+        and document.get("file_id")
+        and str(document.get("mime_type") or "").lower().startswith("image/")
+    ):
+        refs.append(
+            _ImageRef(
+                str(document["file_id"]),
+                str(document["mime_type"]),
+                str(document.get("file_name") or "image"),
+                int(document.get("file_size") or 0),
+            )
+        )
+    return refs
 
 
 class _Unlinked(Exception):
@@ -325,7 +387,8 @@ class TelegramGateway:
         voice = message.get("voice") or message.get("audio")
         if not text and isinstance(voice, dict):
             text = await self._transcribe(chat_id, message_id, voice) or ""
-        if not text:
+        refs = _image_refs(message)
+        if not text and not refs:
             return
         if len(text) > MAX_INPUT_CHARS:
             await self._say(chat_id, "The message is too long.", reply_to=message_id)
@@ -341,6 +404,10 @@ class TelegramGateway:
             elif skill_command:
                 await self._say(chat_id, HELP, reply_to=message_id)
                 return
+        images = await self._download_images(chat_id, message_id, refs)
+        if images is None:
+            return
+        text = with_markers(text, images)
         place = object()
         self._followers.add(place)
         try:
@@ -349,7 +416,11 @@ class TelegramGateway:
                 self._followers.discard(place)
                 return
             run_id = await self._queue.enqueue(
-                org_id=target.org_id, session_id=bound.session_id, text=text, user_id=target.user_id
+                org_id=target.org_id,
+                session_id=bound.session_id,
+                text=text,
+                user_id=target.user_id,
+                attachments=images,
             )
         except QueueError as error:
             self._followers.discard(place)
@@ -519,6 +590,35 @@ class TelegramGateway:
         if not text:
             await self._say(chat_id, "The voice note has no words.", reply_to=message_id)
         return text
+
+    async def _download_images(
+        self, chat_id: int, message_id: int, refs: list[_ImageRef]
+    ) -> list[NewAttachment] | None:
+        """Downloads and checks the images of a message. Gives ``None`` after it told the
+        sender why an image cannot be used. Then the whole message stops: sama does not
+        answer a question about an image that it does not have."""
+        if len(refs) > MAX_IMAGES_PER_MESSAGE:
+            await self._say(chat_id, TOO_MANY, reply_to=message_id)
+            return None
+        images: list[NewAttachment] = []
+        for ref in refs:
+            try:
+                if not is_image(ref.mime_type):
+                    raise ImageRejected(UNSUPPORTED)
+                if ref.size > MAX_IMAGE_BYTES:
+                    raise ImageRejected(TOO_LARGE)
+                try:
+                    data = await self._client.download(ref.file_id, max_bytes=MAX_IMAGE_BYTES)
+                except TelegramError as error:
+                    log.warning("an image download failed chat=%s error=%s", chat_id, error)
+                    raise ImageRejected(
+                        TOO_LARGE if "too large" in str(error) else UNREADABLE
+                    ) from None
+                images.append(check_image(data, name=ref.name, claimed_mime=ref.mime_type))
+            except ImageRejected as error:
+                await self._say(chat_id, str(error), reply_to=message_id)
+                return None
+        return images
 
     # -- commands -------------------------------------------------------------------------
 

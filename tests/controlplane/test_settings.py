@@ -6,6 +6,7 @@ import pytest
 
 from sama.controlplane import ControlPlaneSettings, SettingsError
 from sama.controlplane.settings import DEFAULT_SANDBOX_HOSTS
+from sama.media.vision import DEFAULT_VISION_MODEL
 
 BASE = {
     "SAMA_DATABASE_URL": "postgresql://u:p@db.example.test/postgres",
@@ -136,3 +137,9 @@ def test_the_secret_values_cover_every_secret() -> None:
         vault_text,
     ):
         assert expected in values
+
+
+def test_the_vision_model_has_a_default_and_can_be_set() -> None:
+    assert settings().vision_model == DEFAULT_VISION_MODEL
+    assert settings(SAMA_VISION_MODEL="  ").vision_model == DEFAULT_VISION_MODEL
+    assert settings(SAMA_VISION_MODEL=" claude-opus-5 ").vision_model == "claude-opus-5"

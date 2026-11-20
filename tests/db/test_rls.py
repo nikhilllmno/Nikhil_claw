@@ -22,10 +22,13 @@ from tests.db.world import World
 pytestmark = pytest.mark.usefixtures("world")
 
 TABLES = sorted(Base.metadata.tables)
+COLUMNS = "attachments"
+"""The table whose grant is on columns: the bytes of an image are not readable."""
 SESSION_CHILDREN = (
     "runs",
     "messages",
     "message_embeddings",
+    "attachments",
     "run_events",
     "tool_calls",
     "session_bindings",
@@ -368,7 +371,32 @@ async def test_only_authenticated_select_is_granted(engine: AsyncEngine) -> None
             )
         )
         grants = {(grantee, table, privilege) for grantee, table, privilege in rows}
-    assert grants == {("authenticated", table, "SELECT") for table in TABLES}
+    # ``attachments`` has a grant on columns only: the table grant is absent on purpose.
+    assert grants == {("authenticated", table, "SELECT") for table in TABLES if table != COLUMNS}
+
+
+async def test_nobody_reads_the_bytes_of_an_image_through_the_data_api(
+    engine: AsyncEngine, world: World
+) -> None:
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT grantee, column_name, privilege_type"
+                " FROM information_schema.column_privileges"
+                " WHERE table_schema = 'public' AND table_name = 'attachments'"
+                " AND grantee IN ('anon', 'authenticated', 'PUBLIC')"
+            )
+        )
+        columns = {(grantee, column, privilege) for grantee, column, privilege in rows}
+    assert columns
+    assert {grantee for grantee, _, _ in columns} == {"authenticated"}
+    assert {privilege for _, _, privilege in columns} == {"SELECT"}
+    assert "data" not in {column for _, column, _ in columns}
+    async with as_user(engine, world.auth["alice"]) as connection:
+        assert await count(connection, "attachments") >= 1
+        with pytest.raises(DBAPIError) as error:
+            await connection.execute(text("SELECT data FROM attachments"))
+    assert sqlstate(error.value) == "42501"
 
 
 async def test_new_objects_in_public_are_closed_by_default(engine: AsyncEngine) -> None:

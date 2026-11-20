@@ -78,6 +78,18 @@ async def test_the_vault_turns_on_the_integrations(engine: AsyncEngine) -> None:
         assert hook.status_code == 401
 
 
+async def test_vision_needs_a_key_or_the_vault(engine: AsyncEngine) -> None:
+    assert fake_plane(engine).tools.vision is None
+    with_vault = fake_plane(engine, vault_key=VaultKey.from_text(VaultKey.generate()))
+    assert with_vault.tools.vision is not None
+    assert with_vault.tools.vision.model == "claude-sonnet-5-5"
+    with_key = fake_plane(
+        engine, anthropic_key=SecretStr("sk-ant-test"), vision_model="claude-opus-5"
+    )
+    assert with_key.tools.vision is not None
+    assert with_key.tools.vision.model == "claude-opus-5"
+
+
 async def test_a_message_runs_to_the_end_in_the_process(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:

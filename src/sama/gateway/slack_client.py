@@ -13,6 +13,7 @@ import hmac
 import re
 import time
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import SecretStr
@@ -23,6 +24,9 @@ MAX_TEXT: Final = 39_000
 MAX_SIGNATURE_AGE_S: Final = 300
 """A signed request older (or newer) than 5 minutes is refused, so a copy cannot be sent
 again later."""
+
+FILE_HOSTS: Final = ("slack.com", "slack-files.com")
+"""The hosts of the files that users share. The bot token goes only to these hosts."""
 
 BOT_TOKEN: Final = re.compile(r"xoxb-[A-Za-z0-9-]{20,250}")
 SIGNING_SECRET: Final = re.compile(r"[0-9a-f]{32}")
@@ -114,6 +118,38 @@ class SlackClient:
                 break
             await asyncio.sleep(wait)
         raise SlackError(f"{method} failed: {error}", retry_after=wait)
+
+    async def download(self, url: str, *, max_bytes: int) -> bytes:
+        """Downloads a file that a user shared (the ``url_private_download`` of the file).
+
+        The bot token goes in the header, and only to an https URL of a Slack host. The client
+        does not follow a redirect, so the token cannot go to another host. Raises
+        ``SlackError`` for a wrong URL, a failed download, or a file above ``max_bytes``.
+        """
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme != "https" or not any(
+            host == known or host.endswith(f".{known}") for known in FILE_HOSTS
+        ):
+            raise SlackError("download failed: not a Slack file URL")
+        headers = {"Authorization": f"Bearer {self._token.get_secret_value()}"}
+        try:
+            async with self._http.stream(
+                "GET", url, headers=headers, follow_redirects=False
+            ) as response:
+                if response.status_code != 200:
+                    raise SlackError(f"download failed: {response.status_code}")
+                declared = response.headers.get("Content-Length", "")
+                if declared.isdigit() and int(declared) > max_bytes:
+                    raise SlackError("download failed: the file is too large")
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise SlackError("download failed: the file is too large")
+        except httpx.HTTPError as failure:
+            raise SlackError(f"download failed: {type(failure).__name__}") from None
+        return bytes(data)
 
     async def auth_test(self) -> dict[str, Any]:
         """The workspace and the bot user of the token. Raises ``SlackError``."""

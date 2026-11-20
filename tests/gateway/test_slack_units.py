@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -138,3 +139,81 @@ def test_seen_events_forget_old_ids_and_keep_a_max_size() -> None:
     # A new id makes room: the oldest id goes first.
     assert not seen.is_repeat("d")
     assert not seen.is_repeat("a")
+
+
+FILE = "https://files.slack.com/files-pri/T1-F1/download/a.png"
+
+
+def _downloader(handler: Any) -> SlackClient:
+    return SlackClient(
+        SecretStr(SLACK_TOKEN), http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+
+
+async def test_a_download_sends_the_token_to_a_slack_host_only() -> None:
+    seen: list[httpx.Request] = []
+
+    def ok(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"PNGDATA")
+
+    client = _downloader(ok)
+    assert await client.download(FILE, max_bytes=100) == b"PNGDATA"
+    assert seen[0].headers["Authorization"] == f"Bearer {SLACK_TOKEN}"
+    for url in (
+        "https://evil.example/a.png",
+        "http://files.slack.com/a.png",
+        "https://slack.com.evil.io/a.png",
+        "https://notslack.com/a.png",
+        "file:///etc/passwd",
+    ):
+        with pytest.raises(SlackError, match="not a Slack file URL"):
+            await client.download(url, max_bytes=100)
+    assert len(seen) == 1, "the other URLs never left"
+    await client.aclose()
+
+
+async def test_a_download_does_not_follow_a_redirect() -> None:
+    seen: list[str] = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://evil.example/steal"})
+
+    client = _downloader(redirect)
+    with pytest.raises(SlackError, match="download failed: 302"):
+        await client.download(FILE, max_bytes=100)
+    assert seen == [FILE]
+    await client.aclose()
+
+
+async def test_a_download_has_a_byte_cap() -> None:
+    def big(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 101)
+
+    def declared(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x", headers={"Content-Length": "5000"})
+
+    def streamed(request: httpx.Request) -> httpx.Response:
+        async def chunks() -> Any:
+            for _ in range(5):
+                yield b"x" * 30
+
+        return httpx.Response(200, content=chunks())
+
+    for handler in (big, declared, streamed):
+        client = _downloader(handler)
+        with pytest.raises(SlackError, match="too large"):
+            await client.download(FILE, max_bytes=100)
+        await client.aclose()
+
+
+async def test_a_failed_download_is_a_slack_error_without_the_url() -> None:
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route", request=request)
+
+    client = _downloader(broken)
+    with pytest.raises(SlackError, match="download failed: ConnectError") as error:
+        await client.download(FILE, max_bytes=100)
+    assert "files.slack.com" not in str(error.value)
+    await client.aclose()

@@ -27,6 +27,7 @@ DEFAULT_TOOLSETS: Final = (
     "memory",
     "skills",
     "sessions",
+    "media",
 )
 
 

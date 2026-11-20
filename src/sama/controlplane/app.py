@@ -39,6 +39,8 @@ from sama.gate.wire import GATE_PATH
 from sama.integrations.hub import TelegramHub
 from sama.integrations.service import Integrations
 from sama.integrations.slack_hub import SlackHub
+from sama.media.store import AttachmentStore
+from sama.media.vision import VisionService
 from sama.memory import MemoryService, PostgresMemoryStore
 from sama.modelproxy.app import ModelProxy, ProxySettings
 from sama.modelproxy.prices import PriceTable
@@ -183,6 +185,8 @@ def build(
         if keys.available(SecretName.OPENAI_API_KEY)
         else None
     )
+    usage = PostgresUsageStore(engine)
+    prices = PriceTable.load()
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),
@@ -197,12 +201,24 @@ def build(
         memory=MemoryService(PostgresMemoryStore(engine)),
         skills=PostgresSkillStore(engine, library.builtin),
         sessions=SessionSearch(engine, embedder),
+        vision=(
+            VisionService(
+                store=AttachmentStore(engine),
+                keys=keys,
+                usage=usage,
+                prices=prices,
+                model=settings.vision_model,
+                redactor=default_redactor(),
+            )
+            if keys.available(SecretName.ANTHROPIC_API_KEY)
+            else None
+        ),
         gate=gate,
     )
     proxy = ModelProxy(
         signer=signer,
-        store=PostgresUsageStore(engine),
-        prices=PriceTable.load(),
+        store=usage,
+        prices=prices,
         settings=ProxySettings(
             anthropic_key=settings.anthropic_key, openai_key=settings.openai_key
         ),

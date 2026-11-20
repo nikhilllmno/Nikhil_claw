@@ -26,6 +26,7 @@ from sama.db.models import (
     EMBEDDING_DIMENSIONS,
     AgentProfile,
     Approval,
+    Attachment,
     AuditEntry,
     ChannelGroup,
     ChannelIdentity,
@@ -162,6 +163,17 @@ def plan(
             run_id=run_id,
             role="user",
             content={"text": f"secret of {session}"},
+        )
+        add(
+            Attachment,
+            org_id=org_id,
+            session_id=ids[session],
+            message_id=ids[f"msg:{session}"],
+            name="secret.png",
+            mime_type="image/png",
+            size_bytes=3,
+            sha256="0" * 64,
+            data=b"png",
         )
         add(
             MessageEmbedding,
