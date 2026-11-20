@@ -64,6 +64,7 @@ from sama.gate.decide import (
     json_default,
     merged_catalog,
     policy_verdict,
+    run_limit,
     tools_of,
 )
 from sama.review.policy import REVIEW_TOOLSETS
@@ -411,6 +412,7 @@ class GateService:
                     Run.triggered_by_user_id,
                     Run.unattended,
                     Run.kind,
+                    Run.toolsets.label("run_toolsets"),
                     AgentProfile.toolsets,
                     AgentProfile.group_toolsets,
                     Session.audience,
@@ -447,6 +449,7 @@ class GateService:
             audience=row.audience,
             kind=row.kind,
             lineage=row.lineage,
+            run_toolsets=run_limit(row.run_toolsets),
         )
         if row.kind == "review":
             # A background review has the memory and skill tools and no other tool (Section 9.4).

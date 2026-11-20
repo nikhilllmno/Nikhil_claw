@@ -52,18 +52,29 @@ class SecretName(StrEnum):
     """The signing secret of the Slack app of the org (Section 11.6)."""
     COMPOSIO_API_KEY = "composio_api_key"
     """The Composio API key of the org (Section 10.3). Without it, the key of the process."""
+    COMPOSIO_WEBHOOK_SECRET = "composio_webhook_secret"  # noqa: S105
+    """The signing secret of the Composio webhook subscription of the org (Section 12.2).
+    Without it, the secret of the process."""
 
 
 ConnectionSecretName = NewType("ConnectionSecretName", str)
 """The vault entry of the secret fields of one connection: ``connection:<connection id>``."""
 
-VaultName = SecretName | ConnectionSecretName
+TriggerSecretName = NewType("TriggerSecretName", str)
+"""The vault entry of the signing secret of one webhook trigger: ``trigger:<trigger id>``."""
+
+VaultName = SecretName | ConnectionSecretName | TriggerSecretName
 """The name of a vault entry."""
 
 
 def connection_secret(connection_id: uuid.UUID) -> ConnectionSecretName:
     """The vault name of the secret fields of a connection (Section 10.3)."""
     return ConnectionSecretName(f"connection:{connection_id}")
+
+
+def trigger_secret(trigger_id: uuid.UUID) -> TriggerSecretName:
+    """The vault name of the signing secret of a webhook trigger (Section 12.2)."""
+    return TriggerSecretName(f"trigger:{trigger_id}")
 
 
 def secret_parts(name: str, value: str) -> list[str]:
@@ -82,6 +93,7 @@ def _vault_name(name: str) -> VaultName:
     try:
         return SecretName(name)
     except ValueError:
+        # A ``connection:`` or ``trigger:`` name. Both are plain text at run time.
         return ConnectionSecretName(name)
 
 

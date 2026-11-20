@@ -9,6 +9,10 @@ sama uses the hosted link flow of Composio for every auth scheme (Section 10.3):
    ``connected``;
 4. ``execute`` runs a tool with the account.
 
+For event triggers (Section 12.2), ``upsert_trigger`` and ``delete_trigger`` manage a trigger
+instance on an account, and ``webhook_subscription`` points the project webhook at sama and
+gives its signing secret.
+
 The client never returns or logs the ``data`` or ``state`` of an account: they can hold
 credentials. The API key is in the ``x-api-key`` header only. A Composio error message is cut
 and goes through the redactor before it reaches a log, a row, or the agent.
@@ -34,6 +38,8 @@ TIMEOUT_S: Final = 30.0
 ACTIVE: Final = "ACTIVE"
 PENDING_STATUSES: Final = frozenset({"INITIALIZING", "INITIATED"})
 EXPIRED_STATUSES: Final = frozenset({"EXPIRED", "INACTIVE", "REVOKED"})
+TRIGGER_EVENT: Final = "composio.trigger.message"
+"""The webhook event type of a trigger event (V3 payload)."""
 
 
 class ComposioError(Exception):
@@ -194,6 +200,71 @@ class ComposioClient:
             error = answer.get("error") or "the tool failed"
             raise ComposioError(short_error(str(error)))
         return answer.get("data")
+
+    async def upsert_trigger(
+        self,
+        key: SecretStr,
+        slug: str,
+        *,
+        user_id: str,
+        account_id: str,
+        config: Mapping[str, Any],
+    ) -> str:
+        """Makes (or updates) a trigger instance of the type ``slug`` on a connected account
+        (Section 12.2). Returns the id of the trigger instance."""
+        answer = await self._request(
+            key,
+            "POST",
+            f"/api/v3.1/trigger_instances/{_id(slug)}/upsert",
+            json_body={
+                "user_id": user_id,
+                "connected_account_id": account_id,
+                "trigger_config": dict(config),
+            },
+        )
+        trigger_id = answer.get("trigger_id") or answer.get("id")
+        if not isinstance(trigger_id, str) or not trigger_id:
+            raise ComposioError("Composio gave no trigger id")
+        return _id(trigger_id)
+
+    async def delete_trigger(self, key: SecretStr, trigger_id: str) -> None:
+        """Deletes a trigger instance. A trigger that is gone already is not an error."""
+        try:
+            await self._request(
+                key, "DELETE", f"/api/v3.1/trigger_instances/manage/{_id(trigger_id)}"
+            )
+        except ComposioError as error:
+            if error.status_code != 404:
+                raise
+
+    async def webhook_subscription(self, key: SecretStr, url: str) -> SecretStr:
+        """Points the webhook subscription of the project at ``url`` for trigger events (V3
+        payloads), and returns its signing secret. A project has one subscription: this
+        updates it, or makes it when there is none. An update keeps the secret."""
+        body = {
+            "webhook_url": url,
+            "enabled_events": [TRIGGER_EVENT],
+            "version": "V3",
+        }
+        found = await self._request(key, "GET", "/api/v3.1/webhook_subscriptions")
+        items = found.get("items") if isinstance(found, dict) else None
+        current = items[0] if isinstance(items, list) and items else None
+        if isinstance(current, dict) and isinstance(current.get("id"), str):
+            answer = await self._request(
+                key,
+                "PATCH",
+                f"/api/v3.1/webhook_subscriptions/{_id(current['id'])}",
+                json_body=body,
+            )
+            secret = answer.get("secret") or current.get("secret")
+        else:
+            answer = await self._request(
+                key, "POST", "/api/v3.1/webhook_subscriptions", json_body=body
+            )
+            secret = answer.get("secret")
+        if not isinstance(secret, str) or not secret:
+            raise ComposioError("Composio gave no webhook secret")
+        return SecretStr(secret)
 
 
 def _id(value: str) -> str:

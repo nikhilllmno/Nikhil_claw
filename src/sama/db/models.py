@@ -95,6 +95,7 @@ VAULT_NAMES: Final = (
     "slack_bot_token",
     "slack_signing_secret",
     "composio_api_key",
+    "composio_webhook_secret",
 )
 CONNECTION_SECRET_PATTERN: Final = "^connection:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
 """The vault name of the secret fields of one connection (Section 10.3): ``connection:<id>``."""
@@ -102,6 +103,14 @@ CONNECTION_SCOPES: Final = ("personal", "workspace")
 CONNECTION_KINDS: Final = ("composio", "mcp_remote", "mcp_hosted", "database", "http_api", "plugin")
 CONNECTION_STATES: Final = ("pending", "initiated", "connected", "failed", "expired", "disabled")
 """The states of a connection (Section 10.3). Only the backend sets ``connected``."""
+TRIGGER_SECRET_PATTERN: Final = "^trigger:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
+"""The vault name of the signing secret of one webhook trigger (Section 12.2): ``trigger:<id>``."""
+TRIGGER_KINDS: Final = ("webhook", "composio")
+TRIGGER_STATUSES: Final = ("active", "disabled")
+TRIGGER_TARGETS: Final = ("run",)
+"""What an event starts (Section 12.2). Workflows (M4.5) add ``workflow``."""
+SAFE_TOOLSETS: Final = ("web", "media", "clarify")
+"""The ``safe`` preset (Section 10.2): the default toolsets of an event-triggered run."""
 INTEGRATION_KINDS: Final = ("telegram", "slack")
 """The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
@@ -413,6 +422,9 @@ class Run(Base):
         # A compact run is a chat run of a person (Section 6.3).
         CheckConstraint("NOT compact OR kind = 'chat'", name="compact_is_chat"),
         CheckConstraint("compact OR compact_focus IS NULL", name="compact_focus"),
+        CheckConstraint(
+            "toolsets IS NULL OR jsonb_typeof(toolsets) = 'array'", name="toolsets_array"
+        ),
         Index(None, "org_id", "session_id"),
         Index(None, "status", "created_at"),
         # The per-org message rate and concurrency limit (migration 0007, Section 4.3).
@@ -471,6 +483,10 @@ class Run(Base):
     unattended: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     """True for a run that no human watches, for example a cron job or a webhook. The tool
     gate turns ``ask`` into ``deny`` in these runs (docs/architecture.md, Section 16.1)."""
+    toolsets: Mapped[list[str] | None] = mapped_column(JSONB)
+    """A limit on the toolsets of this run, for example the toolsets of an event trigger
+    (Section 12.2). The run gets only the toolsets in this list and in its profile. Null: no
+    extra limit."""
     failure_code: Mapped[str | None] = mapped_column(Text)
     failure_message: Mapped[str | None] = mapped_column(Text)
     lease_owner: Mapped[str | None] = mapped_column(Text)
@@ -1154,7 +1170,9 @@ class VaultSecret(Base):
     __table_args__ = (
         UniqueConstraint("org_id", "name"),
         CheckConstraint(
-            f"{_one_of('name', VAULT_NAMES)} OR name ~ '{CONNECTION_SECRET_PATTERN}'", name="name"
+            f"{_one_of('name', VAULT_NAMES)} OR name ~ '{CONNECTION_SECRET_PATTERN}'"
+            f" OR name ~ '{TRIGGER_SECRET_PATTERN}'",
+            name="name",
         ),
     )
 
@@ -1962,3 +1980,115 @@ class Delivery(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Trigger(Base):
+    """An event source that starts a run (docs/architecture.md, Section 12.2).
+
+    A ``webhook`` trigger has its own URL, and its signing secret is in the vault under the name
+    ``trigger:<id>``. A ``composio`` trigger is a Composio trigger instance on the account of
+    ``connection_id``. Each event starts an unattended run in a new private session of
+    ``owner_user_id`` with only ``toolsets``. Only the control plane writes the table."""
+
+    __tablename__ = "triggers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "owner_user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "connection_id"],
+            ["connections.org_id", "connections.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint("composio_trigger_id"),
+        CheckConstraint(_one_of("kind", TRIGGER_KINDS), name="kind"),
+        CheckConstraint(_one_of("status", TRIGGER_STATUSES), name="status"),
+        CheckConstraint(_one_of("target", TRIGGER_TARGETS), name="target"),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 80", name="name"),
+        CheckConstraint("char_length(prompt) BETWEEN 1 AND 8000", name="prompt"),
+        CheckConstraint("jsonb_typeof(toolsets) = 'array'", name="toolsets_array"),
+        CheckConstraint(
+            "(kind = 'composio') = (connection_id IS NOT NULL AND composio_slug IS NOT NULL)",
+            name="composio_fields",
+        ),
+        CheckConstraint(
+            "kind = 'composio' OR composio_trigger_id IS NULL", name="composio_trigger_id"
+        ),
+        CheckConstraint(
+            "last_error IS NULL OR char_length(last_error) <= 500", name="last_error_length"
+        ),
+        Index(None, "org_id", "workspace_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The user that the runs act for. Each event starts a private session of this user."""
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    """The instruction of the run. The event payload follows it as untrusted data."""
+    toolsets: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("""'["web", "media", "clarify"]'::jsonb""")
+    )
+    """The toolsets of the runs. The default is the ``safe`` preset (Section 10.2)."""
+    target: Mapped[str] = mapped_column(Text, nullable=False, server_default="run")
+    connection_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """For a ``composio`` trigger: the connection whose account has the trigger instance."""
+    composio_trigger_id: Mapped[str | None] = mapped_column(Text)
+    """The id of the Composio trigger instance. An event names it in ``metadata.trigger_id``."""
+    composio_slug: Mapped[str | None] = mapped_column(Text)
+    """The Composio trigger type, for example ``GMAIL_NEW_GMAIL_MESSAGE``."""
+    composio_config: Mapped[dict[str, Any]] = _json()
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class TriggerEvent(Base):
+    """One accepted event of a trigger and the run that it started (Section 12.2).
+
+    The unique ``(trigger_id, delivery_id)`` rejects a replay of the same delivery. Only the
+    control plane writes the table."""
+
+    __tablename__ = "trigger_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "trigger_id"], ["triggers.org_id", "triggers.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("trigger_id", "delivery_id"),
+        CheckConstraint("char_length(delivery_id) BETWEEN 1 AND 200", name="delivery_id"),
+        Index(None, "org_id", "session_id"),
+        Index(None, "received_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    trigger_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    delivery_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """The ``webhook-id`` of the delivery. A sender sends the same id again on a retry."""
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    received_at: Mapped[datetime] = _created_at()

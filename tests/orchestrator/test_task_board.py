@@ -451,3 +451,35 @@ async def test_a_shared_session_does_not_see_private_cards(
     )
     assert (card_.audience, card_.owner_user_id) == ("private", tenant.ids["mia"])
     assert card_.assignee_user_id == tenant.ids["mia"]
+
+
+async def test_a_card_run_keeps_the_toolset_limit_of_the_run_that_made_it(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """A run with a toolset limit (a trigger run, Section 12.2) cannot get more toolsets
+    through a card."""
+    queue = RunQueue(engine)
+    maker = await queue.enqueue(
+        org_id=tenant.org, session_id=tenant.ids["mine"], text="hi", user_id=tenant.ids["mia"]
+    )
+    async with engine.begin() as connection:
+        await connection.execute(update(Run).where(Run.id == maker).values(toolsets=["web"]))
+    limited = await create(
+        engine,
+        tenant,
+        audience="private",
+        assignee_profile_id=tenant.ids["profile"],
+        created_by_run_id=maker,
+    )
+    free = await create(
+        engine, tenant, audience="private", assignee_profile_id=tenant.ids["profile"]
+    )
+    assert (await TaskDispatcher(engine, queue).run_once()).started == 2
+    async with engine.connect() as connection:
+        found = await connection.execute(
+            select(Task.id, Run.toolsets)
+            .join(Run, Run.id == Task.run_id)
+            .where(Task.id.in_([limited.id, free.id]))
+        )
+        limits = {row.id: row.toolsets for row in found}
+    assert limits == {limited.id: ["web"], free.id: None}

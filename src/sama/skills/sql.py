@@ -4,13 +4,13 @@ filter by the scopes of the actor themselves (the same rule as the RLS policy)."
 from __future__ import annotations
 
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 
 from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import AgentProfile, Membership, Run, Session, Skill, SkillVersion
-from sama.gate.decide import effective_toolsets
+from sama.gate.decide import effective_toolsets, run_limit
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, SkillDoc
 from sama.tenancy.authority import run_user
@@ -85,6 +85,7 @@ async def profile_limits(
     *,
     audience: str = "private",
     kind: str = "chat",
+    run_toolsets: Iterable[str] | None = None,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """The toolsets and the skill list of an agent profile. The toolsets are the toolsets of the
     run: the group toolsets for a chat run in a shared session (Section 11.3), else the toolsets
@@ -99,7 +100,11 @@ async def profile_limits(
     if row is None:
         return frozenset(), frozenset()
     toolsets = effective_toolsets(
-        map(str, row.toolsets), map(str, row.group_toolsets), audience=audience, kind=kind
+        map(str, row.toolsets),
+        map(str, row.group_toolsets),
+        audience=audience,
+        kind=kind,
+        run_toolsets=run_toolsets,
     )
     return toolsets, frozenset(map(str, row.skills))
 
@@ -125,6 +130,7 @@ async def load_actor(
                 Run.kind,
                 Run.unattended,
                 Session.lineage,
+                Run.toolsets,
             )
             .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
             .where(Session.org_id == org_id, Session.id == session_id, Run.id == run_id)
@@ -132,12 +138,12 @@ async def load_actor(
     ).one_or_none()
     if row is None:
         raise SkillError("The run is not known.")
-    workspace_id, audience, owner, profile_id, triggered_by, kind, unattended, lineage = row
+    workspace_id, audience, owner, profile_id, triggered_by, kind, unattended, lineage, limit = row
     user_id = run_user(triggered_by, audience, owner) or (
         uuid.UUID(token_user) if token_user else None
     )
     toolsets, allowed = await profile_limits(
-        connection, org_id, profile_id, audience=audience, kind=kind
+        connection, org_id, profile_id, audience=audience, kind=kind, run_toolsets=run_limit(limit)
     )
     workspace_admin = org_owner = False
     if user_id is not None:

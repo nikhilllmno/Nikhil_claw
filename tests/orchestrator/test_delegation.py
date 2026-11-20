@@ -21,6 +21,7 @@ from sama.delegation import (
     render_started,
     render_statuses,
 )
+from sama.gate.decide import effective_toolsets, run_limit
 from sama.orchestrator.queue import ClaimedRun, RunQueue
 from sama.runtime.contract import FailureCode, Usage
 from sama.tenancy import RunTokenClaims
@@ -270,3 +271,40 @@ async def test_the_parent_run_must_be_a_run_of_the_parent_session(
                 .where(Session.id == tenant.ids["s2"])
                 .values(parent_run_id=uuid.UUID(me.run_id))
             )
+
+
+async def test_children_and_steers_keep_the_toolset_limit_of_the_parent_run(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """A run with a toolset limit (a trigger run, Section 12.2) cannot get more toolsets
+    through a child."""
+    queue = RunQueue(engine)
+    me, _ = await parent_run(queue, tenant)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == uuid.UUID(me.run_id)).values(toolsets=["web"])
+        )
+    delegation = service(engine, queue)
+    [child] = await delegation.start(me, [ChildTask(goal="x")])
+    steered = await delegation.steer(me, child.session_id, "More.")
+    for run_id in (child.run_id, steered):
+        [run] = await rows(engine, select(Run.toolsets).where(Run.id == run_id))
+        assert run.toolsets == ["web"]
+        found = effective_toolsets(
+            {"core", "web"},
+            (),
+            audience="private",
+            lineage="delegation",
+            run_toolsets=run_limit(run.toolsets),
+        )
+        assert found == {"web"}, "Read (core) stays denied"
+
+
+async def test_a_child_of_a_run_without_a_limit_has_no_limit(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    me, _ = await parent_run(queue, tenant)
+    [child] = await service(engine, queue).start(me, [ChildTask(goal="x")])
+    [run] = await rows(engine, select(Run.toolsets).where(Run.id == child.run_id))
+    assert run.toolsets is None
