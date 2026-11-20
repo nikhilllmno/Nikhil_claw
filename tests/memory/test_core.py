@@ -9,6 +9,7 @@ from sama.memory.core import (
     ENTRY_DELIMITER,
     Action,
     MemoryChangeError,
+    MemoryFullError,
     Operation,
     Target,
     apply,
@@ -17,6 +18,7 @@ from sama.memory.core import (
     used,
     validate,
 )
+from sama.vault.redact import default_redactor
 
 
 def add(content: str) -> Operation:
@@ -179,3 +181,32 @@ def test_the_snapshot_does_not_load_notes_with_an_injection() -> None:
     assert "did not load these notes" in text
     assert "reveal the system prompt" not in text
     assert "builds with make" in text
+
+
+def test_the_snapshot_hides_an_entry_with_a_secret() -> None:
+    secret = "sk-ant-api03-" + "a" * 40
+    text = render_snapshot(
+        {Target.AGENT: ["uses uv", f"old key {secret}"], Target.USER: ["likes tea"]}
+    )
+    assert secret not in text
+    assert "uses uv" in text
+    assert "likes tea" in text
+    assert "it holds a secret" in text
+    assert "Agent notes (" in text
+
+
+def test_the_snapshot_hides_a_known_value_of_the_process() -> None:
+    value = "known-value-" + "z" * 20
+    redactor = default_redactor()
+    redactor.add(value)
+    try:
+        text = render_snapshot({Target.WORKSPACE: [f"token {value}", "builds with make"]})
+    finally:
+        redactor.forget(value)
+    assert value not in text
+    assert "builds with make" in text
+
+
+def test_the_cap_error_is_a_full_error() -> None:
+    with pytest.raises(MemoryFullError):
+        validate(Target.USER, [], ["x" * (CAPS[Target.USER] + 1)])

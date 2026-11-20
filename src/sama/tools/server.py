@@ -34,6 +34,7 @@ from sama.memory.core import (
     MAX_REASON_CHARS,
     Action,
     MemoryChangeError,
+    MemoryFullError,
     Operation,
     Target,
 )
@@ -379,7 +380,12 @@ class ToolServer:
                         steps = operations
                     else:
                         raise MemoryChangeError("give either action or operations, not both")
-                    return await memory.write(claims, target, steps, reason)
+                    try:
+                        return await memory.write(claims, target, steps, reason)
+                    except MemoryFullError as error:
+                        # Not an error result: ``_cap_errors`` cuts errors to MAX_ERROR_CHARS,
+                        # and the agent needs all current entries to make room.
+                        return f"Not saved: {error}"
 
                 arguments = {
                     "target": target.value,

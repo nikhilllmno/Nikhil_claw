@@ -771,14 +771,23 @@ assembler can use it.
   nothing. Sama checks the cap only on the end result, so one batch can remove old entries
   and add new ones. `reason` (at most 200 characters) goes to the revision.
 
-**Over the cap.** The error says that the memory is full, how many characters the change
+**Over the cap.** The message says that the memory is full, how many characters the change
 needs and the cap, how many characters to free, and the current entries (before the change)
-with their size.
+with their size. The tool returns it as a normal result that starts with `Not saved:`, not as
+an error result. The tool server cuts an error result to 2,000 characters (`MAX_ERROR_CHARS`),
+and the agent needs all current entries (up to 2,200 characters) to make room. The API maps
+the same failure (`MemoryFullError`) to `422`.
 
 **Content checks.** For each new entry, sama refuses text that the redactor changes (a
 secret, Section 16.3) and text that the prompt scan finds (Section 6.1). The error does not
 repeat the secret. Entries that are already saved are not checked again, so the agent can
 remove them. The tool, the API edit, and the revert all use these checks.
+
+The redactor must know the secrets of the process, or the check only finds the key patterns.
+The control plane gives it the settings and refreshes the vault values. The standalone API
+(`python -m sama.api`) does the same: it adds `SAMA_DATABASE_URL`, `SAMA_SUPABASE_JWT_SECRET`,
+and `SAMA_VAULT_KEY` when it builds the app. With `SAMA_VAULT_KEY` it refreshes the vault values
+before the first request (a failed refresh stops the start) and then every few minutes.
 
 **Who may write.** The service checks the rules in this order:
 
@@ -817,7 +826,9 @@ revision.
 same transaction and puts them in `RunConfig.memory_snapshot` (Section 6.1). The text has a
 note that the entries are data, and then one block for each scope that has entries, with its
 usage (for example `Agent notes (120 of 2,200 characters)`). A block for which the prompt
-scan finds a pattern is not loaded, and the prompt says so. A shared session gets the `agent`
+scan finds a pattern is not loaded, and the prompt says so. An entry that the redactor
+changes (it holds a secret) shows as a note in place of its text, so a value that was saved
+before sama knew the secret never reaches the model. A shared session gets the `agent`
 and `workspace` blocks. A private session also gets the `user` block of its owner. Only a
 profile with the `memory` toolset gets a snapshot. The config is frozen with the session, so
 a write of the run applies from the next session, and the tool result says so.
@@ -827,6 +838,8 @@ read as the user (`as_user`), so RLS is the second guard, and they write through
 `MemoryService`. A person replaces all entries of a scope (`edit`), or sets a scope back to an
 old revision (`revert`). A revert adds a new revision with the old entries. Each write adds an
 audit row (`memory.edited`, `memory.reverted`) with the new revision number but not the text.
+The memory row, the revision, and the audit row are one transaction (`after` hook of
+`MemoryStore.change`), so a failed audit write undoes the edit.
 
 **Assumptions in M2.1.**
 

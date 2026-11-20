@@ -9,10 +9,12 @@ from dataclasses import dataclass, replace
 
 import pytest
 
-from sama.memory import InProcessMemoryStore, MemoryService, RunContext
+from sama.memory import CAPS, InProcessMemoryStore, MemoryService, RunContext, Target
+from sama.memory.core import used
 from sama.runtime.contract import Audience, RunScope
 from sama.tenancy import RunTokenSigner
 from sama.tools import MemoryTodoStore, ToolServer
+from sama.tools.server import MAX_ERROR_CHARS
 from tests.conformance.scripted_model import serve
 from tests.tools.test_server import connect, text_of
 
@@ -159,11 +161,36 @@ async def test_a_full_memory_gives_the_entries_and_the_size_to_free(rig: Rig) ->
         result = await client.call_tool(
             "memory", {"target": "user", "action": "add", "content": "b" * 100}
         )
-    assert result.is_error
+    assert not result.is_error
     text = text_of(result)
-    assert "user memory is full" in text
+    assert text.startswith("Not saved: user memory is full")
     assert "Free at least 28 characters" in text
     assert "a" * 100 in text
+
+
+async def test_a_full_memory_returns_all_current_entries_at_the_cap(rig: Rig) -> None:
+    """An error result is cut to 2,000 characters. The over-cap answer must not be cut, or the
+    agent cannot see which entries to remove."""
+    cap = CAPS[Target.AGENT]
+    entries = [f"entry-{i:02d}-" + "x" * 82 for i in range(23)]
+    entries.append("last-entry-END")
+    total = used(entries)
+    assert cap - 60 < total <= cap
+    async with connect(rig.url, rig.token()) as client:
+        for start in range(0, len(entries), 10):
+            operations = [{"action": "add", "content": e} for e in entries[start : start + 10]]
+            saved = await client.call_tool("memory", {"target": "agent", "operations": operations})
+            assert not saved.is_error
+        result = await client.call_tool(
+            "memory", {"target": "agent", "action": "add", "content": "y" * 200}
+        )
+    assert not result.is_error
+    text = text_of(result)
+    assert text.startswith("Not saved: agent memory is full")
+    assert len(text) > MAX_ERROR_CHARS
+    assert "[cut]" not in text
+    for entry in entries:
+        assert entry in text
 
 
 async def test_a_secret_is_refused_and_not_echoed(rig: Rig) -> None:

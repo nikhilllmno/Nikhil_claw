@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from starlette.types import Lifespan
 
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.db.engine import as_user
@@ -65,7 +66,7 @@ from sama.memory import (
     MAX_REASON_CHARS as MAX_MEMORY_REASON_CHARS,
 )
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
-from sama.memory.store import read_revisions, read_state
+from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -376,8 +377,8 @@ class SamaApi:
                 headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             ) from None
 
-    def app(self) -> FastAPI:
-        app = FastAPI(title="sama", docs_url=None, redoc_url=None)
+    def app(self, *, lifespan: Lifespan[FastAPI] | None = None) -> FastAPI:
+        app = FastAPI(title="sama", docs_url=None, redoc_url=None, lifespan=lifespan)
         app.state.sama_api = self
         settings = self._settings
 
@@ -935,16 +936,8 @@ class SamaApi:
                 status_code=403, detail="only a workspace admin can change workspace memory"
             )
         writer = Writer("user", user_id)
-        try:
-            if edit is not None:
-                state = await self._memory.edit(scope, edit.entries, writer, reason)
-            elif revert_to is not None:
-                state = await self._memory.revert(scope, revert_to, writer, reason)
-        except MemoryDeniedError as error:
-            raise HTTPException(status_code=403, detail=str(error)) from None
-        except MemoryChangeError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from None
-        async with self._engine.begin() as connection:
+
+        async def audit(connection: AsyncConnection, state: MemoryState) -> None:
             await connection.execute(
                 insert(AuditEntry).values(
                     org_id=scope.org_id,
@@ -957,6 +950,16 @@ class SamaApi:
                     details={"revision": state.revision, "reverted_to": revert_to},
                 )
             )
+
+        try:
+            if edit is not None:
+                state = await self._memory.edit(scope, edit.entries, writer, reason, after=audit)
+            elif revert_to is not None:
+                state = await self._memory.revert(scope, revert_to, writer, reason, after=audit)
+        except MemoryDeniedError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
+        except MemoryChangeError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
         return {
             "target": target.value,
             "entries": list(state.entries),

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -101,6 +101,12 @@ class RunContext:
     """True for a run of a delegated child session."""
 
 
+AfterChange = Callable[[AsyncConnection, MemoryState], Awaitable[None]]
+"""Runs in the transaction of a change, after the write, with the new state. If it raises, the
+whole change is rolled back. The Postgres store calls it. The in-process store has no
+transaction and ignores it."""
+
+
 class MemoryStore(Protocol):
     async def context(self, claims: RunTokenClaims) -> RunContext:
         """Raises ``MemoryChangeError`` if the run does not exist."""
@@ -117,9 +123,10 @@ class MemoryStore(Protocol):
         action: RevisionAction,
         reason: str | None = None,
         reverted_to: int | None = None,
+        after: AfterChange | None = None,
     ) -> tuple[MemoryState, bool]:
         """Applies ``change`` to the current entries as one atomic step. Returns the new state
-        and whether it changed. If ``change`` raises, nothing is written."""
+        and whether it changed. If ``change`` or ``after`` raises, nothing is written."""
         ...
 
     async def revisions(self, scope: MemoryScope, limit: int) -> list[Revision]:
@@ -161,6 +168,7 @@ class InProcessMemoryStore:
         action: RevisionAction,
         reason: str | None = None,
         reverted_to: int | None = None,
+        after: AfterChange | None = None,
     ) -> tuple[MemoryState, bool]:
         async with self._lock:
             state = await self.read(scope)
@@ -321,6 +329,7 @@ class PostgresMemoryStore:
         action: RevisionAction,
         reason: str | None = None,
         reverted_to: int | None = None,
+        after: AfterChange | None = None,
     ) -> tuple[MemoryState, bool]:
         async with self._engine.begin() as connection:
             await connection.execute(
@@ -345,7 +354,10 @@ class PostgresMemoryStore:
             old = _entries(row.entries)
             new = tuple(change(list(old)))
             if new == old:
-                return MemoryState(old, row.revision), False
+                state = MemoryState(old, row.revision)
+                if after is not None:
+                    await after(connection, state)
+                return state, False
             seq = row.revision + 1
             await connection.execute(
                 update(Memory)
@@ -367,7 +379,10 @@ class PostgresMemoryStore:
                     reverted_to=reverted_to,
                 )
             )
-        return MemoryState(new, seq), True
+            state = MemoryState(new, seq)
+            if after is not None:
+                await after(connection, state)
+        return state, True
 
     async def revisions(self, scope: MemoryScope, limit: int) -> list[Revision]:
         async with self._engine.connect() as connection:

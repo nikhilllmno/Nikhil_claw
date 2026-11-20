@@ -7,9 +7,10 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.api import SamaApi
 from sama.db.models import AuditEntry, Membership
 from tests.api.conftest import bearer
 from tests.api.test_app import add_user, mia
@@ -236,3 +237,54 @@ async def test_a_member_cannot_revert_workspace_notes(
         url(tenant, "/workspace/revisions/1/revert"), headers=mia(tenant), json={}
     )
     assert denied.status_code == 403
+
+
+async def drop_audit_trigger(engine: AsyncEngine) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("DROP TRIGGER IF EXISTS test_memory_audit_fails ON audit_log")
+        )
+        await connection.execute(text("DROP FUNCTION IF EXISTS public.test_memory_audit_fails()"))
+
+
+async def test_an_audit_failure_rolls_back_the_edit_and_the_revert(
+    api: SamaApi, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    transport = httpx.ASGITransport(app=api.app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        for entries in (["one"], ["one", "two"]):
+            ok = await client.put(
+                url(tenant, "/user"), headers=mia(tenant), json={"entries": entries}
+            )
+            assert ok.status_code == 200
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "CREATE FUNCTION public.test_memory_audit_fails() RETURNS trigger"
+                    " LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit is down'; END $$"
+                )
+            )
+            await connection.execute(
+                text(
+                    "CREATE TRIGGER test_memory_audit_fails BEFORE INSERT ON public.audit_log"
+                    f" FOR EACH ROW WHEN (NEW.org_id = '{tenant.org}')"
+                    " EXECUTE FUNCTION public.test_memory_audit_fails()"
+                )
+            )
+        try:
+            edit = await client.put(
+                url(tenant, "/user"), headers=mia(tenant), json={"entries": ["three"]}
+            )
+            revert = await client.post(
+                url(tenant, "/user/revisions/1/revert"), headers=mia(tenant), json={}
+            )
+        finally:
+            await drop_audit_trigger(engine)
+        assert edit.status_code == 500
+        assert revert.status_code == 500
+        listed = await client.get(url(tenant), headers=mia(tenant))
+        history = await client.get(url(tenant, "/user/revisions"), headers=mia(tenant))
+    user = by_target(listed.json())["user"]
+    assert user["entries"] == ["one", "two"]
+    assert user["revision"] == 2
+    assert [r["seq"] for r in history.json()] == [2, 1]

@@ -54,6 +54,10 @@ class MemoryDeniedError(MemoryChangeError):
     """The caller may not make this change."""
 
 
+class MemoryFullError(MemoryChangeError):
+    """The new entries do not fit in the cap. The message has the current entries."""
+
+
 class Action(StrEnum):
     ADD = "add"
     PATCH = "patch"
@@ -177,7 +181,7 @@ def validate(target: Target, old: Sequence[str], new: Sequence[str]) -> None:
     cap = CAPS[target]
     if used(new) > cap:
         over = used(new) - cap
-        raise MemoryChangeError(
+        raise MemoryFullError(
             f"{target.value} memory is full: this change needs {used(new):,} of {cap:,}"
             f" characters. Free at least {over:,} characters in the same call, for example"
             " with remove or patch steps, and try again. Current entries"
@@ -191,15 +195,20 @@ SNAPSHOT_NOTE: Final = (
 )
 
 
+HIDDEN_ENTRY: Final = "[sama hid this entry: it holds a secret]"
+
+
 def render_snapshot(notes: Mapping[Target, Sequence[str]]) -> str:
-    """The text for the frozen prompt prefix. Empty if no scope has entries. A scope whose
-    text has a prompt injection pattern gets a note in place of its entries."""
+    """The text for the frozen prompt prefix. Empty if no scope has entries. An entry that the
+    redactor changes (it holds a secret) shows as a note, so an old saved value never reaches
+    the model. A scope whose text has a prompt injection pattern gets a note in place of its
+    entries."""
     blocks: list[str] = []
     for target in Target:
         entries = notes.get(target, ())
         if not entries:
             continue
-        body = render_entries(entries)
+        body = render_entries([HIDDEN_ENTRY if redact(e) != e else e for e in entries])
         findings = scan(body)
         if findings:
             body = (

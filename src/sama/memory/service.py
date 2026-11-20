@@ -22,6 +22,7 @@ from sama.memory.core import (
     validate,
 )
 from sama.memory.store import (
+    AfterChange,
     MemoryScope,
     MemoryState,
     MemoryStore,
@@ -129,8 +130,10 @@ class MemoryService:
         entries: Sequence[str],
         writer: Writer,
         reason: str | None,
+        after: AfterChange | None = None,
     ) -> MemoryState:
-        """A person replaces all entries (HTTP API)."""
+        """A person replaces all entries (HTTP API). ``after`` runs in the transaction of the
+        write (see ``AfterChange``)."""
         new = clean(entries)
 
         def change(old: list[str]) -> list[str]:
@@ -138,15 +141,20 @@ class MemoryService:
             return new
 
         state, _ = await self.store.change(
-            scope, change, writer=writer, action="edit", reason=reason
+            scope, change, writer=writer, action="edit", reason=reason, after=after
         )
         return state
 
     async def revert(
-        self, scope: MemoryScope, seq: int, writer: Writer, reason: str | None
+        self,
+        scope: MemoryScope,
+        seq: int,
+        writer: Writer,
+        reason: str | None,
+        after: AfterChange | None = None,
     ) -> MemoryState:
         """A person sets the entries back to a revision (HTTP API). The result is a new
-        revision, the history is not changed."""
+        revision, the history is not changed. ``after`` runs in the transaction of the write."""
         target = await self.store.revision(scope, seq)
         if target is None:
             raise MemoryChangeError(f"revision {seq} does not exist")
@@ -157,7 +165,13 @@ class MemoryService:
             return new
 
         state, _ = await self.store.change(
-            scope, change, writer=writer, action="revert", reason=reason, reverted_to=seq
+            scope,
+            change,
+            writer=writer,
+            action="revert",
+            reason=reason,
+            reverted_to=seq,
+            after=after,
         )
         return state
 
