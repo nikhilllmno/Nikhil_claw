@@ -242,3 +242,22 @@ async def test_a_network_error_or_a_5xx_is_unavailable_not_refused() -> None:
         with pytest.raises(DriverUnavailableError):
             await http.test(manifest, {"token": "tok-1"})
         await http.aclose()
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 501, 503, 507, 520, 524])
+async def test_a_busy_answer_is_unavailable(status: int) -> None:
+    manifest = parse(FORM)
+    http = driver(lambda request: httpx.Response(status, text="busy"))
+    with pytest.raises(DriverUnavailableError):
+        await http.test(manifest, {"token": "tok-1"})
+    await http.aclose()
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+async def test_a_refusal_is_not_unavailable(status: int) -> None:
+    manifest = parse(FORM)
+    http = driver(lambda request: httpx.Response(status, text="no"))
+    with pytest.raises(DriverError) as caught:
+        await http.test(manifest, {"token": "tok-1"})
+    assert not isinstance(caught.value, DriverUnavailableError)
+    await http.aclose()

@@ -32,7 +32,8 @@ from sama.tools.outbound import (
 
 TIMEOUT_S: Final = 30.0
 MAX_ANSWER_BYTES: Final = 2_000_000
-UNAVAILABLE_CODES: Final = frozenset({408, 429, 500, 502, 503, 504})
+UNAVAILABLE_CODES: Final = frozenset({408, 429})
+"""Client codes that mean "try again later". Every 5xx code also means that."""
 POLICY: Final = UrlPolicy(
     max_redirects=0,
     max_bytes=MAX_ANSWER_BYTES,
@@ -123,7 +124,7 @@ class HttpApiDriver:
         except FetchError as error:
             raise DriverUnavailableError(f"the API cannot be reached: {error}") from None
         text = answer.content.decode("utf-8", errors="replace")
-        if answer.status_code in UNAVAILABLE_CODES:
+        if answer.status_code in UNAVAILABLE_CODES or answer.status_code >= 500:
             raise DriverUnavailableError(
                 f"the API answered {answer.status_code}: {short_error(text)}"
             )
