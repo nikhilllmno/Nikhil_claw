@@ -51,6 +51,7 @@ from sama.orchestrator.sandboxed import SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.sandbox.base import SandboxProvider
+from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
@@ -175,6 +176,9 @@ def build(
         gate=gate,
         poll_s=worker_poll_s,
     )
+    # Without an OpenAI key, there is no embed worker, and session search uses the full-text
+    # index alone (Section 7.1).
+    embedder = OpenAIEmbedder(keys) if keys.available(SecretName.OPENAI_API_KEY) else None
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),
@@ -188,6 +192,7 @@ def build(
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
         memory=MemoryService(PostgresMemoryStore(engine)),
         skills=PostgresSkillStore(engine, library.builtin),
+        sessions=SessionSearch(engine, embedder),
         gate=gate,
     )
     proxy = ModelProxy(
@@ -258,6 +263,9 @@ def build(
             if slack is not None:
                 stack.push_async_callback(slack.aclose)
             loops = _monitor(settings, engine, stack)
+            if embedder is not None:
+                stack.push_async_callback(embedder.aclose)
+                loops.append(EmbedWorker(engine, embedder))
             if vault is not None:
                 # The redactor must know every vault value before the first run, request,
                 # or trace. A failed refresh stops the start.

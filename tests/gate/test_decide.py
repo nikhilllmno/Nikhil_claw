@@ -84,6 +84,15 @@ def test_memory_needs_the_memory_toolset_and_then_is_allowed() -> None:
     assert with_it.action == "allow"
 
 
+@pytest.mark.parametrize("tool", ["session_search", "session_read"])
+def test_the_session_tools_need_the_sessions_toolset_and_then_are_allowed(tool: str) -> None:
+    name = f"mcp__sama__{tool}"
+    without = decide(context(toolsets=frozenset({"memory"})), name, {})
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+    with_it = decide(context(toolsets=frozenset({"sessions"})), name, {})
+    assert with_it.action == "allow"
+
+
 def test_an_unknown_mcp_tool_is_in_no_toolset() -> None:
     verdict = decide(context(rules=(rule("*", "allow"),)), "mcp__other__send", {})
     assert verdict.step is GateStep.TOOLSET

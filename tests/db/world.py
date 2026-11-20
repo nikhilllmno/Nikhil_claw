@@ -23,6 +23,7 @@ from sqlalchemy.pool import NullPool
 
 from sama.db import create_engine
 from sama.db.models import (
+    EMBEDDING_DIMENSIONS,
     AgentProfile,
     Approval,
     AuditEntry,
@@ -33,6 +34,7 @@ from sama.db.models import (
     Memory,
     MemoryRevision,
     Message,
+    MessageEmbedding,
     ModelCall,
     Org,
     PairingCode,
@@ -154,11 +156,20 @@ def plan(
         )
         add(
             Message,
+            f"msg:{session}",
             org_id=org_id,
             session_id=ids[session],
             run_id=run_id,
             role="user",
             content={"text": f"secret of {session}"},
+        )
+        add(
+            MessageEmbedding,
+            org_id=org_id,
+            session_id=ids[session],
+            message_id=ids[f"msg:{session}"],
+            embedding=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            model="test-embedding",
         )
         add(
             RunEvent,

@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.3 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.3, M2.5 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -155,6 +155,17 @@ Done: M1.1 to M1.19, M2.1 to M2.3 (below the list of M1 notes).
   prefix. The API can list, edit, and revert (`/workspaces/{id}/memory`). A non-admin cannot write
   `workspace` notes, and unattended and delegated runs cannot write. Not in M2.1: approval cards
   for workspace writes (M3.2), the web editor, and the background review (M2.4).
+- M2.5: session search in `src/sama/search/` (architecture Section 7.1). Migration `0014` makes
+  the `vector` extension, adds a generated full-text column and `embedded_at` to `messages`, and
+  adds `message_embeddings` (HNSW index, RLS). The tools `session_search` and `session_read` are
+  in the `sessions` toolset, which is a default toolset and a default allow. The search joins a
+  full-text list and a meaning list with reciprocal rank fusion. Each query keeps the audience
+  rule: a private run sees shared sessions and its own private sessions in its workspaces, a
+  shared run sees only shared sessions of its workspace. A session that the run may not see gives
+  the error of a missing session. The embed worker of the control plane needs an OpenAI key.
+  Without one, search uses full text only. The database must have pgvector (CI and the README use
+  `pgvector/pgvector:pg17`). Not in M2.5: embeddings in `model_calls`, a search of titles and
+  summaries (M2.4), and a web UI.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
@@ -186,7 +197,7 @@ Done: M1.1 to M1.19, M2.1 to M2.3 (below the list of M1 notes).
 | M2.2 | Skills storage and tools | Skills as versioned rows plus files. Scopes builtin, org, workspace, user. `skills_list`, `skill_view`, `skill_manage`. Skill index (60-char descriptions) in the prefix. Skills sync into the sandbox. Lint and injection scan on every write. Done. |
 | M2.3 | Builtin skills | At least 10 builtin skills of our own (for example research, writing, code review, spreadsheet, PDF, meeting notes). `/<skill-name>` works in Telegram and web. Done (Slack too). |
 | M2.4 | Background review | When a run ends and 10 user turns or 10 tool iterations passed since the last review, sama queues one review and resets the counters. At most one review runs and one waits per session. The review run with a cheap model may write memory and skills. Recursion is off. User-scope writes apply. Workspace and org writes create an approval. |
-| M2.5 | Session search | Full-text plus pgvector index on messages. `session_search` and `session_read`. No LLM call in the tool. |
+| M2.5 | Session search | Full-text plus pgvector index on messages. `session_search` and `session_read`. No LLM call in the tool. Done. |
 | M2.6 | Context management | Compaction events from the Claude SDK, transcript archive, session lineage. `tool_search`, `tool_describe`, `tool_call` for deferred tools. Context pins. `/compact`. |
 | M2.7 | Native sub-agents | Claude `agents` option configured from the agent profile. Sub-agent events appear in traces. |
 | M2.8 | Media tools | `vision_analyze` for images from channels. |
