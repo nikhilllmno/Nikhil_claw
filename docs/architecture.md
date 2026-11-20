@@ -2120,7 +2120,9 @@ pull request. A manifest holds:
 An org admin can also add a custom connection that is not in the catalog (a URL, an OpenAPI
 document, a database, or a stdio command). A custom `mcp_hosted` connection needs the org
 `owner`. Since M3.5, a workspace `admin` or the org `owner` can add a remote MCP server by URL
-to a workspace.
+to a workspace. Since M4.11, they can add a stdio MCP server with a pinned package (Section
+10.3.2). Only the org `owner` can add one with a custom command. Since M4.12, they can add an
+HTTP API from an OpenAPI document or a list of endpoints (Section 10.3.3).
 
 **Connection record**
 
@@ -2167,7 +2169,8 @@ gets one notice per change.
 **Tool naming and exposure**
 
 - Connector tools have a prefix for the kind and the connection name, as in Hermes:
-  `mcp_<connection>_<tool>` for MCP and `db_<connection>_<tool>` for databases. Since M3.4,
+  `mcp_<connection>_<tool>` for MCP (remote and hosted), `api_<connection>_<tool>` for an
+  HTTP API that an admin adds, and `db_<connection>_<tool>` for databases. Since M3.4,
   the tools of a catalog connector start with the connector name, for example
   `gmail_send_email` and `notion_search`. A Composio tool keeps its Composio slug (for example
   `GMAIL_SEND_EMAIL`) in the manifest, and the control plane uses the slug for the call. The
@@ -2249,7 +2252,7 @@ gets one notice per change.
   workspace connection. Default policy: `read` is `allow`, `write` is `ask`, and
   `destructive` is `ask` with a stronger reason. An admin rule wins over the default.
 
-**What M3.5 builds**
+#### 10.3.1 What M3.5 builds: remote MCP servers
 
 - **Catalog servers.** `connectors/catalog/` has `deepwiki` (no sign-in), `neon-mcp` and
   `stripe` (a bearer token in a form), and `sentry` and `supabase-mcp` (OAuth). The names
@@ -2329,6 +2332,100 @@ gets one notice per change.
   `?error=&state=`). It removes the code and the state from the address, also when the answer
   is not valid, and then shows a notice. Each connection of a server by URL has its own form,
   from its own URL and auth.
+
+#### 10.3.2 What M4.11 builds: hosted stdio MCP servers
+
+- **Manifest.** A manifest of kind `mcp_hosted` has a `hosted` block:
+  - `package`: `registry` (`npm` or `pypi`), `name`, `version`, `bin` (optional), and `args`.
+    The version is one exact version. sama refuses a range, a tag, and `latest`.
+  - or `command`: the program and its arguments. Only a server that an admin adds can have a
+    command, not a catalog manifest.
+  - `env`: the environment variables of the server. Each variable is one secret field of the
+    form, with the name in lower case. sama refuses `PATH`, `HOME`, and the other shell
+    variables, and the prefixes `LD_`, `DYLD_`, `NODE_`, `NPM_`, `PYTHON`, `PIP_`, `UV_`, and
+    `SAMA_`, because they can change the program that runs.
+  - `egress`: at most 20 host names that the server can reach.
+  - `memory_mb` (64 to 4096, default 384) and `idle_s` (60 to 3600, default 600).
+  - `include`, `exclude`, and `access`, as for a remote server.
+- **Servers that an admin adds.** `POST /workspaces/{id}/connections/stdio` adds a server.
+  A workspace `admin` or the org `owner` can add a pinned package. Only the org `owner` can
+  add a custom command, because a command runs any program. The rules of a name are the rules
+  of a server by URL. The server goes into `config.hosted` of the row. A new program, new
+  egress, or a new list of variables deletes the stored values. If E2B is not
+  set up, the route answers `409`.
+- **Connector host.** Each connection has its own E2B sandbox (Section 10.5). The control
+  plane keeps the hosts in memory. The labels of a host are `sama.kind=connector_host`,
+  `sama.connection_id`, and `sama.host_hash`. The session id of the host is
+  `host-<connection id>`, so no agent session can find or resume it. After a restart of the
+  control plane, sama finds a host again by its labels. So sama needs no table for the hosts.
+  `SAMA_CONNECTOR_HOST_TEMPLATE` sets the E2B template. The default is the public `base`
+  template: it has Node.js and Python 3, and no sama code and no sama secret.
+- **Egress.** The egress allowlist of the host is `egress` plus the package registry
+  (`registry.npmjs.org` for npm, `pypi.org` and `files.pythonhosted.org` for PyPI). E2B
+  blocks all other addresses. A new allowlist makes a new host and removes the old one.
+- **Bridge.** sama writes a small bridge program (`host_bridge.py`, the standard library only)
+  into the host and starts it. The bridge installs the package (`npx` for npm, a virtual
+  environment for PyPI), then starts the server in its own process group. The secrets go only
+  to the environment of the bridge process. They are not in the labels, the files, or the
+  argv. sama speaks MCP over the stdin and stdout of the bridge (newline-delimited JSON-RPC).
+  The first start can take up to 240 seconds, because the install runs. A call has a
+  60-second limit.
+- **Life cycle.** A host starts on the first call or check. After `idle_s` seconds without a
+  call, a reaper task of the control plane pauses the host. The E2B timeout is `idle_s` plus
+  120 seconds, so E2B pauses the host if the control plane cannot. The next call resumes the
+  host and starts the server again. The bridge reads the memory of the process group each
+  second. Above `memory_mb`, it stops the group and exits with code 86. A server that stops,
+  for any reason, starts again on the next call. A remove of the connection removes the host.
+- **No commands from the agent.** The agent reaches the host only through the
+  `mcp_<connection>_<tool>` tools and the tool gate. No sama tool runs a command in a host.
+- **Tools and access.** The same as a remote server (Section 10.3.1): the tool list is in
+  `tool_cache`, the health check lists the tools, and the access comes from the annotations.
+- **Web app.** The Connections page has a form to add a stdio MCP server. The card of a hosted
+  server shows the package or the command, the egress, and the names of the variables. The
+  form of the connection asks for the value of each variable.
+
+#### 10.3.3 What M4.12 builds: HTTP APIs
+
+- **Import.** `POST /workspaces/{id}/connections/api` adds an HTTP API. Only a workspace
+  `admin` or the org `owner` can do this. Give one source of operations:
+  - `openapi`: an OpenAPI 3 document as JSON or YAML text (at most 2 MB);
+  - `openapi_url`: the `https` address of the document. sama gets it through the outbound
+    client (2 MB, at most 3 redirects, each checked);
+  - `endpoints`: a list of endpoints, each with `method`, `path`, an optional `name`,
+    `description`, `query` (the names of the query parameters), and `body` (true for a JSON
+    body). Each `{name}` of a path is a required path argument.
+- **Parser.** The parser does not run code and does not follow a remote `$ref`. It follows a
+  local `$ref` to a depth of 10, stops at a cycle, and refuses YAML aliases, so a small document
+  cannot expand. It reads path, query, and JSON body parameters. It ignores header and cookie
+  parameters (sama sets the headers) and a body that is not JSON. It skips an operation that it
+  cannot use (for example a path template without a path parameter, or a bad parameter name)
+  and counts it in `skipped`. At most 200 operations. The base URL is the `base_url` of the request,
+  else the first `https` server of the document.
+- **Tools.** Each operation is one tool `api_<connection>_<tool>`. The tool name comes from the
+  `operationId`, else from the method and the path, in lower case with `_`. A second tool with
+  the same name gets `_2`, `_3`, and so on. A name longer than 64 characters is cut. The tool
+  list goes into `tool_cache` when the admin adds the API, so the API needs no discovery.
+- **Access.** `GET` and `HEAD` are `read`, `DELETE` is `destructive`, and the other methods are
+  `write`. The default policy of Section 10.3 applies: the gate allows a `read` tool and asks
+  for a `write` or `destructive` tool. The include and exclude filters of Section 10.3.1 apply.
+- **Auth.** `api_key` (a header or a query parameter, with its name), `bearer`, `basic`,
+  `oauth2` (the client credentials grant, with `token_url` and an optional `scope`; the client
+  sends its id and secret with basic auth or in the body), or `none`. The form asks for the
+  values, and the vault entry `connection:<id>` holds them. sama keeps an OAuth 2 token in
+  memory until 60 seconds before it expires. After a `401`, sama gets a new token and sends the
+  request again once. sama refuses an API key header that it sets itself (for example
+  `Content-Type`).
+- **Calls.** sama quotes a path argument into one path segment, so the agent cannot leave the
+  base URL. It refuses a path argument of `.` or `..`, and an argument that the operation does
+  not have. A query argument goes into the query. `body` is the JSON body. Every request goes
+  through the outbound client (Section 16.4) without redirects. An answer of `2xx` comes back
+  to the agent as text. Another status comes back as an error with the status and the start of
+  the answer. An error text never holds a secret.
+- **Health check.** The `test` operation of the request, else the first `GET` operation without
+  required arguments. A new base URL or auth deletes the stored values.
+- **Web app.** The Connections page has a form to add an API: paste a document, give its
+  address, or write one endpoint on each line (`GET /items?limit,cursor list_items`). The tool
+  list shows the method and the path of each tool.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
 start runs or workflows (Section 12).
@@ -2462,17 +2559,23 @@ at the driver, so a prompt cannot remove them.
 
 Hermes starts stdio MCP servers as local processes. In the cloud, sama runs each
 `mcp_hosted` connection in a **connector host**: a small, separate E2B sandbox (or Fly
-Machine later) that the control plane owns.
+Machine later) that the control plane owns. M4.11 builds it (Section 10.3.2).
 
 - One connector host per connection. It holds only that connection's secrets, as
-  environment variables. It is not the agent sandbox, and the agent cannot run commands in
-  it.
+  environment variables of the server process. It is not the agent sandbox, and the agent
+  cannot run commands in it. The host has its own labels and session id, so the sandbox
+  orchestrator of the sessions never finds it.
 - The host runs the pinned package from the manifest. Sama speaks MCP to it over a stdio
   bridge, and proxies its tools like a remote MCP server.
-- The host has its own egress allowlist from the manifest (for example only `api.vendor.com`).
+- The host has its own egress allowlist from the manifest (for example only `api.vendor.com`),
+  plus the package registry.
 - The host starts on the first call, pauses when idle, and restarts if it uses too much
   memory (Hermes recycles stdio servers in the same way).
 - Custom stdio commands that are not in the catalog need the org `owner` to approve them.
+- A test (`tests/connectors/test_host.py`) shows that an agent sandbox cannot read the secrets
+  of a host: the secrets are not in the labels, the spec, the argv, or the files of the host,
+  an agent spec cannot resume the host, and the environment of a session sandbox does not have
+  them.
 
 ### 10.6 Private networks
 
@@ -4527,6 +4630,12 @@ policy for all of them:
   request, for a server that an admin adds by URL. `OutboundClient.request` can send a form
   body (`form`) and stop at the first full answer of a stream (`enough`). `FetchResult.headers`
   has the answer headers with lower-case names.
+- **HTTP APIs (M4.12).** A call of an `api_<connection>_<tool>` tool and the OAuth 2 token
+  request follow no redirect, for the same reason. `OutboundClient.check(url)` checks the base
+  URL and the token URL when an admin adds the API. The document at `openapi_url` can follow at
+  most 3 redirects, each checked, because it has no credential.
+- **Connector hosts (M4.11).** A stdio MCP server does not use the outbound client. It runs in
+  its own E2B sandbox, and the E2B egress allowlist of the host limits it (Section 10.5).
 
 ### 16.5 Untrusted content
 
@@ -5076,6 +5185,7 @@ the start with a message that names the variable but not its value.
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
 | `SAMA_COMPOSIO_WEBHOOK_SECRET` | No | The signing secret of the Composio webhook subscription of the sama project (Section 12.2). An org secret in the vault (`composio_webhook_secret`) comes first. Without both, sama refuses Composio events. |
 | `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |
+| `SAMA_CONNECTOR_HOST_TEMPLATE` | No | The E2B template of the connector hosts of stdio MCP servers (Section 10.3.2). Default: `base`. |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_GITHUB_APP_ID`, `SAMA_GITHUB_APP_SLUG`, `SAMA_GITHUB_CLIENT_ID`, `SAMA_GITHUB_APP_PRIVATE_KEY`, `SAMA_GITHUB_CLIENT_SECRET` | No | The sama GitHub App (Section 19.5). With `SAMA_GITHUB_APP_ID`, all five are required. The private key can have `\n` in place of its line breaks. Without them, the git proxy and the pull request tools are off. |

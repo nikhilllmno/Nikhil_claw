@@ -5,13 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from sama.connectors.manifest import (
     ENV_DIRECTORY,
     TOKEN_FIELD,
+    ApiAuth,
+    ApiSpec,
     Catalog,
+    Manifest,
     ManifestError,
+    api_fields,
     catalog_directory,
+    hosted_fields,
     mcp_fields,
     parse,
 )
@@ -190,3 +196,106 @@ def test_the_catalog_refuses_a_custom_manifest(tmp_path: Path) -> None:
     (tmp_path / "remote.yaml").write_text(MCP + "custom: true\n")
     with pytest.raises(ManifestError, match="custom"):
         Catalog.load(tmp_path)
+
+
+HOSTED = """
+name: everything
+title: Everything
+description: A demo stdio MCP server.
+kind: mcp_hosted
+hosted:
+  package: {registry: npm, name: "@modelcontextprotocol/server-everything", version: 2025.9.25}
+  env: {DEMO_TOKEN: demo_token}
+  egress: [api.demo.test]
+fields:
+- name: demo_token
+  label: Demo token
+  secret: true
+"""
+
+
+def test_a_hosted_manifest_pins_its_package_and_allows_the_registry() -> None:
+    manifest = parse(HOSTED)
+    assert manifest.hosted is not None
+    assert manifest.hosted.package is not None
+    assert manifest.hosted.package.pinned == "@modelcontextprotocol/server-everything@2025.9.25"
+    assert manifest.hosted.allow_out == ("api.demo.test", "registry.npmjs.org")
+    pypi = parse(
+        HOSTED.replace(
+            '{registry: npm, name: "@modelcontextprotocol/server-everything", version: 2025.9.25}',
+            "{registry: pypi, name: mcp-server-fetch, version: 2025.4.7}",
+        )
+    )
+    assert pypi.hosted is not None
+    assert pypi.hosted.allow_out == ("api.demo.test", "files.pythonhosted.org", "pypi.org")
+    public = manifest.public()
+    assert public["hosted"]["package"]["name"] == "@modelcontextprotocol/server-everything"
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (("version: 2025.9.25", "version: ^2025.9.25"), "exact version"),
+        (("version: 2025.9.25", "version: latest"), "exact version"),
+        (("DEMO_TOKEN: demo_token", "PATH: demo_token"), "cannot set PATH"),
+        (("DEMO_TOKEN: demo_token", "LD_PRELOAD: demo_token"), "LD_PRELOAD"),
+        (("DEMO_TOKEN: demo_token", "DEMO_TOKEN: other"), "no such field"),
+        (("egress: [api.demo.test]", "egress: ['http://x']"), "host name"),
+        (
+            (
+                'package: {registry: npm, name: "@modelcontextprotocol/server-everything", '
+                "version: 2025.9.25}",
+                "command: [node, server.js]",
+            ),
+            "custom",
+        ),
+    ],
+)
+def test_a_bad_hosted_manifest_is_refused(change: tuple[str, str], error: str) -> None:
+    with pytest.raises(ManifestError, match=error):
+        parse(HOSTED.replace(*change))
+
+
+def test_hosted_fields_and_api_fields() -> None:
+    fields = hosted_fields(("GITHUB_TOKEN",))
+    assert [(f.name, f.label, f.secret) for f in fields] == [("github_token", "GITHUB_TOKEN", True)]
+    assert [f.name for f in api_fields(ApiAuth(type="basic"))] == ["username", "password"]
+    oauth = ApiAuth(type="oauth2", token_url="https://auth.test/token")
+    assert [f.name for f in api_fields(oauth)] == ["client_id", "client_secret"]
+    assert [f.name for f in api_fields(ApiAuth(type="api_key", name="X-Key"))] == ["api_key"]
+    assert api_fields(ApiAuth(type="none")) == ()
+
+
+@pytest.mark.parametrize(
+    ("auth", "error"),
+    [
+        ({"type": "api_key"}, "has a name"),
+        ({"type": "bearer", "name": "X"}, "has a name"),
+        ({"type": "oauth2"}, "token_url"),
+        ({"type": "bearer", "scope": "x"}, "scope"),
+        ({"type": "api_key", "name": "Host"}, "sama sets"),
+        ({"type": "oauth2", "token_url": "http://auth.test/token"}, "token_url"),
+    ],
+)
+def test_a_bad_api_auth_is_refused(auth: dict[str, str], error: str) -> None:
+    with pytest.raises(ValidationError, match=error):
+        ApiAuth.model_validate(auth)
+
+
+def test_an_api_manifest_is_custom_only_with_the_form_of_its_auth() -> None:
+    api = {"base_url": "https://api.demo.test/v1", "auth": {"type": "bearer"}}
+    base = {
+        "name": "demo",
+        "title": "Demo",
+        "description": "An API.",
+        "kind": "http_api",
+        "api": api,
+        "fields": [f.model_dump() for f in api_fields(ApiAuth(type="bearer"))],
+    }
+    assert Manifest.model_validate({**base, "custom": True}).api is not None
+    with pytest.raises(ValidationError, match="only a custom connection"):
+        Manifest.model_validate(base)
+    with pytest.raises(ValidationError, match="the form of that auth"):
+        Manifest.model_validate({**base, "custom": True, "fields": []})
+    with pytest.raises(ValidationError, match="base_url"):
+        ApiSpec.model_validate({**api, "base_url": "http://api.demo.test"})

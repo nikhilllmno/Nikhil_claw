@@ -10,7 +10,9 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
+from sama.connectors.api import ApiDriver
 from sama.connectors.composio import ComposioClient
+from sama.connectors.host import ConnectorHosts
 from sama.connectors.http_api import DriverError, DriverUnavailableError
 from sama.connectors.manifest import Catalog, Manifest, ToolSpec
 from sama.connectors.mcp_driver import McpDriver
@@ -125,6 +127,9 @@ def service(
     fake: FakeComposio,
     form: FakeForm,
     mcp: McpDriver | None = None,
+    *,
+    hosts: ConnectorHosts | None = None,
+    api: ApiDriver | None = None,
 ) -> ConnectionService:
     """A connection service with the catalog of the repo and the fakes."""
     return ConnectionService(
@@ -135,5 +140,7 @@ def service(
         composio=ComposioClient(transport=httpx.MockTransport(fake)),
         drivers={"http_api": form},
         mcp=mcp,
+        hosts=hosts,
+        api=api,
         web_base=WEB + "/",
     )

@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import JwtVerifier, SamaApi
+from sama.connectors.api import ApiDriver
 from sama.db.models import Connection, Membership
 from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import Vault
@@ -18,7 +19,10 @@ from tests.api.conftest import ISSUER, SECRET, bearer
 from tests.api.test_app import add_user, mia
 from tests.connectors.fake_mcp import URL, FakeMcp, driver
 from tests.connectors.support import NOTION_TOKEN, FakeComposio, FakeForm, service
+from tests.connectors.test_api_driver import HOST as API_HOST
+from tests.connectors.test_api_driver import FakeApi
 from tests.orchestrator.conftest import Tenant
+from tests.support import wire_transport
 
 pytestmark = pytest.mark.usefixtures("tenant")
 
@@ -261,3 +265,68 @@ async def test_an_admin_adds_a_server_by_url_and_signs_in(
     refused_pattern = await mcp_web.put(tools, headers=mia(tenant), json={"include": ["a b"]})
     assert refused_pattern.status_code == 422
     assert (await mcp_web.put(tools, headers=other, json={})).status_code == 404
+
+
+@pytest.fixture
+async def api_web(engine: AsyncEngine, tenant: Tenant) -> AsyncIterator[httpx.AsyncClient]:
+    from tests.connectors.fake_mcp import public
+
+    vault = Vault(engine, VaultKey(b"w" * KEY_BYTES))
+    api_driver = ApiDriver(transport=wire_transport(FakeApi()), resolver=public)
+    connections = service(engine, vault, FakeComposio(), FakeForm(), api=api_driver)
+    api = SamaApi(
+        engine,
+        verifier=JwtVerifier(secret=SecretStr(SECRET), issuer=ISSUER),
+        connections=connections,
+    )
+    transport = httpx.ASGITransport(app=api.app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
+        yield client
+    await connections.aclose()
+
+
+async def test_an_admin_adds_an_http_api_from_a_list_of_endpoints(
+    api_web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    url = path(tenant) + "/api"
+    body = {
+        "name": "plain",
+        "base_url": f"https://{API_HOST}/v2",
+        "auth": {"type": "none"},
+        "endpoints": [
+            {"name": "get_item", "method": "GET", "path": "/items/{id}"},
+            {"name": "drop_item", "method": "DELETE", "path": "/items/{id}"},
+        ],
+    }
+    assert (await api_web.post(url, headers=mia(tenant), json=body)).status_code == 403
+    await make_admin(engine, tenant)
+    for bad in (
+        {**body, "auth": {"type": "digest"}},
+        {**body, "endpoints": [{"method": "TRACE", "path": "/x"}]},
+        {**body, "unknown": 1},
+    ):
+        assert (await api_web.post(url, headers=mia(tenant), json=bad)).status_code == 422, bad
+    started = await api_web.post(url, headers=mia(tenant), json=body)
+    assert started.status_code == 201, started.text
+    connection = started.json()["connection"]
+    assert connection["state"] == "connected"
+    assert connection["mcp"]["custom"]["base_url"] == f"https://{API_HOST}/v2"
+    tools = {t["name"]: t for t in connection["mcp"]["tools"]}
+    assert set(tools) == {"api_plain_get_item", "api_plain_drop_item"}
+    assert (tools["api_plain_get_item"]["method"], tools["api_plain_get_item"]["path"]) == (
+        "GET",
+        "/items/{id}",
+    )
+
+
+async def test_a_stdio_server_needs_e2b_and_a_valid_body(
+    api_web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    url = path(tenant) + "/stdio"
+    body = {"name": "everything", "package": {"registry": "npm", "name": "x", "version": "1.0.0"}}
+    bad = {**body, "package": {"registry": "cargo", "name": "x", "version": "1.0.0"}}
+    assert (await api_web.post(url, headers=mia(tenant), json=bad)).status_code == 422
+    await make_admin(engine, tenant)
+    refused = await api_web.post(url, headers=mia(tenant), json=body)
+    assert refused.status_code == 409
+    assert "E2B" in refused.text

@@ -28,6 +28,8 @@ Optional environment:
   ``SAMA_SANDBOX_TEMPLATE``, ``SAMA_SANDBOX_ALLOW_OUT`` (comma-separated hosts),
   ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_VISION_MODEL`` (the model of
   ``vision_analyze``, default ``claude-sonnet-5-5``).
+- ``SAMA_CONNECTOR_HOST_TEMPLATE``: the E2B template of the connector hosts of stdio MCP
+  servers (default ``base``).
 """
 
 from __future__ import annotations

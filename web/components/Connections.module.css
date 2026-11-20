@@ -146,3 +146,8 @@
   font-size: var(--text-xs);
   overflow-wrap: anywhere;
 }
+
+/* An open add form takes the full width of the row of add buttons. */
+.addCard {
+  flex-basis: 100%;
+}

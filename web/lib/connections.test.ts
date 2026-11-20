@@ -1,13 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiClient, type Connection, type Connector, type TokenSource } from "./api";
 import {
+  EMPTY_API,
   EMPTY_SERVER,
+  EMPTY_STDIO,
+  apiBody,
+  apiFields,
+  apiProblem,
   canCheck,
   connectionOf,
   connectorFor,
   customServers,
   formProblem,
   formValues,
+  hostedFields,
+  hostedWhat,
   hasOAuthAnswer,
   initialValues,
   isSafeRedirect,
@@ -15,12 +22,15 @@ import {
   mcpFields,
   mcpToolSummary,
   parseConnectionQuery,
+  parseEndpoints,
   parsePatterns,
   patternProblem,
   serverBody,
   serverProblem,
   stateLabel,
   stateTone,
+  stdioBody,
+  stdioProblem,
   toolSummary,
   withConnection,
   withoutConnection,
@@ -380,6 +390,178 @@ describe("remote MCP servers", () => {
     ]);
   });
 });
+
+describe("stdio MCP servers (M4.11)", () => {
+  const good = { ...EMPTY_STDIO, name: "Everything", packageName: "@modelcontextprotocol/server-everything", version: "2025.9.25" };
+
+  it("checks the form", () => {
+    expect(stdioProblem(good)).toBeNull();
+    expect(stdioProblem({ ...good, name: "1x" })).toMatch(/name/);
+    expect(stdioProblem({ ...good, packageName: " " })).toMatch(/package/);
+    expect(stdioProblem({ ...good, version: "^1.2.0" })).toMatch(/exact version/);
+    expect(stdioProblem({ ...good, version: "latest" })).toMatch(/exact version/);
+    expect(stdioProblem({ ...good, env: "GITHUB_TOKEN, lower" })).toMatch(/"lower" is not a variable/);
+    expect(stdioProblem({ ...good, egress: "api.github.com\nhttps://x.test" })).toMatch(/not a host name/);
+    expect(stdioProblem({ ...good, egress: "localhost" })).toMatch(/not a host name/);
+    expect(stdioProblem({ ...good, memoryMb: "32" })).toMatch(/64 to 4096/);
+    expect(stdioProblem({ ...good, idleS: "abc" })).toMatch(/60 to 3600/);
+    expect(stdioProblem({ ...good, source: "command", command: " \n " })).toMatch(/command/);
+  });
+
+  it("makes the body of a package or a command", () => {
+    expect(stdioBody({ ...good, env: "A_KEY\nB_KEY", egress: "API.Example.com", args: "stdio\n", memoryMb: "512" })).toEqual({
+      name: "everything",
+      title: null,
+      scope: "workspace",
+      env: ["A_KEY", "B_KEY"],
+      egress: ["api.example.com"],
+      memory_mb: 512,
+      idle_s: null,
+      package: {
+        registry: "npm",
+        name: "@modelcontextprotocol/server-everything",
+        version: "2025.9.25",
+        bin: null,
+        args: ["stdio"],
+      },
+    });
+    const command = stdioBody({ ...good, source: "command", command: "python3\n-m\nserver" });
+    expect(command.command).toEqual(["python3", "-m", "server"]);
+    expect(command.package).toBeUndefined();
+  });
+
+  it("makes a card with one secret field for each variable", () => {
+    const hosted = {
+      title: null,
+      package: { registry: "pypi" as const, name: "mcp-server-fetch", version: "1.0.0" },
+      command: null,
+      env: ["API_TOKEN"],
+      egress: [],
+      memory_mb: 384,
+      idle_s: 600,
+    };
+    const mcp = { custom: hosted, include: [], exclude: [], discovered_at: null, tools: [] };
+    const cards = customServers([connection({ connector: "fetch", kind: "mcp_hosted", scope: "workspace", mcp })], []);
+    expect(cards[0]?.kind).toBe("mcp_hosted");
+    expect(cards[0]?.description).toContain("mcp-server-fetch==1.0.0 (PyPI)");
+    expect(cards[0]?.fields).toEqual(hostedFields(["API_TOKEN"]));
+    expect(hostedFields(["API_TOKEN"])[0]).toMatchObject({ name: "api_token", label: "API_TOKEN", secret: true });
+    expect(hostedWhat({ package: null, command: ["node", "server.js"] })).toBe("the command node server.js");
+    expect(toolSummary(cards[0]!)).toMatch(/connector host/);
+  });
+});
+
+describe("HTTP APIs (M4.12)", () => {
+  const good = { ...EMPTY_API, name: "Shop", openapi: "openapi: 3.0.3" };
+
+  it("reads a list of endpoints", () => {
+    expect(parseEndpoints("GET /items?limit,cursor list_items\n post /items/{id}\nDELETE /items/{id} drop")).toEqual([
+      { name: "list_items", method: "GET", path: "/items", query: ["limit", "cursor"], body: false },
+      { name: null, method: "POST", path: "/items/{id}", query: [], body: true },
+      { name: "drop", method: "DELETE", path: "/items/{id}", query: [], body: false },
+    ]);
+    expect(parseEndpoints("FETCH /items")).toMatch(/not an endpoint/);
+    expect(parseEndpoints("GET items")).toMatch(/not an endpoint/);
+    expect(parseEndpoints("GET /items name extra")).toMatch(/not an endpoint/);
+    expect(parseEndpoints("GET /items?$x")).toMatch(/query parameter/);
+    expect(parseEndpoints(" ")).toMatch(/one endpoint/);
+  });
+
+  it("checks the form", () => {
+    expect(apiProblem(good)).toBeNull();
+    expect(apiProblem({ ...good, openapi: "" })).toMatch(/Paste/);
+    expect(apiProblem({ ...good, baseUrl: "http://x.test" })).toMatch(/https/);
+    expect(apiProblem({ ...good, source: "endpoints", endpoints: "GET /a" })).toMatch(/base address/);
+    expect(apiProblem({ ...good, source: "endpoints", endpoints: "GET /a", baseUrl: "https://x.test/v1" })).toBeNull();
+    expect(apiProblem({ ...good, source: "openapi_url", openapiUrl: "ftp://x" })).toMatch(/https/);
+    expect(apiProblem({ ...good, keyName: "Content-Type" })).toMatch(/sets the Content-Type/);
+    expect(apiProblem({ ...good, keyName: "api_key", keyLocation: "query" })).toBeNull();
+    expect(apiProblem({ ...good, auth: "oauth2", tokenUrl: "" })).toMatch(/token URL/);
+  });
+
+  it("makes the body for each sign-in", () => {
+    expect(apiBody(good)).toEqual({
+      name: "shop",
+      title: null,
+      scope: "workspace",
+      base_url: null,
+      auth: { type: "api_key", name: "X-Api-Key", location: "header" },
+      openapi: "openapi: 3.0.3",
+    });
+    const oauth = apiBody({
+      ...good,
+      auth: "oauth2",
+      tokenUrl: " https://auth.test/token ",
+      oauthScope: "read",
+      source: "endpoints",
+      endpoints: "GET /a",
+      baseUrl: "https://x.test",
+    });
+    expect(oauth.auth).toEqual({ type: "oauth2", token_url: "https://auth.test/token", scope: "read" });
+    expect(oauth.endpoints).toHaveLength(1);
+    expect(oauth.openapi).toBeUndefined();
+    expect(apiBody({ ...good, auth: "bearer" }).auth).toEqual({ type: "bearer" });
+  });
+
+  it("makes the same form fields as the API", () => {
+    expect(apiFields("api_key", "X-Key", "query")[0]?.help).toBe("The key goes into the X-Key query parameter.");
+    expect(apiFields("bearer").map((f) => f.name)).toEqual(["token"]);
+    expect(apiFields("basic").map((f) => [f.name, f.secret])).toEqual([
+      ["username", false],
+      ["password", true],
+    ]);
+    expect(apiFields("oauth2").map((f) => [f.name, f.secret])).toEqual([
+      ["client_id", false],
+      ["client_secret", true],
+    ]);
+    expect(apiFields("none")).toEqual([]);
+  });
+
+  it("makes a card for an API that an admin added, and shows the tools", () => {
+    const custom = {
+      title: "Shop",
+      base_url: "https://shop.test/v1",
+      auth: "basic" as const,
+      auth_name: null,
+      auth_location: null,
+      token_url: null,
+    };
+    const tools = [
+      { name: "api_shop_list", remote_name: "list", description: "", access: "read" as const, enabled: true, method: "GET", path: "/items" },
+      { name: "api_shop_add", remote_name: "add", description: "", access: "write" as const, enabled: true, method: "POST", path: "/items" },
+    ];
+    const mcp = { custom, include: [], exclude: [], discovered_at: "2026-11-20T00:00:00Z", tools };
+    const row = connection({ connector: "shop", kind: "http_api", scope: "workspace", state: "connected", mcp });
+    const cards = customServers([row], [NOTION]);
+    expect(cards[0]).toMatchObject({ kind: "http_api", title: "Shop", api: { base_url: "https://shop.test/v1", auth: "basic" } });
+    expect(cards[0]?.fields.map((f) => f.name)).toEqual(["username", "password"]);
+    expect(toolSummary(cards[0]!)).toBe("HTTP API");
+    expect(mcpToolSummary(row)).toBe("2 tools, 1 read only");
+    // Each connection keeps its own API: the form follows the auth of that connection.
+    const mine = connection({
+      id: "y",
+      connector: "shop",
+      kind: "http_api",
+      scope: "personal",
+      mcp: { ...mcp, custom: { ...custom, base_url: "https://shop.test/v2", auth: "bearer" as const } },
+    });
+    const [card] = customServers([row, mine], [NOTION]);
+    if (card === undefined) throw new Error("no card");
+    expect(card.description).toBe("HTTP API at https://shop.test/v1, https://shop.test/v2");
+    expect(connectorFor(card, mine).fields.map((f) => f.name)).toEqual(["token"]);
+    expect(connectorFor(card, mine).api).toEqual({ base_url: "https://shop.test/v2", auth: "bearer" });
+  });
+
+  it("calls the add routes", async () => {
+    const fetcher = vi.fn(async () => new Response("{}", { status: 201, headers: { "content-type": "application/json" } }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.addStdioServer(WS, { name: "e", scope: "workspace", command: ["x"], env: [], egress: [] });
+    await client.addApi(WS, { name: "s", scope: "workspace", auth: { type: "none" }, openapi_url: "https://s.test/o.json" });
+    const urls = fetcher.mock.calls.map((call) => (call as unknown as [string])[0]);
+    expect(urls).toEqual([`https://api.test/workspaces/${WS}/connections/stdio`, `https://api.test/workspaces/${WS}/connections/api`]);
+  });
+});
+
 
 function tokens(): TokenSource {
   return { generation: 1, getToken: async () => "t", refresh: async () => "t", signOut: () => undefined };
