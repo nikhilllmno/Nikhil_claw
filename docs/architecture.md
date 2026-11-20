@@ -2251,8 +2251,10 @@ gets one notice per change.
 
 **What M3.5 builds**
 
-- **Catalog servers.** `connectors/catalog/` has `deepwiki` (no sign-in), `neon` and `stripe`
-  (a bearer token in a form), and `sentry` and `supabase` (OAuth). A manifest of kind
+- **Catalog servers.** `connectors/catalog/` has `deepwiki` (no sign-in), `neon-mcp` and
+  `stripe` (a bearer token in a form), and `sentry` and `supabase-mcp` (OAuth). The names
+  `neon` and `supabase` belong to the database connectors of M3.11 (Section 10.4). So the tools
+  of the Neon MCP server are `mcp_neon_mcp_<tool>`. A manifest of kind
   `mcp_remote` has an `mcp` block: `url` (`https`, no query), `auth` (`oauth`, `bearer`,
   `header`, or `none`), `header` (for `auth: header`), `scope` (the OAuth scope), `include`
   and `exclude` (tool patterns), and `access` (an access per tool pattern). It has no tool

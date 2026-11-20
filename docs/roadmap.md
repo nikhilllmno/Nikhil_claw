@@ -184,7 +184,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
   events, and a web page for triggers.
 - M3.5: remote MCP connections in `src/sama/connectors/mcp_remote.py`, `oauth.py`, and
   `mcp_driver.py` (architecture Section 10.3, "What M3.5 builds"). The catalog has `deepwiki`,
-  `neon`, `stripe`, `sentry`, and `supabase`. A workspace admin or the org owner adds a server by
+  `neon-mcp`, `stripe`, `sentry`, and `supabase-mcp` (`neon` and `supabase` are the M3.11
+  database connectors). A workspace admin or the org owner adds a server by
   URL (`POST /workspaces/{id}/connections/mcp`). Auth: OAuth 2.1 with dynamic client
   registration, PKCE, and the `resource` parameter; a bearer token; a header; or none. The
   OAuth answer goes through the web app to `POST /connections/oauth/callback`. The tools are

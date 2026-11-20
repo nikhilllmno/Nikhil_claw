@@ -51,7 +51,7 @@ def test_the_catalog_of_the_repo_loads() -> None:
     catalog = Catalog.load(ROOT / "connectors" / "catalog")
     names = {m.name for m in catalog}
     assert {"gmail", "googlecalendar", "github", "slack", "linear", "notion"} <= names
-    assert {"deepwiki", "neon", "sentry", "supabase", "stripe"} <= names
+    assert {"deepwiki", "neon-mcp", "sentry", "supabase-mcp", "stripe"} <= names
     for manifest in catalog:
         if manifest.kind == "mcp_remote":
             # A remote MCP server gives its tools at check time.

@@ -2,7 +2,7 @@
 
 The fixtures are those of the gate tests: ``mia`` starts the run ``run`` in the shared session
 ``shared``, and the run ``secret-run`` in her private session ``secret``. ``FakeMcp`` is the
-remote server for every host, so the catalog servers (``neon``, ``deepwiki``) answer too.
+remote server for every host, so the catalog servers (``neon-mcp``, ``deepwiki``) answer too.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ async def world(engine: AsyncEngine, org: Org1, fake: FakeMcp) -> AsyncIterator[
 
 async def connect_neon(service: ConnectionService, org: Org1, scope: Any = "personal") -> Any:
     who = member(org, "mia", admin=scope == "workspace")
-    started = await service.start(org.ids["org"], org.ids["ws"], who, "neon", scope)
+    started = await service.start(org.ids["org"], org.ids["ws"], who, "neon-mcp", scope)
     assert started.redirect_url is None
     assert started.connection.state == "pending"
     return await service.submit_form(
@@ -78,28 +78,32 @@ async def test_a_catalog_server_connects_with_a_token_and_its_tools_are_usable(
     assert row.secret_ref == f"connection:{view.id}"
     public = view.public()["mcp"]
     assert [t["name"] for t in public["tools"]] == [
-        "mcp_neon_list_items",
-        "mcp_neon_create_item",
-        "mcp_neon_drop_item",
+        "mcp_neon_mcp_list_items",
+        "mcp_neon_mcp_create_item",
+        "mcp_neon_mcp_drop_item",
     ]
     assert [t["access"] for t in public["tools"]] == ["read", "write", "destructive"]
     # The private session of mia sees the tools of her personal connection.
     tools = {t.name: t for t in await service.mcp_tools(private(org))}
-    assert set(tools) == {"mcp_neon_list_items", "mcp_neon_create_item", "mcp_neon_drop_item"}
-    assert tools["mcp_neon_list_items"].access == "read"
-    assert tools["mcp_neon_list_items"].toolset == "integrations"
-    assert "(remote MCP server)" in tools["mcp_neon_list_items"].description
-    answer = await tools["mcp_neon_list_items"].handler(private(org), {"q": "a"})
-    assert "connector:neon" in answer
+    assert set(tools) == {
+        "mcp_neon_mcp_list_items",
+        "mcp_neon_mcp_create_item",
+        "mcp_neon_mcp_drop_item",
+    }
+    assert tools["mcp_neon_mcp_list_items"].access == "read"
+    assert tools["mcp_neon_mcp_list_items"].toolset == "integrations"
+    assert "(remote MCP server)" in tools["mcp_neon_mcp_list_items"].description
+    answer = await tools["mcp_neon_mcp_list_items"].handler(private(org), {"q": "a"})
+    assert "connector:neon-mcp" in answer
     assert 'ran list_items {"q": "a"}' in answer
     assert fake.calls[-1] == ("list_items", {"q": "a"})
     listed = await service.list_for_agent(private(org))
-    assert "- neon (Neon, remote MCP server): connected (personal)." in listed
+    assert "- neon-mcp (Neon MCP, remote MCP server): connected (personal)." in listed
     assert "Tools: 3 (1 read only)." in listed
     # The shared session does not use a personal connection.
     assert await service.mcp_tools(org.claims()) == []
     with pytest.raises(ConnectorError, match="no connected MCP server"):
-        await service.call_mcp(org.claims(), "mcp_neon_list_items", {})
+        await service.call_mcp(org.claims(), "mcp_neon_mcp_list_items", {})
 
 
 async def test_a_wrong_token_fails_and_a_refused_call_asks_to_connect_again(
@@ -107,7 +111,7 @@ async def test_a_wrong_token_fails_and_a_refused_call_asks_to_connect_again(
 ) -> None:
     service, fake = world
     who = member(org, "mia")
-    started = await service.start(org.ids["org"], org.ids["ws"], who, "neon", "personal")
+    started = await service.start(org.ids["org"], org.ids["ws"], who, "neon-mcp", "personal")
     failed = await service.submit_form(
         org.ids["org"], started.connection.id, {"token": "wrong"}, actor=who.user_id
     )
@@ -116,7 +120,7 @@ async def test_a_wrong_token_fails_and_a_refused_call_asks_to_connect_again(
     view = await connect_neon(service, org)
     fake.tokens = set()
     with pytest.raises(ConnectorError, match="connection_request"):
-        await service.call_mcp(private(org), "mcp_neon_list_items", {})
+        await service.call_mcp(private(org), "mcp_neon_mcp_list_items", {})
     after = await service.get(org.ids["org"], view.id)
     assert after is not None
     assert after.state == "failed"
@@ -157,23 +161,23 @@ async def test_new_tools_and_filters_apply_without_a_new_session(
     claims = private(org)
     fake.tools.append(tool("search_docs", read_only=True))
     await service.check(org.ids["org"], view.id, actor=None)
-    assert "mcp_neon_search_docs" in {t.name for t in await service.mcp_tools(claims)}
+    assert "mcp_neon_mcp_search_docs" in {t.name for t in await service.mcp_tools(claims)}
     mia = member(org, "mia")
     saved = await service.set_filters(
         org.ids["org"], view.id, include=(), exclude=("drop_*",), actor=mia.user_id
     )
     assert saved.public()["mcp"]["exclude"] == ["drop_*"]
     enabled = {t["name"]: t["enabled"] for t in saved.public()["mcp"]["tools"]}
-    assert enabled["mcp_neon_drop_item"] is False
+    assert enabled["mcp_neon_mcp_drop_item"] is False
     names = {t.name for t in await service.mcp_tools(claims)}
-    assert "mcp_neon_drop_item" not in names
-    assert "mcp_neon_list_items" in names
+    assert "mcp_neon_mcp_drop_item" not in names
+    assert "mcp_neon_mcp_list_items" in names
     with pytest.raises(ConnectorError, match="no connected MCP server"):
-        await service.call_mcp(claims, "mcp_neon_drop_item", {})
+        await service.call_mcp(claims, "mcp_neon_mcp_drop_item", {})
     await service.set_filters(
         org.ids["org"], view.id, include=("list_*",), exclude=(), actor=mia.user_id
     )
-    assert {t.name for t in await service.mcp_tools(claims)} == {"mcp_neon_list_items"}
+    assert {t.name for t in await service.mcp_tools(claims)} == {"mcp_neon_mcp_list_items"}
     with pytest.raises(ConnectorError) as caught:
         await service.set_filters(
             org.ids["org"], view.id, include=("bad pattern",), exclude=(), actor=mia.user_id
@@ -203,10 +207,10 @@ async def test_a_stale_tool_list_is_checked_in_the_background(
             .values(last_health_at=datetime.now(UTC) - timedelta(hours=7))
         )
     before = {t.name for t in await service.mcp_tools(private(org))}
-    assert "mcp_neon_new_tool" not in before
+    assert "mcp_neon_mcp_new_tool" not in before
     await asyncio.gather(*list(service._background))
     after = {t.name for t in await service.mcp_tools(private(org))}
-    assert "mcp_neon_new_tool" in after
+    assert "mcp_neon_mcp_new_tool" in after
 
 
 async def test_an_admin_adds_a_server_by_url(engine: AsyncEngine, org: Org1, world: World) -> None:
@@ -352,15 +356,15 @@ async def test_the_gate_knows_the_remote_tools_and_their_access(
     await connect_neon(service, org, "workspace")
     gate = GateService(engine, extra_toolsets=DeferredCatalog([]), run_tools=service)
     await grant(engine, org, "tool_search", "integrations")
-    read = await gate.check(org.claims(), "c1", "tool_call", wrapped("mcp_neon_list_items"))
+    read = await gate.check(org.claims(), "c1", "tool_call", wrapped("mcp_neon_mcp_list_items"))
     assert read.action == "allow"
-    drop = await gate.check(org.claims(), "c2", "tool_call", wrapped("mcp_neon_drop_item"))
+    drop = await gate.check(org.claims(), "c2", "tool_call", wrapped("mcp_neon_mcp_drop_item"))
     assert drop.action == "ask"
-    unknown = await gate.check(org.claims(), "c3", "tool_call", wrapped("mcp_neon_nothing"))
+    unknown = await gate.check(org.claims(), "c3", "tool_call", wrapped("mcp_neon_mcp_nothing"))
     assert unknown.action == "deny"
     # Without the toolset, a remote tool is denied.
     await grant(engine, org, "tool_search")
-    denied = await gate.check(org.claims(), "c4", "tool_call", wrapped("mcp_neon_list_items"))
+    denied = await gate.check(org.claims(), "c4", "tool_call", wrapped("mcp_neon_mcp_list_items"))
     assert denied.action == "deny"
 
 
