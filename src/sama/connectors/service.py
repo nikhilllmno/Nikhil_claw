@@ -24,11 +24,10 @@ and a form connector shows a form. The secret fields of a form go to the vault e
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, cast
@@ -72,9 +71,8 @@ from sama.connectors.mcp_remote import (
     McpUnavailableError,
     RemoteTool,
     exposed_tools,
-    matches,
     sama_name,
-    tools_hash,
+    selected,
 )
 from sama.connectors.postgres import writes_on
 from sama.db.models import AuditEntry, Connection, Run, Session
@@ -92,9 +90,9 @@ from sama.vault.store import OrgKeys, SecretName, Vault, connection_secret
 log: Final = logging.getLogger("sama.connectors")
 
 INITIATED_TTL: Final = timedelta(minutes=30)
+"""An ``initiated`` connection becomes ``expired`` after this time without a finished sign-in."""
 MCP_STALE: Final = timedelta(hours=6)
 """A remote MCP connection reads its tool list again in the background after this time."""
-"""An ``initiated`` connection becomes ``expired`` after this time without a finished sign-in."""
 MAX_ERROR_CHARS: Final = 500
 MAX_FIELD_CHARS: Final = 2_000
 MAX_ANSWER_CHARS: Final = 200_000
@@ -147,7 +145,7 @@ class ConnectionView:
         config = row.config or {}
         raw = config.get("fields")
         fields: dict[Any, Any] = raw if isinstance(raw, dict) else {}
-        cache = getattr(row, "tool_cache", None)
+        cache = row.tool_cache
         return cls(
             id=row.id,
             workspace_id=row.workspace_id,
@@ -195,9 +193,7 @@ class ConnectionView:
             if name is None or name in seen:
                 continue
             seen.add(name)
-            enabled = (not include or matches(remote.name, include)) and not (
-                exclude and matches(remote.name, exclude)
-            )
+            enabled = selected(remote.name, include, exclude)
             out.append(McpTool(name, remote, cast(ToolAccess, access), enabled))
         return out
 
@@ -828,9 +824,12 @@ class ConnectionService:
         names = {m.name for m in out}
         for view in views:
             if view.custom_mcp() is not None and view.connector not in names:
-                with _suppress_connector_error():
+                try:
                     out.append(self._manifest_of(view))
-                    names.add(view.connector)
+                except ConnectorError as error:
+                    log.warning("a connection is skipped: %s", error)
+                    continue
+                names.add(view.connector)
         return out
 
     def _agent_manifest(self, connector: str, views: list[ConnectionView]) -> Manifest:
@@ -953,16 +952,7 @@ class ConnectionService:
             )
         try:
             spec = McpRemote(url=url.strip(), auth=auth, header=header, scope=oauth_scope)
-            manifest = Manifest(
-                name=name,
-                title=(title or "").strip() or name,
-                description=f"A remote MCP server at {urlsplit(spec.url).hostname}.",
-                kind="mcp_remote",
-                scopes=(scope,),
-                mcp=spec,
-                fields=mcp_fields(spec.auth, spec.header),
-                custom=True,
-            )
+            manifest = _custom_manifest(name, (title or "").strip() or name, scope, spec)
         except ValidationError as error:
             problem = error.errors()[0]
             where = ".".join(str(part) for part in problem.get("loc", ()))
@@ -995,31 +985,42 @@ class ConnectionService:
             raise ConnectorError(
                 "the sign-in of this connection is not open. Connect again", status_code=409
             )
+
+        async def claim() -> bool:
+            # Only one callback can move the row out of ``initiated``: the row must be the
+            # one that was read above (state and updated_at).
+            won = await self._write(org_id, view.id, state="pending", error=None, expect=view)
+            return won is not None
+
         try:
             await self._mcp.finish_oauth(
                 org_id,
                 view.id,
+                manifest.mcp,
                 view.config,
                 state=state,
                 code=None if error else code,
                 actor=actor,
+                claim=claim,
             )
         except McpStateError as problem:
             raise ConnectorError(str(problem), status_code=400) from None
         except McpError as problem:
-            await self._set(org_id, view.id, state="failed", error=str(problem))
-            async with self._engine.begin() as connection:
-                await _audit(connection, org_id, actor, "connection.failed", view.id, view.scope)
+            await self._fail(org_id, view, actor, str(problem))
             raise ConnectorError(str(problem), status_code=502) from None
         if error or not code:
             reason = (error or "no code")[:200]
-            done = await self._set(
-                org_id, view.id, state="failed", error=f"The sign-in did not finish: {reason}."
-            )
-            async with self._engine.begin() as connection:
-                await _audit(connection, org_id, actor, "connection.failed", view.id, view.scope)
-            return done
+            return await self._fail(org_id, view, actor, f"The sign-in did not finish: {reason}.")
         return await self.check(org_id, view.id, actor=actor)
+
+    async def _fail(
+        self, org_id: uuid.UUID, view: ConnectionView, actor: uuid.UUID, text: str
+    ) -> ConnectionView:
+        """Sets the state ``failed`` with the error, and audits it."""
+        done = await self._set(org_id, view.id, state="failed", error=text)
+        async with self._engine.begin() as connection:
+            await _audit(connection, org_id, actor, "connection.failed", view.id, view.scope)
+        return done
 
     async def set_filters(
         self,
@@ -1088,6 +1089,7 @@ class ConnectionService:
                         input_schema=tool.remote.input_schema,
                         tags=(view.connector, title, tool.remote.name),
                         access=tool.access,
+                        source=f"connector:{view.connector}",
                     )
                 )
             except ValueError as error:
@@ -1161,20 +1163,27 @@ class ConnectionService:
     ) -> list[tuple[ConnectionView, McpTool]]:
         """The enabled tools of the remote MCP connections that a run uses: for each
         connector, the personal connection first, then the workspace connection. A stale
-        tool list starts a check in the background."""
-        out: list[tuple[ConnectionView, McpTool]] = []
-        seen: set[str] = set()
+        tool list starts a check in the background.
+
+        Two connections can give the same sama name (``a-b`` and ``a_b``, or the connector
+        ``a`` with the tool ``b_c`` and the connector ``a_b`` with the tool ``c``). Such a
+        name is ambiguous, so no connection gets it: a name in a policy or an approval always
+        means one tool of one connection."""
+        found: list[tuple[ConnectionView, McpTool]] = []
         for connector in sorted({v.connector for v in views if v.kind == "mcp_remote"}):
             view = _pick([v for v in views if v.connector == connector], connected=True)
             if view is None:
                 continue
             if refresh_org is not None:
                 self._refresh_if_stale(refresh_org, view)
-            for tool in view.mcp_tools():
-                if tool.enabled and tool.name not in seen:
-                    seen.add(tool.name)
-                    out.append((view, tool))
-        return out
+            found.extend((view, tool) for tool in view.mcp_tools() if tool.enabled)
+        owners: dict[str, set[uuid.UUID]] = {}
+        for view, tool in found:
+            owners.setdefault(tool.name, set()).add(view.id)
+        ambiguous = {name for name, ids in owners.items() if len(ids) > 1}
+        if ambiguous:
+            log.warning("remote MCP tools with an ambiguous name are hidden: %s", sorted(ambiguous))
+        return [(view, tool) for view, tool in found if tool.name not in ambiguous]
 
     def _refresh_if_stale(self, org_id: uuid.UUID, view: ConnectionView) -> None:
         if view.id in self._refreshing:
@@ -1280,9 +1289,7 @@ class ConnectionService:
             view.connector, tools, include=spec.include, exclude=spec.exclude, access=spec.access
         )
         cache = {
-            "hash": tools_hash(tools),
             "discovered_at": datetime.now(UTC).isoformat(),
-            "count": len(tools),
             "tools": [{**tool.remote.stored(), "access": tool.access} for tool in exposed],
         }
         return "connected", None, cache
@@ -1332,16 +1339,8 @@ class ConnectionService:
             spec = McpRemote.model_validate(
                 {key: custom.get(key) for key in ("url", "auth", "header", "scope")}
             )
-            return Manifest(
-                name=view.connector,
-                title=str(custom.get("title") or view.connector)[:60],
-                description=f"A remote MCP server at {urlsplit(spec.url).hostname}.",
-                kind="mcp_remote",
-                scopes=(cast(Scope, view.scope),),
-                mcp=spec,
-                fields=mcp_fields(spec.auth, spec.header),
-                custom=True,
-            )
+            title = str(custom.get("title") or view.connector)[:60]
+            return _custom_manifest(view.connector, title, cast(Scope, view.scope), spec)
         except ValidationError:
             raise ConnectorError(
                 f"the stored server of {view.connector} is not valid", status_code=500
@@ -1572,18 +1571,24 @@ class ConnectionService:
         return None if row is None else ConnectionView.of(row)
 
 
+def _custom_manifest(name: str, title: str, scope: Scope, spec: McpRemote) -> Manifest:
+    """The manifest of a remote MCP server that a workspace admin added by URL."""
+    return Manifest(
+        name=name,
+        title=title,
+        description=f"A remote MCP server at {urlsplit(spec.url).hostname}.",
+        kind="mcp_remote",
+        scopes=(scope,),
+        mcp=spec,
+        fields=mcp_fields(spec.auth, spec.header),
+        custom=True,
+    )
+
+
 def _mcp_spec(manifest: Manifest) -> McpRemote:
     if manifest.mcp is None:
         raise ConnectorError(f"{manifest.title} is not a remote MCP server", status_code=500)
     return manifest.mcp
-
-
-@contextlib.contextmanager
-def _suppress_connector_error() -> Iterator[None]:
-    try:
-        yield
-    except ConnectorError as error:
-        log.warning("a connection is skipped: %s", error)
 
 
 def _default_scope(manifest: Manifest, shared: bool) -> Scope | None:

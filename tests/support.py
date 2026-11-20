@@ -134,6 +134,8 @@ def wire_transport(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.
 
     def send(request: httpx.Request) -> httpx.Response:
         response = handler(request)
+        if not hasattr(response, "_content"):
+            return response  # the handler streams the body itself
         return httpx.Response(
             response.status_code, headers=response.headers, stream=_WireStream(response.content)
         )

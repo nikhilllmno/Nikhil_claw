@@ -73,7 +73,7 @@ async def test_a_catalog_server_connects_with_a_token_and_its_tools_are_usable(
     view = await connect_neon(service, org)
     assert view.state == "connected"
     row = await row_of(engine, view.id)
-    assert row.tool_cache["count"] == 3
+    assert len(row.tool_cache["tools"]) == 3
     assert GOOD_TOKEN not in json.dumps(row.config) + json.dumps(row.tool_cache)
     assert row.secret_ref == f"connection:{view.id}"
     public = view.public()["mcp"]
@@ -362,3 +362,70 @@ async def test_the_gate_knows_the_remote_tools_and_their_access(
     await grant(engine, org, "tool_search")
     denied = await gate.check(org.claims(), "c4", "tool_call", wrapped("mcp_neon_list_items"))
     assert denied.action == "deny"
+
+
+async def test_a_tool_name_that_two_connections_give_is_hidden(
+    org: Org1, world: World, fake: FakeMcp
+) -> None:
+    service, _ = world
+    fake.auth = "none"
+    admin = member(org, "mia", admin=True)
+    args: dict[str, Any] = {
+        "url": URL,
+        "auth": "none",
+        "header": None,
+        "oauth_scope": None,
+        "title": None,
+        "scope": "workspace",
+    }
+    first = await service.add_mcp(org.ids["org"], org.ids["ws"], admin, name="acme-x", **args)
+    assert first.connection.state == "connected"
+    names = {t.name for t in await service.mcp_tools(org.claims())}
+    assert "mcp_acme_x_list_items" in names
+    # ``acme_x`` gives the same sama names: no connection gets them.
+    second = await service.add_mcp(org.ids["org"], org.ids["ws"], admin, name="acme_x", **args)
+    assert second.connection.state == "connected"
+    assert await service.mcp_tools(org.claims()) == []
+    with pytest.raises(ConnectorError):
+        await service.call_mcp(org.claims(), "mcp_acme_x_list_items", {})
+    assert not any("tools/call" in r.content.decode() for r in fake.seen)
+
+
+async def test_two_callbacks_at_once_connect_once(org: Org1, world: World, fake: FakeMcp) -> None:
+    service, _ = world
+    fake.auth = "oauth"
+    fake.tokens = set()
+    mia = member(org, "mia", admin=True)
+    started = await service.add_mcp(
+        org.ids["org"],
+        org.ids["ws"],
+        mia,
+        name="tracker",
+        url=URL,
+        auth="oauth",
+        header=None,
+        oauth_scope=None,
+        title=None,
+        scope="personal",
+    )
+    assert started.redirect_url is not None
+    code, state = fake.approve(started.redirect_url)
+    view = started.connection
+
+    async def callback() -> Any:
+        return await service.finish_oauth(
+            org.ids["org"], view.id, state=state, code=code, error=None, actor=mia.user_id
+        )
+
+    results = await asyncio.gather(callback(), callback(), return_exceptions=True)
+    done = [r for r in results if not isinstance(r, BaseException)]
+    refused = [r for r in results if isinstance(r, ConnectorError)]
+    assert len(done) == 1
+    assert done[0].state == "connected"
+    assert len(refused) == 1
+    assert refused[0].status_code in (400, 409)
+    exchanges = [r for r in fake.token_requests if r.get("grant_type") == "authorization_code"]
+    assert len(exchanges) == 1
+    final = await service.get(org.ids["org"], view.id)
+    assert final is not None
+    assert final.state == "connected"

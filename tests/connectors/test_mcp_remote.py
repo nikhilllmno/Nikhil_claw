@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -19,8 +20,8 @@ from sama.connectors.mcp_remote import (
     render_result,
     sama_name,
     tool_access,
-    tools_hash,
 )
+from sama.vault.redact import default_redactor
 from tests.connectors.fake_mcp import GOOD_TOKEN, METADATA, URL, FakeMcp, client, tool
 
 AUTH = {"authorization": f"Bearer {GOOD_TOKEN}"}
@@ -106,15 +107,15 @@ async def test_the_url_policy_holds_for_each_request() -> None:
 def test_parse_tool_applies_the_limits() -> None:
     assert parse_tool({"name": ""}) is None
     assert parse_tool("x") is None
-    long = parse_tool({"name": "a", "description": "x" * 5000, "inputSchema": {"type": "array"}})
+    long = parse_tool({"name": "a", "description": "x" * 5000})
     assert long is not None
     assert len(long.description) == MAX_DESCRIPTION_CHARS + 3
+    # A tool without a schema gets an open object.
     assert long.input_schema == {"type": "object"}
-    huge = parse_tool(
-        {"name": "b", "inputSchema": {"type": "object", "properties": {"x": "y" * 30_000}}}
-    )
-    assert huge is not None
-    assert huge.input_schema == {"type": "object"}
+    # A schema that is not an object, or that is too large, drops the tool.
+    assert parse_tool({"name": "a", "inputSchema": {"type": "array"}}) is None
+    huge = {"type": "object", "properties": {"x": {"description": "y" * 30_000}}}
+    assert parse_tool({"name": "b", "inputSchema": huge}) is None
     hinted = parse_tool({"name": "c", "annotations": {"title": "C", "readOnlyHint": True}})
     assert hinted is not None
     assert (hinted.title, hinted.read_only) == ("C", True)
@@ -134,8 +135,6 @@ def test_names_access_and_filters() -> None:
     exposed = exposed_tools("srv", remote, include=("get_*",), exclude=("*_b",))
     # The second ``get_a`` has the same sama name, so it is not in the list.
     assert [e.name for e in exposed] == ["mcp_srv_get_a"]
-    assert tools_hash(remote) == tools_hash(list(remote))
-    assert tools_hash(remote) != tools_hash(remote[:1])
 
 
 def test_render_result_gives_text() -> None:
@@ -169,3 +168,41 @@ def test_answer_of_finds_the_answer_in_a_stream() -> None:
     assert answer_of(body.encode(), "text/event-stream", 4) == message
     assert answer_of(json.dumps([other, message]).encode(), "application/json", 4) == message
     assert answer_of(b"{", "application/json", 4) is None
+
+
+async def test_a_crlf_stream_that_stays_open_ends_at_the_answer() -> None:
+    fake = FakeMcp(stream=True)
+    fake.crlf = True
+    fake.stay_open = True
+    mcp = client(fake)
+    session = await asyncio.wait_for(mcp.open(URL, AUTH), timeout=10)
+    tools = await asyncio.wait_for(mcp.list_tools(URL, AUTH, session), timeout=10)
+    assert [t.name for t in tools][:1] == ["list_items"]
+    await mcp.aclose()
+
+
+def test_parse_tool_redacts_known_secrets_before_the_cut() -> None:
+    secret = "known-secret-value-1234567890"
+    default_redactor().add(secret)
+    try:
+        text = "x" * (MAX_DESCRIPTION_CHARS - 5) + secret
+        found = parse_tool(
+            {
+                "name": "leaky",
+                "title": f"t {secret}",
+                "description": text,
+                "inputSchema": {"type": "object", "description": secret},
+            }
+        )
+        assert found is not None
+        assert "known-se" not in found.description
+        assert secret not in json.dumps(found.stored())
+        # A secret that the vault learns later is redacted when the cache is read.
+        later = "later-secret-value-0987654321"
+        stored = {**found.stored(), "description": f"uses {later}"}
+        default_redactor().add(later)
+        loaded = RemoteTool.from_stored(stored)
+        assert loaded is not None
+        assert later not in loaded.description
+    finally:
+        default_redactor().forget(secret, "later-secret-value-0987654321")

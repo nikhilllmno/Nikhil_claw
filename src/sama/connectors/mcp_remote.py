@@ -20,7 +20,6 @@ This module does not copy Hermes code. It follows the MCP specification, version
 from __future__ import annotations
 
 import fnmatch
-import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -36,10 +35,16 @@ from sama.tools.outbound import (
     OutboundClient,
     UrlPolicy,
 )
+from sama.vault.redact import default_redactor, redact
 
 PROTOCOL_VERSION: Final = "2025-06-18"
 SUPPORTED_VERSIONS: Final = frozenset({"2025-06-18", "2025-03-26", "2024-11-05"})
 CLIENT_INFO: Final = {"name": "sama", "version": "0.1"}
+INITIALIZE_PARAMS: Final = {
+    "protocolVersion": PROTOCOL_VERSION,
+    "capabilities": {},
+    "clientInfo": CLIENT_INFO,
+}
 TOOL_PREFIX: Final = "mcp_"
 MAX_PAGES: Final = 10
 MAX_TOOLS: Final = 200
@@ -117,11 +122,14 @@ class RemoteTool:
         schema = data.get("input_schema")
         if not isinstance(name, str) or not isinstance(schema, Mapping):
             return None
+        # The cache was redacted when it was made. A secret that the vault got later is
+        # redacted here, before the text goes to the web app or to the agent.
+        title = _optional_str(data.get("title"))
         return cls(
             name=name,
-            description=str(data.get("description") or ""),
-            input_schema=schema,
-            title=_optional_str(data.get("title")),
+            description=redact(str(data.get("description") or "")),
+            input_schema=default_redactor().json(dict(schema)),
+            title=None if title is None else redact(title),
             read_only=_optional_bool(data.get("read_only")),
             destructive=_optional_bool(data.get("destructive")),
         )
@@ -138,41 +146,37 @@ class ExposedTool:
 
 
 def parse_tool(data: object) -> RemoteTool | None:
-    """One entry of ``tools/list``, or ``None`` if it is not valid. A long description is
-    cut. A schema that is not an object, or that is too large, becomes an open object."""
+    """One entry of ``tools/list``, or ``None`` if it is not valid. A known secret in the text
+    is redacted before a long description is cut, so the cut cannot leave part of a secret.
+    A tool without a schema gets an open object. A tool whose schema is not an object, or
+    is larger than ``MAX_SCHEMA_BYTES``, is dropped: the agent cannot call a tool whose
+    arguments it does not know."""
     if not isinstance(data, Mapping):
         return None
     name = data.get("name")
     if not isinstance(name, str) or not name or len(name) > 128:
         return None
     description = data.get("description")
-    text = description if isinstance(description, str) else ""
+    text = redact(description) if isinstance(description, str) else ""
     if len(text) > MAX_DESCRIPTION_CHARS:
         text = text[:MAX_DESCRIPTION_CHARS].rstrip() + "..."
-    schema = data.get("inputSchema")
-    if (
-        not isinstance(schema, Mapping)
-        or schema.get("type") != "object"
-        or len(json.dumps(schema, default=str)) > MAX_SCHEMA_BYTES
-    ):
-        schema = {"type": "object"}
+    schema = data.get("inputSchema", {"type": "object"})
+    if not isinstance(schema, Mapping) or schema.get("type") != "object":
+        return None
+    schema = default_redactor().json(json.loads(json.dumps(schema, default=str)))
+    if len(json.dumps(schema)) > MAX_SCHEMA_BYTES:
+        return None
     annotations = data.get("annotations")
     hints: Mapping[str, Any] = annotations if isinstance(annotations, Mapping) else {}
     title = data.get("title") or hints.get("title")
     return RemoteTool(
         name=name,
         description=text,
-        input_schema=json.loads(json.dumps(schema, default=str)),
-        title=title[:120] if isinstance(title, str) else None,
+        input_schema=schema,
+        title=redact(title)[:120] if isinstance(title, str) else None,
         read_only=_optional_bool(hints.get("readOnlyHint")),
         destructive=_optional_bool(hints.get("destructiveHint")),
     )
-
-
-def tools_hash(tools: Sequence[RemoteTool]) -> str:
-    """A hash of the tools, so a change of the tool list is easy to see."""
-    data = json.dumps([t.stored() for t in tools], sort_keys=True, default=str)
-    return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
 def sama_name(connector: str, remote: str) -> str | None:
@@ -184,6 +188,12 @@ def sama_name(connector: str, remote: str) -> str | None:
 
 def matches(name: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def selected(name: str, include: Sequence[str], exclude: Sequence[str]) -> bool:
+    """A tool passes the filters if it matches an include pattern (when there is one) and no
+    exclude pattern."""
+    return (not include or matches(name, include)) and not matches(name, exclude)
 
 
 def tool_access(tool: RemoteTool, overrides: Mapping[str, ToolAccess]) -> ToolAccess:
@@ -213,9 +223,7 @@ def exposed_tools(
     out: list[ExposedTool] = []
     seen: set[str] = set()
     for tool in tools:
-        if include and not matches(tool.name, include):
-            continue
-        if exclude and matches(tool.name, exclude):
+        if not selected(tool.name, include, exclude):
             continue
         name = sama_name(connector, tool.name)
         if name is None or name in seen:
@@ -316,12 +324,9 @@ class McpClient:
 
     async def open(self, url: str, headers: Mapping[str, str]) -> McpSession:
         """``initialize`` and ``notifications/initialized``. Returns the session."""
-        params = {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": CLIENT_INFO,
-        }
-        result, session_id = await self._request(url, headers, None, "initialize", params)
+        result, session_id = await self._request(
+            url, headers, None, "initialize", INITIALIZE_PARAMS
+        )
         version = result.get("protocolVersion") if isinstance(result, Mapping) else None
         if not isinstance(version, str) or version not in SUPPORTED_VERSIONS:
             raise McpError(f"the server speaks an MCP version that sama does not know: {version}")
@@ -417,7 +422,9 @@ class McpClient:
 
             def enough(data: bytes) -> bool:
                 # Only an event stream can stay open after the answer.
-                return b"\n\n" in data and _from_stream(data, request_id) is not None
+                # An event ends at an empty line. The line ends can be LF, CRLF, or CR.
+                ended = b"\n\n" in data or b"\r\n\r\n" in data or b"\r\r" in data
+                return ended and _from_stream(data, request_id) is not None
 
         try:
             return await self._http.request("POST", url, headers=sent, json=body, enough=enough)
@@ -451,6 +458,7 @@ def _optional_bool(value: object) -> bool | None:
 
 
 __all__ = [
+    "INITIALIZE_PARAMS",
     "MAX_TOOLS",
     "POLICY",
     "PROTOCOL_VERSION",
@@ -467,6 +475,6 @@ __all__ = [
     "parse_tool",
     "render_result",
     "sama_name",
+    "selected",
     "tool_access",
-    "tools_hash",
 ]

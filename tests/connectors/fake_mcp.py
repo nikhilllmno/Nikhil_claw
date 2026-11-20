@@ -8,11 +8,12 @@ The server is at ``https://mcp.remote.test/mcp``. The authorization server is on
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import ipaddress
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -55,6 +56,10 @@ class FakeMcp:
     def __init__(self, auth: str = "bearer", *, stream: bool = False) -> None:
         self.auth = auth
         self.stream = stream
+        self.crlf = False
+        """The event stream ends its lines with CRLF."""
+        self.stay_open = False
+        """The event stream stays open after the answer, as a server can do."""
         self.tools: list[dict[str, Any]] = [
             tool("list_items", read_only=True),
             tool("create_item", destructive=False),
@@ -203,11 +208,17 @@ class FakeMcp:
         ping = {"jsonrpc": "2.0", "id": "srv-1", "method": "ping"}
         text = f"event: message\ndata: {json.dumps(ping)}\n\n"
         text += f"event: message\ndata: {json.dumps(message)}\n\n"
-        return httpx.Response(
-            200,
-            headers={**(headers or {}), "content-type": "text/event-stream"},
-            content=text.encode(),
-        )
+        if self.crlf:
+            text = text.replace("\n", "\r\n")
+        sent = {**(headers or {}), "content-type": "text/event-stream"}
+        if not self.stay_open:
+            return httpx.Response(200, headers=sent, content=text.encode())
+
+        async def events() -> AsyncIterator[bytes]:
+            yield text.encode()
+            await asyncio.Event().wait()  # never ends
+
+        return httpx.Response(200, headers=sent, content=events())
 
     def _token(self, request: httpx.Request) -> httpx.Response:
         form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}

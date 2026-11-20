@@ -38,7 +38,7 @@ from urllib.parse import urlencode, urlsplit
 
 from sama.connectors.errors import short_error
 from sama.connectors.mcp_remote import (
-    PROTOCOL_VERSION,
+    INITIALIZE_PARAMS,
     McpError,
     McpUnavailableError,
 )
@@ -174,7 +174,7 @@ class OAuthFlow:
             hinted = _SCOPE.search(challenge)
             hinted_scope = hinted.group(1) if hinted else None
         parts = urlsplit(mcp_url)
-        origin = f"{parts.scheme}://{parts.netloc}"
+        origin = _origin(mcp_url)
         path = parts.path.rstrip("/")
         candidates = [metadata_url] if metadata_url else []
         if path:
@@ -317,11 +317,7 @@ class OAuthFlow:
             "jsonrpc": "2.0",
             "id": 0,
             "method": "initialize",
-            "params": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "sama", "version": "0.1"},
-            },
+            "params": INITIALIZE_PARAMS,
         }
         headers = {"accept": "application/json, text/event-stream"}
         answer = await self._send(
@@ -333,7 +329,7 @@ class OAuthFlow:
 
     async def _server_metadata(self, issuer: str) -> dict[str, str]:
         parts = urlsplit(issuer)
-        origin = f"{parts.scheme}://{parts.netloc}"
+        origin = _origin(issuer)
         path = parts.path.rstrip("/")
         if path:
             candidates = [

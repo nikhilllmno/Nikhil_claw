@@ -10,6 +10,7 @@ import {
   type ConnectionScope,
   type Connector,
   type McpAuth,
+  type StartedConnection,
   errorText,
 } from "@/lib/api";
 import {
@@ -17,7 +18,9 @@ import {
   EMPTY_SERVER,
   type ServerDraft,
   connectionOf,
+  connectorFor,
   customServers,
+  hasOAuthAnswer,
   formProblem,
   formValues,
   initialValues,
@@ -122,7 +125,7 @@ export function Connections() {
 
   /** After a start: go to the sign-in link, or open the form if the connection needs one. */
   const opened = useCallback(
-    (started: { connection: Connection; redirect_url: string | null }) => {
+    (started: StartedConnection) => {
       if (isSafeRedirect(started.redirect_url)) {
         window.location.assign(started.redirect_url);
         return;
@@ -144,11 +147,15 @@ export function Connections() {
   useEffect(() => {
     if (handled.current || me === null) return;
     handled.current = true;
-    const intent = parseConnectionQuery(window.location.search);
-    if (intent === null) return;
-    history.replaceState(null, "", window.location.pathname + withoutEntryParams(window.location.search));
+    const search = window.location.search;
+    const intent = parseConnectionQuery(search);
+    const answer = hasOAuthAnswer(search);
+    if (intent === null && !answer) return;
+    // Remove the entry link and any OAuth answer from the address, also when it is not valid.
+    history.replaceState(null, "", window.location.pathname + withoutEntryParams(search));
     // The state changes run after the effect, in the promise.
     const run = async () => {
+      if (intent === null) throw new Error("The sign-in answer is not valid. Connect again.");
       if (intent.kind === "oauth") {
         const done = await api.finishOAuth(intent.state, intent.code, intent.error);
         if (workspaces.some((w) => w.id === done.workspace_id)) setWorkspaceId(done.workspace_id);
@@ -539,7 +546,14 @@ function ScopeRow({
         </div>
       </div>
       {connection?.last_error ? <p className={styles.error}>{connection.last_error}</p> : null}
-      {connection?.mcp ? <McpTools connection={connection} onSaved={onSaved} /> : null}
+      {connection?.mcp ? (
+        <McpTools
+          // A new key when the saved filters change, so the editor shows the filters of another admin.
+          key={`${connection.id}:${connection.mcp.include.join("\n")}|${connection.mcp.exclude.join("\n")}`}
+          connection={connection}
+          onSaved={onSaved}
+        />
+      ) : null}
       {error ? (
         <p className="alert alert-error" role="alert">
           {error}
@@ -547,7 +561,7 @@ function ScopeRow({
       ) : null}
       {showForm ? (
         <ConnectForm
-          connector={connector}
+          connector={connectorFor(connector, connection)}
           connection={connection}
           onSaved={onSaved}
           onCancel={onCloseForm}

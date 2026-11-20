@@ -172,21 +172,27 @@ export function toolSummary(connector: Connector): string {
   return parts.join(", ");
 }
 
+const ENTRY_KEYS = ["workspace", "connect", "scope", "connection"] as const;
+/** The OAuth answer: the code is used once, and it must not stay in the address or history. */
+const OAUTH_KEYS = ["code", "state", "error", "error_description", "error_uri", "iss"] as const;
+
+/** True if the query has a part of an OAuth answer, valid or not. */
+export function hasOAuthAnswer(search: string): boolean {
+  const query = new URLSearchParams(search);
+  return OAUTH_KEYS.some((key) => query.has(key));
+}
+
 /** The query of a page address without the entry-link parameters. */
 export function withoutEntryParams(search: string): string {
   const query = new URLSearchParams(search);
-  const keys = ["workspace", "connect", "scope", "connection"];
-  // The OAuth answer: the code is used once, and it must not stay in the address or history.
-  keys.push("code", "state", "error", "error_description", "error_uri", "iss");
-  for (const key of keys) query.delete(key);
+  for (const key of [...ENTRY_KEYS, ...OAUTH_KEYS]) query.delete(key);
   const rest = query.toString();
   return rest === "" ? "" : `?${rest}`;
 }
 
 // -- remote MCP servers (M3.5) ------------------------------------------------------------------
 
-/** The same rules as the API (`connectors/manifest.py`). */
-const SERVER_NAME = /^[a-z][a-z0-9_-]{0,39}$/;
+/** The same rules as the API (`connectors/manifest.py`). The name rule is `CONNECTOR`. */
 const HEADER = /^[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const TOOL_PATTERN = /^[A-Za-z0-9_.*?/:-]{1,100}$/;
 const MAX_PATTERNS = 50;
@@ -226,7 +232,7 @@ export const EMPTY_SERVER: ServerDraft = {
 
 /** The text of the first problem of a new server, or `null` if the form can be sent. */
 export function serverProblem(draft: ServerDraft): string | null {
-  if (!SERVER_NAME.test(draft.name.trim().toLowerCase())) {
+  if (!CONNECTOR.test(draft.name.trim().toLowerCase())) {
     return "The name has 1 to 40 lower-case letters, digits, _ and -, and starts with a letter.";
   }
   let url: URL;
@@ -277,6 +283,8 @@ export function customServers(
     const seen = out.get(connection.connector);
     if (seen) {
       if (!seen.scopes.includes(connection.scope)) seen.scopes.push(connection.scope);
+      // Each connection keeps its own server: the description names all addresses.
+      if (!seen.description.includes(custom.url)) seen.description += `, ${custom.url}`;
       continue;
     }
     out.set(connection.connector, {
@@ -291,6 +299,21 @@ export function customServers(
     });
   }
   return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * The connector for the form of one connection. A server by URL has its address and its
+ * credential kind on each connection, so a personal and a workspace connection with the same
+ * name can need different fields.
+ */
+export function connectorFor(connector: Connector, connection: Connection | null): Connector {
+  const custom = connection?.mcp?.custom;
+  if (!custom) return connector;
+  return {
+    ...connector,
+    fields: mcpFields(custom.auth, custom.header),
+    mcp: { url: custom.url, auth: custom.auth, header: custom.header },
+  };
 }
 
 /** The form of a server: the same field as `mcp_fields` of the API. */

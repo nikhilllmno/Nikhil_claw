@@ -10,7 +10,10 @@ knows each value (``sama.vault.store.secret_parts``):
 
 - ``bearer`` and ``header``: ``token`` (the form field).
 - ``oauth``: ``access_token``, ``refresh_token``, ``client_secret``, and, while the user signs
-  in, ``state`` and ``verifier``. ``expires_at`` is a number.
+  in, ``state`` and ``verifier``. ``expires_at`` is a number. ``bound`` is a hash of the server
+  URL and the OAuth client id that the tokens are for. A token whose ``bound`` is not the one
+  of the current config is not used: an exchange or a refresh that finishes after the server
+  changed cannot send its token to the new server.
 
 The row config has the parts that are not secret: the endpoints of the authorization server,
 the client id, and the redirect URI.
@@ -24,7 +27,7 @@ import hmac
 import json
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 
 from pydantic import SecretStr
@@ -190,15 +193,18 @@ class McpDriver:
         self,
         org_id: uuid.UUID,
         connection_id: uuid.UUID,
+        spec: McpRemote,
         config: Mapping[str, Any],
         *,
         state: str,
         code: str | None,
         actor: uuid.UUID | None,
+        claim: Callable[[], Awaitable[bool]],
     ) -> None:
         """Checks the state, then exchanges the code. The state and the verifier are used
-        once: a second callback with the same state fails. ``code=None`` (the user refused)
-        only uses them up."""
+        once: after the state matches, ``claim`` must win the sign-in (an atomic change of the
+        row), so of two callbacks with the same state only one goes on. ``code=None`` (the
+        user refused) only uses them up."""
         vault = self._require_vault()
         secret = await self._secret(org_id, connection_id, fresh=True)
         expected = secret.get("state")
@@ -209,30 +215,30 @@ class McpDriver:
             or not hmac.compare_digest(expected.encode(), state.encode())
         ):
             raise McpStateError("the sign-in answer does not match this connection. Connect again")
-        oauth = config.get("oauth")
-        server = AuthServer.from_config(oauth)
-        if server is None or not isinstance(oauth, Mapping):
+        found = _oauth_of(config, secret)
+        if found is None:
             raise OAuthError("the connection has no authorization server. Connect again")
-        client_secret = secret.get("client_secret")
-        kept = {"client_secret": client_secret} if isinstance(client_secret, str) else {}
+        server, client = found
+        if not await claim():
+            raise McpStateError("this sign-in answer was already used")
+        kept = _kept(secret)
         name = connection_secret(connection_id)
         await vault.put(org_id, name, json.dumps(kept), actor_user_id=actor)
         if code is None:
             return
-        client = OAuthClient(
-            str(oauth.get("client_id")),
-            client_secret if isinstance(client_secret, str) else None,
-            str(oauth.get("auth_method") or "none"),
-        )
         tokens = await self._oauth.exchange(
             server,
             client,
             code=code,
             verifier=verifier,
-            redirect_uri=str(oauth.get("redirect_uri") or ""),
+            redirect_uri=str(_oauth_config(config).get("redirect_uri") or ""),
         )
+        bound = _binding(spec.url, client.client_id)
         await vault.put(
-            org_id, name, json.dumps({**kept, **_token_fields(tokens)}), actor_user_id=actor
+            org_id,
+            name,
+            json.dumps({**kept, **_token_fields(tokens), "bound": bound}),
+            actor_user_id=actor,
         )
         self.forget(connection_id)
 
@@ -258,18 +264,20 @@ class McpDriver:
             if spec.header is None:
                 raise McpError("the connector has no credential header")
             return {spec.header: token}
-        tokens = await self._tokens(org_id, connection_id, config, renew=renew)
+        tokens = await self._tokens(org_id, connection_id, spec.url, config, renew=renew)
         return {"authorization": f"Bearer {tokens.access_token}"}
 
     async def _tokens(
         self,
         org_id: uuid.UUID,
         connection_id: uuid.UUID,
+        url: str,
         config: Mapping[str, Any],
         *,
         renew: bool,
     ) -> Tokens:
-        current = _tokens_of(await self._secret(org_id, connection_id))
+        bound = _binding(url, str(_oauth_config(config).get("client_id")))
+        current = _tokens_of(await self._secret(org_id, connection_id), bound)
         if current is None:
             raise McpNotReadyError("the sign-in is not finished")
         if current.fresh() and not renew:
@@ -278,32 +286,27 @@ class McpDriver:
         async with lock:
             # Another task can have refreshed the token while this one waited.
             secret = await self._secret(org_id, connection_id, fresh=True)
-            latest = _tokens_of(secret)
+            latest = _tokens_of(secret, bound)
             if latest is None:
                 raise McpNotReadyError("the sign-in is not finished")
             if latest.access_token != current.access_token and latest.fresh():
                 return latest
             if latest.refresh_token is None:
                 raise McpAuthError("the access token expired and there is no refresh token")
-            oauth = config.get("oauth")
-            server = AuthServer.from_config(oauth)
-            if server is None or not isinstance(oauth, Mapping):
+            found = _oauth_of(config, secret)
+            if found is None:
                 raise McpAuthError("the connection has no authorization server")
-            client_secret = secret.get("client_secret")
-            client = OAuthClient(
-                str(oauth.get("client_id")),
-                client_secret if isinstance(client_secret, str) else None,
-                str(oauth.get("auth_method") or "none"),
-            )
+            server, client = found
             try:
                 tokens = await self._oauth.refresh(server, client, latest.refresh_token)
             except OAuthGrantError as error:
                 raise McpAuthError(str(error)) from None
-            kept = {k: v for k, v in secret.items() if k == "client_secret"}
+            # ``bound`` is the one of the config that this refresh started with. If the
+            # server changed meanwhile, the new config does not accept the token.
             await self._require_vault().put(
                 org_id,
                 connection_secret(connection_id),
-                json.dumps({**kept, **_token_fields(tokens)}),
+                json.dumps({**_kept(secret), **_token_fields(tokens), "bound": bound}),
             )
             return tokens
 
@@ -342,9 +345,13 @@ def _token_fields(tokens: Tokens) -> dict[str, Any]:
     return out
 
 
-def _tokens_of(secret: Mapping[str, Any]) -> Tokens | None:
+def _tokens_of(secret: Mapping[str, Any], bound: str) -> Tokens | None:
+    """The tokens of the vault entry, if they are for the server and the client of ``bound``."""
     access = secret.get("access_token")
     if not isinstance(access, str) or not access:
+        return None
+    stored = secret.get("bound")
+    if not isinstance(stored, str) or not hmac.compare_digest(stored, bound):
         return None
     refresh = secret.get("refresh_token")
     expires = secret.get("expires_at")
@@ -353,6 +360,39 @@ def _tokens_of(secret: Mapping[str, Any]) -> Tokens | None:
         refresh_token=refresh if isinstance(refresh, str) and refresh else None,
         expires_at=float(expires) if isinstance(expires, (int, float)) else None,
     )
+
+
+def _oauth_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    oauth = config.get("oauth")
+    return oauth if isinstance(oauth, Mapping) else {}
+
+
+def _oauth_of(
+    config: Mapping[str, Any], secret: Mapping[str, Any]
+) -> tuple[AuthServer, OAuthClient] | None:
+    """The authorization server and the client of the row config and the vault entry."""
+    oauth = _oauth_config(config)
+    server = AuthServer.from_config(oauth)
+    if server is None:
+        return None
+    client_secret = secret.get("client_secret")
+    client = OAuthClient(
+        str(oauth.get("client_id")),
+        client_secret if isinstance(client_secret, str) else None,
+        str(oauth.get("auth_method") or "none"),
+    )
+    return server, client
+
+
+def _kept(secret: Mapping[str, Any]) -> dict[str, Any]:
+    """The part of the vault entry that a new token keeps: the client secret."""
+    client_secret = secret.get("client_secret")
+    return {"client_secret": client_secret} if isinstance(client_secret, str) else {}
+
+
+def _binding(url: str, client_id: str) -> str:
+    """The ``bound`` value of OAuth tokens: a hash of the server URL and the client id."""
+    return hashlib.sha256(json.dumps([url, client_id]).encode()).hexdigest()
 
 
 def _fingerprint(url: str, headers: Mapping[str, str]) -> str:

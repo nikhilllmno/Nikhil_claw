@@ -3,9 +3,11 @@ import { ApiClient, type Connection, type Connector, type TokenSource } from "./
 import {
   EMPTY_SERVER,
   connectionOf,
+  connectorFor,
   customServers,
   formProblem,
   formValues,
+  hasOAuthAnswer,
   initialValues,
   isSafeRedirect,
   listFor,
@@ -247,6 +249,11 @@ describe("remote MCP servers", () => {
 
   it("removes the code and the state from the address", () => {
     expect(withoutEntryParams(`?code=c1&state=${STATE}&iss=x&tab=2`)).toBe("?tab=2");
+    // A broken answer is still an answer: the page removes it and says so.
+    expect(hasOAuthAnswer("?state=short&code=c1")).toBe(true);
+    expect(parseConnectionQuery("?state=short&code=c1")).toBeNull();
+    expect(hasOAuthAnswer("?error=access_denied")).toBe(true);
+    expect(hasOAuthAnswer(`?workspace=${WS}&connection=${CONN}`)).toBe(false);
   });
 
   it("checks a new server before it goes to the API", () => {
@@ -289,6 +296,31 @@ describe("remote MCP servers", () => {
     expect(cards[0]?.fields.map((f) => [f.name, f.secret])).toEqual([["token", true]]);
     expect(mcpFields("oauth", null)).toEqual([]);
     expect(mcpFields("header", "X-Key")[0]?.help).toContain("X-Key");
+  });
+
+  it("gives each connection of a server by URL its own form", () => {
+    const base = { include: [], exclude: [], discovered_at: null, tools: [] };
+    const team = connection({
+      connector: "docs",
+      kind: "mcp_remote",
+      scope: "workspace",
+      mcp: { ...base, custom: { title: "Docs", url: "https://a.example.com/mcp", auth: "bearer", header: null } },
+    });
+    const mine = connection({
+      id: "x",
+      connector: "docs",
+      kind: "mcp_remote",
+      scope: "personal",
+      mcp: { ...base, custom: { title: "Docs", url: "https://b.example.com/mcp", auth: "header", header: "X-Key" } },
+    });
+    const [card] = customServers([team, mine], [NOTION]);
+    expect(card?.description).toBe("Added by URL: https://a.example.com/mcp, https://b.example.com/mcp");
+    if (card === undefined) throw new Error("no card");
+    expect(connectorFor(card, team).fields[0]?.help).toContain("Authorization");
+    expect(connectorFor(card, mine).fields[0]?.help).toContain("X-Key");
+    expect(connectorFor(card, mine).mcp?.url).toBe("https://b.example.com/mcp");
+    expect(connectorFor(NOTION, connection())).toBe(NOTION);
+    expect(connectorFor(card, null)).toBe(card);
   });
 
   it("sums up the tools and checks the filters", () => {

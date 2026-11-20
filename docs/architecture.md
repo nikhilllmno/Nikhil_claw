@@ -2277,18 +2277,32 @@ gets one notice per change.
   `state`, and the `resource` parameter (RFC 8707). The redirect URI is the Connections page
   (`/connections`). The state is `<connection id>.<random>`. The web app gives the `code` and
   the `state` to `POST /connections/oauth/callback`. The API compares the state with the stored
-  one, and uses the state and the PKCE verifier once. The tokens, the client secret, the state,
-  and the verifier are in the vault entry `connection:<id>`. sama refreshes a token 60 seconds
-  before it expires and after a `401`. One process refreshes one connection at a time. A
-  refused refresh sets `expired`.
+  one, and uses the state and the PKCE verifier once. Before the code exchange, the callback
+  claims the row: it moves the row from `initiated` to `pending` only if the row did not change
+  since the API read it. A second callback at the same time loses the claim and gets a `400`,
+  so one code is exchanged once. The tokens, the client secret, the state, and the verifier are
+  in the vault entry `connection:<id>`. The tokens carry `bound`, a hash of the server URL and
+  the OAuth client id. sama does not use tokens whose `bound` is not that of the current
+  connection, so a late refresh or exchange for an old server or an old client cannot give a
+  token to the new one. sama refreshes a token 60 seconds before it expires and after a
+  `401`. One process refreshes one connection at a time. A refused refresh sets `expired`.
 - **Discovery, cache, and health.** A check opens a new session and lists the tools. This is
-  the health check. The tool names, descriptions, schemas, annotations, and a hash go into
-  `tool_cache`. sama cuts a description to 1,800 characters and drops a tool whose schema is
-  larger than 20,000 bytes or whose name does not fit. A tool list that is older than 6 hours
+  the health check. The tool names, descriptions, schemas, and annotations go into
+  `tool_cache`. sama cuts a description to 1,800 characters. It drops a tool whose schema is not
+  an object, whose schema is larger than 20,000 bytes, or whose name does not fit. A tool
+  without a schema gets `{"type": "object"}`. A tool list that is older than 6 hours
   is read again in the background when a run asks for the tools. A network error, a timeout, or
   an HTTP 5xx keeps the state and the old tool list, and stores the error.
+- **Remote text is untrusted.** The server writes the tool descriptions, titles, and schemas.
+  sama redacts the secrets that the vault knows from them (Section 16) before it cuts or stores
+  them, and again when it reads `tool_cache`, so a secret that the vault learns later is also
+  removed. `tool_search` and `tool_describe` put this text in an `untrusted_content` block with
+  the source `connector:<name>`, one block for each server.
 - **Tool names and access.** A remote tool `<tool>` is `mcp_<connection>_<tool>` for the agent
-  (a `-` becomes `_`, and a name longer than 64 characters is dropped). The access comes from
+  (a `-` becomes `_`, and a name longer than 64 characters is dropped). Two connections can give
+  the same name (for example `a-b` and `a_b`). Such a name is ambiguous: no connection gives it
+  to a run, the gate does not know it, and sama logs a warning. The Connections page still
+  shows the tool. The access comes from
   the `access` of the manifest, else from the annotations: `readOnlyHint` gives `read`,
   `destructiveHint: false` gives `write`, and a tool without hints is `destructive`, as the MCP
   specification says. The default policy of Section 10.3 applies.
@@ -2302,11 +2316,15 @@ gets one notice per change.
   access and the toolset of a tool (`run_tools`). So a server that connects during a session
   gives its tools to the next search, and the frozen prompt prefix does not change (D9).
 - **Outbound policy.** Every MCP and OAuth request goes through `OutboundClient` (Section
-  16.4). sama checks the URL when an admin adds a server.
+  16.4), without redirects. sama checks the URL when an admin adds a server. An SSE answer is
+  read only to the end of the event that has the answer (with `\n`, `\r\n`, or `\r` line
+  ends), so a stream that stays open does not hold the request.
 - **Web app.** The Connections page shows the servers of the catalog and the servers by URL,
   a form to add a server by URL, the tool list of a connected server with its access, and the
   include and exclude filters. It handles the OAuth answer (`?code=&state=` or
-  `?error=&state=`), then removes the code and the state from the address.
+  `?error=&state=`). It removes the code and the state from the address, also when the answer
+  is not valid, and then shows a notice. Each connection of a server by URL has its own form,
+  from its own URL and auth.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
 start runs or workflows (Section 12).

@@ -54,6 +54,14 @@ class MemoryVault:
         )
 
 
+async def won() -> bool:
+    return True
+
+
+async def lost() -> bool:
+    return False
+
+
 def spec(auth: str = "oauth", **more: Any) -> McpRemote:
     return McpRemote(url=URL, auth=auth, **more)  # type: ignore[arg-type]
 
@@ -133,17 +141,39 @@ async def test_the_whole_oauth_flow_and_a_refresh() -> None:
     # A wrong state changes nothing.
     with pytest.raises(McpStateError):
         await mcp.finish_oauth(
-            ORG, connection, {"oauth": config}, state=state + "x", code=code, actor=None
+            ORG,
+            connection,
+            spec(),
+            {"oauth": config},
+            state=state + "x",
+            code=code,
+            actor=None,
+            claim=won,
         )
     assert vault.read(connection) == stored
-    await mcp.finish_oauth(ORG, connection, {"oauth": config}, state=state, code=code, actor=None)
+    await mcp.finish_oauth(
+        ORG, connection, spec(), {"oauth": config}, state=state, code=code, actor=None, claim=won
+    )
     stored = vault.read(connection)
-    assert set(stored) == {"client_secret", "access_token", "refresh_token", "expires_at"}
+    assert set(stored) == {
+        "client_secret",
+        "access_token",
+        "refresh_token",
+        "expires_at",
+        "bound",
+    }
     assert fake.token_requests[-1]["client_secret"] == "dcr-secret-value"
     # The state is used once.
     with pytest.raises(McpStateError):
         await mcp.finish_oauth(
-            ORG, connection, {"oauth": config}, state=state, code=code, actor=None
+            ORG,
+            connection,
+            spec(),
+            {"oauth": config},
+            state=state,
+            code=code,
+            actor=None,
+            claim=won,
         )
     tools = await mcp.discover(ORG, connection, spec(), {"oauth": config})
     assert len(tools) == 3
@@ -175,7 +205,9 @@ async def test_a_refused_sign_in_uses_up_the_state() -> None:
     connection = uuid.uuid4()
     config, url = await mcp.begin_oauth(ORG, connection, spec(), redirect_uri=REDIRECT, actor=None)
     _, state = fake.approve(url)
-    await mcp.finish_oauth(ORG, connection, {"oauth": config}, state=state, code=None, actor=None)
+    await mcp.finish_oauth(
+        ORG, connection, spec(), {"oauth": config}, state=state, code=None, actor=None, claim=won
+    )
     assert vault.read(connection) == {}
     bad_code = "code-unknown"
     config2, url2 = await mcp.begin_oauth(
@@ -184,7 +216,14 @@ async def test_a_refused_sign_in_uses_up_the_state() -> None:
     _, state2 = fake.approve(url2)
     with pytest.raises(OAuthGrantError):
         await mcp.finish_oauth(
-            ORG, connection, {"oauth": config2}, state=state2, code=bad_code, actor=None
+            ORG,
+            connection,
+            spec(),
+            {"oauth": config2},
+            state=state2,
+            code=bad_code,
+            actor=None,
+            claim=won,
         )
 
 
@@ -229,4 +268,51 @@ async def test_the_driver_keeps_the_session_and_opens_a_new_one_when_it_is_gone(
     mcp.forget(connection)
     await mcp.call(ORG, connection, spec("none"), {}, "list_items", {})
     assert fake.opened == 3
+    await mcp.aclose()
+
+
+async def test_a_callback_that_loses_the_claim_changes_nothing() -> None:
+    fake = FakeMcp("oauth")
+    vault = MemoryVault()
+    mcp = driver(fake, cast(Vault, vault))
+    connection = uuid.uuid4()
+    config, url = await mcp.begin_oauth(ORG, connection, spec(), redirect_uri=REDIRECT, actor=None)
+    code, state = fake.approve(url)
+    stored = vault.read(connection)
+    with pytest.raises(McpStateError, match="already used"):
+        await mcp.finish_oauth(
+            ORG,
+            connection,
+            spec(),
+            {"oauth": config},
+            state=state,
+            code=code,
+            actor=None,
+            claim=lost,
+        )
+    assert vault.read(connection) == stored
+    assert not [r for r in fake.token_requests if r.get("grant_type") == "authorization_code"]
+    await mcp.aclose()
+
+
+async def test_tokens_for_another_server_or_client_are_not_used() -> None:
+    fake = FakeMcp("oauth")
+    vault = MemoryVault()
+    mcp = driver(fake, cast(Vault, vault))
+    connection = uuid.uuid4()
+    config, url = await mcp.begin_oauth(ORG, connection, spec(), redirect_uri=REDIRECT, actor=None)
+    code, state = fake.approve(url)
+    await mcp.finish_oauth(
+        ORG, connection, spec(), {"oauth": config}, state=state, code=code, actor=None, claim=won
+    )
+    assert len(await mcp.discover(ORG, connection, spec(), {"oauth": config})) == 3
+    # The server of the connection changed: the stored token is not for the new URL.
+    other = McpRemote(url="https://other.remote.test/mcp", auth="oauth")
+    with pytest.raises(McpNotReadyError):
+        await mcp.discover(ORG, connection, other, {"oauth": config})
+    # A new sign-in registered a new client: an old refresh that writes late is not used.
+    with pytest.raises(McpNotReadyError):
+        await mcp.discover(ORG, connection, spec(), {"oauth": {**config, "client_id": "client-9"}})
+    sent_to_other = [r for r in fake.seen if "other.remote.test" in str(r)]
+    assert not sent_to_other
     await mcp.aclose()

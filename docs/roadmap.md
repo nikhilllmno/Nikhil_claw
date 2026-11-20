@@ -191,7 +191,10 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3 (below the li
   `mcp_<connection>_<tool>` in `tool_search`, read for each run, so a new server needs no new
   session. `tool_cache` keeps the tool list, a check is the health check, and a list older than
   6 hours is read again in the background. `PUT /connections/{id}/tools` sets the include and
-  exclude filters. Every request uses the outbound client without redirects. Not in M3.5:
+  exclude filters. Every request uses the outbound client without redirects. Remote tool text is
+  redacted and goes in untrusted content blocks. OAuth tokens are bound to the server URL and
+  the client id, and one callback claims the row. A tool name that two connections give is
+  hidden. Not in M3.5:
   `policy_overrides` in the gate, MCP resources and prompts, a refresh lock across processes,
   and an MCP `listChanged` notice (sama reads the list again at a check or after 6 hours).
 - M3.4: connections in `src/sama/connectors/` and `connectors/catalog/` (architecture Section
