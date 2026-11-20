@@ -37,7 +37,9 @@ from sama.sandbox.base import (
     WORKDIR,
     ExecResult,
     SandboxError,
+    SandboxFileTooLargeError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxSpec,
     log_start,
@@ -189,14 +191,32 @@ class E2BSandbox:
         except SandboxException as error:
             raise SandboxError(f"write_file failed: {type(error).__name__}") from None
 
-    async def read_file(self, path: str) -> bytes:
+    async def read_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
         try:
+            if max_bytes is not None:
+                return await self._read_bounded(path, max_bytes)
             data = await self.sandbox.files.read(path, format="bytes", user=SANDBOX_USER)
         except (FileNotFoundException, NotFoundException):
             raise FileNotFoundError(path) from None
         except SandboxException as error:
             raise SandboxError(f"read_file failed: {type(error).__name__}") from None
         return bytes(data)
+
+    async def _read_bounded(self, path: str, max_bytes: int) -> bytes:
+        """Streams the file and stops after ``max_bytes``, so the control plane never holds
+        more than that."""
+        chunks: list[bytes] = []
+        size = 0
+        stream = await self.sandbox.files.read(
+            path, format="stream", user=SANDBOX_USER, stream_idle_timeout=60
+        )
+        async with stream:
+            async for chunk in stream:
+                size += len(chunk)
+                if size > max_bytes:
+                    raise SandboxFileTooLargeError(path)
+                chunks.append(bytes(chunk))
+        return b"".join(chunks)
 
     async def remove_file(self, path: str) -> None:
         with contextlib.suppress(FileNotFoundException, NotFoundException):
@@ -276,5 +296,7 @@ class E2BProvider:
         if not spec.owns(info.metadata or {}):
             raise SandboxError("the sandbox belongs to another session")
         result = E2BSandbox(sandbox)
+        if spec.outdated(info.metadata or {}):
+            raise SandboxOutdatedError(sandbox_id, result)
         log_start(self.name, "resume", result.id, spec.session_id, started)
         return result

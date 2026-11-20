@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib.util
 import json
 import os
@@ -24,7 +25,15 @@ from sama.orchestrator.sandboxed import RUNNER_ARGV, SandboxedRuntime, SandboxSe
 from sama.runtime import RunCompleted, RunConfig, RunRequest, RuntimeKind, Usage
 from sama.runtime.fake import FakeScript
 from sama.runtime.runner import forbidden_env
-from sama.sandbox import Sandbox, SandboxError, SandboxNotFoundError, SandboxProvider, SandboxSpec
+from sama.sandbox import (
+    Sandbox,
+    SandboxError,
+    SandboxFileTooLargeError,
+    SandboxNotFoundError,
+    SandboxOutdatedError,
+    SandboxProvider,
+    SandboxSpec,
+)
 from sama.tenancy import RunTokenSigner
 from tests.support import collect, make_scope
 
@@ -127,6 +136,17 @@ async def test_files_round_trip(harness: Harness) -> None:
         await sandbox.read_file(path)
 
 
+async def test_a_bounded_read_stops_after_the_limit(harness: Harness) -> None:
+    sandbox = await harness.create(harness.spec())
+    path = f"{sandbox.workdir}/ten.bin"
+    await sandbox.write_file(path, b"0123456789")
+    assert await sandbox.read_file(path, max_bytes=10) == b"0123456789"
+    with pytest.raises(SandboxFileTooLargeError):
+        await sandbox.read_file(path, max_bytes=9)
+    with pytest.raises(FileNotFoundError):
+        await sandbox.read_file(f"{sandbox.workdir}/none.bin", max_bytes=9)
+
+
 async def test_pause_and_resume_keep_the_files(harness: Harness) -> None:
     spec = harness.spec()
     sandbox = await harness.create(spec)
@@ -142,6 +162,26 @@ async def test_resume_checks_the_session(harness: Harness) -> None:
     sandbox = await harness.create(harness.spec())
     with pytest.raises(SandboxError):
         await harness.provider.resume(sandbox.id, harness.spec(session_id="sess-other"))
+
+
+async def test_resume_of_a_sandbox_from_another_template_gives_it_to_the_caller(
+    harness: Harness,
+) -> None:
+    """The provider does not resume an outdated sandbox as the session sandbox. It gives the
+    running sandbox to the caller, which moves the state and kills it (Section 16.2)."""
+    spec = harness.spec()
+    sandbox = await harness.create(spec)
+    path = f"{sandbox.workdir}/kept.txt"
+    await sandbox.write_file(path, b"state")
+    newer = dataclasses.replace(spec, template=f"{spec.template}-newer")
+    with pytest.raises(SandboxOutdatedError) as caught:
+        await harness.provider.resume(sandbox.id, newer)
+    outdated = caught.value.sandbox
+    assert outdated.id == sandbox.id
+    assert await outdated.read_file(path) == b"state", "the sandbox still runs"
+    await outdated.kill()
+    with pytest.raises(SandboxNotFoundError):
+        await harness.provider.resume(sandbox.id, spec)
 
 
 async def test_resume_of_a_lost_sandbox_is_not_found(harness: Harness) -> None:
@@ -308,3 +348,20 @@ def test_e2b_network_options() -> None:
         "allow_out": ["pypi.org"],
     }
     assert network_options(harness.spec(allow_out=("pypi.org",), open_egress=True)) is None
+
+
+def test_the_labels_name_the_template_and_a_sandbox_without_it_is_outdated() -> None:
+    spec = SandboxSpec(org_id="org-test", session_id="sess-1", template="sama-runner-abc")
+    labels = spec.labels()
+    assert labels["sama.template"] == "sama-runner-abc"
+    assert not spec.outdated(labels)
+    assert spec.outdated({"sama.org_id": "org-test", "sama.session_id": "sess-1"})
+    assert spec.outdated({**labels, "sama.template": "sama-runner-old"})
+    # A caller cannot set the template label through metadata.
+    forged = SandboxSpec(
+        org_id="org-test",
+        session_id="sess-1",
+        template="sama-runner-abc",
+        metadata={"sama.template": "other"},
+    )
+    assert forged.labels()["sama.template"] == "sama-runner-abc"

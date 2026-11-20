@@ -21,7 +21,9 @@ from typing import Final
 from sama.sandbox.base import (
     ExecResult,
     SandboxError,
+    SandboxFileTooLargeError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxSpec,
     log_start,
@@ -80,8 +82,14 @@ class LocalSandbox:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
-    async def read_file(self, path: str) -> bytes:
-        return self._path(path).read_bytes()
+    async def read_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        if max_bytes is None:
+            return self._path(path).read_bytes()
+        with self._path(path).open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise SandboxFileTooLargeError(path)
+        return data
 
     async def remove_file(self, path: str) -> None:
         self._path(path).unlink(missing_ok=True)
@@ -121,7 +129,10 @@ class LocalProvider:
         root = self.root / sandbox_id
         if root.parent != self.root or not (root / _LABELS).is_file():
             raise SandboxNotFoundError(sandbox_id)
-        if not spec.owns(json.loads((root / _LABELS).read_text())):
+        labels = json.loads((root / _LABELS).read_text())
+        if not spec.owns(labels):
             raise SandboxError("the sandbox belongs to another session")
+        if spec.outdated(labels):
+            raise SandboxOutdatedError(sandbox_id, LocalSandbox(root))
         log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return LocalSandbox(root)

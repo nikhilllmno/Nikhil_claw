@@ -444,6 +444,46 @@ async def test_session_resume_uses_the_sdk_session_id() -> None:
     assert second.usage.input_tokens == 10
 
 
+async def test_a_run_whose_sdk_session_is_gone_starts_a_new_one() -> None:
+    """A new sandbox has no transcript of the saved session (Section 16.2). The run starts a
+    new SDK session, and its cost counts from zero."""
+    factory = Factory([result(cost=0.01)], [result(cost=0.03)])
+    runtime = ClaudeRuntime(client_factory=factory)
+    first = (await collect(runtime.run(request(run_id="run-1"))))[-1]
+    assert isinstance(first, RunCompleted)
+    runtime._settings = ClaudeSettings(session_exists=lambda session: session != SESSION)
+    second = (await collect(runtime.run(request(run_id="run-2", state=first.runtime_state))))[-1]
+    assert isinstance(second, RunCompleted)
+    assert factory.clients[1].options.resume is None
+    assert second.usage.cost_usd == Decimal("0.03")
+
+
+async def test_a_gone_session_with_an_open_approval_drops_nothing() -> None:
+    runtime, paused = await pause()
+    factory = Factory([result(text="Hi.", cost=0.01)])
+    runtime._client_factory = factory
+    runtime._settings = ClaudeSettings(session_exists=lambda _: False)
+    events = await collect(runtime.run(request("next", run_id="run-2", state=paused.runtime_state)))
+    assert isinstance(events[-1], RunCompleted)
+    assert len(factory.clients) == 1
+    client = factory.clients[0]
+    assert client.options.resume is None
+    assert DROP_DEFERRED_ENV not in client.options.env
+    assert client.prompts == ["next"]
+
+
+async def test_an_approval_resume_of_a_gone_session_fails() -> None:
+    runtime, paused = await pause()
+    factory = Factory()
+    runtime._client_factory = factory
+    runtime._settings = ClaudeSettings(session_exists=lambda _: False)
+    events = await collect(runtime.resume(resume_request(paused, ApprovalDecision.APPROVE)))
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].code is FailureCode.INVALID_REQUEST
+    assert "gone" in events[-1].message
+    assert factory.clients == []
+
+
 async def test_tool_calls_and_results() -> None:
     factory = Factory(
         [

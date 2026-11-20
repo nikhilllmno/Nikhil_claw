@@ -27,7 +27,9 @@ from sama.sandbox.base import (
     WORKDIR,
     ExecResult,
     SandboxError,
+    SandboxFileTooLargeError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxSpec,
     log_start,
@@ -175,8 +177,9 @@ class DockerSandbox:
         if code != 0:
             raise _failed("write_file", err)
 
-    async def read_file(self, path: str) -> bytes:
-        script = f"test -f {shlex.quote(path)} || exit 44; cat -- {shlex.quote(path)}"
+    async def read_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        read = "cat --" if max_bytes is None else f"head -c {max_bytes + 1} --"
+        script = f"test -f {shlex.quote(path)} || exit 44; {read} {shlex.quote(path)}"
         code, out, err = await _docker(
             "exec", "--user", SANDBOX_USER, self.container, "sh", "-c", script
         )
@@ -184,6 +187,8 @@ class DockerSandbox:
             raise FileNotFoundError(path)
         if code != 0:
             raise _failed("read_file", err)
+        if max_bytes is not None and len(out) > max_bytes:
+            raise SandboxFileTooLargeError(path)
         return out
 
     async def remove_file(self, path: str) -> None:
@@ -242,10 +247,13 @@ class DockerProvider:
         code, out, _ = await _docker("inspect", "--format", "{{json .Config.Labels}}", sandbox_id)
         if code != 0:
             raise SandboxNotFoundError(sandbox_id)
-        if not spec.owns(json.loads(out) or {}):
+        labels = json.loads(out) or {}
+        if not spec.owns(labels):
             raise SandboxError("the sandbox belongs to another session")
         code, _, err = await _docker("start", sandbox_id)
         if code != 0:
             raise _failed("docker start", err)
+        if spec.outdated(labels):
+            raise SandboxOutdatedError(sandbox_id, DockerSandbox(sandbox_id))
         log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return DockerSandbox(sandbox_id)

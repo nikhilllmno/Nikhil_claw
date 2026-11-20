@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -33,7 +33,7 @@ from sama.runtime import (
 )
 from sama.runtime.contract import CompactRequest
 from sama.runtime.fake import FakeRuntime, FakeScript
-from sama.sandbox import SandboxError, SandboxSpec
+from sama.sandbox import ExecResult, SandboxError, SandboxSpec
 from sama.sandbox.local import LocalProvider, LocalSandbox
 from sama.sandbox.process import SubprocessProcess
 from sama.tenancy import RunTokenSigner
@@ -277,6 +277,166 @@ async def test_another_worker_finds_the_sandbox_in_the_directory(
     assert isinstance(events[-1], RunCompleted)
     assert provider.creates == 1
     await first.close_sandboxes(kill=True)
+
+
+async def test_a_deploy_with_a_new_template_replaces_the_session_sandbox(
+    provider: CountingProvider,
+) -> None:
+    """A control plane of a new commit does not resume a sandbox with the runner of the old
+    commit (Section 16.2). It removes that sandbox and creates one from its own template."""
+    directory = DictDirectory()
+    old, new = (
+        SandboxedRuntime(
+            kind=RuntimeKind.FAKE,
+            provider=provider,
+            signer=RunTokenSigner(KEY),
+            settings=SandboxSettings(template=template, runner_argv=RUNNER),
+            directory=directory,
+        )
+        for template in ("sama-runner-old", "sama-runner-new")
+    )
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = old.sandbox_id("org-1", "sess-1")
+    assert first is not None
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    assert provider.creates == 2
+    second = new.sandbox_id("org-1", "sess-1")
+    assert second not in (None, first)
+    assert directory.ids == {("org-1", "sess-1"): second}
+    assert await old.session_sandbox("org-1", "sess-1") is None, "the old sandbox is removed"
+    await new.close_sandboxes(kill=True)
+
+
+def _two_templates(
+    provider: CountingProvider, directory: DictDirectory, **settings: Any
+) -> tuple[SandboxedRuntime, SandboxedRuntime]:
+    old, new = (
+        SandboxedRuntime(
+            kind=RuntimeKind.FAKE,
+            provider=provider,
+            signer=RunTokenSigner(KEY),
+            settings=SandboxSettings(template=template, runner_argv=RUNNER, **settings),
+            directory=directory,
+        )
+        for template in ("sama-runner-old", "sama-runner-new")
+    )
+    return old, new
+
+
+async def test_a_new_template_moves_the_cli_state_to_the_new_sandbox(
+    provider: CountingProvider,
+) -> None:
+    """The transcripts of the CLI go to the new sandbox, so the next run resumes the same
+    conversation. Other files stay behind."""
+    directory = DictDirectory()
+    old, new = _two_templates(provider, directory)
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = await old.session_sandbox("org-1", "sess-1")
+    assert first is not None
+    made = await first.exec(
+        [
+            "sh",
+            "-c",
+            'mkdir -p "$HOME/.claude/projects/w" && echo hello > "$HOME/.claude/projects/w/s.jsonl"'
+            ' && echo other > "$HOME/other.txt"',
+        ]
+    )
+    assert made.exit_code == 0, made.stderr
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    second = await new.session_sandbox("org-1", "sess-1")
+    assert second is not None
+    assert second.id != first.id
+    moved = await second.exec(
+        ["sh", "-c", 'cat "$HOME/.claude/projects/w/s.jsonl"; test ! -e "$HOME/other.txt"']
+    )
+    assert (moved.exit_code, moved.stdout) == (0, "hello\n")
+    with pytest.raises(FileNotFoundError):
+        await second.read_file(f"{second.workdir}/.sama-carry.tgz")
+    await new.close_sandboxes(kill=True)
+
+
+async def test_a_failed_move_of_the_cli_state_does_not_fail_the_run(
+    provider: CountingProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = DictDirectory()
+    old, new = _two_templates(provider, directory)
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = await old.session_sandbox("org-1", "sess-1")
+    assert first is not None
+    await first.exec(["sh", "-c", 'mkdir -p "$HOME/.claude" && echo x > "$HOME/.claude/a"'])
+
+    async def broken(self: LocalSandbox, path: str, *, max_bytes: int | None = None) -> bytes:
+        raise OSError("read failed")
+
+    monkeypatch.setattr(LocalSandbox, "read_file", broken)
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    assert provider.creates == 2
+    assert await old.session_sandbox("org-1", "sess-1") is None, "the old sandbox is removed"
+    await new.close_sandboxes(kill=True)
+
+
+async def test_an_archive_that_grows_after_the_size_check_does_not_move(
+    provider: CountingProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sandbox can change the archive after ``stat``. The read stops at the limit, so the
+    control plane never holds a larger archive."""
+    monkeypatch.setattr(sandboxed_module, "CARRY_MAX_BYTES", 4_096)
+    directory = DictDirectory()
+    old, new = _two_templates(provider, directory)
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = await old.session_sandbox("org-1", "sess-1")
+    assert first is not None
+    await first.exec(["sh", "-c", 'mkdir -p "$HOME/.claude" && echo x > "$HOME/.claude/a"'])
+    real_exec = LocalSandbox.exec
+
+    async def grow(self: LocalSandbox, argv: Sequence[str], **kwargs: Any) -> ExecResult:
+        result = await real_exec(self, argv, **kwargs)
+        archive = (kwargs.get("env") or {}).get("CARRY")
+        if self.id == first.id and archive:
+            grow_argv = ["sh", "-c", 'head -c 10000 /dev/zero >> "$CARRY"']
+            await real_exec(self, grow_argv, env={"CARRY": archive})
+        return result
+
+    monkeypatch.setattr(LocalSandbox, "exec", grow)
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    second = await new.session_sandbox("org-1", "sess-1")
+    assert second is not None
+    monkeypatch.setattr(LocalSandbox, "exec", real_exec)
+    moved = await second.exec(["sh", "-c", 'test ! -e "$HOME/.claude/a"'])
+    assert moved.exit_code == 0, "the archive over the limit did not move"
+    await new.close_sandboxes(kill=True)
+
+
+async def test_a_lookup_of_an_outdated_sandbox_does_not_pause_it(
+    provider: CountingProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool can look up the session sandbox while a run moves its state. The lookup must not
+    stop the old sandbox, or the move fails."""
+    directory = DictDirectory()
+    old, new = _two_templates(provider, directory)
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    paused: list[str] = []
+
+    async def pause(self: LocalSandbox) -> None:
+        paused.append(self.id)
+
+    monkeypatch.setattr(LocalSandbox, "pause", pause)
+    assert await new.session_sandbox("org-1", "sess-1") is None
+    assert paused == []
+    await old.close_sandboxes(kill=True)
 
 
 async def test_a_directory_error_does_not_fail_the_run(provider: CountingProvider) -> None:

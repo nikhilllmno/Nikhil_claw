@@ -10,7 +10,9 @@ for a line that it does not understand.
 
 from __future__ import annotations
 
+import glob
 import json
+import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -19,6 +21,17 @@ from sama.runtime.archive import ArchiveEntry
 
 MAX_TRANSCRIPT_BYTES: Final = 64 * 1024 * 1024
 """A larger file keeps its last bytes. The archive cuts long transcripts anyway."""
+
+
+def cli_session_exists(session_id: str, config_dir: str | None = None) -> bool:
+    """True if the CLI has a transcript file for this SDK session. The folder is
+    ``CLAUDE_CONFIG_DIR``, else ``~/.claude``. A new sandbox has no transcript of an older
+    session, and the CLI cannot resume a session without one (Section 16.2)."""
+    if not session_id or "/" in session_id or session_id in {".", ".."}:
+        return False
+    root = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    pattern = os.path.join(glob.escape(root), "projects", "*", glob.escape(session_id) + ".jsonl")
+    return any(os.path.isfile(path) for path in glob.iglob(pattern))
 
 
 def read_transcript(path: str) -> tuple[list[ArchiveEntry], int]:

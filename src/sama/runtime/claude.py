@@ -210,6 +210,10 @@ class ClaudeSettings:
     env: Mapping[str, str] = field(default_factory=dict)
     claude_code_preset: bool = True
     cancel_grace_s: float = 5.0
+    session_exists: Callable[[str], bool] | None = None
+    """Checks that the CLI can resume an SDK session (its transcript is there). The runner sets
+    it. ``None`` skips the check. A run whose session is gone starts a new SDK session, and an
+    approval resume of it fails (Section 16.2)."""
 
     def __post_init__(self) -> None:
         if not 0 < self.cancel_grace_s <= 8:
@@ -725,6 +729,10 @@ class ClaudeRuntime:
 
     # -- the protocol ----------------------------------------------------------------------
 
+    def _session_exists(self, session_id: str) -> bool:
+        check = self._settings.session_exists
+        return check is None or check(session_id)
+
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         run_id = request.scope.run_id
         problem = self._check_config(request.config)
@@ -738,6 +746,11 @@ class ClaudeRuntime:
         if problem is not None:
             yield _invalid(problem)
             return
+        if previous is not None and not self._session_exists(previous.session_id):
+            # The sandbox is new (lost, or from another template), so the CLI has no
+            # transcript of this session. Start a new SDK session; its counts start at zero.
+            log.warning("the sdk session is gone; starting a new one run=%s", run_id)
+            previous = None
         if request.compact is not None and previous is None:
             yield _invalid("there is nothing to compact")
             return
@@ -776,6 +789,8 @@ class ClaudeRuntime:
                 problem = "runtime_state is not valid for the claude runtime"
         if problem is None:
             problem = self._check_resume(request, state)
+        if problem is None and state is not None and not self._session_exists(state.session_id):
+            problem = "the sdk session of this run is gone, so the approval cannot resume it"
         if problem is not None or state is None or state.pending is None:
             yield _invalid(problem or "runtime_state has no pending approval")
             return
