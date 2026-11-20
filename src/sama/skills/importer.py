@@ -71,9 +71,23 @@ def _destructive(text: str) -> bool:
     recursive delete of ``/``, ``~``, or ``"$HOME"`` with any form of the flags."""
     for line in text.splitlines():
         command = _LINE_PREFIX.sub("", line)
-        if command and len(command) <= MAX_COMMAND_CHARS and command_problem(command):
+        if command and any(command_problem(part) for part in _windows(command)):
             return True
     return False
+
+
+_WINDOW: Final = 4_096
+"""A long line is checked in windows of this size. Each window overlaps the next by half, so
+a command of at most half the size is complete in one window."""
+
+
+def _windows(line: str) -> list[str]:
+    """The line, or overlapping parts of a line that is too long for the hardline check. So
+    padding before or after a command does not hide it."""
+    if len(line) <= MAX_COMMAND_CHARS:
+        return [line]
+    step = _WINDOW // 2
+    return [line[start : start + _WINDOW] for start in range(0, len(line) - step, step)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +315,8 @@ _NAME_LINE: Final = re.compile(r"name\s*:.*")
 def _with_name(skill_md: str, name: str) -> str:
     """The ``SKILL.md`` with ``name`` as the frontmatter name. The other lines do not change.
     The store checks that the two names are the same, so a new name changes the frontmatter
-    too. A text without a frontmatter does not change, and the store reports the problem."""
+    too. The name is a quoted string, so a name such as ``on`` or ``123`` stays text in YAML.
+    A text without a frontmatter does not change, and the store reports the problem."""
     if _frontmatter_name(skill_md) == name:
         return skill_md
     lines = skill_md.split("\n")
@@ -311,9 +326,9 @@ def _with_name(skill_md: str, name: str) -> str:
         line = lines[index]
         if line.rstrip() == "---":
             # No top-level name line: add one at the start of the frontmatter.
-            return "\n".join([lines[0], f"name: {name}", *lines[1:]])
+            return "\n".join([lines[0], f"name: {json.dumps(name)}", *lines[1:]])
         if _NAME_LINE.fullmatch(line.rstrip("\r")):
-            lines[index] = f"name: {name}"
+            lines[index] = f"name: {json.dumps(name)}"
             return "\n".join(lines)
     return skill_md
 

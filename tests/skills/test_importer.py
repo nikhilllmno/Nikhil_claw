@@ -166,7 +166,7 @@ async def test_import_takes_a_name_and_scope() -> None:
     assert (store.requests[0].name, store.requests[0].scope) == ("mine", "workspace")
     # The store checks that the frontmatter name is the skill name.
     plan = plan_write([], actor(workspace_admin=True), store.requests[0])
-    assert plan.skill_md.startswith("---\nname: mine\n")
+    assert plan.skill_md.startswith('---\nname: "mine"\n')
     assert "pdf-tools" not in plan.skill_md.split("---")[1]
 
 
@@ -324,3 +324,27 @@ async def test_the_tool_imports_over_mcp_and_is_hidden_without_an_importer() -> 
     assert store.requests[0].name == "pdf-tools"
     assert bad.is_error
     assert "github.com" in text_of(bad)
+
+
+@pytest.mark.parametrize("name", ["on", "null", "123", "yes"])
+async def test_a_name_that_looks_like_a_yaml_value_stays_text(name: str) -> None:
+    tool, store = importer(github({"SKILL.md": md("pdf-tools")}, folder=""))
+    await tool.import_skill(CLAIMS, parse_source("https://github.com/acme/skills"), name=name)
+    plan = plan_write([], actor(), store.requests[0])
+    assert f'name: "{name}"' in plan.skill_md
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "rm -rf ~ #" + "x" * 33_000,
+        "echo " + "x" * 33_000 + "; rm -rf ~",
+        "x" * 20_000 + " && rm -rf / && " + "y" * 20_000,
+    ],
+)
+def test_padding_does_not_hide_a_destructive_command(line: str) -> None:
+    assert scan_import("scripts/i.sh", line) == ["scripts/i.sh: destructive"]
+
+
+def test_a_long_harmless_line_passes_the_scan() -> None:
+    assert scan_import("assets/data.json", '{"a": "' + "x" * 40_000 + '"}') == []

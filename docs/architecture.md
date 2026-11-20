@@ -1966,11 +1966,12 @@ It is not in the default allow list, so the gate asks a person before each impor
   `exec(b64decode(...))`), or deletes a root or home folder. For the delete check, the scan
   gives each line, without a list mark or a shell prompt, to the hardline check of the gate
   (Section 16.1). So `rm -rf "$HOME"`, `rm -r -f /`, `rm -Rf /etc`, and `rm -rf ~; ...` are
-  refused too. Then the write is a normal `skill_manage` `create`: the lint and the injection
+  refused too. A line that is too long for the hardline check is checked in overlapping parts,
+  so padding does not hide a command. Then the write is a normal `skill_manage` `create`: the lint and the injection
   and secret scan of every skill write run (Section 9.2).
 - **Write.** The name comes from the `name` argument, else from the frontmatter, else from
   the folder. If the name is not the frontmatter name, sama changes the `name:` line of the
-  frontmatter to the name and keeps the other lines, so the lint accepts it. `scope` works as
+  frontmatter to the name as a quoted string and keeps the other lines, so the lint accepts it. `scope` works as
   in `skill_manage`, and the result depends on the role of the user. A workspace admin or the
   org owner writes a `workspace` skill directly, and the org owner writes an `org` skill
   directly. For another user, a `workspace` or `org` skill from a chat run is a proposal that a
