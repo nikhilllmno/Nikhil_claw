@@ -115,8 +115,9 @@ class SessionItems(Protocol):
 
 
 def item_bytes(items: Sequence[dict[str, Any]]) -> int:
-    """The size of items as the stores count it: the UTF-8 bytes of the JSON text of each item,
-    with the separators of the Postgres ``jsonb`` text."""
+    """The size of items as the memory store counts it: the UTF-8 bytes of the JSON text of
+    each item. The Postgres store also checks the ``jsonb`` text after a write, because a
+    number such as ``1e308`` is longer in it."""
     return sum(len(json.dumps(item, ensure_ascii=False).encode()) for item in items)
 
 

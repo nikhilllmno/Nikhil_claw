@@ -960,38 +960,62 @@ class ToolServer:
         declared = request.headers.get("content-length", "")
         if declared.isdecimal() and int(declared) > MAX_SESSION_ITEMS_BODY_BYTES:
             return JSONResponse({"error": "the request is too large"}, status_code=413)
-        async with self._session_item_slots:
-            try:
-                # The run must be able to use the items before the server reads the body.
-                await self.session_items.authorize(claims)
-            except SessionItemsError as error:
-                return JSONResponse({"error": str(error)}, status_code=409)
-            except Exception as error:
-                log.error(
-                    "session items failed run=%s error=%s", claims.run_id, type(error).__name__
-                )
-                return JSONResponse({"error": "the session items failed"}, status_code=503)
-            raw = bytearray()
-            async for chunk in request.stream():
-                raw += chunk
-                if len(raw) > MAX_SESSION_ITEMS_BODY_BYTES:
-                    return JSONResponse({"error": "the request is too large"}, status_code=413)
-            try:
-                body = parse_session_items(bytes(raw))
-            except ValueError:
-                return JSONResponse({"error": "the request is not valid"}, status_code=422)
-            del raw
-            try:
-                answer = await self.session_items.call(claims, body)
-            except SessionItemsError as error:
-                return JSONResponse({"error": str(error)}, status_code=409)
-            except Exception as error:
-                log.error(
-                    "session items failed run=%s error=%s", claims.run_id, type(error).__name__
-                )
-                return JSONResponse({"error": "the session items failed"}, status_code=503)
-            # The answer is in memory only inside the slot, as the body is.
-            return Response(answer.model_dump_json(), media_type="application/json")
+        slots = self._session_item_slots
+        await slots.acquire()
+        try:
+            response = await self._session_items_answer(claims, request)
+        except BaseException:
+            slots.release()
+            raise
+        # The slot stays until the server sent the answer, so a slow client does not let more
+        # answers into memory.
+        return _HeldResponse(response, slots.release)
+
+    async def _session_items_answer(self, claims: RunTokenClaims, request: Request) -> Response:
+        """Runs one session item operation. The caller holds a slot."""
+        assert self.session_items is not None  # noqa: S101
+        try:
+            # The run must be able to use the items before the server reads the body.
+            await self.session_items.authorize(claims)
+        except SessionItemsError as error:
+            return JSONResponse({"error": str(error)}, status_code=409)
+        except Exception as error:
+            log.error("session items failed run=%s error=%s", claims.run_id, type(error).__name__)
+            return JSONResponse({"error": "the session items failed"}, status_code=503)
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > MAX_SESSION_ITEMS_BODY_BYTES:
+                return JSONResponse({"error": "the request is too large"}, status_code=413)
+        try:
+            body = parse_session_items(bytes(raw))
+        except ValueError:
+            return JSONResponse({"error": "the request is not valid"}, status_code=422)
+        del raw
+        try:
+            answer = await self.session_items.call(claims, body)
+        except SessionItemsError as error:
+            return JSONResponse({"error": str(error)}, status_code=409)
+        except Exception as error:
+            log.error("session items failed run=%s error=%s", claims.run_id, type(error).__name__)
+            return JSONResponse({"error": "the session items failed"}, status_code=503)
+        return Response(answer.model_dump_json(), media_type="application/json")
+
+
+class _HeldResponse(Response):
+    """Sends ``inner``, then calls ``release``, also when the send fails."""
+
+    def __init__(self, inner: Response, release: Callable[[], None]) -> None:
+        super().__init__(status_code=inner.status_code)
+        self.body = inner.body
+        self.raw_headers = inner.raw_headers
+        self._release = release
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
 
 
 def _unauthorized(error: InvalidRunTokenError) -> Response:

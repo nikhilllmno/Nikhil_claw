@@ -151,7 +151,8 @@ class _State(BaseModel):
     paused. ``run_state`` is the SDK ``RunState`` of a paused run. ``window`` is the number of
     items at the start of the list that a manual compaction gave: the answer of
     ``/responses/compact`` must stay whole, so a ``compaction`` item in it does not cut the
-    items before it.
+    items before it. ``repair`` is true when a run failed before it gave an output to the
+    calls of an unanswered approval, so the next run must give them.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -167,6 +168,7 @@ class _State(BaseModel):
     pending: _PendingCall | None = None
     run_state: dict[str, Any] | None = None
     window: int = Field(default=0, ge=0)
+    repair: bool = False
 
     def dump(self) -> bytes:
         return self.model_dump_json().encode()
@@ -505,6 +507,11 @@ def _kept_count(previous: _State | None) -> int:
     return previous.item_count
 
 
+def _needs_repair(previous: _State | None) -> bool:
+    """Whether the paused calls of an unanswered approval can have no output."""
+    return previous is not None and (previous.pending is not None or previous.repair)
+
+
 class _WindowCompaction(Compaction):
     """The SDK ``Compaction`` cuts the context before the last ``compaction`` item. The first
     ``floor`` items are the answer of a manual compaction, which must stay whole, so a
@@ -561,6 +568,8 @@ class _Job:
     result: RunResultStreaming | None = None
     window: int = 0
     """``_State.window`` of this run."""
+    repair: bool = False
+    """``_State.repair`` of a failure of this run. It is false after ``_prepare``."""
 
     @property
     def usage(self) -> Usage:
@@ -583,6 +592,7 @@ class _Job:
             elapsed_s=self.elapsed_s(),
             pending=pending,
             window=self.window,
+            repair=self.repair,
             **extra,
         ).dump()
 
@@ -710,6 +720,7 @@ class OpenAIRuntime:
             # A failure before ``_prepare`` ends must keep the items of the run before.
             base_count=_kept_count(previous),
             window=previous.window if previous else 0,
+            repair=_needs_repair(previous),
             input=None if focus is not None else request.input,
             compact=focus,
         )
@@ -846,6 +857,7 @@ class OpenAIRuntime:
                 store = _Store(self._items, job.scope, job.conversation)
                 if job.resume is None:
                     job.base_count = await self._prepare(store, previous)
+                    job.repair = False
                 if active.cancelled.is_set():
                     active.send(_cancelled(job.usage))
                 elif job.compact is not None:
@@ -917,7 +929,7 @@ class OpenAIRuntime:
         unanswered approval, the paused call gets an output, because the Responses API needs
         an output for each call."""
         count = await store.trim(_kept_count(previous))
-        if previous is None or previous.pending is None:
+        if not _needs_repair(previous):
             return count
         items = await store.get_items()
         answered = {i.get("call_id") for i in items if i.get("type") == "function_call_output"}

@@ -123,6 +123,10 @@ async def _apply(
         size = func.coalesce(func.sum(func.octet_length(cast(table.item, Text))), 0)
         return int((await connection.execute(select(size).where(*where))).scalar_one())
 
+    # The check before a write uses the JSON text of Python. The ``jsonb`` text can be longer
+    # (``1e308`` has 309 digits in it), so the check after the write uses the stored text. An
+    # error rolls back the transaction.
+
     async def rows(first: int) -> list[dict[str, Any]]:
         result = await connection.execute(
             select(table.item).where(*where, table.seq >= first).order_by(table.seq)
@@ -157,6 +161,7 @@ async def _apply(
             raise SessionItemsError("the session has too many items")
         check_size(await stored_bytes(), request.items)
         await append(request.items, count)
+        check_size(await stored_bytes(), [])
         return SessionItemsAnswer(count=count + len(request.items))
     if request.op == "pop":
         if count == 0:
@@ -171,6 +176,7 @@ async def _apply(
         check_size(0, request.items)
         await connection.execute(delete(table).where(*where))
         await append(request.items, 0)
+        check_size(await stored_bytes(), [])
         return SessionItemsAnswer(count=len(request.items))
     assert request.count is not None  # noqa: S101 -- the model checks it
     if request.count < count:

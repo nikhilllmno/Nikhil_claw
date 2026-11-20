@@ -200,6 +200,23 @@ async def test_the_stores_refuse_items_over_the_byte_limit(
         assert (await call(_req("add", "c-6", items=[item]))).count == 2
 
 
+async def test_the_postgres_store_counts_the_stored_text_of_large_numbers(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(items_module, "MAX_SESSION_ITEMS_BYTES", 400)
+    run_id = await running_run(harness, tenant)
+    store = PostgresSessionItems(engine)
+    claims = claims_of(tenant, run_id)
+    # 13 bytes in the JSON text of Python, more than 300 bytes in the jsonb text.
+    item = {"n": 1e308}
+    assert item_bytes([item, item]) < 400
+    for op in ("add", "replace"):
+        with pytest.raises(SessionItemsError, match="too large"):
+            await store.call(claims, _req(op, "c-7", items=[item, item]))
+        assert (await store.call(claims, _req("get", "c-7"))).count == 0
+    assert (await store.call(claims, _req("add", "c-7", items=[item]))).count == 1
+
+
 def harness_scope(claims: Any) -> Any:
     from tests.support import make_scope
 

@@ -649,14 +649,18 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
   session is `active`. It applies the operation in one transaction. The transaction first
   takes an advisory lock for the conversation, and then does the checks with a `FOR SHARE`
   lock on the run row. So an operation that waits for the advisory lock sees a cancel that
-  came while it waited, and the worker cannot end the run while an operation commits. The rows are in `runtime_session_items` (Section 17.1). The operations
+  came while it waited, and the worker cannot end the run while an operation commits. The
+  rows are in `runtime_session_items` (Section 17.1). The operations
   are `get` (with a `limit`), `add`, `pop`, `clear`, `replace`, and `trim`. `seq` starts at 0
   and has no gaps, because every operation removes items only from the end or removes all of
   them. Limits: a body has at most 8 MB and 5,000 items, and a conversation has at most
   20,000 items and 16 MB of items (`MAX_SESSION_ITEMS_BYTES`, the UTF-8 bytes of the JSON text
   of each item). The store refuses an `add` or a `replace` over a limit, so a `get` answer is
-  also at most 16 MB. The tool server keeps at most a fixed number of bodies and answers in
-  memory at one time. A store refusal is `409`, and the run fails with `internal`, not retryable.
+  also at most 16 MB. The Postgres store checks the size again after the write, with the
+  stored `jsonb` text, because a number such as `1e308` is longer in that text. If the size is
+  over the limit, the transaction rolls back. The tool server keeps at most a fixed number of
+  bodies and answers in memory at one time: a request holds its slot until the server sent the
+  answer, so a slow client does not let more answers in. A store refusal is `409`, and the run fails with `internal`, not retryable.
   A store fault fails the run with `internal`, retryable.
 - **Conversations.** `runtime_state` names the conversation of the session. A run with no
   `runtime_state` (the first chat run, or a background review run, Section 9.4) starts a new
@@ -664,7 +668,10 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
   `runtime_state` is the count that the next run keeps. A run that failed or was cancelled
   keeps the count of the run before it, so the next run first trims the items of the failed
   run. This is also true for a failure before the trim, for example a store fault: the
-  failure state keeps the count of the run before it, so the items stay.
+  failure state keeps the count of the run before it, so the items stay. After an unanswered
+  approval, the next run gives an output to each paused call (see Approve and reject). If
+  that run fails before it gives the outputs, its failure state has `repair` set, so the run
+  after it gives them.
 - **Tool gate.** The adapter wraps each tool with `needs_approval`, which asks the sama
   `ToolGate` (Section 16.1). The shell call `exec_command` goes to the gate as a `Bash` call
   with a `command`, so one policy fits both runtimes. The adapter removes the SDK tool

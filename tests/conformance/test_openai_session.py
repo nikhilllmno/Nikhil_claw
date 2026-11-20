@@ -122,3 +122,43 @@ async def test_a_transient_store_failure_keeps_the_history(
     recall = _request("What word did I ask you to remember?", failed.runtime_state)
     again = await _completed(adapter, recall)
     assert again.output == word
+
+
+async def test_a_failure_before_the_repair_keeps_the_repair_for_the_next_run(
+    runtime: tuple[object, FlakyItems],
+) -> None:
+    from sama.runtime.openai_agents import _PendingCall, _State
+
+    adapter, items = runtime
+    first = await _completed(adapter, _request("Say hello", None))
+    done = _State.model_validate_json(first.runtime_state or b"")
+    # A run paused on a call, and nobody answered the approval.
+    call = {
+        "type": "function_call",
+        "call_id": "call-unanswered",
+        "name": "Bash",
+        "arguments": "{}",
+    }
+    scope = make_scope("run-paused")
+    add = SessionItemsRequest(op="add", conversation=done.conversation, items=[call])
+    paused_count = (await items.call(scope, add)).count
+    paused = done.model_copy(
+        update={
+            "pending": _PendingCall(call_id="call-unanswered", tool_name="Bash"),
+            "paused_count": paused_count,
+        }
+    )
+    items.fail_next = "trim"
+    events = await collect(
+        adapter.run(_request("Say hello", paused.dump()))  # type: ignore[attr-defined]
+    )
+    failed = events[-1]
+    assert isinstance(failed, RunFailed), failed
+    assert failed.runtime_state is not None
+    assert _State.model_validate_json(failed.runtime_state).repair
+    again = await _completed(adapter, _request("Say hello", failed.runtime_state))
+    assert not _State.model_validate_json(again.runtime_state or b"").repair
+    get = SessionItemsRequest(op="get", conversation=done.conversation)
+    stored = (await items.call(scope, get)).items
+    outputs = [i for i in stored if i.get("type") == "function_call_output"]
+    assert [i["call_id"] for i in outputs] == ["call-unanswered"]

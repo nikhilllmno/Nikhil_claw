@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import secrets
+from collections.abc import MutableMapping
 from typing import Any
 
 import httpx
@@ -17,6 +20,7 @@ from sama.runtime.session_items import (
 )
 from sama.tenancy import RunTokenClaims, RunTokenSigner
 from sama.tools import MemoryTodoStore, ToolServer
+from sama.tools import server as server_module
 from tests.conformance.scripted_model import serve
 from tests.support import make_scope
 
@@ -132,3 +136,61 @@ async def test_a_store_error_is_409_and_a_crash_is_503_without_details(where: st
         response = await post(base, signer.issue(make_scope(), ttl_s=600), GET)
     assert response.status_code == 503
     assert "hunter2" not in response.text
+
+
+def _asgi_call(token: str, body: bytes) -> tuple[dict[str, Any], Any]:
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/session-items",
+        "raw_path": b"/session-items",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"authorization", f"Bearer {token}".encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 80),
+    }
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return scope, receive
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+async def test_a_slot_stays_until_the_answer_is_sent(
+    monkeypatch: pytest.MonkeyPatch, send_fails: bool
+) -> None:
+    monkeypatch.setattr(server_module, "MAX_CONCURRENT_SESSION_ITEMS", 1)
+    tools, signer = rig(FakeItems())
+    slots = tools._session_item_slots
+    token = signer.issue(make_scope("run-7"), ttl_s=600)
+    scope, receive = _asgi_call(token, json.dumps(GET).encode())
+    sending = asyncio.Event()
+    go_on = asyncio.Event()
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.body":
+            sending.set()
+            await go_on.wait()
+            if send_fails:
+                raise OSError("the client went away")
+
+    task = asyncio.create_task(tools.app()(scope, receive, send))
+    await asyncio.wait_for(sending.wait(), 5)
+    # A slow client keeps the slot, so no other answer comes into memory.
+    assert slots.locked()
+    go_on.set()
+    if send_fails:
+        with pytest.raises(OSError, match="went away"):
+            await task
+    else:
+        await task
+    assert not slots.locked()
