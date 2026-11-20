@@ -14,7 +14,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Final
 
 from sqlalchemy import (
@@ -123,7 +123,48 @@ class SessionSearch:
                 Session.audience == "shared",
                 Session.workspace_id == _uuid(claims.workspace_id),
             )
-        user_id = _uuid(claims.user_id)
+        return await self.visible_to_user(connection, org_id, _uuid(claims.user_id))
+
+    # -- search -----------------------------------------------------------------------------
+
+    async def search(
+        self, claims: RunTokenClaims, query: str | None, limit: int
+    ) -> list[SessionHit]:
+        """Gives at most ``limit`` sessions, best first, each with up to two snippets. An empty
+        query gives the latest sessions without snippets."""
+        current = _uuid(claims.session_id)
+
+        async def scope(connection: AsyncConnection) -> ColumnElement[bool]:
+            return and_(await self.visible(connection, claims), Session.id != current)
+
+        return await self._search(_uuid(claims.org_id), scope, query, limit)
+
+    async def search_as_user(
+        self,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID,
+        query: str | None,
+        limit: int,
+        *,
+        workspace_id: uuid.UUID | None = None,
+    ) -> list[SessionHit]:
+        """The search of the web app (Section 11.4). The user sees what a private run of the
+        user sees: the shared sessions and the own private sessions in the workspaces that the
+        user sees. ``workspace_id`` limits the result to one workspace."""
+
+        async def scope(connection: AsyncConnection) -> ColumnElement[bool]:
+            visible = await self.visible_to_user(connection, org_id, user_id)
+            if workspace_id is None:
+                return visible
+            return and_(visible, Session.workspace_id == workspace_id)
+
+        return await self._search(org_id, scope, query, limit)
+
+    async def visible_to_user(
+        self, connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID
+    ) -> ColumnElement[bool]:
+        """The sessions that a user sees, as a SQL condition on ``Session``. It is the rule of
+        a private run of the user (``visible``)."""
         grants = await load_grants(connection, org_id, user_id)
         if not grants.org_member:
             return false()
@@ -136,35 +177,32 @@ class SessionSearch:
         workspaces = [workspace for workspace, _role in grants.rows if workspace is not None]
         return and_(Session.org_id == org_id, audience, Session.workspace_id.in_(workspaces))
 
-    # -- search -----------------------------------------------------------------------------
-
-    async def search(
-        self, claims: RunTokenClaims, query: str | None, limit: int
+    async def _search(
+        self,
+        org_id: uuid.UUID,
+        scope: Callable[[AsyncConnection], Awaitable[ColumnElement[bool]]],
+        query: str | None,
+        limit: int,
     ) -> list[SessionHit]:
-        """Gives at most ``limit`` sessions, best first, each with up to two snippets. An empty
-        query gives the latest sessions without snippets."""
+        """The search of ``search`` and ``search_as_user``. ``scope`` gives the sessions that
+        the caller may see. It runs again on each connection, after the slow embedding call."""
         text_query = (query or "").strip()
         if len(text_query) > MAX_QUERY_CHARS:
             raise SessionSearchError(f"the query has more than {MAX_QUERY_CHARS} characters")
         limit = max(1, min(limit, MAX_LIMIT))
-        org_id = _uuid(claims.org_id)
-        current = _uuid(claims.session_id)
         # An archive repeats the messages of its live session. The search skips it, and
         # ``session_read`` of the live session names its archives.
         not_archive = or_(Session.lineage.is_(None), Session.lineage != ARCHIVE_LINEAGE)
         if not text_query:
             async with self._engine.connect() as connection:
-                visible = await self.visible(connection, claims)
-                return await self._recent(
-                    connection, and_(visible, not_archive, Session.id != current), limit
-                )
+                visible = await scope(connection)
+                return await self._recent(connection, and_(visible, not_archive), limit)
         tsquery = func.websearch_to_tsquery(_SIMPLE, text_query)
         # The query embedding is a slow call. It runs before the grants load, so that a grant
         # that changes during the call counts: every read below uses the fresh rule.
         vector = await self._query_vector(org_id, text_query)
         async with self._engine.connect() as connection:
-            visible = await self.visible(connection, claims)
-            others = and_(visible, not_archive, Session.id != current)
+            others = and_(await scope(connection), not_archive)
             ranked = [await self._full_text(connection, others, tsquery)]
             if vector is not None:
                 ranked.append(await self._by_meaning(connection, others, vector))

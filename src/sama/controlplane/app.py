@@ -260,6 +260,9 @@ def build(
         )
         github_tools = GitHubTools(github)
         upstream = GitHubUpstream(github_client, web_url=settings.github.web_url)
+
+    # The session_search tool and the search page of the web app share one search.
+    sessions = SessionSearch(engine, embedder)
     usage = PostgresUsageStore(engine)
     # One ledger for every spender of model money: a record that fails to write fences them all.
     ledger = UsageLedger(usage)
@@ -299,7 +302,7 @@ def build(
         memory=MemoryService(memory_store, proposals),
         skills=skill_store,
         souls=SoulProposer(engine, proposals),
-        sessions=SessionSearch(engine, embedder),
+        sessions=sessions,
         vision=(
             VisionService(
                 store=AttachmentStore(engine),
@@ -412,6 +415,8 @@ def build(
             public_url=settings.public_url,
             composio_secret=settings.composio_webhook_secret,
         ),
+        skill_store=skill_store,
+        search=sessions,
     )
     api_app = api.app()
     tools_app = tools.app()

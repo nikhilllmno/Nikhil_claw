@@ -433,3 +433,38 @@ async def test_hydration_applies_the_rule_to_each_session_and_message(
         ]
         hits = await search._hits(connection, visible, func.to_tsquery("simple", "x"), chosen)
     assert [h.session_id for h in hits] == [ids["s2"]]
+
+
+async def test_the_search_of_a_user_shows_what_a_private_run_of_the_user_sees(
+    engine: AsyncEngine, talk: World
+) -> None:
+    ids = talk.ids
+    search = SessionSearch(engine)
+    mia = {
+        hit.session_id for hit in await search.search_as_user(talk.org, ids["mia"], "pgbouncer", 10)
+    }
+    # No current session: the search of the web app also finds ``s3``.
+    assert mia == {ids["s2"], ids["mine"], ids["s3"]}
+    bob = {
+        hit.session_id for hit in await search.search_as_user(talk.org, ids["bob"], "pgbouncer", 10)
+    }
+    assert bob == {ids["s2"], ids["bobs"], ids["s3"]}
+    ada = {
+        hit.session_id for hit in await search.search_as_user(talk.org, ids["ada"], "pgbouncer", 10)
+    }
+    assert ada == {ids["s2"], ids["s3"], ids["other_ws"]}
+    assert await search.search_as_user(talk.org, ids["eve"], "pgbouncer", 10) == []
+
+
+async def test_the_search_of_a_user_can_keep_to_one_workspace(
+    engine: AsyncEngine, talk: World
+) -> None:
+    ids = talk.ids
+    hits = await SessionSearch(engine).search_as_user(
+        talk.org, ids["ada"], "pgbouncer", 10, workspace_id=ids["ws2"]
+    )
+    assert [hit.session_id for hit in hits] == [ids["other_ws"]]
+    latest = await SessionSearch(engine).search_as_user(
+        talk.org, ids["mia"], "", 10, workspace_id=ids["ws"]
+    )
+    assert {hit.session_id for hit in latest} == {ids["s1"], ids["s2"], ids["s3"], ids["mine"]}
