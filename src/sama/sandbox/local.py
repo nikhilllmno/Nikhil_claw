@@ -22,6 +22,7 @@ from sama.sandbox.base import (
     ExecResult,
     SandboxError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxSpec,
     log_start,
@@ -121,7 +122,11 @@ class LocalProvider:
         root = self.root / sandbox_id
         if root.parent != self.root or not (root / _LABELS).is_file():
             raise SandboxNotFoundError(sandbox_id)
-        if not spec.owns(json.loads((root / _LABELS).read_text())):
+        labels = json.loads((root / _LABELS).read_text())
+        if not spec.owns(labels):
             raise SandboxError("the sandbox belongs to another session")
+        if spec.outdated(labels):
+            await LocalSandbox(root).kill()
+            raise SandboxOutdatedError(sandbox_id)
         log_start(self.name, "resume", sandbox_id, spec.session_id, started)
         return LocalSandbox(root)

@@ -38,6 +38,7 @@ from sama.sandbox.base import (
     ExecResult,
     SandboxError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxSpec,
     log_start,
@@ -276,5 +277,8 @@ class E2BProvider:
         if not spec.owns(info.metadata or {}):
             raise SandboxError("the sandbox belongs to another session")
         result = E2BSandbox(sandbox)
+        if spec.outdated(info.metadata or {}):
+            await result.kill()
+            raise SandboxOutdatedError(sandbox_id)
         log_start(self.name, "resume", result.id, spec.session_id, started)
         return result

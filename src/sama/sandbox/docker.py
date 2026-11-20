@@ -28,6 +28,7 @@ from sama.sandbox.base import (
     ExecResult,
     SandboxError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxSpec,
     log_start,
@@ -242,8 +243,12 @@ class DockerProvider:
         code, out, _ = await _docker("inspect", "--format", "{{json .Config.Labels}}", sandbox_id)
         if code != 0:
             raise SandboxNotFoundError(sandbox_id)
-        if not spec.owns(json.loads(out) or {}):
+        labels = json.loads(out) or {}
+        if not spec.owns(labels):
             raise SandboxError("the sandbox belongs to another session")
+        if spec.outdated(labels):
+            await DockerSandbox(sandbox_id).kill()
+            raise SandboxOutdatedError(sandbox_id)
         code, _, err = await _docker("start", sandbox_id)
         if code != 0:
             raise _failed("docker start", err)

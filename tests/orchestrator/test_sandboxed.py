@@ -279,6 +279,37 @@ async def test_another_worker_finds_the_sandbox_in_the_directory(
     await first.close_sandboxes(kill=True)
 
 
+async def test_a_deploy_with_a_new_template_replaces_the_session_sandbox(
+    provider: CountingProvider,
+) -> None:
+    """A control plane of a new commit does not resume a sandbox with the runner of the old
+    commit (Section 16.2). It removes that sandbox and creates one from its own template."""
+    directory = DictDirectory()
+    old, new = (
+        SandboxedRuntime(
+            kind=RuntimeKind.FAKE,
+            provider=provider,
+            signer=RunTokenSigner(KEY),
+            settings=SandboxSettings(template=template, runner_argv=RUNNER),
+            directory=directory,
+        )
+        for template in ("sama-runner-old", "sama-runner-new")
+    )
+    old.fake_scripts.append(_reply("ok"))
+    await collect(old.run(_request(make_scope("run-1"))))
+    first = old.sandbox_id("org-1", "sess-1")
+    assert first is not None
+    new.fake_scripts.append(_reply("ok"))
+    events = await collect(new.run(_request(make_scope("run-2"))))
+    assert isinstance(events[-1], RunCompleted)
+    assert provider.creates == 2
+    second = new.sandbox_id("org-1", "sess-1")
+    assert second not in (None, first)
+    assert directory.ids == {("org-1", "sess-1"): second}
+    assert await old.session_sandbox("org-1", "sess-1") is None, "the old sandbox is removed"
+    await new.close_sandboxes(kill=True)
+
+
 async def test_a_directory_error_does_not_fail_the_run(provider: CountingProvider) -> None:
     runtime = SandboxedRuntime(
         kind=RuntimeKind.FAKE,

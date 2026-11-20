@@ -38,6 +38,11 @@ class SandboxNotFoundError(SandboxError):
     """The provider has no sandbox with this id. The caller creates a new sandbox."""
 
 
+class SandboxOutdatedError(SandboxNotFoundError):
+    """The sandbox was made from another template, so its runner can be of another version.
+    The provider removed it, and the caller creates a new sandbox (Section 16.2)."""
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxSpec:
     """What the orchestrator asks for. ``allow_out`` is the egress allowlist (host names).
@@ -65,7 +70,12 @@ class SandboxSpec:
 
     def labels(self) -> dict[str, str]:
         """Provider labels. Sama keys win over ``metadata``, so a caller cannot change them."""
-        return {**self.metadata, "sama.org_id": self.org_id, "sama.session_id": self.session_id}
+        return {
+            **self.metadata,
+            "sama.org_id": self.org_id,
+            "sama.session_id": self.session_id,
+            "sama.template": self.template,
+        }
 
     def owns(self, labels: Mapping[str, str]) -> bool:
         """True if a sandbox with these labels belongs to the org and session of this spec."""
@@ -73,6 +83,11 @@ class SandboxSpec:
             labels.get("sama.org_id") == self.org_id
             and labels.get("sama.session_id") == self.session_id
         )
+
+    def outdated(self, labels: Mapping[str, str]) -> bool:
+        """True if a sandbox with these labels was made from another template. A sandbox from
+        before this label is outdated too, because nothing tells its runner version."""
+        return labels.get("sama.template") != self.template
 
 
 @dataclass(frozen=True, slots=True)

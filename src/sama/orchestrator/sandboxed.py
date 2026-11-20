@@ -63,6 +63,7 @@ from sama.sandbox.base import (
     Sandbox,
     SandboxError,
     SandboxNotFoundError,
+    SandboxOutdatedError,
     SandboxProcess,
     SandboxProvider,
     SandboxSpec,
@@ -351,6 +352,12 @@ class SandboxedRuntime:
             if known is not None:
                 try:
                     sandbox = await self._provider.resume(known, spec)
+                except SandboxOutdatedError:
+                    log.warning(
+                        "the session sandbox is from another template; creating a new one"
+                        " sandbox=%s",
+                        known,
+                    )
                 except SandboxNotFoundError:
                     log.warning("the session sandbox is gone; creating a new one sandbox=%s", known)
             if sandbox is None:
