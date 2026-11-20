@@ -178,7 +178,11 @@ def build(
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
     # index alone (Section 7.1).
-    embedder = OpenAIEmbedder(keys) if keys.available(SecretName.OPENAI_API_KEY) else None
+    embedder = (
+        OpenAIEmbedder(keys, redactor=default_redactor())
+        if keys.available(SecretName.OPENAI_API_KEY)
+        else None
+    )
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),

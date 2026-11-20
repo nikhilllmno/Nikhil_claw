@@ -53,7 +53,7 @@ def _embedder(vault: Vault | None) -> OpenAIEmbedder | None:
     if not keys.available(SecretName.OPENAI_API_KEY):
         log.warning("there is no OpenAI key, so session search has no meaning search")
         return None
-    return OpenAIEmbedder(keys)
+    return OpenAIEmbedder(keys, redactor=default_redactor())
 
 
 def build_app(store_kind: str) -> Starlette:
