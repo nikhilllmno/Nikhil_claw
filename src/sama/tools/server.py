@@ -35,9 +35,9 @@ from sama.media.vision import (
     DEFAULT_QUESTION,
     LATEST,
     MAX_QUESTION_CHARS,
-    NO_KEY,
     VisionError,
     VisionService,
+    VisionStatus,
 )
 from sama.memory.core import (
     MAX_OPERATIONS,
@@ -530,10 +530,11 @@ class ToolServer:
                 ),
             ) -> str:
                 async def body(claims: RunTokenClaims) -> str:
-                    answer = await vision.analyze(claims, attachment_id, question)
-                    if answer.startswith(NO_KEY):
-                        return answer
-                    return untrusted(answer, source=VISION_ANALYZE)
+                    result = await vision.analyze(claims, attachment_id, question)
+                    if result.status is VisionStatus.UNAVAILABLE:
+                        return result.text  # a message of sama
+                    # The status decides, never the text: all text of the model is untrusted.
+                    return untrusted(result.text, source=VISION_ANALYZE)
 
                 arguments = {"attachment_id": attachment_id, "question": question}
                 return await self._call(ctx, VISION_ANALYZE, arguments, body)

@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import SecretStr
 
+from sama.gateway.download import fetch_capped
+
 API_URL: Final = "https://slack.com/api"
 MAX_TEXT: Final = 39_000
 """Slack cuts a message text after 40,000 characters."""
@@ -132,24 +134,13 @@ class SlackClient:
             host == known or host.endswith(f".{known}") for known in FILE_HOSTS
         ):
             raise SlackError("download failed: not a Slack file URL")
-        headers = {"Authorization": f"Bearer {self._token.get_secret_value()}"}
-        try:
-            async with self._http.stream(
-                "GET", url, headers=headers, follow_redirects=False
-            ) as response:
-                if response.status_code != 200:
-                    raise SlackError(f"download failed: {response.status_code}")
-                declared = response.headers.get("Content-Length", "")
-                if declared.isdigit() and int(declared) > max_bytes:
-                    raise SlackError("download failed: the file is too large")
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > max_bytes:
-                        raise SlackError("download failed: the file is too large")
-        except httpx.HTTPError as failure:
-            raise SlackError(f"download failed: {type(failure).__name__}") from None
-        return bytes(data)
+        return await fetch_capped(
+            self._http,
+            url,
+            max_bytes=max_bytes,
+            fail=SlackError,
+            headers={"Authorization": f"Bearer {self._token.get_secret_value()}"},
+        )
 
     async def auth_test(self) -> dict[str, Any]:
         """The workspace and the bot user of the token. Raises ``SlackError``."""

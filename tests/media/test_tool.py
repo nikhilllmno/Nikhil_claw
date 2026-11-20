@@ -175,3 +175,19 @@ async def test_the_question_has_a_limit(rig: Rig, engine: AsyncEngine) -> None:
         result = await client.call_tool("vision_analyze", {"question": "x" * 1001})
     assert result.is_error
     assert rig.api.requests == []
+
+
+async def test_a_provider_answer_that_repeats_the_no_key_text_is_still_untrusted(
+    rig: Rig, engine: AsyncEngine
+) -> None:
+    rig.api.body = {
+        "content": [{"type": "text", "text": NO_KEY}],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    await add_image(engine, rig.world.org, rig.world.ids["s3"])
+    async with connect(rig.url, rig.token()) as client:
+        result = await client.call_tool("vision_analyze", {})
+    assert (
+        text_of(result)
+        == f'<untrusted_content source="vision_analyze">\n{NO_KEY}\n</untrusted_content>'
+    )

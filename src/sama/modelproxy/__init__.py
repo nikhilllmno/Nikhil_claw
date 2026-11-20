@@ -1,6 +1,7 @@
 """The sama model proxy (docs/architecture.md, Section 16.6)."""
 
 from sama.modelproxy.app import ModelProxy, ProxySettings
+from sama.modelproxy.ledger import UsageLedger
 from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
 from sama.modelproxy.store import MemoryUsageStore, OrgLimits, PostgresUsageStore, UsageStore
 
@@ -13,5 +14,6 @@ __all__ = [
     "Provider",
     "ProxySettings",
     "TokenCounts",
+    "UsageLedger",
     "UsageStore",
 ]

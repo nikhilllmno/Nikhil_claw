@@ -43,6 +43,7 @@ from sama.media.store import AttachmentStore
 from sama.media.vision import VisionService
 from sama.memory import MemoryService, PostgresMemoryStore
 from sama.modelproxy.app import ModelProxy, ProxySettings
+from sama.modelproxy.ledger import UsageLedger
 from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import PostgresUsageStore
 from sama.observability.alerts import ErrorRateAlerter, SlackWebhook
@@ -186,6 +187,8 @@ def build(
         else None
     )
     usage = PostgresUsageStore(engine)
+    # One ledger for every spender of model money: a record that fails to write fences them all.
+    ledger = UsageLedger(usage)
     prices = PriceTable.load()
     tools = ToolServer(
         signer=signer,
@@ -209,6 +212,7 @@ def build(
                 prices=prices,
                 model=settings.vision_model,
                 redactor=default_redactor(),
+                ledger=ledger,
             )
             if keys.available(SecretName.ANTHROPIC_API_KEY)
             else None
@@ -223,6 +227,7 @@ def build(
             anthropic_key=settings.anthropic_key, openai_key=settings.openai_key
         ),
         keys=keys,
+        ledger=ledger,
     )
     hub = (
         TelegramHub(engine, vault, keys=keys, gate=gate, skills=library)

@@ -1851,6 +1851,11 @@ The code is in `src/sama/media/`.
 - The gateway checks the size limit before it downloads (the size that the channel states) and
   while it downloads (a byte cap). The Slack download sends the bot token only to an `https`
   URL on `slack.com` or `slack-files.com`, and does not follow a redirect.
+- The byte cap counts the bytes on the wire (`sama.gateway.download`, used for Slack and
+  Telegram). The request has `Accept-Encoding: identity`. An answer with another
+  `Content-Encoding` is refused before the gateway reads a byte, so no decoder runs and a small
+  compressed file cannot grow past the cap. The gateway checks the cap before it adds a chunk,
+  so a file of exactly the limit is accepted and a file of one byte more is refused.
 - The gateway makes the id of each image first, so that the text can name it. `RunQueue.enqueue`
   then stores the message and its images in one transaction. A failed store leaves neither.
 
@@ -1874,15 +1879,42 @@ of the run limits its cost.
 2. It reads the Anthropic key of the org (the vault first, then `ANTHROPIC_API_KEY`). Without a
    key, the tool answers with a plain text that image analysis is off. This is not an error.
 3. It checks the live authority and the budget of the run, the monthly limit of the org, and
-   the daily limit of the user, as the model proxy does (Section 16.6). It fails closed.
+   the daily limit of the user, as the model proxy does (Section 16.6). It fails closed. First
+   it tries again to write the records that the shared ledger holds. If the ledger still holds
+   a record of the org, the tool refuses the call (see "Accounting" below).
 4. It sends the image (base64) and the question to the Anthropic Messages API, with a limit of
    1,024 answer tokens and a time limit of 45 seconds. The question goes through the redactor
    first. The system text says that text in an image is data.
 5. It records the call in `model_calls` (provider `anthropic`, endpoint `messages`), so the
    cost counts for the run, the user, and the org.
-6. The answer is untrusted content (Section 16.5): it goes in an
+6. The answer goes through the redactor as a whole, and only then is it cut to 8,000
+   characters. So a secret that crosses the cut cannot leave as a partial value. The answer is
+   untrusted content (Section 16.5): it goes in an
    `<untrusted_content source="vision_analyze">` block, and the redactor reads it like the
    result of every tool.
+
+The service gives the tool a result with a status, `ok` or `unavailable`. Only the status
+decides how the tool shows the text. `unavailable` (no key) is plain text. Each text from the
+provider is always in the untrusted block, also when it is equal to the no-key text.
+
+**Accounting.** Each call is paid, also when the caller goes away.
+
+- Each call has its own `call_id`. The provider call and the write of its record run in one task
+  that a cancel of the caller does not stop (`asyncio.shield`). A cancel of the run, a time
+  limit, or a stop of the tool server cannot lose the record.
+- The record has the real usage of the answer. It has an estimate (`usage_estimated`) if the
+  caller is cancelled, the call times out, the connection breaks after the request was sent, or
+  a `200` answer has no usage. The estimate has `status_code` 0 (no answer) or 200. The input of
+  the estimate is a fixed 8,000 tokens for the image, plus the text bytes divided by 2. The
+  output is the limit of 1,024 tokens. The estimate does not use the bytes of the image, because
+  that would give millions of tokens for a base64 string.
+- A request that never reached the provider (a connect error or a pool time-out) has no record,
+  because it cost nothing. A status other than 200 has no record either.
+- The write is tried 3 times with the same `call_id`, so a retry cannot count a call twice. If
+  all tries fail, the ledger fences the org. New calls of that org (of the model proxy and of
+  `vision_analyze`) are refused until a later write succeeds. The budget check fails closed.
+- On `aclose`, the open calls get 5 seconds. The service cancels the rest, and each of them
+  writes an estimate before the http client closes.
 
 A failure of the model call becomes a short text without the key, the URL, or the body of the
 provider: busy (`429`), refused key (`401`, `403`), bad image (`400`, `413`), no answer in time,
@@ -1909,6 +1941,18 @@ or not available.
 - A7. The Anthropic key of the org pays for the call. An org with no key has no image analysis.
 - A8. The agent profile of an existing org keeps its own toolset list. Only the default list
   gets `media`. An admin adds `media` to a changed list.
+- A9. The fence is in memory. A restart of the control plane loses the list of records that were
+  not written, the same as for the model proxy. A durable queue is in the backlog (Section
+  16.6).
+- A10. A cancelled call is charged with an estimate that is higher than the usual cost of a
+  description. We prefer to count too much than too little. The estimate of 8,000 image tokens
+  is a fixed allowance for all images.
+- A11. A call that fails after the provider read the request (a time-out, a broken connection)
+  is charged with the estimate, because the provider can have counted it. A connect error is not
+  charged.
+- A12. The download code reads with the decoder of the http client, but it refuses every encoded
+  answer first. So the code cannot decode. A server that sends only compressed files gives a
+  failed download, and the sender sees the usual short answer.
 
 ---
 
@@ -2529,7 +2573,9 @@ the request (64,000 tokens if the request has none). The seen counts stay if the
 same record does nothing, so a retry cannot count a call twice. The proxy tries a record
 write 3 times. If all fail, it keeps the record in memory and refuses new calls of that org
 with `503`. The next call of any org tries the write again, under a lock. The record stays
-in the block list until its write succeeds.
+in the block list until its write succeeds. The model proxy and `vision_analyze` share one
+`UsageLedger` (`sama.modelproxy.ledger`) in the control plane. So a record that one of them
+cannot write blocks new calls of that org in both (Section 11.7).
 
 **Stop.** When the proxy stops, open streams get 5 seconds to end. Then each pump stops
 reading and writes its record, with an estimate if the usage is not final. The proxy builds

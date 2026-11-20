@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import uuid
 from types import SimpleNamespace
@@ -216,4 +217,56 @@ async def test_a_failed_download_is_a_slack_error_without_the_url() -> None:
     with pytest.raises(SlackError, match="download failed: ConnectError") as error:
         await client.download(FILE, max_bytes=100)
     assert "files.slack.com" not in str(error.value)
+    await client.aclose()
+
+
+async def test_a_download_asks_for_identity_encoding_and_refuses_another() -> None:
+    seen: list[httpx.Request] = []
+
+    def gzipped(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, content=gzip.compress(b"x" * 5_000), headers={"Content-Encoding": "gzip"}
+        )
+
+    client = _downloader(gzipped)
+    with pytest.raises(SlackError, match="encoded"):
+        await client.download(FILE, max_bytes=100_000)
+    assert seen[0].headers["Accept-Encoding"] == "identity"
+    await client.aclose()
+
+
+async def test_a_compressed_bomb_never_grows_past_the_cap() -> None:
+    sent: list[int] = []
+
+    def bomb(request: httpx.Request) -> httpx.Response:
+        async def chunks() -> Any:
+            for _ in range(1_000):
+                sent.append(1)
+                yield b"x" * 1_000
+
+        return httpx.Response(200, content=chunks())
+
+    client = _downloader(bomb)
+    with pytest.raises(SlackError, match="too large"):
+        await client.download(FILE, max_bytes=2_500)
+    assert len(sent) <= 3 + 1, "the read stops at the cap"
+    await client.aclose()
+
+
+async def test_the_cap_is_checked_before_a_chunk_is_added() -> None:
+    def body(size: int) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"x" * size, headers={"Content-Encoding": "identity"}
+            )
+
+        return handler
+
+    client = _downloader(body(100))
+    assert len(await client.download(FILE, max_bytes=100)) == 100
+    await client.aclose()
+    client = _downloader(body(101))
+    with pytest.raises(SlackError, match="too large"):
+        await client.download(FILE, max_bytes=100)
     await client.aclose()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from typing import Any
 
@@ -272,3 +273,59 @@ async def test_the_outbox_checks_the_link_again_after_a_wait() -> None:
     with pytest.raises(TelegramError):
         await _Outbox(client(always), 5, linked, max_tries=3).send_message("x")
     assert len(always.calls) == 3
+
+
+async def test_the_telegram_download_refuses_an_encoded_answer_and_a_bomb() -> None:
+    seen: list[httpx.Request] = []
+    info = {"getFile": {"ok": True, "result": {"file_path": "voice/a.oga", "file_size": 3}}}
+
+    class Encoded(Recorder):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            if "/file/" in request.url.path:
+                seen.append(request)
+                return httpx.Response(
+                    200, content=gzip.compress(b"x" * 5_000), headers={"Content-Encoding": "gzip"}
+                )
+            return super().__call__(request)
+
+    with pytest.raises(TelegramError, match="encoded"):
+        await client(Encoded(info)).download("f1", max_bytes=100_000)
+    assert seen[0].headers["Accept-Encoding"] == "identity"
+
+    sent: list[int] = []
+
+    class Bomb(Recorder):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            if "/file/" not in request.url.path:
+                return super().__call__(request)
+
+            async def chunks() -> Any:
+                for _ in range(1_000):
+                    sent.append(1)
+                    yield b"x" * 1_000
+
+            return httpx.Response(200, content=chunks())
+
+    with pytest.raises(TelegramError, match="too large"):
+        await client(Bomb(info)).download("f1", max_bytes=2_500)
+    assert len(sent) <= 4, "the read stops at the cap"
+
+
+async def test_the_telegram_download_cap_is_exact() -> None:
+    for size, ok in ((10, True), (11, False)):
+
+        class Sized(Recorder):
+            body = b"x" * size
+
+            def __call__(self, request: httpx.Request) -> httpx.Response:
+                if "/file/" in request.url.path:
+                    return httpx.Response(200, content=self.body)
+                return super().__call__(request)
+
+        info = {"getFile": {"ok": True, "result": {"file_path": "v", "file_size": 1}}}
+        tg = client(Sized(info))
+        if ok:
+            assert len(await tg.download("f1", max_bytes=10)) == 10
+        else:
+            with pytest.raises(TelegramError, match="too large"):
+                await tg.download("f1", max_bytes=10)

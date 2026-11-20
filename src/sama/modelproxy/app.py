@@ -20,13 +20,13 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Final
 
-import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, SecretStr
 from starlette.types import Receive, Scope, Send
 
+from sama.modelproxy.ledger import UsageLedger
 from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
 from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
 from sama.modelproxy.usage import Endpoint, UsageReader, estimate_counts
@@ -221,9 +221,13 @@ class ModelProxy:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         transport: httpx.AsyncBaseTransport | None = None,
         keys: OrgKeys | None = None,
+        ledger: UsageLedger | None = None,
     ) -> None:
         """``keys`` gives the provider key of each org (the vault, Section 16.3). Without
-        it, or when an org has no key, the proxy uses the keys of ``settings``."""
+        it, or when an org has no key, the proxy uses the keys of ``settings``.
+
+        ``ledger`` writes the call records. Give the same ledger to every part that spends
+        model money (``vision_analyze``), so that a failed write fences all of them."""
         self._signer = signer
         self._keys = keys
         self._store = store
@@ -234,10 +238,15 @@ class ModelProxy:
         self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
         self._tasks: set[asyncio.Task[None]] = set()
         self._pumps: set[_Pump] = set()
-        self._flush_lock = asyncio.Lock()
-        self.unrecorded: list[CallRecord] = []
+        self._ledger = ledger or UsageLedger(
+            store, attempts=settings.record_attempts, retry_s=settings.record_retry_s
+        )
+
+    @property
+    def unrecorded(self) -> list[CallRecord]:
         """Records that the store did not take. They block new calls of their org until a
         write succeeds."""
+        return self._ledger.unrecorded
 
     async def aclose(self) -> None:
         """Stops the proxy. Streams in progress get ``CLOSE_WAIT_S`` to end. Then each pump
@@ -255,7 +264,7 @@ class ModelProxy:
             await asyncio.gather(*pending, return_exceptions=True)
         try:
             async with asyncio.timeout(STOP_WAIT_S):
-                await self._flush()
+                await self._ledger.flush()
         except TimeoutError:
             log.error("the last record writes did not end in time")
         for call in self.unrecorded:
@@ -409,11 +418,11 @@ class ModelProxy:
         try:
             with contextlib.suppress(httpx.HTTPError):
                 await pump.upstream.aclose()
-            if record is not None and not await self._save(record):
-                self._fence(record)
+            if record is not None:
+                await self._ledger.settle(record)
         except asyncio.CancelledError:
             if record is not None:
-                self._fence(record)
+                self._ledger.fence(record)
             raise
 
     async def _body(self, request: Request) -> tuple[dict[str, Any], int]:
@@ -464,8 +473,8 @@ class ModelProxy:
     async def _check_budget(self, claims: RunTokenClaims, authority: Authority) -> None:
         """Fails closed: a store that cannot read, or a record that the store did not take,
         refuses the call."""
-        await self._flush()
-        if any(call.org_id == claims.org_id for call in self.unrecorded):
+        await self._ledger.flush()
+        if self._ledger.blocked(claims.org_id):
             raise ProxyError(503, "api_error", "the proxy cannot record usage now")
         try:
             await self._check_limits(claims, authority)
@@ -575,39 +584,6 @@ class ModelProxy:
             duration_ms=int((time.monotonic() - request.started) * 1000),
             created_at=self._clock(),
         )
-
-    async def _save(self, call: CallRecord) -> bool:
-        for attempt in range(self._settings.record_attempts):
-            if attempt:
-                await anyio.sleep(self._settings.record_retry_s * attempt)
-            try:
-                await self._store.record(call)
-            except Exception:
-                log.exception("the call record write failed run=%s", call.run_id)
-            else:
-                return True
-        return False
-
-    def _fence(self, call: CallRecord) -> None:
-        if call in self.unrecorded:
-            return
-        self.unrecorded.append(call)
-        log.error("the call record was not written; the org is blocked run=%s", call.run_id)
-
-    async def _flush(self) -> None:
-        """Tries again to write the records that the store did not take. A record stays in
-        ``unrecorded``, so it blocks its org, until its write succeeds. The record id makes a
-        second write of the same record harmless."""
-        if not self.unrecorded:
-            return
-        async with self._flush_lock:
-            for call in list(self.unrecorded):
-                try:
-                    await self._store.record(call)
-                except Exception:
-                    log.exception("the call record write failed again run=%s", call.run_id)
-                    continue
-                self.unrecorded.remove(call)
 
 
 def _allowed(body: Mapping[str, Any], key: str, values: frozenset[str]) -> None:
