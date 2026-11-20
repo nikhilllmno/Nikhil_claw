@@ -18,7 +18,16 @@ from sqlalchemy.sql.dml import ReturningInsert
 from sama.db.models import AgentProfile, Membership, Org, User, Workspace
 
 DEFAULT_MODEL: Final = "claude-sonnet-5-5"
-DEFAULT_TOOLSETS: Final = ("core", "todo", "web", "clarify", "github", "memory", "skills")
+DEFAULT_TOOLSETS: Final = (
+    "core",
+    "todo",
+    "web",
+    "clarify",
+    "github",
+    "memory",
+    "skills",
+    "sessions",
+)
 
 
 class BootstrapError(ValueError):

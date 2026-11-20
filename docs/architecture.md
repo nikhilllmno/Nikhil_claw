@@ -715,12 +715,135 @@ Rules:
 - **Cross-channel continuity**: a user can continue a session from another channel with
   `/resume <id>` or a session link.
 - **Search**: `session_search` uses Postgres full-text search plus pgvector embeddings,
-  filtered to sessions that the user can see. It returns redacted snippets with links and
-  makes no LLM call (Hermes design). The agent can then load one session summary.
+  filtered to sessions that the user can see. It returns redacted snippets and makes no LLM
+  call (Hermes design). `session_read` then loads the messages of one session. Section 7.1
+  has the design (M2.5).
 - **Titles and summaries**: a small model writes a title after the first turn and a summary
   when the session goes idle. Summaries feed session search and the background review.
 - **Retention**: per-org setting. Default: keep everything. Delete removes rows and sandbox
   data.
+
+### 7.1 Session search (M2.5)
+
+The agent uses `session_search` when the user refers to earlier work, and `session_read` to
+load the messages of a session that the search found. Neither tool calls an LLM.
+
+**Index.** Migration `0014` makes the `vector` extension (pgvector) and changes two tables
+(Section 17.1).
+
+- `messages.search_vector` is a generated `tsvector` column with a GIN index. It covers the
+  first 100,000 characters of the message text. It uses the `simple` configuration, so words
+  stay as they are and the index works for every language. No stemming and no stop words.
+- `message_embeddings` has one row for each embedded message: `embedding` (`vector(1536)`),
+  `model`, and the keys of the message. A composite foreign key on `(org_id, session_id,
+  message_id)` makes the row point to a message of its own session and org. An HNSW index
+  with cosine distance covers `embedding`. RLS gives a member the rows of the sessions that
+  the member can see (`sama_private.can_read_session`). No policy allows writes.
+- `messages.embedded_at` is null until the embed worker has handled the message. A partial
+  index on the null rows keeps the work queue small.
+
+**Migration lock.** `search_vector` is a stored generated column. `ALTER TABLE ... ADD COLUMN`
+with a stored expression rewrites the whole `messages` table, and it holds an `ACCESS
+EXCLUSIVE` lock until the rewrite ends. The GIN index build adds to this time. A large
+deployment must run migration `0014` in a maintenance window, with the control plane and the
+tool servers stopped. A small database needs seconds.
+
+**Embed worker.** `EmbedWorker` (`src/sama/search/embed.py`) is a loop of the control plane.
+It runs only if an OpenAI key is available (the vault or `OPENAI_API_KEY`, as for voice notes
+and the model proxy). It takes the oldest messages with no `embedded_at`, 64 at a time, and
+calls the OpenAI embeddings endpoint (`text-embedding-3-small`, 1,536 dimensions) with the key
+of the org. The input is the first 6,000 characters of the redacted text (see "Redaction
+order"). The rows and `embedded_at` go in one transaction.
+
+- A message with no text, or with the role `system` or `tool`, gets `embedded_at` and no
+  embedding.
+- An org without a key waits. The worker skips its messages for 10 minutes, so one org
+  without a key does not block the others. With a key later, the worker embeds the old
+  messages too, because they still have no `embedded_at`.
+- A request that the provider refuses (a 4xx other than 401, 403, 408, and 429) is tried one
+  message at a time. The message that fails gets `embedded_at` and no embedding.
+- A network error, a 401, 403, 408, 429, or a 5xx puts only the org of the call on a backoff,
+  5 seconds doubled for each failure up to 5 minutes. Nothing is marked. The query for
+  pending messages skips an org that waits, and the worker goes on with the other orgs in
+  the same pass. So the failing key of one org does not stop the embeddings of the others. A
+  success clears the backoff of the org.
+
+**Redaction order.** Secrets must not reach the embedding provider, the snippets, or the
+agent. Redaction runs on the complete text first. A cut, a highlight, or a mark comes after
+that, because each of them can split a secret into parts that the redactor does not know.
+
+- `OpenAIEmbedder` is the only way out of the process for the text of a message or a query.
+  It redacts each complete text, then cuts the redacted text to 6,000 characters. The worker
+  gives it the complete texts. A message that was stored before the redactor learned a
+  secret is redacted when it is embedded, not when it is stored. The search also redacts the
+  query before it calls the embedder.
+- A snippet is made from the redacted text. `ts_headline` runs on that text, and the cut to
+  20,000 characters comes after the redaction. A search for a part of a secret still finds
+  the message through the index, but the snippet shows `[REDACTED]` and not the secret. The
+  last redaction of the output stays as a second guard.
+- A vector that was stored before the redactor learned a secret still encodes that secret.
+  It cannot give the text back, and nothing returns it to the agent.
+
+**Search.** `session_search(query, limit)` runs one or two ranked lists. Each list gives
+50 messages (roles `user` and `assistant`).
+
+1. Full text: `websearch_to_tsquery('simple', query)`, ranked with `ts_rank_cd`.
+2. Meaning: only if the org has embeddings and the control plane can embed the query. The
+   query goes to the embedder (3 seconds at most). Messages rank by cosine distance, and a
+   distance over 0.7 is not a match. Without a key, after a timeout, or after an error, this
+   list is skipped and the result uses the full-text list alone. The tool does not fail.
+
+Reciprocal rank fusion (`1 / (60 + rank)` for each list, added up) joins the lists. A session
+ranks as its best message. The tool gives the best `limit` sessions (default 5, at most 10),
+each with up to two snippets. The snippet is a `ts_headline` of about 40 words, with the
+matching words between `<<` and `>>`. For a meaning match without a matching word, it is the
+start of the message. A query of more than 400 characters is refused. An empty query lists the
+latest sessions, with no snippet. The current session is not in the result.
+
+**Read.** `session_read(session_id, offset, limit)` gives the `user` and `assistant`
+messages of one session in order: 20 by default, at most 50. A message is cut to 4,000
+characters, and a page to 20,000 characters. The result says which `offset` starts the next
+page.
+
+**Fresh grants.** The query embedding is a slow call (3 seconds at most). The search makes
+the query vector first, and only then loads the grants of the user. All reads of the search
+use this fresh rule. The last step loads the titles and messages of the chosen sessions with
+the same rule, and not by id alone. So a membership that ends during the embedding call
+removes the session from the result. The ids that the ranked lists chose are never an
+authorization.
+
+**Who sees what.** Every query has the org of the run and this rule (the rule of
+Section 11.3, "Audience and principal", and `sama_private.session_visible`). The control
+plane connects as the table owner, so RLS does not protect these queries. The rule in code
+does.
+
+| Run | Sessions that it sees |
+|---|---|
+| Private (the run has a user) | `shared` sessions and the own `private` sessions, in the workspaces that the user sees (all workspaces for an org admin). The user must be an org member. |
+| Shared (no user) | `shared` sessions of its own workspace. It never sees a `private` session. |
+
+`session_read` gives the error `session not found` for a session that the run may not see, for
+a session of another org, for a session that does not exist, and for an id that is not a UUID.
+So the tool does not show which sessions exist.
+
+**Output.** The title, the snippets, and the messages are text that people and tools wrote.
+They are redacted (Section 16.3) and put in an `<untrusted_content source="session_search">`
+or `source="session_read"` block (Section 16.5).
+
+**Limits and gaps.**
+
+- The index covers the first 100,000 characters of a message. The embedding covers the first
+  6,000.
+- The HNSW index filters after the scan. With pgvector 0.8 or later, sama sets
+  `hnsw.iterative_scan = relaxed_order` for the query, so a filter that removes many rows
+  still gives enough rows. With an older pgvector, the meaning list can have fewer rows. The
+  join with the session rule keeps the result correct in both cases.
+- Embedding calls are not in `model_calls`, so the cost of embeddings is not in the budget
+  of a run.
+- The text of messages goes to OpenAI for the embedding, like the text of a model call.
+  Without a key, nothing leaves the control plane.
+- Changing the model or the dimension needs a new migration and a new `embedded_at` pass.
+- Titles and summaries are not searched yet (M2.4 makes summaries).
 
 ---
 
@@ -1097,7 +1220,7 @@ flowchart LR
 | `web` | `web_search`, `web_extract` | Sama MCP (search provider key on the control plane) |
 | `memory` | `memory` (since M2.1, Section 8.1). The snapshot goes in the prompt. | Sama MCP |
 | `skills` | `skills_list`, `skill_view`, `skill_manage` | Sama MCP |
-| `sessions` | `session_search`, `session_read` | Sama MCP |
+| `sessions` | `session_search`, `session_read` (since M2.5, Section 7.1) | Sama MCP |
 | `clarify` | `clarify` (1 to 5 questions, choices or free text, rendered per channel) | Sama MCP |
 | `code_exec` | `execute_code` (Python that calls sama tools through a local RPC stub) | Sandbox, tools through MCP |
 | `delegation` | `delegate_task`, `delegate_status` | Sama MCP |
@@ -2375,6 +2498,8 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `web_extract(urls)` | Gets 1 to 5 pages through the outbound client (Section 16.4) and returns their text. HTML becomes plain text. Text, Markdown, JSON, XML, and CSV stay as they are. Other types get an error for that URL. | Nothing. |
 | `clarify(questions)` | Asks the user 1 to 5 questions. Each question has 2 to 6 choices, or none for a free answer. The call waits for the answers, at most 10 minutes. If nobody answers, the tool tells the agent to continue and state its assumptions. | A clarify broker. Without one the tool is hidden. |
 | `memory(target, action, content, old_text, operations, reason)` | Saves a short note for the next sessions (Section 8.1). `target` is `agent`, `user`, or `workspace`. `action` is `add`, `patch`, or `remove`. Give `action` or `operations` (at most 20), not both. Returns the current entries and the usage. The tool has no read action. | A memory service. Without one the tool is hidden. |
+| `session_search(query, limit)` | Searches past sessions that the run may see, by words and meaning, and returns up to 10 sessions with title, audience, times, and snippets (Section 7.1). An empty query lists the latest sessions. | A database. Without a service the tool is hidden. Meaning search needs an OpenAI key. Without one, the tool uses full text only. |
+| `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
@@ -2455,7 +2580,7 @@ migrated schema.
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
 | `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
 | `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
-| `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content` |
+| `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content`, `search_vector` (generated, GIN index) and `embedded_at` (migration `0014`, Section 7.1) |
 | `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2) |
 | `run_events` | `org_id`, `session_id`, `run_id`, `seq`, `type`, `payload` |
 | `tool_calls` | `org_id`, `session_id`, `run_id`, `call_id`, `tool_name`, `arguments`, `decision`, `status`, `result_preview` |
@@ -2471,6 +2596,7 @@ migrated schema.
 | `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
 | `integrations` | The chat apps of each org, for example its Telegram bot (migration `0011`, Section 11.6) |
 | `memories` | The notes of one scope: `org_id`, `scope` (`agent`, `user`, `workspace`), `workspace_id`, `agent_profile_id`, `user_id`, `entries` (JSON list), `revision` (migration `0012`, Section 8.1) |
+| `message_embeddings` | One embedding for each embedded message: `org_id`, `session_id`, `message_id`, `embedding` (`vector(1536)`, HNSW index), `model` (migration `0014`, Section 7.1) |
 | `memory_revisions` | One row per memory write: `org_id`, `memory_id`, `seq`, `action`, `entries`, `session_id`, `run_id`, `author_kind`, `author_user_id`, `reason`, `reverted_to` (migration `0012`, Section 8.1) |
 
 Rules:
@@ -2525,7 +2651,8 @@ Row-level security:
   gets a new revision that upgrades the existing schema and its data. Before the merge of this
   PR, `0001` was edited and the `sama` project was rebuilt with it (it had no data).
 - Tests: `tests/db/` runs the migration and the RLS tests on a local Postgres with a small
-  Supabase Auth shim (`tests/db/supabase_shim.sql`). CI runs them with a Postgres service.
+  Supabase Auth shim (`tests/db/supabase_shim.sql`). The database needs pgvector (migration
+  `0014`). CI runs them with a Postgres service from `pgvector/pgvector:pg17`.
   A live test (`-m live`) checks isolation on the Supabase project through the Data API and
   through SQL. The sama HTTP API repeats the check in code and reads with RLS (Section 11.4).
 
@@ -2651,7 +2778,7 @@ src/sama/
   sandbox/        # sandbox providers: base, e2b, docker, local, template build
   runtime/        # contract, claude adapter, openai adapter, fake, runner entry point
   tools/          # sama MCP server and tool packs (M1.8: server, web, todo, clarify, outbound)
-  memory/  skills/  sessions/  scheduler/  workflows/  browser/  approvals/
+  memory/  search/ (M2.5)  skills/  sessions/  scheduler/  workflows/  browser/  approvals/
   modelproxy/  vault/  tenancy/ (run tokens, access rules)  observability/
   controlplane/   # one process with all the services (M1.15)
   admin/          # operator commands: bootstrap (M1.15)
@@ -2712,7 +2839,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_SUPABASE_URL`, `SAMA_SUPABASE_ANON_KEY` | Yes | Sign-in (Section 11.4) |
 | `E2B_API_KEY` | Yes | The sandbox provider |
 | `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |

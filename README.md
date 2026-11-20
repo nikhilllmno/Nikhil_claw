@@ -100,10 +100,13 @@ Sama uses Supabase Postgres (architecture Section 17.1). The database tests need
 server. They create a new database, so the URL user must be able to create databases:
 
 ```bash
-docker run -d --name sama-pg -e POSTGRES_PASSWORD=sama -p 55432:5432 postgres:17
+docker run -d --name sama-pg -e POSTGRES_PASSWORD=sama -p 55432:5432 pgvector/pgvector:pg17
 export SAMA_TEST_DATABASE_URL=postgresql://postgres:sama@localhost:55432/postgres
 uv run pytest tests/db
 ```
+
+The migrations need the `vector` extension (pgvector), so use a pgvector image, as above. A
+plain `postgres` image fails at migration 0014. Supabase has the extension.
 
 Without `SAMA_TEST_DATABASE_URL` these tests are skipped. CI runs them with a Postgres service.
 

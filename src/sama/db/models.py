@@ -18,6 +18,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -33,8 +34,10 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import UserDefinedType
 
 NAMING_CONVENTION: Final = {
     "ix": "ix_%(table_name)s_%(column_0_N_name)s",
@@ -76,6 +79,12 @@ SKILL_SCOPES: Final = ("org", "workspace", "user")
 SKILL_STATUSES: Final = ("active", "archived")
 SKILL_CHANGES: Final = ("create", "patch", "edit", "write_file", "remove_file", "archive")
 SKILL_AUTHOR_KINDS: Final = ("user", "agent", "system")
+EMBEDDING_DIMENSIONS: Final = 1536
+"""The size of a message embedding: the output of ``text-embedding-3-small``
+(docs/architecture.md, Section 7.1)."""
+SEARCH_VECTOR_CHARS: Final = 100_000
+"""The full-text index covers the first characters of a message. A ``tsvector`` has a limit of
+1 MB, so the index must not take an unlimited text."""
 
 
 def _one_of(column: str, values: tuple[str, ...]) -> str:
@@ -101,6 +110,34 @@ def _created_at() -> Mapped[datetime]:
 
 def _json(default: str = "'{}'::jsonb") -> Mapped[dict[str, Any]]:
     return mapped_column(JSONB, nullable=False, server_default=text(default))
+
+
+class Vector(UserDefinedType[list[float]]):
+    """The ``vector`` type of the pgvector extension. The value in Python is a list of floats.
+    The driver gets the text form, ``[1,2,3]``, so sama needs no extra package."""
+
+    cache_ok = True
+
+    def __init__(self, dimensions: int) -> None:
+        self.dimensions = dimensions
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return f"vector({self.dimensions})"
+
+    def bind_processor(self, dialect: Any) -> Any:
+        def process(value: list[float] | None) -> str | None:
+            return None if value is None else "[" + ",".join(map(repr, value)) + "]"
+
+        return process
+
+    def result_processor(self, dialect: Any, coltype: Any) -> Any:
+        def process(value: str | None) -> list[float] | None:
+            return None if value is None else [float(x) for x in value.strip("[]").split(",")]
+
+        return process
+
+
+ischema_names["vector"] = Vector  # Reflection: the migration test compares the schema.
 
 
 class Base(DeclarativeBase):
@@ -347,7 +384,16 @@ class Message(Base):
         ),
         ForeignKeyConstraint(["org_id", "author_user_id"], ["users.org_id", "users.id"]),
         CheckConstraint(_one_of("role", MESSAGE_ROLES), name="role"),
+        # Lets a message embedding prove that its message belongs to its session.
+        UniqueConstraint("org_id", "session_id", "id"),
         Index(None, "session_id", "seq"),
+        # Session search (migration 0014, Section 7.1).
+        Index("ix_messages_search_vector", "search_vector", postgresql_using="gin"),
+        Index(
+            "ix_messages_embed_pending",
+            "created_at",
+            postgresql_where=text("embedded_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -359,6 +405,19 @@ class Message(Base):
     author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     content: Mapped[dict[str, Any]] = _json()
     created_at: Mapped[datetime] = _created_at()
+    search_vector: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed(
+            f"to_tsvector('simple', left(coalesce(content->>'text', ''), {SEARCH_VECTOR_CHARS}))",
+            persisted=True,
+        ),
+        deferred=True,
+    )
+    """The full-text index of the message text. The ``simple`` configuration keeps words as
+    they are, so it works for every language."""
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the embed worker handled the message. Null: not yet. The worker also sets it for a
+    message that it skips, for example an empty one (Section 7.1)."""
 
 
 class RunEvent(Base):
@@ -1034,4 +1093,35 @@ class MemoryRevision(Base):
     """The person. For an ``agent`` write: the user of the run, if there is one."""
     reason: Mapped[str | None] = mapped_column(Text)
     reverted_to: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class MessageEmbedding(Base):
+    """The embedding of the text of one message, for the meaning part of session search
+    (docs/architecture.md, Section 7.1). The embed worker of the control plane writes it. The
+    tool never writes it."""
+
+    __tablename__ = "message_embeddings"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "message_id"],
+            ["messages.org_id", "messages.session_id", "messages.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("org_id", "message_id"),
+        Index(None, "org_id", "session_id"),
+        Index(
+            "ix_message_embeddings_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = _created_at()

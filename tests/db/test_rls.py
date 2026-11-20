@@ -25,6 +25,7 @@ TABLES = sorted(Base.metadata.tables)
 SESSION_CHILDREN = (
     "runs",
     "messages",
+    "message_embeddings",
     "run_events",
     "tool_calls",
     "session_bindings",

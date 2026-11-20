@@ -6,6 +6,8 @@ Environment:
 - ``SAMA_RUN_TOKEN_KEY``: the run token key of the control plane, at least 32 bytes.
 - ``BRAVE_API_KEY``: optional. Without it, ``web_search`` is hidden. The vault replaces this
   variable in M1.17.
+- ``OPENAI_API_KEY``: optional. Without it and without a vault key of the org,
+  ``session_search`` uses the full-text index alone.
 - ``SAMA_DATABASE_URL``: used only with ``--store postgres``. Then the server also has the
   tool gate (``POST /gate``, M1.9). Without it, the runner denies every tool call.
 - ``SAMA_VAULT_KEY``: optional, used only with ``--store postgres``. It opens the vault, so that
@@ -28,6 +30,7 @@ from starlette.applications import Starlette
 
 from sama.memory import InProcessMemoryStore, MemoryService, MemoryStore, PostgresMemoryStore
 from sama.observability.logs import configure_logging
+from sama.search import OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SkillStore
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.server import ToolServer, quiet_dependency_logs
@@ -35,8 +38,22 @@ from sama.tools.todo import MemoryTodoStore, PostgresTodoStore, TodoStore
 from sama.tools.web import BraveSearch
 from sama.vault.redact import default_redactor, env_secrets
 from sama.vault.standalone import keep_redactor_current, vault_from_env
+from sama.vault.store import OrgKeys, SecretName, Vault
 
 log = logging.getLogger("sama.tools")
+
+
+def _embedder(vault: Vault | None) -> OpenAIEmbedder | None:
+    """The embedder for the meaning part of session search. The key of the org in the vault
+    comes first, then ``OPENAI_API_KEY``. Without either, the search uses the full-text index
+    alone. The embedder redacts all text with the redactor of the process, which has the
+    vault values (``keep_redactor_current``) and the variables of ``main``."""
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    keys = OrgKeys(vault, {SecretName.OPENAI_API_KEY: SecretStr(key) if key else None})
+    if not keys.available(SecretName.OPENAI_API_KEY):
+        log.warning("there is no OpenAI key, so session search has no meaning search")
+        return None
+    return OpenAIEmbedder(keys, redactor=default_redactor())
 
 
 def build_app(store_kind: str) -> Starlette:
@@ -48,6 +65,7 @@ def build_app(store_kind: str) -> Starlette:
     skills: SkillStore | None = None
     gate = None
     vault = None
+    sessions: SessionSearch | None = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
         from sama.gate.service import GateService
@@ -61,10 +79,12 @@ def build_app(store_kind: str) -> Starlette:
         skills = PostgresSkillStore(engine, BuiltinSkills().all())
         gate = GateService(engine)
         vault = vault_from_env(engine)
+        sessions = SessionSearch(engine, _embedder(vault))
     else:
         log.warning(
             "the task lists are in memory only, there is no tool gate, and the skills tools are off"
         )
+        log.warning("session search needs a database, so the session tools are hidden")
         todos = MemoryTodoStore()
         memories = InProcessMemoryStore()
     brave_key = os.environ.get("BRAVE_API_KEY", "")
@@ -79,6 +99,7 @@ def build_app(store_kind: str) -> Starlette:
         search=search,
         memory=MemoryService(memories),
         skills=skills,
+        sessions=sessions,
         gate=gate,
     )
     return server.app(around=lambda: keep_redactor_current(vault))
@@ -92,7 +113,13 @@ def main() -> None:
     args = parser.parse_args()
     configure_logging("tools")
     default_redactor().add(
-        *env_secrets("SAMA_RUN_TOKEN_KEY", "SAMA_DATABASE_URL", "BRAVE_API_KEY", "SAMA_VAULT_KEY")
+        *env_secrets(
+            "SAMA_RUN_TOKEN_KEY",
+            "SAMA_DATABASE_URL",
+            "BRAVE_API_KEY",
+            "SAMA_VAULT_KEY",
+            "OPENAI_API_KEY",
+        )
     )
     quiet_dependency_logs()
     uvicorn.run(build_app(args.store), host=args.host, port=args.port, log_config=None)

@@ -30,6 +30,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "github": frozenset({"repo_clone"}),
     "memory": frozenset({"memory"}),
     "skills": frozenset({"skills_list", "skill_view", "skill_manage"}),
+    "sessions": frozenset({"session_search", "session_read"}),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet."""
@@ -56,6 +57,8 @@ DEFAULT_ALLOW: Final = frozenset(
         "skills_list",
         "skill_view",
         "skill_manage",
+        "session_search",
+        "session_read",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy

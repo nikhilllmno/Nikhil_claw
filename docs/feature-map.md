@@ -100,7 +100,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | SQLite `state.db` with FTS5 | `hermes_state.py`, `persistence/` | Postgres tables `sessions`, `messages`, `tool_calls`, `runs`, `run_events` with RLS (§7). | Adapt | M1 |
 | Session per chat, survives restarts | `gateway/session.py` | `session_bindings` map a channel thread to a session. | Adapt | M1 |
 | `/new`, `/reset`, `/resume`, `/title`, `/branch` | `hermes_cli/commands.py` | Same commands in all channels. Branch creates a child session (lineage). | Adapt | M1 |
-| `session_search` | `tools/session_search_tool.py` | Postgres full-text plus pgvector. No LLM call in the tool (§7). | Adapt | M2 |
+| `session_search` | `tools/session_search_tool.py` | Postgres full-text plus pgvector. No LLM call in the tool (§7.1). | Adapt | M2 (M2.5 done) |
 | Session lineage after compression | `agent/context_compressor*.py` | Parent and child sessions with the archived transcript (§6.2). | Adapt | M2 |
 | Queue, interrupt, steer while busy | `gateway/session_*.py` | New message while a run is busy: queue by default, `/stop` cancels, `/steer` adds a note to the running turn. | Adapt | M3 |
 | Cross-platform handoff (`/handoff`) | `gateway/` | A session can bind to more than one channel. `/handoff telegram` moves replies. | Adapt | M3 |
