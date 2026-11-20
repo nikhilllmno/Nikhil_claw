@@ -257,7 +257,8 @@ def test_a_client_that_closes_at_once_leaves_no_runner(tmp_path: Path, socket_pa
         _wait_until(lambda: not _in_folder(work), timeout_s=5)
     finally:
         os.close(stdin_write)
-    assert len(warm_servers(socket_path)) == 1
+    # The watcher is a fork of the server (same command line), and it ends after the runner.
+    _wait_until(lambda: len(warm_servers(socket_path)) == 1, timeout_s=5)
 
 
 def test_a_lost_reply_does_not_run_the_job_again(
@@ -271,9 +272,16 @@ def test_a_lost_reply_does_not_run_the_job_again(
         def take() -> None:
             conn, _ = server.accept()
             with conn:
-                _, fds, _, _ = socket.recv_fds(conn, 65536, 3)
+                # Read the whole request (the environment can be large), then drop the link.
+                data, fds, _, _ = socket.recv_fds(conn, 65536, 3)
                 for fd in fds:
                     os.close(fd)
+                (size,) = warm._HEADER.unpack_from(data)
+                while len(data) < warm._HEADER.size + size:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
 
         thread = threading.Thread(target=take)
         thread.start()
