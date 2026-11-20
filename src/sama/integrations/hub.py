@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.db.models import Integration
 from sama.gate.service import GateService
 from sama.gateway.pairing import Lockout
+from sama.gateway.sessions import wait_for_tasks
 from sama.gateway.telegram import TelegramBot, TelegramGateway, TelegramSettings
 from sama.gateway.telegram_client import TelegramClient, bot_id
 from sama.gateway.transcribe import OpenAITranscriber, Transcriber
@@ -103,8 +104,7 @@ class GatewayCache[E: _Entry]:
         """Waits for the background work of all gateways (for tests)."""
         for bot in list(self._bots.values()):
             await bot.gateway.drain()
-        while self._retiring:
-            await asyncio.gather(*list(self._retiring), return_exceptions=True)
+        await wait_for_tasks(self._retiring)
 
     async def aclose(self) -> None:
         for task in list(self._retiring):

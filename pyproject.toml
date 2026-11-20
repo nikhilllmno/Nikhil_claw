@@ -80,6 +80,9 @@ testpaths = ["tests"]
 addopts = "-q --strict-markers"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Prints the stacks of all threads when one test runs longer (tests/conftest.py has the time
+# limit that fails the test).
+faulthandler_timeout = 300
 markers = [
     "live: calls a real external service. Runs only with SAMA_LIVE_TESTS=1.",
 ]

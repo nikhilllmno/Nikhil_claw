@@ -49,6 +49,7 @@ from sama.gateway.sessions import (
     new_session,
     send_ending,
     stop_runs,
+    wait_for_tasks,
 )
 from sama.gateway.telegram_client import TelegramClient, TelegramError
 from sama.gateway.transcribe import TranscribeError, Transcriber
@@ -292,8 +293,7 @@ class TelegramGateway:
 
     async def drain(self) -> None:
         """Waits for the background work (for tests)."""
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        await wait_for_tasks(self._tasks)
 
     async def aclose(self) -> None:
         for task in list(self._tasks):
