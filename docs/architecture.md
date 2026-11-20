@@ -297,6 +297,12 @@ older queued run, with `FOR UPDATE SKIP LOCKED`. The run becomes `running` with 
 A new run gets the runtime state of the last completed run of the session with the same
 runtime, so the adapter continues the session (Section 5.1).
 
+**Review runs (M2.4).** A run has a kind: `chat` or `review` (migration `0016`). A review run is
+queued by sama and not by a person. The claim treats the two kinds in this way: a chat run goes
+before a review run, a chat run waits only for older chat runs, and a review run waits for every
+queued chat run of its session. The runtime state, the rate limit, the chat run list, and the
+event stream of the API count chat runs only. Section 9.4 has the design.
+
 **Lease.** While the run streams, the worker extends the lease every third of the lease time.
 Each write (events, the result) checks that the worker still holds the lease of this attempt:
 the same `lease_owner`, the same `attempts` value, and a lease that did not expire. Thus an old
@@ -720,6 +726,7 @@ Rules:
   has the design (M2.5).
 - **Titles and summaries**: a small model writes a title after the first turn and a summary
   when the session goes idle. Summaries feed session search and the background review.
+  Summaries are not in M2.4: the review reads the transcript (Section 9.4).
 - **Retention**: per-org setting. Default: keep everything. Delete removes rows and sandbox
   data.
 
@@ -978,8 +985,9 @@ The memory row, the revision, and the audit row are one transaction (`after` hoo
   admin approve it come in M3.2.
 - The `user` target works in private sessions only. A person edits their own notes in the API.
 - Any user who can see the workspace can edit the `agent` notes in the API, like the tool.
-- Unattended and delegated runs cannot write. The background review (M2.4) needs an explicit
-  exception.
+- Unattended and delegated runs cannot write. The only exception is the background review
+  (M2.4, Section 9.4): in a private session it writes the `user` target, and it proposes
+  `agent` and `workspace` writes as approvals. It never writes them directly.
 - Migration `0012` adds `memory` to the toolsets of profiles that have exactly the old default
   toolsets. New profiles get it from `DEFAULT_TOOLSETS`. The gate allows `memory` by default,
   because the tool checks the rules itself.
@@ -1171,6 +1179,125 @@ flowchart LR
    becomes active.
 6. **Learn on request.** `/learn <url or topic>` makes the agent read sources and write a
    skill.
+
+### 9.4.1 Background review (M2.4)
+
+Code: `src/sama/review/`. Migration `0016`.
+
+**Counters and trigger.** Each session has `review_user_turns` and `review_tool_iterations`.
+When a `chat` run completes, `after_completed_run` adds 1 user turn and the number of
+`tool_call_started` events of the run, in one atomic UPDATE that locks the session row. If a
+counter is 10 or more, sama queues one run of kind `review`, sets both counters to 0, and sets
+`review_cursor_seq` to the highest message sequence of the session. Failed and cancelled runs
+and review runs do not count, so a review cannot start a review (recursion is off).
+
+**Limits of the queue.** The partial unique index `ix_runs_one_queued_review_per_session` allows
+one queued review for each session. The index `ix_runs_one_active_per_session` allows one running
+review. If a review waits when the next trigger fires, sama extends the range of the waiting
+review and does not make a second one.
+
+**Review run.** The run is unattended, has no user, and writes no message. Its input is a
+transcript of the messages after `review_cursor_seq`, up to the stored end sequence
+(`runs.review_from_seq`, `runs.review_to_seq`). The text is redacted, each message is cut to
+2,000 characters, and the whole text to 24,000 characters (the oldest messages go first, and
+the note `[older messages are not shown]` is inside the 24,000). One message that is too long
+alone is cut too. Each tool name is redacted and cut to 64 characters, and the line of the tools
+of a turn has at most 400 characters (`..., and N more)`). A header tells the model that the
+transcript is data and not instruction. The run is fresh: no runtime state, no SOUL, and no
+context files. Its only MCP server is the sama tool server, with the run token, because the
+`memory` and `skill_*` tools are tools of that server. The gate denies every other tool (Section
+16.1). Its prompt has the review
+instruction, the memory snapshot, the environment, and the skill index. It is not stored on the
+session. Its toolsets are the toolsets of the profile that are also `memory` or `skills`.
+
+**Model and budget.** The model is `agent_profiles.review_model`, else a cheap default of the
+runtime (`claude-haiku-4-5`, `gpt-6-luna`, `fake-review`), else the model of the profile.
+`RunQueue(review_models=...)` can change the defaults. The budget is the lower of the profile
+budget and 10 turns, 300 seconds, and 0.50 USD. If the budget of the org, the workspace, or
+the user is already spent, sama does not queue the review and keeps the counters, so the next
+completed run tries again.
+
+**Authority.**
+
+| Write | Result |
+|---|---|
+| `user` memory, in a private session | Applies at once. |
+| User skill, in a private session | Applies at once. |
+| `agent` memory | Proposal and approval. |
+| `workspace` memory, workspace skill | Proposal and approval. |
+| Org skill | Proposal and approval. |
+
+A proposal is a row in `review_proposals` (RLS: a member reads the proposals of the sessions
+that they can read) and an `approvals` row with the call id `review:<proposal id>`. The summary is
+the `reason` of the approval. Each text in the summary is redacted in full first and cut after
+that, so a secret is never shown in part. The approver must be a workspace `admin` (an org `owner`
+counts) for `agent` and `workspace` scope, and an org `owner` for `org` scope. `always_allow` is
+ignored.
+
+The role decides, and the access to the session does not. A private session can belong to a
+person who is not an admin, and the admin cannot read that session. So the admin lists the open
+proposals with `GET /workspaces/{id}/review-proposals` (`kind`, `scope`, the redacted summary and
+proposal, and the times; no session, run, or message) and decides with
+`POST /approvals/{id}/approve` or `/deny`. `GateService.decide_approval` checks the role for a
+proposal, and the session visibility only for a normal approval. A plain member, also the owner
+of the session, cannot decide. A person who does not see the workspace gets `404`. This is done
+in the API and in the gate. The redactor can learn a secret after the proposal was stored (the
+vault stores a credential later). So each place that shows a proposal builds the view again from
+the stored payload, with the redactor of that moment: `GET /workspaces/{id}/review-proposals`,
+`GET /sessions/{id}/approvals`, and the approval cards of Telegram and Slack
+(`src/sama/review/shown.py`). The payload is redacted in full, and the summary is made from the
+redacted payload and cut after that. The stored `approvals.reason` and `approvals.arguments` of
+a proposal are never returned. It is not done with RLS on `approvals` and `review_proposals`,
+because the control plane is their only reader, and a policy for it would break the rule that
+every row of a session follows the access to the session.
+
+The `ReviewApplier` applies a decided proposal with the roles of the approver, read again at that
+time. The change, the status `applied`, and the audit entry are one transaction: the status is
+set with `UPDATE ... WHERE status = 'pending'` after the write (the `after` hook of the memory
+store and of the skill store). If the process stops before the commit, nothing is written, and
+the proposal stays `pending`, so the next call applies it once. A second caller that works at
+the same time waits, finds the proposal not `pending`, and rolls back. `rejected` and `expired`
+give `discarded`. A domain error gives `failed` with a redacted error (a second, short
+transaction, because nothing was written). The audit log has `review.proposed`,
+`review.applied`, `review.discarded`, and `review.failed`. The API applies the proposal after the
+decision, and the worker sweeps decided proposals in `maintain()`, so a repeat is safe.
+
+A skill proposal stores the scope that the review resolved, the id of the skill that it saw, and
+its version (`null` for a new skill). The apply uses that scope and does not resolve the name
+again. If the skill was archived or changed after the proposal, or is another skill now, the
+proposal is `failed` with the reason, and no other skill (for example an org skill with the same
+name) is written. The review must propose again.
+
+**Assumptions in M2.4.**
+
+- Only completed `chat` runs count. Each one is 1 user turn. A tool iteration is a
+  `tool_call_started` event.
+- A session of a delegated lineage is not reviewed. A profile with `background_review` off does
+  not count: its counters and its cursor stay as they were while the setting is off, and they
+  count again when it is turned on. A review that waits in the queue when the setting goes off
+  is cancelled when a worker claims it (`failure_code` `cancelled`), and does not block a chat
+  run. The setting is on by default.
+- A review runs only when its session is idle. A running review blocks a new chat message of the
+  same session until it ends (300 seconds at most). So in practice a session has one review at a
+  time. The database still enforces one running and one waiting review for any writer.
+- A review that reaches the budget fails with no chat message.
+- Review runs are not in the rate limit, in the runtime state of the session, in the run list, or
+  in the event stream.
+- `agent` memory needs approval, because all users of the profile share it and the review is
+  unattended.
+- The review prompt is written for sama, so `THIRD_PARTY_NOTICES.md` does not change.
+- Summaries (Section 7) are not in M2.4. They stay for a later item.
+- The downgrade of migration `0016` does not delete a review run, because the model calls of a
+  run go with the run, and the budgets of the org and the user add up these calls. It cancels the
+  review runs that are queued, running, or paused, deletes the pending approvals of the proposals,
+  and drops `review_proposals`. It also sets `runtime_state` of every review run to `NULL`,
+  because the old queue resumes a session from the newest completed run with a state and cannot
+  tell a review from a chat run. A completed or failed review run stays as an ended chat run
+  without a message.
+- An admin decides a proposal without access to the private session of its author, and sees only
+  the redacted proposal.
+- The only MCP server of a review run is the sama tool server.
+- A skill proposal that became stale is `failed`, and sama does not resolve it again.
 
 ### 9.5 Skills as slash commands (M2.3)
 
@@ -2202,6 +2329,13 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
 the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
+
+**Review runs (M2.4).** The toolsets of a `review` run are cut to `memory` and `skills` in the
+gate (step 1), so every other tool gets `deny`. The `memory` and `skill_*` tools make a proposal
+for a write that needs approval (Section 9.4). `decide_approval` checks the scope of a proposal:
+an `org` scope needs the org `owner`, and `agent` and `workspace` scope need a workspace `admin`.
+For a proposal the role decides and the access to the session does not (Section 9.4.1). It
+ignores `always_allow` for a proposal.
 
 **Code (M1.9).**
 

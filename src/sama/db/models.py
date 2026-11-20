@@ -33,6 +33,7 @@ from sqlalchemy import (
     false,
     func,
     text,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.dialects.postgresql.base import ischema_names
@@ -56,6 +57,12 @@ MESSAGE_ROLES: Final = ("user", "assistant", "system", "tool")
 RUN_STATUSES: Final = ("queued", "running", "paused", "completed", "failed", "cancelled")
 ENDED_RUN_STATUSES: Final = ("completed", "failed", "cancelled")
 RESUME_DECISIONS: Final = ("approve", "reject")
+RUN_KINDS: Final = ("chat", "review")
+"""``chat`` answers a user message. ``review`` is the background review of a session
+(docs/architecture.md, Section 9.4)."""
+PROPOSAL_KINDS: Final = ("memory", "skill")
+PROPOSAL_SCOPES: Final = ("agent", "workspace", "org")
+PROPOSAL_STATUSES: Final = ("pending", "applied", "failed", "discarded")
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
 APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
@@ -234,6 +241,10 @@ class AgentProfile(Base):
     )
     policy: Mapped[dict[str, Any]] = _json()
     budget: Mapped[dict[str, Any]] = _json()
+    background_review: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
+    """False turns the background review off for the sessions of the profile (Section 9.4)."""
+    review_model: Mapped[str | None] = mapped_column(Text)
+    """The model of the background review. ``None``: the default cheap model of the runtime."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -284,6 +295,12 @@ class Session(Base):
     """The frozen ``RunConfig`` of the session, set by the first run (Section 6.1)."""
     config_fingerprint: Mapped[str | None] = mapped_column(Text)
     """``RunConfig.fingerprint()`` of ``run_config``."""
+    review_user_turns: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The user turns that ended since the last background review (Section 9.4)."""
+    review_tool_iterations: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The tool calls that ended since the last background review (Section 9.4)."""
+    review_cursor_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    """The ``messages.seq`` up to which the last queued review reads the transcript."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -314,6 +331,13 @@ class Run(Base):
         CheckConstraint(
             "status <> 'paused' OR pending_approval_id IS NOT NULL", name="paused_has_approval"
         ),
+        CheckConstraint(_one_of("kind", RUN_KINDS), name="kind"),
+        # A review reads a range of the transcript, and no person is in it (Section 9.4).
+        CheckConstraint(
+            "(kind = 'review') = (review_from_seq IS NOT NULL AND review_to_seq IS NOT NULL)",
+            name="review_range",
+        ),
+        CheckConstraint("kind <> 'review' OR unattended", name="review_unattended"),
         Index(None, "org_id", "session_id"),
         Index(None, "status", "created_at"),
         # The per-org message rate and concurrency limit (migration 0007, Section 4.3).
@@ -329,6 +353,14 @@ class Run(Base):
             "session_id",
             unique=True,
             postgresql_where=text("status IN ('running', 'paused')"),
+        ),
+        # One waiting review per session (migration 0016, Section 9.4). The index above gives
+        # at most one running review.
+        Index(
+            "ix_runs_one_queued_review_per_session",
+            "session_id",
+            unique=True,
+            postgresql_where=text("kind = 'review' AND status = 'queued'"),
         ),
         # The runs that wait for the trace export (migration 0009, Section 18.2).
         Index(
@@ -351,6 +383,11 @@ class Run(Base):
     budget: Mapped[dict[str, Any]] = _json()
     usage: Mapped[dict[str, Any]] = _json()
     runtime_state: Mapped[str | None] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="chat")
+    review_from_seq: Mapped[int | None] = mapped_column(BigInteger)
+    """For a review: the messages after this ``messages.seq`` are new for it."""
+    review_to_seq: Mapped[int | None] = mapped_column(BigInteger)
+    """For a review: the last ``messages.seq`` that it reads."""
     unattended: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     """True for a run that no human watches, for example a cron job or a webhook. The tool
     gate turns ``ask`` into ``deny`` in these runs (docs/architecture.md, Section 16.1)."""
@@ -629,6 +666,8 @@ class Approval(Base):
         ),
         ForeignKeyConstraint(["org_id", "decided_by_user_id"], ["users.org_id", "users.id"]),
         UniqueConstraint("run_id", "call_id"),
+        # Lets a review proposal prove that its approval belongs to its org.
+        UniqueConstraint("org_id", "id"),
         CheckConstraint(_one_of("status", APPROVAL_STATUSES), name="status"),
         CheckConstraint("(status = 'pending') = (decided_at IS NULL)", name="decided_at"),
         Index(None, "org_id", "session_id"),
@@ -1163,3 +1202,48 @@ class Attachment(Base):
     sha256: Mapped[str] = mapped_column(Text, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
     created_at: Mapped[datetime] = _created_at()
+
+
+class ReviewProposal(Base):
+    """A change of shared memory or of a shared skill that a background review proposes
+    (docs/architecture.md, Section 9.4). The row holds the full change. Its approval is the
+    human decision: sama applies the change only after a workspace admin (or the org owner for
+    the scope ``org``) approves it. Only the control plane writes the table."""
+
+    __tablename__ = "review_proposals"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "run_id"],
+            ["runs.org_id", "runs.session_id", "runs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "approval_id"], ["approvals.org_id", "approvals.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "acting_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("approval_id"),
+        CheckConstraint(_one_of("kind", PROPOSAL_KINDS), name="kind"),
+        CheckConstraint(_one_of("scope", PROPOSAL_SCOPES), name="scope"),
+        CheckConstraint(_one_of("status", PROPOSAL_STATUSES), name="status"),
+        CheckConstraint("(status = 'applied') = (applied_at IS NOT NULL)", name="applied_at"),
+        Index(None, "org_id", "session_id"),
+        Index(
+            "ix_review_proposals_pending", "created_at", postgresql_where=text("status = 'pending'")
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    approval_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    acting_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The user of the session when the review proposed the change, if there was one."""
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = _json()
+    """The full change: the memory target and operations, or the ``skill_manage`` request."""
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -89,7 +89,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `MEMORY.md` (2,200 chars) and `USER.md` (1,375 chars) | `tools/memory_tool.py` | Targets `agent` (2,200), `user` (1,375), and `workspace` (2,200) per profile and user (§8). | Adapt | M2 (M2.1 done) |
 | `memory` tool: add, patch, remove | `tools/memory_tool.py` | Same actions. Over-limit writes fail and return the current entries. | Adapt | M2 (M2.1 done) |
 | Frozen memory snapshot in the prompt | `agent/memory_manager.py` | Snapshot in the frozen prefix. New writes apply from the next session. | Adapt | M2 (M2.1 done) |
-| Memory nudges | `agent/background_review.py` | Background review every 10 user turns (§9). | Adapt | M2 |
+| Memory nudges | `agent/background_review.py` | Background review every 10 user turns (§9.4.1). | Adapt | M2 (M2.4 done) |
 | External memory providers (Mem0, Honcho, ...) | `plugins/memory/` | Optional Mem0 provider behind a `MemoryProvider` interface. | Defer | — |
 | Memory history | none (files only) | `memory_revisions` table with author, run, and reason. Revert in the API (M2.1) and the web app. | New | M2 (M2.1 done) |
 
@@ -123,8 +123,8 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| Background review fork (memory and skills) | `agent/background_review.py` | A separate review run after the main run, with a cheap model, recursion off, and only `memory` and `skill_manage` (§9). | Adapt | M2 |
-| Skill creation nudge (10 tool iterations) | `agent/agent_init.py` | Same default. | Adapt | M2 |
+| Background review fork (memory and skills) | `agent/background_review.py` | A separate review run after the main run, with a cheap model, recursion off, and only `memory` and `skills` tools (§9.4.1). | Adapt | M2 (M2.4 done) |
+| Skill creation nudge (10 tool iterations) | `agent/agent_init.py` | Same default (§9.4.1). | Adapt | M2 (M2.4 done) |
 | `/learn` (skill from sources) | `learn_prompt.py` | `/learn <url or files>` creates a draft skill for review. | Adapt | M4 |
 | Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace. Archive, never delete. Pins (§9). | Adapt | M6 |
 | Checkpoints and `/rollback`, `/undo` | `agent/checkpoints/` | Shadow git in the sandbox or Claude file checkpointing. User commands, not model tools (§15.3). | Adapt | M6 |

@@ -8,8 +8,8 @@ time make two versions in sequence.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import asdict, dataclass, replace
 from typing import Protocol, cast
 
 from sqlalchemy import func, insert, select, update
@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AuditEntry, Skill, SkillVersion
+from sama.review.proposals import NewProposal, ProposalSink
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, WritePlan, index, plan_write
 from sama.skills.sql import load_actor, load_docs, scope_filter
@@ -31,6 +32,18 @@ class Written:
     scope: str
     version: int
     change: str
+    proposed: bool = False
+    """True when a background review proposed the change and a person must approve it first
+    (Section 9.4). ``version`` is 0 then, and ``change`` is the action."""
+
+
+@dataclass(frozen=True, slots=True)
+class Expected:
+    """The skill that a person approved: the row and the version that the background review
+    saw (``None`` for a new skill). A write to anything else is refused (Section 9.4)."""
+
+    skill_id: uuid.UUID | None
+    version: int | None
 
 
 class SkillStore(Protocol):
@@ -68,9 +81,15 @@ def _find(docs: list[SkillDoc], actor: Actor, name: str) -> SkillDoc:
 class PostgresSkillStore:
     """``skills`` and ``skill_versions``, written as the table owner."""
 
-    def __init__(self, engine: AsyncEngine, builtin: Mapping[str, SkillDoc]) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        builtin: Mapping[str, SkillDoc],
+        proposals: ProposalSink | None = None,
+    ) -> None:
         self._engine = engine
         self._builtin = builtin
+        self._proposals = proposals
 
     async def list(self, claims: RunTokenClaims, query: str | None) -> list[SkillDoc]:
         async with self._engine.connect() as connection:
@@ -89,20 +108,106 @@ class PostgresSkillStore:
         try:
             async with self._engine.begin() as connection:
                 actor = await _actor(connection, claims)
-                # The lock stops a second write to this name until this one commits.
-                await connection.execute(
-                    select(Skill.id)
-                    .where(scope_filter(actor), Skill.name == request.name)
-                    .with_for_update()
-                )
-                docs = await load_docs(connection, actor, names=[request.name], full=True)
-                builtin = self._builtin.get(request.name)
-                plan = plan_write([*docs, *([builtin] if builtin else [])], actor, request)
-                return await self._save(connection, actor, plan, request)
+                if actor.review:
+                    return await self._review(connection, actor, request)
+                return await self._write(connection, actor, request)
         except IntegrityError:
             raise SkillError(
                 f'A skill "{request.name}" was created at the same time. Try again.'
             ) from None
+
+    async def apply(
+        self,
+        actor: Actor,
+        request: ManageRequest,
+        *,
+        expected: Expected,
+        after: Callable[[AsyncConnection], Awaitable[None]] | None = None,
+    ) -> Written:
+        """Writes an approved proposal of a background review (Section 9.4). ``actor`` has
+        the roles of the person who approved it, so ``authorize`` checks them again.
+        ``request.scope`` is the scope that the person approved, and ``expected`` is the skill
+        and the version. The write is refused if the skill is another one or changed. ``after``
+        runs in the same transaction, after the write. If it raises, nothing is written."""
+        try:
+            async with self._engine.begin() as connection:
+                written = await self._write(
+                    connection, replace(actor, review=False), request, expected
+                )
+                if after is not None:
+                    await after(connection)
+                return written
+        except IntegrityError:
+            raise SkillError(
+                f'A skill "{request.name}" was created at the same time. Try again.'
+            ) from None
+
+    async def _write(
+        self,
+        connection: AsyncConnection,
+        actor: Actor,
+        request: ManageRequest,
+        expected: Expected | None = None,
+    ) -> Written:
+        # The lock stops a second write to this name until this one commits.
+        await connection.execute(
+            select(Skill.id)
+            .where(scope_filter(actor), Skill.name == request.name)
+            .with_for_update()
+        )
+        docs = await load_docs(connection, actor, names=[request.name], full=True)
+        builtin = self._builtin.get(request.name)
+        plan = plan_write([*docs, *([builtin] if builtin else [])], actor, request)
+        if expected is not None:
+            found = plan.target
+            actual = None if found is None else (found.skill_id, int(found.version))
+            wanted = None if expected.skill_id is None else (expected.skill_id, expected.version)
+            if actual != wanted:
+                raise SkillError(
+                    f'The skill "{request.name}" changed after the background review proposed'
+                    " the change. Ask for a new proposal."
+                )
+        return await self._save(connection, actor, plan, request)
+
+    async def _review(
+        self, connection: AsyncConnection, actor: Actor, request: ManageRequest
+    ) -> Written:
+        """A background review writes a user skill itself. For any other scope it proposes
+        the change, and a person approves it (Section 9.4). The plan runs with the roles of an
+        org owner, to check the request and to learn the scope. The real check runs again when
+        a person approves the proposal."""
+        docs = await load_docs(connection, actor, names=[request.name], full=True)
+        builtin = self._builtin.get(request.name)
+        candidates = [*docs, *([builtin] if builtin else [])]
+        plan = plan_write(candidates, replace(actor, workspace_admin=True, org_owner=True), request)
+        if plan.scope == "user":
+            return await self._write(connection, actor, request)
+        target = plan.target
+        if self._proposals is None or actor.session_id is None or actor.run_id is None:
+            raise SkillError("A background review cannot change a shared skill here.")
+        if plan.scope not in ("workspace", "org"):
+            raise SkillError(f"A background review cannot change a {plan.scope} skill.")
+        await self._proposals.propose(
+            NewProposal(
+                org_id=actor.org_id,
+                workspace_id=actor.workspace_id,
+                session_id=actor.session_id,
+                run_id=actor.run_id,
+                acting_user_id=actor.user_id,
+                kind="skill",
+                scope="workspace" if plan.scope == "workspace" else "org",
+                payload={
+                    **asdict(request),
+                    # The scope and the skill that the review saw. The approval is for them.
+                    "scope": plan.scope,
+                    "target_skill_id": None if target is None else str(target.skill_id),
+                    "target_version": None if target is None else int(target.version),
+                },
+                summary=f"{request.action} the {plan.scope} skill {request.name}"
+                + (f": {request.summary}" if request.summary else ""),
+            )
+        )
+        return Written(request.name, plan.scope, 0, request.action, proposed=True)
 
     async def _save(
         self, connection: AsyncConnection, actor: Actor, plan: WritePlan, request: ManageRequest

@@ -30,7 +30,9 @@ from sama.memory.store import (
     RunContext,
     Writer,
 )
+from sama.review.proposals import NewProposal, ProposalSink
 from sama.tenancy.run_token import RunTokenClaims
+from sama.vault.redact import redact
 
 
 def scope_of(
@@ -50,6 +52,23 @@ def scope_of(
             return MemoryScope(org_id, target, workspace_id)
 
 
+def describe_operations(target: Target, operations: Sequence[Operation]) -> str:
+    """One line for the person who decides. Each text is redacted in full before it is cut,
+    so a secret is never cut in the middle and shown in part. The text is not escaped
+    (``repr``), because an escape would change a secret and hide it from the redaction."""
+    steps = "; ".join(
+        step.action.value + ' "' + _shown(step.content or step.old_text or "") + '"'
+        for step in operations[:3]
+    )
+    more = f" and {len(operations) - 3} more" if len(operations) > 3 else ""
+    return f"{target.value} memory: {steps}{more}"
+
+
+def _shown(text: str, limit: int = 80) -> str:
+    flat = " ".join(redact(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
 def action_of(operations: Sequence[Operation]) -> RevisionAction:
     """The label of the revision: the action of a single step, else ``batch``."""
     if len(operations) == 1:
@@ -58,8 +77,12 @@ def action_of(operations: Sequence[Operation]) -> RevisionAction:
 
 
 class MemoryService:
-    def __init__(self, store: MemoryStore) -> None:
+    """``proposals`` is where a background review sends its changes of shared memory
+    (Section 9.4). Without it, a review run cannot change memory."""
+
+    def __init__(self, store: MemoryStore, proposals: ProposalSink | None = None) -> None:
         self.store = store
+        self.proposals = proposals
 
     async def write(
         self,
@@ -72,6 +95,8 @@ class MemoryService:
         if not operations:
             raise MemoryChangeError("give an action or a list of operations")
         context = await self.store.context(claims)
+        if context.review and target is not Target.USER:
+            return await self._propose(claims, context, target, operations, reason)
         scope = self._scope(claims, context, target)
 
         def change(entries: list[str]) -> list[str]:
@@ -87,8 +112,55 @@ class MemoryService:
         )
         return self._result(target, state, changed)
 
+    async def _propose(
+        self,
+        claims: RunTokenClaims,
+        context: RunContext,
+        target: Target,
+        operations: Sequence[Operation],
+        reason: str | None,
+    ) -> str:
+        """A background review does not change agent or workspace memory itself. It checks the
+        change against the current entries, and then it proposes the change. A person with the
+        right role approves it (Section 9.4)."""
+        if self.proposals is None:
+            raise MemoryDeniedError("a background review cannot change shared memory here")
+        scope = scope_of(
+            target,
+            org_id=uuid.UUID(claims.org_id),
+            workspace_id=uuid.UUID(claims.workspace_id),
+            agent_profile_id=context.agent_profile_id,
+            user_id=None,
+        )
+        state = await self.store.read(scope)
+        new = apply(list(state.entries), operations)
+        validate(target, list(state.entries), new)
+        if tuple(new) == state.entries:
+            return self._result(target, state, False)
+        await self.proposals.propose(
+            NewProposal(
+                org_id=scope.org_id,
+                workspace_id=uuid.UUID(claims.workspace_id),
+                session_id=uuid.UUID(claims.session_id),
+                run_id=uuid.UUID(claims.run_id),
+                acting_user_id=context.acting_user_id,
+                kind="memory",
+                scope="agent" if target is Target.AGENT else "workspace",
+                payload={
+                    "target": target.value,
+                    "operations": [step.model_dump(mode="json") for step in operations],
+                    "reason": reason,
+                },
+                summary=describe_operations(target, operations),
+            )
+        )
+        return (
+            f"Proposed a change of {target.value} memory. It is not saved. A person must"
+            " approve it first. Do not propose it again."
+        )
+
     def _scope(self, claims: RunTokenClaims, context: RunContext, target: Target) -> MemoryScope:
-        if context.unattended:
+        if context.unattended and not context.review:
             raise MemoryDeniedError("this run has no person in it, so it cannot change memory")
         if context.delegated:
             raise MemoryDeniedError(

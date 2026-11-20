@@ -35,6 +35,7 @@ SESSION_CHILDREN = (
     "model_calls",
     "session_todos",
     "approvals",
+    "review_proposals",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 
@@ -424,3 +425,28 @@ async def test_new_objects_in_public_are_closed_by_default(engine: AsyncEngine) 
         await transaction.rollback()
     assert all(not select and not insert for _, _, select, insert in tables), tables
     assert tuple(sequence) == (False, False)
+
+
+async def test_a_review_proposal_follows_the_visibility_of_its_session(
+    engine: AsyncEngine, world: World
+) -> None:
+    """A proposal of a private session is for its owner only. A proposal of a shared session is
+    for the members of the workspace. Nobody writes it through the Data API."""
+    async with as_user(engine, world.auth["alice"]) as connection:
+        assert await labels(connection, world, "review_proposals", "id") == {
+            "proposal:a1-shared",
+            "proposal:a1-alice",
+        }
+    async with as_user(engine, world.auth["dave"]) as connection:
+        assert await labels(connection, world, "review_proposals", "id") == set(), (
+            "dave is not in the workspace a1"
+        )
+    async with as_user(engine, world.auth["carol"]) as connection:
+        assert await labels(connection, world, "review_proposals", "id") == {
+            "proposal:a1-shared",
+            "proposal:a2-shared",
+        }, "an org admin does not read the private session of a member"
+    async with as_user(engine, world.auth["alice"]) as connection:
+        with pytest.raises(DBAPIError) as error:
+            await connection.execute(text("UPDATE review_proposals SET status = 'applied'"))
+    assert sqlstate(error.value) == INSUFFICIENT_PRIVILEGE

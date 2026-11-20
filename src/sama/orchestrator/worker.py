@@ -36,6 +36,7 @@ from sama.gate.service import GateService
 from sama.observability.logs import log_context
 from sama.orchestrator.queue import ClaimedRun, Lease, Resume, RunQueue
 from sama.prompt import PromptAssembler
+from sama.review.apply import ReviewApplier
 from sama.runtime.contract import (
     AgentRuntime,
     ApprovalDecision,
@@ -133,6 +134,7 @@ class Worker:
         config: ConfigBuilder | None = None,
         gate: GateService | None = None,
         on_run_end: Sequence[RunEndHook] = (),
+        reviews: ReviewApplier | None = None,
         heartbeat_s: float | None = None,
         poll_s: float = 1.0,
         maintenance_s: float = 30.0,
@@ -144,6 +146,7 @@ class Worker:
         self._config = config or PromptAssembler(queue.engine)
         self._gate = gate or GateService(queue.engine)
         self._on_run_end = tuple(on_run_end)
+        self._reviews = reviews
         self._heartbeat_s = heartbeat_s or queue.lease.total_seconds() / 3
         self._poll_s = poll_s
         self._maintenance_s = maintenance_s
@@ -179,10 +182,19 @@ class Worker:
             await _wait(stop, self._maintenance_s)
 
     async def maintain(self) -> None:
-        """Times out approvals, queues decided runs, and reaps runs with an expired lease."""
+        """Times out approvals, queues decided runs, reaps runs with an expired lease, and
+        applies the decided proposals of background reviews (Section 9.4)."""
         expired = await self._gate.expire()
         if expired:
             log.info("approvals timed out count=%s", expired)
+        if self._reviews is not None:
+            try:
+                applied = await self._reviews.apply_decided()
+            except Exception:
+                log.exception("the review proposals could not be applied owner=%s", self.owner)
+            else:
+                if applied:
+                    log.info("review proposals decided count=%s", applied)
         released = await self._queue.release_decided()
         requeued, ended = await self._queue.reap()
         for run_id in released:

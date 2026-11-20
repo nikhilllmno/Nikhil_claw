@@ -39,6 +39,7 @@ from sama.db.models import (
     ModelCall,
     Org,
     PairingCode,
+    ReviewProposal,
     Run,
     RunEvent,
     Session,
@@ -201,6 +202,7 @@ def plan(
         )
         add(
             Approval,
+            f"approval:{session}",
             org_id=org_id,
             session_id=ids[session],
             run_id=run_id,
@@ -209,6 +211,17 @@ def plan(
             arguments={"command": "make test"},
             arguments_digest="0" * 64,
             expires_at=text("now() + interval '1 day'"),
+        )
+        add(
+            ReviewProposal,
+            f"proposal:{session}",
+            org_id=org_id,
+            session_id=ids[session],
+            run_id=run_id,
+            approval_id=ids[f"approval:{session}"],
+            kind="memory",
+            scope="workspace",
+            payload={"target": "workspace", "operations": []},
         )
         add(
             SessionBinding,

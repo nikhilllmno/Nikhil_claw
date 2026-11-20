@@ -1,0 +1,53 @@
+"""What a person sees of a proposal of a background review (docs/architecture.md, Section 9.4).
+
+The proposal is stored with redacted text. The redactor of the process can learn a secret later
+(a credential that the vault stores after the proposal), so the stored text is not enough. Every
+place that shows a proposal builds the view again from the stored payload, with the redactor of
+the process at that time: first the full payload is redacted, then the summary is made from the
+redacted payload and cut. The stored ``approvals.reason`` and the stored arguments are not
+shown, because they were cut at the time of the write, and a cut can hide the start of a secret
+from a pattern that is learned later.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from sama.gate.service import stored_arguments
+from sama.memory.core import Operation, Target
+from sama.memory.service import describe_operations
+from sama.review.policy import PROPOSAL_SUMMARY_MAX_CHARS
+from sama.vault.redact import default_redactor, redact
+
+
+@dataclass(frozen=True, slots=True)
+class ShownProposal:
+    payload: dict[str, Any]
+    """The full change, redacted now."""
+    summary: str
+    """One line, made from the redacted payload."""
+    reason: str
+    """The text for an approval: a fixed start and the summary."""
+    arguments: dict[str, Any]
+    """The arguments of the approval, made from the redacted payload."""
+
+
+def shown_proposal(kind: str, scope: str, payload: Mapping[str, Any]) -> ShownProposal:
+    clean: dict[str, Any] = default_redactor().json(dict(payload))
+    if kind == "memory":
+        line = describe_operations(
+            Target(clean["target"]), [Operation.model_validate(o) for o in clean["operations"]]
+        )
+    else:
+        line = f"{clean.get('action')} the {scope} skill {clean.get('name')}"
+        if clean.get("summary"):
+            line += f": {clean['summary']}"
+    summary = redact(line)[:PROPOSAL_SUMMARY_MAX_CHARS]
+    return ShownProposal(
+        payload=clean,
+        summary=summary,
+        reason=f"the background review proposes a change of {scope} {kind}: {summary}",
+        arguments=stored_arguments(clean),
+    )

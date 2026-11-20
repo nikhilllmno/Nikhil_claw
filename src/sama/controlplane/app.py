@@ -52,6 +52,8 @@ from sama.observability.traces import TraceExporter
 from sama.orchestrator import PostgresSandboxDirectory, RunQueue, Worker
 from sama.orchestrator.sandboxed import SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
+from sama.review.apply import ReviewApplier
+from sama.review.proposals import PostgresProposalStore
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.sandbox.base import SandboxProvider
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
@@ -141,6 +143,12 @@ def build(
     gate = GateService(engine)
     broker = ClarifyBroker()
     library = SkillLibrary(engine, BuiltinSkills().all())
+    # A background review proposes the changes of shared memory and shared skills. A person
+    # approves them, and the applier writes them (Section 9.4).
+    proposals = PostgresProposalStore(engine)
+    memory_store = PostgresMemoryStore(engine)
+    skill_store = PostgresSkillStore(engine, library.builtin, proposals)
+    reviews = ReviewApplier(engine, memory_store, skill_store)
 
     registry = RuntimeRegistry()
     sandboxed: SandboxedRuntime | None = None
@@ -177,6 +185,7 @@ def build(
             skills=library,
         ),
         gate=gate,
+        reviews=reviews,
         poll_s=worker_poll_s,
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
@@ -201,8 +210,8 @@ def build(
         clarify=broker,
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
-        memory=MemoryService(PostgresMemoryStore(engine)),
-        skills=PostgresSkillStore(engine, library.builtin),
+        memory=MemoryService(memory_store, proposals),
+        skills=skill_store,
         sessions=SessionSearch(engine, embedder),
         vision=(
             VisionService(
@@ -261,6 +270,7 @@ def build(
         ),
         integrations=integrations,
         skills=library,
+        reviews=reviews,
     )
     api_app = api.app()
     tools_app = tools.app()

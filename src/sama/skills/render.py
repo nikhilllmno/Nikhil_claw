@@ -39,6 +39,11 @@ def render_view(skill: SkillDoc, file_path: str | None) -> str:
 
 
 def render_written(written: Written) -> str:
+    if written.proposed:
+        return (
+            f"Proposed to {written.change} the {written.scope} skill {written.name}. It is not"
+            " saved. A person must approve it first. Do not propose it again."
+        )
     return (
         f'Skill "{written.name}": {written.change} done in the scope {written.scope}. '
         f"It is version {written.version}. The index of this session does not change. A new "
