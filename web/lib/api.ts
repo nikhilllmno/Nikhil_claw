@@ -276,6 +276,69 @@ export interface StartedConnection {
 
 // -- errors -------------------------------------------------------------------------------------
 
+/** The status of a card on the task board (docs/architecture.md, Section 12.4). */
+export type TaskStatus = "todo" | "running" | "blocked" | "done" | "cancelled";
+
+export interface TaskOut {
+  id: string;
+  workspace_id: string;
+  title: string;
+  body: string;
+  status: TaskStatus;
+  audience: Audience;
+  owner_user_id: string | null;
+  assignee_profile_id: string | null;
+  assignee_user_id: string | null;
+  parent_task_id: string | null;
+  depends_on: string[];
+  session_id: string | null;
+  run_id: string | null;
+  result: string | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
+export interface TaskList {
+  /** The user row of the caller in the org of the workspace. */
+  user_id: string;
+  tasks: TaskOut[];
+}
+
+export interface TaskComment {
+  id: string;
+  task_id: string;
+  author_kind: "user" | "agent" | "system";
+  author_user_id: string | null;
+  run_id: string | null;
+  body: string;
+  created_at: string;
+}
+
+export interface TaskDetail {
+  task: TaskOut;
+  comments: TaskComment[];
+}
+
+export interface NewTaskBody {
+  title: string;
+  body: string;
+  audience: Audience;
+  assignee_profile_id: string | null;
+  assignee_user_id: string | null;
+}
+
+export interface TaskPatch {
+  status?: Exclude<TaskStatus, "running">;
+  title?: string;
+  body?: string;
+  result?: string;
+  assignee?: "agent" | "person" | "none";
+  assignee_profile_id?: string;
+  assignee_user_id?: string;
+}
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -479,6 +542,25 @@ export class ApiClient {
   disableConnection = (id: string) =>
     this.json<Connection>(`/connections/${id}/disable`, { method: "POST" });
   deleteConnection = (id: string) => this.json<null>(`/connections/${id}`, { method: "DELETE" });
+  listTasks = (workspaceId: string) =>
+    this.json<TaskList>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks`);
+  getTask = (workspaceId: string, taskId: string) =>
+    this.json<TaskDetail>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}`);
+  createTask = (workspaceId: string, body: NewTaskBody) =>
+    this.json<TaskOut>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks`, {
+      method: "POST",
+      body,
+    });
+  updateTask = (workspaceId: string, taskId: string, patch: TaskPatch) =>
+    this.json<TaskOut>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}`, {
+      method: "PATCH",
+      body: patch,
+    });
+  addTaskComment = (workspaceId: string, taskId: string, body: string) =>
+    this.json<TaskComment>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}/comments`,
+      { method: "POST", body: { body } },
+    );
 }
 
 /** The public config of the API (no sign-in needed). */

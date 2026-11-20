@@ -276,6 +276,7 @@ async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[s
         row.group_toolsets if isinstance(row.group_toolsets, list) else [],
         audience=run.audience,
         kind=run.kind,
+        lineage=run.lineage,
     )
 
 

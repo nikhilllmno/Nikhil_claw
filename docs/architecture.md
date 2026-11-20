@@ -1095,8 +1095,11 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 - **Lineage**: compaction, `/branch`, `/retry`, and delegation create child sessions linked to
   the parent. Nothing is overwritten. Since M2.6 a compaction makes an archive session
   (`lineage = compaction`, the status `archived`) that holds the transcript from before the
-  compaction (Section 6.3). `/new` after `/model` makes a `branch`. `retry` and `delegation`
-  come later.
+  compaction (Section 6.3). `/new` after `/model` makes a `branch`. Since M4.6 `delegate_task`
+  makes a `delegation` session. Its `parent_run_id` names the parent run, and the key
+  `(org_id, parent_session_id, parent_run_id)` proves that the run is a run of the parent
+  session. Only a `delegation` session has a `parent_run_id` (Section 13.2). `retry` comes
+  later.
 - **Cross-channel continuity**: a user can continue a session from another channel with
   `/resume <id>` or a session link.
 - **Search**: `session_search` uses Postgres full-text search plus pgvector embeddings,
@@ -1830,7 +1833,8 @@ policy rule cannot approve a proposal.
 | `clarify` | `clarify` (1 to 5 questions, choices or free text, rendered per channel) | Sama MCP |
 | `code_exec` | `execute_code` (Python that calls sama tools through a local RPC stub) | Sandbox, tools through MCP |
 | `subagents` | `Task` and `Agent`, the native tool of Claude that starts a sub-agent (since M2.7, Section 13.1). It is separate from `delegation`. | Runtime, in the sandbox |
-| `delegation` | `delegate_task`, `delegate_status` | Sama MCP |
+| `delegation` | `delegate_task`, `delegate_status` (since M4.6, Section 13.2) | Sama MCP |
+| `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (create, list, update, pause, resume, remove, run, cancel) | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
@@ -1845,13 +1849,16 @@ Agent profiles combine toolsets. Built-in presets: `assistant` (everything excep
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, vision,
 clarify; for webhook triggers), and `cron` (like `assistant` but no `cron` and no `clarify`).
 A profile also has a **group set**: the toolsets that a chat run in a shared session uses
-(Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`, and
-`media`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`, `browser`,
-`workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The default
-profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
-since migration `0019` (M2.7), and `connections` and `integrations` since migration `0022`
-(M3.4). The default group set has no `subagents`, `connections`, or `integrations`. Sub-agents
-(Section 13.1) do not get `connections` or `integrations`.
+(Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`,
+`media`, and `tasks`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`,
+`browser`, `workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`. The
+default profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
+since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
+and `delegation` and `tasks` since migration `0023` (M4.6, M4.7). The default group set has no
+`subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
+a shared card is a run in a shared session, and that run ends its card with `task_complete`.
+Migrations `0022` and `0023` change only the lists that are equal to the old defaults.
+Sub-agents (Section 13.1) do not get `connections` or `integrations`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -2917,12 +2924,61 @@ steps:
   approval before their first run.
 - The web app shows each workflow instance with its steps, outputs, and approvals.
 
-### 12.4 Task board
+### 12.4 Task board (M4.7)
 
-For multi-agent work, a `tasks` table holds cards with a status, an assignee (an agent
-profile or a human), dependencies, and comments (Hermes kanban). A dispatcher turns ready
-cards into runs. Agents use `task_*` tools to complete, block, comment, and create child
-cards. This is M4.
+For multi-agent work, the `tasks` table holds **cards** (Hermes kanban). A card has a title,
+a body, a status, an assignee (an agent profile or a person, not both), a parent card, a
+list of dependencies, a result, and comments in `task_comments`. A card belongs to one
+workspace and has the audience of a session: `shared` (the members of the workspace see it)
+or `private` (only its owner sees it). The select policy uses `session_visible`, and a
+comment uses `can_read_task`. No policy allows writes: the control plane writes as the
+table owner.
+
+**Statuses**: `todo`, `running`, `blocked`, `done`, and `cancelled`. Only the dispatcher sets
+`running`. A person sets the other statuses on the web board. When a person moves a card out
+of `running`, sama cancels the run of the card.
+
+**Limits**: a title has at most 200 characters, a body and a result 20,000, and a comment
+4,000. A card has at most 20 dependencies and at most 5 parent cards above it. A workspace
+has at most 500 open cards. A shared card can only link to shared cards, so the run of a
+shared card never reads a private result.
+
+**Dispatcher** (`TaskDispatcher`, a control-plane loop, every 5 seconds):
+
+1. It takes at most 20 `todo` cards that have an agent assignee, oldest first, with
+   `FOR UPDATE SKIP LOCKED`, so two control planes do not start one card two times.
+2. A card waits until each dependency is `done`. A cancelled or deleted dependency moves
+   the card to `blocked` and adds a comment from `system`.
+3. An org has at most 5 running cards. An agent profile that is not in the workspace moves
+   the card to `blocked`.
+4. The dispatcher makes a new session for the card (with the audience and owner of the
+   card) and an unattended run in one transaction. The prompt has the title, the body, and
+   the results of the dependencies (each cut to 1,500 characters and marked as untrusted
+   data). A rate limit leaves the card in `todo` for the next pass.
+5. When the run ends, the dispatcher reconciles the card. A completed run makes the card
+   `done`, with the result from `task_complete` or else the last answer of the run. A run
+   that fails or is cancelled makes the card `blocked` with a comment that gives the reason.
+
+**Tools** (toolset `tasks`, sama MCP):
+
+| Tool | What it does |
+|---|---|
+| `task_create` | Makes a card. The assignee is `self` (the profile of the run), `agent` (a profile id), `person` (the user of the run), or `none`. The parent is the card of the run by default. |
+| `task_list` | Lists the cards that the session can see (at most 50) and marks the card of the run. |
+| `task_complete` | Sets a card to `done` with a result. With no `task_id` it is the card of the run. |
+| `task_block` | Sets a card to `blocked` and adds the reason as a comment. |
+| `task_comment` | Adds a comment to a card. |
+
+A run sees cards as its session does: a shared session sees shared cards, and a private
+session also sees the cards of its owner. An agent cannot stop the run of another card:
+only a person does that.
+
+**Web board**: the route `/tasks` of the web app shows the cards of the current workspace
+in four columns (To do, Running, Blocked, Done). A person makes cards, changes the status
+and the assignee, reads the result, and adds comments. The board loads again every 10
+seconds while an agent works on a card. The API routes are
+`GET` and `POST /workspaces/{id}/tasks`, `GET` and `PATCH /workspaces/{id}/tasks/{task_id}`,
+and `POST /workspaces/{id}/tasks/{task_id}/comments`.
 
 ---
 
@@ -2934,10 +2990,10 @@ cards. This is M4.
 | `delegate_task` | Parallel or long tasks, a different runtime or model, or a clean context | Sama creates a child session and run, in its own sandbox, linked to the parent. Only the child's summary (and file paths) return to the parent. |
 | Task board | Multi-step projects with many agents and humans | Section 12.4. |
 
-Limits for `delegate_task` (Hermes defaults): depth 1 unless the profile allows more, at most
-10 children at a time per run, a turn and cost budget per child, and blocked tools for
-children (`delegate_task`, `memory` writes, `cronjob_manage`, `clarify`, and outbound
-messages). Children inherit the parent's approval policy and can only narrow it.
+Limits for `delegate_task` (Hermes defaults): depth 1, at most 10 children per run, a turn
+and cost budget per child, and blocked tools for children (`delegate_task`, the task board,
+`memory`, `cronjob_manage`, `clarify`, and outbound messages). Children inherit the parent's
+approval policy and can only narrow it. Section 13.2 has the design (M4.6).
 
 ### 13.1 Native sub-agents (M2.7)
 
@@ -3026,6 +3082,48 @@ the root and not of the sub-agent span, because the gate does not receive the su
 | A7 | The model of a sub-agent is `inherit` or a priced Anthropic model id. |
 | A8 | The spend of a sub-agent is limited by the budgets of the run and by `max_turns`. The tokens of one sub-agent come from the CLI task message when the CLI reports them. |
 | A9 | The runner never cuts the text of a `SubagentEvent`. The control plane redacts it and then cuts it, so a secret cannot lose a part to a cut before the redaction (same rule as the archive, M2.6 A6). |
+
+### 13.2 `delegate_task` (M4.6)
+
+`delegate_task` gives 1 to 10 independent tasks to child agents. Each task has a `goal`, an
+optional `context`, and an optional budget (`max_turns`, `max_cost_usd`). For each task, sama
+makes a child session and a queued child run in one transaction:
+
+- The child session has the lineage `delegation`, `parent_session_id`, and `parent_run_id`.
+  It copies the workspace, the agent profile, the audience, and the owner of the parent
+  session, so a child never sees more than its parent. One sandbox belongs to one session
+  (D5), so each child has its own sandbox.
+- The child run is **unattended**: a gate `ask` is `deny`, because no person watches it.
+- The prompt of the child has only the goal and the context. The child does not get the
+  conversation of the parent and gets no memory snapshot.
+
+**Limits**
+
+| Limit | Value |
+|---|---|
+| Depth | 1. A child has no `delegation` toolset, so it cannot delegate. |
+| Children | At most 10 per call and at most 10 per parent run in total. |
+| Blocked toolsets | `delegation`, `tasks`, `memory`, `clarify`, and `cron` (`CHILD_BLOCKED_TOOLSETS`). The gate and the prompt assembler take them away for a `delegation` session. |
+| Budget | The lower of the profile budget and the defaults: 30 turns, 1.00 USD, and 1,800 seconds. A task can ask for at most 100 turns and 10 USD, and it never gets more than the profile allows. |
+| Result | The answer of a child is cut to 4,000 characters and is marked as untrusted data. |
+
+**Wait**: with `wait=true` (the default), the call polls every 2 seconds until each child ends
+or `timeout_s` (at most 600 seconds) passes. Then it returns the status, the cost, and the
+answer or error of each child. With `wait=false`, it returns the child ids at once.
+
+**`delegate_status`** takes an `action`:
+
+| Action | What it does |
+|---|---|
+| `status` | Shows the children of the run, or one child. |
+| `cancel` | Cancels the open run of a child. |
+| `steer` | Sends a new message to a child. The message runs as the next run of the child session, after the current run. A message during a run comes with M3.9. |
+
+A run can control only the children of its own session. A cancel of the parent does not
+cancel its children: each child ends on its own budget.
+
+**Risk**: a parent that waits holds a worker slot. A child run counts toward the chat rate
+limits of the user and the org.
 
 ---
 

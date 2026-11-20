@@ -114,6 +114,13 @@ export function Sidebar({
         <Link href="/" className="btn btn-primary" aria-current={pathname === "/" ? "page" : undefined}>
           New session
         </Link>
+        <Link
+          href="/tasks"
+          className="btn"
+          aria-current={pathname === "/tasks" ? "page" : undefined}
+        >
+          Task board
+        </Link>
       </div>
 
       <nav className={styles.sessions} aria-label="Sessions">

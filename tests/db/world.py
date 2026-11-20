@@ -49,6 +49,8 @@ from sama.db.models import (
     SessionCompaction,
     SessionTodo,
     StoredContextFile,
+    Task,
+    TaskComment,
     ToolCall,
     ToolPolicy,
     User,
@@ -259,6 +261,25 @@ def plan(
             session_id=ids[session],
             items=[{"id": "1", "content": f"todo of {session}", "status": "pending"}],
             run_id=run_id,
+        )
+        # One task card with the audience of the session, and one comment on it.
+        add(
+            Task,
+            f"task:{session}",
+            org_id=org_id,
+            workspace_id=ids[workspace],
+            title=f"task of {session}",
+            audience=audience,
+            owner_user_id=ids[owner] if owner else None,
+        )
+        add(
+            TaskComment,
+            f"comment:{session}",
+            org_id=org_id,
+            workspace_id=ids[workspace],
+            task_id=ids[f"task:{session}"],
+            author_kind="user",
+            body=f"comment of {session}",
         )
         add(
             SessionCompaction,

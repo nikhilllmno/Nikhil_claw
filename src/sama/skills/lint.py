@@ -46,6 +46,7 @@ KNOWN_TOOLSETS: Final = frozenset(
         "self",
         "tool_search",
         "subagents",
+        "tasks",
     }
 )
 """The toolsets of docs/architecture.md, Section 10.2."""
