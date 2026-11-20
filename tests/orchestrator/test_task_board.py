@@ -244,6 +244,35 @@ async def test_a_cancelled_dependency_blocks_the_card(engine: AsyncEngine, tenan
     assert await comments(engine, second.id) == ["a dependency was cancelled or deleted"]
 
 
+async def test_a_cancelled_dependency_blocks_the_card_while_another_waits(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    cancelled = await create(engine, tenant, title="cancelled")
+    waiting = await create(engine, tenant, title="a person does this")
+    deleted = await create(engine, tenant, title="deleted")
+    both = await create(
+        engine,
+        tenant,
+        title="both",
+        depends_on=[cancelled.id, waiting.id],
+        assignee_profile_id=tenant.ids["profile"],
+    )
+    gone = await create(
+        engine,
+        tenant,
+        title="gone",
+        depends_on=[deleted.id, waiting.id],
+        assignee_profile_id=tenant.ids["profile"],
+    )
+    await change(engine, tenant, cancelled.id, status="cancelled")
+    async with engine.begin() as connection:
+        await connection.execute(delete(Task).where(Task.id == deleted.id))
+    assert (await TaskDispatcher(engine, RunQueue(engine)).run_once()).blocked == 2
+    for task_id in (both.id, gone.id):
+        assert (await card(engine, task_id)).status == "blocked"
+        assert await comments(engine, task_id) == ["a dependency was cancelled or deleted"]
+
+
 async def test_the_dispatcher_keeps_the_running_cap_of_an_org(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:

@@ -2947,7 +2947,8 @@ shared card never reads a private result.
 
 1. It takes at most 20 `todo` cards that have an agent assignee, oldest first, with
    `FOR UPDATE SKIP LOCKED`, so two control planes do not start one card two times. A card
-   that waits for a dependency is not taken, an org with 5 running cards is not taken, and
+   that waits for a dependency is not taken, unless another dependency is cancelled or
+   deleted. An org with 5 running cards is not taken, and
    an org gives at most 5 cards to one pass. So waiting cards and one busy org do not stop
    the cards of other orgs.
 2. A card waits until each dependency is `done`. A cancelled or deleted dependency moves

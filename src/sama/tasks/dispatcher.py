@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Final
 
-from sqlalchemy import and_, func, insert, select, update
+from sqlalchemy import and_, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import (
@@ -147,15 +147,26 @@ class TaskDispatcher:
         batch and stop the cards of other orgs.
         """
         dependency = Task.__table__.alias("dependency")
+        of_card = and_(
+            dependency.c.org_id == Task.org_id,
+            dependency.c.workspace_id == Task.workspace_id,
+            dependency.c.id == func.any(Task.depends_on),
+        )
         waiting_dependency = (
             select(dependency.c.id)
-            .where(
-                dependency.c.org_id == Task.org_id,
-                dependency.c.workspace_id == Task.workspace_id,
-                dependency.c.id == func.any(Task.depends_on),
-                dependency.c.status.in_(("todo", "running", "blocked")),
-            )
+            .where(of_card, dependency.c.status.in_(("todo", "running", "blocked")))
             .exists()
+        )
+        cancelled_dependency = (
+            select(dependency.c.id).where(of_card, dependency.c.status == "cancelled").exists()
+        )
+        found_dependencies = (
+            select(func.count()).select_from(dependency).where(of_card).scalar_subquery()
+        )
+        # A card with a cancelled or deleted dependency is a candidate too: it becomes blocked.
+        broken = or_(
+            cancelled_dependency,
+            found_dependencies < func.coalesce(func.cardinality(Task.depends_on), 0),
         )
         running_card = Task.__table__.alias("running_card")
         busy_orgs = (
@@ -175,7 +186,7 @@ class TaskDispatcher:
             .where(
                 Task.status == "todo",
                 Task.assignee_profile_id.is_not(None),
-                ~waiting_dependency,
+                or_(~waiting_dependency, broken),
                 Task.org_id.not_in(busy_orgs),
             )
             .subquery()
