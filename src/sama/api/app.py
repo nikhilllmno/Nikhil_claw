@@ -26,7 +26,7 @@ from decimal import Decimal
 from importlib import resources
 from typing import Annotated, Any, Final, Literal, Self
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,7 +47,25 @@ from starlette.types import ASGIApp, Lifespan
 
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
+from sama.api.history import (
+    DEFAULT_RUNS,
+    MAX_RUNS,
+    ExportFormat,
+    RunSummary,
+    RunTrace,
+    SearchHit,
+    SessionHistory,
+)
 from sama.api.origins import check_origins
+from sama.api.skill_editor import (
+    ReadScope,
+    SkillCatalog,
+    SkillDetail,
+    SkillEditor,
+    SkillVersionDetail,
+    SkillWrite,
+    SkillWritten,
+)
 from sama.api.tasks import (
     CommentOut,
     NewComment,
@@ -125,7 +143,11 @@ from sama.scheduler.jobs import Actor as JobActor
 from sama.scheduler.jobs import JobService
 from sama.scheduler.jobs import preview as preview_schedule
 from sama.scheduler.spec import JobError, JobInput, JobNotFoundError
+from sama.search.core import MAX_LIMIT as MAX_SEARCH_LIMIT
+from sama.search.core import MAX_QUERY_CHARS
+from sama.search.service import SessionSearch
 from sama.skills.service import SkillLibrary
+from sama.skills.store import PostgresSkillStore
 from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -680,12 +702,15 @@ class SamaApi:
         connections: ConnectionService | None = None,
         jobs: JobService | None = None,
         triggers: triggers.TriggerService | None = None,
+        skill_store: PostgresSkillStore | None = None,
+        search: SessionSearch | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
         ``409``. Without ``jobs``, the job routes answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
-        command."""
+        command. Without ``search``, the session search of the web app uses full-text search
+        only."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
@@ -700,6 +725,14 @@ class SamaApi:
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._board = TaskBoard(engine, self._queue)
+        self._history = SessionHistory(engine, search or SessionSearch(engine), session_access)
+        self._skill_editor = (
+            None
+            if skills is None
+            else SkillEditor(
+                engine, skills, skill_store or PostgresSkillStore(engine, skills.builtin)
+            )
+        )
         self._gate = gate or GateService(engine)
         self._clarify = clarify
         self._settings = settings or ApiSettings()
@@ -1346,7 +1379,62 @@ class SamaApi:
         ) -> CommentOut:
             return await self._board.comment(principal, workspace_id, task_id, body)
 
+        @app.get("/orgs/{org_id}/session-search")
+        async def session_search(
+            principal: Me,
+            org_id: uuid.UUID,
+            q: Annotated[str, Query(max_length=MAX_QUERY_CHARS)] = "",
+            workspace_id: uuid.UUID | None = None,
+            limit: Annotated[int, Query(ge=1, le=MAX_SEARCH_LIMIT)] = MAX_SEARCH_LIMIT,
+        ) -> list[SearchHit]:
+            return await self._history.search(principal, org_id, q, workspace_id, limit)
+
+        @app.get("/sessions/{session_id}/export")
+        async def export_session(
+            principal: Me, session_id: uuid.UUID, format: ExportFormat = "markdown"
+        ) -> Response:
+            return await self._history.export(principal, session_id, format)
+
+        @app.get("/sessions/{session_id}/runs")
+        async def session_runs(
+            principal: Me,
+            session_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=MAX_RUNS)] = DEFAULT_RUNS,
+        ) -> list[RunSummary]:
+            return await self._history.runs(principal, session_id, limit)
+
+        @app.get("/runs/{run_id}/trace")
+        async def run_trace(principal: Me, run_id: uuid.UUID) -> RunTrace:
+            return await self._history.trace(principal, run_id)
+
+        @app.get("/workspaces/{workspace_id}/skills")
+        async def workspace_skills(principal: Me, workspace_id: uuid.UUID) -> SkillCatalog:
+            return await self._editor().catalog(principal, workspace_id)
+
+        @app.get("/workspaces/{workspace_id}/skills/{name}")
+        async def workspace_skill(
+            principal: Me, workspace_id: uuid.UUID, name: str, scope: ReadScope | None = None
+        ) -> SkillDetail:
+            return await self._editor().detail(principal, workspace_id, name, scope)
+
+        @app.post("/workspaces/{workspace_id}/skills")
+        async def write_skill(
+            principal: Me, workspace_id: uuid.UUID, body: SkillWrite
+        ) -> SkillWritten:
+            return await self._editor().write(principal, workspace_id, body)
+
+        @app.get("/skills/{skill_id}/versions/{version}")
+        async def skill_version(
+            principal: Me, skill_id: uuid.UUID, version: Annotated[int, Path(ge=1)]
+        ) -> SkillVersionDetail:
+            return await self._editor().version(principal, skill_id, version)
+
         return app
+
+    def _editor(self) -> SkillEditor:
+        if self._skill_editor is None:
+            raise HTTPException(status_code=409, detail="skills are not set up")
+        return self._skill_editor
 
     # -- reads ------------------------------------------------------------------------------
 

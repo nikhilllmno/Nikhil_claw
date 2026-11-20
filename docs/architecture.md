@@ -2480,6 +2480,11 @@ cross-org check of Section 17.1 through the API.
 | `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_approval`, then `RunQueue.release_decided`. `always_allow` writes the user rule. `409` if the approval is decided or expired. |
 | `GET /workspaces/{id}/memory`, `GET .../memory/{target}/revisions`, `PUT .../memory/{target}`, `POST .../memory/{target}/revisions/{seq}/revert` | The memory of the workspace (Section 8.1). `target` is `agent`, `user`, or `workspace`. The `agent` target needs `agent_profile_id` (query or body). `user` is the notes of the caller. A user who cannot see the workspace gets `404`. A `workspace` write needs a workspace admin (`403`). A change that is not valid gets `422`. |
 | `GET /sessions/{id}/questions`, `POST .../questions/{request_id}/answer` | The open `clarify` questions of the session, when the process has a `ClarifyBroker` (Section 16.7). |
+| `GET /orgs/{org_id}/session-search?q=&workspace_id=&limit=` | Search the sessions of the org that the user can read (M3.12, below). At most 10 hits. `q` has at most 400 characters (`422`). An empty `q` gives the latest sessions. |
+| `GET /sessions/{id}/export?format=markdown\|json` | The transcript as a file to download (M3.12, below). |
+| `GET /sessions/{id}/runs?limit=` | The runs of the session, newest first, with the token use and the cost. Default 50, at most 200. |
+| `GET /runs/{run_id}/trace` | The steps, the tool calls, and the model calls of one run (M3.12, below). |
+| `GET /workspaces/{id}/skills`, `GET .../skills/{name}?scope=`, `POST .../skills`, `GET /skills/{skill_id}/versions/{version}` | The skill editor of the web app (M3.12, below). |
 
 **Event stream.** `GET /sessions/{id}/events` sends `text/event-stream`:
 
@@ -2616,6 +2621,49 @@ has no active Telegram integration (Section 11.6) and `429` when the user has 5 
 `DELETE /channels/telegram/identities/{id}` unlinks one. `/config` gives `integrations: true`
 to the page when the process can connect integrations. `/me` gives, for each org, `admin`
 (the user is an org owner or admin) and the integrations of the org (kind, status, name).
+
+**Web app v1 rest (M3.12).** These routes serve the memory, skills, search, runs, and settings
+pages of the web app. They use the same guards as the session routes (code and RLS):
+
+- **Session search.** `GET /orgs/{org_id}/session-search` uses the same index as the
+  `session_search` tool (Section 8.3). The visibility rule is the rule of a private run: the
+  shared sessions of the workspaces that the user sees, and the private sessions of the user.
+  `workspace_id` limits the search to one workspace. A user who is not an org member, or who
+  cannot see the workspace, gets `404`. An archive session (Section 6.3) is not a hit. Each hit
+  has the session id, the workspace, the title, the audience, the times, and the snippets.
+- **Export.** `GET /sessions/{id}/export` returns `format=markdown` (`text/markdown`) or
+  `format=json` (`application/json`, `"format": "sama.session.v1"`). The file has the session
+  data and the messages by `seq`. The API reads the messages in batches of 200. It stops after
+  5,000 messages, or after the message that brings the text over 4,000,000 characters. Then
+  the file has a note and `truncated: true`. The answer has `Content-Disposition: attachment` with the name
+  `session-<first 8 characters of the id>.md` or `.json`, and `Cache-Control: no-store`. The
+  redactor runs again on each message.
+- **Runs and traces.** `GET /sessions/{id}/runs` gives `kind`, `status`, `compact`, the times,
+  the failure, and the sum of `model_calls` (tokens, cost, count). `GET /runs/{run_id}/trace`
+  needs read access to the session of the run, else `404`. It gives the run, its `run_events`
+  as steps (at most 2,000, then `truncated: true`), its `tool_calls` (at most 500), and its
+  `model_calls` (at most 500). Adjacent `text_delta` events become one step with at most 20,000
+  characters. The redactor runs again on each payload and on the whole joined text, because a
+  secret can span two deltas. The cut comes after the redaction and ends at a space. When the
+  events are cut and the last step is text, that step is not in the trace, because the rest of
+  its text is not there and the redactor cannot see a whole secret. Thus a trace never shows
+  the start of a secret. The trace never has `runtime_state`.
+- **Skill editor.** `GET /workspaces/{id}/skills` lists the skills that the user sees in the
+  workspace (Section 9.4) with `can_edit` and `writable_scopes`. `GET .../skills/{name}` gives
+  the `SKILL.md`, the files, and the other scopes that have the same name. `POST .../skills`
+  takes `action` (`create`, `edit`, `write_file`, `remove_file`, or `archive`), `name`, `scope`
+  (`user`, `workspace`, or `org`), and the content. The write goes through
+  `PostgresSkillStore` with the same lint, scan, and role checks as `skill_manage`, and the
+  version has `author_kind` `user`. A write without the role gets `403`, and a change that is
+  not valid gets `422`. A `builtin` skill is read only. `GET /skills/{skill_id}/versions/{version}`
+  gives the `SKILL.md` and the files of one version. A skill has no revert: the web app loads an
+  old `SKILL.md` into the editor, and the user saves it as an edit. Without a skill store, the
+  routes return `409`.
+
+The web app routes are `/search`, `/memory`, `/skills`, `/settings`, and `/s/{id}/runs`. The chat
+header has the export buttons and a link to the runs. The settings page shows the account, the
+chat apps of each org (an admin connects and disconnects the Telegram bot there), the linked chat
+accounts, and the agents. The web app has no Slack connect form.
 
 **Not in M1.12.** `python -m sama.api` runs only the API. The control plane process (Section
 19.1) puts the API, the worker, and the tool server in one process, so that the API answers

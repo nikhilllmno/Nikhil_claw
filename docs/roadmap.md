@@ -361,7 +361,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 note
 | M3.9 | Busy controls and handoff | Queue, `/stop`, `/steer` while a run is busy. `/handoff` between channels. |
 | M3.10 | Worker bots | An agent profile bound to a Slack channel with a daily budget. Done. |
 | M3.11 | PostgreSQL connections | Database gateway with PostgreSQL (also Supabase and Neon) (architecture §10.4). Tools `db_<conn>_schema`, `sample`, `query`, `export`, and `execute`. Tests show that: `query` runs in a read-only transaction; a write or a second statement in `query` is rejected; DDL is denied by default; a query stops after 30 seconds; the model gets at most 1,000 rows and 50 KB, and the rest spills to a file; hidden columns do not appear in any result; `execute` needs an approval that shows the SQL. Static egress IP addresses are documented for allowlists. |
-| M3.12 | Web app v1 rest | Memory editor, skill editor, connections, sessions with search and export (Markdown and JSON), run traces, settings. |
+| M3.12 | Web app v1 rest | Memory editor, skill editor, connections, sessions with search and export (Markdown and JSON), run traces, settings. Done. |
 
 ## M4 — Automation
 

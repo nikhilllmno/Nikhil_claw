@@ -9,6 +9,7 @@ import {
   errorText,
   type ChatMessage,
   type ClarifyRequest,
+  type ExportFormat,
   OPEN_RUN_STATUSES,
   type SessionDetail,
 } from "@/lib/api";
@@ -22,6 +23,7 @@ import {
   parseCompact,
   sessionTitle,
 } from "@/lib/chat";
+import { saveFile } from "@/lib/history";
 import { runEventStream } from "@/lib/stream";
 import { ApprovalCard } from "./ApprovalCard";
 import { useApi } from "./AuthProvider";
@@ -286,13 +288,16 @@ export function Chat({ sessionId }: { sessionId: string }) {
             {detail.audience === "shared" ? "Shared with the workspace" : "Only you"}
           </p>
         </div>
-        {paused ? (
-          <span className="badge badge-warning">Waiting for you</span>
-        ) : running ? (
-          <span className="badge badge-accent">
-            <span className="spinner" aria-hidden="true" /> Working
-          </span>
-        ) : null}
+        <div className={styles.headerActions}>
+          {paused ? (
+            <span className="badge badge-warning">Waiting for you</span>
+          ) : running ? (
+            <span className="badge badge-accent">
+              <span className="spinner" aria-hidden="true" /> Working
+            </span>
+          ) : null}
+          <SessionTools sessionId={sessionId} />
+        </div>
       </header>
 
       <div
@@ -424,5 +429,56 @@ function MessageView({ message: m }: { message: ChatMessage }) {
     <p className={styles.note}>
       {m.role}: {m.text}
     </p>
+  );
+}
+
+/** The links to the run traces and the export of the session. */
+function SessionTools({ sessionId }: { sessionId: string }) {
+  const api = useApi();
+  const [busy, setBusy] = useState<ExportFormat | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const download = async (format: ExportFormat) => {
+    setBusy(format);
+    setError(null);
+    try {
+      const file = await api.exportSession(sessionId, format);
+      saveFile(file.name, file.blob);
+    } catch (e) {
+      setError(errorText(e, "The export failed."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className={styles.tools}>
+      <Link href={`/s/${sessionId}/runs`} className="btn btn-quiet btn-small">
+        Runs
+      </Link>
+      <button
+        type="button"
+        className="btn btn-quiet btn-small"
+        disabled={busy !== null}
+        aria-label="Export .md: the session as Markdown"
+        onClick={() => void download("markdown")}
+      >
+        {busy === "markdown" ? "Exporting" : "Export .md"}
+      </button>
+      <button
+        type="button"
+        className="btn btn-quiet btn-small"
+        disabled={busy !== null}
+        aria-label="Export .json: the session as JSON"
+        onClick={() => void download("json")}
+      >
+        {busy === "json" ? "Exporting" : "Export .json"}
+      </button>
+      {error ? (
+        <span className={styles.toolsError} role="alert">
+          {error}
+        </span>
+      ) : null}
+    </div>
   );
 }

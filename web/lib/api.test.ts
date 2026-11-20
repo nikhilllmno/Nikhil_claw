@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiClient, ApiError, type ChatMessage, errorMessage, errorText, type TokenSource } from "./api";
+import {
+  ApiClient,
+  ApiError,
+  attachmentName,
+  type ChatMessage,
+  errorMessage,
+  errorText,
+  query,
+  type TokenSource,
+} from "./api";
 import { AuthSession } from "./auth";
 import type { KeyValueStore } from "./pkce";
 
@@ -399,5 +408,88 @@ describe("job calls", () => {
     await expect(missing.getJob(ORG, JOB)).rejects.toMatchObject({ status: 404, message: "the job does not exist" });
     const off = new ApiClient("https://api.test", tokens(), vi.fn(async () => json(409, { detail: "scheduled jobs are off in this process" })));
     await expect(off.listJobs(ORG)).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe("query", () => {
+  it("leaves out null values and encodes the rest", () => {
+    expect(query({ q: "a b&c", workspace_id: null, limit: 10 })).toBe("?q=a+b%26c&limit=10");
+    expect(query({ scope: null })).toBe("");
+  });
+});
+
+describe("attachmentName", () => {
+  it("reads the file name of the header and refuses a path", () => {
+    expect(attachmentName('attachment; filename="session-1.md"', "x.md")).toBe("session-1.md");
+    expect(attachmentName(null, "x.md")).toBe("x.md");
+    expect(attachmentName('attachment; filename="../etc/passwd"', "x.md")).toBe("x.md");
+  });
+});
+
+function firstUrl(fetcher: { mock: { calls: unknown[][] } }): string {
+  return String(fetcher.mock.calls[0]?.[0]);
+}
+
+describe("ApiClient M3.12 calls", () => {
+  it("sends the search query and the workspace filter", async () => {
+    const fetcher = vi.fn(async () => json(200, []));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.searchSessions("o1", "deploy plan", "w1", 5);
+    expect(firstUrl(fetcher)).toBe(
+      "https://api.test/orgs/o1/session-search?q=deploy+plan&workspace_id=w1&limit=5",
+    );
+  });
+
+  it("puts the new memory entries with the profile and the reason", async () => {
+    const fetcher = vi.fn(async () => json(200, { target: "agent", entries: ["a"] }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.editMemory("w1", "agent", ["a"], "p1", "fix");
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/workspaces/w1/memory/agent");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({
+      entries: ["a"],
+      agent_profile_id: "p1",
+      reason: "fix",
+    });
+  });
+
+  it("encodes the skill name and the scope", async () => {
+    const fetcher = vi.fn(async () => json(200, {}));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.getSkill("w1", "a b", "user");
+    expect(firstUrl(fetcher)).toBe("https://api.test/workspaces/w1/skills/a%20b?scope=user");
+  });
+
+  it("returns the export file with the name of the header", async () => {
+    const fetcher = vi.fn(
+      async () =>
+        new Response("# Session", {
+          status: 200,
+          headers: { "Content-Disposition": 'attachment; filename="session-abc.md"' },
+        }),
+    );
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    const file = await client.exportSession("abcdef0123", "markdown");
+    expect(firstUrl(fetcher)).toBe("https://api.test/sessions/abcdef0123/export?format=markdown");
+    expect(file.name).toBe("session-abc.md");
+    expect(await file.blob.text()).toBe("# Session");
+  });
+
+  it("throws an ApiError when the export fails", async () => {
+    const fetcher = vi.fn(async () => json(404, { detail: "the session does not exist" }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.exportSession("s1", "json")).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("drops an export that ends after the account changed", async () => {
+    const source = tokens();
+    const fetcher = vi.fn(async () => {
+      return new Response("{}", { status: 200 });
+    });
+    const client = new ApiClient("https://api.test", source, fetcher);
+    const pending = client.exportSession("s1", "json");
+    (source as { generation: number }).generation = 2;
+    await expect(pending).rejects.toBeInstanceOf(ApiError);
   });
 });

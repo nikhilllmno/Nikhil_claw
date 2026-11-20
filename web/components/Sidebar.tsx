@@ -9,6 +9,15 @@ import { useAuth } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import styles from "./Sidebar.module.css";
 
+/** The links under the sessions and the agents, in this order. */
+const SETTINGS_LINKS = [
+  { href: "/search", title: "Search", meta: "Find words in your past sessions" },
+  { href: "/memory", title: "Memory", meta: "The notes that the agents keep" },
+  { href: "/skills", title: "Skills", meta: "The guides that the agents follow" },
+  { href: "/connections", title: "Connections", meta: "The tools that the agent can use" },
+  { href: "/settings", title: "Settings", meta: "Account, chat apps, and agents" },
+] as const;
+
 export function Sidebar({
   open,
   modal,
@@ -47,7 +56,7 @@ export function Sidebar({
   const groups = groupByAge(visible, now);
   const profiles = profilesFor(workspaceId);
   const org = orgOfWorkspace(workspaceId);
-  const activeSession = pathname.startsWith("/s/") ? pathname.slice(3) : null;
+  const activeSession = pathname.startsWith("/s/") ? (pathname.split("/")[2] ?? null) : null;
 
   return (
     <aside
@@ -203,16 +212,18 @@ export function Sidebar({
         ) : null}
         <nav aria-label="Settings">
           <ul className={styles.list}>
-            <li>
-              <Link
-                href="/connections"
-                className={styles.item}
-                aria-current={pathname === "/connections" ? "page" : undefined}
-              >
-                <span className={styles.itemTitle}>Connections</span>
-                <span className={styles.itemMeta}>The tools that the agent can use</span>
-              </Link>
-            </li>
+            {SETTINGS_LINKS.map((link) => (
+              <li key={link.href}>
+                <Link
+                  href={link.href}
+                  className={styles.item}
+                  aria-current={pathname === link.href ? "page" : undefined}
+                >
+                  <span className={styles.itemTitle}>{link.title}</span>
+                  <span className={styles.itemMeta}>{link.meta}</span>
+                </Link>
+              </li>
+            ))}
           </ul>
         </nav>
         <div className={styles.user}>

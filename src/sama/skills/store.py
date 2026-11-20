@@ -146,12 +146,29 @@ class PostgresSkillStore:
                 f'A skill "{request.name}" was created at the same time. Try again.'
             ) from None
 
+    async def edit(self, actor: Actor, request: ManageRequest) -> Written:
+        """Writes a change that a person made in the web app (Section 11.4). ``actor`` has the
+        roles of the person, so ``authorize`` checks them. The version and the audit entry name
+        a ``user`` as the author. Nothing is proposed: a person without the role gets an
+        error."""
+        try:
+            async with self._engine.begin() as connection:
+                return await self._write(
+                    connection, replace(actor, review=False), request, author_kind="user"
+                )
+        except IntegrityError:
+            raise SkillError(
+                f'A skill "{request.name}" was created at the same time. Try again.'
+            ) from None
+
     async def _write(
         self,
         connection: AsyncConnection,
         actor: Actor,
         request: ManageRequest,
         expected: Expected | None = None,
+        *,
+        author_kind: str = "agent",
     ) -> Written:
         # The lock stops a second write to this name until this one commits.
         await connection.execute(
@@ -171,7 +188,7 @@ class PostgresSkillStore:
                     f'The skill "{request.name}" changed after the background review proposed'
                     " the change. Ask for a new proposal."
                 )
-        return await self._save(connection, actor, plan, request)
+        return await self._save(connection, actor, plan, request, author_kind)
 
     async def _plan_as_owner(
         self, connection: AsyncConnection, actor: Actor, request: ManageRequest
@@ -245,7 +262,12 @@ class PostgresSkillStore:
         return Written(request.name, plan.scope, 0, request.action, proposed=True)
 
     async def _save(
-        self, connection: AsyncConnection, actor: Actor, plan: WritePlan, request: ManageRequest
+        self,
+        connection: AsyncConnection,
+        actor: Actor,
+        plan: WritePlan,
+        request: ManageRequest,
+        author_kind: str,
     ) -> Written:
         target = plan.target
         if target is None:
@@ -288,7 +310,7 @@ class PostgresSkillStore:
                 requires_toolsets=list(plan.requires_toolsets),
                 change=plan.change,
                 summary=(request.summary or None) and request.summary[:500],
-                author_kind="agent",
+                author_kind=author_kind,
                 author_user_id=actor.user_id,
                 session_id=actor.session_id,
                 run_id=actor.run_id,
@@ -298,7 +320,7 @@ class PostgresSkillStore:
             insert(AuditEntry).values(
                 org_id=actor.org_id,
                 workspace_id=actor.workspace_id,
-                actor_kind="agent",
+                actor_kind=author_kind,
                 actor_user_id=actor.user_id,
                 action=f"skill.{plan.change}",
                 target_type="skill",
