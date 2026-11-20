@@ -2096,6 +2096,75 @@ list, new session, chat with streamed text, approval cards (Approve, Always allo
 
 The Next.js app in `web/` replaces this page in M3. The web app keeps the same API.
 
+**Web app and CORS.** The Next.js app in `web/` runs on another origin than the API. It calls
+the API from the browser with a Bearer token and no cookies. The optional setting
+`SAMA_WEB_ORIGINS` lists the origins that may do this. It is a comma-separated list of exact
+origins, for example `https://sama-web.vercel.app,http://localhost:3000`:
+
+- Each origin is `http://host` or `https://host` with an optional port. It has no path, no query,
+  and no `*`. The process refuses a bad value at start-up and names the variable.
+- With the setting, the API answers a preflight request from a listed origin. It allows the
+  methods `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`, the headers `Authorization`,
+  `Content-Type`, and `Last-Event-ID`, and caches the answer for 600 seconds. It never allows
+  credentials. The event stream and error answers have the CORS header, too, also the answer
+  to an unhandled error (`500`): the CORS layer is outside the layer that makes that answer.
+- Without the setting (the default), the API sends no CORS header. The page at `/` does not
+  need CORS, because it has the same origin as the API.
+- `sama.api.__main__` and `sama.controlplane` both read the setting.
+
+**Agent profile read and update.** `/me` lists the agent profiles that the user sees. The
+settings page of the web app uses two more routes:
+
+- `GET /orgs/{org_id}/agent-profiles/{profile_id}` returns the profile to each org member who
+  can see it: `id`, `org_id`, `workspace_id`, `name`, `soul`, `runtime`, `model`, `toolsets`,
+  `group_toolsets`, `subagents`, `updated_at`, `editable`, and `options`. A profile of a
+  workspace is visible to the same users as in `/me`: an org owner or admin, and a member of the
+  workspace. Any other user gets `404`, as for a profile that does not exist. `editable` is true
+  for an org owner or admin. `options` has the data for the form:
+  `toolsets` (each name of the fixed toolset table with its sorted tools), `models` (the models
+  that have a price for the provider of the runtime), `subagents` (true if the runtime has
+  native sub-agents), and `limits` (`name_max_chars`, `soul_max_chars`, `max_subagents`, and the
+  limits of the sub-agent spec).
+- `PATCH /orgs/{org_id}/agent-profiles/{profile_id}` changes the profile. Only an org owner or
+  admin can do it (`403` for another member). The body has `name`, `soul`, `model`, `toolsets`,
+  and `subagents`. Each field is optional, an unknown field is an error, and the body has at
+  least one field. The answer has the same body as the `GET`.
+
+The rules of an update:
+
+- `name` has 1 to 80 characters after the spaces at both ends are removed. `soul` has at most
+  20,000 characters. The API refuses a soul that has a secret (`422`). It does not run the
+  injection scan on the soul: the soul is the instruction of the admin.
+- `model` must be one of `options.models`. `toolsets` have no duplicates, and each one is in the
+  fixed toolset table. `subagents` replaces the whole list. The same code as `python -m
+  sama.admin subagents set` checks it (`sama.subagents.validate_subagents`), and its error text
+  is safe to show.
+- The API checks the sub-agents against the new toolsets in the same transaction. An admin
+  cannot remove a toolset that a sub-agent uses, and cannot remove the toolset `subagents`
+  while the profile has sub-agents (`422`).
+- The transaction locks the row (`SELECT ... FOR UPDATE`), sets `updated_at`, and writes one
+  audit entry: `action` `profile.updated`, `target_type` `agent_profile`, and `details` with
+  `fields` (the names of the changed fields) and `subagents` (the names of the sub-agents, when
+  the list changed). The entry never has the soul or a prompt. A request that changes nothing
+  writes nothing.
+- The read goes through the same guards as the session routes (code and RLS). The write uses
+  the table owner, as the other writes do, after the code checked the role.
+- A session keeps the soul, the model, and the sub-agents that it froze. A change to them
+  applies from the next session. The gate reads the toolsets of the profile on every tool call,
+  so a change to the toolsets applies at the next tool call, also in a session that is running.
+  This keeps a revoked toolset immediate (Section 5.1). The web app shows this note.
+- A change to the soul or to the sub-agents needs a redactor that knows every secret of the org,
+  as `python -m sama.admin subagents set` does (`sama.vault.standalone.know_the_secrets`). It
+  fails closed with `503`, and the message has no secret, when the org has vault entries but the
+  process has no `SAMA_VAULT_KEY`, or when the vault cannot be read or an entry does not decrypt.
+  A change to the name, the model, or the toolsets does not need it.
+- The write checks the role again after it locks the profile row, and it locks the membership
+  row of the admin (`FOR SHARE`) until the end of the transaction. An admin who loses the role
+  while the write waits for the lock gets `403`, and nothing is written.
+
+In-place edits by an admin are the M3.8 interim. When `change_propose` (M6.1) exists, a change
+to a profile goes through an approval card, and the history and the revert are in the web app.
+
 **Telegram pairing.** `POST /channels/telegram/pairing-codes` with `workspace_id`,
 `agent_profile_id`, and `kind` (`user` or `group`) makes a pairing code (Section 11.5). It does
 the same access checks as `POST /sessions`. The code is for the Telegram bot of the org of the
@@ -2625,8 +2694,9 @@ It is empty by default. A spec has:
 | `model` | Not set or `inherit`: the model of the run. Else a model id that has a price in the price table. |
 | `max_turns` | Not set, or 1 to 50. |
 
-**Write.** `set_profile_subagents` is the only code that writes the column. It locks the
-profile and checks the specs. It rejects the specs when: the runtime of the profile has no
+**Write.** Two code paths write the column. They share `lock_profile` and `validate_subagents`:
+`set_profile_subagents` (the admin command) and `sama.profiles.update_profile` (the web app, Section
+11.4). `validate_subagents` checks the specs. It rejects the specs when: the runtime of the profile has no
 `native_subagents`; the profile has no `subagents` toolset; a spec uses a toolset that the
 profile does not have, or `subagents`, `clarify`, or `tool_search`; a model has no price; or the description
 or the prompt has a secret or a finding of the injection scan (Section 6.1). The error text
@@ -2637,7 +2707,9 @@ spec, and it never has the name of an unknown key: such a key shows as `unknown 
 The command first gives the redactor the secrets of the environment and the vault of
 the org, so a secret that no pattern matches is also found in a spec. It fails closed: it reads
 the vault in one strict refresh, and it stops when any entry does not decrypt or the vault cannot
-be read. It also stops when the org has vault entries but `SAMA_VAULT_KEY` is not set. There is no HTTP API for it yet.
+be read. It also stops when the org has vault entries but `SAMA_VAULT_KEY` is not set. The web app
+changes the sub-agents with `PATCH /orgs/{org_id}/agent-profiles/{profile_id}` (Section 11.4). It
+writes the audit entry `profile.updated`, not `profile.subagents_set`.
 
 **Build.** The prompt assembler (Section 6.1) turns the specs into `SubagentDefinition`
 objects and puts them in `RunConfig.subagents`. The config is frozen with the session (D9),
@@ -3737,7 +3809,7 @@ the start with a message that names the variable but not its value.
 | `BRAVE_API_KEY` | No | `web_search` |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
-| `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
+| `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first
 (Section 16.3).

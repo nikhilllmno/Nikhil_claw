@@ -27,16 +27,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncEngine
-
 from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Owner, bootstrap
 from sama.db.engine import create_engine
-from sama.db.models import VaultSecret
 from sama.subagents import SubagentError, parse_subagents, profile_subagents, set_profile_subagents
 from sama.vault.crypto import VaultKey
-from sama.vault.redact import default_redactor, env_secrets
-from sama.vault.standalone import vault_from_env
+from sama.vault.standalone import VaultUnreadableError, know_the_secrets
 from sama.vault.store import SecretName, Vault
 
 
@@ -98,59 +93,15 @@ async def _secret(args: argparse.Namespace) -> dict[str, Any]:
         await engine.dispose()
 
 
-ENV_SECRETS = (
-    "SAMA_RUN_TOKEN_KEY",
-    "SAMA_DATABASE_URL",
-    "SAMA_VAULT_KEY",
-    "SAMA_SUPABASE_JWT_SECRET",
-    "SAMA_ALERT_SLACK_WEBHOOK_URL",
-    "LANGFUSE_SECRET_KEY",
-    "E2B_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "BRAVE_API_KEY",
-)
-"""The environment variables that hold a secret of the control plane. The redactor knows their
-values before the sub-agent specs are checked."""
-
-VAULT_UNREADABLE = "the vault cannot be read, so the sub-agents are not stored"
-
-
-async def _know_the_secrets(engine: AsyncEngine, org_id: uuid.UUID) -> None:
-    """Gives the redactor the environment secrets and every vault value, as the control plane
-    does at start (Section 16.3). A spec with an opaque known secret is then not stored.
-
-    Fails closed: if the vault key is bad, the table cannot be read, or an entry does not
-    decrypt, there is no write. Without ``SAMA_VAULT_KEY`` the org must have no vault entry.
-    """
-    default_redactor().add(*env_secrets(*ENV_SECRETS))
-    try:
-        vault = vault_from_env(engine)
-        if vault is None:
-            async with engine.connect() as connection:
-                stored = (
-                    await connection.execute(
-                        select(func.count()).where(VaultSecret.org_id == org_id)
-                    )
-                ).scalar_one()
-            if stored:
-                raise SystemExit("set SAMA_VAULT_KEY: the org has vault entries")
-            return
-        # Strict: one read, and any entry that does not decrypt raises. No count to compare.
-        await vault.refresh_redactor(strict=True)
-    except SystemExit:
-        raise
-    except Exception:
-        # No detail: the text of a database error can have the connection URL.
-        raise SystemExit(VAULT_UNREADABLE) from None
-
-
 async def _subagents(args: argparse.Namespace, raw: Any) -> dict[str, Any]:
     engine = create_engine(_database_url())
     try:
         result: dict[str, Any] = {"org_id": str(args.org), "profile_id": str(args.profile)}
         if args.action == "set":
-            await _know_the_secrets(engine, args.org)
+            try:
+                await know_the_secrets(engine, args.org)
+            except VaultUnreadableError as error:
+                raise SystemExit(str(error)) from None
             await set_profile_subagents(engine, args.org, args.profile, parse_subagents(raw))
         specs = await profile_subagents(engine, args.org, args.profile)
         return result | {"subagents": [spec.model_dump(mode="json") for spec in specs]}

@@ -75,6 +75,18 @@ def test_a_bad_value_is_refused_without_its_value(changes: dict[str, str], messa
             assert value not in str(error.value)
 
 
+def test_the_web_origins_are_read() -> None:
+    assert settings().web_origins == ()
+    s = settings(SAMA_WEB_ORIGINS=" https://sama-web.example.test,http://localhost:3000, ")
+    assert s.web_origins == ("https://sama-web.example.test", "http://localhost:3000")
+
+
+@pytest.mark.parametrize("value", ["*", "https://example.test/", "example.test"])
+def test_a_web_origin_that_is_not_exact_is_refused(value: str) -> None:
+    with pytest.raises(SettingsError, match="SAMA_WEB_ORIGINS"):
+        settings(SAMA_WEB_ORIGINS=value)
+
+
 def test_the_options_are_read() -> None:
     s = settings(
         SAMA_SANDBOX_ALLOW_OUT=" GitHub.com, pypi.org,,example.org,sama-staging.fly.dev ",
