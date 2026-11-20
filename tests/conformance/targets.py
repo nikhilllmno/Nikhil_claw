@@ -11,6 +11,8 @@ tests run on every target.
 - ``claude-runner``: ``SandboxedRuntime`` with the local provider. The orchestrator starts the
   runner in a folder with a clean environment, and the runner starts ``ClaudeRuntime``. It
   uses the scripted model and a run token. CI runs it.
+- ``claude-warm``: ``claude-runner`` with the warm runner (``sama.warm``), as in production. The
+  first run of the suite is cold. The next runs fork from the warm server. CI runs it.
 - ``claude-docker``: the same in the sama image with the Docker provider. It runs when the
   image is built (``SAMA_DOCKER_IMAGE``).
 """
