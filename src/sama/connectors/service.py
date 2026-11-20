@@ -44,7 +44,12 @@ from sama.connectors.composio import (
     ComposioError,
 )
 from sama.connectors.errors import ConnectorError
-from sama.connectors.http_api import DriverError, FormDriver, HttpApiDriver
+from sama.connectors.http_api import (
+    DriverError,
+    DriverUnavailableError,
+    FormDriver,
+    HttpApiDriver,
+)
 from sama.connectors.manifest import Catalog, Manifest, Scope, ToolSpec
 from sama.db.models import AuditEntry, Connection, Run, Session
 from sama.tenancy.access import Grants
@@ -62,7 +67,6 @@ INITIATED_TTL: Final = timedelta(minutes=30)
 MAX_ERROR_CHARS: Final = 500
 MAX_FIELD_CHARS: Final = 2_000
 MAX_ANSWER_CHARS: Final = 200_000
-STATES: Final = ("pending", "initiated", "connected", "failed", "expired", "disabled")
 CHAT_WARNING: Final = (
     "Do not send passwords, API keys, or tokens in a chat. Give them only on the sama web page."
 )
@@ -236,18 +240,7 @@ class ConnectionService:
         self, org_id: uuid.UUID, workspace_id: uuid.UUID, user_id: uuid.UUID
     ) -> list[ConnectionView]:
         """The workspace connections and the personal connections of the user."""
-        async with self._engine.begin() as connection:
-            await _expire_stale(connection, org_id)
-            rows = await connection.execute(
-                select(Connection)
-                .where(
-                    Connection.org_id == org_id,
-                    Connection.workspace_id == workspace_id,
-                    or_(Connection.scope == "workspace", Connection.owner_user_id == user_id),
-                )
-                .order_by(Connection.connector, Connection.scope, Connection.id)
-            )
-            return [ConnectionView.of(row) for row in rows]
+        return await self.for_run(RunScope(org_id, workspace_id, user_id, shared=False))
 
     async def start(
         self,
@@ -357,6 +350,8 @@ class ConnectionService:
     ) -> ConnectionView:
         """Asks the backend for the state of the connection, and stores it. This is the only
         way to ``connected``."""
+        async with self._engine.begin() as connection:
+            await _expire_stale(connection, org_id)
         view = await self.get(org_id, connection_id)
         if view is None:
             raise ConnectorError("the connection does not exist", status_code=404)
@@ -367,12 +362,22 @@ class ConnectionService:
             state, error = await self._composio_state(org_id, view)
         else:
             state, error = await self._form_state(org_id, view, manifest)
+        if view.state == "expired" and state == "initiated":
+            # The link is older than ``INITIATED_TTL``. Only a new link starts the time again.
+            state, error = "expired", view.last_error
         changed = state != view.state
         # Only a change moves ``updated_at``: an ``initiated`` connection expires 30 minutes
         # after its link, also when the web page checks it again and again.
-        result = await self._set(
-            org_id, view.id, state=state, error=error, health=True, touch=changed
+        result = await self._write(
+            org_id, view.id, state=state, error=error, health=True, touch=changed, expect=view
         )
+        if result is None:
+            # The connection changed while the backend answered (for example an admin disabled
+            # it, or the user started it again). That change wins, and this answer is old.
+            current = await self.get(org_id, view.id)
+            if current is None:
+                raise ConnectorError("the connection does not exist", status_code=404)
+            return current
         if changed:
             async with self._engine.begin() as connection:
                 await _audit(connection, org_id, actor, f"connection.{state}", view.id, view.scope)
@@ -655,8 +660,7 @@ class ConnectionService:
                         handler=self._handler(spec.name),
                         input_schema=spec.input_schema,
                         tags=(manifest.name, manifest.title),
-                        read_only=spec.access == "read",
-                        destructive=spec.access == "destructive",
+                        access=spec.access,
                     )
                 )
 
@@ -720,6 +724,9 @@ class ConnectionService:
             return "failed", f"this process cannot connect {manifest.kind} connectors"
         try:
             await driver.test(manifest, values)
+        except DriverUnavailableError as error:
+            # The check did not get an answer: the state stays, and the row keeps the error.
+            return cast(State, view.state), str(error)
         except DriverError as error:
             return "failed", str(error)
         return "connected", None
@@ -817,9 +824,26 @@ class ConnectionService:
         state: State,
         error: str | None,
         config: Mapping[str, Any] | None = None,
+    ) -> ConnectionView:
+        view = await self._write(org_id, connection_id, state=state, error=error, config=config)
+        if view is None:
+            raise ConnectorError("the connection does not exist", status_code=404)
+        return view
+
+    async def _write(
+        self,
+        org_id: uuid.UUID,
+        connection_id: uuid.UUID,
+        *,
+        state: State,
+        error: str | None,
+        config: Mapping[str, Any] | None = None,
         health: bool = False,
         touch: bool = True,
-    ) -> ConnectionView:
+        expect: ConnectionView | None = None,
+    ) -> ConnectionView | None:
+        """Sets the state, and returns ``None`` if the row is not there. With ``expect``, sets
+        it only if the row did not change since ``expect`` was read."""
         values: dict[str, Any] = {
             "state": state,
             "last_error": None if error is None else error[:MAX_ERROR_CHARS],
@@ -830,18 +854,18 @@ class ConnectionService:
             values["config"] = dict(config)
         if health:
             values["last_health_at"] = func.now()
+        statement = update(Connection).where(
+            Connection.org_id == org_id, Connection.id == connection_id
+        )
+        if expect is not None:
+            statement = statement.where(
+                Connection.state == expect.state, Connection.updated_at == expect.updated_at
+            )
         async with self._engine.begin() as connection:
             row = (
-                await connection.execute(
-                    update(Connection)
-                    .where(Connection.org_id == org_id, Connection.id == connection_id)
-                    .values(**values)
-                    .returning(Connection)
-                )
+                await connection.execute(statement.values(**values).returning(Connection))
             ).one_or_none()
-        if row is None:
-            raise ConnectorError("the connection does not exist", status_code=404)
-        return ConnectionView.of(row)
+        return None if row is None else ConnectionView.of(row)
 
 
 def _default_scope(manifest: Manifest, shared: bool) -> Scope | None:
@@ -931,7 +955,6 @@ __all__ = [
     "CHAT_WARNING",
     "CONNECTOR_TOOLSET",
     "INITIATED_TTL",
-    "STATES",
     "ConnectionService",
     "ConnectionView",
     "ConnectorError",

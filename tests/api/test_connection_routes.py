@@ -146,11 +146,19 @@ async def test_a_form_secret_is_never_in_an_answer(
     async with engine.connect() as db:
         row = (await db.execute(select(Connection).where(Connection.id == connection["id"]))).one()
     assert row.secret_ref == f"connection:{connection['id']}"
-    too_many = {"values": {f"f{i}": "x" for i in range(30)}}
-    response = await web.put(
-        f"/connections/{connection['id']}/form", headers=mia(tenant), json=too_many
-    )
-    assert response.status_code == 422
+    # A refused body does not come back in the answer: it can hold a secret.
+    too_many = {"values": {"token": NOTION_TOKEN} | {f"f{i}": "x" for i in range(30)}}
+    for refused in (
+        too_many,
+        {"values": {"token": NOTION_TOKEN, "n": 5}},
+        {"values": {"token": NOTION_TOKEN}, "extra": NOTION_TOKEN},
+    ):
+        response = await web.put(
+            f"/connections/{connection['id']}/form", headers=mia(tenant), json=refused
+        )
+        assert response.status_code == 422
+        assert NOTION_TOKEN not in response.text
+        assert response.json()["detail"][0]["loc"]
     disabled = await web.post(f"/connections/{connection['id']}/disable", headers=mia(tenant))
     assert disabled.json()["state"] == "disabled"
 

@@ -5,30 +5,49 @@ The manifest fixes the host, the auth header, the test request, and the request 
 The agent gives only the arguments: a path argument is quoted into one path segment, so the
 agent cannot change the host or leave the path. The credential comes from the vault entry
 ``connection:<id>`` for each call and goes only into the auth header.
+
+Every request goes through ``OutboundClient`` (Section 16.4): public addresses only, no
+redirects, and a size limit while the body is read.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Mapping
 from typing import Any, Final, Protocol
 from urllib.parse import quote
 
 import httpx
 
+from sama.connectors.errors import short_error
 from sama.connectors.manifest import HttpApi, HttpRequest, Manifest, ToolSpec, path_params
-from sama.vault.redact import redact
-
-log: Final = logging.getLogger("sama.connectors.http_api")
+from sama.tools.outbound import (
+    BlockedUrlError,
+    FetchError,
+    OutboundClient,
+    Resolver,
+    UrlPolicy,
+    system_resolver,
+)
 
 TIMEOUT_S: Final = 30.0
 MAX_ANSWER_BYTES: Final = 2_000_000
-MAX_ERROR_CHARS: Final = 300
+UNAVAILABLE_CODES: Final = frozenset({408, 429, 500, 502, 503, 504})
+POLICY: Final = UrlPolicy(
+    max_redirects=0,
+    max_bytes=MAX_ANSWER_BYTES,
+    hop_timeout_s=TIMEOUT_S,
+    total_timeout_s=TIMEOUT_S,
+)
 
 
 class DriverError(Exception):
     """A call of the API failed. The message is safe to show: it holds no secret."""
+
+
+class DriverUnavailableError(DriverError):
+    """The API cannot be reached now (a network error, a time limit, or a 5xx or 429 answer).
+    The credential can still be good, so a check keeps the state of the connection."""
 
 
 class FormDriver(Protocol):
@@ -45,29 +64,35 @@ class FormDriver(Protocol):
 
 
 class HttpApiDriver:
-    def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
-        self._http = httpx.AsyncClient(timeout=TIMEOUT_S, transport=transport)
+    def __init__(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        resolver: Resolver = system_resolver,
+    ) -> None:
+        self._http = OutboundClient(POLICY, resolver=resolver, transport=transport)
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
     async def test(self, manifest: Manifest, values: Mapping[str, str]) -> None:
-        await self._send(_http(manifest), manifest.http.test if manifest.http else None, values, {})
+        http = _http(manifest)
+        await self._send(http, http.test, values, {})
 
     async def call(
         self, manifest: Manifest, tool: ToolSpec, values: Mapping[str, str], arguments: Any
     ) -> str:
+        if tool.request is None:
+            raise DriverError("the connector has no request for this")
         return await self._send(_http(manifest), tool.request, values, dict(arguments or {}))
 
     async def _send(
         self,
         http: HttpApi,
-        request: HttpRequest | None,
+        request: HttpRequest,
         values: Mapping[str, str],
         arguments: dict[str, Any],
     ) -> str:
-        if request is None:
-            raise DriverError("the connector has no request for this")
         path = request.path
         for name in path_params(path):
             value = arguments.pop(name, None)
@@ -84,21 +109,26 @@ class HttpApiDriver:
             http.auth.header: http.auth.prefix + credential,
             "Accept": "application/json",
         }
-        body = None if request.method in ("GET", "DELETE") else arguments
-        params = (
-            {k: _param(v) for k, v in arguments.items()}
-            if request.method in ("GET", "DELETE")
-            else None
-        )
+        in_query = request.method in ("GET", "DELETE")
         try:
-            response = await self._http.request(
-                request.method, http.base_url + path, headers=headers, json=body, params=params
+            answer = await self._http.request(
+                request.method,
+                http.base_url + path,
+                headers=headers,
+                params={k: _param(v) for k, v in arguments.items()} if in_query else None,
+                json=None if in_query else arguments,
             )
-        except httpx.HTTPError as error:
-            raise DriverError(f"the API cannot be reached: {type(error).__name__}") from None
-        text = response.content[:MAX_ANSWER_BYTES].decode("utf-8", errors="replace")
-        if response.status_code >= 400:
-            raise DriverError(f"the API answered {response.status_code}: {_cut(text)}")
+        except BlockedUrlError as error:
+            raise DriverError(f"the API address is not allowed: {error}") from None
+        except FetchError as error:
+            raise DriverUnavailableError(f"the API cannot be reached: {error}") from None
+        text = answer.content.decode("utf-8", errors="replace")
+        if answer.status_code in UNAVAILABLE_CODES:
+            raise DriverUnavailableError(
+                f"the API answered {answer.status_code}: {short_error(text)}"
+            )
+        if answer.status_code >= 400:
+            raise DriverError(f"the API answered {answer.status_code}: {short_error(text)}")
         return text
 
 
@@ -114,8 +144,3 @@ def _param(value: Any) -> str:
     if isinstance(value, str | int | float):
         return str(value)
     return json.dumps(value, separators=(",", ":"))
-
-
-def _cut(text: str) -> str:
-    text = redact(" ".join(text.split()))
-    return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 3] + "..."

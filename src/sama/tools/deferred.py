@@ -59,16 +59,9 @@ class DeferredTool:
     handler: DeferredHandler
     input_schema: Mapping[str, Any] = field(default_factory=lambda: {"type": "object"})
     tags: tuple[str, ...] = ()
-    read_only: bool = False
-    destructive: bool = False
-    """The tool can delete or change data that cannot be restored. The approval card says so."""
-
-    @property
-    def access(self) -> ToolAccess:
-        """What the tool does, for its default policy (Section 10.3)."""
-        if self.destructive:
-            return "destructive"
-        return "read" if self.read_only else "write"
+    access: ToolAccess = "write"
+    """What the tool does, for its default policy (Section 10.3). A ``destructive`` tool can
+    delete or change data that cannot be restored; the approval card says so."""
 
     def __post_init__(self) -> None:
         if _NAME.fullmatch(self.name) is None:
@@ -83,8 +76,6 @@ class DeferredTool:
             raise ValueError(f"the description has more than {MAX_DESCRIPTION_CHARS} characters")
         if self.input_schema.get("type") != "object":
             raise ValueError("the input schema must describe an object")
-        if self.read_only and self.destructive:
-            raise ValueError("a tool that only reads cannot be destructive")
 
 
 def missing_arguments(tool: DeferredTool, arguments: Mapping[str, Any]) -> list[str]:

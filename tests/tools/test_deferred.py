@@ -51,7 +51,7 @@ def mail_tools() -> list[DeferredTool]:
         DeferredTool(
             "mail_send", "Send an email message.", "mail", echo, SEND_SCHEMA, tags=("gmail",)
         ),
-        DeferredTool("mail_read", "Read the inbox.", "mail", echo, read_only=True),
+        DeferredTool("mail_read", "Read the inbox.", "mail", echo, access="read"),
         DeferredTool("speak", "Turn text into speech audio.", "media", echo, tags=("tts",)),
     ]
 

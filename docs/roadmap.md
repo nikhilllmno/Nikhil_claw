@@ -185,7 +185,9 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   `connection_request`, and `connection_test` are default allow tools. The connector tools are
   deferred tools in `integrations`: `tool_search` shows them only with a connected connection
   that the run can use, and a shared session uses only workspace connections. Read tools are
-  `allow`, write tools `ask`. Not in M3.4: `mcp_remote`, `mcp_hosted`, `database`, and
+  `allow`, write tools `ask`. The `http_api` driver uses the outbound client (public addresses
+  only, no redirects), and a check never overwrites a `disable` that happens during it. Not in
+  M3.4: `mcp_remote`, `mcp_hosted`, `database`, and
   `plugin` connectors, tool discovery and `tool_cache`, `policy_overrides` in the gate,
   Composio triggers, custom connections, and per-tool filters.
 - M2.1: memory in `src/sama/memory/` (architecture Section 8.1). Migration `0012` adds

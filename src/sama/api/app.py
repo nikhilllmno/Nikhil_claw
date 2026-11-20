@@ -27,6 +27,8 @@ from importlib import resources
 from typing import Annotated, Any, Final, Literal, Self
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -605,6 +607,17 @@ class SamaApi:
         app.state.sama_api = self
         settings = self._settings
 
+        @app.exception_handler(RequestValidationError)
+        async def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
+            # The default answer repeats the input of each error. A body can hold a secret (a
+            # bot token, a connection form), so the answer says only where and why.
+            detail = [{k: v for k, v in e.items() if k != "input"} for e in error.errors()]
+            return JSONResponse({"detail": jsonable_encoder(detail)}, status_code=422)
+
+        @app.exception_handler(ConnectorError)
+        async def connector_error(request: Request, error: ConnectorError) -> JSONResponse:
+            return JSONResponse({"detail": str(error)}, status_code=error.status_code)
+
         @app.middleware("http")
         async def security_headers(request: Request, call_next: Any) -> Response:
             response: Response = await call_next(request)
@@ -850,23 +863,13 @@ class SamaApi:
         ) -> dict[str, Any]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
             service = self._require_connections()
-            try:
-                started = await service.start(
-                    org_id, workspace_id, grants, body.connector, body.scope
-                )
-            except ConnectorError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            started = await service.start(org_id, workspace_id, grants, body.connector, body.scope)
             return started.public()
 
         @app.post("/connections/{connection_id}/check")
         async def check_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
             org_id, view, grants = await self._connection(principal, connection_id, manage=False)
-            try:
-                checked = await self._require_connections().check(
-                    org_id, view.id, actor=grants.user_id
-                )
-            except ConnectorError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            checked = await self._require_connections().check(org_id, view.id, actor=grants.user_id)
             return checked.public()
 
         @app.put("/connections/{connection_id}/form")
@@ -875,23 +878,15 @@ class SamaApi:
         ) -> dict[str, Any]:
             org_id, view, grants = await self._connection(principal, connection_id, manage=True)
             values = {k: v.get_secret_value() for k, v in body.values.items()}
-            try:
-                saved = await self._require_connections().submit_form(
-                    org_id, view.id, values, actor=grants.user_id
-                )
-            except ConnectorError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            saved = await self._require_connections().submit_form(
+                org_id, view.id, values, actor=grants.user_id
+            )
             return saved.public()
 
         @app.post("/connections/{connection_id}/disable")
         async def disable_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
             org_id, view, grants = await self._connection(principal, connection_id, manage=True)
-            try:
-                done = await self._require_connections().disable(
-                    org_id, view.id, actor=grants.user_id
-                )
-            except ConnectorError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            done = await self._require_connections().disable(org_id, view.id, actor=grants.user_id)
             return done.public()
 
         @app.delete("/connections/{connection_id}", status_code=204)

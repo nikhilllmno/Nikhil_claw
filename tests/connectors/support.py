@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +11,7 @@ import httpx
 from pydantic import SecretStr
 
 from sama.connectors.composio import ComposioClient
-from sama.connectors.http_api import DriverError
+from sama.connectors.http_api import DriverError, DriverUnavailableError
 from sama.connectors.manifest import Catalog, Manifest, ToolSpec
 from sama.connectors.service import ConnectionService
 from sama.vault.store import OrgKeys, SecretName, Vault
@@ -64,9 +64,16 @@ class FakeComposio:
 class FakeForm:
     def __init__(self) -> None:
         self.good = NOTION_TOKEN
+        self.down = False
+        self.during_test: Callable[[], Awaitable[object]] | None = None
+        """Runs while the API "answers", to change the connection at the same time."""
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def test(self, manifest: Manifest, values: Mapping[str, str]) -> None:
+        if self.during_test is not None:
+            await self.during_test()
+        if self.down:
+            raise DriverUnavailableError("the API cannot be reached: ConnectError")
         if values.get("token") != self.good:
             raise DriverError("the API answered 401")
 

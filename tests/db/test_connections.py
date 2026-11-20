@@ -150,6 +150,67 @@ async def test_a_check_keeps_the_state_when_composio_does_not_answer(org: Org1, 
     assert view.state == "expired"
 
 
+async def test_a_check_does_not_start_an_expired_sign_in_again(
+    engine: AsyncEngine, org: Org1, world: Any
+) -> None:
+    service, fake, _ = world
+    mia = member(org, "mia")
+    started = await service.start(org.ids["org"], org.ids["ws"], mia, "gmail", "personal")
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Connection)
+            .where(Connection.id == started.connection.id)
+            .values(updated_at=text("now() - interval '31 minutes'"))
+        )
+    # Composio still waits for the user, but the link is too old.
+    view = await service.check(org.ids["org"], started.connection.id, actor=mia.user_id)
+    assert view.state == "expired"
+    assert view.last_error
+    view = await service.check(org.ids["org"], started.connection.id, actor=mia.user_id)
+    assert view.state == "expired"
+    # A late sign-in that Composio accepted still connects.
+    fake.status = "ACTIVE"
+    view = await service.check(org.ids["org"], started.connection.id, actor=mia.user_id)
+    assert view.state == "connected"
+
+
+async def test_a_network_error_keeps_a_connected_form_connection(org: Org1, world: Any) -> None:
+    service, _, form = world
+    mia = member(org, "mia")
+    started = await service.start(org.ids["org"], org.ids["ws"], mia, "notion", "personal")
+    view = await service.submit_form(
+        org.ids["org"], started.connection.id, {"token": NOTION_TOKEN}, actor=mia.user_id
+    )
+    assert view.state == "connected"
+    form.down = True
+    view = await service.check(org.ids["org"], view.id, actor=None)
+    assert view.state == "connected"
+    assert view.last_error
+    assert "cannot be reached" in view.last_error
+
+
+async def test_a_disable_during_a_check_wins(org: Org1, world: Any) -> None:
+    service, _, form = world
+    admin = member(org, "max", admin=True)
+    started = await service.start(org.ids["org"], org.ids["ws"], admin, "notion", "workspace")
+    view = await service.submit_form(
+        org.ids["org"], started.connection.id, {"token": NOTION_TOKEN}, actor=admin.user_id
+    )
+    assert view.state == "connected"
+
+    async def disable() -> None:
+        form.during_test = None
+        await service.disable(org.ids["org"], view.id, actor=admin.user_id)
+
+    # A member checks; the admin disables the connection before the API answers.
+    form.during_test = disable
+    checked = await service.check(org.ids["org"], view.id, actor=None)
+    assert checked.state == "disabled"
+    current = await service.get(org.ids["org"], view.id)
+    assert current is not None
+    assert current.state == "disabled"
+
+
 async def test_a_form_secret_goes_only_to_the_vault(
     engine: AsyncEngine, org: Org1, world: Any
 ) -> None:

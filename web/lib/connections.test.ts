@@ -6,10 +6,13 @@ import {
   formValues,
   initialValues,
   isSafeRedirect,
+  listFor,
   parseConnectionQuery,
   stateLabel,
   stateTone,
   toolSummary,
+  withConnection,
+  withoutConnection,
   withoutEntryParams,
 } from "./connections";
 
@@ -91,6 +94,8 @@ describe("isSafeRedirect", () => {
     expect(isSafeRedirect("javascript:alert(1)")).toBe(false);
     expect(isSafeRedirect("not a url")).toBe(false);
     expect(isSafeRedirect(null)).toBe(false);
+    expect(isSafeRedirect("https://connect.composio.dev@evil.test/")).toBe(false);
+    expect(isSafeRedirect("https://user:pw@connect.composio.dev/")).toBe(false);
   });
 });
 
@@ -177,5 +182,32 @@ describe("ApiClient connections", () => {
       ["POST", `https://api.test/connections/${CONN}/disable`, undefined],
       ["DELETE", `https://api.test/connections/${CONN}`, undefined],
     ]);
+  });
+});
+
+describe("the connection list of a workspace", () => {
+  const OTHER_WS = "99999999-2222-4333-8444-555555555555";
+
+  it("shows the rows only for their workspace", () => {
+    const list = { workspaceId: WS, items: [connection()] };
+    expect(listFor(list, WS)).toEqual([connection()]);
+    expect(listFor(list, OTHER_WS)).toBeNull();
+    expect(listFor(null, WS)).toBeNull();
+  });
+
+  it("puts a saved connection only into the list of its workspace", () => {
+    const list = { workspaceId: WS, items: [connection({ state: "pending" })] };
+    const saved = withConnection(list, connection({ state: "connected" }));
+    expect(saved?.items.map((c) => c.state)).toEqual(["connected"]);
+    // An old answer for another workspace does not change the list.
+    const other = { workspaceId: OTHER_WS, items: [] };
+    expect(withConnection(other, connection())).toBe(other);
+    expect(withConnection(null, connection())).toBeNull();
+  });
+
+  it("removes a connection", () => {
+    const list = { workspaceId: WS, items: [connection()] };
+    expect(withoutConnection(list, CONN)?.items).toEqual([]);
+    expect(withoutConnection(null, CONN)).toBeNull();
   });
 });

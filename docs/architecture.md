@@ -1948,9 +1948,9 @@ gets one notice per change.
   `mcp_<connection>_<tool>` for MCP and `db_<connection>_<tool>` for databases. Since M3.4,
   the tools of a catalog connector start with the connector name, for example
   `gmail_send_email` and `notion_search`. A Composio tool keeps its Composio slug (for example
-  `GMAIL_SEND_EMAIL`) in the manifest, and the control plane uses the slug for the call. If a
-  name is longer than 64 characters, sama shortens it and adds a short hash. Each connection
-  is also a toolset `conn-<connection>` (later).
+  `GMAIL_SEND_EMAIL`) in the manifest, and the control plane uses the slug for the call. The
+  control plane rejects a tool name that is longer than 64 characters. Each connection is also
+  a toolset `conn-<connection>` (later).
 - Connector tools are deferred behind `tool_search` by default. An agent profile can pin a
   connection so that its tools are always visible. The mechanism is in M2.6: a connector
   registers its tools in the `DeferredCatalog`, each with a toolset (Section 6.3).
@@ -1975,9 +1975,9 @@ gets one notice per change.
 - **Catalog.** `connectors/catalog/` has `gmail`, `googlecalendar`, `github`, `slack`, and
   `linear` (kind `composio`), and `notion` (kind `http_api`, a form with an API key). The
   tool schemas are a trimmed copy of the Composio schemas. Each tool has `access`: `read`,
-  `write`, or `destructive`. A manifest is checked when the control plane starts: unknown keys,
-  a tool name that does not start with the connector name, an `http_api` base URL that is not
-  `https` or has a path, and two connectors with the same tool name are refused.
+  `write`, or `destructive`. The control plane checks each manifest when it starts. It rejects
+  unknown keys, a tool name that does not start with the connector name, an `http_api` base URL
+  that is not `https` or has a path, and two connectors with the same tool name.
   `SAMA_CONNECTORS_DIR` changes the folder.
 - **Composio.** Sama uses the Composio v3 API. The key is the vault entry
   `composio_api_key` of the org, else `COMPOSIO_API_KEY` of the control plane. Sama finds or
@@ -1989,17 +1989,24 @@ gets one notice per change.
   token. A new link deletes the old Composio account of the connection, and so does a delete.
 - **Forms (`http_api`).** The secret fields go to the vault entry `connection:<id>` as one JSON
   value. The other fields go to `config.fields`. The API never returns a secret. Sama tests
-  the form with the `test` request of the manifest before it sets `connected`. A path value of
-  `.` or `..` is refused.
+  the form with the `test` request of the manifest before it sets `connected`. Sama rejects a
+  path value of `.` or `..`. A form that the API rejects (HTTP 422) does not echo the values
+  in the answer. The `http_api` requests go through the outbound client of Section 16.4: the
+  address must be public, sama does not follow a redirect, and an answer has at most 2 MB.
 - **States.** Only a backend check sets `connected`: the Composio account status `ACTIVE`, or a
   good test request. An `initiated` connection becomes `expired` after 30 minutes, when sama
-  next reads it. A Composio 404 gives `expired`. A network error keeps the state and stores the
-  error. A check does not change a `disabled` connection. `policy_overrides` is stored but not
+  next reads it. A check does not start an `expired` sign-in again, but a late Composio `ACTIVE`
+  still connects it. A Composio 404 gives `expired`. A network error, a timeout, or an HTTP 408,
+  429, or 5xx keeps the state and stores the error. A check writes its result only if the row
+  did not change during the check, so a `disable` or a remove during a check wins. A check does
+  not change a `disabled` connection. `policy_overrides` is stored but not
   used yet. Discovery and `tool_cache` come later: the tools come from the manifest.
 - **Web app.** The Connections page (`/connections`) lists the connectors of the catalog with a
   row per scope. It starts a connection, sends the user to the Composio link, checks the
   connection when Composio sends the user back (`?connection=<id>`), shows the form of an
-  `http_api` connector, and disables or removes a connection. The API routes are
+  `http_api` connector, and disables or removes a connection. The page shows only the
+  connections of the current workspace, and it ignores a callback connection of another
+  workspace. It goes only to an `https` sign-in link without a user name or a password. The API routes are
   `GET /connectors`, `GET` and `POST /workspaces/{id}/connections`,
   `POST /connections/{id}/check`, `PUT /connections/{id}/form`,
   `POST /connections/{id}/disable`, and `DELETE /connections/{id}`. A form has at most 20

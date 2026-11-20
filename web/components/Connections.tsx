@@ -3,7 +3,7 @@
 // The Connections page (docs/architecture.md, Section 10.3). The user connects the tools of a
 // workspace here. Secrets go only into the forms of this page, never into a chat.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   type Connection,
@@ -12,15 +12,19 @@ import {
   errorText,
 } from "@/lib/api";
 import {
+  type ConnectionList,
   connectionOf,
   formProblem,
   formValues,
   initialValues,
   isSafeRedirect,
+  listFor,
   parseConnectionQuery,
   stateLabel,
   stateTone,
   toolSummary,
+  withConnection,
+  withoutConnection,
   withoutEntryParams,
 } from "@/lib/connections";
 import { useApi } from "./AuthProvider";
@@ -34,7 +38,14 @@ const SCOPE_LABELS: Record<ConnectionScope, string> = {
   workspace: "Whole workspace",
 };
 
-type Notice = { tone: "success" | "error"; text: string } | null;
+type Notice = { tone: "success" | "info" | "error"; connector: string | null; text: string } | null;
+
+/** The line of a notice. The connector title goes first: "Gmail is connected." or "Gmail: Failed. …". */
+function noticeText(notice: NonNullable<Notice>, catalog: Connector[] | null): string {
+  if (notice.connector === null) return notice.text;
+  const title = catalog?.find((c) => c.name === notice.connector)?.title ?? notice.connector;
+  return notice.tone === "success" ? `${title} ${notice.text}` : `${title}: ${notice.text}`;
+}
 
 export function Connections() {
   const api = useApi();
@@ -46,21 +57,49 @@ export function Connections() {
 
   const loadCatalog = useCallback(() => api.listConnectors(), [api]);
   const catalog = useLoad(loadCatalog, "Could not load the connectors.");
-  const loadList = useMemo(
-    () => (workspaceId === null ? null : () => api.listConnections(workspaceId)),
-    [api, workspaceId],
-  );
-  const list = useLoad(loadList, "Could not load the connections.");
-  const { setData: setList, reload: reloadList } = list;
 
-  const replace = useCallback(
-    (saved: Connection) => {
-      setList((current) =>
-        current === null ? [saved] : [...current.filter((c) => c.id !== saved.id), saved],
-      );
-    },
-    [setList],
-  );
+  // The connections of the workspace. The list keeps its workspace, so the page never shows
+  // (or acts on) the rows of the workspace before. `changes` counts the changes of the page: a
+  // list that started to load before a change is old, so the page loads it again.
+  const [list, setList] = useState<ConnectionList | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+  const changes = useRef(0);
+  useEffect(() => {
+    if (workspaceId === null) return;
+    let live = true;
+    const seen = changes.current;
+    api.listConnections(workspaceId).then(
+      (items) => {
+        if (!live) return;
+        if (changes.current !== seen) {
+          setTick((n) => n + 1);
+          return;
+        }
+        setList({ workspaceId, items });
+        setListError(null);
+      },
+      (e: unknown) => {
+        if (live) setListError(errorText(e, "Could not load the connections."));
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [api, workspaceId, tick]);
+  const reloadList = useCallback(() => {
+    setListError(null);
+    setTick((n) => n + 1);
+  }, []);
+
+  const replace = useCallback((saved: Connection) => {
+    changes.current += 1;
+    setList((current) => withConnection(current, saved));
+  }, []);
+  const remove = useCallback((id: string) => {
+    changes.current += 1;
+    setList((current) => withoutConnection(current, id));
+  }, []);
 
   const start = useCallback(
     async (workspace: string, connector: string, scope: ConnectionScope) => {
@@ -93,23 +132,31 @@ export function Connections() {
         return;
       }
       const checked = await api.checkConnection(intent.connectionId);
+      if (checked.workspace_id !== intent.workspaceId) {
+        throw new Error("The connection is not in the workspace of this link.");
+      }
       replace(checked);
-      setNotice(
-        checked.state === "connected"
-          ? { tone: "success", text: `${checked.connector} is connected.` }
-          : { tone: "error", text: `${checked.connector}: ${stateLabel(checked.state)}. ${checked.last_error ?? ""}`.trim() },
-      );
+      const tone = stateTone(checked.state);
+      setNotice({
+        tone: tone === "ok" ? "success" : tone === "error" ? "error" : "info",
+        connector: checked.connector,
+        text:
+          checked.state === "connected"
+            ? "is connected."
+            : `${stateLabel(checked.state)}. ${checked.last_error ?? ""}`.trim(),
+      });
     };
     Promise.resolve()
       .then(run)
       .catch((e: unknown) =>
-      setNotice({ tone: "error", text: errorText(e, "The connection did not start.") }),
-    );
+        setNotice({ tone: "error", connector: null, text: errorText(e, "The connection did not start.") }),
+      );
   }, [api, me, workspaces, setWorkspaceId, start, replace]);
 
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the connections" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
+  const rows = workspace === null ? null : listFor(list, workspace.id);
 
   return (
     <div className={styles.page}>
@@ -125,8 +172,11 @@ export function Connections() {
       </header>
 
       {notice ? (
-        <p className={`alert ${notice.tone === "success" ? "alert-success" : "alert-error"}`} role="status">
-          {notice.text}
+        <p
+          className={`alert ${notice.tone === "success" ? "alert-success" : notice.tone === "error" ? "alert-error" : ""}`}
+          role="status"
+        >
+          {noticeText(notice, catalog.data)}
         </p>
       ) : null}
 
@@ -134,9 +184,9 @@ export function Connections() {
         <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
       ) : catalog.error ? (
         <ErrorState title="The connectors did not load" message={catalog.error} onRetry={catalog.reload} />
-      ) : list.error ? (
-        <ErrorState title="The connections did not load" message={list.error} onRetry={reloadList} />
-      ) : catalog.data === null || list.data === null ? (
+      ) : listError ? (
+        <ErrorState title="The connections did not load" message={listError} onRetry={reloadList} />
+      ) : catalog.data === null || rows === null ? (
         <LoadingState label="Loading the connections" />
       ) : catalog.data.length === 0 ? (
         <p className="alert">This sama has no connectors.</p>
@@ -146,15 +196,15 @@ export function Connections() {
             <li key={connector.name}>
               <ConnectorCard
                 connector={connector}
-                connections={list.data ?? []}
+                connections={rows}
                 formFor={formFor}
                 onStart={(scope) => start(workspace.id, connector.name, scope)}
                 onSaved={(saved) => {
                   replace(saved);
                   if (saved.state === "connected") setFormFor(null);
                 }}
-                onOpenForm={setFormFor}
-                onRemoved={(id) => setList((current) => (current ?? []).filter((c) => c.id !== id))}
+                onCloseForm={() => setFormFor(null)}
+                onRemoved={remove}
               />
             </li>
           ))}
@@ -170,7 +220,7 @@ function ConnectorCard({
   formFor,
   onStart,
   onSaved,
-  onOpenForm,
+  onCloseForm,
   onRemoved,
 }: {
   connector: Connector;
@@ -178,7 +228,7 @@ function ConnectorCard({
   formFor: string | null;
   onStart: (scope: ConnectionScope) => Promise<void>;
   onSaved: (connection: Connection) => void;
-  onOpenForm: (id: string | null) => void;
+  onCloseForm: () => void;
   onRemoved: (id: string) => void;
 }) {
   return (
@@ -194,10 +244,10 @@ function ConnectorCard({
           connector={connector}
           scope={scope}
           connection={connectionOf(connections, connector.name, scope)}
-          formOpen={(id) => id === formFor}
+          formFor={formFor}
           onStart={() => onStart(scope)}
           onSaved={onSaved}
-          onOpenForm={onOpenForm}
+          onCloseForm={onCloseForm}
           onRemoved={onRemoved}
         />
       ))}
@@ -209,19 +259,19 @@ function ScopeRow({
   connector,
   scope,
   connection,
-  formOpen,
+  formFor,
   onStart,
   onSaved,
-  onOpenForm,
+  onCloseForm,
   onRemoved,
 }: {
   connector: Connector;
   scope: ConnectionScope;
   connection: Connection | null;
-  formOpen: (id: string) => boolean;
+  formFor: string | null;
   onStart: () => Promise<void>;
   onSaved: (connection: Connection) => void;
-  onOpenForm: (id: string | null) => void;
+  onCloseForm: () => void;
   onRemoved: (id: string) => void;
 }) {
   const api = useApi();
@@ -241,7 +291,7 @@ function ScopeRow({
   };
 
   const connected = connection?.state === "connected";
-  const showForm = connection !== null && connector.kind !== "composio" && formOpen(connection.id);
+  const showForm = connection !== null && connector.kind !== "composio" && connection.id === formFor;
   const tone = connection ? stateTone(connection.state) : "off";
   const badge =
     tone === "ok" ? "badge badge-accent" : tone === "wait" ? "badge badge-warning" : tone === "error" ? `badge ${styles.badgeError}` : "badge";
@@ -254,7 +304,7 @@ function ScopeRow({
           <span className={badge}>{connection ? stateLabel(connection.state) : "Not connected"}</span>
         </div>
         <div className={styles.actions}>
-          {connection === null || !connected ? (
+          {!connected ? (
             <button
               type="button"
               className="btn btn-primary btn-small"
@@ -313,7 +363,7 @@ function ScopeRow({
           connector={connector}
           connection={connection}
           onSaved={onSaved}
-          onCancel={() => onOpenForm(null)}
+          onCancel={onCloseForm}
         />
       ) : null}
     </div>
@@ -350,7 +400,8 @@ function ConnectForm({
       // The secret leaves the page state as soon as the API has it.
       setValues(initialValues(connector, saved));
       onSaved(saved);
-      if (saved.state !== "connected") setError(saved.last_error ?? "The connection test failed.");
+      // The row shows `last_error` already; the form says only that the test failed.
+      if (saved.state !== "connected") setError("The test failed. Check the values and try again.");
     } catch (e) {
       setError(errorText(e, "The form was not saved."));
     } finally {

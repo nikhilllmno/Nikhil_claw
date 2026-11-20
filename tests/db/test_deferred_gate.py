@@ -37,7 +37,7 @@ def catalog() -> DeferredCatalog:
     return DeferredCatalog(
         [
             DeferredTool("mail_send", "Send mail.", "mail", nothing),
-            DeferredTool("mail_read", "Read mail.", "mail", nothing, read_only=True),
+            DeferredTool("mail_read", "Read mail.", "mail", nothing, access="read"),
             DeferredTool("clock", "Show the time.", "clock", nothing),
         ]
     )

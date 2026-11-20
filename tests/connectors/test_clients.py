@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
@@ -10,9 +12,16 @@ import pytest
 from pydantic import SecretStr
 
 from sama.connectors.composio import ComposioClient, ComposioError
-from sama.connectors.http_api import DriverError, HttpApiDriver
+from sama.connectors.http_api import (
+    MAX_ANSWER_BYTES,
+    DriverError,
+    DriverUnavailableError,
+    HttpApiDriver,
+)
 from sama.connectors.manifest import parse
+from sama.tools.outbound import IPAddress
 from tests.connectors.test_manifest import FORM
+from tests.support import wire_transport
 
 KEY = SecretStr("ck-test-key")
 
@@ -146,8 +155,16 @@ async def test_an_error_answer_is_short_and_has_a_status() -> None:
     await client.aclose()
 
 
-def driver(handler: Any) -> HttpApiDriver:
-    return HttpApiDriver(transport=httpx.MockTransport(handler))
+async def public(host: str, port: int) -> Sequence[IPAddress]:
+    return [ipaddress.ip_address("93.184.216.34")]
+
+
+async def private(host: str, port: int) -> Sequence[IPAddress]:
+    return [ipaddress.ip_address("10.0.0.5")]
+
+
+def driver(handler: Any, resolver: Any = public) -> HttpApiDriver:
+    return HttpApiDriver(transport=wire_transport(handler), resolver=resolver)
 
 
 async def test_the_driver_sends_the_credential_and_the_path() -> None:
@@ -164,6 +181,8 @@ async def test_the_driver_sends_the_credential_and_the_path() -> None:
     text = await http.call(manifest, tool, {"token": "tok-1"}, {"item_id": "a/b", "limit": 2})
     assert json.loads(text) == {"ok": True}
     assert seen[0].url.path == "/me"
+    assert seen[0].url.host == "93.184.216.34"
+    assert seen[0].headers["host"] == "api.acme.test"
     assert seen[0].headers["authorization"] == "Bearer tok-1"
     assert seen[1].url.raw_path == b"/items/a%2Fb?limit=2"
     with pytest.raises(DriverError, match="not a valid"):
@@ -181,3 +200,45 @@ async def test_the_driver_refuses_an_error_answer() -> None:
     with pytest.raises(DriverError, match="no credential"):
         await http.test(manifest, {})
     await http.aclose()
+
+
+async def test_the_driver_refuses_a_private_address_and_a_redirect() -> None:
+    manifest = parse(FORM)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(302, headers={"location": "https://evil.test/"})
+
+    blocked = driver(handler, private)
+    with pytest.raises(DriverError, match="not allowed") as caught:
+        await blocked.test(manifest, {"token": "tok-1"})
+    assert not isinstance(caught.value, DriverUnavailableError)
+    assert seen == []
+    await blocked.aclose()
+    moved = driver(handler)
+    with pytest.raises(DriverUnavailableError, match="redirect"):
+        await moved.test(manifest, {"token": "tok-1"})
+    assert len(seen) == 1
+    await moved.aclose()
+
+
+async def test_the_driver_stops_reading_at_the_size_limit() -> None:
+    manifest = parse(FORM)
+    http = driver(lambda request: httpx.Response(200, content=b"x" * (MAX_ANSWER_BYTES + 10)))
+    text = await http.call(manifest, manifest.tools[0], {"token": "tok-1"}, {"item_id": "a"})
+    assert len(text) == MAX_ANSWER_BYTES
+    await http.aclose()
+
+
+async def test_a_network_error_or_a_5xx_is_unavailable_not_refused() -> None:
+    manifest = parse(FORM)
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    for handler in (broken, lambda request: httpx.Response(503, text="busy")):
+        http = driver(handler)
+        with pytest.raises(DriverUnavailableError):
+            await http.test(manifest, {"token": "tok-1"})
+        await http.aclose()

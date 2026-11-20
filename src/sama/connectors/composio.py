@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
@@ -27,13 +26,10 @@ from typing import Any, Final
 import httpx
 from pydantic import SecretStr
 
-from sama.vault.redact import redact
-
-log: Final = logging.getLogger("sama.connectors.composio")
+from sama.connectors.errors import MAX_ERROR_CHARS, short_error
 
 BASE_URL: Final = "https://backend.composio.dev"
 TIMEOUT_S: Final = 30.0
-MAX_ERROR_CHARS: Final = 300
 
 ACTIVE: Final = "ACTIVE"
 PENDING_STATUSES: Final = frozenset({"INITIALIZING", "INITIATED"})
@@ -196,7 +192,7 @@ class ComposioClient:
         )
         if answer.get("successful") is False or answer.get("error"):
             error = answer.get("error") or "the tool failed"
-            raise ComposioError(_cut(str(error)))
+            raise ComposioError(short_error(str(error)))
         return answer.get("data")
 
 
@@ -211,21 +207,16 @@ def _digest(key: SecretStr) -> str:
     return hashlib.sha256(key.get_secret_value().encode()).hexdigest()[:16]
 
 
-def _cut(text: str) -> str:
-    text = redact(" ".join(text.split()))
-    return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 3] + "..."
-
-
 def _message(response: httpx.Response) -> str:
     try:
         body = response.json()
     except ValueError:
-        return _cut(response.text or "no message")
+        return short_error(response.text or "no message")
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
-        return _cut(str(error.get("message") or error.get("code") or "no message"))
+        return short_error(str(error.get("message") or error.get("code") or "no message"))
     if isinstance(error, str):
-        return _cut(error)
+        return short_error(error)
     if isinstance(body, dict) and isinstance(body.get("message"), str):
-        return _cut(body["message"])
-    return _cut(json.dumps(body)[:MAX_ERROR_CHARS])
+        return short_error(body["message"])
+    return short_error(json.dumps(body)[:MAX_ERROR_CHARS])

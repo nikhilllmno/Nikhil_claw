@@ -31,14 +31,41 @@ export function parseConnectionQuery(search: string): ConnectionIntent | null {
   return { kind: "connect", workspaceId, connector, scope };
 }
 
-/** True only for an `https` address. The page goes to a sign-in link only if this is true. */
+/**
+ * True only for an `https` address without a user name or a password. The page goes to a
+ * sign-in link only if this is true. The link comes from the API (Composio), not from the
+ * query of the page.
+ */
 export function isSafeRedirect(url: string | null): url is string {
   if (url === null) return false;
   try {
-    return new URL(url).protocol === "https:";
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && parsed.username === "" && parsed.password === "";
   } catch {
     return false;
   }
+}
+
+/** The connections of one workspace. The page shows them only for that workspace. */
+export type ConnectionList = { workspaceId: string; items: Connection[] };
+
+/** The connections to show for the workspace, or `null` while they load. */
+export function listFor(list: ConnectionList | null, workspaceId: string): Connection[] | null {
+  return list !== null && list.workspaceId === workspaceId ? list.items : null;
+}
+
+/**
+ * The list with the saved connection in it. A connection of another workspace (an old answer
+ * after the user changed the workspace) does not go into the list.
+ */
+export function withConnection(list: ConnectionList | null, saved: Connection): ConnectionList | null {
+  if (list === null || list.workspaceId !== saved.workspace_id) return list;
+  return { ...list, items: [...list.items.filter((c) => c.id !== saved.id), saved] };
+}
+
+/** The list without the removed connection. */
+export function withoutConnection(list: ConnectionList | null, id: string): ConnectionList | null {
+  return list === null ? null : { ...list, items: list.items.filter((c) => c.id !== id) };
 }
 
 const STATE_LABELS: Record<string, string> = {
