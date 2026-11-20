@@ -56,7 +56,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   (architecture Section 16.2). The image is `sandbox/Dockerfile`. CI builds it and runs the
   Docker provider tests and the `claude-docker` conformance target. The nightly job builds the
   E2B template `sama-runner` and runs the E2B tests. It needs the repository secret
-  `E2B_API_KEY`.
+  `E2B_API_KEY`. Each deploy builds the template of its commit, `sama-runner-<sha12>`, and
+  sets `SAMA_SANDBOX_TEMPLATE` to it (architecture Section 19.3).
 - M1.7: the model proxy in `src/sama/modelproxy/` (architecture Section 16.6), with the price
   table `prices.toml` and the `model_calls` table (migration `0002`). The `claude-runner` and
   `claude-docker` conformance targets send their model calls through the proxy. A live Claude

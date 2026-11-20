@@ -2909,8 +2909,11 @@ gives no deferred tool: the search fails closed (Section 6.3).
 
 ### 16.2 Sandbox and runner (M1.6)
 
-- One E2B sandbox per session, from the sama template `sama-runner`. It pauses when idle and
-  resumes on the next run, and the files stay.
+- One E2B sandbox per session, from the sama template. A deployed environment uses the
+  template of its own commit, `sama-runner-<first 12 characters of the SHA>`
+  (`SAMA_SANDBOX_TEMPLATE`, Section 19.3). Without the setting, the template is `sama-runner`,
+  which the nightly job builds from `main`. It pauses when idle and resumes on the next run,
+  and the files stay.
 - Default limits: 2 vCPU, 4 GB RAM, 1 hour per run, 15 minutes of idle before E2B pauses the
   sandbox. Later, 24 hours of pause before the workspace is archived to Supabase Storage.
 - Egress: the sama API endpoints, package registries, GitHub, and a per-org allowlist. E2B
@@ -3629,8 +3632,14 @@ The provider and search keys are the defaults. An org key in the vault comes fir
   `main` and deploys the staging image of that commit, so production runs the tested image.
 - The GitHub environments `staging` and `production` hold the secret `FLY_API_TOKEN`. Only
   `main` can deploy to them.
-- The E2B template `sama-runner` is shared by both environments. The nightly job builds it
-  from `main` (Section 16.2).
+- Each deploy builds the E2B template of its commit, `sama-runner-<first 12 characters of the
+  SHA>`, and sets `SAMA_SANDBOX_TEMPLATE` to it. The runner in the sandbox then has the code of
+  the control plane that starts it. The runner and the control plane change their job and
+  event models together, and both refuse unknown fields, so a shared template breaks the
+  environment that runs the older commit. The template build needs the repository secret
+  `E2B_API_KEY`. The nightly job still builds `sama-runner` from `main` for the E2B tests and
+  for local use (Section 16.2).
+- A template stays in E2B after its deploy. Old templates are removed by hand.
 
 ### 19.4 First org (M1.15)
 
