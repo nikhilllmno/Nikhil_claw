@@ -36,6 +36,9 @@ _PAGE = """<!doctype html>
 
 _NO_STORE = {"cache-control": "no-store"}
 _CODE: Final = re.compile(r"[A-Za-z0-9_-]{1,200}")
+_INSTALLATION_ID: Final = re.compile(r"[1-9][0-9]{0,17}")
+"""A GitHub installation id: ASCII digits only, so ``int`` cannot fail."""
+MAX_FORM_BYTES: Final = 4096
 """The characters of a manifest code of GitHub."""
 
 
@@ -73,7 +76,7 @@ def setup_router(service: GitHubService | None) -> APIRouter:
 
     @router.get("/github/setup", include_in_schema=False)
     async def setup(
-        installation_id: Annotated[int | None, Query(gt=0)] = None,
+        installation_id: Annotated[int | None, Query(gt=0, lt=2**63)] = None,
         setup_action: Annotated[str, Query(max_length=40)] = "",
         code: Annotated[str, Query(max_length=200)] = "",
         state: Annotated[str, Query(max_length=1000)] = "",
@@ -120,14 +123,19 @@ def setup_router(service: GitHubService | None) -> APIRouter:
     async def confirm(request: Request) -> HTMLResponse:
         if service is None:
             return _off()
-        raw = await request.body()
-        if len(raw) > 4096:
+        raw = await _small_body(request)
+        if raw is None:
             return _start_from_sama()
-        form = parse_qs(raw.decode("utf-8", "replace"), max_num_fields=10)
+        try:
+            form = parse_qs(raw.decode("utf-8", "replace"), max_num_fields=10)
+        except ValueError:
+            return _start_from_sama()
         installation = _one(form, "installation_id")
         code = _one(form, "code")
         state = _one(form, "state")
-        if not installation.isdigit() or not code or not state or len(code) > 200:
+        if not _INSTALLATION_ID.fullmatch(installation) or not code or not state:
+            return _start_from_sama()
+        if len(code) > 200:
             return _start_from_sama()
         installation_id = int(installation)
         try:
@@ -141,6 +149,17 @@ def setup_router(service: GitHubService | None) -> APIRouter:
         return page("GitHub is connected", body)
 
     return router
+
+
+async def _small_body(request: Request) -> bytes | None:
+    """The body of the request, or ``None`` when it is larger than ``MAX_FORM_BYTES``. The
+    page is public, so the route reads the body in parts and stops at the limit."""
+    raw = bytearray()
+    async for part in request.stream():
+        raw += part
+        if len(raw) > MAX_FORM_BYTES:
+            return None
+    return bytes(raw)
 
 
 def _one(form: dict[str, list[str]], name: str) -> str:

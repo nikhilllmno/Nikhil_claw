@@ -11,9 +11,12 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.requests import Request
 
 from sama.api import JwtVerifier, SamaApi
 from sama.db.models import AuditEntry
+from sama.github import routes
+from sama.github.routes import MAX_FORM_BYTES
 from sama.github.service import (
     DEFAULT_PROTECTED_PATHS,
     MAX_PATH_CHARS,
@@ -486,6 +489,10 @@ async def test_the_setup_page_shows_that_github_is_connected(
         {"installation_id": "1", "code": "", "state": "s"},
         {"installation_id": "1", "code": CODE},
         {"installation_id": "1", "code": "c" * 201, "state": "s"},
+        {"installation_id": "\u00b2", "code": CODE, "state": "s"},
+        {"installation_id": "0", "code": CODE, "state": "s"},
+        {"installation_id": "1" * 19, "code": CODE, "state": "s"},
+        {"installation_id": "1", "code": CODE, "state": "s", **{f"f{i}": "x" for i in range(9)}},
     ],
 )
 async def test_the_confirm_form_needs_all_the_fields(
@@ -499,3 +506,37 @@ async def test_the_confirm_form_needs_all_the_fields(
 async def test_the_confirm_form_answers_409_without_the_app(off: httpx.AsyncClient) -> None:
     response = await off.post("/github/setup", data={"installation_id": "1"})
     assert response.status_code == 409
+
+
+async def test_the_confirm_form_refuses_a_large_body(http: httpx.AsyncClient) -> None:
+    async def parts() -> AsyncIterator[bytes]:
+        for _ in range(64):
+            yield b"a" * 1024
+
+    response = await http.post(
+        "/github/setup",
+        content=parts(),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 400
+    assert "Start the install from sama" in response.text
+
+
+async def test_the_body_reader_stops_at_the_limit() -> None:
+    """The page is public. A body without a length must not fill the memory, so the reader
+    stops at the limit and does not read the other parts."""
+    read = 0
+
+    async def receive() -> dict[str, object]:
+        nonlocal read
+        read += 1
+        return {"type": "http.request", "body": b"a" * 1024, "more_body": read < 1000}
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+    assert await routes._small_body(request) is None
+    assert read == MAX_FORM_BYTES // 1024 + 1
+
+    async def short() -> dict[str, object]:
+        return {"type": "http.request", "body": b"a=1", "more_body": False}
+
+    assert await routes._small_body(Request({"type": "http", "headers": []}, short)) == b"a=1"

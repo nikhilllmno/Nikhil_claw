@@ -2932,7 +2932,7 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
 |---|---|---|
 | App and client | `src/sama/github/client.py` | `GitHubAppConfig` holds the App id, slug, client id, private key, and client secret. `app_manifest` gives the manifest of the App. `GitHubClient` signs the App JWT (9 minutes), makes installation tokens, keeps each token for its life minus 5 minutes, and calls the REST API (installations, repos, pull requests, comments, `compare`). A `401` removes the kept token. No error message has a token. |
 | Org connections | `src/sama/github/service.py` | `GitHubService`: the install URL with a signed state, the end of the install, the allowlist of repos, and the push grants. |
-| Push checks | `src/sama/github/push.py` | The checks of each ref update of a push (below). |
+| Push checks | `src/sama/github/push.py`, `src/sama/github/packscan.py` | The size check of the pack and the checks of each ref update of a push (below). |
 | Git proxy | `src/sama/github/proxy.py`, `src/sama/github/pktline.py` | Smart HTTP git at `<SAMA_PUBLIC_URL>/git/<owner>/<name>.git`. A fetch goes to GitHub as it is. A push goes to GitHub only after the push checks. |
 | Tools | `src/sama/tools/github.py`, `src/sama/tools/server.py` | `pr_create`, `pr_comment`, and `repo_push_approval` in the toolset `github`. The tools are hidden when the GitHub App is off. |
 | Clone | `src/sama/tools/repos.py` | A repo on the allowlist clones through the proxy. Other repos clone from GitHub with no credentials. |
@@ -3007,8 +3007,13 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
   - The proxy finds the commits and their parents with `git rev-list --parents`, which reads
     only the real parent headers of a commit. A `parent` line after the `committer` line does
     not make a fast-forward.
-  - Before git reads an object, the proxy checks its size: a commit or a tag is at most 1 MB
-    and a tree at most 16 MB. The proxy reads at most 64 MB of output from each git command.
+  - Before `git index-pack` reads the pack, a size check (`src/sama/github/packscan.py`)
+    reads the header of each object and inflates it in small parts, with no copy of the
+    output. A commit or a tag is at most 1 MB, a tree at most 16 MB, and a delta, its base,
+    and its result at most 64 MB each. All objects together inflate to at most 1 GB, and a
+    pack has at most 200,000 objects. Each object must inflate to the size of its header.
+    `git index-pack` runs with `core.bigFileThreshold=1m`, so it streams a large blob and does
+    not keep it in memory. The proxy reads at most 64 MB of output from each git command.
 - **Approval of protected paths.** The refusal tells the agent to call
   `repo_push_approval(repo, branch, commit)`. This tool is in `ALWAYS_ASK` (Section 16.1): a
   person approves each call, an `allow` rule does not remove the ask, and "always allow"
@@ -3039,8 +3044,9 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
     That person sees the sama org name on the confirm page and must click "Connect".
   - In its 30 minutes, a state works again. A second install of the same installation for
     the same org changes the same row.
-  - The git commands of the proxy have no memory limit of their own. The size caps above limit
-    what they read.
+  - The git commands of the proxy have no memory limit of their own. The size check above
+    limits what they read. A push can write up to 1 GB of objects to a temporary folder on the
+    disk of the control plane.
   - Not verified live: that the Claude Code `Bash` tool in an E2B sandbox sees
     `SAMA_RUN_TOKEN`. The proxy tests run `git` with that variable on the local machine.
 

@@ -10,8 +10,9 @@ The proxy sends a push to GitHub only when every ref update passes:
   default branch. GitHub runs the workflows of the pushed commit, so the check looks at the
   tree of that commit, not at each commit of the push.
 
-The proxy advertises ``no-thin``, so the pack of the push has every delta base. ``git
-index-pack`` reads it in an empty temporary repository. The proxy fetches the trees of the
+The proxy advertises ``no-thin``, so the pack of the push has every delta base. A size check
+(``sama.github.packscan``) reads the pack first, then ``git index-pack`` reads it in an empty
+temporary repository. The proxy fetches the trees of the
 bases, without blobs, from GitHub. If a check cannot read an object, the proxy refuses the push.
 """
 
@@ -26,6 +27,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
 
+from sama.github.packscan import (
+    INDEX_PACK_CONFIG,
+    MAX_COMMIT_BYTES,
+    MAX_TREE_BYTES,
+    PackScanError,
+    scan_pack,
+)
 from sama.github.pktline import PushRequest, RefUpdate
 from sama.github.service import (
     SAMA_BRANCH_PREFIX,
@@ -40,10 +48,6 @@ MAX_PUSH_COMMITS: Final = 2_000
 MAX_BOUNDARY: Final = 20
 """The most parent commits outside the pack that one ref update can have."""
 GIT_TIMEOUT_S: Final = 120.0
-MAX_COMMIT_BYTES: Final = 1024 * 1024
-"""The largest commit or tag object in a push."""
-MAX_TREE_BYTES: Final = 16 * 1024 * 1024
-"""The largest tree object in a push."""
 MAX_GIT_OUTPUT_BYTES: Final = 64 * 1024 * 1024
 """The most output that the proxy reads from one git command."""
 MAX_LISTED_PATHS: Final = 10
@@ -121,7 +125,11 @@ async def check_push(
         git_dir = Path(folder) / "repo.git"
         await _git(Path(folder), "init", "--quiet", "--bare", str(git_dir))
         if push.pack:
-            await _git(git_dir, "index-pack", "--stdin", stdin=push.pack)
+            try:
+                await asyncio.to_thread(scan_pack, push.pack)
+            except PackScanError as error:
+                raise PushCheckError(str(error)) from error
+            await _git(git_dir, *INDEX_PACK_CONFIG, "index-pack", "--stdin", stdin=push.pack)
         parents = await _commits(git_dir)
         walks: dict[str, set[str]] = {}
         for update in push.updates:
