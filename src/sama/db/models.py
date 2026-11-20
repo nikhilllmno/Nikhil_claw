@@ -82,6 +82,10 @@ SKILL_AUTHOR_KINDS: Final = ("user", "agent", "system")
 EMBEDDING_DIMENSIONS: Final = 1536
 """The size of a message embedding: the output of ``text-embedding-3-small``
 (docs/architecture.md, Section 7.1)."""
+ATTACHMENT_MIME_TYPES: Final = ("image/png", "image/jpeg", "image/gif", "image/webp")
+"""The image types that a channel can attach to a message (docs/architecture.md, Section 11.7)."""
+MAX_ATTACHMENT_BYTES: Final = 10 * 1024 * 1024
+"""The size limit of one attachment, for the database and for the gateways."""
 SEARCH_VECTOR_CHARS: Final = 100_000
 """The full-text index covers the first characters of a message. A ``tsvector`` has a limit of
 1 MB, so the index must not take an unlimited text."""
@@ -1124,4 +1128,38 @@ class MessageEmbedding(Base):
     message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=False)
     model: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class Attachment(Base):
+    """An image that a user sent with a message in a channel (docs/architecture.md, Section
+    11.7). The gateway writes it with the message, in one transaction. The bytes stay in the
+    database: only the control plane and the tool server read ``data``. A member can read the
+    metadata of the sessions that the member can see, never ``data``."""
+
+    __tablename__ = "attachments"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id", "message_id"],
+            ["messages.org_id", "messages.session_id", "messages.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(_one_of("mime_type", ATTACHMENT_MIME_TYPES), name="mime_type"),
+        CheckConstraint(
+            f"size_bytes BETWEEN 1 AND {MAX_ATTACHMENT_BYTES} AND size_bytes = octet_length(data)",
+            name="size_bytes",
+        ),
+        Index(None, "org_id", "session_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    """The file name that the sender gave, cleaned and cut short."""
+    mime_type: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
     created_at: Mapped[datetime] = _created_at()

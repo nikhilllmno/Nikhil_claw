@@ -54,6 +54,19 @@ from sama.gateway.sessions import (
     stop_runs,
 )
 from sama.gateway.slack_client import SlackClient, SlackError
+from sama.media.images import (
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES_PER_MESSAGE,
+    TOO_LARGE,
+    TOO_MANY,
+    UNREADABLE,
+    UNSUPPORTED,
+    ImageRejected,
+    NewAttachment,
+    check_image,
+    is_image,
+    with_markers,
+)
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.skills import commands
 from sama.skills.service import SkillLibrary
@@ -119,6 +132,37 @@ class _Place:
     thread_ts: str | None
     """The root of the thread. None in a direct message: the app answers in the channel."""
     sender: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageRef:
+    """A file of a message, before the download."""
+
+    url: str
+    mime_type: str
+    name: str
+    size: int
+
+
+def _image_refs(event: Mapping[str, Any]) -> list[_ImageRef]:
+    """The image files of a message. Other files (documents, archives) are not for the
+    agent and the gateway ignores them, as it did before images."""
+    refs: list[_ImageRef] = []
+    for item in event.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        mime = str(item.get("mimetype") or "")
+        if not mime.lower().startswith("image/"):
+            continue
+        refs.append(
+            _ImageRef(
+                url=str(item.get("url_private_download") or item.get("url_private") or ""),
+                mime_type=mime,
+                name=str(item.get("name") or item.get("title") or "image"),
+                size=int(item["size"]) if isinstance(item.get("size"), int) else 0,
+            )
+        )
+    return refs
 
 
 class _Unlinked(Exception):
@@ -314,10 +358,11 @@ class SlackGateway:
             if place is None:
                 return
             async with self._locks.hold((place.channel, place.thread_ts)):
+                refs = _image_refs(event)
                 if place.thread_ts is None:
-                    await self._on_direct(place, str(event.get("text") or "").strip())
+                    await self._on_direct(place, str(event.get("text") or "").strip(), refs)
                 else:
-                    await self._on_mention(place, str(event.get("text") or ""))
+                    await self._on_mention(place, str(event.get("text") or ""), refs)
         except Exception:
             log.exception("a Slack event failed type=%s", event.get("type"))
 
@@ -333,14 +378,21 @@ class SlackGateway:
         ):
             return None
         kind = event.get("type")
-        if kind == "message" and event.get("channel_type") == "im" and not event.get("subtype"):
+        # A message with a file has the subtype ``file_share``.
+        if (
+            kind == "message"
+            and event.get("channel_type") == "im"
+            and event.get("subtype") in (None, "file_share")
+        ):
             return _Place(channel, None, user)
         if kind == "app_mention" and event.get("channel_type") != "im":
             root = event.get("thread_ts") or event.get("ts")
             return _Place(channel, str(root), user) if root else None
         return None
 
-    async def _on_direct(self, place: _Place, text: str) -> None:
+    async def _on_direct(
+        self, place: _Place, text: str, refs: list[_ImageRef] | None = None
+    ) -> None:
         text = unescape(text)
         identity = await self._identity(place.sender)
         if identity is None:
@@ -350,9 +402,11 @@ class SlackGateway:
             else:
                 await self._say(place, await self._pair(place.sender, place.channel, code, None))
             return
-        await self._start(place, Target.private(identity), text)
+        await self._start(place, Target.private(identity), text, refs)
 
-    async def _on_mention(self, place: _Place, text: str) -> None:
+    async def _on_mention(
+        self, place: _Place, text: str, refs: list[_ImageRef] | None = None
+    ) -> None:
         text = unescape(self._mention.sub("", text)).strip()
         identity = await self._identity(place.sender)
         if identity is None:
@@ -366,15 +420,22 @@ class SlackGateway:
                 " page and send /sama pair CODE in this channel.",
             )
             return
-        await self._start(place, target, text)
+        await self._start(place, target, text, refs)
 
-    async def _start(self, place: _Place, target: Target, text: str) -> None:
+    async def _start(
+        self,
+        place: _Place,
+        target: Target,
+        text: str,
+        refs: list[_ImageRef] | None = None,
+    ) -> None:
         async with self._engine.connect() as connection:
             grants = await load_grants(connection, target.org_id, target.user_id)
         if not grants.sees_workspace(target.workspace_id):
             await self._say(place, "You do not have access to this workspace now.")
             return
-        if not text:
+        refs = refs or []
+        if not text and not refs:
             return
         if len(text) > MAX_INPUT_CHARS:
             await self._say(place, "The message is too long.")
@@ -385,6 +446,10 @@ class SlackGateway:
             return
         if text.startswith("/"):
             text = await self._expand(place, target, grants, text) or text
+        images = await self._download_images(place, refs)
+        if images is None:
+            return
+        text = with_markers(text, images)
         holder = object()
         self._followers.add(holder)
         try:
@@ -393,7 +458,11 @@ class SlackGateway:
                 self._followers.discard(holder)
                 return
             run_id = await self._queue.enqueue(
-                org_id=target.org_id, session_id=bound.session_id, text=text, user_id=target.user_id
+                org_id=target.org_id,
+                session_id=bound.session_id,
+                text=text,
+                user_id=target.user_id,
+                attachments=images,
             )
         except QueueError as error:
             self._followers.discard(holder)
@@ -403,6 +472,37 @@ class SlackGateway:
             self._followers.discard(holder)
             raise
         self._spawn(self._follow(place, target, run_id, holder))
+
+    async def _download_images(
+        self, place: _Place, refs: list[_ImageRef]
+    ) -> list[NewAttachment] | None:
+        """Downloads and checks the images of a message. Gives ``None`` after it told the
+        sender why an image cannot be used. Then the whole message stops: sama does not
+        answer a question about an image that it does not have."""
+        if len(refs) > MAX_IMAGES_PER_MESSAGE:
+            await self._say(place, TOO_MANY)
+            return None
+        images: list[NewAttachment] = []
+        for ref in refs:
+            try:
+                if not is_image(ref.mime_type):
+                    raise ImageRejected(UNSUPPORTED)
+                if ref.size > MAX_IMAGE_BYTES:
+                    raise ImageRejected(TOO_LARGE)
+                try:
+                    data = await self._client.download(ref.url, max_bytes=MAX_IMAGE_BYTES)
+                except SlackError as error:
+                    log.warning(
+                        "an image download failed channel=%s error=%s", place.channel, error
+                    )
+                    raise ImageRejected(
+                        TOO_LARGE if "too large" in str(error) else UNREADABLE
+                    ) from None
+                images.append(check_image(data, name=ref.name, claimed_mime=ref.mime_type))
+            except ImageRejected as error:
+                await self._say(place, str(error))
+                return None
+        return images
 
     async def _expand(self, place: _Place, target: Target, grants: Grants, text: str) -> str | None:
         """The message text for a skill command, or ``None`` if ``text`` is not one."""

@@ -55,6 +55,7 @@ from sqlalchemy.orm import aliased
 from sama.db.models import (
     AgentProfile,
     Approval,
+    Attachment,
     AuditEntry,
     Message,
     Org,
@@ -64,6 +65,7 @@ from sama.db.models import (
 )
 from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
+from sama.media.images import NewAttachment
 from sama.orchestrator.limits import QueueLimits
 from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
 from sama.vault.redact import default_redactor, redact
@@ -202,8 +204,12 @@ class RunQueue:
         text: str,
         user_id: uuid.UUID | None = None,
         unattended: bool = False,
+        attachments: Sequence[NewAttachment] = (),
     ) -> uuid.UUID:
         """Stores a user message and queues a run for it. Returns the run id.
+
+        ``attachments`` are the images of the message (Section 11.7). The database takes them
+        in the same transaction as the message: both exist, or neither.
 
         The run uses the budget of the session profile. It uses the runtime of the frozen
         session config, or the runtime of the profile before the first run builds the config
@@ -251,16 +257,34 @@ class RunQueue:
                     unattended=unattended,
                 )
             )
-            await connection.execute(
-                insert(Message).values(
-                    org_id=org_id,
-                    session_id=session_id,
-                    run_id=run_id,
-                    role="user",
-                    author_user_id=user_id,
-                    content={"text": redact(text)},
+            message_id = (
+                await connection.execute(
+                    insert(Message)
+                    .values(
+                        org_id=org_id,
+                        session_id=session_id,
+                        run_id=run_id,
+                        role="user",
+                        author_user_id=user_id,
+                        content={"text": redact(text)},
+                    )
+                    .returning(Message.id)
                 )
-            )
+            ).scalar_one()
+            for image in attachments:
+                await connection.execute(
+                    insert(Attachment).values(
+                        id=image.id,
+                        org_id=org_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                        name=image.name,
+                        mime_type=image.mime_type,
+                        size_bytes=len(image.data),
+                        sha256=image.sha256,
+                        data=image.data,
+                    )
+                )
         return run_id
 
     async def _check_rate(

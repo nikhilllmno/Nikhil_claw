@@ -65,6 +65,7 @@ SLACK_SCOPES: Final = (
     "app_mentions:read",
     "chat:write",
     "commands",
+    "files:read",
     "im:history",
     "im:read",
     "im:write",

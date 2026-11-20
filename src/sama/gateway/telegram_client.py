@@ -14,6 +14,8 @@ from typing import Any, Final
 import httpx
 from pydantic import SecretStr
 
+from sama.gateway.download import fetch_capped
+
 API_URL: Final = "https://api.telegram.org"
 MAX_TEXT: Final = 4096
 """The longest message text that Telegram accepts."""
@@ -137,18 +139,7 @@ class TelegramClient:
         if int(info.get("file_size") or 0) > max_bytes or not info.get("file_path"):
             raise TelegramError("getFile failed: the file is too large")
         url = f"{self._base_url}/file/bot{self._token.get_secret_value()}/{info['file_path']}"
-        try:
-            async with self._http.stream("GET", url) as response:
-                if response.status_code != 200:
-                    raise TelegramError(f"download failed: {response.status_code}")
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > max_bytes:
-                        raise TelegramError("download failed: the file is too large")
-        except httpx.HTTPError as error:
-            raise TelegramError(f"download failed: {type(error).__name__}") from None
-        return bytes(data)
+        return await fetch_capped(self._http, url, max_bytes=max_bytes, fail=TelegramError)
 
     async def set_webhook(self, url: str, secret: SecretStr) -> None:
         await self.call(

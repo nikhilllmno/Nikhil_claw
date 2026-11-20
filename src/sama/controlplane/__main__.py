@@ -23,7 +23,8 @@ Optional environment:
 - ``SAMA_ALERT_SLACK_WEBHOOK_URL``: turns on the error rate alerts.
 - ``SAMA_ENVIRONMENT``, ``SAMA_TRACE_CONTENT``, ``SAMA_SUPABASE_JWT_SECRET``,
   ``SAMA_SANDBOX_TEMPLATE``, ``SAMA_SANDBOX_ALLOW_OUT`` (comma-separated hosts),
-  ``SAMA_WORKER_CONCURRENCY`` (default 4).
+  ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_VISION_MODEL`` (the model of
+  ``vision_analyze``, default ``claude-sonnet-5-5``).
 """
 
 from __future__ import annotations

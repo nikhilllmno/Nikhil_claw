@@ -93,6 +93,14 @@ def test_the_session_tools_need_the_sessions_toolset_and_then_are_allowed(tool: 
     assert with_it.action == "allow"
 
 
+def test_vision_needs_the_media_toolset_and_is_allowed_by_default() -> None:
+    name = "mcp__sama__vision_analyze"
+    without = decide(context(), name, {})
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+    allowed = decide(context(toolsets=frozenset({"media"})), name, {})
+    assert allowed.action == "allow"
+
+
 def test_an_unknown_mcp_tool_is_in_no_toolset() -> None:
     verdict = decide(context(rules=(rule("*", "allow"),)), "mcp__other__send", {})
     assert verdict.step is GateStep.TOOLSET

@@ -8,6 +8,10 @@ Environment:
   variable in M1.17.
 - ``OPENAI_API_KEY``: optional. Without it and without a vault key of the org,
   ``session_search`` uses the full-text index alone.
+- ``ANTHROPIC_API_KEY``: optional. It is the default key of ``vision_analyze``; the key of the
+  org in the vault comes first. Without either, the tool tells the model that image analysis is
+  off. ``SAMA_VISION_MODEL`` sets the vision model (default ``claude-sonnet-5-5``).
+  ``vision_analyze`` needs ``--store postgres``: the images are in the database.
 - ``SAMA_DATABASE_URL``: used only with ``--store postgres``. Then the server also has the
   tool gate (``POST /gate``, M1.9). Without it, the runner denies every tool call.
 - ``SAMA_VAULT_KEY``: optional, used only with ``--store postgres``. It opens the vault, so that
@@ -26,9 +30,14 @@ import os
 
 import uvicorn
 from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
 
+from sama.media.store import AttachmentStore
+from sama.media.vision import DEFAULT_VISION_MODEL, VisionService
 from sama.memory import InProcessMemoryStore, MemoryService, MemoryStore, PostgresMemoryStore
+from sama.modelproxy.prices import PriceTable
+from sama.modelproxy.store import PostgresUsageStore
 from sama.observability.logs import configure_logging
 from sama.search import OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SkillStore
@@ -56,6 +65,25 @@ def _embedder(vault: Vault | None) -> OpenAIEmbedder | None:
     return OpenAIEmbedder(keys, redactor=default_redactor())
 
 
+def _vision(engine: AsyncEngine, vault: Vault | None) -> VisionService | None:
+    """The backend of ``vision_analyze``. The key of the org in the vault comes first, then
+    ``ANTHROPIC_API_KEY``. With neither source, an org has no key, and the tool answers that
+    image analysis is off."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    keys = OrgKeys(vault, {SecretName.ANTHROPIC_API_KEY: SecretStr(key) if key else None})
+    if not keys.available(SecretName.ANTHROPIC_API_KEY):
+        log.warning("there is no Anthropic key, so vision_analyze is hidden")
+        return None
+    return VisionService(
+        store=AttachmentStore(engine),
+        keys=keys,
+        usage=PostgresUsageStore(engine),
+        prices=PriceTable.load(),
+        model=os.environ.get("SAMA_VISION_MODEL", "").strip() or DEFAULT_VISION_MODEL,
+        redactor=default_redactor(),
+    )
+
+
 def build_app(store_kind: str) -> Starlette:
     key = os.environ.get("SAMA_RUN_TOKEN_KEY", "")
     if not key:
@@ -66,6 +94,7 @@ def build_app(store_kind: str) -> Starlette:
     gate = None
     vault = None
     sessions: SessionSearch | None = None
+    vision: VisionService | None = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
         from sama.gate.service import GateService
@@ -80,11 +109,13 @@ def build_app(store_kind: str) -> Starlette:
         gate = GateService(engine)
         vault = vault_from_env(engine)
         sessions = SessionSearch(engine, _embedder(vault))
+        vision = _vision(engine, vault)
     else:
         log.warning(
             "the task lists are in memory only, there is no tool gate, and the skills tools are off"
         )
         log.warning("session search needs a database, so the session tools are hidden")
+        log.warning("images are in the database, so vision_analyze is hidden")
         todos = MemoryTodoStore()
         memories = InProcessMemoryStore()
     brave_key = os.environ.get("BRAVE_API_KEY", "")
@@ -100,6 +131,7 @@ def build_app(store_kind: str) -> Starlette:
         memory=MemoryService(memories),
         skills=skills,
         sessions=sessions,
+        vision=vision,
         gate=gate,
     )
     return server.app(around=lambda: keep_redactor_current(vault))
@@ -119,6 +151,7 @@ def main() -> None:
             "BRAVE_API_KEY",
             "SAMA_VAULT_KEY",
             "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
         )
     )
     quiet_dependency_logs()

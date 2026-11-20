@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from sama.media.vision import VisionService
 from sama.search import OpenAIEmbedder, SessionSearch
 from sama.skills import PostgresSkillStore
 from sama.tools.__main__ import build_app
@@ -85,3 +86,28 @@ async def test_build_app_with_postgres_serves_the_session_tools_and_a_redacting_
     seen.clear()
     build_app("memory")
     assert seen["sessions"] is None
+
+
+async def test_build_app_with_postgres_serves_vision_and_hides_it_in_memory_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+    real = ToolServer
+
+    def spy(**kwargs: object) -> ToolServer:
+        seen.update(kwargs)
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("sama.tools.__main__.ToolServer", spy)
+    monkeypatch.setenv("SAMA_RUN_TOKEN_KEY", "k" * 32)
+    monkeypatch.setenv("SAMA_DATABASE_URL", "postgresql://u:p@localhost:1/none")
+    monkeypatch.delenv("SAMA_VAULT_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    build_app("postgres")
+    assert isinstance(seen["vision"], VisionService)
+    names = {tool.name for tool in await real(**seen).mcp().list_tools()}  # type: ignore[arg-type]
+    assert "vision_analyze" in names
+    seen.clear()
+    build_app("memory")
+    assert seen["vision"] is None

@@ -51,7 +51,7 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
     assert profile == (
         None,
         "claude-sonnet-5-5",
-        ["core", "todo", "web", "clarify", "github", "memory", "skills", "sessions"],
+        ["core", "todo", "web", "clarify", "github", "memory", "skills", "sessions", "media"],
     )
     assert grants.sees_workspace(first.workspace_id)
 

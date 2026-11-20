@@ -42,11 +42,15 @@ class FakeTelegram:
             TOKEN: {"id": BOT_ID, "is_bot": True, "username": "sama_bot"}
         }
         self.failing: set[str] = set()
+        self.files: dict[str, bytes] = {}
+        """The bytes of the files that users sent, by ``file_id``. A voice note has none: it
+        gets the bytes ``OGG``."""
         self._ids = itertools.count(100)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if "/file/" in request.url.path:
-            return httpx.Response(200, content=b"OGG")
+            name = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, content=self.files.get(name, b"OGG"))
         token_part, method = request.url.path.rsplit("/", 2)[-2:]
         token = token_part.removeprefix("bot")
         body = json.loads(request.content or b"{}")
@@ -70,6 +74,10 @@ class FakeTelegram:
         if method == "editMessageText" and body["message_id"] in self.messages:
             self.messages[body["message_id"]] = (body["chat_id"], body["text"])
         if method == "getFile":
+            data = self.files.get(str(body.get("file_id")))
+            if data is not None:
+                result = {"file_path": body["file_id"], "file_size": len(data)}
+                return httpx.Response(200, json={"ok": True, "result": result})
             return httpx.Response(200, json={"ok": True, "result": {"file_path": "v.oga"}})
         return httpx.Response(200, json={"ok": True, "result": True})
 
@@ -146,9 +154,19 @@ class FakeSlack:
         }
         self.failing: set[str] = set()
         self.limited: set[str] = set()
+        self.files: dict[str, bytes] = {}
+        """The bytes of the shared files, by URL."""
+        self.downloads: list[tuple[str, str]] = []
+        """The ``(url, bearer token)`` of each file download."""
         self._ts = itertools.count(1)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            url = str(request.url)
+            token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+            self.downloads.append((url, token))
+            data = self.files.get(url)
+            return httpx.Response(404 if data is None else 200, content=data or b"")
         method = request.url.path.rsplit("/", 1)[-1]
         token = request.headers.get("Authorization", "").removeprefix("Bearer ")
         body = json.loads(request.content or b"{}")

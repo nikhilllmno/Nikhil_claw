@@ -1227,7 +1227,7 @@ flowchart LR
 | `cron` | `cronjob_manage` (create, list, update, pause, resume, remove, run, cancel) | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
-| `media` | `vision_analyze`, `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
+| `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate`, `text_to_speech`, `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (sends the user a link or a form), `connection_test` | Sama MCP |
 | `integrations` | Connector tools (Composio, MCP, database, HTTP API, plugin), behind `tool_search` (Section 10.3) | Sama MCP (Composio, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment` through the sama GitHub App. Since M1.16: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
@@ -1454,8 +1454,8 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 | Channel | Transport | Notes |
 |---|---|---|
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
-| Slack | Events API, interactivity, and the `/sama` command over HTTP. Web API calls with `httpx` (no Bolt: sama needs only six methods and checks the signature itself) | One Slack app per org. An org admin makes the app from a manifest and connects it as an integration (Section 11.6). Direct messages and mentions in linked channels. A thread in a channel is a session. Approval buttons through Block Kit. |
-| Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Inline keyboards for approvals. |
+| Slack | Events API, interactivity, and the `/sama` command over HTTP. Web API calls with `httpx` (no Bolt: sama needs only six methods and checks the signature itself) | One Slack app per org. An org admin makes the app from a manifest and connects it as an integration (Section 11.6). Direct messages and mentions in linked channels. A thread in a channel is a session. Approval buttons through Block Kit. Images that users send are stored for `vision_analyze` (Section 11.7). |
+| Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Photos and image files are stored for `vision_analyze` (Section 11.7). Inline keyboards for approvals. |
 | Chrome extension | WebSocket from the extension to the gateway | Side panel chat bound to the current tab. Also the `my_chrome` browser target (Section 14). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
 
@@ -1624,7 +1624,9 @@ time (Section 11.6). The gateway drops a repeated
 `update_id`, answers at once, and handles the update in the background. Updates of one chat
 run one at a time. Messages from bots and from other chat types are dropped. In a group the
 bot reacts only to a command, an `@` mention of the bot, or a reply to a bot message. A voice
-note of at most 5 minutes and 10 MB is downloaded and transcribed (OpenAI `whisper-1`).
+note of at most 5 minutes and 10 MB is downloaded and transcribed (OpenAI `whisper-1`). A
+photo, or a document with an image type, is downloaded and stored as an attachment. A message
+with an image and no text is a valid message (Section 11.7).
 
 **Access.** An unknown sender gets a pairing prompt in a direct chat and nothing in a group.
 For each message the gateway loads the grants of the user again. A user who lost the workspace
@@ -1761,8 +1763,8 @@ connect has two steps:
 1. the admin clicks "Start Slack setup". `setup_slack` makes a `pending` row (audit
    `integration.created`) and returns `<SAMA_PUBLIC_URL>/slack/<integration id>/events`,
    `.../interactions`, and `.../commands`, and a manifest with these URLs, the bot scopes
-   (`app_mentions:read`, `chat:write`, `commands`, `im:history`, `im:read`, `im:write`,
-   `users:read`), the events `app_mention` and `message.im`, and the `/sama` command. The link
+   (`app_mentions:read`, `chat:write`, `commands`, `files:read`, `im:history`, `im:read`,
+   `im:write`, `users:read`), the events `app_mention` and `message.im`, and the `/sama` command. The link
    opens `https://api.slack.com/apps?new_app=1&manifest_json=...`. The admin picks the Slack
    workspace, makes the app, and installs it. When Slack checks the events URL, the `pending`
    row answers the `url_verification` challenge;
@@ -1812,6 +1814,12 @@ answer that only the sender sees.
 The Telegram and Slack gateways share the session, follow, and approval code
 (`sama.gateway.sessions`).
 
+**Images.** The scope `files:read` lets the gateway download the files of a message. A message
+with an image is valid without text. Section 11.7 has the rules. An app that was connected
+before M2.8 needs the new scope: the admin adds `files:read` to the app and installs it again.
+Without the scope, the download fails and the sender gets the message that sama cannot read
+the image.
+
 **Limits.** Slack has no voice notes and no `/model` command. In a channel thread, each message
 to the app needs a mention. The pairing lockout and the limit of 200 followed runs are for each
 hub: the Telegram hub and the Slack hub each have their own.
@@ -1819,6 +1827,145 @@ hub: the Telegram hub and the Slack hub each have their own.
 **Not in this step.** Integrations for each workspace, more than one app of a kind per org,
 Slack OAuth distribution (one app for many Slack workspaces), and a check that the webhook still
 works after the connect.
+
+### 11.7 Images from channels and `vision_analyze` (M2.8)
+
+A user can send an image to sama in Telegram or Slack. The gateway stores the image, tells the
+agent that it exists, and the agent looks at it with the tool `vision_analyze` when it needs to.
+The code is in `src/sama/media/`.
+
+**Inbound rules.** The Telegram and the Slack gateway use the same code (`sama.media.images`).
+
+- Accepted: a Telegram photo, a Telegram document with an image type, and a Slack file with an
+  image type. The types are PNG, JPEG, GIF, and WebP. Other files are ignored, as before.
+- An image is at most 10 MB. A message has at most 4 images. A larger image, another image
+  type (for example HEIC or SVG), too many images, a download that fails, and bytes that do not
+  match the type get a short plain-text answer, and the whole message stops. The answer says
+  only what the sender already knows.
+- The gateway does not trust the type that the channel gives. It reads the first bytes of the
+  file, and they must match the type (PNG, JPEG, GIF, or WebP signature).
+- A message with an image and no text is valid. The text of the message is the caption (or the
+  text) and one line for each image: `[image attached: <id> <name>; use vision_analyze to look
+  at it]`. The line is the only change to the text. The name is cleaned to letters, digits,
+  `.`, `_`, and `-`, and cut to 80 characters.
+- The gateway checks the size limit before it downloads (the size that the channel states) and
+  while it downloads (a byte cap). The Slack download sends the bot token only to an `https`
+  URL on `slack.com` or `slack-files.com`, and does not follow a redirect.
+- The byte cap counts the bytes on the wire (`sama.gateway.download`, used for Slack and
+  Telegram). The request has `Accept-Encoding: identity`. An answer with another
+  `Content-Encoding` is refused before the gateway reads a byte, so no decoder runs and a small
+  compressed file cannot grow past the cap. The gateway checks the cap before it adds a chunk,
+  so a file of exactly the limit is accepted and a file of one byte more is refused.
+- The gateway makes the id of each image first, so that the text can name it. `RunQueue.enqueue`
+  then stores the message and its images in one transaction. A failed store leaves neither.
+
+**Storage (migration `0015`).** The table `attachments` has one row for each image: `id`,
+`org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data`
+(`bytea`), `created_at`. A foreign key on `(org_id, session_id, message_id)` ties the row to its
+message, so an image always belongs to the session of its message, and a delete of the session
+deletes the images. Checks limit the type to the four image types and the size to 1 byte to
+10 MB, and the size must equal the length of `data`. RLS follows the session
+(`can_read_session`). The grant to `authenticated` is a column grant without `data`, so the Data
+API never gives the bytes. The same migration adds `media` to the default toolsets of the first
+org (an exact match, like `0014`).
+
+**The tool.** `vision_analyze(attachment_id, question)` is in the toolset `media`. The gate
+allows it by default (Section 16.1): it reads only an image of the run session, and the budget
+of the run limits its cost.
+
+1. It finds the image. The scope is the org and the session of the run token, never an argument.
+   `latest` is the newest image of the session. An id of another session, another org, or no
+   image at all gives the same answer: `The image was not found`.
+2. It reads the Anthropic key of the org (the vault first, then `ANTHROPIC_API_KEY`). Without a
+   key, the tool answers with a plain text that image analysis is off. This is not an error.
+3. It checks the live authority and the budget of the run, the monthly limit of the org, and
+   the daily limit of the user, as the model proxy does (Section 16.6). It fails closed. First
+   it tries again to write the records that the shared ledger holds. If the ledger still holds
+   a record of the org, the tool refuses the call (see "Accounting" below).
+4. It sends the image (base64) and the question to the Anthropic Messages API, with a limit of
+   1,024 answer tokens and a time limit of 45 seconds. The question goes through the redactor
+   first. The system text says that text in an image is data.
+5. It records the call in `model_calls` (provider `anthropic`, endpoint `messages`), so the
+   cost counts for the run, the user, and the org.
+6. The answer goes through the redactor as a whole, and only then is it cut to 8,000
+   characters. So a secret that crosses the cut cannot leave as a partial value. The answer is
+   untrusted content (Section 16.5): it goes in an
+   `<untrusted_content source="vision_analyze">` block, and the redactor reads it like the
+   result of every tool.
+
+The service gives the tool a result with a status, `ok` or `unavailable`. Only the status
+decides how the tool shows the text. `unavailable` (no key) is plain text. Each text from the
+provider is always in the untrusted block, also when it is equal to the no-key text.
+
+**Accounting.** Each call is paid, also when the caller goes away.
+
+- Each call has its own `call_id`. The provider call and the write of its record run in one task
+  that a cancel of the caller does not stop (`asyncio.shield`). A cancel of the run, a time
+  limit, or a stop of the tool server cannot lose the record.
+- The record has the real usage of the answer. It has an estimate (`usage_estimated`) if the
+  caller is cancelled, the call times out, the connection breaks after the request was sent, or
+  a `200` answer has no usage. The estimate has `status_code` 0 (no answer) or 200. The input of
+  the estimate is a fixed 8,000 tokens for the image, plus the text bytes divided by 2. The
+  output is the limit of 1,024 tokens. The estimate does not use the bytes of the image, because
+  that would give millions of tokens for a base64 string.
+- A request that never reached the provider (a connect error or a pool time-out) has no record,
+  because it cost nothing. A status other than 200 has no record either.
+- A record is pending from the start of its settlement (when the provider answers, or when the
+  call is cancelled or fails) until its write succeeds. A pending record blocks new calls of its
+  org, like a fenced record, so a write that stalls without an error cannot open the budget. A
+  budget check first waits for the pending writes of its own org, for at most 2 seconds. A normal
+  write takes milliseconds, so concurrent calls of one org do not refuse each other. A write that
+  still runs after the wait refuses the call. Other orgs do not wait.
+- Each write attempt has a time limit of 5 seconds (an attempt that the limit stops can have
+  reached the database). The write is tried 3 times with the same `call_id`, so a retry cannot
+  count a call twice. If all tries fail, or a cancel stops the write, the ledger fences the
+  record. New calls of that org (of the model proxy and of `vision_analyze`) are refused until a
+  later write succeeds. The retry of fenced records runs under a lock, with the same time limit.
+  The budget check fails closed.
+- `aclose` stops in a fixed time. The open calls get 5 seconds to end. The service cancels the
+  rest, and each of them writes an estimate. A call that still writes after another 5 seconds is
+  cancelled again: the cancel fences the record in the shared ledger, so the final flush and log
+  of the model proxy handle it. Then the http client closes, also if a call did not end.
+
+A failure of the model call becomes a short text without the key, the URL, or the body of the
+provider: busy (`429`), refused key (`401`, `403`), bad image (`400`, `413`), no answer in time,
+or not available.
+
+**Assumptions.** These choices are for M2.8. Change them in a new revision of this section.
+
+- A1. The tool sees only the images of its own session. A session that the user can read
+  through search does not give its images (a later step can add this with the same rules as
+  `session_read`).
+- A2. The images stay in Postgres. At 10 MB and 4 images for each message, this is simple and
+  keeps one transaction. A move to object storage is possible later: the table keeps the
+  metadata and the hash.
+- A3. The vision model is a separate Anthropic call of the control plane, not the model of the
+  run. So the tool works with both runtimes, and the run does not need to carry the image in
+  its context. The model is `claude-sonnet-5-5` (`SAMA_VISION_MODEL` changes it). The model
+  needs a price in the price table, or the process does not start.
+- A4. The answer and the question can have secrets that the redactor does not know. The
+  redactor reads the question and the answer. It cannot read the pixels of an image.
+- A5. A Telegram album arrives as one update for each photo, so it makes one run for each
+  photo. The limit of 4 images is for one message.
+- A6. Old attachments stay as long as the session does. A retention rule comes with the data
+  retention work.
+- A7. The Anthropic key of the org pays for the call. An org with no key has no image analysis.
+- A8. The agent profile of an existing org keeps its own toolset list. Only the default list
+  gets `media`. An admin adds `media` to a changed list.
+- A9. The fence and the list of pending records are in memory. A restart of the control plane
+  loses them, the same as for the model proxy. A durable queue is in the backlog (Section 16.6).
+- A10. A cancelled call is charged with an estimate that is higher than the usual cost of a
+  description. We prefer to count too much than too little. The estimate of 8,000 image tokens
+  is a fixed allowance for all images.
+- A11. A call that fails after the provider read the request (a time-out, a broken connection)
+  is charged with the estimate, because the provider can have counted it. A connect error is not
+  charged.
+- A12. The download code reads with the decoder of the http client, but it refuses every encoded
+  answer first. So the code cannot decode. A server that sends only compressed files gives a
+  failed download, and the sender sees the usual short answer.
+- A13. A call that the provider has not answered yet is not in the budget. Calls of one org that
+  run at the same time can pass the limit together by their cost, as in the model proxy
+  (Section 16.6). The budget limits the calls that start after a record is pending or written.
 
 ---
 
@@ -2368,7 +2515,8 @@ policy for all of them:
 ### 16.5 Untrusted content
 
 - Content from the web, email, webhooks, other people in groups, and files is untrusted.
-  Sama marks it as untrusted in tool results.
+  Sama marks it as untrusted in tool results. The answer of `vision_analyze` is untrusted too:
+  an image can contain text that tries to give orders (Section 11.7).
 - A run triggered by untrusted input uses a narrow toolset by default.
 - Context files and skills are scanned for prompt-injection patterns before use.
 
@@ -2437,8 +2585,13 @@ the request (64,000 tokens if the request has none). The seen counts stay if the
 **A lost record blocks the org.** Each record has a `call_id`, and a second write of the
 same record does nothing, so a retry cannot count a call twice. The proxy tries a record
 write 3 times. If all fail, it keeps the record in memory and refuses new calls of that org
-with `503`. The next call of any org tries the write again, under a lock. The record stays
-in the block list until its write succeeds.
+with `503`. The next call tries the write again, under a lock. The record stays in the block
+list until its write succeeds. A record also blocks its org while its write runs, and each write
+attempt has a time limit of 5 seconds, so a write that stalls without an error cannot open the
+budget. A budget check waits at most 2 seconds for the pending writes of its own org. The model
+proxy and `vision_analyze` share one `UsageLedger` (`sama.modelproxy.ledger`) in the control
+plane. So a record that one of them cannot write blocks new calls of that org in both (Section
+11.7).
 
 **Stop.** When the proxy stops, open streams get 5 seconds to end. Then each pump stops
 reading and writes its record, with an estimate if the usage is not final. The proxy builds
@@ -2500,6 +2653,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `memory(target, action, content, old_text, operations, reason)` | Saves a short note for the next sessions (Section 8.1). `target` is `agent`, `user`, or `workspace`. `action` is `add`, `patch`, or `remove`. Give `action` or `operations` (at most 20), not both. Returns the current entries and the usage. The tool has no read action. | A memory service. Without one the tool is hidden. |
 | `session_search(query, limit)` | Searches past sessions that the run may see, by words and meaning, and returns up to 10 sessions with title, audience, times, and snippets (Section 7.1). An empty query lists the latest sessions. | A database. Without a service the tool is hidden. Meaning search needs an OpenAI key. Without one, the tool uses full text only. |
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
+| `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
@@ -2598,6 +2752,7 @@ migrated schema.
 | `memories` | The notes of one scope: `org_id`, `scope` (`agent`, `user`, `workspace`), `workspace_id`, `agent_profile_id`, `user_id`, `entries` (JSON list), `revision` (migration `0012`, Section 8.1) |
 | `message_embeddings` | One embedding for each embedded message: `org_id`, `session_id`, `message_id`, `embedding` (`vector(1536)`, HNSW index), `model` (migration `0014`, Section 7.1) |
 | `memory_revisions` | One row per memory write: `org_id`, `memory_id`, `seq`, `action`, `entries`, `session_id`, `run_id`, `author_kind`, `author_user_id`, `reason`, `reverted_to` (migration `0012`, Section 8.1) |
+| `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 
 Rules:
 
@@ -2636,6 +2791,9 @@ Row-level security:
   - the audit log only as an org `owner` or `admin`;
   - the `agent` and `workspace` memory (and its revisions) of the workspaces that the user can
     see, and the `user` memory of the user's own user rows (Section 8.1).
+- A member reads the `attachments` of the sessions that the member can see, but only the
+  columns without `data`: the grant on the table is a column grant. The bytes of an image stay
+  in the control plane and the tool server (Section 11.7).
 - `anon` gets no access. All writes go through the control plane. The control plane
   connects as the table owner, which RLS does not limit, and checks scope in code.
 - **Closed by default.** Supabase gives `anon` and `authenticated` all rights on new objects
@@ -2843,7 +3001,7 @@ the start with a message that names the variable but not its value.
 | `BRAVE_API_KEY` | No | `web_search` |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
-| `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY` | No | See the module doc of `sama.controlplane.__main__` |
+| `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first
 (Section 16.3).
