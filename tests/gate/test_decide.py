@@ -75,6 +75,15 @@ def test_no_toolsets_means_no_tools() -> None:
     assert verdict.action == "deny"
 
 
+def test_memory_needs_the_memory_toolset_and_then_is_allowed() -> None:
+    without = decide(context(), "mcp__sama__memory", {"target": "agent"})
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+    with_it = decide(
+        context(toolsets=frozenset({"memory"})), "mcp__sama__memory", {"target": "agent"}
+    )
+    assert with_it.action == "allow"
+
+
 def test_an_unknown_mcp_tool_is_in_no_toolset() -> None:
     verdict = decide(context(rules=(rule("*", "allow"),)), "mcp__other__send", {})
     assert verdict.step is GateStep.TOOLSET

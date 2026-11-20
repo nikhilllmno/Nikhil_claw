@@ -51,6 +51,21 @@ from sama.db.models import (
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.gateway.pairing import PairingError, create_code
 from sama.integrations.service import IntegrationError, Integrations
+from sama.memory import (
+    CAPS,
+    MemoryChangeError,
+    MemoryDeniedError,
+    MemoryScope,
+    MemoryService,
+    PostgresMemoryStore,
+    Writer,
+    scope_of,
+)
+from sama.memory import (
+    MAX_REASON_CHARS as MAX_MEMORY_REASON_CHARS,
+)
+from sama.memory.core import MAX_ENTRY_CHARS, Target, used
+from sama.memory.store import read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -135,6 +150,24 @@ class SlackConnect(_Body):
 
 
 Channel = Literal["telegram", "slack"]
+
+MAX_MEMORY_ENTRIES: Final = 100
+
+
+class MemoryEdit(_Body):
+    """The new notes of one scope. They replace all entries."""
+
+    entries: list[Annotated[str, Field(max_length=MAX_ENTRY_CHARS)]] = Field(
+        max_length=MAX_MEMORY_ENTRIES
+    )
+    agent_profile_id: uuid.UUID | None = None
+    """Needed for the ``agent`` target."""
+    reason: str | None = Field(default=None, max_length=MAX_MEMORY_REASON_CHARS)
+
+
+class MemoryRevert(_Body):
+    agent_profile_id: uuid.UUID | None = None
+    reason: str | None = Field(default=None, max_length=MAX_MEMORY_REASON_CHARS)
 
 
 class Answers(_Body):
@@ -313,9 +346,11 @@ class SamaApi:
         clarify: ClarifyBroker | None = None,
         settings: ApiSettings | None = None,
         integrations: Integrations | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``."""
         self._engine = engine
+        self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
@@ -532,6 +567,40 @@ class SamaApi:
             await self._unlink(principal, channel, identity_id)
             return Response(status_code=204)
 
+        @app.get("/workspaces/{workspace_id}/memory")
+        async def memory_notes(
+            principal: Me, workspace_id: uuid.UUID, agent_profile_id: uuid.UUID | None = None
+        ) -> dict[str, Any]:
+            return await self._memory_notes(principal, workspace_id, agent_profile_id)
+
+        @app.get("/workspaces/{workspace_id}/memory/{target}/revisions")
+        async def memory_revisions(
+            principal: Me,
+            workspace_id: uuid.UUID,
+            target: Target,
+            agent_profile_id: uuid.UUID | None = None,
+            limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        ) -> list[dict[str, Any]]:
+            return await self._memory_revisions(
+                principal, workspace_id, target, agent_profile_id, limit
+            )
+
+        @app.put("/workspaces/{workspace_id}/memory/{target}")
+        async def memory_edit(
+            principal: Me, workspace_id: uuid.UUID, target: Target, body: MemoryEdit
+        ) -> dict[str, Any]:
+            return await self._memory_write(
+                principal, workspace_id, target, body.agent_profile_id, body.reason, None, body
+            )
+
+        @app.post("/workspaces/{workspace_id}/memory/{target}/revisions/{seq}/revert")
+        async def memory_revert(
+            principal: Me, workspace_id: uuid.UUID, target: Target, seq: int, body: MemoryRevert
+        ) -> dict[str, Any]:
+            return await self._memory_write(
+                principal, workspace_id, target, body.agent_profile_id, body.reason, seq, None
+            )
+
         return app
 
     # -- reads ------------------------------------------------------------------------------
@@ -743,6 +812,158 @@ class SamaApi:
             }
             for request in self._clarify.pending(str(access.org_id), str(session_id))
         ]
+
+    # -- memory -----------------------------------------------------------------------------
+
+    async def _memory_access(
+        self,
+        connection: AsyncConnection,
+        principal: Principal,
+        workspace_id: uuid.UUID,
+        target: Target,
+        agent_profile_id: uuid.UUID | None,
+    ) -> tuple[MemoryScope, uuid.UUID, bool]:
+        """The scope, the user row, and whether the user is a workspace admin. Raises ``404``
+        if the user cannot see the workspace or the profile is not in it, and ``422`` if an
+        ``agent`` call has no profile."""
+        org_id = (
+            await connection.execute(select(Workspace.org_id).where(Workspace.id == workspace_id))
+        ).scalar_one_or_none()
+        user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+        if org_id is None or user_id is None:
+            raise _not_found("the workspace does not exist")
+        grants = await load_grants(connection, org_id, user_id)
+        if not grants.sees_workspace(workspace_id):
+            raise _not_found("the workspace does not exist")
+        if target is Target.AGENT:
+            if agent_profile_id is None:
+                raise HTTPException(status_code=422, detail="agent_profile_id is needed")
+            profile_workspace = (
+                await connection.execute(
+                    select(AgentProfile.workspace_id).where(
+                        AgentProfile.org_id == org_id, AgentProfile.id == agent_profile_id
+                    )
+                )
+            ).one_or_none()
+            if profile_workspace is None or profile_workspace[0] not in (None, workspace_id):
+                raise _not_found("the agent profile does not exist in this workspace")
+        scope = scope_of(
+            target,
+            org_id=org_id,
+            workspace_id=workspace_id,
+            agent_profile_id=agent_profile_id,
+            user_id=user_id,
+        )
+        return scope, user_id, grants.admins_workspace(workspace_id)
+
+    async def _memory_notes(
+        self, principal: Principal, workspace_id: uuid.UUID, agent_profile_id: uuid.UUID | None
+    ) -> dict[str, Any]:
+        targets = [Target.WORKSPACE, Target.USER]
+        if agent_profile_id is not None:
+            targets.insert(0, Target.AGENT)
+        notes: list[dict[str, Any]] = []
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            for target in targets:
+                scope, _, admin = await self._memory_access(
+                    connection, principal, workspace_id, target, agent_profile_id
+                )
+                state = await read_state(connection, scope)
+                notes.append(
+                    {
+                        "target": target.value,
+                        "entries": list(state.entries),
+                        "chars": used(state.entries),
+                        "cap": CAPS[target],
+                        "revision": state.revision,
+                        "can_edit": admin or target is not Target.WORKSPACE,
+                    }
+                )
+        return {"workspace_id": str(workspace_id), "targets": notes}
+
+    async def _memory_revisions(
+        self,
+        principal: Principal,
+        workspace_id: uuid.UUID,
+        target: Target,
+        agent_profile_id: uuid.UUID | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            scope, _, _ = await self._memory_access(
+                connection, principal, workspace_id, target, agent_profile_id
+            )
+            revisions = await read_revisions(connection, scope, limit)
+        return [
+            {
+                "seq": r.seq,
+                "action": r.action,
+                "entries": list(r.entries),
+                "author_kind": r.author_kind,
+                "author_user_id": None if r.author_user_id is None else str(r.author_user_id),
+                "session_id": None if r.session_id is None else str(r.session_id),
+                "run_id": None if r.run_id is None else str(r.run_id),
+                "reason": r.reason,
+                "reverted_to": r.reverted_to,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in revisions
+        ]
+
+    async def _memory_write(
+        self,
+        principal: Principal,
+        workspace_id: uuid.UUID,
+        target: Target,
+        agent_profile_id: uuid.UUID | None,
+        reason: str | None,
+        revert_to: int | None,
+        edit: MemoryEdit | None,
+    ) -> dict[str, Any]:
+        """A person replaces the notes of a scope (``edit``) or sets them back to an old
+        revision (``revert_to``)."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            scope, user_id, admin = await self._memory_access(
+                connection, principal, workspace_id, target, agent_profile_id
+            )
+            if revert_to is not None and not await read_revisions(
+                connection, scope, 1, seq=revert_to
+            ):
+                raise _not_found("the revision does not exist")
+        if target is Target.WORKSPACE and not admin:
+            raise HTTPException(
+                status_code=403, detail="only a workspace admin can change workspace memory"
+            )
+        writer = Writer("user", user_id)
+        try:
+            if edit is not None:
+                state = await self._memory.edit(scope, edit.entries, writer, reason)
+            elif revert_to is not None:
+                state = await self._memory.revert(scope, revert_to, writer, reason)
+        except MemoryDeniedError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
+        except MemoryChangeError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                insert(AuditEntry).values(
+                    org_id=scope.org_id,
+                    workspace_id=workspace_id,
+                    actor_kind="user",
+                    actor_user_id=user_id,
+                    action="memory.reverted" if revert_to is not None else "memory.edited",
+                    target_type="memory",
+                    target_id=target.value,
+                    details={"revision": state.revision, "reverted_to": revert_to},
+                )
+            )
+        return {
+            "target": target.value,
+            "entries": list(state.entries),
+            "chars": used(state.entries),
+            "cap": CAPS[target],
+            "revision": state.revision,
+        }
 
     # -- writes -----------------------------------------------------------------------------
 

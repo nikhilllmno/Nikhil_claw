@@ -23,6 +23,7 @@ import uvicorn
 from pydantic import SecretStr
 from starlette.applications import Starlette
 
+from sama.memory import InProcessMemoryStore, MemoryService, MemoryStore, PostgresMemoryStore
 from sama.observability.logs import configure_logging
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.server import ToolServer, quiet_dependency_logs
@@ -38,6 +39,7 @@ def build_app(store_kind: str) -> Starlette:
     if not key:
         raise SystemExit("set SAMA_RUN_TOKEN_KEY")
     todos: TodoStore
+    memories: MemoryStore
     gate = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
@@ -48,17 +50,25 @@ def build_app(store_kind: str) -> Starlette:
             raise SystemExit("set SAMA_DATABASE_URL for --store postgres")
         engine = create_engine(url)
         todos = PostgresTodoStore(engine)
+        memories = PostgresMemoryStore(engine)
         gate = GateService(engine)
     else:
         log.warning("the task lists are in memory only, and there is no tool gate")
         todos = MemoryTodoStore()
+        memories = InProcessMemoryStore()
     brave_key = os.environ.get("BRAVE_API_KEY", "")
     search = None
     if brave_key:
         search = BraveSearch(SecretStr(brave_key))
     else:
         log.warning("BRAVE_API_KEY is not set, so web_search is hidden")
-    server = ToolServer(signer=RunTokenSigner(key.encode()), todos=todos, search=search, gate=gate)
+    server = ToolServer(
+        signer=RunTokenSigner(key.encode()),
+        todos=todos,
+        search=search,
+        memory=MemoryService(memories),
+        gate=gate,
+    )
     return server.app()
 
 

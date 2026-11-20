@@ -86,12 +86,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| `MEMORY.md` (2,200 chars) and `USER.md` (1,375 chars) | `tools/memory_tool.py` | Targets `agent` (2,200), `user` (1,375), and `workspace` (2,200) per profile and user (§8). | Adapt | M2 |
-| `memory` tool: add, patch, remove | `tools/memory_tool.py` | Same actions. Over-limit writes fail and return the current entries. | Adapt | M2 |
-| Frozen memory snapshot in the prompt | `agent/memory_manager.py` | Snapshot in the frozen prefix. New writes apply from the next session. | Adapt | M2 |
+| `MEMORY.md` (2,200 chars) and `USER.md` (1,375 chars) | `tools/memory_tool.py` | Targets `agent` (2,200), `user` (1,375), and `workspace` (2,200) per profile and user (§8). | Adapt | M2 (M2.1 done) |
+| `memory` tool: add, patch, remove | `tools/memory_tool.py` | Same actions. Over-limit writes fail and return the current entries. | Adapt | M2 (M2.1 done) |
+| Frozen memory snapshot in the prompt | `agent/memory_manager.py` | Snapshot in the frozen prefix. New writes apply from the next session. | Adapt | M2 (M2.1 done) |
 | Memory nudges | `agent/background_review.py` | Background review every 10 user turns (§9). | Adapt | M2 |
 | External memory providers (Mem0, Honcho, ...) | `plugins/memory/` | Optional Mem0 provider behind a `MemoryProvider` interface. | Defer | — |
-| Memory history | none (files only) | `memory_revisions` table with author, run, and reason. Revert in the web app. | New | M2 |
+| Memory history | none (files only) | `memory_revisions` table with author, run, and reason. Revert in the API (M2.1) and the web app. | New | M2 (M2.1 done) |
 
 ## 5. Sessions
 

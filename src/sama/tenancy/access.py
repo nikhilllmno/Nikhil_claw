@@ -42,6 +42,15 @@ class Grants:
             self.org_member and any(workspace == workspace_id for workspace, _ in self.rows)
         )
 
+    def admins_workspace(self, workspace_id: uuid.UUID) -> bool:
+        """True for the org ``owner`` and for a member with the role ``admin`` or ``owner`` in
+        the workspace. These users may change workspace memory (Section 8)."""
+        org_owner = any(workspace is None and role == "owner" for workspace, role in self.rows)
+        workspace_admin = self.org_member and any(
+            workspace == workspace_id and role in ADMIN_ROLES for workspace, role in self.rows
+        )
+        return org_owner or workspace_admin
+
     def sees_session(
         self, workspace_id: uuid.UUID, audience: str, owner_user_id: uuid.UUID | None
     ) -> bool:

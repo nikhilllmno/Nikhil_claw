@@ -39,6 +39,7 @@ from sama.gate.wire import GATE_PATH
 from sama.integrations.hub import TelegramHub
 from sama.integrations.service import Integrations
 from sama.integrations.slack_hub import SlackHub
+from sama.memory import MemoryService, PostgresMemoryStore
 from sama.modelproxy.app import ModelProxy, ProxySettings
 from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import PostgresUsageStore
@@ -181,6 +182,7 @@ def build(
         clarify=broker,
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
         repos=RepoCloner(sandboxed.session_sandbox) if sandboxed else None,
+        memory=MemoryService(PostgresMemoryStore(engine)),
         gate=gate,
     )
     proxy = ModelProxy(

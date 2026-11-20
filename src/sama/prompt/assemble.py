@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Final
 from sqlalchemy import case, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AuditEntry, Session, SessionBinding, StoredContextFile
+from sama.db.models import AgentProfile, AuditEntry, Session, SessionBinding, StoredContextFile
 from sama.prompt.scan import scan
 from sama.runtime.contract import (
     CONTEXT_FILE_MAX_CHARS,
@@ -174,6 +174,7 @@ class PromptAssembler:
             )
         ).scalar_one_or_none()
         return RunConfig(
+            memory_snapshot=await _memory_snapshot(connection, run),
             runtime=RuntimeKind(run.runtime),
             model=run.model,
             system=self._system,
@@ -182,6 +183,30 @@ class PromptAssembler:
             environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
         )
+
+
+async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:
+    """The notes of the agent, the workspace, and the owner of a private session. Only a
+    profile with the ``memory`` toolset gets them (Section 8)."""
+    toolsets = (
+        await connection.execute(
+            select(AgentProfile.toolsets).where(
+                AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id
+            )
+        )
+    ).scalar_one_or_none()
+    if not toolsets or "memory" not in toolsets:
+        return ""
+    # Here, not at the top: ``sama.memory`` imports ``sama.prompt.scan``.
+    from sama.memory.store import load_snapshot
+
+    return await load_snapshot(
+        connection,
+        org_id=run.org_id,
+        workspace_id=run.workspace_id,
+        agent_profile_id=run.agent_profile_id,
+        user_id=run.owner_user_id if run.audience == "private" else None,
+    )
 
 
 async def _load(connection: AsyncConnection, run: ClaimedRun) -> Sequence[Any]:
