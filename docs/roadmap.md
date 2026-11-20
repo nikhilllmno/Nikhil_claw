@@ -221,8 +221,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M3.11, M4.1 to M4.3 (below the list of 
   unless the connection allows it. Reads run in a read-only transaction. Each statement has a
   30-second timeout. The model gets at most 1,000 rows and 48,000 bytes of rows, and the full
   result goes to a CSV file in the session sandbox. Hidden columns do not show in any tool.
-  `execute` is `ask` with the full SQL in the card, and `tool_search` shows it only when the
-  connection has writes on. The gateway connects only to public addresses, with TLS. Not in
+  `execute` asks a person for each call, also with an `allow` rule, and the card shows the
+  full SQL. `tool_search` shows it only when the connection has writes on. The gateway connects only to public addresses, with TLS. Not in
   M3.11: Parquet export, the estimated row count in the card, a static egress address (an
   operator allocates it, architecture Section 10.6), SSH tunnels (M4.13), other engines
   (M4.13), and a policy for each tool of a connection.

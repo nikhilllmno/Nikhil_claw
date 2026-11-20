@@ -1894,7 +1894,7 @@ profile on purpose.
 **Approvals over chat.** A Slack card and a Telegram card have three buttons for a tool call:
 Approve, Deny, and "Always allow for me". A proposal card has Approve and Deny only, because a
 policy rule cannot approve a proposal. A card for a tool in `ALWAYS_ASK` (`repo_push_approval`,
-Section 15.1) also has Approve and Deny only.
+Section 15.1) or for `db_<conn>_execute` (Section 10.4) also has Approve and Deny only.
 
 - "Always allow for me" approves the call and writes a user rule `allow` for the tool and the
   profile of the run (Section 16.1). The card then shows "Always allowed by <user>".
@@ -2342,8 +2342,9 @@ at the driver, so a prompt cannot remove them.
   if `tables` is set, in the list. A name without a schema matches through `search_path`.
   The check rejects the system catalogs when a list is set, and the statistics views
   (`pg_stats`) when a list or a hidden column is set.
-- **Approval.** `execute` has the access `destructive`, so the gate asks a person each time
-  (Section 16.1). The approval card shows the full SQL and the parameters. The gateway rejects
+- **Approval.** The gate asks a person for each `execute` call (Section 16.1). Like
+  `repo_push_approval`, an `allow` rule (exact or with a prefix, at any level) does not remove
+  the ask, and "Always allow" writes no rule. A `deny` rule still wins. The approval card shows the full SQL and the parameters. The gateway rejects
   an `execute` call whose SQL has more than 1,000 characters, or whose card text has more than
   1,400 characters, so the card never cuts the SQL. `tool_search` shows `execute` only for a
   connection with `writes` on. Errors give the database message and the SQLSTATE, never the
@@ -4036,7 +4037,8 @@ Rules of the steps:
   the toolset `subagents`, and each call of the sub-agent has its own check, Section 13.1),
   and `repo_clone`, which only copies data into the
   sandbox. Every other tool gets `ask`. `repo_push_approval` is in `ALWAYS_ASK`: it gets `ask`
-  even with an `allow` rule, and only a `deny` rule changes that (Section 15.1). The classifier comes later.
+  even with an `allow` rule, and only a `deny` rule changes that (Section 15.1). The same
+  applies to each `db_<conn>_execute` tool (Section 10.4). The classifier comes later.
 - **Context.** `runs.unattended` marks a run with no human. In such a run `clarify` gets
   `deny`, and `ask` becomes `deny`. In the run of a job fire (M4.2), the gate loads the job
   of the run. When the fire ran the approved version and the stored fields still have the

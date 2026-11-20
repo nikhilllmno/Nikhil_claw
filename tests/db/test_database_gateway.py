@@ -39,7 +39,7 @@ from sama.vault.store import OrgKeys, SecretName, Vault
 from tests.connectors.support import CATALOG, WEB, FakeComposio
 from tests.db.test_connections import member
 from tests.db.test_deferred_gate import grant
-from tests.db.test_tool_gate import Org1, approval
+from tests.db.test_tool_gate import Org1, add_rule, approval
 from tests.db.test_tool_gate import org as gate_org
 
 org = gate_org
@@ -422,3 +422,26 @@ async def test_execute_needs_an_approval_that_shows_the_sql(
     read = {"name": "db_postgres_query", "arguments": {"sql": "select 1"}}
     verdict = await gate.check(org.claims(), "c2", "mcp__sama__tool_call", read)
     assert verdict.action == "allow"
+    # "Always allow" writes no rule: the next call, with other SQL, asks again.
+    await gate.decide_approval(
+        org_id=org.ids["org"],
+        run_id=org.ids["run"],
+        call_id="c1",
+        user_id=org.ids["mia"],
+        approve=True,
+        always_allow=True,
+    )
+    other = {"name": "db_postgres_execute", "arguments": {"sql": "delete from orders"}}
+    verdict = await gate.check(org.claims(), "c3", "mcp__sama__tool_call", other)
+    assert (verdict.action, verdict.step) == ("ask", GateStep.POLICY)
+    # An allow rule, exact or with a prefix, at the user or the org level, does not remove
+    # the ask. A deny rule still wins.
+    for number, (tool, user) in enumerate(
+        (("db_postgres_execute", "mia"), ("db_*", None), ("mcp__sama__tool_call", None))
+    ):
+        await add_rule(engine, org, tool, "allow", user)
+        verdict = await gate.check(org.claims(), f"c{4 + number}", "mcp__sama__tool_call", other)
+        assert (verdict.action, verdict.step) == ("ask", GateStep.POLICY), tool
+    await add_rule(engine, org, "db_postgres_execute", "deny")
+    verdict = await gate.check(org.claims(), "c9", "mcp__sama__tool_call", other)
+    assert verdict.action == "deny"

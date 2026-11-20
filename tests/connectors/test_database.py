@@ -33,6 +33,7 @@ from sama.connectors.manifest import (
     parse,
 )
 from sama.connectors.postgres import DbSettings, coerce, model_cell, pinned_tls, to_csv, writes_on
+from sama.gate.decide import PolicyRule, RuleLevel, always_asks, policy_verdict
 from sama.gateway.sessions import MAX_ARGUMENT_CHARS
 from sama.tools.output import MAX_OUTPUT_BYTES, untrusted
 
@@ -251,3 +252,19 @@ async def test_the_gateway_connects_only_to_public_addresses() -> None:
 def test_the_module_keeps_the_limits() -> None:
     assert database.MAX_ROWS == 1_000
     assert database.MAX_MODEL_BYTES + 1_500 < MAX_OUTPUT_BYTES
+
+
+def test_database_execute_always_asks() -> None:
+    assert always_asks("db_postgres_execute")
+    assert always_asks("mcp__sama__db_my_neon_execute")
+    assert always_asks("repo_push_approval")
+    for name in ("db_postgres_query", "db_postgres_export", "gmail_send_email", "execute_code"):
+        assert not always_asks(name), name
+    allow = (
+        PolicyRule(level=RuleLevel.USER, tool="db_postgres_execute", action="allow"),
+        PolicyRule(level=RuleLevel.ORG, tool="db_*", action="allow"),
+    )
+    verdict = policy_verdict(allow, "db_postgres_execute")
+    assert verdict.action == "ask"
+    deny = (*allow, PolicyRule(level=RuleLevel.ORG, tool="db_*", action="deny"))
+    assert policy_verdict(deny, "db_postgres_execute").action == "deny"
