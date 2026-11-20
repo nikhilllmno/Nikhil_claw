@@ -80,23 +80,47 @@ def test_a_listed_user_and_the_star_widen_the_set() -> None:
 
 
 def test_the_card_tells_who_may_decide() -> None:
-    assert (
-        answerers_text("Mia", Approvers())
-        == "Mia, who asked, or a workspace admin can decide this."
-    )
-    assert answerers_text(None, Approvers()) == "A workspace admin can decide this."
-    assert answerers_text("  ", Approvers()) == "A workspace admin can decide this."
+    admins = "a workspace or org admin"
+    assert answerers_text("Mia", Approvers()) == f"Mia (who asked) or {admins} can decide this."
     assert (
         answerers_text("Mia", Approvers(any_member=True))
         == "Each member of the workspace can decide this."
     )
     long = answerers_text("N" * 200 + "\nx", Approvers())
     assert "\n" not in long
-    assert long.startswith("N" * 60 + ", who asked")
+    assert long.startswith("N" * 60 + " (who asked)")
+
+
+def test_the_card_says_the_person_who_asked_when_the_name_is_blank() -> None:
+    expected = "The person who asked or a workspace or org admin can decide this."
+    assert answerers_text("  ", Approvers()) == expected
+    assert answerers_text(None, Approvers()) == expected
+
+
+def test_the_card_does_not_name_a_requester_when_there_is_none() -> None:
+    assert (
+        answerers_text(None, Approvers(), has_requester=False)
+        == "A workspace or org admin can decide this."
+    )
+
+
+def test_the_card_includes_the_listed_approvers() -> None:
+    listed = Approvers(users=frozenset({FRIEND}))
+    assert answerers_text("Mia", listed) == (
+        "Mia (who asked), a person who is listed as an approver or a workspace or org admin"
+        " can decide this."
+    )
+    assert answerers_text(None, listed, has_requester=False) == (
+        "A person who is listed as an approver or a workspace or org admin can decide this."
+    )
+    assert answerers_text("", listed) == (
+        "The person who asked, a person who is listed as an approver or a workspace or org"
+        " admin can decide this."
+    )
 
 
 def test_the_text_of_a_card_has_the_line_of_the_approvers_only_when_there_is_one() -> None:
-    line = "Mia, who asked, or a workspace admin can decide this."
+    line = "Mia (who asked) or a workspace or org admin can decide this."
     shared = ShownApproval(uuid.uuid4(), "Bash", "deletes files", {"command": "rm"}, line)
     private = ShownApproval(uuid.uuid4(), "Bash", "deletes files", {"command": "rm"})
     assert approval_text(shared).splitlines()[:3] == [

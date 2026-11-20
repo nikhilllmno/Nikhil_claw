@@ -22,6 +22,7 @@ from sama.prompt.assemble import SHARED_HINT
 from sama.runtime.contract import McpServerConfig, RunConfig, RuntimeKind, RuntimeRegistry
 from sama.runtime.fake import FakeRuntime
 from sama.skills import ManageRequest, PostgresSkillStore, SkillLibrary
+from sama.skills.sql import load_actor, profile_limits
 from sama.tenancy import RunTokenClaims
 from tests.orchestrator.conftest import Tenant
 from tests.skills.helpers import doc, md
@@ -457,3 +458,74 @@ async def test_the_group_set_decides_the_notes_and_the_index_of_a_shared_session
     await end(engine, private)
     assert [e.name for e in own.skill_index] == ["summarize", "xxx"]
     assert SHARED_HINT not in own.render_prefix()
+
+
+async def set_both(
+    engine: AsyncEngine, tenant: Tenant, private: list[str], group: list[str]
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(toolsets=private, group_toolsets=group)
+        )
+
+
+def requirement_library(engine: AsyncEngine) -> SkillLibrary:
+    return SkillLibrary(
+        engine,
+        {
+            "plain": doc("plain", description="No requirement"),
+            "needs-core": doc("needs-core", description="Needs core", requires=("core",)),
+            "needs-web": doc("needs-web", description="Needs the web", requires=("web",)),
+        },
+    )
+
+
+async def index_names(engine: AsyncEngine, tenant: Tenant, session: str) -> list[str]:
+    run = await claimed(engine, tenant, session)
+    config = await PromptAssembler(engine, skills=requirement_library(engine))(run)
+    await end(engine, run)
+    return [entry.name for entry in config.skill_index]
+
+
+async def test_a_shared_index_checks_the_requirements_against_the_group_set(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await set_both(engine, tenant, ["core", "skills"], ["skills", "web"])
+    assert await index_names(engine, tenant, "s1") == ["needs-web", "plain"]
+    assert await index_names(engine, tenant, "mine") == ["needs-core", "plain"]
+
+
+async def test_a_shared_index_is_not_empty_when_only_the_group_set_has_the_skills(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await set_both(engine, tenant, ["core"], ["skills", "web"])
+    assert await index_names(engine, tenant, "s1") == ["needs-web", "plain"]
+    assert await index_names(engine, tenant, "mine") == []
+
+
+async def test_the_skill_tools_of_a_run_use_the_toolsets_of_the_run(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """``skills_list`` and ``skill_view`` read through the actor of the run token."""
+    await set_both(engine, tenant, ["core", "skills"], ["skills", "web"])
+    seen: dict[str, frozenset[str]] = {}
+    for session in ("s1", "mine"):
+        run = await claimed(engine, tenant, session)
+        async with engine.connect() as connection:
+            actor = await load_actor(
+                connection,
+                org_id=tenant.org,
+                session_id=tenant.ids[session],
+                run_id=run.run_id,
+                token_user=None,
+            )
+        await end(engine, run)
+        seen[session] = actor.toolsets
+    assert seen == {"s1": frozenset({"skills", "web"}), "mine": frozenset({"core", "skills"})}
+    async with engine.connect() as connection:
+        review = await profile_limits(
+            connection, tenant.org, tenant.ids["profile"], audience="shared", kind="review"
+        )
+    assert review[0] == frozenset({"core", "skills"}), "a review run ignores the group set"

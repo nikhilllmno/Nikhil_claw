@@ -44,7 +44,7 @@ async def client(
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=["core", "skills"])
+            .values(toolsets=["core", "skills"], group_toolsets=["core", "skills"])
         )
     api = SamaApi(
         engine,
@@ -248,7 +248,7 @@ async def test_a_skill_command_needs_the_skills_toolset(
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=["core"])
+            .values(toolsets=["core"], group_toolsets=["core"])
         )
     s1 = tenant.ids["s1"]
     await client.post(

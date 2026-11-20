@@ -36,9 +36,17 @@ class SkillLibrary:
         profile_id: uuid.UUID,
         user_id: uuid.UUID | None,
         private: bool,
+        kind: str = "chat",
     ) -> Actor:
-        """The actor of a session. It has no roles, so it is for reads only."""
-        toolsets, allowed = await profile_limits(connection, org_id, profile_id)
+        """The actor of a session. It has no roles, so it is for reads only. A shared session
+        has the group toolsets of the profile (Section 11.3)."""
+        toolsets, allowed = await profile_limits(
+            connection,
+            org_id,
+            profile_id,
+            audience="private" if private else "shared",
+            kind=kind,
+        )
         return Actor(
             org_id=org_id,
             workspace_id=workspace_id,

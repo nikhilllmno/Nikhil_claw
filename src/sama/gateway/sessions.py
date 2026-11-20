@@ -313,6 +313,7 @@ async def read_run(
                         Session.audience,
                         AgentProfile.policy,
                         User.display_name.label("requester_name"),
+                        Run.triggered_by_user_id.label("requester_id"),
                     )
                     .join(Run, (Run.org_id == Approval.org_id) & (Run.id == Approval.run_id))
                     .join(
@@ -388,13 +389,23 @@ class ShownApproval:
 MAX_NAME_CHARS: Final = 60
 
 
-def answerers_text(requester: str | None, approvers: Approvers) -> str:
-    """Who may decide an approval of a shared session (Section 11.3)."""
+def answerers_text(
+    requester: str | None, approvers: Approvers, *, has_requester: bool = True
+) -> str:
+    """Who may decide an approval of a shared session (Section 11.3). It names the person who
+    asked (or says so without a name), the approvers that the profile lists, and the admins
+    of the workspace and of the org."""
     if approvers.any_member:
         return "Each member of the workspace can decide this."
-    name = " ".join((requester or "").split())[:MAX_NAME_CHARS]
-    who = f"{name}, who asked, or a workspace admin" if name else "A workspace admin"
-    return f"{who} can decide this."
+    who: list[str] = []
+    if has_requester:
+        name = " ".join((requester or "").split())[:MAX_NAME_CHARS]
+        who.append(f"{name} (who asked)" if name else "the person who asked")
+    if approvers.users:
+        who.append("a person who is listed as an approver")
+    who.append("a workspace or org admin")
+    text = who[0] if len(who) == 1 else f"{', '.join(who[:-1])} or {who[-1]}"
+    return f"{text[0].upper()}{text[1:]} can decide this."
 
 
 def _shown_approval(row: Any) -> ShownApproval:
@@ -405,7 +416,11 @@ def _shown_approval(row: Any) -> ShownApproval:
         shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
         return ShownApproval(row.id, row.tool_name, shown.reason, shown.arguments)
     answerers = (
-        answerers_text(row.requester_name, approvers_of(row.policy))
+        answerers_text(
+            row.requester_name,
+            approvers_of(row.policy),
+            has_requester=row.requester_id is not None,
+        )
         if row.audience == "shared"
         else None
     )

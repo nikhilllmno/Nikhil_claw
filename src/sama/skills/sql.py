@@ -10,6 +10,7 @@ from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import AgentProfile, Membership, Run, Session, Skill, SkillVersion
+from sama.gate.decide import effective_toolsets
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, SkillDoc
 from sama.tenancy.authority import run_user
@@ -78,19 +79,29 @@ async def load_docs(
 
 
 async def profile_limits(
-    connection: AsyncConnection, org_id: uuid.UUID, profile_id: uuid.UUID
+    connection: AsyncConnection,
+    org_id: uuid.UUID,
+    profile_id: uuid.UUID,
+    *,
+    audience: str = "private",
+    kind: str = "chat",
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """The toolsets and the skill list of an agent profile."""
+    """The toolsets and the skill list of an agent profile. The toolsets are the toolsets of the
+    run: the group toolsets for a chat run in a shared session (Section 11.3), else the toolsets
+    of the profile. So the skills of a run need the toolsets that the gate lets the run use."""
     row = (
         await connection.execute(
-            select(AgentProfile.toolsets, AgentProfile.skills).where(
+            select(AgentProfile.toolsets, AgentProfile.group_toolsets, AgentProfile.skills).where(
                 AgentProfile.org_id == org_id, AgentProfile.id == profile_id
             )
         )
     ).one_or_none()
     if row is None:
         return frozenset(), frozenset()
-    return frozenset(map(str, row[0])), frozenset(map(str, row[1]))
+    toolsets = effective_toolsets(
+        map(str, row.toolsets), map(str, row.group_toolsets), audience=audience, kind=kind
+    )
+    return toolsets, frozenset(map(str, row.skills))
 
 
 async def load_actor(
@@ -123,7 +134,9 @@ async def load_actor(
     user_id = run_user(triggered_by, audience, owner) or (
         uuid.UUID(token_user) if token_user else None
     )
-    toolsets, allowed = await profile_limits(connection, org_id, profile_id)
+    toolsets, allowed = await profile_limits(
+        connection, org_id, profile_id, audience=audience, kind=kind
+    )
     workspace_admin = org_owner = False
     if user_id is not None:
         roles = await connection.execute(

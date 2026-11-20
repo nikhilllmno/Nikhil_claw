@@ -514,7 +514,7 @@ async def test_a_channel_card_names_who_may_decide_and_refuses_another_member(
 ) -> None:
     harness = Harness(engine)
     card, card_ts = await channel_card(gateway, engine, tenant, slack, harness)
-    assert "mia, who asked, or a workspace admin can decide this." in card["text"]
+    assert "Mia (who asked) or a workspace or org admin can decide this." in card["text"]
     await add_bob(gateway, engine, tenant)
 
     await gateway.handle_action(press(card, card_ts, BOB))

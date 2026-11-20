@@ -52,7 +52,7 @@ async def gateway(
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=["core", "skills"])
+            .values(toolsets=["core", "skills"], group_toolsets=["core", "skills"])
         )
     client = slack.client(SecretStr(SLACK_TOKEN))
     integration_id = await add_slack(engine, tenant)

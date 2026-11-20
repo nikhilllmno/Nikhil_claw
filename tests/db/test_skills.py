@@ -38,12 +38,16 @@ async def clean(engine: AsyncEngine, world: World) -> AsyncIterator[None]:
     files expect the seed, so each test puts it back."""
     async with engine.begin() as connection:
         before = list(
-            (await connection.execute(select(AgentProfile.id, AgentProfile.toolsets))).all()
+            (
+                await connection.execute(
+                    select(AgentProfile.id, AgentProfile.toolsets, AgentProfile.group_toolsets)
+                )
+            ).all()
         )
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id.in_([world.ids["profile-a"], world.ids["profile-b"]]))
-            .values(toolsets=["core", "skills"])
+            .values(toolsets=["core", "skills"], group_toolsets=["core", "skills"])
         )
     yield
     async with engine.begin() as connection:
@@ -56,9 +60,11 @@ async def clean(engine: AsyncEngine, world: World) -> AsyncIterator[None]:
             .where(Membership.user_id == world.ids["alice"], Membership.workspace_id.is_not(None))
             .values(role="member")
         )
-        for profile_id, toolsets in before:
+        for profile_id, toolsets, group_toolsets in before:
             await connection.execute(
-                update(AgentProfile).where(AgentProfile.id == profile_id).values(toolsets=toolsets)
+                update(AgentProfile)
+                .where(AgentProfile.id == profile_id)
+                .values(toolsets=toolsets, group_toolsets=group_toolsets)
             )
 
 

@@ -236,6 +236,7 @@ class PromptAssembler:
             profile_id=run.agent_profile_id,
             user_id=run_user(run.user_id, run.audience, run.owner_user_id),
             private=run.audience == "private",
+            kind=run.kind,
         )
         skills = await self._skills.index(connection, actor)
         return tuple(SkillIndexEntry(name=s.name, description=s.description) for s in skills)

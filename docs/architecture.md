@@ -1627,7 +1627,9 @@ more rules than a private session.
    that has no list has no tool in a group (fail closed). A resume gets the same set, so a
    resume cannot widen it. The tool `ToolSearch` stays open, as in a private session.
    The prompt follows the set: a shared run has the memory snapshot only with `memory` in
-   the set, and the skill index only with `skills` in the set. The prompt of a shared run
+   the set, and the skill index only with `skills` in the set. The skills of a shared run
+   (the index, `skills_list`, `skill_view`, and skill commands) also check `requires_toolsets`
+   against the group set, and not against `toolsets`. The prompt of a shared run
    also says that this is a group chat with a limited toolset. A `review` run does not use
    the group set (Section 9.4.1). Its tools are the profile toolsets cut to `memory` and
    `skills`, and its writes are proposals that a role decides.
@@ -1635,7 +1637,8 @@ more rules than a private session.
    `admin` and `owner` of the workspace can decide an approval of a shared session. Any other
    member gets a refusal from `GateService.decide_approval`, and the approval stays pending.
    The Telegram gateway shows the refusal as the answer of the button, and the Slack gateway
-   whispers it to the user. The card of a shared session says who can decide. The key
+   whispers it to the user. The card of a shared session says who can decide: the person who asked, the people that
+   the profile lists as approvers, and the admins of the workspace and of the org. The key
    `approvers` of `agent_profiles.policy` widens the set: a list of user ids adds these users,
    and `["*"]` lets each member who can see the session decide (the default of Hermes). A
    value that is not a list, and an item that is not a user id, adds nobody. A private session

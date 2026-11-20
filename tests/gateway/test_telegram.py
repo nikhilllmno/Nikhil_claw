@@ -718,7 +718,7 @@ async def test_a_group_card_names_who_may_decide_and_refuses_another_member(
 ) -> None:
     harness = Harness(engine)
     card = await group_card(gateway, engine, tenant, telegram, harness)
-    assert "mia, who asked, or a workspace admin can decide this." in card["text"]
+    assert "Mia (who asked) or a workspace or org admin can decide this." in card["text"]
     await add_ben(gateway, engine, tenant)
 
     await gateway.handle_update(press(card, BEN_TG, "Ben", "cb-ben"))
@@ -764,3 +764,26 @@ async def test_a_star_approver_lets_any_member_decide_a_group_card(
     await add_ben(gateway, engine, tenant)
     await gateway.handle_update(press(card, BEN_TG, "Ben", "cb-ben"))
     assert last_answer(telegram)["text"] == "Approved"
+
+
+async def test_a_group_card_names_the_listed_approvers_and_an_unnamed_requester(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(policy={"approvers": [str(uuid.uuid4())]})
+        )
+        await connection.execute(
+            update(User).where(User.id == tenant.ids["mia"]).values(display_name=" ")
+        )
+    harness = Harness(engine)
+    card = await group_card(gateway, engine, tenant, telegram, harness)
+    assert (
+        "The person who asked, a person who is listed as an approver or a workspace or org"
+        " admin can decide this."
+    ) in card["text"]
