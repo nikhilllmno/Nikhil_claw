@@ -79,7 +79,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Bundled skills (44) and optional skills (141) | `skills/`, `optional-skills/` | We write a small set of our own builtin skills. We do not copy Hermes skill text without attribution. | Adapt | M2 (done) |
 | Skills Hub install with quarantine and scan | `tools/skills_hub*.py`, `skills_guard.py` | `skill_import` from a public GitHub URL with an import scan, the skill lint and injection scan, and an approval (§9.6). `agentskills.io` is later. | Adapt | M4 (M4.10 done) |
 | Conditional activation (`requires_toolsets`, platforms) | frontmatter | Same frontmatter keys. Skills whose tools are missing are hidden. | Adapt | M2 (done) |
-| Per-skill config | `skills.config` | Skill settings per workspace, filled in the web app. | Adapt | M3 |
+| Per-skill config | `skills.config` | Skill settings per workspace, filled in the web app. The M3.12 skill editor changes only `SKILL.md` and the files. The settings form comes later. | Adapt | Later |
 | Skill bundles | `agent/skill_bundles.py` | Agent profiles list skills. | Adapt | M2 (done) |
 
 ## 4. Memory
@@ -91,7 +91,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Frozen memory snapshot in the prompt | `agent/memory_manager.py` | Snapshot in the frozen prefix. New writes apply from the next session. | Adapt | M2 (M2.1 done) |
 | Memory nudges | `agent/background_review.py` | Background review every 10 user turns (§9.4.1). | Adapt | M2 (M2.4 done) |
 | External memory providers (Mem0, Honcho, ...) | `plugins/memory/` | Optional Mem0 provider behind a `MemoryProvider` interface. | Defer | — |
-| Memory history | none (files only) | `memory_revisions` table with author, run, and reason. Revert in the API (M2.1) and the web app. | New | M2 (M2.1 done) |
+| Memory history | none (files only) | `memory_revisions` table with author, run, and reason. Revert in the API (M2.1) and in the memory editor of the web app (M3.12). | New | M2, M3 (M2.1 and M3.12 done) |
 
 ## 5. Sessions
 
@@ -105,7 +105,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Queue, interrupt, steer while busy | `gateway/session_*.py` | New message while a run is busy: queue by default, `/stop` cancels, `/steer` adds a note to the running turn. | Adapt | M3 |
 | Cross-platform handoff (`/handoff`) | `gateway/` | A session can bind to more than one channel. `/handoff telegram` moves replies. | Adapt | M3 |
 | Retention and housekeeping | `session_retention.py` | Retention per org plan. Export and delete per user. | Adapt | M6 |
-| Export and import | `/export`, `/import` | Session export to Markdown and JSON from the web app (M3). Full account export with data controls (M6). | Adapt | M3, M6 |
+| Export and import | `/export`, `/import` | Session export to Markdown and JSON from the web app (M3.12, `GET /sessions/{id}/export`). Full account export with data controls (M6). | Adapt | M3 (M3.12 done), M6 |
 
 ## 6. Context management
 
@@ -162,7 +162,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. Since M3.2: "Always allow for me" on Slack and Telegram cards, chat proposals, and the timeout counts as deny (§9.4.2). | Adapt | M1, M3 (M3.2 done) |
 | Streaming edits to messages | `gateway/stream_consumer*.py` | Edit one message as text arrives, with rate limits per channel. | Adapt | M1 |
 | Slash command registry | `hermes_cli/commands.py` | One command registry for all channels (§11.1). | Adapt | M1 |
-| Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, jobs, workflows, connections, traces (§11.2). | Adapt | M1 (minimal), M3, M6 |
+| Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, session search, run traces, connections, and settings (M3.8, M3.12). Jobs and workflows come in M6 (§11.2, §11.4). | Adapt | M1 (minimal), M3 (M3.8 and M3.12 done), M6 |
 | Chrome extension side panel | none | MV3 extension with chat bound to the current tab (§14.2). | New | M5 |
 
 ## 10. Sub-agents and multi-agent work
