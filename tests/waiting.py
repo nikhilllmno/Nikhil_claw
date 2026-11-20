@@ -10,28 +10,30 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
+from typing import Any
 
 DEFAULT_WITHIN = 15.0  # an upper bound: only a hang waits this long
 DEFAULT_INTERVAL = 0.01
 
 
-async def async_wait_until[T](
-    predicate: Callable[[], T | Awaitable[T]],
+async def async_wait_until(
+    predicate: Callable[[], Any],
     *,
     within: float = DEFAULT_WITHIN,
     interval: float = DEFAULT_INTERVAL,
     what: str = "the condition",
-) -> T:
+) -> Any:
     """Returns the first true value of ``predicate()``. Raises ``AssertionError`` at the limit."""
-    deadline = time.monotonic() + within
-    while True:
-        value = predicate()
-        if inspect.isawaitable(value):
-            value = await value
-        if value:
-            return value
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"timed out after {within}s while waiting for {what}")
-        await asyncio.sleep(interval)
+    # The limit covers the whole wait, also an async predicate that never returns.
+    try:
+        async with asyncio.timeout(within):
+            while True:
+                value = predicate()
+                if inspect.isawaitable(value):
+                    value = await value
+                if value:
+                    return value
+                await asyncio.sleep(interval)
+    except TimeoutError:
+        raise AssertionError(f"timed out after {within}s while waiting for {what}") from None

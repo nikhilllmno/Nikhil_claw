@@ -21,7 +21,7 @@ from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.clarify import ClarifyBroker, ClarifyQuestion
-from tests.api.conftest import bearer
+from tests.api.conftest import STREAM_LIFETIME_S, bearer
 from tests.api.streams import open_stream
 from tests.orchestrator.conftest import Tenant, add_tenant
 from tests.orchestrator.test_worker import Harness, approval_script
@@ -289,16 +289,29 @@ async def test_a_message_runs_and_streams(
     assert bad.status_code == 400
 
 
+@pytest.mark.parametrize("run_delay_s", [0.0, 0.6])
 async def test_the_stream_reports_run_status_changes(
-    app: FastAPI, engine: AsyncEngine, tenant: Tenant
+    stream_app: FastAPI,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+    run_delay_s: float,
 ) -> None:
     harness = Harness(engine)
+    # A slow worker takes longer than the 0.3 s stream of the shared ``api`` fixture.
+    run_once = harness.worker.run_once
+
+    async def slow_run_once() -> bool:
+        await asyncio.sleep(run_delay_s)
+        return await run_once()
+
+    monkeypatch.setattr(harness.worker, "run_once", slow_run_once)
     s2 = tenant.ids["s2"]
     run_id = await harness.send(tenant, "s2", "hi")
 
     # The test reads the open stream until the run shows "completed". The end time of the stream
     # does not matter, so a slow runner cannot make the test fail.
-    async with open_stream(app, f"/sessions/{s2}/events", mia(tenant)) as stream:
+    async with open_stream(stream_app, f"/sessions/{s2}/events", mia(tenant)) as stream:
         first = await stream.wait_for(lambda events: bool(events), what="the first event")
         assert first[0][0] == "runs"
         assert [(r["run_id"], r["status"]) for r in first[0][1]["runs"]] == [
@@ -329,8 +342,13 @@ async def test_a_new_stream_shows_a_run_that_ended_while_away(
     assert [(r["run_id"], r["status"]) for r in again[0][1]["runs"]] == [(str(run_id), "cancelled")]
 
 
+@pytest.mark.parametrize("cancel_delay_s", [0.0, 0.6])
 async def test_the_stream_follows_an_open_run_behind_many_newer_runs(
-    app: FastAPI, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+    stream_app: FastAPI,
+    client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    cancel_delay_s: float,
 ) -> None:
     async with engine.begin() as connection:
         await connection.execute(
@@ -342,9 +360,10 @@ async def test_the_stream_follows_an_open_run_behind_many_newer_runs(
         await harness.send(tenant, "s2", f"later {number}")
     s2 = tenant.ids["s2"]
 
-    async with open_stream(app, f"/sessions/{s2}/events", mia(tenant)) as stream:
+    async with open_stream(stream_app, f"/sessions/{s2}/events", mia(tenant)) as stream:
         first = await stream.wait_for(lambda events: bool(events), what="the first event")
         assert str(oldest) in {r["run_id"] for r in first[0][1]["runs"]}
+        await asyncio.sleep(cancel_delay_s)
         response = await client.post(f"/runs/{oldest}/cancel", headers=mia(tenant))
         assert response.status_code == 200
         events = await stream.wait_for(
@@ -422,7 +441,9 @@ async def test_too_many_streams_get_429(api: SamaApi, engine: AsyncEngine, tenan
     capped = SamaApi(
         engine,
         verifier=api._verifier,
-        settings=api._settings.model_copy(update={"max_streams_per_user": 1}),
+        settings=api._settings.model_copy(
+            update={"max_streams_per_user": 1, "max_stream_s": STREAM_LIFETIME_S}
+        ),
     )
     app = capped.app()
     transport = httpx.ASGITransport(app=app)
@@ -434,8 +455,8 @@ async def test_too_many_streams_get_429(api: SamaApi, engine: AsyncEngine, tenan
             second = await client.get(path, headers=mia(tenant))
             assert second.status_code == 429
             assert second.headers["retry-after"] == "5"
-        third = await client.get(path, headers=mia(tenant))
-        assert third.status_code == 200, "the first stream gave its slot back"
+        async with open_stream(app, path, mia(tenant)) as third:
+            assert third.status == 200, "the first stream gave its slot back"
 
 
 async def test_a_message_too_long_is_refused(client: httpx.AsyncClient, tenant: Tenant) -> None:

@@ -617,9 +617,12 @@ function slackForm(org, connected) {
       + " Slack links of the org stop, and users must pair again.")) return;
     submit.disabled = true;
     status.textContent = "Connecting...";
+    const signOut0 = state.signOuts;
     try {
       const body = Object.fromEntries(fields.map(([name, input]) => [name, input.value.trim()]));
       const result = await api(`/orgs/${org.id}/integrations/slack`, { method: "POST", body });
+      // A late answer for the user who signed out must not show to the next user.
+      if (signOut0 !== state.signOuts) return;
       for (const [, input] of fields) input.value = "";
       connectResults.set(`${org.id}:slack`, `The workspace ${result.name} is connected.`);
       status.textContent = connectResults.get(`${org.id}:slack`);
@@ -658,11 +661,14 @@ function telegramForm(org, connected) {
       + " the org stop, and users must pair again.")) return;
     submit.disabled = true;
     status.textContent = "Connecting...";
+    const signOut0 = state.signOuts;
     try {
       const result = await api(`/orgs/${org.id}/integrations/telegram`, {
         method: "POST",
         body: { bot_token: input.value.trim() },
       });
+      // A late answer for the user who signed out must not show to the next user.
+      if (signOut0 !== state.signOuts) return;
       input.value = "";
       connectResults.set(`${org.id}:telegram`, result.status === "active"
         ? `@${result.name} is connected.`

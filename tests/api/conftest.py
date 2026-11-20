@@ -66,6 +66,31 @@ def api(engine: AsyncEngine, broker: ClarifyBroker) -> SamaApi:  # noqa: F811
     )
 
 
+STREAM_LIFETIME_S = 60.0
+"""The stream lifetime of ``stream_app``. It is longer than the wait of ``async_wait_until``."""
+
+
+@pytest.fixture
+def stream_app(engine: AsyncEngine, broker: ClarifyBroker) -> FastAPI:  # noqa: F811
+    """An app for the tests that read an open stream until a condition holds.
+
+    The stream of the shared ``api`` closes after 0.3 s. A test that waits for a run on a slow
+    runner needs a stream that outlives the wait. The test closes the stream when it is done.
+    """
+    return SamaApi(
+        engine,
+        verifier=JwtVerifier(secret=SecretStr(SECRET), issuer=ISSUER),
+        clarify=broker,
+        settings=ApiSettings(
+            supabase_url="https://project.example.test",
+            supabase_anon_key="anon-key",
+            poll_s=0.02,
+            heartbeat_s=0.05,
+            max_stream_s=STREAM_LIFETIME_S,
+        ),
+    ).app()
+
+
 @pytest.fixture
 def app(api: SamaApi) -> FastAPI:
     return api.app()
