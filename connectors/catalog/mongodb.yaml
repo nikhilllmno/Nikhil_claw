@@ -1,0 +1,19 @@
+# The MongoDB connector (docs/architecture.md, Section 10.4, "What M4.13 builds"). The gateway
+# runs reads only: find and aggregate. It connects to one host. It does not use SRV records.
+name: mongodb
+title: MongoDB
+description: Read the collections and the documents of a MongoDB database with find and
+  aggregate. The connection is read only.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: mongodb
+  sslmode: require
+  hints:
+    host: The host name of one member of the server, for example db.example.com. sama does
+      not use mongodb+srv records. sama connects only to public addresses, or through the
+      SSH tunnel below.
+    user: Use a user with only the read role on the database. The roles of the user are the
+      strongest control.

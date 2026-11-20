@@ -1,0 +1,21 @@
+# The MariaDB connector (docs/architecture.md, Section 10.4, "What M4.13 builds"). MariaDB uses
+# the MySQL protocol. The gateway uses the MariaDB statement time limit.
+name: mariadb
+title: MariaDB
+description: Read the schema and the rows of a MariaDB database with read-only SQL. Change
+  rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: mariadb
+  sslmode: require
+  hints:
+    host: The host name of the server, for example db.example.com. sama connects only to
+      public addresses, or through the SSH tunnel below. Allow the sama egress addresses in
+      the firewall of the database.
+    database: The default database (schema) of the connection. To let the agent read only
+      some databases, put them in Schemas.
+    user: Use a user with only the grants that the agent needs. For read only, grant SELECT
+      only. The grants of the user are the strongest control.

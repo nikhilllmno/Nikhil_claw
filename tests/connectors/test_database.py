@@ -69,7 +69,7 @@ def test_a_database_manifest_gets_the_form_and_the_five_tools() -> None:
     }
     assert [found.operation(t) for t in found.tools] == list(DATABASE_OPERATIONS)
     fields = {f.name: f for f in found.fields}
-    assert [n for n, f in fields.items() if f.secret] == ["password"]
+    assert [n for n, f in fields.items() if f.secret] == ["password", "ssh_private_key"]
     assert fields["host"].help == "The host of the main database."
     assert {n for n, f in fields.items() if f.required} == {"host", "database", "user", "password"}
     execute = found.tools[-1].input_schema
@@ -93,7 +93,7 @@ def test_a_bad_hint_or_engine_is_refused() -> None:
     with pytest.raises(ManifestError):
         manifest(PG.replace("host: The host", "nothing: The host"))
     with pytest.raises(ManifestError):
-        manifest(PG.replace("engine: postgres", "engine: mysql"))
+        manifest(PG.replace("engine: postgres", "engine: oracle"))
     with pytest.raises(ManifestError):
         parse(PG.replace("kind: database", "kind: http_api"))
 

@@ -26,6 +26,13 @@ requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+databases = [
+    "aiomysql>=0.3.2",
+    "asyncssh>=2.24.1",
+    "pymongo>=4.20.1",
+    "pyopenssl>=26.4.0",
+    "python-tds>=1.17.1",
+]
 dev = [
     "asyncpg-stubs>=0.32.0,<0.33",
     "mypy>=2.4.1,<3",
@@ -52,7 +59,7 @@ sandbox-e2b = [
 ]
 
 [tool.uv]
-default-groups = ["dev", "runtime-claude", "runtime-openai", "sandbox-e2b"]
+default-groups = ["databases", "dev", "runtime-claude", "runtime-openai", "sandbox-e2b"]
 
 [tool.ruff]
 line-length = 100
@@ -71,6 +78,11 @@ python_version = "3.12"
 mypy_path = "src"
 files = ["src", "tests", "migrations"]
 plugins = ["pydantic.mypy"]
+
+# The database drivers of M4.13 (the ``databases`` group) without type information.
+[[tool.mypy.overrides]]
+module = ["aiomysql", "aiomysql.*", "pymysql", "pymysql.*", "pytds", "pytds.*"]
+ignore_missing_imports = true
 
 [tool.pydantic-mypy]
 init_forbid_extra = true

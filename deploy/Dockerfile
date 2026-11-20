@@ -26,14 +26,14 @@ RUN pip install --no-cache-dir uv==0.13.8
 WORKDIR /opt/sama
 COPY pyproject.toml uv.lock README.md ./
 # The control plane does not run an agent runtime: the runner does, in the sandbox. It needs
-# only the E2B client.
-RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --no-install-project
+# only the E2B client, and the database drivers of the gateway (M4.13).
+RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --group databases --no-install-project
 COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY skills ./skills
 COPY connectors ./connectors
-RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --no-editable \
+RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --group databases --no-editable \
     && pip uninstall --yes uv \
     && useradd --system --no-create-home sama
 

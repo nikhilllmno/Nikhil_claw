@@ -27,8 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import csv
-import io
 import ipaddress
 import json
 import logging
@@ -37,39 +35,48 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg
+import httpx
 from asyncpg.pool import PoolConnectionProxy
 
-from sama.connectors.http_api import DriverError, DriverUnavailableError
-from sama.connectors.manifest import (
+from sama.connectors.dbcore import (
+    MAX_MODEL_BYTES,
+    MAX_ROWS,
+    RowCollector,
+    SqlSession,
+    Target,
+    render_tables,
+)
+from sama.connectors.dbcore import Rows as _Rows
+from sama.connectors.dbforms import (
     MAX_EXECUTE_SQL_CHARS,
     MAX_PARAMS,
     MAX_SAMPLE_ROWS,
     MAX_SQL_CHARS,
-    DatabaseOperation,
-    Manifest,
-    ToolSpec,
+    SPECS,
 )
+from sama.connectors.dbsettings import DbSettings
+from sama.connectors.engines import EngineContext, open_mongo, open_sql
+from sama.connectors.http_api import DriverError, DriverUnavailableError
+from sama.connectors.manifest import DatabaseOperation, Manifest, ToolSpec
+from sama.connectors.mongoquery import MongoRead, collection_of, read_of
 from sama.connectors.postgres import (
     COLUMNS_SQL,
     CONSTRAINTS_SQL,
-    CUT_MARK,
     INDEXES_SQL,
     KINDS,
     MAX_CELL_CHARS,
     RELATION_SQL,
     SAMPLE_COLUMNS_SQL,
-    DbSettings,
     coerce,
     mentions,
-    model_cell,
     pinned_tls,
     quote_ident,
-    to_csv,
 )
 from sama.connectors.sql import Checked, Mode, SqlRejectedError, check
+from sama.connectors.tunnel import Tunnels, forward, open_ssh
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.outbound import (
     METADATA_HOSTS,
@@ -81,6 +88,11 @@ from sama.tools.outbound import (
 from sama.tools.output import Spill
 from sama.vault.redact import redact
 
+if TYPE_CHECKING:
+    from sama.connectors.engines.mongo import MongoSession
+
+__all__ = ["MAX_MODEL_BYTES", "MAX_ROWS", "DatabaseGateway", "_Rows"]
+
 log: Final = logging.getLogger("sama.connectors.database")
 
 type _Connection = PoolConnectionProxy[asyncpg.Record]
@@ -88,11 +100,6 @@ type _Connection = PoolConnectionProxy[asyncpg.Record]
 TIMEOUT_S: Final = 30.0
 """A statement stops after this time."""
 CONNECT_TIMEOUT_S: Final = 10.0
-MAX_ROWS: Final = 1_000
-"""The most rows in the model text."""
-MAX_MODEL_BYTES: Final = 48_000
-"""The most bytes of rows in the model text. With the notes and the untrusted wrapper, the
-tool result stays under the 50,000-byte cap of the tool server (``MAX_OUTPUT_BYTES``)."""
 SPILL_MAX_ROWS: Final = 100_000
 SPILL_MAX_BYTES: Final = 20_000_000
 EXPORT_MAX_ROWS: Final = 200_000
@@ -120,32 +127,15 @@ class _Pool:
     """The pool is out of the map (other settings); its last borrower closes it."""
 
 
-@dataclass(frozen=True, slots=True)
-class _Rows:
-    """The result of a statement, as the model sees it and as a CSV text."""
-
-    columns: list[str]
-    dropped: int
-    shown: list[str]
-    """The JSON lines of the rows for the model."""
-    count: int
-    complete: bool
-    """False if more rows exist than were read."""
-    csv: str | None
-    """All rows that were read, as CSV, if they do not all fit in the model text."""
-    status: str
-    cut: bool = False
-    """A shown value was cut to ``MAX_CELL_CHARS``; the CSV has the full value."""
-
-
 class DatabaseGateway:
     """The gateway for all orgs. One for the process. A ``FormDriver`` for the connection
     test, and ``run`` for the tools.
 
     - ``spill``: where the full result of a large query goes (``.sama/spill/``).
     - ``exports``: where ``export`` writes (``.sama/exports/``).
-    - ``resolver``, ``allow_private``, and ``require_tls`` are for tests: the gateway in the
-      app connects only to public addresses, with TLS.
+    - ``resolver``, ``allow_private``, ``require_tls``, and ``http_transport`` are for tests:
+      the gateway in the app connects only to public addresses, with TLS. ``allow_private``
+      is ``True`` (every host) or a set of host names (only these hosts).
     """
 
     def __init__(
@@ -155,10 +145,11 @@ class DatabaseGateway:
         exports: Spill | None = None,
         timeout_s: float = TIMEOUT_S,
         resolver: Resolver = system_resolver,
-        allow_private: bool = False,
+        allow_private: bool | frozenset[str] = False,
         require_tls: bool = True,
         per_org: int = PER_ORG,
         clock: Any = time.monotonic,
+        http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.spill = spill
         self.exports = exports
@@ -173,22 +164,43 @@ class DatabaseGateway:
         self._limits: dict[str, asyncio.Semaphore] = {}
         self._closing: set[asyncio.Future[None]] = set()
         self._schemas: dict[tuple[str, str, str, str, bool], tuple[float, str]] = {}
+        self._tunnels = Tunnels(clock=clock, idle_s=POOL_IDLE_S)
+        self._engine = EngineContext(
+            timeout_s=timeout_s,
+            require_tls=require_tls,
+            resolver=resolver,
+            transport=http_transport,
+        )
 
     async def aclose(self) -> None:
         async with self._lock:
             pools, self._pools = list(self._pools.values()), {}
         for entry in pools:
             await _close(entry.pool)
+        await self._tunnels.aclose()
 
     # -- FormDriver ------------------------------------------------------------------------
 
     async def test(self, manifest: Manifest, values: Mapping[str, str]) -> None:
-        """Connects, runs ``SELECT 1`` in a read-only transaction, and disconnects."""
+        """Connects (through a new SSH tunnel, if the form has one), runs ``SELECT 1`` (or a
+        ``ping``) in a read-only transaction, and disconnects."""
         settings = DbSettings.parse(manifest, values)
-        address = await self._address(settings)
+        key = f"test:{uuid.uuid4()}"
+        try:
+            if settings.engine != "postgres":
+                await self._test_engine(key, settings)
+                return
+            async with self._route(key, settings) as target:
+                await self._test_postgres(settings, target)
+        finally:
+            await self._tunnels.discard(key)
+
+    async def _test_postgres(self, settings: DbSettings, target: Target) -> None:
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT_S + self.timeout_s):
-                connection = await asyncpg.connect(**self._connect_args(settings, address))
+                connection = await asyncpg.connect(
+                    **self._connect_args(settings, target.host, target.port)
+                )
                 try:
                     async with connection.transaction(readonly=True):
                         await connection.fetchval("SELECT 1")
@@ -201,6 +213,22 @@ class DatabaseGateway:
         except asyncpg.PostgresError as error:
             raise DriverError(f"the database answered: {_message(error)}") from None
         except (OSError, ssl.SSLError, TimeoutError, asyncpg.InterfaceError) as error:
+            raise DriverUnavailableError(_network(error, settings)) from None
+
+    async def _test_engine(self, key: str, settings: DbSettings) -> None:
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT_S * 2 + self.timeout_s):
+                if settings.engine == "mongodb":
+                    async with self._mongo_session(key, settings) as mongo:
+                        await mongo.ping()
+                    return
+                async with (
+                    self._route(key, settings) as target,
+                    open_sql(settings, target, self._engine, write=False) as session,
+                ):
+                    sink = RowCollector(frozenset(), 1, SPILL_MAX_BYTES)
+                    await session.rows("SELECT 1", [], sink)
+        except (OSError, ssl.SSLError) as error:  # TimeoutError is an OSError
             raise DriverUnavailableError(_network(error, settings)) from None
 
     async def call(
@@ -237,6 +265,8 @@ class DatabaseGateway:
                     "writes are off for this connection. An admin can turn on 'Allow writes'"
                 )
         conn = manifest.name.replace("-", "_")
+        if settings.engine == "mongodb":
+            return await self._mongo(claims, connection_id, settings, operation, arguments, conn)
         if operation == "schema":
             return await self._schema(claims, connection_id, settings, arguments)
         if operation == "sample":
@@ -252,7 +282,7 @@ class DatabaseGateway:
             raise DriverError(f"params must be a list of at most {MAX_PARAMS} values")
         mode: Mode = "execute" if operation == "execute" else "query"
         try:
-            checked = check(sql, mode, settings.policy)
+            checked = check(sql, mode, settings.policy, settings.dialect)
         except SqlRejectedError as error:
             raise DriverError(f"the SQL was not run: {error}") from None
         if operation == "export":
@@ -263,26 +293,67 @@ class DatabaseGateway:
             claims, connection_id, settings, checked, params, operation, conn
         )
 
+    async def _collect(
+        self,
+        claims: RunTokenClaims,
+        connection_id: uuid.UUID,
+        settings: DbSettings,
+        statement: Checked | MongoRead,
+        params: Sequence[Any],
+        max_rows: int,
+        max_bytes: int,
+        *,
+        write: bool = False,
+        keep_csv: bool = False,
+        show: int = MAX_ROWS,
+    ) -> _Rows:
+        """Runs one statement (or one MongoDB read) and collects the rows."""
+        if isinstance(statement, MongoRead):
+            sink = RowCollector(frozenset(), max_rows, max_bytes, keep_csv=keep_csv, show=show)
+            async with self._mongo_call(claims, connection_id, settings) as mongo:
+                status = await mongo.read(statement, sink)
+            return sink.finish(status)
+        drop = statement.drop_columns
+        if settings.engine == "postgres":
+            async with self._transaction(
+                claims, connection_id, settings, write=write
+            ) as connection:
+                return await self._read_rows(
+                    connection,
+                    statement.sql,
+                    params,
+                    drop,
+                    max_rows,
+                    max_bytes,
+                    keep_csv=keep_csv,
+                    show=show,
+                )
+        sink = RowCollector(drop, max_rows, max_bytes, keep_csv=keep_csv, show=show)
+        async with self._sql_call(claims, connection_id, settings, write=write) as session:
+            status = await session.rows(statement.sql, params, sink)
+        return sink.finish(status)
+
     async def _statement(
         self,
         claims: RunTokenClaims,
         connection_id: uuid.UUID,
         settings: DbSettings,
-        checked: Checked,
+        checked: Checked | MongoRead,
         params: Sequence[Any],
         operation: DatabaseOperation,
         conn: str,
     ) -> str:
         write = operation == "execute"
-        async with self._transaction(claims, connection_id, settings, write=write) as connection:
-            rows = await self._read_rows(
-                connection,
-                checked.sql,
-                params,
-                checked.drop_columns,
-                SPILL_MAX_ROWS,
-                SPILL_MAX_BYTES,
-            )
+        rows = await self._collect(
+            claims,
+            connection_id,
+            settings,
+            checked,
+            params,
+            SPILL_MAX_ROWS,
+            SPILL_MAX_BYTES,
+            write=write,
+        )
         path: str | None = None
         if rows.csv is not None:
             path = await self._save(self.spill, claims, f"db_{conn}_{operation}", rows.csv)
@@ -293,23 +364,23 @@ class DatabaseGateway:
         claims: RunTokenClaims,
         connection_id: uuid.UUID,
         settings: DbSettings,
-        checked: Checked,
+        checked: Checked | MongoRead,
         params: Sequence[Any],
         conn: str,
     ) -> str:
         if self.exports is None:
             raise DriverError("export needs a session sandbox, and this run has none")
-        async with self._transaction(claims, connection_id, settings, write=False) as connection:
-            rows = await self._read_rows(
-                connection,
-                checked.sql,
-                params,
-                checked.drop_columns,
-                EXPORT_MAX_ROWS,
-                EXPORT_MAX_BYTES,
-                keep_csv=True,
-                show=0,
-            )
+        rows = await self._collect(
+            claims,
+            connection_id,
+            settings,
+            checked,
+            params,
+            EXPORT_MAX_ROWS,
+            EXPORT_MAX_BYTES,
+            keep_csv=True,
+            show=0,
+        )
         text = rows.csv or ""
         path = await self._save(self.exports, claims, f"db_{conn}_export", text)
         if path is None:
@@ -342,46 +413,19 @@ class DatabaseGateway:
         keep_csv: bool = False,
         show: int = MAX_ROWS,
     ) -> _Rows:
+        sink = RowCollector(drop, max_rows, max_bytes, keep_csv=keep_csv, show=show)
         try:
             statement = await connection.prepare(sql)
             types = [t.name for t in statement.get_parameters()]
             args = coerce(params, types)
             attributes = statement.get_attributes()
-            names = [a.name for a in attributes]
-            keep = [i for i, name in enumerate(names) if name.lower() not in drop]
-            columns = [names[i] for i in keep]
             if not attributes:
                 await statement.fetch(*args)
-                return _Rows([], 0, [], 0, True, None, statement.get_statusmsg() or "")
-            parts: list[str] = [_csv_line(columns)]
-            written = len(parts[0].encode())
-            shown: list[str] = []
-            used = len(json.dumps(columns, ensure_ascii=False)) + 1
-            fits = True
-            cut = False
-            count = 0
-            complete = True
+                return sink.finish(statement.get_statusmsg() or "")
+            sink.start([a.name for a in attributes])
             async for record in statement.cursor(*args, prefetch=PREFETCH):
-                values = [record[i] for i in keep]
-                line_csv = _csv_line([to_csv(v) for v in values])
-                size_csv = len(line_csv.encode())
-                if count >= max_rows or written + size_csv > max_bytes:
-                    # The file stays in its limits: the row that does not fit is not in it.
-                    complete = False
+                if not sink.add(list(record.values())):
                     break
-                count += 1
-                parts.append(line_csv)
-                written += size_csv
-                if fits and len(shown) < show:
-                    cells = [model_cell(v) for v in values]
-                    line = json.dumps(cells, ensure_ascii=False, separators=(",", ":"))
-                    size = len(line.encode()) + 1
-                    if used + size <= MAX_MODEL_BYTES:
-                        shown.append(line)
-                        used += size
-                        cut = cut or any(_is_cut(c) for c in cells)
-                    else:
-                        fits = False  # The rows after a row that does not fit are not shown.
             status = statement.get_statusmsg() or ""
         except asyncpg.QueryCanceledError:
             raise DriverError(
@@ -392,17 +436,7 @@ class DatabaseGateway:
             raise DriverError(f"the database answered: {_message(error)}") from None
         except asyncpg.InterfaceError as error:
             raise DriverError(f"the statement was not run: {error}") from None
-        everything = complete and len(shown) == count and not cut
-        return _Rows(
-            columns=columns,
-            dropped=len(names) - len(keep),
-            shown=shown,
-            count=count,
-            complete=complete,
-            csv="".join(parts) if keep_csv or not everything else None,
-            status=status,
-            cut=cut,
-        )
+        return sink.finish(status)
 
     async def _schema(
         self,
@@ -411,14 +445,19 @@ class DatabaseGateway:
         settings: DbSettings,
         arguments: Mapping[str, Any],
     ) -> str:
-        schema = _optional_name(arguments.get("schema"), "schema")
-        table = _optional_name(arguments.get("table"), "table")
+        size = 63 if settings.engine == "postgres" else 260
+        schema = _optional_name(arguments.get("schema"), "schema", size)
+        table = _optional_name(arguments.get("table"), "table", size)
         key = (str(connection_id), settings.fingerprint(), schema or "", table or "", True)
         now = self._clock()
         cached = self._schemas.get(key)
         if cached is not None and cached[0] > now and not arguments.get("refresh"):
             return cached[1]
         policy = settings.policy
+        if settings.engine != "postgres":
+            text = await self._engine_schema(claims, connection_id, settings, schema, table)
+            self._schemas[key] = (now + SCHEMA_TTL_S, text)
+            return text
         async with self._transaction(claims, connection_id, settings, write=False) as connection:
             try:
                 rows = await connection.fetch(COLUMNS_SQL, schema, table)
@@ -470,6 +509,8 @@ class DatabaseGateway:
         bad = not isinstance(limit, int) or isinstance(limit, bool)
         if bad or not 0 < limit <= MAX_SAMPLE_ROWS:
             raise DriverError(f"limit must be 1 to {MAX_SAMPLE_ROWS}")
+        if settings.engine != "postgres":
+            return await self._engine_sample(claims, connection_id, settings, name, limit)
         parts = [p.strip() for p in name.strip().split(".")]
         if len(parts) > 2 or not all(parts):
             raise DriverError("table must be schema.table or table")
@@ -507,6 +548,132 @@ class DatabaseGateway:
             note_hidden=bool(hidden),
         )
 
+    async def _engine_schema(
+        self,
+        claims: RunTokenClaims,
+        connection_id: uuid.UUID,
+        settings: DbSettings,
+        schema: str | None,
+        table: str | None,
+    ) -> str:
+        """The ``schema`` tool of the other SQL engines."""
+        policy = settings.policy
+        spec = SPECS[settings.engine]
+        async with self._sql_call(claims, connection_id, settings, write=False) as session:
+            found = await session.tables(schema, table)
+        tables = [
+            t
+            for t in found
+            if t.schema.lower() not in settings.dialect.system_schemas
+            and policy.table_allowed(t.schema, t.name)
+        ]
+        return render_tables(
+            tables,
+            hidden=policy.column_hidden,
+            filtered=bool(schema or table),
+            word=spec.schema_word,
+        )
+
+    async def _engine_sample(
+        self,
+        claims: RunTokenClaims,
+        connection_id: uuid.UUID,
+        settings: DbSettings,
+        name: str,
+        limit: int,
+    ) -> str:
+        """The ``sample`` tool of the other SQL engines."""
+        policy = settings.policy
+        parts = [p.strip().strip('`"[]') for p in name.strip().split(".")]
+        if len(parts) > 2 or not all(parts):
+            raise DriverError("table must be schema.table or table")
+        sink = RowCollector(frozenset(), limit, SPILL_MAX_BYTES)
+        async with self._sql_call(claims, connection_id, settings, write=False) as session:
+            found = await session.locate(parts)
+            if found is None:
+                raise DriverError(f"the table {name} does not exist (or you cannot read it)")
+            schema, table, all_columns = found
+            if schema.lower() in settings.dialect.system_schemas or not policy.table_allowed(
+                schema, table
+            ):
+                raise DriverError(f"{name} is not an allowed table on this connection")
+            columns = [c for c in all_columns if not policy.column_hidden(table, c)]
+            if not columns:
+                raise DriverError(f"all columns of {name} are hidden")
+            status = await session.rows(session.sample_sql(schema, table, columns, limit), [], sink)
+        return _render(
+            sink.finish(status),
+            path=None,
+            conn="",
+            write=False,
+            title=f"{schema}.{table}",
+            note_hidden=len(columns) < len(all_columns),
+        )
+
+    async def _mongo(
+        self,
+        claims: RunTokenClaims,
+        connection_id: uuid.UUID,
+        settings: DbSettings,
+        operation: DatabaseOperation,
+        arguments: Mapping[str, Any],
+        conn: str,
+    ) -> str:
+        """The tools of a MongoDB connection (reads only)."""
+        policy = settings.policy
+        if operation == "schema":
+            table = _optional_name(arguments.get("table"), "table", 120)
+            if table is not None:
+                collection_of(table, policy)
+            key = (str(connection_id), settings.fingerprint(), "", table or "", True)
+            now = self._clock()
+            cached = self._schemas.get(key)
+            if cached is not None and cached[0] > now and not arguments.get("refresh"):
+                return cached[1]
+            async with self._mongo_call(claims, connection_id, settings) as mongo:
+                found = await mongo.collections(table)
+            text = render_tables(
+                [t for t in found if policy.table_allowed(None, t.name)],
+                hidden=policy.column_hidden,
+                filtered=table is not None,
+                word="database",
+            )
+            self._schemas[key] = (now + SCHEMA_TTL_S, text)
+            return text
+        if operation == "sample":
+            limit = arguments.get("limit") or 5
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                raise DriverError(f"limit must be 1 to {MAX_SAMPLE_ROWS}")
+            read = read_of(
+                {"collection": arguments.get("table"), "limit": limit},
+                policy,
+                limit_max=MAX_SAMPLE_ROWS,
+            )
+            rows = await self._collect(
+                claims, connection_id, settings, read, [], limit, SPILL_MAX_BYTES
+            )
+            return _render(
+                rows,
+                path=None,
+                conn="",
+                write=False,
+                title=read.collection,
+                note_hidden=bool(read.hidden),
+            )
+        if operation == "export":
+            if (arguments.get("format") or "csv") != "csv":
+                raise DriverError("the export format must be csv")
+            read = read_of(
+                {k: v for k, v in arguments.items() if k != "format"},
+                policy,
+                limit_max=EXPORT_MAX_ROWS,
+            )
+            return await self._export(claims, connection_id, settings, read, [], conn)
+        if operation != "query":
+            raise DriverError("a MongoDB connection is read only")
+        read = read_of(arguments, policy, limit_max=SPILL_MAX_ROWS)
+        return await self._statement(claims, connection_id, settings, read, [], operation, conn)
+
     # -- connections -----------------------------------------------------------------------
 
     @contextlib.asynccontextmanager
@@ -520,14 +687,95 @@ class DatabaseGateway:
     ) -> AsyncIterator[_Connection]:
         """A connection in a transaction with the limits of the connection. A read
         transaction is read only and always rolled back."""
-        limit = self._limits.setdefault(claims.org_id, asyncio.Semaphore(self._per_org))
-        async with limit:
-            entry = await self._borrow(connection_id, settings)
+        async with self._org_limit(claims), self._route(str(connection_id), settings) as target:
+            entry = await self._borrow(connection_id, settings, target)
             try:
                 async with self._in_transaction(entry.pool, settings, write=write) as connection:
                     yield connection
             finally:
                 await self._give_back(entry)
+
+    @contextlib.asynccontextmanager
+    async def _org_limit(self, claims: RunTokenClaims) -> AsyncIterator[None]:
+        """At most ``per_org`` calls at a time for each org."""
+        limit = self._limits.setdefault(claims.org_id, asyncio.Semaphore(self._per_org))
+        async with limit:
+            yield
+
+    @contextlib.asynccontextmanager
+    async def _route(self, key: str, settings: DbSettings) -> AsyncIterator[Target]:
+        """Where the driver connects: the checked address of the host, or the local end of
+        the SSH tunnel of the connection (Section 10.6). BigQuery and Snowflake send HTTPS
+        requests through ``OutboundClient``, which checks the host itself."""
+        if not SPECS[settings.engine].network:
+            yield Target(settings.host, settings.port)
+            return
+        ssh = settings.ssh
+        if ssh is None:
+            yield Target(str(await self._address(settings.host, settings.port)), settings.port)
+            return
+        destination = _tunnel_destination(settings.host)
+
+        async def opener() -> tuple[Any, Any]:
+            address = await self._address(ssh.host, ssh.port)
+            connection = await open_ssh(ssh, str(address))
+            try:
+                listener = await forward(connection, destination, settings.port)
+            except BaseException:
+                connection.close()
+                raise
+            return connection, listener
+
+        async with self._tunnels.route(key, settings.fingerprint(), opener) as target:
+            yield target
+
+    @contextlib.asynccontextmanager
+    async def _sql_call(
+        self,
+        claims: RunTokenClaims,
+        connection_id: uuid.UUID,
+        settings: DbSettings,
+        *,
+        write: bool,
+    ) -> AsyncIterator[SqlSession]:
+        """A session of an SQL engine (not PostgreSQL) for one call, with the limits."""
+        async with self._org_limit(claims), self._route(str(connection_id), settings) as target:
+            try:
+                async with (
+                    asyncio.timeout(CONNECT_TIMEOUT_S + self.timeout_s + 5),
+                    open_sql(settings, target, self._engine, write=write) as session,
+                ):
+                    yield session
+            except TimeoutError:
+                raise DriverError(
+                    f"the statement stopped after {self.timeout_s:g} seconds"
+                ) from None
+            except (OSError, ssl.SSLError) as error:
+                raise DriverUnavailableError(_network(error, settings)) from None
+
+    @contextlib.asynccontextmanager
+    async def _mongo_call(
+        self, claims: RunTokenClaims, connection_id: uuid.UUID, settings: DbSettings
+    ) -> AsyncIterator[MongoSession]:
+        async with (
+            self._org_limit(claims),
+            self._mongo_session(str(connection_id), settings) as session,
+        ):
+            yield session
+
+    @contextlib.asynccontextmanager
+    async def _mongo_session(self, key: str, settings: DbSettings) -> AsyncIterator[MongoSession]:
+        async with self._route(key, settings) as target:
+            try:
+                async with (
+                    asyncio.timeout(CONNECT_TIMEOUT_S + self.timeout_s + 5),
+                    open_mongo(settings, target, self._engine) as session,
+                ):
+                    yield session
+            except TimeoutError:
+                raise DriverError(f"the read stopped after {self.timeout_s:g} seconds") from None
+            except (OSError, ssl.SSLError) as error:
+                raise DriverUnavailableError(_network(error, settings)) from None
 
     @contextlib.asynccontextmanager
     async def _in_transaction(
@@ -582,12 +830,15 @@ class DatabaseGateway:
                 connection.terminate()
             await pool.release(connection)
 
-    async def _borrow(self, connection_id: uuid.UUID, settings: DbSettings) -> _Pool:
+    async def _borrow(
+        self, connection_id: uuid.UUID, settings: DbSettings, target: Target
+    ) -> _Pool:
         """The pool of the connection, marked as in use. A pool that is idle for more than
-        ``POOL_IDLE_S``, or that has other settings, is retired: it closes when its last
-        borrower gives it back. Give the pool back with ``_give_back``."""
+        ``POOL_IDLE_S``, or that has other settings or another target (a new tunnel port), is
+        retired: it closes when its last borrower gives it back. Give the pool back with
+        ``_give_back``."""
         key = str(connection_id)
-        fingerprint = settings.fingerprint()
+        fingerprint = f"{settings.fingerprint()}:{target.host}:{target.port}"
         now = self._clock()
         stale: list[asyncpg.Pool] = []
         async with self._lock:
@@ -600,9 +851,8 @@ class DatabaseGateway:
                         stale.append(entry.pool)
             found = self._pools.get(key)
             if found is None:
-                address = await self._address(settings)
                 pool = asyncpg.create_pool(
-                    **self._connect_args(settings, address),
+                    **self._connect_args(settings, target.host, target.port),
                     min_size=0,
                     max_size=POOL_SIZE,
                     max_inactive_connection_lifetime=60.0,
@@ -632,23 +882,25 @@ class DatabaseGateway:
         if close:
             await _close(entry.pool)
 
-    async def _address(self, settings: DbSettings) -> IPAddress:
+    async def _address(self, host: str, port: int) -> IPAddress:
         """The checked address to connect to. Every address of the host must be public."""
-        host = settings.host
+        allowed = self._allow_private is True or (
+            isinstance(self._allow_private, frozenset) and host in self._allow_private
+        )
         local = host in METADATA_HOSTS or host == "localhost" or host.endswith(".localhost")
-        if local and not self._allow_private:
+        if local and not allowed:
             raise DriverError(f"{host} is not a public host")
         try:
             addresses: Sequence[IPAddress] = [ipaddress.ip_address(host)]
         except ValueError:
             try:
                 async with asyncio.timeout(CONNECT_TIMEOUT_S):
-                    addresses = await self._resolve(host, settings.port)
+                    addresses = await self._resolve(host, port)
             except (OSError, UnicodeError, TimeoutError):
                 raise DriverUnavailableError(f"{host} cannot be resolved") from None
         if not addresses:
             raise DriverUnavailableError(f"{host} cannot be resolved")
-        if not self._allow_private:
+        if not allowed:
             for address in addresses:
                 problem = address_problem(address)
                 if problem is not None:
@@ -657,13 +909,13 @@ class DatabaseGateway:
                     )
         return addresses[0]
 
-    def _connect_args(self, settings: DbSettings, address: IPAddress) -> dict[str, Any]:
+    def _connect_args(self, settings: DbSettings, host: str, port: int) -> dict[str, Any]:
         tls: ssl.SSLContext | bool = pinned_tls(settings.host, settings.sslmode)
-        if not self._require_tls:
+        if not self._require_tls or settings.sslmode == "disable":
             tls = False
         return {
-            "host": str(address),
-            "port": settings.port,
+            "host": host,
+            "port": port,
             "user": settings.user,
             "password": settings.password,
             "database": settings.database,
@@ -794,10 +1046,10 @@ def _check_card(arguments: Mapping[str, Any]) -> None:
         )
 
 
-def _optional_name(value: Any, label: str) -> str | None:
+def _optional_name(value: Any, label: str, size: int = 63) -> str | None:
     if value is None or value == "":
         return None
-    if not isinstance(value, str) or len(value) > 63:
+    if not isinstance(value, str) or len(value) > size:
         raise DriverError(f"{label} must be a name")
     return value
 
@@ -810,6 +1062,20 @@ def _message(error: asyncpg.PostgresError) -> str:
     return f"{message} (SQLSTATE {state})" if state else message
 
 
+def _tunnel_destination(host: str) -> str:
+    """The database host as the bastion sees it. It can be private (that is the reason for
+    the tunnel), but not a cloud metadata host or a link-local address."""
+    if host in METADATA_HOSTS:
+        raise DriverError(f"{host} is a cloud metadata host")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.is_link_local or address.is_multicast or address.is_unspecified:
+        raise DriverError(f"{host} is not a database address")
+    return host
+
+
 def _network(error: BaseException, settings: DbSettings) -> str:
     name = type(error).__name__
     if isinstance(error, TimeoutError):
@@ -818,16 +1084,6 @@ def _network(error: BaseException, settings: DbSettings) -> str:
         return f"the TLS connection to {settings.host} failed ({name})"
     text = " ".join(str(error).split())[:200]
     return f"the database at {settings.host}:{settings.port} cannot be reached: {name} {text}"
-
-
-def _csv_line(cells: Sequence[str]) -> str:
-    out = io.StringIO()
-    csv.writer(out, lineterminator="\n").writerow(cells)
-    return out.getvalue()
-
-
-def _is_cut(cell: Any) -> bool:
-    return isinstance(cell, str) and cell.endswith(CUT_MARK)
 
 
 async def _close(pool: asyncpg.Pool) -> None:

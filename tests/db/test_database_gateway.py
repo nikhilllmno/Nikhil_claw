@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.connectors import database
 from sama.connectors.composio import ComposioClient
 from sama.connectors.database import MAX_ROWS, POOL_IDLE_S, DatabaseGateway
+from sama.connectors.dbcore import Target
 from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import Catalog, Manifest
 from sama.connectors.postgres import DbSettings
@@ -110,6 +111,11 @@ async def gateway() -> AsyncIterator[tuple[DatabaseGateway, Sink, Sink]]:
     gateway = DatabaseGateway(spill=spill, exports=exports, allow_private=True, require_tls=False)
     yield gateway, spill, exports
     await gateway.aclose()
+
+
+def at(settings: DbSettings) -> Target:
+    """The target of a connection with no SSH tunnel."""
+    return Target(settings.host, settings.port)
 
 
 def postgres() -> Manifest:
@@ -437,9 +443,9 @@ async def test_an_idle_pool_closes_and_a_new_one_opens(outside: dict[str, str]) 
         assert first.is_closing()
         # Other settings: a new pool. The old pool closes when its last call ends.
         settings = DbSettings.parse(postgres(), outside)
-        borrowed = await gw._borrow(connection_id, settings)
+        borrowed = await gw._borrow(connection_id, settings, at(settings))
         changed = DbSettings.parse(postgres(), {**outside, "hidden_columns": "ssn"})
-        replaced = await gw._borrow(connection_id, changed)
+        replaced = await gw._borrow(connection_id, changed, at(changed))
         assert replaced.pool is not borrowed.pool
         assert borrowed.retired
         assert not borrowed.pool.is_closing()
@@ -467,7 +473,7 @@ async def test_a_cancel_while_an_old_pool_closes_gives_the_pool_back(
         await run(gw, outside, "query", connection_id, sql="select 1")
         monkeypatch.setattr(database, "_close", slow_close)
         changed = DbSettings.parse(postgres(), {**outside, "hidden_columns": "ssn"})
-        task = asyncio.create_task(gw._borrow(connection_id, changed))
+        task = asyncio.create_task(gw._borrow(connection_id, changed, at(changed)))
         await asyncio.wait_for(started.wait(), 5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
