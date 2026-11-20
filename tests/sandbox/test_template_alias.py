@@ -11,9 +11,9 @@ import pytest
 
 from sama.sandbox.template import (
     BUILD_FILES,
-    ENTRY_POINTS,
     FingerprintError,
     content_alias,
+    entry_points,
     main,
     sandbox_sources,
 )
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture
 def tree(tmp_path: Path) -> Path:
     """A copy of the files that go into the alias, plus one control plane file."""
-    for name in BUILD_FILES:
+    for name in (*BUILD_FILES, Path(".dockerignore")):
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / name, tmp_path / name)
     shutil.copytree(
@@ -36,7 +36,7 @@ def tree(tmp_path: Path) -> Path:
 def test_the_sources_hold_every_module_that_the_sandbox_imports() -> None:
     code = (
         "import contextlib, importlib, sys\n"
-        f"for name in {list(ENTRY_POINTS)!r}:\n"
+        f"for name in {list(entry_points(ROOT))!r}:\n"
         "    with contextlib.suppress(ImportError):\n"
         "        importlib.import_module(name)\n"
         "for name, module in sys.modules.items():\n"
@@ -68,7 +68,14 @@ def test_a_control_plane_change_keeps_the_alias(tree: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["src/sama/runtime/contract.py", "src/sama/warm.py", "sandbox/Dockerfile", "uv.lock"]
+    "name",
+    [
+        "src/sama/runtime/contract.py",
+        "src/sama/warm.py",
+        "sandbox/Dockerfile",
+        "uv.lock",
+        ".dockerignore",
+    ],
 )
 def test_a_sandbox_change_changes_the_alias(tree: Path, name: str) -> None:
     before = content_alias(tree)
@@ -89,14 +96,39 @@ def test_a_new_relative_import_joins_the_sources(tree: Path) -> None:
     assert extra in sandbox_sources(tree)
 
 
-def test_an_import_by_name_in_the_sandbox_code_fails(tree: Path) -> None:
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import importlib\nimportlib.import_module('x')\n",
+        "def f():\n    from importlib import import_module as load\n    load('x')\n",
+        "import builtins\ngetattr(builtins, '__import__')('x')\n",
+    ],
+)
+def test_an_import_by_name_in_the_sandbox_code_fails(tree: Path, code: str) -> None:
     runner = tree / "src/sama/runtime/runner.py"
-    runner.write_text(
-        runner.read_text(encoding="utf-8") + "\nimport importlib\nimportlib.import_module('x')\n",
+    runner.write_text(runner.read_text(encoding="utf-8") + "\n" + code, encoding="utf-8")
+    with pytest.raises(FingerprintError):
+        sandbox_sources(tree)
+
+
+def test_preload_comes_from_the_tree(tree: Path) -> None:
+    extra = tree / "src/sama/runtime/extra_helper.py"
+    extra.write_text("X = 1\n", encoding="utf-8")
+    warm = tree / "src/sama/warm.py"
+    text = warm.read_text(encoding="utf-8")
+    assert '    "sama.runtime.archive",\n)' in text
+    warm.write_text(
+        text.replace(
+            '    "sama.runtime.archive",\n)',
+            '    "sama.runtime.archive",\n    "sama.runtime.extra_helper",\n)',
+        ),
         encoding="utf-8",
     )
-    with pytest.raises(FingerprintError, match="import_module"):
-        sandbox_sources(tree)
+    assert "sama.runtime.extra_helper" in entry_points(tree)
+    assert extra in sandbox_sources(tree)
+    before = content_alias(tree)
+    extra.write_text("X = 2\n", encoding="utf-8")
+    assert content_alias(tree) != before
 
 
 def test_print_alias_prints_the_alias_and_needs_no_key(

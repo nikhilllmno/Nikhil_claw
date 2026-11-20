@@ -27,22 +27,25 @@ from typing import Final
 
 from sama.sandbox.base import DEFAULT_CPU_COUNT, DEFAULT_MEMORY_MB
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
-from sama.warm import PRELOAD
 
 log: Final = logging.getLogger("sama.sandbox.template")
 
 DOCKERFILE: Final = Path("sandbox/Dockerfile")
 IGNORE: Final = ["**/__pycache__", ".venv", ".git", "**/*.pyc"]
 
-ENTRY_POINTS: Final = ("sama.runtime.runner", "sama.warm", *PRELOAD)
+ENTRY_POINTS: Final = ("sama.runtime.runner", "sama.warm")
 """The modules that the orchestrator starts in the sandbox (``RUNNER_ARGV``,
-``WARM_RUNNER_ARGV``), and the modules that the warm runner imports by name."""
-DYNAMIC_IMPORT_OK: Final = frozenset({"sama.warm"})
-"""Modules that can import by name. Their targets must be in ``ENTRY_POINTS``."""
+``WARM_RUNNER_ARGV``). ``entry_points`` adds ``PRELOAD`` of ``sama.warm`` from the tree."""
+WARM: Final = "sama.warm"
+"""The only module that can import by name. Its targets (``PRELOAD``) are entry points."""
 BUILD_FILES: Final = (DOCKERFILE, Path("pyproject.toml"), Path("uv.lock"), Path("README.md"))
+OPTIONAL_BUILD_FILES: Final = (Path(".dockerignore"),)
+"""Files that change the build context when they exist. E2B reads ``.dockerignore``."""
 ALIAS_PREFIX: Final = "sama-runner-"
 HASH_CHARS: Final = 12
 DYNAMIC_IMPORTS: Final = frozenset({"import_module", "__import__"})
+"""Names that import by name. A use, an import, or a string of them in sandbox code (other
+than ``sama.warm``) stops the fingerprint, because the search cannot follow them."""
 
 
 class FingerprintError(Exception):
@@ -68,6 +71,8 @@ def _imports(module: str, path: Path) -> set[str]:
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
+            if module != WARM and any(alias.name in DYNAMIC_IMPORTS for alias in node.names):
+                raise FingerprintError(f"{path}: an import by name is not allowed")
             base = node.module or ""
             if node.level:
                 parts = _package(module, path).split(".")
@@ -75,11 +80,38 @@ def _imports(module: str, path: Path) -> set[str]:
                 base = ".".join([*parts, base] if base else parts)
             found.add(base)
             found.update(f"{base}.{alias.name}" for alias in node.names)
-        elif isinstance(node, ast.Name | ast.Attribute):
-            name = node.id if isinstance(node, ast.Name) else node.attr
-            if name in DYNAMIC_IMPORTS and module not in DYNAMIC_IMPORT_OK:
+        elif isinstance(node, ast.Name | ast.Attribute | ast.Constant):
+            if isinstance(node, ast.Name):
+                name = node.id
+            elif isinstance(node, ast.Attribute):
+                name = node.attr
+            else:
+                name = node.value if isinstance(node.value, str) else ""
+            if name in DYNAMIC_IMPORTS and module != WARM:
                 raise FingerprintError(f"{path}: {name} is not allowed in the sandbox code")
     return {name for name in found if name == "sama" or name.startswith("sama.")}
+
+
+def entry_points(root: Path) -> tuple[str, ...]:
+    """Returns ``ENTRY_POINTS`` and the ``PRELOAD`` modules of ``sama.warm`` in ``root``."""
+    path = _module_file(root / "src", WARM)
+    if path is None:
+        raise FingerprintError(f"no source file for {WARM}")
+    for node in ast.parse(path.read_text(encoding="utf-8"), str(path)).body:
+        target: ast.expr
+        value: ast.expr | None
+        if isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == "PRELOAD" and value is not None:
+            preload = ast.literal_eval(value)
+            if not isinstance(preload, tuple) or not all(isinstance(n, str) for n in preload):
+                raise FingerprintError(f"{path}: PRELOAD must be a tuple of module names")
+            return (*ENTRY_POINTS, *preload)
+    raise FingerprintError(f"{path}: no PRELOAD")
 
 
 def sandbox_sources(root: Path) -> list[Path]:
@@ -92,7 +124,8 @@ def sandbox_sources(root: Path) -> list[Path]:
     src = root / "src"
     seen: set[str] = set()
     files: set[Path] = set()
-    todo = list(ENTRY_POINTS)
+    entries = entry_points(root)
+    todo = list(entries)
     while todo:
         module = todo.pop()
         if module in seen:
@@ -100,7 +133,7 @@ def sandbox_sources(root: Path) -> list[Path]:
         seen.add(module)
         path = _module_file(src, module)
         if path is None:
-            if module in ENTRY_POINTS:
+            if module in entries:
                 raise FingerprintError(f"no source file for {module}")
             continue
         files.add(path)
@@ -112,8 +145,10 @@ def sandbox_sources(root: Path) -> list[Path]:
 
 def fingerprint(root: Path) -> str:
     """Returns the hash of everything that goes into the template (hex, SHA-256)."""
-    digest = hashlib.sha256(f"cpu={DEFAULT_CPU_COUNT};memory={DEFAULT_MEMORY_MB}\n".encode())
-    for path in [*(root / name for name in BUILD_FILES), *sandbox_sources(root)]:
+    settings = f"cpu={DEFAULT_CPU_COUNT};memory={DEFAULT_MEMORY_MB};ignore={sorted(IGNORE)}\n"
+    digest = hashlib.sha256(settings.encode())
+    optional = [root / name for name in OPTIONAL_BUILD_FILES if (root / name).is_file()]
+    for path in [*(root / name for name in BUILD_FILES), *optional, *sandbox_sources(root)]:
         digest.update(path.relative_to(root).as_posix().encode() + b"\0")
         digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()

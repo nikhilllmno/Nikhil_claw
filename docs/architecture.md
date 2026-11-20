@@ -3974,10 +3974,12 @@ The provider and search keys are the defaults. An org key in the vault comes fir
 - Each deploy builds the E2B template `sama-runner-<content hash>` and sets
   `SAMA_SANDBOX_TEMPLATE` to it. `python -m sama.sandbox.template --print-alias` gives the
   alias. The hash (first 12 characters of a SHA-256) covers the Dockerfile, `pyproject.toml`,
-  `uv.lock`, `README.md`, the CPU and memory limits, and the source files that the sandbox
-  entry points can import (`sama.runtime.runner`, `sama.warm`, and the modules that the warm
-  runner preloads). The search reads every import statement, also in function bodies, and
-  fails on an import by name outside `sama.warm`. The runner in the sandbox then has the
+  `uv.lock`, `README.md`, `.dockerignore`, the CPU, memory, and ignore settings of the build,
+  and the source files that the sandbox entry points can import (`sama.runtime.runner`,
+  `sama.warm`, and the modules in `PRELOAD` of `sama.warm`). The search reads every import
+  statement, also in function bodies, and fails on an import by name outside `sama.warm`. A
+  commit from before the content alias has no `--print-alias`, so the deploy uses
+  `sama-runner-<first 12 characters of the SHA>` for it. The runner in the sandbox then has the
   runner code of the control plane that starts it. The runner and the control plane change
   their job and event models together (`sama.runtime.contract`), and both refuse unknown
   fields, so a different template is necessary when that code changes. A deploy that does not

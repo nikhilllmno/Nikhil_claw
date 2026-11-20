@@ -82,7 +82,13 @@ jobs:
             exit 1
           fi
           uv sync --locked
-          ALIAS="$(uv run python -m sama.sandbox.template --print-alias)"
+          # A commit from before the content alias has no --print-alias. It keeps the alias
+          # of its commit, so a promotion or a rollback to it still works.
+          if uv run python -m sama.sandbox.template --help | grep -q -- --print-alias; then
+            ALIAS="$(uv run python -m sama.sandbox.template --print-alias)"
+          else
+            ALIAS="sama-runner-${SHA:0:12}"
+          fi
           echo "TEMPLATE_ALIAS=${ALIAS}" >> "$GITHUB_ENV"
           uv run python -m sama.sandbox.template --alias "${ALIAS}"
       - name: Deploy
@@ -152,7 +158,13 @@ jobs:
             exit 1
           fi
           uv sync --locked
-          ALIAS="$(uv run python -m sama.sandbox.template --print-alias)"
+          # A commit from before the content alias has no --print-alias. It keeps the alias
+          # of its commit, so a promotion or a rollback to it still works.
+          if uv run python -m sama.sandbox.template --help | grep -q -- --print-alias; then
+            ALIAS="$(uv run python -m sama.sandbox.template --print-alias)"
+          else
+            ALIAS="sama-runner-${SHA:0:12}"
+          fi
           echo "TEMPLATE_ALIAS=${ALIAS}" >> "$GITHUB_ENV"
           uv run python -m sama.sandbox.template --alias "${ALIAS}"
       - name: Deploy the staging image of the commit
