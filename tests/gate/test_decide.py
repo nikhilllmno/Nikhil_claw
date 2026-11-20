@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from sama.admin.bootstrap import DEFAULT_GROUP_TOOLSETS, DEFAULT_TOOLSETS
 from sama.gate import (
     GateContext,
     GateStep,
@@ -18,8 +19,10 @@ from sama.gate import (
     command_problem,
     decide,
     decide_recorded,
+    effective_toolsets,
     policy_verdict,
 )
+from sama.gate.decide import TOOLSETS, tools_of
 from sama.gate.hardline import MAX_COMMAND_CHARS
 from sama.gate.service import stored_arguments
 from sama.runtime.contract import ApprovalRequired
@@ -443,3 +446,79 @@ def test_an_open_approval_in_an_unattended_run_is_a_deny() -> None:
     recorded = Recorded("pending", "Bash", arguments_digest(ARGS))
     verdict = decide(context(unattended=True, recorded=recorded), "Bash", ARGS)
     assert (verdict.action, verdict.step) == ("deny", GateStep.CONTEXT)
+
+
+# -- the group toolset (Sections 10.2 and 11.3) -------------------------------------------------
+
+PROFILE = ("core", "todo", "github", "memory", "skills")
+GROUP = ("todo", "web")
+
+
+def test_a_shared_chat_run_has_the_group_toolsets() -> None:
+    assert effective_toolsets(PROFILE, GROUP, audience="shared") == frozenset(GROUP)
+    assert effective_toolsets(PROFILE, GROUP, audience="shared", kind="chat") == frozenset(GROUP)
+
+
+def test_a_private_run_keeps_the_profile_toolsets() -> None:
+    assert effective_toolsets(PROFILE, GROUP, audience="private") == frozenset(PROFILE)
+    assert effective_toolsets(PROFILE, [], audience="private") == frozenset(PROFILE)
+
+
+def test_a_review_run_does_not_use_the_group_toolsets() -> None:
+    # The review clamp of the gate takes the rest away (Section 9.4).
+    assert effective_toolsets(PROFILE, GROUP, audience="shared", kind="review") == frozenset(
+        PROFILE
+    )
+
+
+def test_the_default_group_toolsets_have_no_shell_no_edit_and_no_outbound_write() -> None:
+    assert set(DEFAULT_GROUP_TOOLSETS) <= set(TOOLSETS), "each default group toolset has tools"
+    assert set(DEFAULT_GROUP_TOOLSETS) <= set(DEFAULT_TOOLSETS)
+    tools = tools_of(DEFAULT_GROUP_TOOLSETS)
+    for blocked in (
+        "Bash",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "repo_clone",
+        "skill_manage",
+        "pr_create",
+        "pr_comment",
+    ):
+        assert blocked not in tools
+    assert {"todo", "web_search", "memory", "session_search", "vision_analyze"} <= tools
+
+
+def test_a_tool_outside_the_group_toolsets_is_denied_in_a_shared_run() -> None:
+    group = context(toolsets=effective_toolsets(PROFILE, GROUP, audience="shared"), shared=True)
+    verdict = decide(group, "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+    assert decide(group, "ToolSearch", {}).action == "allow", "a loader is in no toolset"
+    assert decide(group, "mcp__sama__web_search", {}).action == "allow"
+    private = context(toolsets=effective_toolsets(PROFILE, GROUP, audience="private"))
+    assert decide(private, "Bash", ARGS).step is GateStep.POLICY
+
+
+def test_memory_gets_ask_in_a_shared_run_and_allow_otherwise() -> None:
+    shared = context(toolsets=frozenset({"memory"}), shared=True)
+    verdict = decide(shared, "mcp__sama__memory", {"target": "agent"})
+    assert (verdict.action, verdict.step) == ("ask", GateStep.POLICY)
+    plain = context(toolsets=frozenset({"memory"}))
+    assert decide(plain, "mcp__sama__memory", {"target": "agent"}).action == "allow"
+    assert policy_verdict((), "memory", shared=True).action == "ask"
+    assert policy_verdict((), "todo", shared=True).action == "allow"
+
+
+def test_a_rule_still_wins_over_the_shared_memory_default() -> None:
+    allow = (rule("memory", "allow", RuleLevel.PROFILE),)
+    assert policy_verdict(allow, "memory", shared=True).action == "allow"
+    deny = (rule("memory", "deny"),)
+    assert policy_verdict(deny, "memory", shared=True).action == "deny"
+
+
+def test_an_approval_of_a_shared_memory_write_allows_the_call() -> None:
+    args = {"target": "agent", "action": "add", "content": "x"}
+    recorded = Recorded("approved", "mcp__sama__memory", arguments_digest(args))
+    shared = context(toolsets=frozenset({"memory"}), shared=True, recorded=recorded)
+    assert decide(shared, "mcp__sama__memory", args).action == "allow"

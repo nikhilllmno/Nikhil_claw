@@ -20,6 +20,7 @@ from sqlalchemy import case, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AgentProfile, AuditEntry, Session, SessionBinding, StoredContextFile
+from sama.gate.decide import effective_toolsets
 from sama.prompt.scan import scan
 from sama.review.policy import SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT
 from sama.runtime.contract import (
@@ -95,6 +96,13 @@ CHANNEL_HINTS: Final = {
 }
 """Hints for sessions that a chat channel made (Section 11). A web session gets no hint."""
 
+SHARED_HINT: Final = (
+    "Group or channel session: other people can read and steer this chat. Tools outside the"
+    " group set are not available. A change of memory needs an approval."
+)
+"""Tells the model about the group toolset (Sections 10.2 and 11.3). The gate enforces the set.
+The text only saves the model from calls that the gate denies."""
+
 
 def environment(run: ClaimedRun, now: datetime, channel: str | None = None) -> str:
     """The volatile tier: facts at the start of the session."""
@@ -103,8 +111,10 @@ def environment(run: ClaimedRun, now: datetime, channel: str | None = None) -> s
         " during the session.\n"
         f"Audience: {run.audience}."
     )
-    hint = CHANNEL_HINTS.get(channel or "")
-    return f"{text}\n{hint}" if hint else text
+    hints = [CHANNEL_HINTS.get(channel or "")]
+    if run.audience == "shared" and run.kind != "review":
+        hints.append(SHARED_HINT)
+    return "\n".join([text, *(hint for hint in hints if hint)])
 
 
 class PromptAssembler:
@@ -217,7 +227,7 @@ class PromptAssembler:
         self, connection: AsyncConnection, run: ClaimedRun
     ) -> tuple[SkillIndexEntry, ...]:
         """The skill index of the run. It is frozen with the config (Section 6.1)."""
-        if self._skills is None:
+        if self._skills is None or "skills" not in await _toolsets(connection, run):
             return ()
         actor = await self._skills.actor(
             connection,
@@ -226,22 +236,36 @@ class PromptAssembler:
             profile_id=run.agent_profile_id,
             user_id=run_user(run.user_id, run.audience, run.owner_user_id),
             private=run.audience == "private",
+            kind=run.kind,
         )
         skills = await self._skills.index(connection, actor)
         return tuple(SkillIndexEntry(name=s.name, description=s.description) for s in skills)
 
 
-async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:
-    """The notes of the agent, the workspace, and the owner of a private session. Only a
-    profile with the ``memory`` toolset gets them (Section 8)."""
-    toolsets = (
+async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[str]:
+    """The toolsets of the run: the group toolsets of the profile for a chat run in a shared
+    session (Sections 10.2 and 11.3), else the toolsets. The gate uses the same rule."""
+    row = (
         await connection.execute(
-            select(AgentProfile.toolsets).where(
+            select(AgentProfile.toolsets, AgentProfile.group_toolsets).where(
                 AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id
             )
         )
-    ).scalar_one_or_none()
-    if not toolsets or "memory" not in toolsets:
+    ).one_or_none()
+    if row is None:
+        return frozenset()
+    return effective_toolsets(
+        row.toolsets if isinstance(row.toolsets, list) else [],
+        row.group_toolsets if isinstance(row.group_toolsets, list) else [],
+        audience=run.audience,
+        kind=run.kind,
+    )
+
+
+async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:
+    """The notes of the agent, the workspace, and the owner of a private session. Only a run
+    with the ``memory`` toolset gets them (Section 8)."""
+    if "memory" not in await _toolsets(connection, run):
         return ""
     # Here, not at the top: ``sama.memory`` imports ``sama.prompt.scan``.
     from sama.memory.store import load_snapshot

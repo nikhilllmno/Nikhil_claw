@@ -71,6 +71,11 @@ write is a version that can be reverted."""
 NEEDS_A_HUMAN: Final = frozenset({"clarify"})
 """Tools that wait for a human. Unattended runs cannot use them."""
 
+SHARED_ASK: Final = frozenset({"memory"})
+"""Tools that are in ``DEFAULT_ALLOW`` but get ``ask`` in a shared session (Section 11.3). Every
+call of ``memory`` writes a note that all later sessions of the profile or workspace read, and
+every member of a group can steer the run. A policy rule still wins over this default."""
+
 
 class GateStep(StrEnum):
     AUTHORITY = "authority"
@@ -129,6 +134,9 @@ class GateContext:
     preapproved: frozenset[str] = field(default_factory=frozenset)
     """Tools that a human pre-approved for this job version (Section 12.1). Jobs come in M3,
     so today the set is always empty."""
+    shared: bool = False
+    """The run is a chat run in a shared session. ``SHARED_ASK`` tools get ``ask``. A background
+    review is not a chat run: its shared changes are proposals that a person decides."""
     recorded: Recorded | None = None
     revoked: str | None = None
     """Why the run has no authority now (Section 5.1), or ``None``. See
@@ -147,6 +155,19 @@ def tools_of(toolsets: Iterable[str]) -> frozenset[str]:
     for name in toolsets:
         tools |= TOOLSETS.get(name, frozenset())
     return frozenset(tools)
+
+
+def effective_toolsets(
+    toolsets: Iterable[str], group_toolsets: Iterable[str], *, audience: str, kind: str = "chat"
+) -> frozenset[str]:
+    """The toolsets of a run (Section 10.2). A chat run in a shared session has the group
+    toolsets of the profile, and not its toolsets. A private session has the toolsets. A
+    background review has the toolsets of the profile that the review clamp keeps (Section
+    9.4): it has no person in it, and its changes of shared state are proposals that a person
+    decides, so the group toolsets do not apply to it."""
+    if audience == "shared" and kind != "review":
+        return frozenset(group_toolsets)
+    return frozenset(toolsets)
 
 
 def json_default(value: Any) -> Any:
@@ -193,7 +214,7 @@ def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
 
 def _after_hardline(context: GateContext, name: str, digest: str) -> Verdict:
     # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
-    policy = policy_verdict(context.rules, name)
+    policy = policy_verdict(context.rules, name, shared=context.shared)
     if policy.action == "deny":
         return policy
     verdict = _recorded(context.recorded, name, digest) or policy
@@ -216,11 +237,12 @@ def _recorded(recorded: Recorded | None, name: str, digest: str) -> Verdict | No
             return Verdict("ask", GateStep.RECORDED, "the approval is still open")
 
 
-def policy_verdict(rules: Iterable[PolicyRule], name: str) -> Verdict:
+def policy_verdict(rules: Iterable[PolicyRule], name: str, *, shared: bool = False) -> Verdict:
     """Step 4. A ``deny`` rule at any level wins. An org or profile ``ask`` rule cannot be
     removed by a user rule. Otherwise a user rule wins, then the profile rule, then the org
     rule. At one level an exact name wins over a prefix. Without a rule, the built-in
-    default applies, and the default for unknown tools is ``ask``."""
+    default applies, and the default for unknown tools is ``ask``. In a shared session, the
+    tools in ``SHARED_ASK`` also get ``ask`` by default."""
     matching = [rule for rule in rules if rule.matches(name)]
     if any(rule.action == "deny" for rule in matching):
         return Verdict("deny", GateStep.POLICY, f"a policy rule denies {name}")
@@ -233,6 +255,8 @@ def policy_verdict(rules: Iterable[PolicyRule], name: str) -> Verdict:
         return Verdict(
             chosen.action, GateStep.POLICY, f"the {chosen.level} policy: {chosen.action}"
         )
+    if shared and name in SHARED_ASK:
+        return Verdict("ask", GateStep.POLICY, f"{name} needs an approval in a shared session")
     if name in DEFAULT_ALLOW:
         return Verdict("allow", GateStep.POLICY, f"{name} is allowed by default")
     return Verdict("ask", GateStep.POLICY, f"{name} needs an approval")

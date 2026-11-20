@@ -118,6 +118,9 @@ async def org(engine: AsyncEngine) -> AsyncIterator[Org1]:
                 "name": "p",
                 "model": "claude-sonnet-5-5",
                 "toolsets": ["core", "todo", "web", "clarify"],
+                # The tests of the gate steps use the same tools in the shared session. The
+                # tests of the group toolset change this value.
+                "group_toolsets": ["core", "todo", "web", "clarify"],
             },
         )
     )
@@ -299,10 +302,11 @@ async def test_the_profile_toolsets_limit_the_tools(engine: AsyncEngine, org: Or
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == org.ids["profile"])
-            .values(toolsets=["web"])
+            .values(toolsets=["web"], group_toolsets=["web"])
         )
-    verdict = await GateService(engine).check(org.claims(), "c1", "Read", {})
-    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+    for claims in (org.claims(), org.claims("secret-run", session_id=str(org.ids["secret"]))):
+        verdict = await GateService(engine).check(claims, "c1", "Read", {})
+        assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
 
 
 async def test_rules_come_from_the_org_and_the_run_user(engine: AsyncEngine, org: Org1) -> None:
@@ -413,13 +417,13 @@ async def test_an_approval_allows_the_same_call(engine: AsyncEngine, org: Org1) 
         org_id=org.ids["org"],
         run_id=org.ids["run"],
         call_id="c1",
-        user_id=org.ids["max"],
+        user_id=org.ids["admin"],
         approve=True,
         reason="fine",
     )
     assert status == "approved"
     row = await approval(engine, org, "c1")
-    assert row.decided_by_user_id == org.ids["max"]
+    assert row.decided_by_user_id == org.ids["admin"]
     assert row.decided_at is not None
     assert row.decision_reason == "fine"
     verdict = await gate.check(org.claims(), "c1", "Bash", ARGS)
@@ -456,8 +460,8 @@ async def test_a_rejection_denies_the_call(engine: AsyncEngine, org: Org1) -> No
     ("run", "user", "allowed"),
     [
         ("run", "mia", True),
-        ("run", "max", True),
         ("run", "admin", True),
+        ("run", "max", False),
         ("run", "nia", False),
         ("secret-run", "mia", True),
         ("secret-run", "max", False),
@@ -482,7 +486,7 @@ async def test_only_a_user_who_sees_the_session_decides(
     if allowed:
         assert await decide() == "approved"
     else:
-        with pytest.raises(ApprovalError, match="cannot decide"):
+        with pytest.raises(ApprovalError, match=r"cannot decide|only the person who asked"):
             await decide()
 
 
@@ -544,11 +548,11 @@ async def test_always_allow_for_one_user_keeps_ask_for_others(
         org_id=org.ids["org"],
         run_id=org.ids["run"],
         call_id="c1",
-        user_id=org.ids["max"],
+        user_id=org.ids["admin"],
         approve=True,
         always_allow=True,
     )
-    # The run belongs to mia, and the rule is for max.
+    # The run belongs to mia, and the rule is for the admin.
     assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == "ask"
 
 
@@ -615,7 +619,7 @@ async def approve(gate: GateService, org: Org1, call_id: str = "c1") -> None:
         org_id=org.ids["org"],
         run_id=org.ids["run"],
         call_id=call_id,
-        user_id=org.ids["max"],
+        user_id=org.ids["mia"],
         approve=True,
     )
 
@@ -848,3 +852,205 @@ async def test_reconfirm_loads_the_rules_of_the_private_session_owner(
         org_id=org.ids["org"], run_id=org.ids["secret-run"], call_id="c1"
     )
     assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+
+
+# -- the group toolset and the approvers of a shared session (Section 11.3) --------------------
+
+
+async def set_profile(engine: AsyncEngine, org: Org1, **values: Any) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile).where(AgentProfile.id == org.ids["profile"]).values(**values)
+        )
+
+
+def private_claims(org: Org1) -> RunTokenClaims:
+    return org.claims("secret-run", session_id=str(org.ids["secret"]))
+
+
+async def test_a_shared_run_uses_the_group_toolsets(engine: AsyncEngine, org: Org1) -> None:
+    await set_profile(engine, org, group_toolsets=["todo", "web"])
+    gate = GateService(engine)
+    shared = await gate.check(org.claims(), "c1", "Bash", ARGS)
+    assert (shared.action, shared.step) == ("deny", GateStep.TOOLSET)
+    assert "not in the toolsets" in shared.reason
+    # The same call in a private run is not denied at the toolset step: the profile has core.
+    private = await gate.check(private_claims(org), "c1", "Bash", ARGS)
+    assert (private.action, private.step) == ("ask", GateStep.POLICY)
+    # A group tool and a tool loader still work in the shared run.
+    assert (await gate.check(org.claims(), "c2", "web_search", {})).action == "allow"
+    assert (await gate.check(org.claims(), "c3", "ToolSearch", {})).action == "allow"
+
+
+async def test_a_profile_without_group_toolsets_gives_a_group_no_tool(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await set_profile(engine, org, group_toolsets=[])
+    gate = GateService(engine)
+    denied = await gate.check(org.claims(), "c1", "web_search", {})
+    assert (denied.action, denied.step) == ("deny", GateStep.TOOLSET)
+    assert (await gate.check(private_claims(org), "c1", "web_search", {})).action == "allow"
+
+
+async def test_a_resume_cannot_widen_the_group_toolsets(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await gate.decide_approval(
+        org_id=org.ids["org"],
+        run_id=org.ids["run"],
+        call_id="c1",
+        user_id=org.ids["mia"],
+        approve=True,
+    )
+    await set_profile(engine, org, group_toolsets=["todo"])
+    verdict = await reconfirm(gate, org)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+
+
+async def test_memory_needs_an_approval_in_a_shared_run_only(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await set_profile(engine, org, toolsets=["core", "memory"], group_toolsets=["memory", "todo"])
+    gate = GateService(engine)
+    shared = await gate.check(org.claims(), "c1", "mcp__sama__memory", {"target": "agent"})
+    assert (shared.action, shared.step) == ("ask", GateStep.POLICY)
+    assert (await approval(engine, org, "c1")).status == "pending"
+    private = await gate.check(private_claims(org), "c1", "mcp__sama__memory", {"target": "user"})
+    assert private.action == "allow"
+    # A person approves the write, and the same call goes on.
+    await gate.decide_approval(
+        org_id=org.ids["org"],
+        run_id=org.ids["run"],
+        call_id="c1",
+        user_id=org.ids["mia"],
+        approve=True,
+    )
+    again = await gate.check(org.claims(), "c1", "mcp__sama__memory", {"target": "agent"})
+    assert (again.action, again.step) == ("allow", GateStep.RECORDED)
+
+
+async def add_review_run(engine: AsyncEngine, org: Org1) -> uuid.UUID:
+    run_id = uuid.uuid4()
+    org.ids["review"] = run_id
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Run).values(
+                id=run_id,
+                org_id=org.ids["org"],
+                session_id=org.ids["shared"],
+                agent_profile_id=org.ids["profile"],
+                runtime="claude_agent_sdk",
+                unattended=True,
+                kind="review",
+                review_from_seq=0,
+                review_to_seq=1,
+            )
+        )
+    return run_id
+
+
+async def test_a_review_of_a_shared_session_keeps_the_review_clamp(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """The review is not a chat run: the group toolsets do not apply to it, and it has the
+    memory and skill tools of the profile and no other tool (Section 9.4). Its memory call is
+    not asked twice: a shared change is a proposal that a person decides."""
+    await set_profile(
+        engine,
+        org,
+        toolsets=["core", "memory", "skills"],
+        group_toolsets=["todo"],
+    )
+    await add_review_run(engine, org)
+    gate = GateService(engine)
+    claims = org.claims("review")
+    for call_id, tool in (("r1", "mcp__sama__memory"), ("r2", "mcp__sama__skill_view")):
+        verdict = await gate.check(claims, call_id, tool, {})
+        assert (verdict.action, verdict.step) == ("allow", GateStep.POLICY), tool
+    denied = await gate.check(claims, "r3", "Bash", ARGS)
+    assert (denied.action, denied.step) == ("deny", GateStep.TOOLSET)
+    assert (await gate.check(claims, "r4", "todo", {})).step is GateStep.TOOLSET
+
+
+async def decide_as(gate: GateService, org: Org1, user: str, call_id: str = "c1") -> str:
+    return await gate.decide_approval(
+        org_id=org.ids["org"],
+        run_id=org.ids["run"],
+        call_id=call_id,
+        user_id=org.ids[user],
+        approve=True,
+    )
+
+
+async def test_a_member_who_did_not_ask_cannot_decide_in_a_shared_session(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    with pytest.raises(ApprovalError, match="only the person who asked or a workspace admin"):
+        await decide_as(gate, org, "max")
+    assert (await approval(engine, org, "c1")).status == "pending"
+    assert await decide_as(gate, org, "mia") == "approved"
+
+
+async def test_an_org_admin_and_a_workspace_admin_decide_in_a_shared_session(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org, "c1")
+    await ask(gate, org, "c2")
+    assert await decide_as(gate, org, "admin", "c1") == "approved"
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(Membership.user_id == org.ids["max"], Membership.workspace_id == org.ids["ws"])
+            .values(role="admin")
+        )
+    assert await decide_as(gate, org, "max", "c2") == "approved"
+
+
+async def test_the_profile_approvers_widen_the_set(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await ask(gate, org, "c1")
+    await ask(gate, org, "c2")
+    await set_profile(engine, org, policy={"approvers": [str(org.ids["max"]), "not-an-id", 7]})
+    assert await decide_as(gate, org, "max", "c1") == "approved"
+    # Only a listed user is added: nia has no workspace and still cannot see the session.
+    with pytest.raises(ApprovalError, match="cannot decide"):
+        await decide_as(gate, org, "nia", "c2")
+
+
+async def test_a_star_approver_restores_the_decision_of_any_member(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org, "c1")
+    await ask(gate, org, "c2")
+    await set_profile(engine, org, policy={"approvers": ["*"]})
+    assert await decide_as(gate, org, "max", "c1") == "approved"
+    with pytest.raises(ApprovalError, match="cannot decide"):
+        await decide_as(gate, org, "nia", "c2")
+
+
+async def test_a_wrong_approvers_value_adds_nobody(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await set_profile(engine, org, policy={"approvers": "*"})
+    with pytest.raises(ApprovalError, match="only the person who asked"):
+        await decide_as(gate, org, "max")
+
+
+async def test_the_approvers_do_not_change_a_private_session(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await set_profile(engine, org, policy={"approvers": ["*"]})
+    await ask(gate, org, run="secret-run")
+    with pytest.raises(ApprovalError, match="cannot decide"):
+        await gate.decide_approval(
+            org_id=org.ids["org"],
+            run_id=org.ids["secret-run"],
+            call_id="c1",
+            user_id=org.ids["max"],
+            approve=True,
+        )

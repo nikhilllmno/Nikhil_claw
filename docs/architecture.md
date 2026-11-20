@@ -1191,6 +1191,10 @@ counter is 10 or more, sama queues one run of kind `review`, sets both counters 
 `review_cursor_seq` to the highest message sequence of the session. Failed and cancelled runs
 and review runs do not count, so a review cannot start a review (recursion is off).
 
+**Group toolset.** A review run of a shared session does not use the group set of the profile
+(Section 11.3). Its tools are the profile toolsets cut to `memory` and `skills`, and the gate
+does not ask for a `memory` call, because each shared change is a proposal that a role decides.
+
 **Limits of the queue.** The partial unique index `ix_runs_one_queued_review_per_session` allows
 one queued review for each session. The index `ix_runs_one_active_per_session` allows one running
 review. If a review waits when the next trigger fires, sama extends the range of the waiting
@@ -1364,6 +1368,10 @@ name) is written. The review must propose again.
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, vision,
 clarify; for webhook triggers), and `cron` (like `assistant` but no `cron` and no `clarify`).
+A profile also has a **group set**: the toolsets that a chat run in a shared session uses
+(Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`, and
+`media`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`, `browser`,
+`workflows`, `cron`, `self`, `connections`, `integrations`, or `tool_search`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -1594,10 +1602,11 @@ One gateway service hosts all channel adapters. Each adapter does five things:
   1 hour). Codes are never logged.
 - A Slack workspace or Telegram group can bind to a workspace and an agent profile. Only
   paired members can start runs there.
-- Group messages are untrusted input. In groups the agent uses the profile's group toolset
-  (default: no shell, no code edits, no outbound writes). M1.13 does not apply the group
-  toolset yet. Until it does, the tool gate asks for approval as in a private session, and a
-  group shares the session and the approvals of its workspace (Section 11.5).
+- Group messages are untrusted input. In a shared session the agent uses the group set of
+  the profile (the column `agent_profiles.group_toolsets`), and not `toolsets`. The default
+  has no shell, no code edits, and no outbound writes (Section 10.2). The tool gate does the
+  cut at step 1, so a tool that is not in the group set gets `deny`. A private session is not
+  changed. See "Group toolset and approvers" below.
 - **Audience and principal.** Each session has an audience: `private` (one user, for
   example a DM) or `shared` (a Slack channel or thread, a Telegram group). A private session
   runs as its user. A shared session runs as the workspace and uses only shared context:
@@ -1607,6 +1616,61 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 - The same audience rule applies to `session_search`, `session_read`, resume, and delivery.
   A user finds only sessions whose audience includes the user. A job delivers to a shared
   target only output from a shared-audience run.
+
+**Group toolset and approvers.** Every linked member of a group can steer the run of its
+shared session, and every member of the workspace can read it. So a shared session has two
+more rules than a private session.
+
+1. **Group set.** A `chat` run of a shared session has the toolsets of
+   `agent_profiles.group_toolsets`. The default list is in Section 10.2 and in
+   `DEFAULT_GROUP_TOOLSETS` (`sama.admin.bootstrap`). The column default is `[]`, so a profile
+   that has no list has no tool in a group (fail closed). A resume gets the same set, so a
+   resume cannot widen it. The tool `ToolSearch` stays open, as in a private session.
+   The prompt follows the set: a shared run has the memory snapshot only with `memory` in
+   the set, and the skill index only with `skills` in the set. The skills of a shared run
+   (the index, `skills_list`, `skill_view`, and skill commands) also check `requires_toolsets`
+   against the group set, and not against `toolsets`. The prompt of a shared run
+   also says that this is a group chat with a limited toolset. A `review` run does not use
+   the group set (Section 9.4.1). Its tools are the profile toolsets cut to `memory` and
+   `skills`, and its writes are proposals that a role decides.
+2. **Approvers.** The user who started the run, the org admins, the org `owner`, and the
+   `admin` and `owner` of the workspace can decide an approval of a shared session. Any other
+   member gets a refusal from `GateService.decide_approval`, and the approval stays pending.
+   The Telegram gateway shows the refusal as the answer of the button, and the Slack gateway
+   whispers it to the user. The card of a shared session says who can decide: the person who asked, the people that
+   the profile lists as approvers, and the admins of the workspace and of the org. The key
+   `approvers` of `agent_profiles.policy` widens the set: a list of user ids adds these users,
+   and `["*"]` lets each member who can see the session decide (the default of Hermes). A
+   value that is not a list, and an item that is not a user id, adds nobody. A private session
+   is not changed: only its owner sees it. A proposal of a background review keeps its role
+   rules (Section 9.4.1).
+3. **Memory asks.** A `memory` call in a shared session gets `ask` by default, because the
+   text goes to the prompt of every run of the group. A policy rule still wins (for example
+   `allow`), and an approval of the call allows it. A review run is not asked, because its
+   shared changes are already proposals.
+
+**Assumptions.** These choices are for the group toolset. Change them in a new revision of
+this section.
+
+- A1. `memory` is in the default group set, with the ask of rule 3. The tool only writes,
+  because the snapshot loads in the prompt.
+- A2. The approvers are the requester and the admins. This is stricter than Hermes, where
+  each allowed user can approve (`approvals.approvers`, default `["*"]`). Hermes has no group
+  toolset: its only group control is the approver list. The default of sama is stricter on
+  purpose, and `["*"]` gives the Hermes behavior back. The org admins are in the set,
+  because they see each workspace.
+- A3. `github` is not in the default group set, so `repo_clone`, `pr_create`, and
+  `pr_comment` are not available in a group. `skills` is not in it either, so `skill_manage`
+  is not available and the skill index is empty. An admin adds a toolset to the group list
+  of a profile on purpose.
+- A4. Migration `0017` fills the group set of the profiles that exist with the default list,
+  cut to the toolsets of each profile and in the order of the default list. So a group never
+  gets a toolset that the profile does not have. For a profile with the default toolsets, the
+  result is the default group set.
+- A5. A review run ignores the group set. The group set would block the skill proposals of
+  a shared session.
+- A6. The skill index of a private session also needs `skills` in the toolsets now. Before,
+  the index did not depend on the toolsets.
 
 ### 11.4 HTTP API and minimal web page (M1.12)
 
@@ -1798,13 +1862,14 @@ it queues the run.
 **Approval buttons.** The callback data is `ap:<approval id>:y` or `ap:<approval id>:n`. The
 gateway finds the linked user of the presser, checks that the user can see the session, calls
 `GateService.decide_approval`, releases the run, and edits the card to show the decision and
-the person.
+the person. In a group, `decide_approval` also checks the approvers (Section 11.3). If the
+presser is not an approver, the card does not change and the presser sees the refusal. The card
+of a group names who can decide.
 
 **Limits of M1.13.**
 
 - The lockout, the repeat filter, and the run followers are in memory. A restart of the gateway
   loses the followers: the runs go on, but their replies do not reach Telegram.
-- The group toolset (Section 11.3) is not applied yet.
 - `clarify` questions do not show in Telegram yet.
 - Voice notes use the OpenAI key of the org in the vault, else the `OPENAI_API_KEY` of the
   process. Without a key, voice notes are off. The key never goes to a sandbox.
@@ -2082,7 +2147,9 @@ or not available.
   retention work.
 - A7. The Anthropic key of the org pays for the call. An org with no key has no image analysis.
 - A8. The agent profile of an existing org keeps its own toolset list. Only the default list
-  gets `media`. An admin adds `media` to a changed list.
+  gets `media`. An admin adds `media` to a changed list. The group set (Section 11.3) is
+  separate: migration `0017` fills it for each existing profile with the default group list, cut
+  to the toolsets of the profile.
 - A9. The fence and the list of pending records are in memory. A restart of the control plane
   loses them, the same as for the model proxy. A durable queue is in the backlog (Section 16.6).
 - A10. A cancelled call is charged with an estimate that is higher than the usual cost of a
@@ -2319,14 +2386,16 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 
 0. **Authority** (M1.18): the run must not be ended, the run user must still see the
    session, and the run must not have spent its live budget. Otherwise `deny`.
-1. **Toolset**: the tool must be in the run's toolsets. Otherwise `deny`.
+1. **Toolset**: the tool must be in the run's toolsets. Otherwise `deny`. In a shared
+   session the toolsets are the group set of the profile (Section 11.3).
 2. **Hardline**: a fixed deny list that nothing overrides (for example `rm -rf /`, fork
    bombs, disk wipes, piping a remote script to a shell as root).
 3. **Recorded decision**: a one-time human decision for this call id, if any. A `deny`
    policy rule wins over a recorded approval, so a newer deny applies at once (Section 5.1).
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
-   mode. The default for unknown tools is `ask`.
+   mode. The default for unknown tools is `ask`. In a shared session, `memory` also has the
+   default `ask` (Section 11.3).
 5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
    pre-approval for this tool in this job version, and the call fits its connection and
    argument limits (Section 12.1).
@@ -2339,7 +2408,13 @@ gate (step 1), so every other tool gets `deny`. The `memory` and `skill_*` tools
 for a write that needs approval (Section 9.4). `decide_approval` checks the scope of a proposal:
 an `org` scope needs the org `owner`, and `agent` and `workspace` scope need a workspace `admin`.
 For a proposal the role decides and the access to the session does not (Section 9.4.1). It
-ignores `always_allow` for a proposal.
+ignores `always_allow` for a proposal. A review run does not use the group set of a shared
+session, and its `memory` calls are not asked again.
+
+**Shared sessions.** `GateContext.shared` is true for a `chat` run of a shared session. The
+toolsets then come from `effective_toolsets` (the group set), and `memory` has the default
+`ask`. `decide_approval` lets only the approvers decide a non-proposal approval of a shared
+session (`src/sama/gate/approvers.py`, Section 11.3).
 
 **Code (M1.9).**
 
@@ -2426,7 +2501,8 @@ Records, all in the transaction of the verdict:
 Approvals:
 
 - `GateService.decide_approval` records a human decision. Only a user who can read the session
-  decides (the rule of `session_visible`). A decision after `expires_at` raises
+  decides (the rule of `session_visible`). In a shared session, only the requester of the run,
+  the admins, and the listed approvers decide (Section 11.3). A decision after `expires_at` raises
   `ApprovalExpiredError` and the approval becomes `expired`.
 - With "always allow", it writes a user rule (`allow`) for the tool and the run profile, and
   the audit row `tool_policy.set`.
@@ -2870,7 +2946,7 @@ migrated schema.
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
-| `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `skills`, `policy`, `budget` |
+| `agent_profiles` | `org_id`, `workspace_id` (null for the org), `name`, `soul`, `runtime`, `model`, `toolsets`, `group_toolsets` (migration `0017`), `skills`, `policy`, `budget` |
 | `sessions` | `org_id`, `workspace_id`, `agent_profile_id`, `audience`, `owner_user_id`, `parent_session_id`, `lineage`, `title`, `status`, `sandbox_id` (migration `0005`), `run_config`, `config_fingerprint` (migration `0006`, Section 6.1) |
 | `messages` | `org_id`, `session_id`, `run_id`, `seq`, `role`, `author_user_id`, `content`, `search_vector` (generated, GIN index) and `embedded_at` (migration `0014`, Section 7.1) |
 | `runs` | `org_id`, `session_id`, `agent_profile_id`, `status`, `runtime`, `config_fingerprint`, `budget`, `usage`, `runtime_state`, `failure_code`, `unattended` (migration `0004`), the queue columns `lease_owner`, `lease_expires_at`, `attempts`, `cancel_requested_at`, `pending_approval_id`, `resume_decision`, `resume_reason` (migration `0005`, Section 4.3), `trace_exported_at` (migration `0009`, Section 18.2) |

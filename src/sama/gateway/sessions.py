@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import (
     ENDED_RUN_STATUSES,
+    AgentProfile,
     Approval,
     AuditEntry,
     Message,
@@ -31,7 +32,9 @@ from sama.db.models import (
     RunEvent,
     Session,
     SessionBinding,
+    User,
 )
+from sama.gate.approvers import Approvers, approvers_of
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.orchestrator.queue import RunQueue
 from sama.review.shown import shown_proposal
@@ -307,6 +310,24 @@ async def read_run(
                         ReviewProposal.kind.label("proposal_kind"),
                         ReviewProposal.scope.label("proposal_scope"),
                         ReviewProposal.payload.label("proposal_payload"),
+                        Session.audience,
+                        AgentProfile.policy,
+                        User.display_name.label("requester_name"),
+                        Run.triggered_by_user_id.label("requester_id"),
+                    )
+                    .join(Run, (Run.org_id == Approval.org_id) & (Run.id == Approval.run_id))
+                    .join(
+                        Session,
+                        (Session.org_id == Approval.org_id) & (Session.id == Approval.session_id),
+                    )
+                    .join(
+                        AgentProfile,
+                        (AgentProfile.org_id == Run.org_id)
+                        & (AgentProfile.id == Run.agent_profile_id),
+                    )
+                    .outerjoin(
+                        User,
+                        (User.org_id == Run.org_id) & (User.id == Run.triggered_by_user_id),
                     )
                     .outerjoin(
                         ReviewProposal,
@@ -355,12 +376,36 @@ async def failure_message(engine: AsyncEngine, org_id: uuid.UUID, run_id: uuid.U
 
 @dataclass(frozen=True, slots=True)
 class ShownApproval:
-    """``id``, ``tool_name``, ``reason``, and ``arguments`` for an approval card."""
+    """``id``, ``tool_name``, ``reason``, and ``arguments`` for an approval card.
+    ``answerers`` tells a group who may decide it, or is ``None`` where it is not needed."""
 
     id: uuid.UUID
     tool_name: str
     reason: str
     arguments: Any
+    answerers: str | None = None
+
+
+MAX_NAME_CHARS: Final = 60
+
+
+def answerers_text(
+    requester: str | None, approvers: Approvers, *, has_requester: bool = True
+) -> str:
+    """Who may decide an approval of a shared session (Section 11.3). It names the person who
+    asked (or says so without a name), the approvers that the profile lists, and the admins
+    of the workspace and of the org."""
+    if approvers.any_member:
+        return "Each member of the workspace can decide this."
+    who: list[str] = []
+    if has_requester:
+        name = " ".join((requester or "").split())[:MAX_NAME_CHARS]
+        who.append(f"{name} (who asked)" if name else "the person who asked")
+    if approvers.users:
+        who.append("a person who is listed as an approver")
+    who.append("a workspace or org admin")
+    text = who[0] if len(who) == 1 else f"{', '.join(who[:-1])} or {who[-1]}"
+    return f"{text[0].upper()}{text[1:]} can decide this."
 
 
 def _shown_approval(row: Any) -> ShownApproval:
@@ -369,8 +414,17 @@ def _shown_approval(row: Any) -> ShownApproval:
     reason, arguments = row.reason, row.arguments
     if row.proposal_payload is not None:
         shown = shown_proposal(row.proposal_kind, row.proposal_scope, row.proposal_payload)
-        reason, arguments = shown.reason, shown.arguments
-    return ShownApproval(row.id, row.tool_name, reason, arguments)
+        return ShownApproval(row.id, row.tool_name, shown.reason, shown.arguments)
+    answerers = (
+        answerers_text(
+            row.requester_name,
+            approvers_of(row.policy),
+            has_requester=row.requester_id is not None,
+        )
+        if row.audience == "shared"
+        else None
+    )
+    return ShownApproval(row.id, row.tool_name, reason, arguments, answerers)
 
 
 def approval_text(row: Any) -> str:
@@ -378,7 +432,10 @@ def approval_text(row: Any) -> str:
     arguments = json.dumps(row.arguments, ensure_ascii=False, indent=1)
     if len(arguments) > MAX_ARGUMENT_CHARS:
         arguments = arguments[:MAX_ARGUMENT_CHARS] + "\n..."
-    return f"Approval needed: {row.tool_name}\n{row.reason}\n\n{arguments}".strip()
+    head = f"Approval needed: {row.tool_name}\n{row.reason}"
+    if row.answerers:
+        head = f"{head}\n{row.answerers}"
+    return f"{head}\n\n{arguments}".strip()
 
 
 async def _bind(

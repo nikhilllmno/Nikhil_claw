@@ -49,7 +49,7 @@ async def gateway(
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=["core", "skills"])
+            .values(toolsets=["core", "skills"], group_toolsets=["core", "skills"])
         )
     client = TelegramClient(
         SecretStr(f"{BOT_ID}:token"),
@@ -154,7 +154,7 @@ async def test_the_skills_toolset_is_needed(
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.id == tenant.ids["profile"])
-            .values(toolsets=["core"])
+            .values(toolsets=["core"], group_toolsets=["core"])
         )
     await pair(gateway, engine, tenant)
     await gateway.handle_update(message("/skills"))

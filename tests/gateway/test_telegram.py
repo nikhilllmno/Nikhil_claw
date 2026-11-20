@@ -11,10 +11,11 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import (
+    AgentProfile,
     AuditEntry,
     ChannelGroup,
     ChannelIdentity,
@@ -24,6 +25,7 @@ from sama.db.models import (
     SessionBinding,
     User,
 )
+from sama.gate.approvers import SHARED_REFUSAL
 from sama.gateway.pairing import create_code
 from sama.gateway.telegram import (
     BUSY,
@@ -631,3 +633,157 @@ async def test_updates_of_one_chat_run_one_at_a_time(
     assert most == 1
     assert sorted(order) == ["a", "b", "c"]
     assert len(gateway._chat_locks) == 0, "the lock goes away when no update waits"
+
+
+# -- approvals in a group (Section 11.3) -------------------------------------------------------
+
+BEN_TG = 9009
+
+
+async def add_ben(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    *,
+    role: str = "member",
+) -> None:
+    """A second member of the workspace, with a linked Telegram account."""
+    ben = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(User).values(
+                id=ben,
+                org_id=tenant.org,
+                auth_user_id=uuid.uuid4(),
+                email="ben@example.test",
+                display_name="ben",
+            )
+        )
+        await connection.execute(
+            insert(Membership).values(org_id=tenant.org, user_id=ben, role="member")
+        )
+        await connection.execute(
+            insert(Membership).values(
+                org_id=tenant.org, user_id=ben, workspace_id=tenant.ids["ws"], role=role
+            )
+        )
+    tenant.ids["ben"] = ben
+    code = await code_for(engine, tenant, user="ben")
+    await gateway.handle_update(message(f"/start {code}", chat=BEN_TG, sender=BEN_TG))
+
+
+async def group_card(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+    harness: Harness,
+) -> dict[str, Any]:
+    """Mia asks in the linked group. The run pauses for an approval. Gives the card."""
+    await pair(gateway, engine, tenant)
+    group_code = await code_for(engine, tenant, kind="group")
+    await gateway.handle_update(message(f"/pair@sama_bot {group_code}", chat=GROUP))
+    harness.runtime.add_script(approval_script())
+    await gateway.handle_update(message("@sama_bot clean up", chat=GROUP))
+    assert await harness.worker.run_once()
+
+    async def carded() -> bool:
+        return any("reply_markup" in body for body in telegram.sent(GROUP))
+
+    await until(carded)
+    return next(body for body in telegram.sent(GROUP) if "reply_markup" in body)
+
+
+def press(card: dict[str, Any], sender: int, name: str, callback_id: str) -> dict[str, Any]:
+    return {
+        "update_id": next(_update_ids),
+        "callback_query": {
+            "id": callback_id,
+            "from": {"id": sender, "first_name": name},
+            "data": card["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "message": {"message_id": 101, "chat": {"id": GROUP}, "text": card["text"]},
+        },
+    }
+
+
+def last_answer(telegram: FakeTelegram) -> dict[str, Any]:
+    return [body for method, body in telegram.calls if method == "answerCallbackQuery"][-1]
+
+
+async def test_a_group_card_names_who_may_decide_and_refuses_another_member(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    harness = Harness(engine)
+    card = await group_card(gateway, engine, tenant, telegram, harness)
+    assert "Mia (who asked) or a workspace or org admin can decide this." in card["text"]
+    await add_ben(gateway, engine, tenant)
+
+    await gateway.handle_update(press(card, BEN_TG, "Ben", "cb-ben"))
+    answer = last_answer(telegram)
+    assert answer["callback_query_id"] == "cb-ben"
+    assert answer["text"] == SHARED_REFUSAL, "the member is told why the press does not count"
+    assert not [call for call in telegram.calls if call[0] == "editMessageText"]
+    assert not await harness.worker.run_once(), "the run still waits for the approval"
+
+    await gateway.handle_update(press(card, MIA_TG, "Mia", "cb-mia"))
+    assert last_answer(telegram) == {"callback_query_id": "cb-mia", "text": "Approved"}
+    assert await harness.worker.run_once()
+
+
+async def test_a_workspace_admin_decides_a_group_card(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    harness = Harness(engine)
+    card = await group_card(gateway, engine, tenant, telegram, harness)
+    await add_ben(gateway, engine, tenant, role="admin")
+    await gateway.handle_update(press(card, BEN_TG, "Ben", "cb-ben"))
+    assert last_answer(telegram)["text"] == "Approved"
+
+
+async def test_a_star_approver_lets_any_member_decide_a_group_card(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(policy={"approvers": ["*"]})
+        )
+    harness = Harness(engine)
+    card = await group_card(gateway, engine, tenant, telegram, harness)
+    assert "Each member of the workspace can decide this." in card["text"]
+    await add_ben(gateway, engine, tenant)
+    await gateway.handle_update(press(card, BEN_TG, "Ben", "cb-ben"))
+    assert last_answer(telegram)["text"] == "Approved"
+
+
+async def test_a_group_card_names_the_listed_approvers_and_an_unnamed_requester(
+    gateway: TelegramGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(policy={"approvers": [str(uuid.uuid4())]})
+        )
+        await connection.execute(
+            update(User).where(User.id == tenant.ids["mia"]).values(display_name=" ")
+        )
+    harness = Harness(engine)
+    card = await group_card(gateway, engine, tenant, telegram, harness)
+    assert (
+        "The person who asked, a person who is listed as an approver or a workspace or org"
+        " admin can decide this."
+    ) in card["text"]

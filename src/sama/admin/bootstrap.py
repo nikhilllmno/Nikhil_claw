@@ -29,6 +29,10 @@ DEFAULT_TOOLSETS: Final = (
     "sessions",
     "media",
 )
+DEFAULT_GROUP_TOOLSETS: Final = ("todo", "web", "clarify", "memory", "sessions", "media")
+"""The toolsets of a shared session (Section 10.2): no shell, no code edit, no outbound write.
+``skills`` is out because ``skill_manage`` writes workspace skills. ``github`` is out because
+``repo_clone`` needs the sandbox. Migration 0017 has a copy of this list."""
 
 
 class BootstrapError(ValueError):
@@ -129,6 +133,7 @@ async def bootstrap(
                 name=profile_name,
                 model=model,
                 toolsets=list(DEFAULT_TOOLSETS),
+                group_toolsets=list(DEFAULT_GROUP_TOOLSETS),
             )
             .returning(AgentProfile.id),
         )

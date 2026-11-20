@@ -8,7 +8,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.admin.__main__ import main
-from sama.admin.bootstrap import BootstrapError, Owner, bootstrap
+from sama.admin.bootstrap import DEFAULT_GROUP_TOOLSETS, BootstrapError, Owner, bootstrap
 from sama.db.models import AgentProfile, Membership, Org, User, Workspace
 from sama.tenancy.access import load_grants
 
@@ -41,9 +41,12 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
         )
         profile = (
             await connection.execute(
-                select(AgentProfile.workspace_id, AgentProfile.model, AgentProfile.toolsets).where(
-                    AgentProfile.id == first.agent_profile_id
-                )
+                select(
+                    AgentProfile.workspace_id,
+                    AgentProfile.model,
+                    AgentProfile.toolsets,
+                    AgentProfile.group_toolsets,
+                ).where(AgentProfile.id == first.agent_profile_id)
             )
         ).one()
         grants = await load_grants(connection, first.org_id, first.user_id)
@@ -52,7 +55,9 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
         None,
         "claude-sonnet-5-5",
         ["core", "todo", "web", "clarify", "github", "memory", "skills", "sessions", "media"],
+        list(DEFAULT_GROUP_TOOLSETS),
     )
+    assert {"core", "github", "skills"}.isdisjoint(profile[3])
     assert grants.sees_workspace(first.workspace_id)
 
 

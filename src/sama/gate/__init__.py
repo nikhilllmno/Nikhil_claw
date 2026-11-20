@@ -19,6 +19,7 @@ from sama.gate.decide import (
     canonical_name,
     decide,
     decide_recorded,
+    effective_toolsets,
     policy_verdict,
 )
 from sama.gate.hardline import command_problem, hardline_problem
@@ -36,6 +37,7 @@ __all__ = [
     "command_problem",
     "decide",
     "decide_recorded",
+    "effective_toolsets",
     "hardline_problem",
     "policy_verdict",
 ]
