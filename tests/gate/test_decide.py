@@ -23,7 +23,15 @@ from sama.gate import (
     effective_toolsets,
     policy_verdict,
 )
-from sama.gate.decide import CHILD_BLOCKED_TOOLSETS, TOOLSETS, Preapproval, connection_of, tools_of
+from sama.gate.decide import (
+    CHILD_BLOCKED_TOOLSETS,
+    TOOLSETS,
+    Preapproval,
+    connection_of,
+    narrow_toolsets,
+    run_limit,
+    tools_of,
+)
 from sama.gate.hardline import MAX_COMMAND_CHARS
 from sama.gate.service import stored_arguments
 from sama.runtime.contract import ApprovalRequired
@@ -538,6 +546,22 @@ def test_the_delegation_and_task_tools_are_in_their_toolsets() -> None:
     assert "delegation" not in DEFAULT_GROUP_TOOLSETS
 
 
+def test_the_run_toolsets_only_remove_toolsets() -> None:
+    limit = ["todo", "web", "media"]
+    assert effective_toolsets(PROFILE, GROUP, audience="private", run_toolsets=limit) == {"todo"}
+    assert effective_toolsets(PROFILE, GROUP, audience="shared", run_toolsets=limit) == {
+        "todo",
+        "web",
+    }
+    assert effective_toolsets(PROFILE, GROUP, audience="private", run_toolsets=[]) == frozenset()
+    assert effective_toolsets(PROFILE, GROUP, audience="private", run_toolsets=None) == frozenset(
+        PROFILE
+    )
+    assert run_limit(None) is None
+    assert run_limit(["web", 1]) == ["web", "1"]
+    assert run_limit({"web": True}) == [], "a value that is not a list allows nothing"
+
+
 def test_the_default_group_toolsets_have_no_shell_no_edit_and_no_outbound_write() -> None:
     assert set(DEFAULT_GROUP_TOOLSETS) <= set(TOOLSETS), "each default group toolset has tools"
     assert set(DEFAULT_GROUP_TOOLSETS) <= set(DEFAULT_TOOLSETS)
@@ -754,3 +778,11 @@ def test_a_rule_can_deny_the_subagent_tool() -> None:
         {"subagent_type": "researcher"},
     )
     assert verdict.action == "deny"
+
+
+def test_narrow_toolsets_keeps_every_limit() -> None:
+    assert narrow_toolsets() is None
+    assert narrow_toolsets(None, None) is None
+    assert narrow_toolsets(["web", "media"], None) == ["web", "media"]
+    assert narrow_toolsets(None, ["web", "media"], ["media", "core"]) == ["media"]
+    assert narrow_toolsets(["web"], "not a list") == []

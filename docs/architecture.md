@@ -2030,8 +2030,8 @@ as it is.
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool. | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
-`coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, vision,
-clarify; for webhook triggers), and `cron` (like `assistant` but no `cron` and no `clarify`).
+`coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, media,
+clarify; the default of an event trigger, Section 12.2), and `cron` (like `assistant` but no `cron` and no `clarify`).
 A profile also has a **group set**: the toolsets that a chat run in a shared session uses
 (Section 11.3). The default group set is `todo`, `web`, `clarify`, `memory`, `sessions`,
 `media`, and `tasks`. It has no `core`, `code_exec`, `skills`, `github`, `delegation`,
@@ -2192,7 +2192,8 @@ gets one notice per change.
   RLS policy, and one row per `(org, workspace, connector, owner)` (`NULLS NOT DISTINCT`, so
   one workspace connection per connector). A member sees the workspace connections and only
   their own personal connections. The vault takes the names `composio_api_key` and
-  `connection:<uuid>`.
+  `connection:<uuid>`. Since M4.4, a Composio trigger instance on the account of a connection
+  can start runs (Section 12.2).
 - **Catalog.** `connectors/catalog/` has `gmail`, `googlecalendar`, `github`, `slack`, and
   `linear` (kind `composio`), and `notion` (kind `http_api`, a form with an API key). The
   tool schemas are a trimmed copy of the Composio schemas. Each tool has `access`: `read`,
@@ -3242,6 +3243,65 @@ Webhooks (signed, one URL per trigger), Composio triggers, and channel events (f
 message in #support that matches a pattern") can start a run or a workflow. Event payloads
 are untrusted. Event-triggered runs use the `safe` toolset unless the trigger says otherwise.
 
+**What M4.4 builds**
+
+- **Tables.** Migration `0025` adds `triggers` (one event source of a workspace) and
+  `trigger_events` (one row for each accepted delivery), both with `org_id` and RLS. A member of
+  the workspace or an org admin sees its triggers. An event row shows to the users who can read
+  its session. The migration also adds `runs.toolsets` and the vault names `trigger:<uuid>` and
+  `composio_webhook_secret`. The field `target` takes only `run`. Workflows (M4.5) add a value.
+- **Kinds.** A `webhook` trigger has its own URL, `<SAMA_PUBLIC_URL>/triggers/<id>/webhook`,
+  and its own secret `whsec_<base64>` in the vault entry `trigger:<id>`. Sama shows the secret
+  one time, when it makes or rotates it. A `composio` trigger is a Composio trigger instance
+  (a slug such as `GMAIL_NEW_GMAIL_MESSAGE` and a config) on the account of a connection. Sama
+  makes the instance when it makes the trigger and deletes it with the trigger. Composio gives
+  the same instance for the same account, slug, and config, so a second trigger for it gets
+  `409`, and the instance of the first trigger stays. A transaction lock on the connection,
+  slug, and config covers the upsert, the insert, and the clean-up of a create, and the
+  clean-up of a delete. A request that waits for the lock tries again and keeps no database
+  connection while it waits. After 30 seconds it gets `409`. Sama deletes an instance only when
+  no trigger row uses it.
+- **Signature.** Both kinds use the Standard Webhooks scheme: the headers `webhook-id`,
+  `webhook-timestamp`, and `webhook-signature` (`v1,<base64 HMAC-SHA256>` of
+  `<id>.<timestamp>.<body>`). Sama compares in constant time. A timestamp more than 300 seconds
+  from now is refused. The key of a webhook trigger is the decoded part of its secret. The key
+  of Composio is the webhook secret of the org (vault entry `composio_webhook_secret`), else
+  `SAMA_COMPOSIO_WEBHOOK_SECRET`. A GitHub-style signature has no timestamp, so sama does not
+  accept it.
+- **Limits.** Sama reads at most 1 MiB of a body (`413`), also when the body has no
+  `Content-Length`. A body that is not JSON, or that has more than 64 levels of arrays and
+  objects, gets `400`. A bad signature and an unknown trigger
+  get the same `401`. A disabled trigger gets `410`. A replay (the same `webhook-id` for the
+  same trigger) gets `200` with `duplicate` and starts nothing. Over the message rate of the
+  owner, the answer is `429` with `Retry-After`, and no row stays, so the sender tries again.
+- **Runs.** One transaction makes a private session of the trigger owner (`Trigger: <name>`),
+  queues an unattended run as the owner, and writes the event row. The message is the prompt of
+  the trigger and the payload as compact JSON, redacted, cut at 20,000 characters, and in an
+  `untrusted_content` block. The transaction reads the trigger again with a share lock, so a
+  change or a disable that commits after the signature check applies to the run. A Composio
+  event for a trigger that is gone at that time gets `200` with `ignored`. `runs.toolsets`
+  limits the run to the toolsets of the trigger and of the profile, in the gate, the prompt,
+  and the skills. The default is `safe`. Only a workspace admin, an org admin, or the org owner
+  can give more than `safe`. A trigger cannot have `delegation` or `tasks`, the toolsets that
+  start other runs. A run that another run starts (a delegated child, a steer, or a task card)
+  also keeps the `runs.toolsets` limit of the run that started it. Unattended rules
+  apply (Section 12.1): `ask` becomes `deny`, and `clarify` gets no answer. If the owner cannot
+  see the workspace now, the event gets `410` and the trigger gets `last_error`.
+- **Management.** `GET` and `POST /workspaces/{id}/triggers`, `GET`, `PATCH`, and `DELETE
+  /workspaces/{id}/triggers/{trigger}`, and `POST .../secret` (rotate). A member makes a
+  webhook trigger. A Composio trigger needs a user who manages the connection (Section 10.3).
+  Only the owner or an admin changes or deletes a trigger. Each change writes an audit row
+  (`trigger.created`, `trigger.updated`, `trigger.secret_rotated`, `trigger.deleted`).
+  `PUT /orgs/{id}/composio/webhook` (org admin) subscribes the Composio project of an org with
+  its own `composio_api_key` to `<SAMA_PUBLIC_URL>/composio/webhook` and keeps the secret in the
+  vault. The operator subscribes the project of sama and sets `SAMA_COMPOSIO_WEBHOOK_SECRET`.
+- **Not in M4.4.** Workflows as targets (M4.5), delivery of the answer to a channel (M4.3; the
+  answer stays in the trigger session), channel events, and a web page. A follow-up message
+  in a trigger session is a normal run with the toolsets of the profile. A late Composio
+  event for a deleted trigger of an org with its own Composio project gets `401`, not `200`:
+  without the trigger row, sama does not know the org, so it checks with the secret of the
+  process.
+
 ### 12.3 Workflows
 
 A workflow is a saved, versioned definition of steps. It turns a task that works into a
@@ -4136,7 +4196,9 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 
 - The **sama vault** (`sama.vault`, M1.17) holds the secrets of each org. M1 stores the
   Anthropic, OpenAI, and Brave keys and the tokens of the integrations (Section 11.6).
-  Connection tokens and browser logins come with their milestones (M3, M5).
+  Connection tokens and browser logins come with their milestones (M3, M5). Since M4.4, the
+  vault also holds the signing secret of each webhook trigger (`trigger:<id>`) and the
+  Composio webhook secret of an org (`composio_webhook_secret`, Section 12.2).
 - **Envelope encryption.** Each entry has its own random 256-bit data key. AES-256-GCM
   encrypts the value with the data key, and the vault key (`SAMA_VAULT_KEY`, 32 bytes in
   base64) encrypts the data key. Both steps bind the org id and the name, so a row that is
@@ -4765,6 +4827,7 @@ the start with a message that names the variable but not its value.
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
+| `SAMA_COMPOSIO_WEBHOOK_SECRET` | No | The signing secret of the Composio webhook subscription of the sama project (Section 12.2). An org secret in the vault (`composio_webhook_secret`) comes first. Without both, sama refuses Composio events. |
 | `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |

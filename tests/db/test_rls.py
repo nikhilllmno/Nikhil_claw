@@ -41,6 +41,7 @@ SESSION_CHILDREN = (
     "session_compactions",
     "context_pins",
     "runtime_session_items",
+    "trigger_events",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 
@@ -59,6 +60,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "pairing_codes": {"code:alice"},
         "integrations": {"int:org-a"},
         "connections": {"conn:a1", "conn:a1-alice"},
+        "triggers": {"trig:a1"},
         "memories": {"mem:alice", "mem:a1", "mem:a1-agent"},
         "memory_revisions": {"rev:mem:alice", "rev:mem:a1", "rev:mem:a1-agent"},
         "github_installations": {"gh-inst:org-a"},
@@ -81,6 +83,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "pairing_codes": set(),
         "integrations": {"int:org-a"},
         "connections": {"conn:a1", "conn:a2"},
+        "triggers": {"trig:a1", "trig:a2"},
         "memories": {"mem:a1", "mem:a2", "mem:a1-agent"},
         "memory_revisions": {"rev:mem:a1", "rev:mem:a2", "rev:mem:a1-agent"},
         "github_installations": {"gh-inst:org-a"},
@@ -103,6 +106,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "pairing_codes": set(),
         "integrations": {"int:org-a"},
         "connections": set(),
+        "triggers": set(),
         "memories": {"mem:dave"},
         "memory_revisions": {"rev:mem:dave"},
         "github_installations": {"gh-inst:org-a"},
@@ -125,6 +129,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "pairing_codes": {"code:bob"},
         "integrations": {"int:org-b"},
         "connections": {"conn:b1", "conn:b1-bob"},
+        "triggers": {"trig:b1"},
         "memories": {"mem:bob", "mem:b1"},
         "memory_revisions": {"rev:mem:bob", "rev:mem:b1"},
         "github_installations": {"gh-inst:org-b"},
@@ -147,6 +152,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "pairing_codes": set(),
         "integrations": set(),
         "connections": set(),
+        "triggers": set(),
         "memories": set(),
         "memory_revisions": set(),
         "github_installations": set(),

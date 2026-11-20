@@ -334,20 +334,47 @@ def effective_toolsets(
     audience: str,
     kind: str = "chat",
     lineage: str | None = None,
+    run_toolsets: Iterable[str] | None = None,
 ) -> frozenset[str]:
     """The toolsets of a run (Section 10.2). A chat run in a shared session has the group
     toolsets of the profile, and not its toolsets. A private session has the toolsets. A
     background review has the toolsets of the profile that the review clamp keeps (Section
     9.4): it has no person in it, and its changes of shared state are proposals that a person
     decides, so the group toolsets do not apply to it. A delegated child (lineage
-    ``delegation``) loses ``CHILD_BLOCKED_TOOLSETS`` (Section 13.2)."""
+    ``delegation``) loses ``CHILD_BLOCKED_TOOLSETS`` (Section 13.2).
+
+    ``run_toolsets`` is the limit of the run itself (``runs.toolsets``), for example the
+    toolsets of an event trigger (Section 12.2). It can only remove toolsets."""
     if audience == "shared" and kind != "review":
         found = frozenset(group_toolsets)
     else:
         found = frozenset(toolsets)
+    if run_toolsets is not None:
+        found &= frozenset(run_toolsets)
     if lineage == DELEGATION_LINEAGE:
         return found - CHILD_BLOCKED_TOOLSETS
     return found
+
+
+def run_limit(value: Any) -> list[str] | None:
+    """The toolset limit of a run from the JSON column ``runs.toolsets`` (Section 12.2). Null
+    means no limit. A value that is not a list allows no toolset."""
+    if value is None:
+        return None
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def narrow_toolsets(*limits: Any) -> list[str] | None:
+    """The toolset limit that obeys all the limits (``runs.toolsets`` values). Null means no
+    limit. A run that another run starts (a child, a steer, a task card) keeps the limit of
+    the run that started it, so a trigger run cannot get more toolsets that way."""
+    out: list[str] | None = None
+    for value in limits:
+        limit = run_limit(value)
+        if limit is None:
+            continue
+        out = limit if out is None else [name for name in out if name in limit]
+    return out
 
 
 def json_default(value: Any) -> Any:

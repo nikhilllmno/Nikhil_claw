@@ -34,6 +34,7 @@ from sama.db.models import (
     Task,
     TaskComment,
 )
+from sama.gate.decide import narrow_toolsets
 from sama.orchestrator.queue import QueueError, RunQueue
 
 log = logging.getLogger("sama.tasks")
@@ -242,6 +243,20 @@ class TaskDispatcher:
         if profile is None or profile[0] not in (None, card.workspace_id):
             await self._block(connection, card, "the agent profile is not in this workspace")
             return "blocked"
+        # The card run keeps the toolset limit of the run that made the card (a trigger run,
+        # Section 12.2). The card outlives that run, so a run that is gone gives no limit. A
+        # trigger cannot have the ``tasks`` toolset, so a trigger run does not make cards.
+        maker_limit = (
+            (
+                await connection.execute(
+                    select(Run.toolsets).where(
+                        Run.org_id == card.org_id, Run.id == card.created_by_run_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if card.created_by_run_id is not None
+            else None
+        )
         try:
             # A savepoint: a rate limit undoes this card and keeps the other cards of the pass.
             async with connection.begin_nested():
@@ -267,6 +282,7 @@ class TaskDispatcher:
                     text=task_prompt(card, list(dependencies)),
                     user_id=user_id or card.created_by_user_id,
                     unattended=True,
+                    toolsets=narrow_toolsets(maker_limit),
                 )
                 await connection.execute(
                     update(Task)

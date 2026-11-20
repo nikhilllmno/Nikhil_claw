@@ -64,6 +64,8 @@ from sama.db.models import (
     TaskComment,
     ToolCall,
     ToolPolicy,
+    Trigger,
+    TriggerEvent,
     User,
     VaultSecret,
     WorkerBot,
@@ -423,6 +425,34 @@ def plan(
             connector="gmail",
             kind="composio",
             created_by_user_id=ids[creator],
+        )
+    # Event triggers show to the workspace. A trigger event shows with its session.
+    triggers: tuple[tuple[str, str, str, str, str], ...] = (
+        ("trig:a1", "org-a", "a1", "alice", "profile-a"),
+        ("trig:a2", "org-a", "a2", "carol", "profile-a2"),
+        ("trig:b1", "org-b", "b1", "bob", "profile-b"),
+    )
+    for label, org, workspace, owner, profile in triggers:
+        add(
+            Trigger,
+            label,
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            owner_user_id=ids[owner],
+            agent_profile_id=ids[profile],
+            kind="webhook",
+            name=label,
+            prompt=f"prompt of {label}",
+            created_by_user_id=ids[owner],
+        )
+    for session, org, workspace, _, _, _ in sessions:
+        add(
+            TriggerEvent,
+            org_id=ids[org],
+            trigger_id=ids[f"trig:{workspace}"],
+            delivery_id=f"msg_{session}",
+            session_id=ids[session],
+            run_id=ids[f"run:{session}"],
         )
     # Telegram links: each user reads only their own; a group shows to the workspace.
     for user, org, workspace, profile in (

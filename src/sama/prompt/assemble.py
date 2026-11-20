@@ -9,6 +9,7 @@ session.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import logging
 import uuid
@@ -16,12 +17,19 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
-from sqlalchemy import case, insert, or_, select, update
+from sqlalchemy import and_, case, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.engine import autocommit
-from sama.db.models import AgentProfile, AuditEntry, Session, SessionBinding, StoredContextFile
-from sama.gate.decide import effective_toolsets
+from sama.db.models import (
+    AgentProfile,
+    AuditEntry,
+    Run,
+    Session,
+    SessionBinding,
+    StoredContextFile,
+)
+from sama.gate.decide import effective_toolsets, run_limit
 from sama.prompt.scan import scan
 from sama.review.policy import SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT
 from sama.runtime.contract import (
@@ -244,7 +252,10 @@ class PromptAssembler:
         self, connection: AsyncConnection, run: ClaimedRun
     ) -> tuple[SkillIndexEntry, ...]:
         """The skill index of the run. It is frozen with the config (Section 6.1)."""
-        if self._skills is None or "skills" not in await _toolsets(connection, run):
+        if self._skills is None:
+            return ()
+        toolsets = await _toolsets(connection, run)
+        if "skills" not in toolsets:
             return ()
         actor = await self._skills.actor(
             connection,
@@ -255,18 +266,25 @@ class PromptAssembler:
             private=run.audience == "private",
             kind=run.kind,
         )
+        # The toolsets of the run, with the limit of the run (Section 12.2).
+        actor = dataclasses.replace(actor, toolsets=toolsets)
         skills = await self._skills.index(connection, actor)
         return tuple(SkillIndexEntry(name=s.name, description=s.description) for s in skills)
 
 
 async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[str]:
     """The toolsets of the run: the group toolsets of the profile for a chat run in a shared
-    session (Sections 10.2 and 11.3), else the toolsets. The gate uses the same rule."""
+    session (Sections 10.2 and 11.3), else the toolsets, and only the toolsets in the limit of
+    the run (``runs.toolsets``, Section 12.2). The gate uses the same rule."""
     row = (
         await connection.execute(
-            select(AgentProfile.toolsets, AgentProfile.group_toolsets).where(
-                AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id
+            select(
+                AgentProfile.toolsets,
+                AgentProfile.group_toolsets,
+                Run.toolsets.label("run_toolsets"),
             )
+            .join(Run, and_(Run.org_id == AgentProfile.org_id, Run.id == run.run_id))
+            .where(AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id)
         )
     ).one_or_none()
     if row is None:
@@ -277,6 +295,7 @@ async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[s
         audience=run.audience,
         kind=run.kind,
         lineage=run.lineage,
+        run_toolsets=run_limit(row.run_toolsets),
     )
 
 

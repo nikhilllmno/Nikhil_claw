@@ -90,6 +90,7 @@ from sama.tools.repos import RepoCloner
 from sama.tools.server import MCP_PATH, ToolServer
 from sama.tools.todo import PostgresTodoStore
 from sama.tools.web import BraveSearch
+from sama.triggers.service import TriggerService
 from sama.vault.redact import default_redactor
 from sama.vault.store import OrgKeys, SecretName, Vault
 
@@ -403,6 +404,14 @@ def build(
         github=github,
         connections=connections,
         jobs=jobs,
+        triggers=TriggerService(
+            engine,
+            queue=RunQueue(engine),
+            vault=vault,
+            connections=connections,
+            public_url=settings.public_url,
+            composio_secret=settings.composio_webhook_secret,
+        ),
     )
     api_app = api.app()
     tools_app = tools.app()

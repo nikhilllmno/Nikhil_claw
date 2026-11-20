@@ -345,6 +345,20 @@ async def test_the_profile_toolsets_limit_the_tools(engine: AsyncEngine, org: Or
         assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
 
 
+async def test_the_run_toolsets_limit_the_tools(engine: AsyncEngine, org: Org1) -> None:
+    # An event trigger limits its runs to its toolsets (Section 12.2): the run cannot use a
+    # toolset of the profile outside the limit.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["run"]).values(toolsets=["web", "clarify"])
+        )
+    gate = GateService(engine)
+    verdict = await gate.check(org.claims(), "c1", "Read", {})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.TOOLSET)
+    allowed = await gate.check(org.claims(), "c2", "mcp__sama__web_search", {"query": "x"})
+    assert allowed.action == "allow"
+
+
 async def test_rules_come_from_the_org_and_the_run_user(engine: AsyncEngine, org: Org1) -> None:
     gate = GateService(engine)
     await add_rule(engine, org, "Bash", "allow", user="max")

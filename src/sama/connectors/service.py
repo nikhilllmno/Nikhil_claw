@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlencode
 
+from pydantic import SecretStr
 from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -468,6 +469,52 @@ class ConnectionService:
         if account:
             await self._forget_account(org_id, str(account))
         return True
+
+    # -- event triggers (Section 12.2) --------------------------------------------------------
+
+    async def add_trigger(
+        self, org_id: uuid.UUID, view: ConnectionView, slug: str, config: Mapping[str, Any]
+    ) -> str:
+        """Makes a Composio trigger instance of the type ``slug`` on the account of a connected
+        Composio connection. Returns the id of the trigger instance."""
+        if view.kind != "composio" or view.state != "connected":
+            raise ConnectorError("a Composio trigger needs a connected Composio connection")
+        account = await self._account(org_id, view.id)
+        entity = await self._entity(org_id, view.id)
+        if not account or not entity:
+            raise ConnectorError("the connection is not complete")
+        try:
+            return await self._composio.upsert_trigger(
+                await self._composio_key(org_id),
+                slug,
+                user_id=entity,
+                account_id=account,
+                config=config,
+            )
+        except ComposioError as error:
+            client_error = error.status_code is not None and 400 <= error.status_code < 500
+            raise ConnectorError(
+                f"Composio did not make the trigger: {error}",
+                status_code=422 if client_error else 502,
+            ) from None
+
+    async def remove_trigger(self, org_id: uuid.UUID, trigger_id: str) -> None:
+        """Deletes a Composio trigger instance. A failure is logged: sama deleted its row, so an
+        event of the instance finds no trigger and starts no run."""
+        try:
+            await self._composio.delete_trigger(await self._composio_key(org_id), trigger_id)
+        except (ComposioError, ConnectorError) as error:
+            log.warning("a Composio trigger delete failed org=%s: %s", org_id, error)
+
+    async def subscribe_webhook(self, org_id: uuid.UUID, url: str) -> SecretStr:
+        """Points the Composio webhook of the project of the org at ``url`` and returns its
+        signing secret."""
+        try:
+            return await self._composio.webhook_subscription(await self._composio_key(org_id), url)
+        except ComposioError as error:
+            raise ConnectorError(
+                f"Composio did not set the webhook: {error}", status_code=502
+            ) from None
 
     def can_manage(self, view: ConnectionView, grants: Grants) -> bool:
         """The owner manages a personal connection. A workspace admin or the org owner

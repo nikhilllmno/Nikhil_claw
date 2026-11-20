@@ -56,6 +56,7 @@ from sqlalchemy import (
     func,
     insert,
     literal,
+    null,
     select,
     tuple_,
     update,
@@ -387,14 +388,16 @@ class RunQueue:
         budget: Mapping[str, Any] | None = None,
         model: str | None = None,
         check_rate: bool = True,
+        toolsets: Sequence[str] | None = None,
     ) -> uuid.UUID:
         """``enqueue`` in the transaction of the caller. A caller that makes the session in
-        the same transaction (delegation, the task dispatcher) gets the session and the run
-        together, or neither. The scheduler uses it to write the fire and its run in one
-        transaction (Section 12.1). ``budget`` can only make the profile budget smaller
-        (``narrow_budget``). ``model`` pins the model of the run; without it, the run uses the
-        model of the profile. ``check_rate=False`` keeps the lock order but does not apply the
-        message rate: a job fire is not a message of a person."""
+        the same transaction (delegation, the task dispatcher, an event trigger) gets the
+        session and the run together, or neither. The scheduler uses it to write the fire and
+        its run in one transaction (Section 12.1). ``budget`` can only make the profile budget
+        smaller (``narrow_budget``). ``model`` pins the model of the run; without it, the run
+        uses the model of the profile. ``check_rate=False`` keeps the lock order but does not
+        apply the message rate: a job fire is not a message of a person. ``toolsets`` limits
+        the toolsets of the run (``runs.toolsets``, Section 12.2)."""
         await self._rate_lock(connection, org_id)  # the lock order of all enqueues
         # One statement reads the session, the limits, and the rate counts. It comes
         # after the lock statement, so its snapshot has every enqueue before the lock.
@@ -451,6 +454,7 @@ class RunQueue:
                         budget=narrow_budget(session.budget, budget),
                         unattended=unattended,
                         model=model,
+                        toolsets=list(toolsets) if toolsets is not None else null(),
                     )
                     .cte("new_run")
                 )

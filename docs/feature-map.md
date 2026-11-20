@@ -143,11 +143,11 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | No cron recursion | `toolsets.py` (`hermes-cron`) | A job run cannot create jobs: the gate removes the `cron` toolset, and the job service refuses it. Done in M4.2. | Adapt | M4 |
 | Per-job model and script-only jobs | `cron/` | `model` pin (`runs.model`) and `mode: script` in the session sandbox. Done in M4.2. | Adapt | M4 |
 | Unattended approvals deny | `tools/approval*.py` | `ask` becomes `deny` unless a human approved a pre-approval for that tool in that job version (D13, §12.1). | Adapt | M1 |
-| Webhooks (restricted toolset) | `gateway/platforms/webhook*.py` | Signed webhook triggers with the `safe` toolset (§12.2). | Adapt | M4 |
+| Webhooks (restricted toolset) | `gateway/platforms/webhook*.py` | Signed webhook triggers (Standard Webhooks) with the `safe` toolset (§12.2). | Adapt | M4 (M4.4 done) |
 | Heartbeat, goals, loops | `gateway/run_goals.py` | A job with `attach_to_session` runs inside one session (heartbeat). | Adapt | M4 |
 | Automation blueprints | `cron/blueprint_catalog.py` | Workflow templates (§12.3). | Adapt | M4 |
 | Workflows (multi-step, approvals, durable) | none | YAML workflows with tool, agent, approval, branch, parallel, wait steps on the Postgres queue (§12.3). | New | M4 |
-| Composio triggers | none | Composio triggers start runs or workflows (§10.3). | New | M4 |
+| Composio triggers | none | Composio triggers start runs (workflows with M4.5) with the `safe` toolset (§12.2). | New | M4 (M4.4 done) |
 
 ## 9. Channels
 

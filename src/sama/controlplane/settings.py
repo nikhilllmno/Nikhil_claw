@@ -115,6 +115,10 @@ class ControlPlaneSettings:
     composio_key: SecretStr | None = None
     """The Composio API key of the process (``COMPOSIO_API_KEY``). An org can set its own key
     in the vault (``composio_api_key``)."""
+    composio_webhook_secret: SecretStr | None = None
+    """The signing secret of the webhook of the Composio project of the process
+    (``SAMA_COMPOSIO_WEBHOOK_SECRET``). An org with its own Composio key keeps its own secret in
+    the vault (``composio_webhook_secret``)."""
     langfuse: LangfuseConfig | None = None
     slack_webhook_url: SecretStr | None = None
     environment: str | None = None
@@ -142,6 +146,7 @@ class ControlPlaneSettings:
             self.openai_key,
             self.brave_key,
             self.composio_key,
+            self.composio_webhook_secret,
             self.slack_webhook_url,
             self.sendgrid_key,
         ]
@@ -225,6 +230,7 @@ class ControlPlaneSettings:
             openai_key=_secret(env, "OPENAI_API_KEY"),
             brave_key=_secret(env, "BRAVE_API_KEY"),
             composio_key=_secret(env, "COMPOSIO_API_KEY"),
+            composio_webhook_secret=_secret(env, "SAMA_COMPOSIO_WEBHOOK_SECRET"),
             langfuse=langfuse,
             slack_webhook_url=_secret(env, "SAMA_ALERT_SLACK_WEBHOOK_URL"),
             environment=env.get("SAMA_ENVIRONMENT", "").strip() or None,

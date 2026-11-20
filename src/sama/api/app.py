@@ -129,6 +129,8 @@ from sama.skills.service import SkillLibrary
 from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
+from sama.triggers import router as trigger_routes
+from sama.triggers import service as triggers
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
 
 log = logging.getLogger("sama.api")
@@ -317,6 +319,40 @@ class WorkerBotEdit(_Edit):
     agent_profile_id: uuid.UUID | None = None
     channel_id: _BotChannel | None = None
     daily_budget_usd: _BotBudget | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+_TriggerName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=triggers.NAME_MAX_CHARS),
+]
+_TriggerPrompt = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=triggers.PROMPT_MAX_CHARS),
+]
+_TriggerToolsets = Annotated[list[Annotated[str, Field(max_length=100)]], Field(max_length=100)]
+
+
+class NewTriggerBody(_Body):
+    """An event trigger (Section 12.2). Without ``toolsets``, the runs get the ``safe`` preset.
+    A ``composio`` trigger needs ``connection_id`` and ``composio_slug``."""
+
+    kind: Literal["webhook", "composio"]
+    name: _TriggerName
+    prompt: _TriggerPrompt
+    agent_profile_id: uuid.UUID
+    toolsets: _TriggerToolsets | None = None
+    connection_id: uuid.UUID | None = None
+    composio_slug: Annotated[str, Field(max_length=100)] | None = None
+    composio_config: dict[str, Any] | None = None
+
+
+class TriggerEdit(_Edit):
+    """The fields to change. Every field is optional, and a body has at least one."""
+
+    name: _TriggerName | None = None
+    prompt: _TriggerPrompt | None = None
+    toolsets: _TriggerToolsets | None = None
     status: Literal["active", "disabled"] | None = None
 
 
@@ -643,6 +679,7 @@ class SamaApi:
         github: GitHubService | None = None,
         connections: ConnectionService | None = None,
         jobs: JobService | None = None,
+        triggers: triggers.TriggerService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``connections`` the connection routes answer
@@ -654,6 +691,7 @@ class SamaApi:
         self._integrations = integrations
         self._github = github
         self._connections = connections
+        self._triggers = triggers
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -1182,6 +1220,67 @@ class SamaApi:
             org_id, grants = await self._bot_admin(principal, workspace_id)
             await workerbots.delete_bot(self._engine, org_id, workspace_id, bot_id, grants.user_id)
             return Response(status_code=204)
+
+        @app.exception_handler(triggers.TriggerError)
+        async def trigger_error(_: Request, error: triggers.TriggerError) -> JSONResponse:
+            return JSONResponse(
+                {"detail": str(error)}, status_code=error.status_code, headers=error.headers
+            )
+
+        if self._triggers is not None:
+            app.include_router(trigger_routes.router(self._triggers))
+
+        @app.get("/workspaces/{workspace_id}/triggers")
+        async def list_triggers(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
+            org_id, _ = await self._workspace_grants(principal, workspace_id)
+            return await self._require_triggers().list_triggers(org_id, workspace_id)
+
+        @app.post("/workspaces/{workspace_id}/triggers", status_code=201)
+        async def new_trigger(
+            principal: Me, workspace_id: uuid.UUID, body: NewTriggerBody
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            fields = triggers.NewTrigger(**body.model_dump())
+            return await self._require_triggers().create(org_id, workspace_id, grants, fields)
+
+        @app.get("/workspaces/{workspace_id}/triggers/{trigger_id}")
+        async def get_trigger(
+            principal: Me, workspace_id: uuid.UUID, trigger_id: uuid.UUID
+        ) -> dict[str, Any]:
+            org_id, _ = await self._workspace_grants(principal, workspace_id)
+            return await self._require_triggers().get(org_id, workspace_id, trigger_id)
+
+        @app.patch("/workspaces/{workspace_id}/triggers/{trigger_id}")
+        async def edit_trigger(
+            principal: Me, workspace_id: uuid.UUID, trigger_id: uuid.UUID, body: TriggerEdit
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            changes = triggers.TriggerChanges(**body.model_dump())
+            return await self._require_triggers().update(
+                org_id, workspace_id, trigger_id, grants, changes
+            )
+
+        @app.post("/workspaces/{workspace_id}/triggers/{trigger_id}/secret")
+        async def rotate_trigger_secret(
+            principal: Me, workspace_id: uuid.UUID, trigger_id: uuid.UUID
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            return await self._require_triggers().rotate_secret(
+                org_id, workspace_id, trigger_id, grants
+            )
+
+        @app.delete("/workspaces/{workspace_id}/triggers/{trigger_id}", status_code=204)
+        async def delete_trigger(
+            principal: Me, workspace_id: uuid.UUID, trigger_id: uuid.UUID
+        ) -> Response:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._require_triggers().delete(org_id, workspace_id, trigger_id, grants)
+            return Response(status_code=204)
+
+        @app.put("/orgs/{org_id}/composio/webhook")
+        async def composio_webhook(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            return await self._require_triggers().subscribe_composio(org_id, grants.user_id)
 
         @app.get("/workspaces/{workspace_id}/memory")
         async def memory_notes(
@@ -1857,6 +1956,11 @@ class SamaApi:
         if self._github is None:
             raise HTTPException(status_code=409, detail="the GitHub App is off in this process")
         return self._github
+
+    def _require_triggers(self) -> triggers.TriggerService:
+        if self._triggers is None:
+            raise HTTPException(status_code=409, detail="triggers are off in this process")
+        return self._triggers
 
     def _require_connections(self) -> ConnectionService:
         if self._connections is None:

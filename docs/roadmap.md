@@ -173,6 +173,15 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 note
   with the profile of the bot. The gateway does not start a run after the bot spent its daily
   budget (UTC day), and the live authority limits a running run to the rest of the budget. Not
   in M3.10: a web page for the bots, and bots in Telegram.
+- M4.4: event triggers in `src/sama/triggers/` (architecture Section 12.2). Migration `0025`
+  adds `triggers` and `trigger_events` with RLS, `runs.toolsets`, and the vault names
+  `trigger:<uuid>` and `composio_webhook_secret`. A webhook trigger has its own URL and secret
+  and uses the Standard Webhooks signature. A Composio trigger is a Composio trigger instance on
+  the account of a connection. Sama checks the signature, rejects a replay (one row per
+  delivery id), and reads at most 1 MiB. Each event starts an unattended run in a new private
+  session of the trigger owner, with the `safe` toolsets unless an admin gave more. Not in
+  M4.4: workflows as targets (M4.5), delivery of the answer to a channel (M4.3), channel
+  events, and a web page for triggers.
 - M3.4: connections in `src/sama/connectors/` and `connectors/catalog/` (architecture Section
   10.3). Migration `0022` adds `connections` with RLS, the vault names `composio_api_key` and
   `connection:<uuid>`, and the toolsets `connections` and `integrations` in the default
@@ -361,7 +370,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.6, M4.1 to M4.3 (below the list of M1 note
 | M4.1 | Scheduler | `scheduler` service with a 60-second tick and leader lease. A fire runs once, also when two schedulers run. Done. |
 | M4.2 | Cron jobs | `jobs` table, `cronjob_manage`, `/cron`, and a web page. Natural language to cron with validation and the next 3 fire times. Model pin, `mode: script`, `preapproved_tools`, `attach_to_session`. A job run cannot create jobs. Adding or widening a pre-approval needs a human approval bound to the job version, connection, and argument limits. A test shows that a job created by the agent cannot run a write tool without that approval. Done. |
 | M4.3 | Delivery | Targets `origin`, Slack, Telegram, email, `none`, plus `failure_deliver`. Receipts. An unknown result is not retried. Repeated failures pause the job and alert once. Done. |
-| M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. |
+| M4.4 | Event triggers | Signed webhooks and Composio triggers start runs or workflows with the `safe` toolset by default. Done (runs; workflows come with M4.5). |
 | M4.5 | Workflows | YAML definition, versioned. Steps `tool`, `agent`, `approval`, `branch`, `parallel`, `wait`, `workflow`. Durable steps on the queue with resume after a crash. Stable operation ids, idempotency keys where the provider supports them, and receipts. A test crashes a worker after a non-idempotent write, and the step waits for reconcile or a human instead of a second write. `workflow_manage`, `workflow_run`. "Turn this session into a workflow" skill. New workflows that write externally need approval before the first run. |
 | M4.6 | `delegate_task` | Child session and run in its own sandbox. Single and batch. Depth 1, 10 children, blocked tools, cost budget per child. `delegate_status`, cancel, steer. Done. |
 | M4.7 | Task board | `tasks` table, dispatcher, `task_*` tools, web board view. Done. |

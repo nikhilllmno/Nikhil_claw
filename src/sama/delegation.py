@@ -26,7 +26,7 @@ from sqlalchemy import and_, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import ENDED_RUN_STATUSES, Message, Run, Session
-from sama.gate.decide import DELEGATION_LINEAGE
+from sama.gate.decide import DELEGATION_LINEAGE, narrow_toolsets
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.tenancy.authority import run_user
 from sama.tenancy.run_token import RunTokenClaims
@@ -223,6 +223,7 @@ class DelegationService:
                     Run.triggered_by_user_id,
                     Run.kind,
                     Run.status.label("run_status"),
+                    Run.toolsets.label("run_toolsets"),
                 )
                 .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
                 .where(
@@ -276,6 +277,8 @@ class DelegationService:
             user_id=user_id,
             unattended=True,
             budget=child_budget(task),
+            # The child keeps the toolset limit of the parent run (a trigger run, Section 12.2).
+            toolsets=narrow_toolsets(parent.run_toolsets),
         )
         return Child(session_id=session_id, run_id=run_id, title=title)
 
@@ -409,6 +412,7 @@ class DelegationService:
                     user_id=run_user(parent.triggered_by_user_id, parent.audience, parent.owner),
                     unattended=True,
                     budget=child.budget,
+                    toolsets=narrow_toolsets(parent.run_toolsets, child.toolsets),
                 )
         except QueueError as error:
             raise DelegationError(str(error)) from None
@@ -416,10 +420,10 @@ class DelegationService:
     async def _child(
         self, ids: _Ids, child_id: uuid.UUID, connection: AsyncConnection | None = None
     ) -> Any:
-        """The child session and the budget of its first run. A child of another session is
-        not found."""
+        """The child session, and the budget and the toolset limit of its first run. A child of
+        another session is not found."""
         query = (
-            select(Session.id, Run.budget)
+            select(Session.id, Run.budget, Run.toolsets)
             .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
             .where(
                 Session.org_id == ids.org_id,
