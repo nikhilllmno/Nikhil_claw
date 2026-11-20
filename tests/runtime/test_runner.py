@@ -194,7 +194,7 @@ async def test_the_runner_needs_a_run_token() -> None:
     assert RUN_TOKEN_ENV in events[0].message
 
 
-async def test_an_unsupported_runtime_is_an_invalid_request() -> None:
+async def test_an_openai_job_without_a_session_url_is_an_invalid_request() -> None:
     request = RunRequest(
         scope=make_scope(), input="hi", config=make_config(RuntimeKind.OPENAI_AGENTS_SDK)
     )
@@ -288,6 +288,49 @@ def test_the_claude_runtime_gets_an_archiver_when_the_job_has_an_archive_url(
         RunnerJob(op="run", run=request, gate=GatePolicy(), archive_url="http://t/archive"), env
     )
     assert isinstance(static._archiver, RemoteArchiver)  # type: ignore[attr-defined]
+
+
+def test_the_openai_runtime_uses_the_control_plane_for_items_and_the_proxy_for_models(
+    tmp_path: object,
+) -> None:
+    pytest.importorskip("agents")
+    from sama.runtime.archive import RemoteArchiver
+    from sama.runtime.remote_gate import RemoteGate
+    from sama.runtime.session_items import RemoteSessionItems
+
+    request = RunRequest(
+        scope=make_scope(), input="hi", config=make_config(RuntimeKind.OPENAI_AGENTS_SDK)
+    )
+    job = RunnerJob(
+        op="run",
+        run=request,
+        gate_url="http://t/gate",
+        archive_url="http://t/archive",
+        session_url="http://t/session-items",
+    )
+    env = {**ENV, "SAMA_WORKDIR": str(tmp_path), "SAMA_MODEL_URL": "http://proxy:8002/"}
+    runtime = build_runtime(job, env)
+    assert runtime.kind is RuntimeKind.OPENAI_AGENTS_SDK
+    settings = runtime._settings  # type: ignore[attr-defined]
+    assert settings.model_url == "http://proxy:8002/openai/v1"
+    assert settings.api_key == "token-1"
+    assert settings.cwd == str(tmp_path)
+    assert "token-1" not in repr(settings)
+    items = runtime._items  # type: ignore[attr-defined]
+    assert isinstance(items, RemoteSessionItems)
+    assert "http://t/session-items" in repr(items)
+    assert "token-1" not in repr(items)
+    assert isinstance(runtime._gate, RemoteGate)  # type: ignore[attr-defined]
+    assert isinstance(runtime._archiver, RemoteArchiver)  # type: ignore[attr-defined]
+
+
+def test_the_openai_runtime_needs_the_model_url(tmp_path: object) -> None:
+    request = RunRequest(
+        scope=make_scope(), input="hi", config=make_config(RuntimeKind.OPENAI_AGENTS_SDK)
+    )
+    job = RunnerJob(op="run", run=request, session_url="http://t/session-items")
+    with pytest.raises(ValueError, match="SAMA_MODEL_URL"):
+        build_runtime(job, {**ENV, "SAMA_WORKDIR": str(tmp_path)})
 
 
 async def test_a_runner_waits_for_the_runner_lock(tmp_path: Path) -> None:

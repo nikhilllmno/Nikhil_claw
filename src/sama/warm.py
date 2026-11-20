@@ -57,6 +57,9 @@ PRELOAD: Final = (
     "sama.runtime.claude",
     "sama.runtime.claude_transcript",
     "sama.runtime.remote_gate",
+    "sama.runtime.gating",
+    "sama.runtime.session_items",
+    "sama.runtime.openai_agents",
     "sama.runtime.archive",
 )
 """The modules that the warm server imports before the first fork."""

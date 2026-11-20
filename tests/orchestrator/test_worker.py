@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Approval, Message, Run, RunEvent, ToolPolicy
+from sama.db.models import AgentProfile, Approval, Message, Run, RunEvent, ToolPolicy
 from sama.gate.service import GateService
 from sama.orchestrator import worker as worker_module
 from sama.orchestrator.queue import RunQueue
@@ -350,9 +350,12 @@ async def test_a_secret_on_the_cut_of_a_failure_message_is_redacted(
 
 async def test_an_unknown_runtime_fails_the_run(harness: Harness, tenant: Tenant) -> None:
     run_id = await harness.send(tenant, "s1", "x")
+    # The claim takes the runtime of a first chat run from the profile.
     async with harness.engine.begin() as connection:
         await connection.execute(
-            update(Run).where(Run.id == run_id).values(runtime="openai_agents_sdk")
+            update(AgentProfile)
+            .where(AgentProfile.org_id == tenant.org)
+            .values(runtime="openai_agents_sdk")
         )
     assert await harness.worker.run_once()
     row = await harness.run(run_id)

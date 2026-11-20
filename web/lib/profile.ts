@@ -1,6 +1,13 @@
 // The draft of the agent settings form and its change to a PATCH body.
 
-import type { AgentProfile, AgentProfileLimits, AgentProfilePatch, Subagent } from "./api";
+import type {
+  AgentProfile,
+  AgentProfileLimits,
+  AgentProfileOptions,
+  AgentProfilePatch,
+  RuntimeOption,
+  Subagent,
+} from "./api";
 
 export interface DraftSubagent {
   /** A key for React. It is not sent. */
@@ -18,6 +25,7 @@ export interface DraftSubagent {
 export interface Draft {
   name: string;
   soul: string;
+  runtime: string;
   model: string;
   toolsets: string[];
   subagents: DraftSubagent[];
@@ -41,6 +49,7 @@ export function toDraft(profile: AgentProfile): Draft {
   return {
     name: profile.name,
     soul: profile.soul,
+    runtime: profile.runtime,
     model: profile.model,
     toolsets: [...profile.toolsets],
     subagents: profile.subagents.map((s) => ({
@@ -75,16 +84,60 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
   const patch: AgentProfilePatch = {};
   if (draft.name.trim() !== profile.name) patch.name = draft.name.trim();
   if (draft.soul !== profile.soul) patch.soul = draft.soul;
-  if (draft.model !== profile.model) patch.model = draft.model;
+  if (draft.runtime !== profile.runtime) {
+    // The API needs a model of the new runtime, so the patch always has the model.
+    patch.runtime = draft.runtime;
+    patch.model = draft.model;
+  } else if (draft.model !== profile.model) {
+    patch.model = draft.model;
+  }
   if (!sameList(draft.toolsets, profile.toolsets)) patch.toolsets = draft.toolsets;
   const subagents = draft.subagents.map(toSubagent);
   if (JSON.stringify(subagents) !== JSON.stringify(profile.subagents)) patch.subagents = subagents;
   return patch;
 }
 
+const RUNTIME_LABELS: Record<string, string> = {
+  claude_agent_sdk: "Claude Agent SDK",
+  openai_agents_sdk: "OpenAI Agents SDK",
+};
+
+/** The name of a runtime for people. */
+export function runtimeLabel(runtime: string): string {
+  return RUNTIME_LABELS[runtime] ?? runtime;
+}
+
+/** The option of `runtime`. For the saved runtime, the options of the profile are the fallback. */
+export function runtimeOption(options: AgentProfileOptions, saved: string, runtime: string): RuntimeOption {
+  const found = options.runtimes.find((r) => r.name === runtime);
+  if (found) return found;
+  if (runtime === saved) return { name: runtime, models: options.models, subagents: options.subagents };
+  return { name: runtime, models: [], subagents: false };
+}
+
+/**
+ * The draft after the user chooses `runtime`. A model of another runtime cannot stay, so the
+ * draft takes the saved model (back on the saved runtime) or the first model of the runtime.
+ */
+export function withRuntime(draft: Draft, profile: AgentProfile, runtime: string): Draft {
+  const { models } = runtimeOption(profile.options, profile.runtime, runtime);
+  let model = draft.model;
+  if (runtime === profile.runtime) model = profile.model;
+  else if (!models.includes(model)) model = models[0] ?? "";
+  return { ...draft, runtime, model };
+}
+
 /** The first problem that the browser can see before it sends the form, or `null`. */
-export function validateDraft(draft: Draft, limits: AgentProfileLimits): string | null {
+export function validateDraft(
+  draft: Draft,
+  limits: AgentProfileLimits,
+  runtime?: RuntimeOption,
+): string | null {
   if (draft.name.trim() === "") return "The agent needs a name.";
+  if (draft.model === "") return "Choose a model.";
+  if (runtime && !runtime.subagents && draft.subagents.length > 0) {
+    return `The ${runtimeLabel(runtime.name)} runtime has no sub-agents. Remove the sub-agents first.`;
+  }
   if (draft.name.trim().length > limits.name_max_chars) {
     return `The name has at most ${limits.name_max_chars} characters.`;
   }

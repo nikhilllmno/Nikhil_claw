@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
@@ -115,6 +116,17 @@ CAPABILITIES: Final[Mapping[RuntimeKind, Capabilities]] = {
         manual_compaction=True,
         compaction_archive=True,
     ),
+    RuntimeKind.OPENAI_AGENTS_SDK: Capabilities(
+        streaming=True,
+        native_subagents=False,
+        native_compaction=True,
+        native_skills=False,
+        native_file_checkpoints=False,
+        resumable_sessions=True,
+        mcp_client=True,
+        manual_compaction=True,
+        compaction_archive=True,
+    ),
     RuntimeKind.FAKE: Capabilities(
         streaming=True,
         native_subagents=False,
@@ -193,12 +205,14 @@ class SandboxSettings:
     the model proxy (M1.7). ``gate_url`` is the gate endpoint of the control plane (M1.9):
     with it, the runner asks the control plane for each tool call. ``archive_url`` is the
     archive endpoint (M2.6): with it, the runner gives the transcript to the control plane
-    before a compaction."""
+    before a compaction. ``session_url`` is the session items endpoint (M3.6): the OpenAI
+    runtime keeps its conversation items there."""
 
     template: str
     model_url: str | None = None
     gate_url: str | None = None
     archive_url: str | None = None
+    session_url: str | None = None
     allow_out: tuple[str, ...] = ()
     open_egress: bool = False
     runner_argv: tuple[str, ...] = RUNNER_ARGV
@@ -261,6 +275,16 @@ class SandboxedRuntime:
     def capabilities(self) -> Capabilities:
         return CAPABILITIES[self._kind]
 
+    def for_kind(self, kind: RuntimeKind) -> SandboxedRuntime:
+        """The same sandboxes, sessions, and runs for another runtime kind. Both objects share
+        their state, so a session that changes its runtime keeps its sandbox, and a cancel or a
+        resume finds the run in either object."""
+        if kind not in CAPABILITIES:
+            raise ValueError(f"the runner does not support runtime {kind}")
+        other = copy.copy(self)
+        other._kind = kind
+        return other
+
     def sandbox_id(self, org_id: str, session_id: str) -> str | None:
         return self._sandbox_ids.get((org_id, session_id))
 
@@ -281,6 +305,7 @@ class SandboxedRuntime:
             gate=self._gate,
             gate_url=self._settings.gate_url,
             archive_url=self._settings.archive_url,
+            session_url=self._settings.session_url,
             fake_scripts=scripts,
         )
         async with contextlib.aclosing(self._invoke(job, request.scope, request.budget)) as stream:
@@ -310,6 +335,7 @@ class SandboxedRuntime:
             gate=self._gate,
             gate_url=self._settings.gate_url,
             archive_url=self._settings.archive_url,
+            session_url=self._settings.session_url,
         )
         # The usage at the pause is in the opaque runtime state. Only the runner reads it, so a
         # failure before the runner starts reports zero usage.

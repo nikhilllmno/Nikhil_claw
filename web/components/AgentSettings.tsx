@@ -8,8 +8,11 @@ import {
   type DraftSubagent,
   diffDraft,
   newSubagent,
+  runtimeLabel,
+  runtimeOption,
   toDraft,
   validateDraft,
+  withRuntime,
 } from "@/lib/profile";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
@@ -85,7 +88,15 @@ function SettingsForm({
 
   const patch = useMemo(() => diffDraft(profile, draft), [profile, draft]);
   const dirty = Object.keys(patch).length > 0;
-  const problem = useMemo(() => validateDraft(draft, options.limits), [draft, options.limits]);
+  // The runtime of the draft: its models and its sub-agent support.
+  const runtime = useMemo(
+    () => runtimeOption(options, profile.runtime, draft.runtime),
+    [options, profile.runtime, draft.runtime],
+  );
+  const problem = useMemo(
+    () => validateDraft(draft, options.limits, runtime),
+    [draft, options.limits, runtime],
+  );
 
   const edit = useCallback((change: Partial<Draft>) => {
     setDraft((d) => ({ ...d, ...change }));
@@ -121,7 +132,11 @@ function SettingsForm({
   };
 
   const { soul_max_chars: soulMax, max_subagents: maxSubagents } = options.limits;
-  const models = withCurrent(options.models, draft.model);
+  const models = withCurrent(runtime.models, draft.model);
+  const runtimes = withCurrent(
+    options.runtimes.map((r) => r.name),
+    draft.runtime,
+  );
   const toggle = (list: string[], name: string) =>
     list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
@@ -136,7 +151,7 @@ function SettingsForm({
         </Link>
         <h1 className={styles.title}>{profile.name}</h1>
         <p className={styles.meta}>
-          {profile.runtime} · {profile.workspace_id === null ? "available to the whole org" : "one workspace"}
+          {runtimeLabel(profile.runtime)} · {profile.workspace_id === null ? "available to the whole org" : "one workspace"}
         </p>
       </header>
 
@@ -146,7 +161,7 @@ function SettingsForm({
         </p>
       ) : (
         <p className="alert" role="note">
-          Soul, model, and sub-agent changes apply to new sessions. Toolset changes apply at the next tool call in every session.
+          Soul, runtime, model, and sub-agent changes apply to new sessions. Toolset changes apply at the next tool call in every session.
         </p>
       )}
 
@@ -161,6 +176,21 @@ function SettingsForm({
             readOnly={readOnly}
             onChange={(e) => edit({ name: e.target.value })}
           />
+        </label>
+        <label className="field">
+          <span className="label">Runtime</span>
+          <select
+            className="input"
+            value={draft.runtime}
+            disabled={readOnly}
+            onChange={(e) => setDraft((d) => withRuntime(d, profile, e.target.value))}
+          >
+            {runtimes.map((r) => (
+              <option key={r} value={r}>
+                {runtimeLabel(r)}
+              </option>
+            ))}
+          </select>
         </label>
         <label className="field">
           <span className="label">Model</span>
@@ -226,7 +256,7 @@ function SettingsForm({
       <section className={`card ${styles.section}`}>
         <div className={styles.row}>
           <h2 className={styles.heading}>Sub-agents</h2>
-          {options.subagents && !readOnly ? (
+          {runtime.subagents && !readOnly ? (
             <button
               type="button"
               className="btn btn-small"
@@ -237,7 +267,7 @@ function SettingsForm({
             </button>
           ) : null}
         </div>
-        {!options.subagents ? (
+        {!runtime.subagents && draft.subagents.length === 0 ? (
           <p className="hint">The runtime of this agent does not support sub-agents.</p>
         ) : draft.subagents.length === 0 ? (
           <p className="hint">
@@ -330,7 +360,7 @@ function SettingsForm({
                         onChange={(e) => updateSub(sub.uid, { model: e.target.value })}
                       >
                         <option value="">Same as the agent</option>
-                        {withCurrent(options.models, sub.model).map((m) => (
+                        {withCurrent(runtime.models, sub.model).map((m) => (
                           <option key={m} value={m}>
                             {m}
                           </option>

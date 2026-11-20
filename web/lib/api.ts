@@ -167,10 +167,20 @@ export interface ToolsetOption {
   tools: string[];
 }
 
-export interface AgentProfileOptions {
-  toolsets: ToolsetOption[];
+/** A runtime that an editor can choose, with its models and its sub-agent support. */
+export interface RuntimeOption {
+  name: string;
   models: string[];
   subagents: boolean;
+}
+
+export interface AgentProfileOptions {
+  toolsets: ToolsetOption[];
+  /** The models of the saved runtime. */
+  models: string[];
+  /** True if the saved runtime has sub-agents. */
+  subagents: boolean;
+  runtimes: RuntimeOption[];
   limits: AgentProfileLimits;
 }
 
@@ -207,6 +217,7 @@ export interface AgentProfile {
 export interface AgentProfilePatch {
   name?: string;
   soul?: string;
+  runtime?: string;
   model?: string;
   toolsets?: string[];
   subagents?: Subagent[];

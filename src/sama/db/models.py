@@ -1699,3 +1699,33 @@ class GitHubPushGrant(Base):
     created_at: Mapped[datetime] = _created_at()
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RuntimeSessionItem(Base):
+    """One conversation item of the OpenAI runtime (docs/architecture.md, Section 5.3). The
+    runner keeps the items of its session through ``POST /session-items``, so it needs no
+    database credential. ``conversation`` names one list of items in the session, and ``seq``
+    is the position of the item in that list, from 0 with no gaps. Only the control plane
+    writes the table."""
+
+    __tablename__ = "runtime_session_items"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("session_id", "conversation", "seq"),
+        CheckConstraint("seq >= 0", name="seq"),
+        CheckConstraint("char_length(conversation) BETWEEN 1 AND 100", name="conversation"),
+        Index(None, "org_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    conversation: Mapped[str] = mapped_column(Text, nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    item: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """One Responses API item, as the OpenAI Agents SDK stores it."""
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The run that wrote the item. No foreign key: a compaction rewrites the items."""
+    created_at: Mapped[datetime] = _created_at()

@@ -29,9 +29,10 @@ RUN pip install --no-cache-dir uv==0.13.8
 
 WORKDIR /opt/sama
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-default-groups --group runtime-claude --no-install-project
+RUN uv sync --frozen --no-dev --no-default-groups --group runtime-claude --group runtime-openai \
+    --no-install-project
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-default-groups --group runtime-claude \
+RUN uv sync --frozen --no-dev --no-default-groups --group runtime-claude --group runtime-openai \
     && pip uninstall --yes uv
 
 # E2B templates use the user `user`. Create it here if the base image has none.

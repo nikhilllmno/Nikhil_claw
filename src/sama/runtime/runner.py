@@ -55,6 +55,7 @@ from sama.runtime.contract import (
     run_event_adapter,
 )
 from sama.runtime.fake import FakeRuntime, FakeScript
+from sama.runtime.gating import GateDecision, ToolGate
 from sama.sandbox.base import WORKDIR
 
 log: Final = logging.getLogger("sama.runner")
@@ -104,6 +105,28 @@ class GatePolicy(BaseModel):
     deny: tuple[str, ...] = ()
 
 
+class StaticGate:
+    """The tool gate of a ``GatePolicy``."""
+
+    def __init__(self, policy: GatePolicy) -> None:
+        self._policy = policy
+
+    async def check(
+        self,
+        scope: RunScope,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        call_id: str,
+        child: bool = False,
+    ) -> GateDecision:
+        if tool_name in self._policy.deny:
+            return GateDecision("deny", "the tool policy denies this tool")
+        if tool_name in self._policy.ask:
+            return GateDecision("ask", "the tool policy asks for approval")
+        return GateDecision("allow")
+
+
 class RunnerJob(BaseModel):
     """The first line on stdin. Exactly one of ``run`` and ``resume`` is set."""
 
@@ -119,6 +142,10 @@ class RunnerJob(BaseModel):
     archive_url: str | None = Field(default=None, min_length=1)
     """The archive endpoint of the control plane (``POST /archive``). With it, the runtime
     gives its transcript to the control plane before it compacts (Section 6.3)."""
+    session_url: str | None = Field(default=None, min_length=1)
+    """The session items endpoint of the control plane (``POST /session-items``). The OpenAI
+    runtime keeps its conversation items there, so the runner needs no database credential
+    (Section 7.3). The OpenAI runtime needs it."""
     fake_scripts: tuple[FakeScript, ...] = ()
     """Scripts for the fake runtime. Only for tests."""
 
@@ -171,52 +198,58 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
     kind = job.request.config.runtime
     if kind is RuntimeKind.FAKE:
         return FakeRuntime(scripts=job.fake_scripts)
-    if kind is RuntimeKind.CLAUDE_AGENT_SDK:
-        from sama.runtime.claude import ClaudeRuntime, ClaudeSettings, GateDecision
-        from sama.runtime.claude_transcript import cli_session_exists
+    if kind not in {RuntimeKind.CLAUDE_AGENT_SDK, RuntimeKind.OPENAI_AGENTS_SDK}:
+        raise ValueError(f"the runner does not support runtime {kind}")
+    if kind is RuntimeKind.OPENAI_AGENTS_SDK and (
+        job.session_url is None or not env.get(MODEL_URL_ENV)
+    ):
+        raise ValueError("the openai runtime needs session_url and SAMA_MODEL_URL")
+    token = env[RUN_TOKEN_ENV]
+    workdir = env.get(WORKDIR_ENV) or WORKDIR
+    os.makedirs(workdir, exist_ok=True)
+    archiver = None
+    if job.archive_url is not None:
+        from sama.runtime.archive import RemoteArchiver
 
-        workdir = env.get(WORKDIR_ENV) or WORKDIR
-        os.makedirs(workdir, exist_ok=True)
-        settings = ClaudeSettings(
+        archiver = RemoteArchiver(job.archive_url, token)
+    gate: ToolGate
+    if job.gate_url is not None:
+        from sama.runtime.remote_gate import RemoteGate
+
+        gate = RemoteGate(job.gate_url, token)
+    else:
+        gate = StaticGate(job.gate)
+
+    if kind is RuntimeKind.OPENAI_AGENTS_SDK:
+        from sama.runtime.openai_agents import OpenAIRuntime, OpenAISettings
+        from sama.runtime.session_items import RemoteSessionItems
+
+        model_url = env[MODEL_URL_ENV]
+        assert job.session_url is not None  # noqa: S101 -- checked above
+        settings = OpenAISettings(
             cwd=workdir,
-            env=claude_cli_env(env[RUN_TOKEN_ENV], env.get(MODEL_URL_ENV)),
+            # The OpenAI route of the model proxy (docs/architecture.md, Section 16.6).
+            model_url=model_url.rstrip("/") + "/openai/v1",
+            api_key=token,
             cancel_grace_s=CANCEL_GRACE_S,
-            session_exists=cli_session_exists,
         )
-        archiver = None
-        if job.archive_url is not None:
-            from sama.runtime.archive import RemoteArchiver
+        return OpenAIRuntime(
+            items=RemoteSessionItems(job.session_url, token),
+            gate=gate,
+            settings=settings,
+            archiver=archiver,
+        )
 
-            archiver = RemoteArchiver(job.archive_url, env[RUN_TOKEN_ENV])
-        if job.gate_url is not None:
-            from sama.runtime.remote_gate import RemoteGate
+    from sama.runtime.claude import ClaudeRuntime, ClaudeSettings
+    from sama.runtime.claude_transcript import cli_session_exists
 
-            return ClaudeRuntime(
-                gate=RemoteGate(job.gate_url, env[RUN_TOKEN_ENV]),
-                settings=settings,
-                archiver=archiver,
-            )
-
-        policy = job.gate
-
-        class StaticGate:
-            async def check(
-                self,
-                scope: RunScope,
-                tool_name: str,
-                arguments: Mapping[str, Any],
-                *,
-                call_id: str,
-                child: bool = False,
-            ) -> GateDecision:
-                if tool_name in policy.deny:
-                    return GateDecision("deny", "the tool policy denies this tool")
-                if tool_name in policy.ask:
-                    return GateDecision("ask", "the tool policy asks for approval")
-                return GateDecision("allow")
-
-        return ClaudeRuntime(gate=StaticGate(), settings=settings, archiver=archiver)
-    raise ValueError(f"the runner does not support runtime {kind}")
+    claude_settings = ClaudeSettings(
+        cwd=workdir,
+        env=claude_cli_env(token, env.get(MODEL_URL_ENV)),
+        cancel_grace_s=CANCEL_GRACE_S,
+        session_exists=cli_session_exists,
+    )
+    return ClaudeRuntime(gate=gate, settings=claude_settings, archiver=archiver)
 
 
 def _failed(code: FailureCode, message: str, usage: Usage | None = None) -> RunFailed:

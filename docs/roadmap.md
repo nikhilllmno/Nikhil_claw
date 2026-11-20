@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.6 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -190,6 +190,20 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   M3.4: `mcp_remote`, `mcp_hosted`, `database`, and
   `plugin` connectors, tool discovery and `tool_cache`, `policy_overrides` in the gate,
   Composio triggers, custom connections, and per-tool filters.
+- M3.6: the OpenAI Agents SDK adapter in `src/sama/runtime/openai_agents.py` (architecture
+  Section 5.3). A run is a `SandboxAgent` with the `Shell` and `Compaction` capabilities and the
+  local sandbox client, so the runner needs no E2B key. The model is the Responses API through
+  the model proxy (`/openai/v1`, and `/openai/v1/responses/compact` for a manual compaction).
+  The SDK `Session` is a sama store over `POST /session-items` of the tool server, so the runner
+  needs no database credential. Migration `0025` adds `runtime_session_items` with RLS that
+  follows the session. Each tool has `needs_approval`, which asks the sama gate. A pause saves
+  the SDK `RunState`, and a resume calls `approve()` or `reject()`. The adapter archives the
+  items that a compaction drops. The conformance targets `openai-scripted` and `openai-runner`
+  pass the suite, and an OpenAI run has the same Langfuse trace shape. An admin can switch the
+  runtime of a profile in the API and the web app; the switch applies to new sessions. The
+  sandbox image and the default `uv sync` install the group `runtime-openai`. Not in M3.6: native
+  sub-agents (agents as tools and handoffs), native skills, the filesystem capability, and a live
+  test against the OpenAI API.
 - M3.7: the GitHub App, the git proxy, and pull requests in `src/sama/github/` and
   `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0024` adds
   `github_installations`, `github_repos`, and `github_push_grants` with RLS. An org admin
@@ -319,7 +333,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
 | M3.3 | Shared sessions in Slack | Slack channels and threads are shared sessions (architecture §11.3). `session_search` and delivery follow the audience rule. A test shows that one user's `user` memory does not reach a shared thread. Done. |
 | M3.4 | Connection framework and Composio | `connections` table with RLS, states, and the vault reference (architecture §10.3). Catalog of YAML manifests in `connectors/catalog/`. Connections page in the web app and `/connect <name>` in channels; secrets go only into web forms, never into chat. `connections_list`, `connection_request`, `connection_test`. Only the backend can set `connected`. Composio entity per user and per workspace. Connector tools behind `tool_search`. Read tools `allow`, write tools `ask`. A test shows that a `personal` connection is not usable in a shared session. Done. |
 | M3.5 | Remote MCP connections | Add a remote MCP server from the catalog or by URL, with OAuth 2.1 (dynamic client registration and PKCE), a bearer token, or a header. Tools proxied by the sama MCP server as `mcp_<connection>_<tool>`. Include and exclude filters, a tool schema cache, and a health check. New tools are usable without a new session. All calls use the outbound URL policy (architecture §16.4). |
-| M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the local sandbox client inside the E2B sandbox (no E2B key in the runner), a sama `Session` over the control-plane API (no database credentials in the runner), `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. |
+| M3.6 | OpenAI Agents SDK adapter | Maps the contract to `SandboxAgent` with the local sandbox client inside the E2B sandbox (no E2B key in the runner), a sama `Session` over the control-plane API (no database credentials in the runner), `needs_approval`, `RunState` approve and reject, sessions, and compaction. Passes the conformance suite. Langfuse traces. A profile can switch runtime. Done. |
 | M3.7 | GitHub App, git proxy, and pull requests | Sama GitHub App. Sama git proxy holds the tokens; the sandbox has none. `repo_clone`, `pr_create`, `pr_comment`. Allowlist of repos per org. The proxy rejects pushes to non-`sama/*` refs, force-pushes, and ref deletes, and needs an approval for protected paths. Setup docs require a default-branch ruleset with no bypass for the App. Tests cover each rejected push. Done. A person still creates the real App and the rulesets (architecture §19.5). |
 | M3.8 | Web app v1 core | Next.js app in `web/`, hosted on Vercel: sign-in (password and email link), session list, chat with live streaming, approvals and questions, stop, and agent settings (soul, model, toolsets, sub-agents) for org admins. CORS from `SAMA_WEB_ORIGINS`. CI runs lint, typecheck, tests, and build. Done. |
 | M3.9 | Busy controls and handoff | Queue, `/stop`, `/steer` while a run is busy. `/handoff` between channels. |

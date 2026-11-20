@@ -325,6 +325,7 @@ class ProfileEdit(_Edit):
         | None
     ) = None
     soul: Annotated[str, Field(max_length=SOUL_MAX_CHARS)] | None = None
+    runtime: RuntimeKind | None = None
     model: Annotated[str, Field(min_length=1, max_length=100)] | None = None
     toolsets: (
         Annotated[list[Annotated[str, Field(max_length=100)]], Field(max_length=100)] | None
@@ -1236,8 +1237,8 @@ class SamaApi:
     async def _edit_profile(
         self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
     ) -> dict[str, Any]:
-        """Changes the profile. A session keeps its frozen soul, model, and sub-agents: those
-        changes apply from the next session. A change to the toolsets applies at the next tool
+        """Changes the profile. A session keeps its frozen soul, runtime, model, and sub-agents:
+        those changes apply from the next session. A change to the toolsets applies at the next tool
         call of every session, because the gate reads them on every call."""
         _, grants = await self._profile_access(principal, org_id, profile_id)
         if not grants.org_admin:

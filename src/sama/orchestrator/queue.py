@@ -92,9 +92,11 @@ from sama.runtime.contract import (
     MAX_COMPACT_FOCUS_CHARS,
     ApprovalDecision,
     FailureCode,
+    RuntimeKind,
     Usage,
     clip_subagent_text,
 )
+from sama.subagents import model_is_known
 from sama.vault.redact import default_redactor, redact
 
 DEFAULT_LEASE: Final = timedelta(seconds=30)
@@ -777,6 +779,17 @@ class RunQueue:
                     attempts=Run.attempts + 1,
                     dispatched_at=None,
                     started_at=func.coalesce(Run.started_at, func.now()),
+                    # A chat run that starts takes the runtime of the session now, as the
+                    # model: the profile can switch runtime while the run waits (Section 11.4).
+                    runtime=case(
+                        (
+                            and_(Run.kind == "chat", ~resumes),
+                            func.coalesce(
+                                Session.run_config["runtime"].astext, AgentProfile.runtime
+                            ),
+                        ),
+                        else_=Run.runtime,
+                    ),
                 )
                 .returning(
                     Run.org_id,
@@ -879,6 +892,17 @@ class RunQueue:
         pins = await pins_for_input(connection, row.org_id, row.session_id, run_id)
         return pin_block(pins) + str((text or {}).get("text", ""))
 
+    def _review_model(self, row: Any) -> str:
+        """The review model of the profile if the runtime of the run knows it (the fake runtime
+        knows all models), or else the default review model of the runtime. The profile can
+        switch runtime after the review is in the queue."""
+        runtime = RuntimeKind(row.runtime)
+        if row.review_model and (
+            runtime is RuntimeKind.FAKE or model_is_known(runtime, row.review_model)
+        ):
+            return str(row.review_model)
+        return str(self._review_models.get(row.runtime, row.model))
+
     async def _claimed_review(
         self, connection: AsyncConnection, run_id: uuid.UUID, row: Any
     ) -> ClaimedRun:
@@ -901,7 +925,7 @@ class RunQueue:
             audience=row.audience,
             owner_user_id=row.owner_user_id,
             runtime=row.runtime,
-            model=row.review_model or self._review_models.get(row.runtime, row.model),
+            model=self._review_model(row),
             soul="",
             budget=row.budget,
             input=transcript,

@@ -1368,7 +1368,7 @@ wheels = [
 name = "sama"
 version = "0.1.0"
 source = { editable = "." }
-default-groups = ["dev", "runtime-claude", "sandbox-e2b"]
+default-groups = ["dev", "runtime-claude", "runtime-openai", "sandbox-e2b"]
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },

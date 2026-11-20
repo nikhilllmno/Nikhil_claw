@@ -8,12 +8,15 @@ It has two tools:
 
 The server checks the bearer token, like the run token of the real sama MCP server.
 It accepts a static test token and the run tokens that it signed.
+
+It also answers ``POST /session-items`` for the OpenAI runner, with the items in memory
+(``session_items``). As in the real tool server, the session comes from the run token.
 """
 
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from mcp.server.mcpserver import MCPServer
@@ -22,6 +25,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from sama.runtime.contract import Audience, RunScope
+from sama.runtime.session_items import (
+    SESSION_ITEMS_PATH,
+    MemorySessionItems,
+    SessionItemsError,
+    parse_session_items,
+)
 from sama.tenancy import InvalidRunTokenError, RunTokenSigner
 
 SERVER_NAME = "sama"
@@ -46,6 +56,7 @@ class ToolServer:
     secret: str = field(default_factory=lambda: f"amber-{secrets.token_hex(4)}")
     notes: list[str] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
+    session_items: MemorySessionItems = field(default_factory=MemorySessionItems)
 
     def app(self) -> ASGIApp:
         server: MCPServer = MCPServer(SERVER_NAME)
@@ -62,7 +73,30 @@ class ToolServer:
             return "sent"
 
         inner = server.streamable_http_app(stateless_http=True, json_response=True)
-        return _BearerAuth(inner, self.accepts)
+        return _BearerAuth(inner, self.accepts, self._session_items)
+
+    async def _session_items(self, request: Request, bearer: str) -> JSONResponse:
+        try:
+            claims = self.run_tokens.verify(bearer)
+        except InvalidRunTokenError:
+            return JSONResponse({"error": "bad run token"}, status_code=401)
+        try:
+            body = parse_session_items(await request.body())
+        except ValueError:
+            return JSONResponse({"error": "the request is not valid"}, status_code=422)
+        scope = RunScope(
+            org_id=claims.org_id,
+            workspace_id=claims.workspace_id,
+            session_id=claims.session_id,
+            run_id=claims.run_id,
+            audience=Audience.PRIVATE if claims.user_id else Audience.SHARED,
+            user_id=claims.user_id,
+        )
+        try:
+            answer = await self.session_items.call(scope, body)
+        except SessionItemsError as error:
+            return JSONResponse({"error": str(error)}, status_code=409)
+        return JSONResponse(answer.model_dump(mode="json"))
 
     def accepts(self, bearer: str) -> bool:
         if secrets.compare_digest(bearer, self.token):
@@ -78,14 +112,19 @@ class ToolServer:
 class _BearerAuth:
     app: Starlette
     accepts: Callable[[str], bool]
+    session_items: Callable[[Request, str], Awaitable[JSONResponse]]
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
-            request = Request(scope)
+            request = Request(scope, receive)
             header = request.headers.get("authorization", "")
             bearer = header.removeprefix("Bearer ")
             if bearer == header or not self.accepts(bearer):
                 response = JSONResponse({"error": "bad run token"}, status_code=401)
+                await response(scope, receive, send)
+                return
+            if request.url.path == SESSION_ITEMS_PATH and request.method == "POST":
+                response = await self.session_items(request, bearer)
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)

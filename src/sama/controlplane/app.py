@@ -35,6 +35,7 @@ from sama.api.auth import issuer, jwks_url
 from sama.connectors.manifest import Catalog
 from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
+from sama.context.session_items import PostgresSessionItems
 from sama.controlplane.settings import ControlPlaneSettings
 from sama.db.engine import create_engine
 from sama.delegation import DelegationService
@@ -64,6 +65,7 @@ from sama.review.proposals import PostgresProposalStore
 from sama.review.soul import SoulProposer
 from sama.runtime.archive import ARCHIVE_PATH
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
+from sama.runtime.session_items import SESSION_ITEMS_PATH
 from sama.sandbox.base import SandboxProvider
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
@@ -138,7 +140,7 @@ def build(
     worker_poll_s: float = 1.0,
     exit_on_failure: bool = True,
 ) -> ControlPlane:
-    """Builds the process. ``runtimes`` replaces the sandboxed Claude runtime, for tests.
+    """Builds the process. ``runtimes`` replaces the sandboxed runtimes, for tests.
     ``exit_on_failure`` stops the process when a background loop ends with an error, so
     that the platform starts it again."""
     default_redactor().add(*settings.secret_values())
@@ -192,6 +194,7 @@ def build(
                 model_url=settings.model_url,
                 gate_url=f"{settings.tools_url}{GATE_PATH}",
                 archive_url=f"{settings.tools_url}{ARCHIVE_PATH}",
+                session_url=f"{settings.tools_url}{SESSION_ITEMS_PATH}",
                 allow_out=settings.allow_out,
                 # The warm runner saves the Python start of each run (Section 16.2).
                 runner_argv=WARM_RUNNER_ARGV,
@@ -199,7 +202,8 @@ def build(
             directory=PostgresSandboxDirectory(engine),
             skills=SessionSkillSource(engine, library),
         )
-        runtimes = (sandboxed,)
+        # The OpenAI runtime runs in the same session sandbox (M3.6). A profile selects it.
+        runtimes = (sandboxed, sandboxed.for_kind(RuntimeKind.OPENAI_AGENTS_SDK))
     for runtime in runtimes:
         registry.register(runtime)
 
@@ -281,6 +285,7 @@ def build(
         deferred=deferred,
         connections=connections,
         archive=ContextArchive(engine),
+        session_items=PostgresSessionItems(engine),
         gate=gate,
         delegation=DelegationService(engine, queue),
         tasks=TaskTools(engine),
