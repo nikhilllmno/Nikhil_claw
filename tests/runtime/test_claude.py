@@ -1010,6 +1010,79 @@ async def test_a_follow_up_run_waits_for_the_cli_of_the_last_run_to_stop() -> No
     await runtime.aclose()
 
 
+async def test_two_follow_ups_of_one_run_during_the_stop_start_one_cli() -> None:
+    factory = Factory([delta("Hi"), result()], [result()], [result()], disconnect_s=0.3)
+    runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=2.0), client_factory=factory)
+    completed = (await collect(runtime.run(request())))[-1]
+    assert isinstance(completed, RunCompleted)
+    follow_up = request(run_id="run-2", state=completed.runtime_state)
+    results = await asyncio.gather(collect(runtime.run(follow_up)), collect(runtime.run(follow_up)))
+    terminals = sorted(type(events[-1]).__name__ for events in results)
+    assert terminals == ["RunCompleted", "RunFailed"]
+    assert len(factory.clients) == 2
+    await runtime.aclose()
+
+
+async def test_a_cancel_during_the_stop_wait_ends_the_follow_up() -> None:
+    factory = Factory([delta("Hi"), result()], [result()], disconnect_s=0.3)
+    runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=2.0), client_factory=factory)
+    completed = (await collect(runtime.run(request())))[-1]
+    assert isinstance(completed, RunCompleted)
+    task = asyncio.create_task(
+        collect(runtime.run(request(run_id="run-2", state=completed.runtime_state)))
+    )
+    await asyncio.sleep(0.05)
+    await runtime.cancel("run-2")
+    events = await task
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].code is FailureCode.CANCELLED
+    assert len(factory.clients) == 1
+    await runtime.aclose()
+
+
+def _hold_stop(runtime: ClaudeRuntime) -> asyncio.Event:
+    """Makes the runtime see a CLI stop of SESSION that ends when the event is set."""
+    release = asyncio.Event()
+    runtime._stopping[SESSION] = asyncio.create_task(_wait_for(release))
+    return release
+
+
+async def _wait_for(event: asyncio.Event) -> None:
+    await event.wait()
+
+
+async def test_two_resumes_of_one_approval_during_the_stop_use_it_once() -> None:
+    runtime, paused = await pause()
+    factory = Factory([tool_result("call-1", "sent"), result()], [result()])
+    runtime._client_factory = factory
+    release = _hold_stop(runtime)
+    resume = resume_request(paused, ApprovalDecision.APPROVE)
+    tasks = [asyncio.create_task(collect(runtime.resume(resume))) for _ in range(2)]
+    await asyncio.sleep(0.05)
+    release.set()
+    results = await asyncio.gather(*tasks)
+    terminals = sorted(type(events[-1]).__name__ for events in results)
+    assert terminals == ["RunCompleted", "RunFailed"]
+    assert len(factory.clients) == 1
+
+
+async def test_a_cancel_during_the_stop_wait_ends_the_resume() -> None:
+    runtime, paused = await pause()
+    factory = Factory([tool_result("call-1", "sent"), result()])
+    runtime._client_factory = factory
+    release = _hold_stop(runtime)
+    task = asyncio.create_task(
+        collect(runtime.resume(resume_request(paused, ApprovalDecision.APPROVE)))
+    )
+    await asyncio.sleep(0.05)
+    await runtime.cancel("run-1")
+    release.set()
+    events = await task
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].code is FailureCode.CANCELLED
+    assert factory.clients == []
+
+
 async def test_a_failed_run_still_waits_for_the_cli_to_stop() -> None:
     factory = Factory([result(subtype="error_during_execution", is_error=True)], disconnect_s=0.3)
     runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=2.0), client_factory=factory)

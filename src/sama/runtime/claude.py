@@ -736,32 +736,45 @@ class ClaudeRuntime:
         check = self._settings.session_exists
         return check is None or check(session_id)
 
-    async def _wait_stopped(self, session_id: str) -> None:
-        """Waits until the CLI of the last run of the session has stopped.
+    async def _wait_stopped(self, session_id: str, run_id: str) -> bool:
+        """Waits until the CLI of the last run of the session has stopped. Returns ``False``
+        if ``cancel(run_id)`` came during the wait.
 
         The CLI writes the transcript while it stops. So a run that comes after an early
-        ``RunCompleted`` must not look for the transcript or start a CLI before that.
+        ``RunCompleted`` must not look for the transcript or start a CLI before that. The
+        callers do all their checks after this wait, with no ``await`` between the checks and
+        the registration of the run, so two calls cannot both pass the same check.
         """
         task = self._stopping.get(session_id)
-        if task is not None:
-            # asyncio.wait does not cancel the stop when this run is cancelled.
-            await asyncio.wait({task})
+        if task is None:
+            return True
+        cancelled_before = run_id in self._cancelled_runs
+        # asyncio.wait does not cancel the stop when this run is cancelled.
+        await asyncio.wait({task})
+        return cancelled_before or run_id not in self._cancelled_runs
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         run_id = request.scope.run_id
         problem = self._check_config(request.config)
-        if problem is None and (run_id in self._active or run_id in self._paused):
-            problem = f"run {run_id} is already active"
         try:
             previous = _State.load(request.runtime_state)
         except ValidationError:
             problem = problem or "runtime_state is not valid for the claude runtime"
             previous = None
+        stopped = (
+            previous is None
+            or problem is not None
+            or await self._wait_stopped(previous.session_id, run_id)
+        )
+        if not stopped:
+            yield _cancelled(Usage())
+            return
+        # No await from here to the registration of the run in ``_stream``.
+        if problem is None and (run_id in self._active or run_id in self._paused):
+            problem = f"run {run_id} is already active"
         if problem is not None:
             yield _invalid(problem)
             return
-        if previous is not None:
-            await self._wait_stopped(previous.session_id)
         if previous is not None and not self._session_exists(previous.session_id):
             # The sandbox is new (lost, or from another template), so the CLI has no
             # transcript of this session. Start a new SDK session; its counts start at zero.
@@ -803,10 +816,17 @@ class ClaudeRuntime:
                 state = _State.load(request.runtime_state)
             except ValidationError:
                 problem = "runtime_state is not valid for the claude runtime"
+        if (
+            problem is None
+            and state is not None
+            and not await self._wait_stopped(state.session_id, run_id)
+        ):
+            yield _cancelled(state.usage)
+            return
+        # No await from here to the registration of the run in ``_stream``: the checks and the
+        # use of the approval are one step.
         if problem is None:
             problem = self._check_resume(request, state)
-        if problem is None and state is not None:
-            await self._wait_stopped(state.session_id)
         if problem is None and state is not None and not self._session_exists(state.session_id):
             problem = "the sdk session of this run is gone, so the approval cannot resume it"
         if problem is not None or state is None or state.pending is None:

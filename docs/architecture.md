@@ -3271,7 +3271,8 @@ sends `RunFailed` (`sandbox_error`, retryable). So the runner of a run that is s
 runner of the next run. The orchestrator kills a runner that does not stop in less time than
 this wait. In one process (a `ClaudeRuntime` that is not in a runner), the adapter does the
 same: a run or a resume of a session first waits until the CLI of the last run of that session
-has stopped.
+has stopped. It does its checks (an active run, a used approval, a cancel) after this wait, so
+two calls cannot both pass, and a cancel during the wait ends the call with `cancelled`.
 
 **Early terminal event.** The Claude adapter sends `RunCompleted` as soon as the result
 message comes, and then stops the Claude CLI (about 0.5 to 1 second). The orchestrator gives a
