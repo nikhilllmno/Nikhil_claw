@@ -89,6 +89,24 @@ def test_an_unknown_mcp_tool_is_in_no_toolset() -> None:
     assert verdict.step is GateStep.TOOLSET
 
 
+@pytest.mark.parametrize("tool", ["skills_list", "skill_view", "skill_manage"])
+def test_the_skill_tools_need_the_skills_toolset_and_are_allowed_by_default(tool: str) -> None:
+    name = f"mcp__sama__{tool}"
+    without = decide(context(), name, {})
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+    allowed = decide(context(toolsets=frozenset({"skills"})), name, {})
+    assert allowed.action == "allow"
+
+
+def test_a_deny_rule_stops_a_skill_change() -> None:
+    verdict = decide(
+        context(toolsets=frozenset({"skills"}), rules=(rule("skill_manage", "deny"),)),
+        "mcp__sama__skill_manage",
+        {"action": "create", "name": "x"},
+    )
+    assert (verdict.action, verdict.step) == ("deny", GateStep.POLICY)
+
+
 def test_tool_search_is_in_every_run_and_allowed() -> None:
     verdict = decide(context(toolsets=frozenset({"todo"})), "ToolSearch", {"query": "select:x"})
     assert verdict.action == "allow"

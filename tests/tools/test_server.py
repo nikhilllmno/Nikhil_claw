@@ -17,12 +17,14 @@ from mcp.client import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp_types import CallToolResult, TextContent
 
+from sama.skills import MemorySkillStore
 from sama.tenancy import RunTokenSigner
 from sama.tools import ClarifyBroker, MemoryTodoStore, OutboundClient, SearchHit, ToolServer
 from sama.tools.outbound import IPAddress
 from sama.tools.output import MAX_OUTPUT_BYTES
 from sama.tools.server import MAX_ERROR_CHARS, quiet_dependency_logs
 from tests.conformance.scripted_model import serve
+from tests.skills.helpers import actor, doc, md
 from tests.support import RecordingSpill, make_scope, wire_transport
 
 
@@ -300,3 +302,92 @@ async def test_the_tool_log_has_no_arguments(
     assert any("tool=web_search" in line and "ok=True" in line for line in lines)
     assert any("tool=todo" in line and "ok=False" in line for line in lines)
     assert not any("private words" in line or "secret-id" in line for line in lines)
+
+
+@asynccontextmanager
+async def skills_client(store: MemorySkillStore) -> AsyncIterator[Client]:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), skills=store)
+    with serve(server.app()) as base:
+        token = signer.issue(make_scope(), ttl_s=600)
+        async with connect(base + "/mcp", token) as client:
+            yield client
+
+
+async def test_the_skill_tools_are_listed_with_a_store() -> None:
+    store = MemorySkillStore(actor())
+    async with skills_client(store) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    assert {"skills_list", "skill_view", "skill_manage"} <= set(tools)
+    assert tools["skills_list"].annotations is not None
+    assert tools["skills_list"].annotations.read_only_hint is True
+    assert tools["skill_view"].annotations is not None
+    assert tools["skill_view"].annotations.read_only_hint is True
+
+
+async def test_the_skill_tools_create_list_view_and_patch() -> None:
+    store = MemorySkillStore(actor(), {"base": doc("base", description="Builtin base")})
+    async with skills_client(store) as client:
+        created = await client.call_tool(
+            "skill_manage", {"action": "create", "name": "notes", "content": md("notes", "Notes")}
+        )
+        assert not created.is_error
+        assert "version 1" in text_of(created)
+        listed = text_of(await client.call_tool("skills_list", {}))
+        assert "- base (builtin, v1): Builtin base" in listed
+        assert "- notes (user, v1): Notes" in listed
+        assert "notes" not in text_of(await client.call_tool("skills_list", {"query": "base"}))
+        await client.call_tool(
+            "skill_manage",
+            {
+                "action": "write_file",
+                "name": "notes",
+                "file_path": "references/a.md",
+                "file_content": "File A",
+            },
+        )
+        viewed = text_of(await client.call_tool("skill_view", {"name": "notes"}))
+        assert "Skill: notes (user, v2)" in viewed
+        assert "Files: references/a.md" in viewed
+        assert "Do it." in viewed
+        file = await client.call_tool(
+            "skill_view", {"name": "notes", "file_path": "references/a.md"}
+        )
+        assert text_of(file) == "File A"
+        patched = await client.call_tool(
+            "skill_manage",
+            {"action": "patch", "name": "notes", "old_string": "Do it.", "new_string": "Done."},
+        )
+        assert "version 3" in text_of(patched)
+        assert "Done." in text_of(await client.call_tool("skill_view", {"name": "notes"}))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ({"action": "create", "name": "ours", "scope": "workspace"}, "admin"),
+        ({"action": "create", "name": "all", "scope": "org"}, "org owner"),
+        ({"action": "edit", "name": "base"}, "read-only"),
+        ({"action": "archive", "name": "missing"}, "no skill"),
+        ({"action": "create", "name": "Bad Name"}, "name"),
+    ],
+)
+async def test_a_refused_skill_change_is_a_tool_error(
+    arguments: dict[str, str], expected: str
+) -> None:
+    store = MemorySkillStore(actor(), {"base": doc("base")})
+    arguments.setdefault("content", md(arguments["name"].lower().replace(" ", "-")))
+    async with skills_client(store) as client:
+        result = await client.call_tool("skill_manage", arguments)
+    assert result.is_error
+    assert expected in text_of(result)
+
+
+async def test_viewing_an_unknown_skill_or_file_is_a_tool_error() -> None:
+    store = MemorySkillStore(actor(), {"base": doc("base")})
+    async with skills_client(store) as client:
+        unknown = await client.call_tool("skill_view", {"name": "nope"})
+        no_file = await client.call_tool("skill_view", {"name": "base", "file_path": "x.md"})
+    assert unknown.is_error
+    assert no_file.is_error
+    assert "no file x.md" in text_of(no_file)

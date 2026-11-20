@@ -160,6 +160,66 @@ async def test_files_stay_in_the_session_sandbox(runtime: SandboxedRuntime) -> N
     assert await again.read_file(f"{again.workdir}/a.txt") == b"kept"
 
 
+class FakeSkills:
+    def __init__(self, files: dict[str, str] | None = None, *, fail: bool = False) -> None:
+        self.files_by_scope = files or {}
+        self.fail = fail
+        self.calls: list[RunScope] = []
+
+    async def files(self, scope: RunScope) -> dict[str, str]:
+        self.calls.append(scope)
+        if self.fail:
+            raise RuntimeError("the library is down")
+        return self.files_by_scope
+
+
+async def test_the_skills_of_the_session_are_written_before_the_run(
+    provider: CountingProvider,
+) -> None:
+    skills = FakeSkills({"notes/SKILL.md": "---\nname: notes\n---\n", "notes/scripts/a.py": "x"})
+    runtime = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=provider,
+        signer=RunTokenSigner(KEY),
+        settings=SandboxSettings(template="local", runner_argv=RUNNER),
+        skills=skills,
+    )
+    try:
+        runtime.fake_scripts.append(_reply("ok"))
+        events = await collect(runtime.run(_request(make_scope("run-1"))))
+        assert isinstance(events[-1], RunCompleted)
+        sandbox = await runtime.session_sandbox("org-1", "sess-1")
+        assert sandbox is not None
+        base = f"{sandbox.workdir}/.sama/skills"
+        assert await sandbox.read_file(f"{base}/notes/scripts/a.py") == b"x"
+        assert b"notes/SKILL.md" in await sandbox.read_file(f"{base}/.manifest.json")
+        # The next run syncs again and removes a file that left the library.
+        skills.files_by_scope = {"notes/SKILL.md": "---\nname: notes\n---\n"}
+        runtime.fake_scripts.append(_reply("ok"))
+        await collect(runtime.run(_request(make_scope("run-2"))))
+        with pytest.raises(FileNotFoundError):
+            await sandbox.read_file(f"{base}/notes/scripts/a.py")
+        assert [c.run_id for c in skills.calls] == ["run-1", "run-2"]
+    finally:
+        await runtime.close_sandboxes(kill=True)
+
+
+async def test_a_failed_skill_sync_does_not_fail_the_run(provider: CountingProvider) -> None:
+    runtime = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=provider,
+        signer=RunTokenSigner(KEY),
+        settings=SandboxSettings(template="local", runner_argv=RUNNER),
+        skills=FakeSkills(fail=True),
+    )
+    try:
+        runtime.fake_scripts.append(_reply("ok"))
+        events = await collect(runtime.run(_request(make_scope("run-1"))))
+        assert isinstance(events[-1], RunCompleted)
+    finally:
+        await runtime.close_sandboxes(kill=True)
+
+
 async def test_a_lost_sandbox_is_created_again(
     runtime: SandboxedRuntime, provider: CountingProvider
 ) -> None:
