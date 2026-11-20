@@ -39,6 +39,7 @@ from sama.memory import InProcessMemoryStore, MemoryService, MemoryStore, Postgr
 from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import PostgresUsageStore
 from sama.observability.logs import configure_logging
+from sama.review.proposals import PostgresProposalStore
 from sama.search import OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SkillStore
 from sama.tenancy.run_token import RunTokenSigner
@@ -95,6 +96,7 @@ def build_app(store_kind: str) -> Starlette:
     vault = None
     sessions: SessionSearch | None = None
     vision: VisionService | None = None
+    proposals: PostgresProposalStore | None = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
         from sama.gate.service import GateService
@@ -105,7 +107,8 @@ def build_app(store_kind: str) -> Starlette:
         engine = create_engine(url)
         todos = PostgresTodoStore(engine)
         memories = PostgresMemoryStore(engine)
-        skills = PostgresSkillStore(engine, BuiltinSkills().all())
+        proposals = PostgresProposalStore(engine)
+        skills = PostgresSkillStore(engine, BuiltinSkills().all(), proposals)
         gate = GateService(engine)
         vault = vault_from_env(engine)
         sessions = SessionSearch(engine, _embedder(vault))
@@ -128,7 +131,7 @@ def build_app(store_kind: str) -> Starlette:
         signer=RunTokenSigner(key.encode()),
         todos=todos,
         search=search,
-        memory=MemoryService(memories),
+        memory=MemoryService(memories, proposals),
         skills=skills,
         sessions=sessions,
         vision=vision,

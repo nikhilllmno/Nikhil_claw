@@ -70,6 +70,7 @@ from sama.memory import (
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
+from sama.review.apply import ReviewApplier
 from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -334,6 +335,12 @@ Me = Annotated[Principal, Depends(_principal)]
 """The user of the request. A route with this parameter needs a valid access token."""
 
 
+def _chat_runs(session_id: uuid.UUID) -> Any:
+    """The chat runs of a session. A background review run (Section 9.4) is not part of the
+    chat: its runs and events stay out of the run list and the event stream."""
+    return select(Run.id).where(Run.session_id == session_id, Run.kind == "chat")
+
+
 # -- the service ----------------------------------------------------------------------------
 
 
@@ -352,6 +359,7 @@ class SamaApi:
         integrations: Integrations | None = None,
         memory: MemoryService | None = None,
         skills: SkillLibrary | None = None,
+        reviews: ReviewApplier | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
@@ -360,6 +368,7 @@ class SamaApi:
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._skills = skills
+        self._reviews = reviews
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
@@ -723,7 +732,11 @@ class SamaApi:
                     Run.failure_message,
                     Run.created_at,
                 )
-                .where(Run.org_id == access.org_id, Run.session_id == session_id)
+                .where(
+                    Run.org_id == access.org_id,
+                    Run.session_id == session_id,
+                    Run.kind == "chat",
+                )
                 .order_by(Run.created_at.desc(), Run.id.desc())
                 .limit(RECENT_RUNS)
             )
@@ -738,7 +751,7 @@ class SamaApi:
         value = (
             await connection.execute(
                 select(func.coalesce(func.max(RunEvent.id), 0)).where(
-                    RunEvent.session_id == session_id
+                    RunEvent.session_id == session_id, RunEvent.run_id.in_(_chat_runs(session_id))
                 )
             )
         ).scalar_one()
@@ -1349,11 +1362,23 @@ class SamaApi:
         except ApprovalExpiredError as error:
             # An expired approval resumes the run as a reject.
             await self._queue.release_decided(org_id=access.org_id, run_id=row.run_id)
+            await self._apply_reviews(access.org_id, row.run_id)
             return JSONResponse(status_code=409, content={"detail": str(error)})
         except ApprovalError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         resumed = await self._queue.release_decided(org_id=access.org_id, run_id=row.run_id)
+        await self._apply_reviews(access.org_id, row.run_id)
         return JSONResponse(content={"status": status, "resumed": bool(resumed)})
+
+    async def _apply_reviews(self, org_id: uuid.UUID, run_id: uuid.UUID) -> None:
+        """Applies a decided proposal of a background review at once (Section 9.4). The worker
+        does the same in its maintenance round, so a failure here only delays the change."""
+        if self._reviews is None:
+            return
+        try:
+            await self._reviews.apply_decided(org_id=org_id, run_id=run_id)
+        except Exception:
+            log.exception("the review proposals could not be applied run=%s", run_id)
 
     async def _answer(
         self, principal: Principal, session_id: uuid.UUID, request_id: str, answers: Sequence[str]
@@ -1446,6 +1471,7 @@ class SamaApi:
                     .where(
                         RunEvent.org_id == access.org_id,
                         RunEvent.session_id == session_id,
+                        RunEvent.run_id.in_(_chat_runs(session_id)),
                         RunEvent.id > cursor,
                     )
                     .order_by(RunEvent.id)
@@ -1496,7 +1522,7 @@ class SamaApi:
         status, also when more than ``RECENT_RUNS`` newer runs are in the session.
         """
         columns = (Run.id, Run.status, Run.failure_code, Run.failure_message)
-        scope = (Run.org_id == org_id, Run.session_id == session_id)
+        scope = (Run.org_id == org_id, Run.session_id == session_id, Run.kind == "chat")
         recent = await connection.execute(
             select(*columns)
             .where(*scope)

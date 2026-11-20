@@ -66,6 +66,9 @@ class Actor:
     org_owner: bool = False
     session_id: uuid.UUID | None = None
     run_id: uuid.UUID | None = None
+    review: bool = False
+    """True in a background review run. It writes user skills itself and proposes the rest
+    (Section 9.4)."""
 
     @property
     def sees_user_skills(self) -> bool:

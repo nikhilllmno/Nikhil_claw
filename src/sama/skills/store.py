@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Protocol, cast
 
 from sqlalchemy import func, insert, select, update
@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AuditEntry, Skill, SkillVersion
+from sama.review.proposals import NewProposal, ProposalSink
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, WritePlan, index, plan_write
 from sama.skills.sql import load_actor, load_docs, scope_filter
@@ -31,6 +32,9 @@ class Written:
     scope: str
     version: int
     change: str
+    proposed: bool = False
+    """True when a background review proposed the change and a person must approve it first
+    (Section 9.4). ``version`` is 0 then, and ``change`` is the action."""
 
 
 class SkillStore(Protocol):
@@ -68,9 +72,15 @@ def _find(docs: list[SkillDoc], actor: Actor, name: str) -> SkillDoc:
 class PostgresSkillStore:
     """``skills`` and ``skill_versions``, written as the table owner."""
 
-    def __init__(self, engine: AsyncEngine, builtin: Mapping[str, SkillDoc]) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        builtin: Mapping[str, SkillDoc],
+        proposals: ProposalSink | None = None,
+    ) -> None:
         self._engine = engine
         self._builtin = builtin
+        self._proposals = proposals
 
     async def list(self, claims: RunTokenClaims, query: str | None) -> list[SkillDoc]:
         async with self._engine.connect() as connection:
@@ -89,20 +99,71 @@ class PostgresSkillStore:
         try:
             async with self._engine.begin() as connection:
                 actor = await _actor(connection, claims)
-                # The lock stops a second write to this name until this one commits.
-                await connection.execute(
-                    select(Skill.id)
-                    .where(scope_filter(actor), Skill.name == request.name)
-                    .with_for_update()
-                )
-                docs = await load_docs(connection, actor, names=[request.name], full=True)
-                builtin = self._builtin.get(request.name)
-                plan = plan_write([*docs, *([builtin] if builtin else [])], actor, request)
-                return await self._save(connection, actor, plan, request)
+                if actor.review:
+                    return await self._review(connection, actor, request)
+                return await self._write(connection, actor, request)
         except IntegrityError:
             raise SkillError(
                 f'A skill "{request.name}" was created at the same time. Try again.'
             ) from None
+
+    async def apply(self, actor: Actor, request: ManageRequest) -> Written:
+        """Writes an approved proposal of a background review (Section 9.4). ``actor`` has
+        the roles of the person who approved it, so ``authorize`` checks them again."""
+        try:
+            async with self._engine.begin() as connection:
+                return await self._write(connection, replace(actor, review=False), request)
+        except IntegrityError:
+            raise SkillError(
+                f'A skill "{request.name}" was created at the same time. Try again.'
+            ) from None
+
+    async def _write(
+        self, connection: AsyncConnection, actor: Actor, request: ManageRequest
+    ) -> Written:
+        # The lock stops a second write to this name until this one commits.
+        await connection.execute(
+            select(Skill.id)
+            .where(scope_filter(actor), Skill.name == request.name)
+            .with_for_update()
+        )
+        docs = await load_docs(connection, actor, names=[request.name], full=True)
+        builtin = self._builtin.get(request.name)
+        plan = plan_write([*docs, *([builtin] if builtin else [])], actor, request)
+        return await self._save(connection, actor, plan, request)
+
+    async def _review(
+        self, connection: AsyncConnection, actor: Actor, request: ManageRequest
+    ) -> Written:
+        """A background review writes a user skill itself. For any other scope it proposes
+        the change, and a person approves it (Section 9.4). The plan runs with the roles of an
+        org owner, to check the request and to learn the scope. The real check runs again when
+        a person approves the proposal."""
+        docs = await load_docs(connection, actor, names=[request.name], full=True)
+        builtin = self._builtin.get(request.name)
+        candidates = [*docs, *([builtin] if builtin else [])]
+        plan = plan_write(candidates, replace(actor, workspace_admin=True, org_owner=True), request)
+        if plan.scope == "user":
+            return await self._write(connection, actor, request)
+        if self._proposals is None or actor.session_id is None or actor.run_id is None:
+            raise SkillError("A background review cannot change a shared skill here.")
+        if plan.scope not in ("workspace", "org"):
+            raise SkillError(f"A background review cannot change a {plan.scope} skill.")
+        await self._proposals.propose(
+            NewProposal(
+                org_id=actor.org_id,
+                workspace_id=actor.workspace_id,
+                session_id=actor.session_id,
+                run_id=actor.run_id,
+                acting_user_id=actor.user_id,
+                kind="skill",
+                scope="workspace" if plan.scope == "workspace" else "org",
+                payload=asdict(request),
+                summary=f"{request.action} the {plan.scope} skill {request.name}"
+                + (f": {request.summary}" if request.summary else ""),
+            )
+        )
+        return Written(request.name, plan.scope, 0, request.action, proposed=True)
 
     async def _save(
         self, connection: AsyncConnection, actor: Actor, plan: WritePlan, request: ManageRequest

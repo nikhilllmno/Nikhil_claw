@@ -10,6 +10,10 @@ Rules:
 - One active run per session. ``running`` and ``paused`` runs are active. A partial unique
   index enforces the rule, and ``claim`` takes a run only when its session has no active run.
 - The runs of one session start in the order of ``created_at`` (FIFO). New messages queue.
+- A review run (Section 9.4) is a run of the kind ``review``. It is active too, so a session
+  has at most one running review, and a review never runs together with a chat run. A
+  second partial unique index allows one waiting review per session. A chat run starts before
+  a waiting review, and a review starts only when no chat run of its session waits.
 - A paused run waits for its approval. When the approval is decided or times out,
   ``release_decided`` queues the run again with the decision, and the next claim resumes it.
 - ``reap`` handles runs whose lease expired, for example after a worker crash. A run that
@@ -67,6 +71,9 @@ from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
 from sama.media.images import NewAttachment
 from sama.orchestrator.limits import QueueLimits
+from sama.review import policy as review_policy
+from sama.review.transcript import build_transcript
+from sama.review.trigger import after_completed_run
 from sama.runtime.contract import ApprovalDecision, FailureCode, Usage
 from sama.vault.redact import default_redactor, redact
 
@@ -146,6 +153,9 @@ class ClaimedRun:
     attempt: int
     next_seq: int
     """The ``seq`` of the next run event."""
+    kind: str = "chat"
+    """``review`` for a background review run (Section 9.4). Its ``input`` is the new part of
+    the transcript, ``model`` is the cheap review model, and it has no runtime state."""
 
 
 def _encode_state(state: bytes | None) -> str | None:
@@ -176,6 +186,7 @@ class RunQueue:
         lease: timedelta = DEFAULT_LEASE,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         approval_ttl: timedelta = APPROVAL_TTL,
+        review_models: Mapping[str, str] | None = None,
     ) -> None:
         if lease <= timedelta(0):
             raise ValueError("lease must be more than 0")
@@ -185,6 +196,7 @@ class RunQueue:
         self._lease = lease
         self._max_attempts = max_attempts
         self._approval_ttl = approval_ttl
+        self._review_models = {**review_policy.DEFAULT_MODELS, **(review_models or {})}
 
     @property
     def lease(self) -> timedelta:
@@ -297,12 +309,20 @@ class RunQueue:
             (await connection.execute(select(Org.limits).where(Org.id == org_id))).scalar_one()
         )
         checks: list[tuple[Any, int, str]] = [
-            (Run.org_id == org_id, limits.org_messages_per_minute, "the org")
+            (
+                and_(Run.org_id == org_id, Run.kind == "chat"),
+                limits.org_messages_per_minute,
+                "the org",
+            )
         ]
         if user_id is not None:
             checks.append(
                 (
-                    and_(Run.org_id == org_id, Run.triggered_by_user_id == user_id),
+                    and_(
+                        Run.org_id == org_id,
+                        Run.kind == "chat",
+                        Run.triggered_by_user_id == user_id,
+                    ),
                     limits.user_messages_per_minute,
                     "you",
                 )
@@ -433,7 +453,10 @@ class RunQueue:
     @staticmethod
     def _candidate(full: set[uuid.UUID]) -> Any:
         """The oldest ready run: queued, its session has no active run and no older queued
-        run, and its org is not in ``full``."""
+        run, and its org is not in ``full``.
+
+        A review run is ready only when no chat run of its session waits. A waiting review
+        does not block a chat run. Chat runs go before review runs."""
         other = aliased(Run)
         older = aliased(Run)
         conditions = [
@@ -442,7 +465,14 @@ class RunQueue:
             ~exists().where(
                 older.session_id == Run.session_id,
                 older.status == "queued",
+                older.kind == "chat",
                 tuple_(older.created_at, older.id) < tuple_(Run.created_at, Run.id),
+            ),
+            ~exists().where(
+                older.session_id == Run.session_id,
+                older.status == "queued",
+                older.kind == "chat",
+                Run.kind == "review",
             ),
         ]
         if full:
@@ -450,7 +480,7 @@ class RunQueue:
         return (
             select(Run.id, Run.org_id)
             .where(*conditions)
-            .order_by(Run.created_at, Run.id)
+            .order_by(case((Run.kind == "chat", 0), else_=1), Run.created_at, Run.id)
             .limit(1)
             .with_for_update(of=Run, skip_locked=True)
         )
@@ -496,11 +526,15 @@ class RunQueue:
                     Run.resume_decision,
                     Run.resume_reason,
                     Run.attempts,
+                    Run.kind,
+                    Run.review_from_seq,
+                    Run.review_to_seq,
                     Session.workspace_id,
                     Session.audience,
                     Session.owner_user_id,
                     AgentProfile.model,
                     AgentProfile.soul,
+                    AgentProfile.review_model,
                 )
                 .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
                 .join(
@@ -512,6 +546,8 @@ class RunQueue:
                 .where(Run.id == run_id)
             )
         ).one()
+        if row.kind == "review":
+            return await self._claimed_review(connection, run_id, row)
         text = (
             await connection.execute(
                 select(Message.content)
@@ -559,6 +595,46 @@ class RunQueue:
             next_seq=int(next_seq),
         )
 
+    async def _claimed_review(
+        self, connection: AsyncConnection, run_id: uuid.UUID, row: Any
+    ) -> ClaimedRun:
+        """A review run reads the new part of the transcript. It starts a fresh runtime
+        session with the cheap model, so it has no runtime state and no SOUL."""
+        transcript = await build_transcript(
+            connection,
+            org_id=row.org_id,
+            session_id=row.session_id,
+            from_seq=row.review_from_seq,
+            to_seq=row.review_to_seq,
+        )
+        next_seq = (
+            await connection.execute(
+                select(func.coalesce(func.max(RunEvent.seq) + 1, 0)).where(
+                    RunEvent.org_id == row.org_id, RunEvent.run_id == run_id
+                )
+            )
+        ).scalar_one()
+        return ClaimedRun(
+            org_id=row.org_id,
+            workspace_id=row.workspace_id,
+            session_id=row.session_id,
+            run_id=run_id,
+            agent_profile_id=row.agent_profile_id,
+            user_id=None,
+            audience=row.audience,
+            owner_user_id=row.owner_user_id,
+            runtime=row.runtime,
+            model=row.review_model or self._review_models.get(row.runtime, row.model),
+            soul="",
+            budget=row.budget,
+            input=transcript,
+            runtime_state=None,
+            resume=None,
+            attempt=row.attempts,
+            next_seq=int(next_seq),
+            kind="review",
+        )
+
     async def _session_state(
         self, connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, runtime: str
     ) -> bytes | None:
@@ -570,6 +646,7 @@ class RunQueue:
                     Run.org_id == org_id,
                     Run.session_id == session_id,
                     Run.runtime == runtime,
+                    Run.kind == "chat",
                     Run.status == "completed",
                     Run.runtime_state.is_not(None),
                 )
@@ -651,7 +728,8 @@ class RunQueue:
         runtime_state: bytes | None,
         usage: Usage,
     ) -> bool:
-        """Stores the reply as an assistant message and ends the run as ``completed``."""
+        """Stores the reply as an assistant message and ends the run as ``completed``. A
+        completed chat run counts for the background review (Section 9.4)."""
         async with self._engine.begin() as connection:
             ended = await self._end(
                 connection,
@@ -661,7 +739,8 @@ class RunQueue:
                 usage=usage,
                 runtime_state=_encode_state(runtime_state),
             )
-            if ended:
+            # A review run writes no message: nobody reads its reply (Section 9.4).
+            if ended and run.kind == "chat":
                 await connection.execute(
                     insert(Message).values(
                         org_id=run.org_id,
@@ -671,6 +750,8 @@ class RunQueue:
                         content={"text": redact(output)},
                     )
                 )
+                # In the same transaction, so a run that completes always counts, once.
+                await after_completed_run(connection, run)
             return ended
 
     async def fail(

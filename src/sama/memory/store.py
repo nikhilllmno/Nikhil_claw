@@ -99,6 +99,8 @@ class RunContext:
     unattended: bool
     delegated: bool
     """True for a run of a delegated child session."""
+    review: bool = False
+    """True for a background review run (Section 9.4)."""
 
 
 AfterChange = Callable[[AsyncConnection, MemoryState], Awaitable[None]]
@@ -289,6 +291,7 @@ class PostgresMemoryStore:
                         Run.agent_profile_id,
                         Run.triggered_by_user_id,
                         Run.unattended,
+                        Run.kind,
                         Session.audience,
                         Session.owner_user_id,
                         Session.lineage,
@@ -314,6 +317,7 @@ class PostgresMemoryStore:
             workspace_admin=admin,
             unattended=bool(row.unattended),
             delegated=row.lineage == "delegation",
+            review=row.kind == "review",
         )
 
     async def read(self, scope: MemoryScope) -> MemoryState:

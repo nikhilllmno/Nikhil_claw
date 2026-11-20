@@ -36,6 +36,7 @@ from sama.db.models import (
     AgentProfile,
     Approval,
     AuditEntry,
+    ReviewProposal,
     Run,
     Session,
     ToolCall,
@@ -55,6 +56,7 @@ from sama.gate.decide import (
     decide_recorded,
     json_default,
 )
+from sama.review.policy import REVIEW_TOOLSETS
 from sama.tenancy.access import load_grants
 from sama.tenancy.authority import budget_problem, load_authority, load_run_spend, run_user
 from sama.tenancy.run_token import RunTokenClaims
@@ -356,6 +358,7 @@ class GateService:
                     Run.agent_profile_id,
                     Run.triggered_by_user_id,
                     Run.unattended,
+                    Run.kind,
                     AgentProfile.toolsets,
                     Session.audience,
                     Session.owner_user_id,
@@ -384,9 +387,14 @@ class GateService:
         user_id = run_user(row.triggered_by_user_id, row.audience, row.owner_user_id)
         if user_id is None and claims is not None and claims.user_id:
             user_id = uuid.UUID(claims.user_id)
-        toolsets = row.toolsets if isinstance(row.toolsets, list) else []
+        toolsets = frozenset(
+            str(item) for item in (row.toolsets if isinstance(row.toolsets, list) else [])
+        )
+        if row.kind == "review":
+            # A background review has the memory and skill tools and no other tool (Section 9.4).
+            toolsets &= REVIEW_TOOLSETS
         context = GateContext(
-            toolsets=frozenset(str(item) for item in toolsets),
+            toolsets=toolsets,
             rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
             unattended=bool(row.unattended),
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),
@@ -601,6 +609,28 @@ class GateService:
             grants = await load_grants(connection, org_id, user_id)
             if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
                 raise ApprovalError("this user cannot decide the approval")
+            proposed = (
+                await connection.execute(
+                    select(ReviewProposal.scope).where(
+                        ReviewProposal.org_id == org_id, ReviewProposal.approval_id == row.id
+                    )
+                )
+            ).scalar_one_or_none()
+            if proposed is not None:
+                # The proposal of a background review changes shared memory or a shared skill
+                # (Section 9.4). Seeing the session is not enough to decide it.
+                allowed = (
+                    grants.org_owner
+                    if proposed == "org"
+                    else grants.admins_workspace(row.workspace_id)
+                )
+                if not allowed:
+                    raise ApprovalError(
+                        "only an org owner can decide this proposal"
+                        if proposed == "org"
+                        else "only a workspace admin can decide this proposal"
+                    )
+                always_allow = False
             if row.status != "pending":
                 raise ApprovalError(f"the approval is already {row.status}")
             now = self._clock()

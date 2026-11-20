@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AgentProfile, AuditEntry, Session, SessionBinding, StoredContextFile
 from sama.prompt.scan import scan
+from sama.review.policy import SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT
 from sama.runtime.contract import (
     CONTEXT_FILE_MAX_CHARS,
     CONTEXT_FILE_PATH_MAX_CHARS,
@@ -123,6 +124,8 @@ class PromptAssembler:
         self._system = system
 
     async def __call__(self, run: ClaimedRun) -> RunConfig:
+        if run.kind == "review":
+            return await self._review(run)
         session = (Session.org_id == run.org_id, Session.id == run.session_id)
         async with self._engine.begin() as connection:
             # The lock makes concurrent first runs of a session build one config.
@@ -148,6 +151,21 @@ class PromptAssembler:
         if config.runtime != RuntimeKind(run.runtime):
             raise ValueError("the run runtime is not the runtime of the session")
         return config
+
+    async def _review(self, run: ClaimedRun) -> RunConfig:
+        """The config of a background review (Section 9.4). It is built for this run and not
+        stored on the session: the chat prefix of the session stays frozen. It has the review
+        prompt, the notes and the skill index that the review can change, no SOUL, no context
+        files, and no MCP servers."""
+        async with self._engine.connect() as connection:
+            return RunConfig(
+                memory_snapshot=await _memory_snapshot(connection, run),
+                runtime=RuntimeKind(run.runtime),
+                model=run.model,
+                system=REVIEW_SYSTEM_PROMPT,
+                environment=environment(run, datetime.now(UTC)),
+                skill_index=await self._skill_index(connection, run),
+            )
 
     async def _build(
         self, connection: AsyncConnection, run: ClaimedRun, started: datetime
