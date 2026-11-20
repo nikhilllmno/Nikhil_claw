@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import jwt
 import pytest
+from fastapi import FastAPI
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -66,7 +67,12 @@ def api(engine: AsyncEngine, broker: ClarifyBroker) -> SamaApi:  # noqa: F811
 
 
 @pytest.fixture
-async def client(api: SamaApi) -> AsyncIterator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=api.app())
+def app(api: SamaApi) -> FastAPI:
+    return api.app()
+
+
+@pytest.fixture
+async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as client:
         yield client
