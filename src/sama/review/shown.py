@@ -1,4 +1,7 @@
-"""What a person sees of a proposal of a background review (docs/architecture.md, Section 9.4).
+"""What a person sees of a proposal (docs/architecture.md, Sections 9.4.1 and 9.4.2).
+
+A proposal comes from a background review (origin ``review``) or from a chat run (origin
+``chat``, M3.2). It changes memory, a skill, or the soul of a profile.
 
 The proposal is stored with redacted text. The redactor of the process can learn a secret later
 (a credential that the vault stores after the proposal), so the stored text is not enough. Every

@@ -32,7 +32,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Agent loop | `run_agent.py`, `agent/` | The SDK runs the loop. Sama wraps it in the `AgentRuntime` contract (§5). | SDK | M1 |
 | Provider abstraction (many providers) | `agent/transports/`, `providers/` | Only Anthropic and OpenAI models. Claude adapter (default) and OpenAI Agents adapter. | Adapt | M1, M3 |
 | Three-tier prompt (stable, context, volatile) | `agent/prompt_builder*.py` | Frozen prefix per session: SOUL, context files, memory snapshot, skill index. Volatile notes on the user message (§6.1, D9). | Adapt | M1 |
-| `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). | Adapt | M1 |
+| `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). Since M3.2, `change_propose` proposes a new SOUL, and a workspace admin or the org owner approves it (§9.4.2). | Adapt | M1 |
 | Context files (`AGENTS.md`, `CLAUDE.md`, `.hermes.md`) | `agent/context_files*.py` | Loaded from the repo in the sandbox and from workspace settings, 20,000-char cap, injection scan (§6). | Adapt | M1 |
 | Personalities (`/personality`) | `hermes_cli` | Agent profiles cover this. | Adapt | M3 |
 | Model switch per session (`/model`) | `hermes_cli/commands.py` | `/model` starts a child session (lineage) with the new model and a new prefix. The old session keeps its frozen prefix. | Adapt | M1 |
@@ -128,7 +128,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `/learn` (skill from sources) | `learn_prompt.py` | `/learn <url or files>` creates a draft skill for review. | Adapt | M4 |
 | Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace. Archive, never delete. Pins (§9). | Adapt | M6 |
 | Checkpoints and `/rollback`, `/undo` | `agent/checkpoints/` | Shadow git in the sandbox or Claude file checkpointing. User commands, not model tools (§15.3). | Adapt | M6 |
-| Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). | Adapt | M6 |
+| Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). The SOUL target is done in M3.2 (§9.4.2). | Adapt | M6 |
 | Changes to its own code | `self_repo_guard.py`, `hermes update` | `sama_pr`: a pull request to the sama repo that a human merges. CI deploys (§15.2). | New | M6 |
 | Version history and revert for all agent changes | partial (curator backups) | Every self-improvement write is a versioned row with provenance (D14). | New | M2 |
 
@@ -154,12 +154,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | Telegram adapter | `plugins/platforms/telegram/` | Bot API webhook adapter, inline keyboards, voice notes (§11.2). | Adapt | M1 |
-| Slack adapter | `plugins/platforms/slack/` | Events API and Web API with `httpx` (no Bolt), one Slack app per org as an integration, Block Kit approvals, thread = session (§11.2, §11.6). | Adapt | M3 (M3.1 done) |
+| Slack adapter | `plugins/platforms/slack/` | Events API and Web API with `httpx` (no Bolt), one Slack app per org as an integration, Block Kit approvals, thread = session (§11.2, §11.6). Threads are shared sessions with the audience rule (M3.3). | Adapt | M3 (M3.1, M3.3 done) |
 | 24 other platforms (Discord, WhatsApp, Signal, Email, Teams, ...) | `plugins/platforms/` | Same adapter shape. Email and WhatsApp first, on request. | Defer | — |
 | API server (OpenAI-compatible) | `gateway/platforms/api_server*.py` | Sama HTTP API with streaming events (§4.1). OpenAI-compatible endpoint later. | Adapt | M1 |
 | Authorization ladder, default deny | `gateway/authz_mixin.py` | Paired identities only. Group toolset and approver rule for shared sessions. Private and shared session audiences (§11.3). | Adapt | M1 |
 | DM pairing codes with rate limits and lockout | `gateway/pairing.py` | Codes from the web app, 10-minute expiry, lockout (§11.3). | Adapt | M1 |
-| Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. | Adapt | M1, M3 |
+| Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. Since M3.2: "Always allow for me" on Slack and Telegram cards, chat proposals, and the timeout counts as deny (§9.4.2). | Adapt | M1, M3 (M3.2 done) |
 | Streaming edits to messages | `gateway/stream_consumer*.py` | Edit one message as text arrives, with rate limits per channel. | Adapt | M1 |
 | Slash command registry | `hermes_cli/commands.py` | One command registry for all channels (§11.1). | Adapt | M1 |
 | Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, jobs, workflows, connections, traces (§11.2). | Adapt | M1 (minimal), M3, M6 |
@@ -175,7 +175,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents`, OpenAI agents as tools and handoffs (§13). | SDK | M2 (done) |
 | Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for running children. | Adapt | M4 |
 | Kanban board and dispatcher | `hermes kanban` | Task board with `task_*` tools (§12.4). | Adapt | M4 |
-| Worker bots in Slack channels | `gateway/bot_*` | An agent profile bound to a Slack channel with a budget. | Adapt | M3 |
+| Worker bots in Slack channels | `gateway/bot_*` | An agent profile bound to a Slack channel with a daily budget (§11.6). Done in M3.10. | Adapt | M3 |
 
 ## 11. Browser
 
