@@ -188,6 +188,42 @@ class McpServerConfig(_Frozen):
     bearer_token: SecretStr | None = Field(default=None, exclude=True)
 
 
+SUBAGENT_NAME_PATTERN: Final = r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+SUBAGENT_NAME_MAX_CHARS: Final = 40
+SUBAGENT_DESCRIPTION_MAX_CHARS: Final = 300
+SUBAGENT_PROMPT_MAX_CHARS: Final = 8_000
+SUBAGENT_MAX_TOOLS: Final = 64
+SUBAGENT_MAX_TURNS: Final = 50
+"""The limits of a sub-agent definition (docs/architecture.md, Section 13.1)."""
+
+
+class SubagentDefinition(_Frozen):
+    """A native sub-agent of a run: a short side task with its own prompt and tools.
+
+    Only a runtime with the capability ``native_subagents`` uses it (Section 13.1). The
+    control plane builds it from the agent profile, so a definition is part of the frozen
+    config and the model can call only these sub-agents. ``tools`` are sama tool names. They
+    are never more than the tools of the run (``sama.subagents.resolve``), and the tool gate
+    still checks every call of a sub-agent, in the same way as a call of the main agent.
+    """
+
+    name: str = Field(max_length=SUBAGENT_NAME_MAX_CHARS, pattern=SUBAGENT_NAME_PATTERN)
+    description: str = Field(min_length=1, max_length=SUBAGENT_DESCRIPTION_MAX_CHARS)
+    """Tells the main agent when to use this sub-agent."""
+    prompt: str = Field(min_length=1, max_length=SUBAGENT_PROMPT_MAX_CHARS)
+    """The system prompt of the sub-agent."""
+    tools: tuple[str, ...] = Field(default=(), max_length=SUBAGENT_MAX_TOOLS)
+    """The tools that the sub-agent can call. An empty list means no tool."""
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    """``None``: the sub-agent uses the model of the run."""
+    max_turns: int | None = Field(default=None, gt=0, le=SUBAGENT_MAX_TURNS)
+
+    @model_validator(mode="after")
+    def _tools_are_unique(self) -> Self:
+        _require_unique("sub-agent tool", self.tools)
+        return self
+
+
 class RunConfig(_Frozen):
     """What the model sees. Frozen for the life of a session (decision D9)."""
 
@@ -203,6 +239,9 @@ class RunConfig(_Frozen):
     """Facts of the session start, for example the date (volatile tier)."""
     tool_schemas: tuple[ToolSchema, ...] = ()
     mcp_servers: tuple[McpServerConfig, ...] = ()
+    subagents: tuple[SubagentDefinition, ...] = ()
+    """Native sub-agents. A runtime without ``native_subagents`` ignores them. The control
+    plane does not put them in the config of such a runtime."""
 
     @model_validator(mode="after")
     def _names_are_unique(self) -> Self:
@@ -210,6 +249,7 @@ class RunConfig(_Frozen):
         _require_unique("skill name", (s.name for s in self.skill_index))
         _require_unique("tool name", (t.name for t in self.tool_schemas))
         _require_unique("MCP server name", (m.name for m in self.mcp_servers))
+        _require_unique("sub-agent name", (a.name for a in self.subagents))
         return self
 
     def fingerprint(self) -> str:
@@ -220,6 +260,9 @@ class RunConfig(_Frozen):
         prefix did not change.
         """
         payload = self.model_dump(mode="json")
+        if not self.subagents:
+            # A config with no sub-agent keeps the digest that it had before the field existed.
+            del payload["subagents"]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -405,6 +448,14 @@ class SubagentEvent(_Event):
     type: Literal["subagent_event"] = "subagent_event"
     subagent: str = Field(min_length=1)
     text: str
+    call_id: str | None = None
+    """The id of the tool call that started the sub-agent. It groups the events of one
+    invocation. ``None``: the runtime did not tell it."""
+    done: bool = False
+    """The last event of the invocation: the sub-agent ended, with any status."""
+    tokens: int | None = Field(default=None, ge=0)
+    """The tokens that the sub-agent used in this invocation. Only the last event has it, and
+    only when the runtime reports it."""
 
 
 class ApprovalRequired(_Event):

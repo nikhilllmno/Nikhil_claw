@@ -222,7 +222,11 @@ class ScriptedGate:
 
 
 def call_hook(
-    tool_name: str, call_id: str, *, subagent: bool = False
+    tool_name: str,
+    call_id: str,
+    *,
+    subagent: bool = False,
+    tool_input: Mapping[str, Any] | None = None,
 ) -> Callable[[FakeClient], Any]:
     """A step that runs the PreToolUse hook of the options, like the CLI does."""
 
@@ -232,7 +236,7 @@ def call_hook(
         data: dict[str, Any] = {
             "hook_event_name": "PreToolUse",
             "tool_name": tool_name,
-            "tool_input": {"to": "a@b.c"},
+            "tool_input": dict(tool_input) if tool_input is not None else {"to": "a@b.c"},
             "tool_use_id": call_id,
             "session_id": SESSION,
             "transcript_path": "",

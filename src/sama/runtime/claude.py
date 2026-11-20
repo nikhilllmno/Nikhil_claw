@@ -31,6 +31,7 @@ from decimal import Decimal
 from typing import Any, Final, Literal, Protocol, cast
 
 from claude_agent_sdk import (
+    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -54,6 +55,8 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     SyncHookJSONOutput,
     SystemPromptPreset,
+    TaskNotificationMessage,
+    TaskStartedMessage,
     ToolPermissionContext,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -75,6 +78,7 @@ from sama.runtime.contract import (
     RunRequest,
     RunScope,
     RuntimeKind,
+    SubagentDefinition,
     SubagentEvent,
     TerminalEvent,
     TextDelta,
@@ -88,6 +92,11 @@ log: Final = logging.getLogger("sama.runtime.claude")
 
 DROP_DEFERRED_ENV: Final = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL"
 """CLI switch: drop a deferred tool call when the tool is not available on resume."""
+
+BACKGROUND_TASKS_ENV: Final = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
+"""CLI switch: no background tasks. Without it, the CLI starts a sub-agent in the background,
+and the run can end before the sub-agent ends. With a sub-agent in the config, a sub-agent
+runs in the foreground, and its calls stay inside the run (the budget, the gate, the events)."""
 
 TOOL_SEARCH_ENV: Final = "ENABLE_TOOL_SEARCH"
 """CLI switch for tool search. With tool search on, the CLI defers MCP tools: the model must
@@ -105,6 +114,13 @@ _KNOWN_SUBTYPES: Final = frozenset(
     {"error_during_execution", "error_max_structured_output_retries"}
 )
 _SUBAGENT_TOOLS: Final = frozenset({"Task", "Agent"})
+_NATIVE_TOOLS: Final = frozenset(
+    {"Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch"}
+    | {"TodoWrite"}
+)
+"""The sama tools that the CLI has built in. Every other sama tool is a tool of the sama MCP
+server, and the CLI names it ``mcp__sama__<tool>``."""
+_SAMA_MCP_PREFIX: Final = "mcp__sama__"
 _PREVIEW_CHARS: Final = 2_000
 _MEMORY_SIZE: Final = 10_000
 
@@ -341,10 +357,14 @@ class _Translator:
             name = self._subagents.get(parent, "subagent")
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text:
-                    events.append(SubagentEvent(subagent=name, text=block.text, usage=self.usage))
+                    text = block.text
                 elif isinstance(block, ToolUseBlock):
                     text = f"calls {block.name}"
-                    events.append(SubagentEvent(subagent=name, text=text, usage=self.usage))
+                else:
+                    continue
+                events.append(
+                    SubagentEvent(subagent=name, text=text, call_id=parent, usage=self.usage)
+                )
             return events
         streamed = self._streamed_text
         self._streamed_text = False
@@ -378,6 +398,8 @@ class _Translator:
         ]
 
     def _system(self, message: SystemMessage) -> list[RunEvent]:
+        if isinstance(message, TaskStartedMessage | TaskNotificationMessage):
+            return self._subagent_task(message)
         if message.subtype != "compact_boundary":
             return []
         metadata = message.data.get("compact_metadata") or {}
@@ -389,6 +411,31 @@ class _Translator:
         self.compacted = True
         return [
             Compacted(tokens_before=before, tokens_after=after, trigger=trigger, usage=self.usage)
+        ]
+
+    def _subagent_task(
+        self, message: TaskStartedMessage | TaskNotificationMessage
+    ) -> list[RunEvent]:
+        """The start and the end of a sub-agent. The CLI reports the tokens of the sub-agent
+        only here, because the usage of the stream is the usage of the run."""
+        call_id = message.tool_use_id
+        if call_id is None or call_id not in self._subagents:
+            return []  # Not a sub-agent of the Agent tool, for example a background command.
+        name = self._subagents[call_id]
+        if isinstance(message, TaskStartedMessage):
+            text = f"started: {message.description[:_PREVIEW_CHARS]}"
+            return [SubagentEvent(subagent=name, text=text, call_id=call_id, usage=self.usage)]
+        tokens = message.usage["total_tokens"] if message.usage else None
+        text = f"{message.status}: {message.summary[:_PREVIEW_CHARS]}"
+        return [
+            SubagentEvent(
+                subagent=name,
+                text=text,
+                call_id=call_id,
+                done=True,
+                tokens=None if tokens is None else _non_negative_int(tokens),
+                usage=self.usage,
+            )
         ]
 
     def add_result_usage(self, result: ResultMessage) -> None:
@@ -1020,6 +1067,8 @@ class ClaudeRuntime:
         else:
             system_prompt = prefix
         env = {TOOL_SEARCH_ENV: "false", **settings.env}
+        if config.subagents:
+            env[BACKGROUND_TASKS_ENV] = "1"
         disallowed: list[str] = []
         if phase.drop_tool is not None:
             env[DROP_DEFERRED_ENV] = "1"
@@ -1028,6 +1077,7 @@ class ClaudeRuntime:
             model=config.model,
             system_prompt=system_prompt,
             mcp_servers=_mcp_servers(config),
+            agents=_agents(config),
             strict_mcp_config=True,
             setting_sources=[],
             disallowed_tools=disallowed,
@@ -1035,7 +1085,7 @@ class ClaudeRuntime:
             max_turns=_remaining_turns(budget, translator),
             max_budget_usd=_remaining_cost(budget, translator),
             include_partial_messages=True,
-            hooks=self._hooks(scope, phase, translator),
+            hooks=self._hooks(scope, config, phase, translator),
             can_use_tool=_can_use_tool(translator),
             env=env,
             cwd=settings.cwd,
@@ -1043,10 +1093,10 @@ class ClaudeRuntime:
         )
 
     def _hooks(
-        self, scope: RunScope, phase: _Phase, translator: _Translator
+        self, scope: RunScope, config: RunConfig, phase: _Phase, translator: _Translator
     ) -> dict[Any, list[HookMatcher]]:
         hooks: dict[Any, list[HookMatcher]] = {
-            "PreToolUse": [HookMatcher(hooks=[self._hook(scope, phase, translator)])]
+            "PreToolUse": [HookMatcher(hooks=[self._hook(scope, config, phase, translator)])]
         }
         if self._archiver is not None:
             hooks["PreCompact"] = [HookMatcher(hooks=[self._archive_hook(scope, self._archiver)])]
@@ -1088,8 +1138,11 @@ class ClaudeRuntime:
 
         return pre_compact
 
-    def _hook(self, scope: RunScope, phase: _Phase, translator: _Translator) -> HookCallback:
+    def _hook(
+        self, scope: RunScope, config: RunConfig, phase: _Phase, translator: _Translator
+    ) -> HookCallback:
         gate = self._gate
+        subagents = frozenset(agent.name for agent in config.subagents)
         if phase.approved_call is not None:
             translator.allowed_calls.add(phase.approved_call)
 
@@ -1102,6 +1155,11 @@ class ClaudeRuntime:
             tool_name = str(raw.get("tool_name", ""))
             arguments = raw.get("tool_input") or {}
             call_id = str(raw.get("tool_use_id") or tool_use_id or "")
+            problem = _subagent_problem(tool_name, arguments, subagents)
+            if problem is not None:
+                # Sama never starts a sub-agent that the profile does not define. The call
+                # does not reach the gate, so the gate has no record of it.
+                return _deny(problem)
             if call_id and call_id == phase.approved_call:
                 # A human approved this call. The worker checked it again before the resume
                 # (GateService.reconfirm), and that check made the ticket of the call.
@@ -1122,16 +1180,62 @@ class ClaudeRuntime:
                 action = decision.action
             if action == "allow" and call_id:
                 translator.allowed_calls.add(call_id)
-            output: SyncHookJSONOutput = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": action,
-                    "permissionDecisionReason": decision.reason or f"sama tool gate: {action}",
-                }
-            }
-            return output
+            return _pre_tool_use_output(action, decision.reason or f"sama tool gate: {action}")
 
         return pre_tool_use
+
+
+def _pre_tool_use_output(
+    action: Literal["allow", "deny", "defer"], reason: str
+) -> SyncHookJSONOutput:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": action,
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _deny(reason: str) -> SyncHookJSONOutput:
+    return _pre_tool_use_output("deny", reason)
+
+
+def _subagent_problem(
+    tool_name: str, arguments: Mapping[str, Any], defined: frozenset[str]
+) -> str | None:
+    """Why a call of the sub-agent tool cannot start, or ``None``. The CLI has built-in
+    sub-agents that sama does not define, and a sub-agent can run in the background after
+    the run ended. Sama allows neither. Another tool gives ``None``."""
+    if tool_name not in _SUBAGENT_TOOLS:
+        return None
+    kind = arguments.get("subagent_type")
+    if not isinstance(kind, str) or kind not in defined:
+        return "this profile does not define that sub-agent"
+    if arguments.get("run_in_background"):
+        return "a sub-agent cannot run in the background"
+    return None
+
+
+def _agents(config: RunConfig) -> dict[str, AgentDefinition] | None:
+    """The ``agents`` option: the sub-agents of the config, or ``None`` when it has none."""
+    if not config.subagents:
+        return None
+    return {agent.name: _agent(agent) for agent in config.subagents}
+
+
+def _agent(agent: SubagentDefinition) -> AgentDefinition:
+    tools = [tool if tool in _NATIVE_TOOLS else f"{_SAMA_MCP_PREFIX}{tool}" for tool in agent.tools]
+    return AgentDefinition(
+        description=agent.description,
+        prompt=agent.prompt,
+        tools=tools,
+        # A sub-agent cannot start a sub-agent.
+        disallowedTools=sorted(_SUBAGENT_TOOLS),
+        model=agent.model or "inherit",
+        maxTurns=agent.max_turns,
+        background=False,
+    )
 
 
 def _can_use_tool(translator: _Translator) -> CanUseTool:
