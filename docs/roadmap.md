@@ -244,7 +244,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
 | M2.4 | Background review | When a run ends and 10 user turns or 10 tool iterations passed since the last review, sama queues one review and resets the counters. At most one review runs and one waits per session. The review run with a cheap model may write memory and skills. Recursion is off. User-scope writes apply. Workspace and org writes create an approval. Done. |
 | M2.5 | Session search | Full-text plus pgvector index on messages. `session_search` and `session_read`. No LLM call in the tool. Done. |
 | M2.6 | Context management | Compaction events from the Claude SDK, transcript archive, session lineage. `tool_search`, `tool_describe`, `tool_call` for deferred tools. Context pins. `/compact`. Done. |
-| M2.7 | Native sub-agents | Claude `agents` option configured from the agent profile. Sub-agent events appear in traces. |
+| M2.7 | Native sub-agents | Claude `agents` option configured from the agent profile. Sub-agent events appear in traces. Done. |
 | M2.8 | Media tools | `vision_analyze` for images from channels. Telegram photos and Slack files are stored (PNG, JPEG, GIF, WebP, 10 MB), and the tool asks a vision model about one image of the session. Done. |
 
 ## M3 — Reach
