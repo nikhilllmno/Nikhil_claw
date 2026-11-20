@@ -55,6 +55,7 @@ from sama.runtime.fake import FakeScript
 from sama.runtime.runner import (
     MODEL_URL_ENV,
     RUN_TOKEN_ENV,
+    TIMING_PREFIX,
     WORKDIR_ENV,
     GatePolicy,
     RunnerJob,
@@ -75,6 +76,8 @@ log: Final = logging.getLogger("sama.orchestrator")
 
 RUNNER_ARGV: Final = ("/opt/sama/.venv/bin/python", "-m", "sama.runtime.runner")
 """The runner in the sama image (``sandbox/Dockerfile``)."""
+WARM_RUNNER_ARGV: Final = ("/opt/sama/.venv/bin/python", "-m", "sama.warm")
+"""The same runner, started in a warm process when one is ready (``sama.warm``)."""
 DEFAULT_RUN_WALL_TIME_S: Final = 60 * 60
 TOKEN_MARGIN_S: Final = 10 * 60
 """The run token lives this long after the wall-time limit, for the start and the stop."""
@@ -590,13 +593,14 @@ class SandboxedRuntime:
                     if event is None:
                         continue
                     usage = event.usage
+                    events.put_nowait(event)
                     if is_terminal(event):
                         terminal = True
-                        # The run ends when the runner has stopped, so the next invocation of
-                        # the session never meets a runner that is still shutting down.
+                        # The caller gets the terminal event now, and this task stops the
+                        # runner after it. The next runner of the session waits for this one
+                        # to exit: it takes the runner lock in the sandbox (Section 16.2).
                         await _stop(process)
-                    events.put_nowait(event)
-                    if terminal:
+                        _log_timing(run_id, process)
                         return
             except SandboxError as error:
                 if active.cancelled.is_set():
@@ -687,6 +691,15 @@ async def _stop(process: SandboxProcess) -> None:
         await asyncio.wait_for(process.close_stdin(), timeout=PROVIDER_CALL_S)
     if await _bounded_wait(process) is None:
         await _bounded_kill(process)
+
+
+def _log_timing(run_id: str, process: SandboxProcess) -> None:
+    """Logs the timing line of the runner (Section 18.1), if its stderr has one."""
+    for line in reversed(process.stderr_tail().splitlines()):
+        start = line.find(TIMING_PREFIX)
+        if start >= 0:
+            log.info("%s run=%s", line[start:][:300], run_id)
+            return
 
 
 def _parse(line: str) -> RunEvent | None:

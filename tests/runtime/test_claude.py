@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -964,6 +965,32 @@ async def test_aclose_right_after_cancel_waits_for_the_cli_to_stop() -> None:
     await anext(stream)
     await runtime.cancel("run-1")
     await runtime.aclose()  # The stream is not drained yet.
+    assert factory.clients[0].disconnected
+
+
+async def test_a_completed_run_does_not_wait_for_the_cli_to_stop() -> None:
+    factory = Factory([delta("Hi"), result()], disconnect_s=0.5)
+    runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=2.0), client_factory=factory)
+    started = time.monotonic()
+    stream = cast(AsyncGenerator[RunEvent], runtime.run(request()))
+    events: list[RunEvent] = []
+    async with contextlib.aclosing(stream):
+        async for event in stream:
+            events.append(event)
+            if isinstance(event, RunCompleted):
+                break
+    assert isinstance(events[-1], RunCompleted)
+    assert time.monotonic() - started < 0.4
+    assert not factory.clients[0].disconnected
+    await runtime.aclose()  # The runner waits for the CLI before it exits.
+    assert factory.clients[0].disconnected
+
+
+async def test_a_failed_run_still_waits_for_the_cli_to_stop() -> None:
+    factory = Factory([result(subtype="error_during_execution", is_error=True)], disconnect_s=0.3)
+    runtime = ClaudeRuntime(settings=ClaudeSettings(cancel_grace_s=2.0), client_factory=factory)
+    events = await collect(runtime.run(request()))
+    assert isinstance(events[-1], RunFailed)
     assert factory.clients[0].disconnected
 
 

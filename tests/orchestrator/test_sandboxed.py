@@ -790,3 +790,42 @@ def test_the_capabilities_of_the_sandboxed_runtimes_name_the_compaction_features
 def test_the_settings_can_name_the_archive_endpoint() -> None:
     assert SandboxSettings(template="t").archive_url is None
     assert SandboxSettings(template="t", archive_url="http://tools/archive").archive_url
+
+
+_SLOW_EXIT = (
+    "import sys, time\n"
+    "sys.stdin.readline()\n"
+    'print(\'{"type": "run_completed", "output": "ok"}\', flush=True)\n'
+    "time.sleep(1.0)\n"
+)
+
+
+async def test_the_terminal_event_does_not_wait_for_the_runner_to_exit(
+    provider: CountingProvider,
+) -> None:
+    sandboxed = _sandboxed(provider, (sys.executable, "-c", _SLOW_EXIT))
+    started = asyncio.get_running_loop().time()
+    events = await collect(sandboxed.run(_request(make_scope())))
+    assert isinstance(events[-1], RunCompleted)
+    assert asyncio.get_running_loop().time() - started < 0.9
+    # The runner still stops, and the idle timeout is set back only after that.
+    assert provider.keep_alives == [int(sandboxed_module.DEFAULT_RUN_WALL_TIME_S + 600)]
+    await sandboxed.wait_for_cleanup()
+    assert asyncio.get_running_loop().time() - started >= 1.0
+    assert len(provider.keep_alives) == 2
+    await sandboxed.close_sandboxes(kill=True)
+
+
+async def test_the_timing_line_of_the_runner_is_logged(
+    runtime: SandboxedRuntime, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="sama.orchestrator")
+    runtime.fake_scripts.append(_reply("ok"))
+    scope = make_scope("run-timing")
+    await collect(runtime.run(_request(scope)))
+    await runtime.wait_for_cleanup()
+    lines = [r.getMessage() for r in caplog.records if "runner timing" in r.getMessage()]
+    assert len(lines) == 1
+    assert lines[0].startswith("runner timing mode=cold job_s=")
+    assert "terminal_s=" in lines[0]
+    assert lines[0].endswith("run=run-timing")

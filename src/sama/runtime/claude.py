@@ -1021,11 +1021,18 @@ class ClaudeRuntime:
                     break
                 for event in translator.feed(message):
                     active.send(event)
+            if final is not None and phase.drop_tool is None:
+                early = translator.terminal(final, active.cancelled.is_set())
+                if isinstance(early, RunCompleted):
+                    # A completed run has nothing more to count, so the answer goes out now
+                    # and does not wait for the CLI to stop (Section 16.2). ``aclose`` still
+                    # waits for the CLI, so the runner exits only after the CLI.
+                    active.send(early)
         finally:
             active.client = None
             await self._disconnect(client)
-        # Map the result only after the CLI stopped, so the wall time in runtime_state also
-        # counts the time to stop the CLI.
+        # Map other results only after the CLI stopped, so the wall time in runtime_state
+        # also counts the time to stop the CLI.
         if final is None:
             raise _UnexpectedResult("the CLI stopped before it sent a result")
         if phase.drop_tool is None:
