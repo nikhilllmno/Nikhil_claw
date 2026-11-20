@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+import shutil
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from sama.runtime.contract import RunScope
+from sama.sandbox.base import ExecResult
 from sama.sandbox.local import LocalSandbox
 from sama.skills import BuiltinSkills, ManageRequest, MemorySkillStore, SkillError, commands
 from sama.skills.builtin import ENV_DIRECTORY, builtin_directory, load
 from sama.skills.lint import MAX_DESCRIPTION_CHARS
 from sama.skills.render import render_list, render_view
-from sama.skills.sync import MAX_SYNC_FILES, ROOT, sync_files, sync_skills
+from sama.skills.sync import MAX_SYNC_FILES, ROOT, digest, sync_files, sync_skills
 from sama.tenancy import RunTokenClaims
 from tests.skills.helpers import actor, doc, md
 from tests.support import make_scope
@@ -221,10 +224,10 @@ async def test_the_staging_folder_has_a_new_random_name_for_each_sync(tmp_path: 
     box = _Racy(tmp_path / "box", tmp_path)
     box.written.append("skip the link")
     await sync_files(box, {"a/SKILL.md": "A"})
-    await sync_files(box, {"a/SKILL.md": "A"})
-    names = {path.split("/")[-3] for path in box.written[1:]}
+    await sync_files(box, {"a/SKILL.md": "B"})
+    names = {path.split("/")[-1] for path in box.written[1:]}
     assert len(names) == 2
-    assert all(len(name) == len(".skills-") + 32 for name in names)
+    assert all(len(name) == len(".skills-") + 32 + len(".tar") for name in names)
 
 
 async def test_old_staging_folders_are_removed_and_a_failed_sync_leaves_none(
@@ -243,9 +246,79 @@ async def test_old_staging_folders_are_removed_and_a_failed_sync_leaves_none(
 
     failing = Failing(tmp_path / "box")
     with pytest.raises(OSError, match="disk full"):
-        await sync_files(failing, {"a/SKILL.md": "A"})
+        await sync_files(failing, {"a/SKILL.md": "B"})
     assert [path.name for path in sama.iterdir()] == ["skills"]
     assert (sama / "skills/a/SKILL.md").read_text() == "A"
+
+
+class _Counting(LocalSandbox):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.writes = 0
+        self.execs = 0
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        self.writes += 1
+        await super().write_file(path, data)
+
+    async def exec(self, argv: Sequence[str], **kwargs: Any) -> ExecResult:
+        self.execs += 1
+        return await super().exec(argv, **kwargs)
+
+
+async def test_unchanged_skills_cost_one_call_and_no_write(tmp_path: Path) -> None:
+    (tmp_path / "box" / "work").mkdir(parents=True)
+    box = _Counting(tmp_path / "box")
+    files = {"a/SKILL.md": "A", "a/scripts/run.sh": "echo hi", "b/references/x.md": "X"}
+    assert await sync_files(box, files) == 3
+    assert (box.writes, box.execs) == (1, 2)  # the check, one archive, and the publish
+    assert await sync_files(box, dict(reversed(files.items()))) == 0
+    assert (box.writes, box.execs) == (1, 3)  # only the check
+    assert digest(files) == digest(dict(reversed(files.items())))
+
+
+@pytest.mark.parametrize("change", ["edit", "extra", "link", "delete", "folder-link"])
+async def test_any_change_in_the_folder_makes_the_sync_write_again(
+    tmp_path: Path, change: str
+) -> None:
+    box = _sandbox(tmp_path)
+    base = Path(box.workdir) / ROOT
+    files = {"a/SKILL.md": "A", "a/references/n.md": "N"}
+    assert await sync_files(box, files) == 2
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if change == "edit":
+        (base / "a/SKILL.md").write_text("tampered")
+    elif change == "extra":
+        (base / "a/extra.sh").write_text("rm -rf /")
+    elif change == "link":
+        (base / "a/references/n.md").unlink()
+        (base / "a/references/n.md").symlink_to(outside / "n.md")
+        (outside / "n.md").write_text("N")  # the same text through a link
+    elif change == "delete":
+        (base / "a/references/n.md").unlink()
+    else:
+        shutil.copytree(base, outside / "skills")
+        shutil.rmtree(base)
+        base.symlink_to(outside / "skills", target_is_directory=True)
+    assert await sync_files(box, files) == 2
+    assert not base.is_symlink()
+    assert sorted(str(p.relative_to(base)) for p in base.rglob("*") if not p.is_dir()) == [
+        "a/SKILL.md",
+        "a/references/n.md",
+    ]
+    assert not (base / "a/references/n.md").is_symlink()
+    assert (base / "a/SKILL.md").read_text() == "A"
+
+
+async def test_an_empty_library_makes_an_empty_folder_once(tmp_path: Path) -> None:
+    (tmp_path / "box" / "work").mkdir(parents=True)
+    box = _Counting(tmp_path / "box")
+    assert await sync_files(box, {}) == 0
+    assert list((Path(box.workdir) / ROOT).iterdir()) == []
+    writes = box.writes
+    assert await sync_files(box, {}) == 0
+    assert box.writes == writes
 
 
 async def test_a_failed_prepare_stops_the_sync(tmp_path: Path) -> None:
