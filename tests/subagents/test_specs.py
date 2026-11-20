@@ -165,7 +165,7 @@ def test_a_toolset_of_a_spec_must_be_a_toolset_of_the_profile() -> None:
     assert "does not have the toolset memory" in found
 
 
-@pytest.mark.parametrize("toolset", ["subagents", "clarify"])
+@pytest.mark.parametrize("toolset", ["subagents", "clarify", "tool_search"])
 def test_a_subagent_cannot_have_the_toolsets_that_start_agents_or_ask_people(toolset: str) -> None:
     [found] = check(spec(toolsets=[toolset]))
     assert f"cannot have the toolset {toolset}" in found
@@ -223,6 +223,20 @@ def test_a_subagent_never_has_the_subagent_or_the_clarify_tools() -> None:
         runtime=CLAUDE,
     )
     assert definition.tools == ("web_extract", "web_search")
+
+
+def test_a_subagent_never_has_the_tools_of_tool_search_for_a_deferred_tool() -> None:
+    """A deferred tool of the run is behind ``tool_call``. A sub-agent must not reach it."""
+    toolsets = run_toolsets("web", "subagents", "tool_search", "github-extra")
+    [definition] = resolve(
+        # Built without ``problems``, as an old row of the database can be.
+        specs(spec(toolsets=["web", "tool_search", "github-extra"])),
+        toolsets=toolsets,
+        runtime=CLAUDE,
+    )
+    assert definition.tools == ("web_extract", "web_search")
+    for name in ("tool_search", "tool_describe", "tool_call"):
+        assert name not in definition.tools
 
 
 def test_the_model_inherit_is_no_model_and_an_id_stays() -> None:
