@@ -26,7 +26,6 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
-import logging
 import re
 import secrets
 import tarfile
@@ -35,8 +34,6 @@ from typing import Final, Protocol
 
 from sama.runtime.contract import RunScope
 from sama.sandbox.base import Sandbox
-
-log = logging.getLogger(__name__)
 
 ROOT_PARENT: Final = ".sama"
 ROOT: Final = f"{ROOT_PARENT}/skills"

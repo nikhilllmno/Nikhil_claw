@@ -908,6 +908,7 @@ class RunQueue:
         ``compacted`` event writes a second record, so it uses a transaction."""
         if not events:
             return True
+        leased = select(Run.id).where(*self._owned(run, owner)).with_for_update()
         if all(kind != "compacted" for _seq, kind, _payload in events):
             rows = (
                 func.unnest(
@@ -925,7 +926,6 @@ class RunQueue:
                 .table_valued(column("seq", Integer), column("type", Text), column("payload", Text))
                 .render_derived(name="event")
             )
-            leased = select(Run.id).where(*self._owned(run, owner)).with_for_update()
             async with autocommit(self._engine) as connection:
                 stored = await connection.execute(
                     insert(RunEvent)
@@ -944,11 +944,7 @@ class RunQueue:
                 )
                 return bool(stored.first())
         async with self._engine.begin() as connection:
-            held = (
-                await connection.execute(
-                    select(Run.id).where(*self._owned(run, owner)).with_for_update()
-                )
-            ).scalar_one_or_none()
+            held = (await connection.execute(leased)).scalar_one_or_none()
             if held is None:
                 return False
             await connection.execute(

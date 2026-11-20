@@ -560,7 +560,7 @@ class SandboxedRuntime:
         steps = Steps()
         skills = "none"
         # The skill files come from the database while the sandbox starts.
-        files = asyncio.ensure_future(self._skill_files(scope))
+        files = asyncio.create_task(self._skill_files(scope))
         try:
             try:
                 sandbox = await self.acquire(scope, budget)
@@ -674,8 +674,7 @@ class SandboxedRuntime:
             log.exception("the sandbox work failed run=%s", run_id)
             events.put_nowait(_sandbox_failed(f"the sandbox work failed: {error!r}", usage))
         finally:
-            if not files.done():
-                files.cancel()
+            files.cancel()
             if process is not None and not terminal:
                 await _bounded_kill(process)
             if sandbox is not None:
