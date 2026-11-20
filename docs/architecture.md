@@ -677,10 +677,14 @@ Rules:
   the system text also tells the model that file text is data.
 - A file longer than 20,000 characters keeps its head (70%) and its tail (30%). A marker
   `[... N characters cut ...]` replaces the middle.
-- Not in M1.11: channel formatting hints (M1.13), pinned skills, the skill index, the memory snapshot, and the user profile
-  block (later milestones). The `RunConfig` fields for them exist, and they are empty.
+- Not in M1.11: channel formatting hints (M1.13), pinned skills, and the user profile block
+  (later milestones). The `RunConfig` fields for them exist, and they are empty.
   Since M2.1 the memory snapshot is full: the `agent`, `workspace`, and (in a private session)
   `user` notes of the run (Section 8.1). The user profile block is the `user` part of it.
+- The skill index (M2.2) is filled when the session starts: name and description of each
+  skill that the profile and the session can use (Section 9.2). It is part of the frozen
+  prefix, so a skill that the agent writes during the session is not in the index. The agent
+  can find it with `skills_list`.
 - Repo `AGENTS.md` and `CLAUDE.md` files do not go into the prefix. The prefix stays the same
   for the whole session, and a repo is cloned during a run. Since M1.16 the `repo_clone`
   result holds these files (Section 15.1).
@@ -865,6 +869,30 @@ that both Claude and Hermes use. Frontmatter: `name`, `description` (one sentenc
 60 characters, as in Hermes), `version`, `tags`, `requires_toolsets`, `requires_integrations`,
 and `config` (settings that the user fills in once).
 
+**Code (M2.2).** The package `src/sama/skills/` holds the format, the lint, the scan, the
+store, and the sync. The rules:
+
+- `SKILL.md` starts with a YAML block between two `---` lines. `sama.skills.format` reads it
+  with `yaml.safe_load`. It refuses anchors and aliases, a block longer than 4,000
+  characters, and keys that the format does not know. The known keys are `name`,
+  `description`, `version`, `tags`, `requires_toolsets`, `requires_integrations`, `config`,
+  `license`, `compatibility`, `metadata`, and `allowed-tools`. `version` can be a number in
+  the file. Sama reads it as text.
+- Lint (`sama.skills.lint`) runs on every write. The `name` has lowercase letters, digits,
+  and single hyphens, at most 64 characters. It must be the folder name, and it must not be
+  a reserved command (Section 9.5). The `description` is one line of 1 to 60 characters.
+  There are at most 10 tags (30 characters each, `[a-z0-9-]`). Each entry of
+  `requires_toolsets` must be a toolset of Section 10.2. The body is not empty.
+  `SKILL.md` has at most 20,000 characters. A file has at most 50,000 characters. A skill has
+  at most 20 files and 200,000 characters. A file path is relative, has no `..` and no
+  backslash, has at most 200 characters, and starts with `references/`, `templates/`,
+  `scripts/`, or `assets/`. Files are text.
+- Scan (`sama.skills.lint`) runs on `SKILL.md`, every file, and the description. It uses
+  `sama.prompt.scan` for prompt injection and `sama.vault.redact` for secrets: text that the
+  redactor would change is a finding. A write with a finding fails, and the error lists the
+  finding ids. The check for network calls to unknown hosts (Section 9.4, step 5) is not in
+  M2.2, because sama has no list of known hosts yet.
+
 ### 9.2 Library and scopes
 
 | Scope | Who writes | Where |
@@ -879,6 +907,48 @@ and `config` (settings that the user fills in once).
 - An agent profile chooses which skills and categories are on. The session gets the index
   of these skills.
 
+**Code (M2.2).**
+
+- Storage. The table `skills` has one row per skill and scope: `org_id`, `scope`
+  (`org`, `workspace`, or `user`), `workspace_id` (workspace scope only), `user_id` (user
+  scope only), `name`, `status` (`active` or `archived`), and `current_version`. The table
+  `skill_versions` has one row per version: the name, the description, the full `SKILL.md`,
+  the files, the tags, `requires_toolsets`, the change (`create`, `patch`, `edit`,
+  `write_file`, `remove_file`, or `archive`), a summary, and the provenance: author kind
+  (`user`, `agent`, or `system`), author user, session, and run. Session and run have no
+  foreign key, so the provenance stays when a session is deleted. A version never changes.
+  Builtin skills are not in the database. They are the folders of `skills/`.
+- Assumption: the files of a skill are in the version row, as a JSON object of path and
+  text. This replaces Supabase Storage for now. The size caps of Section 9.1 keep a row
+  small. Binary files are not possible. A move to Storage later does not change the tools.
+- Names. A narrower scope overrides a wider scope: `user`, then `workspace`, then `org`, then
+  `builtin`. An archived skill is not in the library, and it does not override a wider
+  skill. A `create` with the name of an archived skill of the same scope makes a new version
+  of that row, and its status is `active` again. Archive is the only way to remove a skill.
+  Sama never deletes a row.
+- Write rules (Section 9.4, step 3, applies to every writer). `skill_manage` takes the scope
+  of the write. The default is `user` in a private session and `workspace` in a shared
+  session. A `user` write applies at once, but only in a private
+  session, because a shared session has no single owner. A `workspace` write applies when
+  the user of the run is a workspace `admin` or `owner`, or the org `owner`. Other users get
+  an error that says an admin must make the change. Approval cards for these writes come in
+  M3.2. An `org` write needs the org `owner`. A `builtin` skill is read-only. To change one,
+  the agent makes a skill with the same name in a narrower scope.
+- Every write locks the row of the skill, adds the next version, and adds the audit entry
+  `skill.<change>` (agent actor, user, run). Two writes at the same time get two versions
+  in sequence.
+- RLS. A member reads a skill of `org` scope. A member reads a skill of `workspace` scope
+  when the member can see the workspace. Only the owner reads a skill of `user` scope. A
+  version has the visibility of its skill. The tables have no write policy. The control
+  plane writes as the table owner.
+- The index. A run sees a skill when all of these are true: the profile has the `skills`
+  toolset; the profile list `agent_profiles.skills` is empty (all skills) or has the name;
+  each `requires_toolsets` entry is in `agent_profiles.toolsets`; and, in a shared session,
+  the scope is not `user`. The index has at most 200 skills, sorted by name.
+- Migration `0013` adds `skills` to the toolsets of every existing profile, because the new
+  tools would have no effect without it. `python -m sama.admin bootstrap` gives the toolset
+  to new profiles.
+
 ### 9.3 Progressive disclosure and tools
 
 - Level 0: the index (name and description) is in the prompt.
@@ -889,7 +959,34 @@ and `config` (settings that the user fills in once).
 - `skills_list`, `skill_view`, and `skill_manage` (`create`, `patch`, `edit`, `write_file`,
   `remove_file`, `archive`) are sama tools. All writes go through `skill_manage`, so every
   write is versioned and scanned.
-- Slash command per skill (`/<skill-name>`) in every channel.
+- Slash command per skill (`/<skill-name>`) in every channel (Section 9.5).
+
+**Code (M2.2).**
+
+- `skills_list` takes an optional `query` and returns the index of the run: name,
+  description, scope, and version. It is the same list as the prompt, but fresh. A skill that
+  an earlier call of the run created is in it.
+- `skill_view` takes `name` and an optional `file_path`. Without a path it returns
+  `SKILL.md` and the list of files. With a path it returns that file. The result also gives
+  the folder of the skill in the sandbox.
+- `skill_manage` takes `action`, `name`, and the fields of the action: `content` (`create`,
+  `edit`), `old_string`, `new_string`, and `replace_all` (`patch`), `file_path` and
+  `file_content` (`write_file`), `file_path` (`remove_file`), `scope`, and an optional
+  `summary`. `patch` works on `SKILL.md`, or on `file_path`. It fails when `old_string` is
+  not in the text exactly once, unless `replace_all` is true. The result gives the new
+  version number.
+- Errors of these tools (not found, lint, scan, and permission errors) are tool errors with a
+  text that the model can act on. They do not stop the run.
+- The gate allows the three tools without a policy rule, in the toolset `skills`. The role
+  check is in the store, because it depends on the scope.
+- Sync into the sandbox. Before a run starts the runner, `SandboxedRuntime` writes the
+  files of the visible skills to `.sama/skills/<name>/` in the work folder of the sandbox.
+  It also writes `.sama/skills/.manifest.json` (path and SHA-256). A later run writes only
+  the changed files and removes the files that are no longer in the library. A failed sync
+  logs a warning and does not fail the run. The tools of the run do not depend on the
+  files, because `skill_view` reads from the database. The sync is for scripts. It does not
+  use `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and
+  the gate does not allow it.
 
 ### 9.4 Self-improvement loop
 
@@ -927,6 +1024,32 @@ flowchart LR
    becomes active.
 6. **Learn on request.** `/learn <url or topic>` makes the agent read sources and write a
    skill.
+
+### 9.5 Skills as slash commands (M2.3)
+
+- `/<skill-name> <request>` makes a normal message that runs with that skill. The gateway
+  does not load the skill. It changes the text of the message, so the frozen prefix stays
+  the same. The new text is the original text, then one line: `(Skill command: load the
+  skill "<name>" with skill_view and follow it for this request.)` If the user gave no
+  request, the line says so. The agent then calls `skill_view`. The stored message is the
+  new text, so the transcript shows what the agent got.
+- A command is a skill command only when the library of the session has the skill. The
+  library follows the rules of Section 9.2: scope override, the profile list, and
+  `requires_toolsets`. An unknown command works as before. In Telegram it gets the help
+  text, and in the web page and in Slack it is normal text.
+- The names of channel commands are reserved (`new`, `stop`, `model`, `start`, `pair`,
+  `help`, `skills`, `approve`, `deny`, `resume`, `memory`, `cron`, `compact`, `learn`,
+  and more). The lint refuses them as skill names, so a skill never hides a command.
+- Telegram: `/name rest`. A skill name can have hyphens, but Telegram menus and the legacy
+  parser allow only letters, digits, and `_`. So `/code_review` and `/code-review` both
+  mean the skill `code-review`. In a group, the message still needs a mention or a reply,
+  as for all text.
+- Web page: a message that starts with `/name` is expanded in the API before it is queued.
+- Slack: a message to the app (DM or mention) that starts with `/name` is expanded. Slack
+  does not send an unknown slash command to the app, so the slash command is
+  `/sama <name> <request>`. Sama accepts it in a DM, where the reply goes to the thread of
+  the DM. In a channel, the user mentions the app and writes `/<name> <request>`.
+- `/skills` in Telegram lists the index of the session in one message.
 
 ---
 
@@ -1176,7 +1299,8 @@ One gateway service hosts all channel adapters. Each adapter does five things:
    and split long text by the channel's limits.
 5. **Controls**: render approval cards and `clarify` questions as buttons, and map slash
    commands (`/new`, `/stop`, `/resume`, `/model`, `/skills`, `/memory`, `/cron`, `/approve`,
-   `/deny`, `/<skill-name>`).
+   `/deny`, `/<skill-name>`). A skill command changes the text of the
+   message (Section 9.5).
 
 ### 11.2 Adapters
 
@@ -1820,7 +1944,9 @@ Rules of the steps:
   gets `deny`.
 - **Toolsets.** `core` (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`,
   `Grep`, `WebFetch`), `todo` (`todo`, `TodoWrite`), `web` (`web_search`, `web_extract`),
-  `clarify`, and `github` (`repo_clone`, M1.16). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
+  `clarify`, `github` (`repo_clone`, M1.16), and `skills` (`skills_list`, `skill_view`,
+  `skill_manage`, M2.2; allowed without a rule, because the store checks the role of the
+  user). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
   default is an empty list, so a new profile can use no tool until an admin sets its toolsets.
 - **Hardline.** Recursive deletes of `/`, `~`, `$HOME`, or a top-level system folder;
   `--no-preserve-root`; fork bombs; `mkfs`, `wipefs`, `blkdiscard`; `dd`, `shred`, or `>` to
@@ -2316,6 +2442,8 @@ migrated schema.
 | `approvals` | One row per tool call that asks a human (migration `0004`, Section 16.1) |
 | `tool_policies` | Tool gate rules per org, profile, and user (migration `0004`, Section 16.1) |
 | `context_files` | Context files per org, workspace, and profile (migration `0006`, Section 6.1) |
+| `skills` | One row per skill and scope, with the current version and the status (migration `0013`, Section 9.2) |
+| `skill_versions` | One row per version of a skill: text, files, and provenance (migration `0013`, Section 9.2) |
 | `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
 | `integrations` | The chat apps of each org, for example its Telegram bot (migration `0011`, Section 11.6) |
 | `memories` | The notes of one scope: `org_id`, `scope` (`agent`, `user`, `workspace`), `workspace_id`, `agent_profile_id`, `user_id`, `entries` (JSON list), `revision` (migration `0012`, Section 8.1) |
@@ -2598,7 +2726,7 @@ The provider and search keys are the defaults. An org key in the vault comes fir
 
 `python -m sama.admin bootstrap --org-slug <slug> --email <email>` creates the first org, an
 org-level `owner` membership, the workspace `main`, and the agent profile `sama` (model
-`claude-sonnet-5-5`, toolsets `core`, `todo`, `web`, `clarify`). The owner signs in on the web
+`claude-sonnet-5-5`, toolsets `core`, `todo`, `web`, `clarify`, `github`, `skills`). The owner signs in on the web
 page one time first, so that the email finds the Supabase Auth user. A second run adds only
 what is missing. Run it on the app machine with `fly ssh console`.
 

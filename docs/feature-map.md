@@ -71,16 +71,16 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| `SKILL.md` format (Agent Skills standard) | `skills/`, `agent/skill_*.py` | Same format. Stored as versioned rows plus files in Supabase Storage, synced into the sandbox (§9). | Adapt | M2 |
-| Progressive disclosure (index, view, files) | `tools/skills_tool.py` | Index in the prefix (60-char descriptions), `skill_view` loads the body and files. Claude native skills are an option. | Adapt | M2 |
-| `skills_list`, `skill_view`, `skill_manage` | `tools/skills_tool.py`, `tools/skill_manager_tool.py` | Same tool names. `skill_manage`: create, patch, edit, write_file, remove_file, archive. | Adapt | M2 |
-| Skill scopes (builtin, user dir, project) | `agent/skill_*.py` | builtin, org, workspace, user. User scope applies at once. Shared scopes need approval (§9). | Adapt | M2 |
-| Skills as slash commands (`/<skill>`) | `gateway/slash_commands.py` | `/<skill-name>` in every channel (§11.1). | Adapt | M2 |
-| Bundled skills (44) and optional skills (141) | `skills/`, `optional-skills/` | We write a small set of our own builtin skills. We do not copy Hermes skill text without attribution. | Adapt | M2 |
+| `SKILL.md` format (Agent Skills standard) | `skills/`, `agent/skill_*.py` | Same format. Stored as versioned rows with the files in the version row (Supabase Storage later), synced into the sandbox (§9). | Adapt | M2 (done) |
+| Progressive disclosure (index, view, files) | `tools/skills_tool.py` | Index in the prefix (60-char descriptions), `skill_view` loads the body and files. Claude native skills are an option. | Adapt | M2 (done) |
+| `skills_list`, `skill_view`, `skill_manage` | `tools/skills_tool.py`, `tools/skill_manager_tool.py` | Same tool names. `skill_manage`: create, patch, edit, write_file, remove_file, archive. | Adapt | M2 (done) |
+| Skill scopes (builtin, user dir, project) | `agent/skill_*.py` | builtin, org, workspace, user. User scope applies at once. Shared scopes need approval (§9). | Adapt | M2 (done) |
+| Skills as slash commands (`/<skill>`) | `gateway/slash_commands.py` | `/<skill-name>` in every channel (§11.1). | Adapt | M2 (done) |
+| Bundled skills (44) and optional skills (141) | `skills/`, `optional-skills/` | We write a small set of our own builtin skills. We do not copy Hermes skill text without attribution. | Adapt | M2 (done) |
 | Skills Hub install with quarantine and scan | `tools/skills_hub*.py`, `skills_guard.py` | Import from a Git URL or `agentskills.io` with a lint and injection scan, then approval. | Adapt | M4 |
-| Conditional activation (`requires_toolsets`, platforms) | frontmatter | Same frontmatter keys. Skills whose tools are missing are hidden. | Adapt | M2 |
+| Conditional activation (`requires_toolsets`, platforms) | frontmatter | Same frontmatter keys. Skills whose tools are missing are hidden. | Adapt | M2 (done) |
 | Per-skill config | `skills.config` | Skill settings per workspace, filled in the web app. | Adapt | M3 |
-| Skill bundles | `agent/skill_bundles.py` | Agent profiles list skills. | Adapt | M2 |
+| Skill bundles | `agent/skill_bundles.py` | Agent profiles list skills. | Adapt | M2 (done) |
 
 ## 4. Memory
 
