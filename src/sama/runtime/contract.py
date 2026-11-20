@@ -434,6 +434,11 @@ class RunFailed(_Event):
     code: FailureCode
     message: str
     retryable: bool = False
+    runtime_state: bytes | None = None
+    """Optional. The state from which the next run of the session starts, if the runtime must
+    keep something that the failure would lose (for example, the count of cost that the runtime
+    reports for a whole session). It is not a state to resume the failed run: the conversation
+    stays the one of the last completed run. A runtime that has nothing to keep sets nothing."""
 
 
 RunEvent = Annotated[

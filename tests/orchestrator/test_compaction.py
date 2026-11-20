@@ -21,8 +21,8 @@ from sama.db.models import (
 )
 from sama.orchestrator.queue import QueueError, RateLimitedError
 from sama.runtime.archive import ArchiveEntry, TranscriptArchive
-from sama.runtime.contract import Capabilities, FailureCode, RunRequest
-from sama.runtime.fake import FakeRuntime
+from sama.runtime.contract import Capabilities, FailureCode, RunFailed, RunRequest
+from sama.runtime.fake import FakeRuntime, FakeScript
 from sama.tenancy import RunTokenClaims
 from tests.orchestrator.conftest import Tenant
 from tests.orchestrator.test_worker import Harness, until
@@ -460,3 +460,63 @@ async def test_a_compaction_with_no_archive_still_has_a_record(
     assert (row.trigger, row.tokens_before, row.tokens_after) == ("auto", 90, 0)
     assert row.archive_session_id is None
     assert row.completed_at is not None
+
+
+# -- the state that a failed run leaves --------------------------------------------------------
+
+
+async def failed_run(
+    harness: Harness, tenant: Tenant, session: str, state: bytes | None
+) -> uuid.UUID:
+    harness.runtime.add_script(
+        FakeScript(
+            events=[RunFailed(code=FailureCode.MODEL_ERROR, message="boom", runtime_state=state)]
+        )
+    )
+    run_id = await harness.send(tenant, session, "this fails")
+    assert await harness.worker.run_once()
+    assert await harness.status_is(run_id, "failed")
+    return run_id
+
+
+async def test_the_state_of_a_failed_run_is_the_start_of_the_next_run(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    """A runtime can keep a count that the failure would lose (``RunFailed.runtime_state``).
+    The next run starts from the newest state, also if that run failed."""
+    await chat(harness, tenant, "s1", "one")
+    run_id = await failed_run(harness, tenant, "s1", b'{"turns": 7}')
+    async with engine.connect() as connection:
+        stored = (
+            await connection.execute(select(Run.runtime_state).where(Run.id == run_id))
+        ).scalar_one()
+    assert stored is not None
+    await chat(harness, tenant, "s1", "two")
+    request = harness.runtime.requests[-1]
+    assert isinstance(request, RunRequest)
+    assert request.runtime_state == b'{"turns": 7}'
+
+
+async def test_a_failed_run_without_a_state_keeps_the_state_of_the_last_completed_run(
+    harness: Harness, tenant: Tenant
+) -> None:
+    await chat(harness, tenant, "s1", "one")
+    await chat(harness, tenant, "s1", "two")
+    await failed_run(harness, tenant, "s1", None)
+    await chat(harness, tenant, "s1", "three")
+    request = harness.runtime.requests[-1]
+    assert isinstance(request, RunRequest)
+    assert request.runtime_state == b'{"turns": 2}'
+
+
+async def test_the_state_of_a_failed_run_is_for_its_own_session(
+    harness: Harness, tenant: Tenant
+) -> None:
+    """The state of a failed run in session s1 is not the start of a run in session s2."""
+    await chat(harness, tenant, "s1", "one")
+    await chat(harness, tenant, "s2", "other")
+    await failed_run(harness, tenant, "s1", b'{"turns": 9}')
+    await chat(harness, tenant, "s2", "again")
+    request = harness.runtime.requests[-1]
+    assert isinstance(request, RunRequest)
+    assert request.runtime_state == b'{"turns": 1}'

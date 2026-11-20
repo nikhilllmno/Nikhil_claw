@@ -28,12 +28,16 @@ MAX_ARCHIVE_BODY_BYTES: Final = 8_000_000
 MAX_WIRE_ENTRIES: Final = 5_000
 """The most entries of one request. The model refuses a longer list."""
 MAX_WIRE_ENTRY_BYTES: Final = 1_000_000
-"""The largest entry that the runner sends. A larger entry stays out whole (a marker takes its
-place): the control plane redacts the whole value, so a cut before the redaction could split a
-secret into parts that the redactor does not know."""
+"""The largest entry that the runner sends, in bytes of its JSON text in UTF-8
+(``entry_wire_bytes``). The model of the entry and ``bound_for_wire`` use the same definition.
+A larger entry stays out whole (a marker takes its place): the control plane redacts the
+whole value, so a cut before the redaction could split a secret into parts that the redactor
+does not know."""
 MAX_WIRE_BYTES: Final = 6_000_000
 """The most bytes of all entries of one request. The runner leaves whole entries out."""
 MAX_TOOL_NAME_CHARS: Final = 200
+"""The longest tool name. The model refuses a longer name. Nobody cuts it: the control plane
+redacts the whole name, and a cut before could split a secret."""
 MAX_ENTRY_CHARS: Final = 20_000
 """The longest text of one stored entry. A longer text keeps its start (70%) and its end (30%).
 The control plane cuts after the redaction."""
@@ -59,17 +63,24 @@ class ArchiveEntry(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     role: Role
-    text: str = Field(default="", max_length=MAX_WIRE_ENTRY_BYTES)
+    text: str = ""
     tool_name: str | None = Field(default=None, max_length=MAX_TOOL_NAME_CHARS)
     tool_input: Any = None
 
     @model_validator(mode="after")
-    def _bounded_input(self) -> ArchiveEntry:
-        if self.tool_input is not None:
-            size = len(json.dumps(self.tool_input, ensure_ascii=False, default=str))
-            if size > MAX_WIRE_ENTRY_BYTES:
-                raise ValueError("the tool input is too large")
+    def _bounded(self) -> ArchiveEntry:
+        # One limit for the whole entry, in bytes of the JSON text in UTF-8, the same value that
+        # ``bound_for_wire`` uses. A limit for each field would count characters, and it would
+        # miss an entry whose fields are each small but large together.
+        if entry_wire_bytes(self) > MAX_WIRE_ENTRY_BYTES:
+            raise ValueError("the entry is too large")
         return self
+
+
+def entry_wire_bytes(entry: ArchiveEntry) -> int:
+    """The size of an entry on the wire: the bytes of its JSON text in UTF-8. The size limit of
+    an entry and ``bound_for_wire`` both use it."""
+    return len(entry.model_dump_json(exclude_defaults=True).encode())
 
 
 class TranscriptArchive(BaseModel):
@@ -88,13 +99,26 @@ def parse_archive(raw: bytes) -> TranscriptArchive:
     body that is not valid.
 
     Pydantic checks the length of a list after it built all items, and 200,000 small entries
-    need hundreds of MB. So a check of the raw bytes comes first. Each entry has the key
-    ``"role"``, and a quote inside a JSON string is escaped, so the bytes ``"role"`` appear at
-    least one time for each entry. A body with many more of them has too many entries. The
-    count has room for tool inputs that have a ``"role"`` key of their own.
+    need hundreds of MB. So the list is counted first, and it does not matter how the body
+    spells its keys (``"role"`` and ``"\\u0072ole"`` are the same key). The count is a parse
+    of the body in which every JSON object becomes ``0`` (``object_pairs_hook``): the items of
+    the list cost one pointer each, and the check needs no copy of any entry. Only a body with
+    at most ``MAX_WIRE_ENTRIES`` entries goes to the model.
     """
-    if raw.count(b'"role"') > 2 * MAX_WIRE_ENTRIES:
-        raise ValueError("the archive has too many entries")
+    seen: list[list[tuple[str, Any]]] = []
+
+    def hook(pairs: list[tuple[str, Any]]) -> int:
+        # The last object that the decoder finishes is the outer object of the body.
+        seen[:] = [pairs]
+        return 0
+
+    try:
+        json.loads(raw, object_pairs_hook=hook)
+    except RecursionError as error:
+        raise ValueError("the archive is nested too deeply") from error
+    for key, value in seen[0] if seen else ():
+        if key == "entries" and isinstance(value, list) and len(value) > MAX_WIRE_ENTRIES:
+            raise ValueError("the archive has too many entries")
     return TranscriptArchive.model_validate_json(raw)
 
 
@@ -155,10 +179,6 @@ def fit(entries: Sequence[ArchiveEntry]) -> tuple[list[ArchiveEntry], bool]:
     return [*head, marker, *tail], True
 
 
-def _wire_size(entry: ArchiveEntry) -> int:
-    return len(entry.model_dump_json(exclude_defaults=True).encode())
-
-
 def bound_for_wire(
     entries: Sequence[ArchiveEntry], omitted: int = 0
 ) -> tuple[list[ArchiveEntry], int]:
@@ -172,13 +192,13 @@ def bound_for_wire(
     clips the long text after it redacted the text."""
     sized: list[tuple[ArchiveEntry, int]] = []
     for entry in entries:
-        size = _wire_size(entry)
+        size = entry_wire_bytes(entry)
         if size > MAX_WIRE_ENTRY_BYTES:
             omitted += 1
             marker = ArchiveEntry(
                 role="system", text=f"[an entry of {size} bytes is not in this archive]"
             )
-            sized.append((marker, _wire_size(marker)))
+            sized.append((marker, entry_wire_bytes(marker)))
         else:
             sized.append((entry, size))
     if len(sized) <= MAX_WIRE_ENTRIES and sum(size for _, size in sized) <= MAX_WIRE_BYTES:

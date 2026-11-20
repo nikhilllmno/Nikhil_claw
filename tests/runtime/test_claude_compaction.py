@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -13,13 +14,34 @@ import pytest
 
 pytest.importorskip("claude_agent_sdk")
 
-from claude_agent_sdk import HookInput, SystemMessage
+from claude_agent_sdk import HookInput, SystemMessage, ToolUseBlock
+from claude_agent_sdk.types import DeferredToolUse
 
-from sama.runtime import Compacted, FailureCode, RunCompleted, RunFailed, RunRequest
+from sama.runtime import (
+    ApprovalDecision,
+    ApprovalRequired,
+    Compacted,
+    FailureCode,
+    RunCompleted,
+    RunFailed,
+    RunRequest,
+)
 from sama.runtime.archive import Archiver, TranscriptArchive
-from sama.runtime.claude import ClaudeRuntime
+from sama.runtime.claude import ClaudeRuntime, GateDecision
 from sama.runtime.contract import CompactRequest, RunScope
-from tests.runtime.test_claude import SESSION, Factory, FakeClient, config, delta, result
+from tests.runtime.test_claude import (
+    SESSION,
+    Factory,
+    FakeClient,
+    ScriptedGate,
+    assistant,
+    call_hook,
+    config,
+    delta,
+    request,
+    result,
+    resume_request,
+)
 from tests.support import collect, make_scope
 
 
@@ -251,6 +273,106 @@ async def test_a_state_without_a_baseline_does_not_count_the_whole_session() -> 
     # The new state has the baseline for the next run.
     assert done.runtime_state is not None
     assert json.loads(done.runtime_state)["sdk_tokens"]["input_tokens"] == 40
+
+
+# -- the count after a run that failed ---------------------------------------------------------
+
+
+def zero_result(tokens: tuple[int, int, int, int], cost: float) -> Any:
+    return result(
+        input_tokens=0, output_tokens=0, cache_read=0, cache_write=0,
+        model_usage=models(*tokens), cost=cost,
+    )  # fmt: skip
+
+
+async def test_a_failed_compaction_does_not_count_its_tokens_two_times() -> None:
+    """Baseline 10 tokens. A compaction fails after the model call (no boundary) and the
+    session total is 20. The next compaction ends at 50. It counts 30, not 40: the failed run
+    has the first 10 in its own usage."""
+    state = await counted_state()
+    failed_run = Factory([zero_result((20, 8, 4, 2), 0.03)])
+    failed = (
+        await collect(ClaudeRuntime(client_factory=failed_run).run(compact_request(state=state)))
+    )[-1]
+    assert isinstance(failed, RunFailed)
+    assert failed.usage.input_tokens == 10
+    assert failed.runtime_state is not None
+    # The conversation does not change: the failed state has the session of the base.
+    saved = json.loads(failed.runtime_state)
+    assert saved["session_id"] == json.loads(state)["session_id"]
+    assert saved["pending"] is None
+    assert saved["sdk_tokens"]["input_tokens"] == 20
+    follow = Factory([boundary("manual"), zero_result((50, 12, 6, 3), 0.06)])
+    done = (
+        await collect(
+            ClaudeRuntime(client_factory=follow).run(compact_request(state=failed.runtime_state))
+        )
+    )[-1]
+    assert isinstance(done, RunCompleted)
+    assert (done.usage.input_tokens, done.usage.output_tokens) == (30, 4)
+    # The cost has the same rule: 0.06 - 0.03, not 0.06 - 0.01.
+    assert done.usage.cost_usd == Decimal("0.03")
+
+
+async def test_a_run_that_failed_after_a_pause_keeps_the_count_too() -> None:
+    """A paused run has the session of the last completed run as its base. If it fails after
+    the resume, the count of that session still moves on."""
+    state = await counted_state()
+    call = "mcp__sama__gmail_send"
+    ask = result(
+        stop_reason="tool_deferred",
+        text=None,
+        deferred=DeferredToolUse(id="call-1", name=call, input={"to": "a@b.c"}),
+        input_tokens=0, output_tokens=0, cache_read=0, cache_write=0,
+        model_usage=models(20, 8, 4, 2), cost=0.03,
+    )  # fmt: skip
+    steps = [
+        assistant(ToolUseBlock(id="call-1", name=call, input={"to": "a@b.c"})),
+        call_hook(call, "call-1"),
+        ask,
+    ]
+    gate = ScriptedGate(GateDecision("ask", "write action"))
+    runtime = ClaudeRuntime(gate=gate, client_factory=Factory(steps))
+    paused = (await collect(runtime.run(request("go", state=state))))[-1]
+    assert isinstance(paused, ApprovalRequired)
+    assert paused.runtime_state is not None
+    assert json.loads(paused.runtime_state)["base_session_id"] == json.loads(state)["session_id"]
+    broken = result(
+        is_error=True, subtype="error_during_execution", api_error_status=500,
+        input_tokens=0, output_tokens=0, cache_read=0, cache_write=0,
+        model_usage=models(30, 9, 5, 2), cost=0.05,
+    )  # fmt: skip
+    resumed = ClaudeRuntime(gate=gate, client_factory=Factory([broken]))
+    failed = (await collect(resumed.resume(resume_request(paused, ApprovalDecision.APPROVE))))[-1]
+    assert isinstance(failed, RunFailed)
+    assert failed.runtime_state is not None
+    saved = json.loads(failed.runtime_state)
+    assert saved["sdk_tokens"]["input_tokens"] == 30
+    assert saved["session_id"] == json.loads(state)["session_id"]
+
+
+async def test_the_state_of_a_completed_run_has_no_base() -> None:
+    assert json.loads(await counted_state())["base_session_id"] is None
+
+
+async def test_a_first_run_that_fails_leaves_no_state() -> None:
+    """There is no completed run to continue, so the next run starts a new SDK session."""
+    broken = result(is_error=True, subtype="error_during_execution", api_error_status=500)
+    events = await collect(ClaudeRuntime(client_factory=Factory([broken])).run(chat()))
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].runtime_state is None
+
+
+async def test_a_run_on_another_session_leaves_no_state() -> None:
+    """The count is for the SDK session of the base. A run that moved to another session
+    keeps nothing: the next run uses the state of the last completed run."""
+    state = await counted_state()
+    other = replace(zero_result((20, 8, 4, 2), 0.03), session_id="another-session")
+    events = await collect(
+        ClaudeRuntime(client_factory=Factory([other])).run(compact_request(state=state))
+    )
+    assert isinstance(events[-1], RunFailed)
+    assert events[-1].runtime_state is None
 
 
 async def test_a_result_without_model_usage_changes_nothing() -> None:

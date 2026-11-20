@@ -794,7 +794,10 @@ class RunQueue:
     async def _session_state(
         self, connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, runtime: str
     ) -> bytes | None:
-        """The runtime state at the end of the last completed run of the session."""
+        """The runtime state that the next run of the session starts from: the state of the
+        newest chat run that saved one. A completed run saves its state. A failed or cancelled
+        run saves one only to keep a count (``RunFailed.runtime_state``), and it keeps the
+        conversation of the last completed run."""
         state = (
             await connection.execute(
                 select(Run.runtime_state)
@@ -803,7 +806,7 @@ class RunQueue:
                     Run.session_id == session_id,
                     Run.runtime == runtime,
                     Run.kind == "chat",
-                    Run.status == "completed",
+                    Run.status.in_(("completed", "failed", "cancelled")),
                     Run.runtime_state.is_not(None),
                 )
                 .order_by(Run.finished_at.desc())
@@ -923,9 +926,20 @@ class RunQueue:
             return ended
 
     async def fail(
-        self, run: ClaimedRun, owner: str, *, code: FailureCode, message: str, usage: Usage
+        self,
+        run: ClaimedRun,
+        owner: str,
+        *,
+        code: FailureCode,
+        message: str,
+        usage: Usage,
+        runtime_state: bytes | None = None,
     ) -> bool:
-        """Ends the run as ``failed``, or as ``cancelled`` for the code ``cancelled``."""
+        """Ends the run as ``failed``, or as ``cancelled`` for the code ``cancelled``.
+
+        ``runtime_state`` is the state that the next run of the session starts from (see
+        ``RunFailed.runtime_state``). The runtime sets it only to keep a count that the failure
+        would lose, so the next run never resumes the failed conversation."""
         async with self._engine.begin() as connection:
             return await self._end(
                 connection,
@@ -935,6 +949,7 @@ class RunQueue:
                 usage=usage,
                 failure_code=code.value,
                 failure_message=redact(message),
+                runtime_state=_encode_state(runtime_state),
             )
 
     async def pause(

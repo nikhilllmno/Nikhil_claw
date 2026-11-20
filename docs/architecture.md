@@ -316,7 +316,9 @@ events at once. A resumed run continues the `seq` of the run.
 
 **End.** `RunCompleted` stores the reply as an assistant message and the runtime state.
 `RunFailed` stores the failure code and message; the code `cancelled` gives the status
-`cancelled`. A stream with no terminal event fails with `internal`. When a run ends (not when it
+`cancelled`. `RunFailed.runtime_state` is optional. A runtime sets it only to keep a count that the
+failure would lose, and the next run of the session starts from the newest state, also the state
+of a failed run (Section 6.3, "Tokens of a compaction"). A stream with no terminal event fails with `internal`. When a run ends (not when it
 pauses), the worker calls the run-end hooks, for example `ClarifyBroker.cancel_run`.
 
 **Cancel.** `cancel(org_id, run_id)` ends a `queued` or `paused` run at once. For a `running`
@@ -564,7 +566,9 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   (Section 6.3). A compact request resumes the SDK session and sends `/compact <focus>` as the
   prompt. A compact request with no earlier state fails with `invalid_request`. A compact run
   with no compaction boundary fails (`model_error`). The tokens of a compact run come from the
-  difference of `model_usage`, because `usage` is zero (Section 6.3). The adapter
+  difference of `model_usage`, because `usage` is zero (Section 6.3). A failed run keeps this
+  count in `RunFailed.runtime_state` (`_Translator.failure_state`), so the next run does not count
+  the paid work of the failed run again. The adapter
   does not use the CLI hook `SessionStart` with the source `compact`, because the Python SDK
   does not expose it: sama injects the pins itself (Section 6.3).
 
@@ -770,9 +774,14 @@ hook input has `trigger` (`manual` or `auto`) and `transcript_path`.
    contract, so the parser never raises for a line that it does not understand
    (`sama.runtime.claude_transcript`).
 2. The runner does not cut inside an entry. It has no redactor, and a cut before the
-   redaction can split a secret into parts that the redactor does not know. So
-   `bound_for_wire` leaves **whole entries** out. An entry over 1 MB stays out, and a marker
-   (`system` entry) takes its place. A transcript over 5,000 entries or 6 MB keeps its first
+   redaction can split a secret into parts that the redactor does not know. So the parser and
+   `bound_for_wire` leave **whole entries** out. The size of an entry is the bytes of its JSON
+   text in UTF-8 (`entry_wire_bytes`). The model of the entry, the parser, and
+   `bound_for_wire` use this one definition. An entry over 1 MB stays out, and a marker
+   (`system` entry) takes its place. The parser checks each **content block**, so one large
+   block does not remove the other blocks of the same message, and each large block counts
+   once in `omitted`. A tool name over 200 characters is not cut either: the entry of that tool
+   call stays out whole, with the same marker (the marker has no part of the name). A transcript over 5,000 entries or 6 MB keeps its first
    30 % and its last 70 %, with one marker for the middle. The request has `omitted`, the
    number of entries that stay out, so the row can show `archive_truncated`.
 3. `RemoteArchiver` posts the entries to `POST /archive` of the sama tool server. It sends
@@ -793,9 +802,14 @@ hook input has `trigger` (`manual` or `auto`) and `transcript_path`.
    the open row (the token counts and `completed_at`).
 
 Limits of the request (the runner and the model refuse more): 5,000 entries, 1 MB for one
-entry, 8 MB for the body. A body that has far more `"role"` keys than the limit is refused
-from its bytes, before the model builds any entry (the check of the list length comes after
-the items are built, and 200,000 small entries need hundreds of MB). Limits of the store, after
+entry (bytes of the JSON text in UTF-8, for the whole entry and not for each field), 8 MB for
+the body. The list is counted before the model builds any entry (the check of the list length
+comes after the items are built, and 200,000 small entries need hundreds of MB). The count is
+a first parse of the body with `json.loads` in which every JSON object becomes `0`
+(`object_pairs_hook`), so the list of items costs one pointer for each item and the count does
+not depend on how the body spells its keys (`"role"` and `"\u0072ole"` are the same key).
+Only a body with at most 5,000 entries goes to the model. A body that is nested too deeply is
+refused too. Limits of the store, after
 the redaction: 20,000 characters for one entry (the start 70 % and the end 30 % stay), 4,000
 entries, 2,000,000 characters for one archive (the first 30 % and the last 70 % stay, with a
 `system` entry that says how many entries are not in the archive), 60 seconds for the call, and
@@ -815,6 +829,23 @@ of `model_usage` in its `runtime_state` (`sdk_tokens`). If a result has no token
 the run counts the difference of `model_usage`. A normal turn has its tokens in `usage`, so it
 is not counted two times. A state without `sdk_tokens` (an older state) has no known baseline,
 so the first run counts nothing from `model_usage` and then saves the baseline.
+
+The baseline (`sdk_tokens`, and the cost `sdk_cost_usd`) must also move on when a run **fails**
+after it paid for model calls. A failed run has those tokens and that cost in its own usage.
+The CLI counts them in the cumulative values of the SDK session too. If the next run started
+from the baseline of the last completed run, it would count that work a second time (the
+baseline 100, a failed run to 120, the next run to 150 would count 50 and not 30). So
+`RunFailed` has an optional `runtime_state`, and the queue stores it in `runs.runtime_state` of
+the failed run (`RunQueue.fail`). The next run of the session starts from the **newest** chat
+run that saved a state, whether it is `completed`, `failed`, or `cancelled`. The state of a
+failed run is not a state to resume the failed conversation: the adapter writes the state of
+the last completed run (its `session_id`) with only the counts moved on
+(`_Translator.failure_state`). A paused run keeps that session in `base_session_id`, so a run
+that fails after a resume does the same. The adapter writes no state when there is no base
+(the first run of a session, which starts a new SDK session next time), or when the run
+continued another SDK session than the base: the count is not for the base session then, and
+the next run uses the last completed state. A run that the worker stops after the cancel grace
+period (the CLI did not answer) has no result, so it keeps no count (A21).
 
 **An archive that fails does not stop the compaction.** A session that is full must still be
 able to make room. The hook catches every error, logs only the error type, and returns an empty
@@ -861,7 +892,17 @@ session list of the API, and it cannot get new runs or pins.
 - **Lock order.** Every enqueue takes the org rate lock first (an advisory lock), and the
   session row after it. A run insert needs a share lock on the session row, so `enqueue` held
   the rate lock and waited for the row, while `enqueue_compact` held the row and waited for the
-  rate lock: a deadlock. Both paths use the same order now.
+  rate lock: a deadlock. Both paths use the same order now. The creation of a background
+  review run (`review.trigger.after_completed_run`, M2.4) is the one exception, and it is safe:
+  it runs in the transaction that completes a run, it locks the session row (the counters
+  update) and then inserts the review run, and it **never takes the rate lock and never waits
+  for it**. A lock cycle needs a transaction that holds one lock and waits for the other
+  while another transaction does the reverse. The review path only waits for row locks, and
+  the enqueue paths take the rate lock before any row, so no path holds the session row and
+  waits for the rate lock. A review run is no user message, so it does not count for the rate
+  limit, and it must not wait for the lock that puts the enqueues of an org in a sequence (that
+  would slow the completion of every run). Tests: `test_a_review_trigger_never_waits_for_the_org_rate_lock`
+  and `test_enqueues_and_review_triggers_of_one_session_do_not_deadlock`.
 - **Busy rule.** `enqueue_compact` locks the session row and refuses when any run of the
   session is open (`queued`, `running`, or `paused`). A message uses the queue rule: it waits
   behind the open run. A compaction must not change the context under a run, and a run that
@@ -956,13 +997,16 @@ model finds it with three sama tools (toolset `tool_search`, Section 10.2).
 | A10 | `compact` and pins in Slack work in direct messages only. |
 | A11 | The default profile gets the toolset `tool_search`. The default group set does not, because no deferred tool is registered yet and a shared session should opt in. Migration `0018` changes only a profile that has the exact old default list. |
 | A12 | `tool_search` and `tool_describe` are allowed by default (they only read). `tool_call` has no default of its own: the called tool has its own rule or its default (`ask` for an unknown tool). |
-| A14 | The archive endpoint has hard limits at the model (5,000 entries, 1 MB for an entry, 8 MB for the body), a check of the run before the body is read, and 2 archive bodies at one time (a third gets `429`; the hook is fail-open, so the cost is one archive). A tool input with many `"role"` keys of its own can make a body that is refused (over 10,000 such keys). The archive is lost then, and the compaction goes on. |
+| A14 | The archive endpoint has hard limits at the model (5,000 entries, 1 MB for an entry, 8 MB for the body), a check of the run before the body is read, and 2 archive bodies at one time (a third gets `429`; the hook is fail-open, so the cost is one archive). The entries are counted before the model builds them (a first parse that turns every object into `0`), and the size limit of an entry is for the whole entry in UTF-8 bytes. The count runs on the event loop and parses the body two times (at most 8 MB, 0.1 s in a test with 500,000 small entries). |
 | A15 | An archive needs the live authority of the run (the user still sees the session), as a tool call does. A user who loses access while a run runs cannot write an archive. The compaction itself is not stopped. |
 | A16 | A pin is due again unless the run that got it is open or completed with a runtime state. A failed run does not save a state, so the pin goes again. A run that fails after the CLI saved its own session can give a pin two times to that session. The cost is a repeated note, and this is the safe side. |
 | A17 | A compact run that has no compaction boundary fails. The run ends as `failed` with `model_error`. The archive that the hook made stays as an open row. |
 | A18 | `model_usage` of the CLI is cumulative for the SDK session across processes, as the cost is. This is checked with the real CLI and the scripted model, and not with a live model. |
 | A19 | The pin list is redacted again when it is shown. The text in the table can still hold a secret that the redactor learned after the pin was made, until the pin is removed. |
 | A20 | The tool search fails closed without a visibility source. A tool server in a test or a product that has no gate shows no deferred tool. |
+| A21 | The accounting baseline (`sdk_tokens`, `sdk_cost_usd`) of a failed or cancelled run is kept in `runs.runtime_state` of that run (`RunFailed.runtime_state`, optional, so the contract stays compatible), and the next run starts from the newest chat run that has a state. The state of a failed run has the session of the last completed run, so the conversation is never the failed one. A run that the worker stops after the cancel grace period has no result and keeps no baseline: the next run can count that work again (only its cost and the tokens of a compaction; a normal turn counts its own tokens). |
+| A22 | The tool name of a transcript entry is never cut in the runner. A name over 200 characters makes the tool-call entry stay out whole (`omitted` counts it). A real tool name is much shorter, so the cost is a marker for a name that is not real. |
+| A23 | Background review creation does not take the org rate lock. It never waits for it, so it cannot close a lock cycle with the enqueue paths, and it is no user message (it does not count for the rate limit). Taking the lock would put the completion of every run of an org in a sequence. |
 | A13 | The PreCompact hook and the compact boundary behave as the CLI of `claude-agent-sdk==0.2.184` documents. They are not checked against a live model in M2.6 (no key in the test environment). A live check is in the nightly conformance job when a key exists. |
 
 **Limits and gaps.**
@@ -3228,7 +3272,8 @@ their warnings. The tool gate writes the audit log rows (Section 16.1).
 **Archive endpoint (M2.6).** `POST /archive` takes a transcript before a compaction from the
 runner of the run of the token (Section 6.3). The body is JSON: `trigger`, `entries`, and `omitted`. An entry has `role` and
 either `text`, or `tool_name` and `tool_input` (a JSON value). Limits: 5,000 entries, 1 MB for an
-entry, 8 MB for the body. The order of the checks:
+entry (bytes of the JSON text in UTF-8 for the whole entry), 8 MB for the body. The order of
+the checks:
 
 1. `401` without a valid run token. `503` when the server has no archive store.
 2. `ContextArchive.authorize`: `409` when the run is not running, its user cannot see the
@@ -3238,8 +3283,9 @@ entry, 8 MB for the body. The order of the checks:
    (`MAX_CONCURRENT_ARCHIVES`). The check is before the body is read, so a busy server holds no
    new body.
 4. `422` for a body that is not valid: a bad field, too many entries, a value that is too large.
-   A body with more than 10,000 `"role"` keys is refused from its bytes, before the model
-   builds the entries.
+   The entries are counted in a first parse in which every object becomes `0`, so a body with
+   more than 5,000 entries is refused before the model builds an entry, and it does not
+   matter how the body spells its keys.
 5. `ContextArchive.archive` checks the run again and stores the entries. `409` and `503` as
    before. The error text of a failure is fixed, so it holds no data.
 

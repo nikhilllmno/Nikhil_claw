@@ -175,7 +175,11 @@ Done: M1.1 to M1.19, M2.1 to M2.6 (below the list of M1 notes).
   values and whole entries (the runner leaves whole entries out and never cuts), it has hard
   limits and a check of the live run authority before the body is read, a pin is reserved until
   a run saves a runtime state, enqueue and compact use one lock order, a compact run without a
-  compaction boundary fails, and its tokens come from `model_usage`. Not in M2.6: a live test of `/compact` and of the hook
+  compaction boundary fails, and its tokens come from `model_usage`. After review 2: the entries
+  of an archive body are counted without the spelling of the keys, an entry has one size limit in
+  UTF-8 bytes, the parser omits one large block or tool name and keeps the other blocks, a failed
+  run keeps the token and cost baseline (`RunFailed.runtime_state`), and the review trigger is
+  documented as safe for the lock order. Not in M2.6: a live test of `/compact` and of the hook
   against the Claude API, a deferred tool in production (M3.4 is the first), a pin of a file, a pin
   by the agent, pins in a Slack channel, a search of archives, and a web UI.
 - M2.5: session search in `src/sama/search/` (architecture Section 7.1). Migration `0014` makes

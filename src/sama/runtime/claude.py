@@ -224,6 +224,10 @@ class _State(BaseModel):
     models. A local command, such as ``/compact``, reports no tokens in ``usage``, but it adds
     to ``model_usage``. The adapter counts the difference. ``None`` means that an older state
     did not save it, so the difference is not known."""
+    base_session_id: str | None = None
+    """In the state of a paused run: the SDK session of the last completed run, which the run
+    continued. If the run fails later, the next run goes on with that session, and only the
+    count of the cost and the tokens moves on (``_Translator.failure_state``)."""
     turns: int = Field(default=0, ge=0)
     elapsed_s: float = Field(default=0.0, ge=0)
     pending: _PendingCall | None = None
@@ -288,6 +292,9 @@ class _Translator:
     sdk_cost_usd: Decimal
     sdk_tokens: Usage | None = None
     """The cumulative tokens of ``model_usage`` at the last result. ``None``: not known."""
+    base_session_id: str | None = None
+    """The SDK session of the last completed run, which this run continues. ``None``: there is
+    none (the first run, or a run that started in a state that was paused)."""
     compact: bool = False
     """The run is a ``/compact`` run. It needs a compaction boundary to be complete."""
     compacted: bool = False
@@ -425,9 +432,31 @@ class _Translator:
             usage=self.usage,
             sdk_cost_usd=self.sdk_cost_usd,
             sdk_tokens=self.sdk_tokens,
+            # Only a paused run needs it: a completed run is the base of the next run.
+            base_session_id=self.base_session_id if pending is not None else None,
             turns=self.turns,
             elapsed_s=self.elapsed_s(),
             pending=pending,
+        ).dump()
+
+    def failure_state(self) -> bytes | None:
+        """The state that a failed run leaves for the next run: the state of the last completed
+        run, with the count of the cost and the tokens that this run moved on.
+
+        The paid work of a failed run is in its own usage already. The CLI counts it in the
+        cumulative values of the SDK session too. If the next run started again from the
+        count of the last completed run, it would count that work a second time. The
+        conversation does not change: ``session_id`` is the session of the last completed run,
+        so the next run never resumes the conversation of the failed run. The state has no
+        state if the run did not continue that session: its count is not for that session.
+        """
+        if self.base_session_id is None or self.session_id != self.base_session_id:
+            return None
+        return _State(
+            session_id=self.base_session_id,
+            run_id=self.run_id,
+            sdk_cost_usd=self.sdk_cost_usd,
+            sdk_tokens=self.sdk_tokens,
         ).dump()
 
     def terminal(self, result: ResultMessage, cancelled: bool) -> TerminalEvent:
@@ -673,6 +702,7 @@ class ClaudeRuntime:
             sdk_cost_usd=previous.sdk_cost_usd if previous else Decimal(0),
             # A new SDK session starts at zero. An older state has no count: not known.
             sdk_tokens=previous.sdk_tokens if previous else Usage(),
+            base_session_id=previous.session_id if previous else None,
             compact=request.compact is not None,
             session_id=previous.session_id if previous else None,
         )
@@ -710,6 +740,7 @@ class ClaudeRuntime:
             usage=state.usage,
             sdk_cost_usd=state.sdk_cost_usd,
             sdk_tokens=state.sdk_tokens,
+            base_session_id=state.base_session_id,
             session_id=state.session_id,
             turns=state.turns,
             elapsed_before_s=state.elapsed_s,
@@ -828,7 +859,12 @@ class ClaudeRuntime:
         active: _ActiveRun,
     ) -> None:
         """Owns the SDK clients. Every SDK call happens in this task."""
-        send = active.send
+
+        def send(event: RunEvent) -> None:
+            if isinstance(event, RunFailed) and event.runtime_state is None:
+                event = event.model_copy(update={"runtime_state": translator.failure_state()})
+            active.send(event)
+
         translator.started_at = asyncio.get_running_loop().time()
         wall_time: float | None = None
         if budget.max_wall_time_s is not None:

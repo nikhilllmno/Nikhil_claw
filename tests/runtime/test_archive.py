@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
 from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from sama.runtime.archive import (
     MAX_ARCHIVE_CHARS,
     MAX_ENTRIES,
     MAX_ENTRY_CHARS,
+    MAX_TOOL_NAME_CHARS,
     MAX_WIRE_BYTES,
     MAX_WIRE_ENTRIES,
     MAX_WIRE_ENTRY_BYTES,
@@ -19,6 +22,7 @@ from sama.runtime.archive import (
     RemoteArchiver,
     TranscriptArchive,
     bound_for_wire,
+    entry_wire_bytes,
     fit,
     parse_archive,
 )
@@ -195,6 +199,69 @@ def test_a_large_entry_of_a_file_stays_out_whole_with_a_marker() -> None:
     assert "zzz" not in entries[1].text
 
 
+def test_a_tool_name_that_is_too_long_stays_out_whole_and_is_not_cut() -> None:
+    """The old parser cut the name at 200 characters in the runner, before the redaction: a
+    secret that crossed the limit lost its end, and the redactor did not know the rest."""
+    secret = "SECRET-VALUE-0123456789"
+    name = "n" * (MAX_TOOL_NAME_CHARS - 5) + secret
+    raw = lines(
+        {"type": "user", "message": {"content": "start"}},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": name, "input": {"a": 1}}]},
+        },
+        {"type": "assistant", "message": {"content": "end"}},
+    )
+    entries, omitted = parse_transcript(raw)
+    assert omitted == 1
+    assert [e.role for e in entries] == ["user", "system", "assistant"]
+    dumped = "".join(e.model_dump_json() for e in entries)
+    assert secret not in dumped
+    assert secret[:6] not in dumped
+    assert entries[1].tool_name is None
+
+
+def test_an_oversized_block_does_not_drop_the_blocks_around_it() -> None:
+    """One line (one message) can have many blocks. The size check is for each block, so the
+    valid blocks of the same message stay in, and each large block counts as one."""
+    huge = "z" * (MAX_WIRE_ENTRY_BYTES + 1)
+    raw = lines(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "tool_use", "name": "Write", "input": {"data": huge}},
+                    {"type": "tool_use", "name": "Read", "input": {"path": "a.txt"}},
+                    {"type": "text", "text": huge},
+                    {"type": "text", "text": "last"},
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "1", "content": huge},
+                    {"type": "tool_result", "tool_use_id": "2", "content": "small result"},
+                ]
+            },
+        },
+    )
+    entries, omitted = parse_transcript(raw)
+    assert omitted == 3
+    assert [(e.role, e.text or e.tool_name) for e in entries] == [
+        ("assistant", "first"),
+        ("system", "[a large entry is not in this archive]"),
+        ("assistant", "Read"),
+        ("system", "[a large entry is not in this archive]"),
+        ("assistant", "last"),
+        ("system", "[a large entry is not in this archive]"),
+        ("tool", "small result"),
+    ]
+    assert "zzz" not in "".join(e.model_dump_json() for e in entries)
+
+
 def test_a_file_over_the_read_limit_keeps_its_end_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -232,7 +299,12 @@ def test_the_runner_does_not_cut_inside_an_entry() -> None:
 
 
 def test_an_entry_over_the_limit_stays_out_whole_with_a_marker() -> None:
-    huge = entry("\n" * (MAX_WIRE_ENTRY_BYTES // 2 + 1))  # the JSON text escapes each \n
+    # The model refuses a large entry, so the entry is built without the check. This is what
+    # ``bound_for_wire`` does for an entry that came from another source.
+    huge = ArchiveEntry.model_construct(
+        role="user",
+        text="\n" * (MAX_WIRE_ENTRY_BYTES // 2 + 1),  # the JSON text escapes each \n
+    )
     kept, omitted = bound_for_wire([entry("first"), huge, entry("last")], 2)
     assert omitted == 3
     assert [e.text for e in kept][0::2] == ["first", "last"]
@@ -282,17 +354,21 @@ async def test_the_remote_archiver_sends_the_omitted_count_as_it_is() -> None:
 
 def test_the_model_refuses_too_many_entries_and_large_values() -> None:
     body = {"trigger": "auto", "entries": [{"role": "user", "text": "a"}] * (MAX_WIRE_ENTRIES + 1)}
-    with pytest.raises(ValueError, match="at most"):
+    with pytest.raises(ValueError, match="too many entries"):
         parse_archive(json.dumps(body).encode())
     with pytest.raises(ValueError, match="too large"):
         ArchiveEntry(role="assistant", tool_name="W", tool_input={"d": "x" * MAX_WIRE_ENTRY_BYTES})
-    with pytest.raises(ValueError, match="at most"):
+    with pytest.raises(ValueError, match="too large"):
         ArchiveEntry(role="user", text="x" * (MAX_WIRE_ENTRY_BYTES + 1))
 
 
+def many_entries(entry_json: bytes, count: int, *, entries_key: bytes = b'"entries"') -> bytes:
+    return b'{"trigger":"auto",' + entries_key + b":[" + b",".join([entry_json] * count) + b"]}"
+
+
 def test_a_body_of_many_tiny_entries_is_refused_before_pydantic_builds_them() -> None:
-    """200,000 small entries in 5 MB took 400 MiB of memory with the old model. The check of
-    the raw bytes refuses the body at once, and it builds no entry."""
+    """200,000 small entries in 5 MB took 400 MiB of memory with the old model. The count
+    refuses the body, and it builds no entry."""
     raw = json.dumps({"trigger": "auto", "entries": [{"role": "user"}] * 200_000}).encode()
     assert len(raw) < 8_000_000
     with pytest.raises(ValueError, match="too many entries"):
@@ -305,3 +381,94 @@ def test_a_body_of_many_tiny_entries_is_refused_before_pydantic_builds_them() ->
         len(parse_archive(json.dumps({"trigger": "auto", "entries": entries}).encode()).entries)
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    ("entry_json", "entries_key"),
+    [
+        (b'{"\\u0072ole":"user"}', b'"entries"'),  # the key "role" in escapes
+        (b'{"\\u0072\\u006fle":"user"}', b'"entries"'),
+        (b'{"r\\u006fle":"user","text":""}', b'"entries"'),
+        (b'{"role":"user"}', b'"\\u0065ntries"'),  # the key "entries" in escapes
+        (b'{"\\u0072ole":"user"}', b'"\\u0065\\u006etries"'),
+    ],
+)
+def test_the_entry_count_does_not_depend_on_how_the_body_spells_its_keys(
+    entry_json: bytes, entries_key: bytes
+) -> None:
+    """The old check counted the bytes ``"role"``. JSON can write the key with escapes, so a
+    body without those bytes got to the model and made 200,000 objects."""
+    raw = many_entries(entry_json, 200_000, entries_key=entries_key)
+    assert b'"role"' not in raw or entries_key != b'"entries"'
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="too many entries"):
+            parse_archive(raw)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # The model needs more than 100 MiB for 200,000 entries. The count needs a pointer each.
+    assert peak < 30_000_000
+
+
+def test_a_body_with_escaped_keys_in_the_limits_is_accepted() -> None:
+    raw = many_entries(b'{"\\u0072ole":"user","t\\u0065xt":"hi"}', MAX_WIRE_ENTRIES)
+    parsed = parse_archive(raw)
+    assert len(parsed.entries) == MAX_WIRE_ENTRIES
+    assert parsed.entries[0].text == "hi"
+    with pytest.raises(ValueError, match="too many entries"):
+        parse_archive(many_entries(b'{"\\u0072ole":"user"}', MAX_WIRE_ENTRIES + 1))
+
+
+def test_a_body_that_is_nested_too_deeply_or_not_json_is_refused() -> None:
+    with pytest.raises(ValueError, match="nested too deeply"):
+        parse_archive(b"[" * 1_000_000)
+    with pytest.raises(json.JSONDecodeError):
+        parse_archive(b'{"trigger": "auto", "entries": [')
+    with pytest.raises(ValidationError):
+        parse_archive(b"[1, 2]")
+
+
+# -- the size of an entry, in bytes of its JSON text -------------------------------------------
+
+
+def test_the_size_of_an_entry_is_the_bytes_of_its_json_text() -> None:
+    base = entry_wire_bytes(entry("a")) - 1  # the empty text is a default: it has no bytes
+    assert entry_wire_bytes(entry("é")) == base + 2
+    assert entry_wire_bytes(entry("\n")) == base + 2  # an escape takes two bytes
+    # An entry at the limit is accepted, and one byte more is not.
+    at_limit = entry("a" * (MAX_WIRE_ENTRY_BYTES - base))
+    assert entry_wire_bytes(at_limit) == MAX_WIRE_ENTRY_BYTES
+    assert bound_for_wire([at_limit]) == ([at_limit], 0)
+    with pytest.raises(ValueError, match="too large"):
+        entry("a" * (MAX_WIRE_ENTRY_BYTES - base + 1))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"text": "é" * 600_000},  # 600,000 characters, 1.2 MB in UTF-8
+        {"text": "\n" * 500_001},  # 500,001 characters, 1,000,002 bytes with escapes
+        {"tool_name": "W", "tool_input": {"d": "é" * 600_000}},
+        {"tool_name": "W", "tool_input": {"d": "\\" * 500_001}},
+        # Each field is in a limit for characters, but together they are over the limit.
+        {"text": "a" * 600_000, "tool_name": "W", "tool_input": {"d": "b" * 600_000}},
+        {"text": "é" * 300_000, "tool_name": "W", "tool_input": {"d": "é" * 300_000}},
+    ],
+)
+def test_the_model_counts_the_bytes_of_the_whole_entry(fields: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="too large"):
+        ArchiveEntry(role="assistant", **fields)  # type: ignore[arg-type]
+    # The body is refused with the same rule.
+    raw = json.dumps(
+        {"trigger": "auto", "entries": [{"role": "assistant", **fields}]}, ensure_ascii=False
+    ).encode()
+    assert len(raw) < MAX_WIRE_BYTES * 2
+    with pytest.raises(ValueError, match="too large"):
+        parse_archive(raw)
+
+
+def test_the_model_refuses_a_tool_name_that_is_too_long() -> None:
+    with pytest.raises(ValueError, match="at most"):
+        ArchiveEntry(role="assistant", tool_name="n" * (MAX_TOOL_NAME_CHARS + 1))
+    assert ArchiveEntry(role="assistant", tool_name="n" * MAX_TOOL_NAME_CHARS)
