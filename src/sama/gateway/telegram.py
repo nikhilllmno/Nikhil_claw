@@ -53,6 +53,7 @@ from sama.gateway.sessions import (
 from sama.gateway.telegram_client import TelegramClient, TelegramError
 from sama.gateway.transcribe import TranscribeError, Transcriber
 from sama.orchestrator.queue import QueueError, RunQueue
+from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 
 log: Final = logging.getLogger("sama.gateway.telegram")
@@ -73,8 +74,12 @@ HELP: Final = (
     "/new - start a new session\n"
     "/stop - stop the current run\n"
     "/model - show the agent profiles. /model <name> starts a new session with that profile\n"
-    "/pair <code> - link this account, or link a group with a group code"
+    "/pair <code> - link this account, or link a group with a group code\n"
+    "/skills - list the skills. /<skill> <request> uses a skill"
 )
+
+OWN_COMMANDS: Final = frozenset({"/new", "/stop", "/model", "/skills", "/start", "/pair", "/help"})
+"""Commands of the gateway. Any other command can be a skill (Section 9.5)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +178,7 @@ class TelegramGateway:
         settings: TelegramSettings | None = None,
         queue: RunQueue | None = None,
         gate: GateService | None = None,
+        skills: SkillLibrary | None = None,
         transcriber: Transcriber | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
@@ -185,6 +191,7 @@ class TelegramGateway:
         self._settings = settings or TelegramSettings()
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
+        self._skills = skills
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
         self._seen: OrderedDict[int, None] = OrderedDict()
@@ -307,9 +314,14 @@ class TelegramGateway:
             )
             return
 
-        if command is not None:
+        skill_command = (
+            command is not None and command not in OWN_COMMANDS and self._skills is not None
+        )
+        if command is not None and not skill_command:
             await self._run_command(chat_id, message_id, command, rest, target, grants)
             return
+        if skill_command and command is not None:
+            text = f"{command} {rest}".strip()
         voice = message.get("voice") or message.get("audio")
         if not text and isinstance(voice, dict):
             text = await self._transcribe(chat_id, message_id, voice) or ""
@@ -322,6 +334,13 @@ class TelegramGateway:
             log.warning("too many runs to follow; chat=%s must try again", chat_id)
             await self._say(chat_id, BUSY, reply_to=message_id)
             return
+        if text.startswith("/") and self._skills is not None:
+            expanded = await self._expand(chat_id, target, grants, text)
+            if expanded is not None:
+                text = expanded
+            elif skill_command:
+                await self._say(chat_id, HELP, reply_to=message_id)
+                return
         place = object()
         self._followers.add(place)
         try:
@@ -340,6 +359,51 @@ class TelegramGateway:
             self._followers.discard(place)
             raise
         self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
+
+    async def _expand(self, chat_id: int, target: Target, grants: Grants, text: str) -> str | None:
+        """The message text for a skill command, or ``None`` if ``text`` is not one."""
+        if self._skills is None:
+            return None
+        current = await self._session(chat_id, target, grants, create=False)
+        profile = target.agent_profile_id if current is None else current.agent_profile_id
+        async with self._engine.connect() as connection:
+            actor = await self._skills.actor(
+                connection,
+                org_id=target.org_id,
+                workspace_id=target.workspace_id,
+                profile_id=profile,
+                user_id=target.user_id,
+                private=target.audience == "private",
+            )
+        return await self._skills.expand(actor, text)
+
+    async def _skill_list(
+        self, chat_id: int, message_id: int, target: Target, grants: Grants
+    ) -> None:
+        if self._skills is None:
+            await self._say(chat_id, HELP, reply_to=message_id)
+            return
+        current = await self._session(chat_id, target, grants, create=False)
+        profile = target.agent_profile_id if current is None else current.agent_profile_id
+        async with self._engine.connect() as connection:
+            actor = await self._skills.actor(
+                connection,
+                org_id=target.org_id,
+                workspace_id=target.workspace_id,
+                profile_id=profile,
+                user_id=target.user_id,
+                private=target.audience == "private",
+            )
+            skills = await self._skills.index(connection, actor)
+        if not skills:
+            await self._say(chat_id, "There are no skills.", reply_to=message_id)
+            return
+        lines = [f"/{s.name.replace('-', '_')} - {s.description}" for s in skills]
+        await self._say(
+            chat_id,
+            "Skills (send /<skill> and your request):\n" + "\n".join(lines),
+            reply_to=message_id,
+        )
 
     async def _identity(self, sender_id: str) -> Any:
         """The `channel_identities` row of the sender, or None."""
@@ -480,6 +544,8 @@ class TelegramGateway:
             )
         elif command == "/model":
             await self._model(chat_id, message_id, rest, target, grants)
+        elif command == "/skills":
+            await self._skill_list(chat_id, message_id, target, grants)
         else:
             await self._say(chat_id, HELP, reply_to=message_id)
 

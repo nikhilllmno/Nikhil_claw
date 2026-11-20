@@ -28,10 +28,13 @@ from sama.runtime.contract import (
     McpServerConfig,
     RunConfig,
     RuntimeKind,
+    SkillIndexEntry,
 )
+from sama.tenancy.authority import run_user
 
 if TYPE_CHECKING:
     from sama.orchestrator.queue import ClaimedRun
+    from sama.skills.service import SkillLibrary
 
 log: Final = logging.getLogger("sama.prompt")
 
@@ -112,8 +115,10 @@ class PromptAssembler:
         *,
         mcp_servers: Sequence[McpServerConfig] = (),
         system: str = SYSTEM_PROMPT,
+        skills: SkillLibrary | None = None,
     ) -> None:
         self._engine = engine
+        self._skills = skills
         self._mcp_servers = tuple(mcp_servers)
         self._system = system
 
@@ -182,7 +187,25 @@ class PromptAssembler:
             context_files=tuple(files),
             environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
+            skill_index=await self._skill_index(connection, run),
         )
+
+    async def _skill_index(
+        self, connection: AsyncConnection, run: ClaimedRun
+    ) -> tuple[SkillIndexEntry, ...]:
+        """The skill index of the run. It is frozen with the config (Section 6.1)."""
+        if self._skills is None:
+            return ()
+        actor = await self._skills.actor(
+            connection,
+            org_id=run.org_id,
+            workspace_id=run.workspace_id,
+            profile_id=run.agent_profile_id,
+            user_id=run_user(run.user_id, run.audience, run.owner_user_id),
+            private=run.audience == "private",
+        )
+        skills = await self._skills.index(connection, actor)
+        return tuple(SkillIndexEntry(name=s.name, description=s.description) for s in skills)
 
 
 async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:

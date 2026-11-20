@@ -12,7 +12,8 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Annotated, Any, Final, Protocol
+from dataclasses import asdict
+from typing import Annotated, Any, Final, Literal, Protocol
 
 import anyio
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
@@ -39,6 +40,11 @@ from sama.memory.core import (
     Target,
 )
 from sama.memory.service import MemoryService
+from sama.skills.errors import SkillError
+from sama.skills.library import ManageRequest
+from sama.skills.lint import MAX_FILE_CHARS, MAX_SKILL_MD_CHARS
+from sama.skills.render import render_list, render_view, render_written
+from sama.skills.store import SkillStore
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
 from sama.tools.clarify import (
     MAX_QUESTIONS,
@@ -73,11 +79,14 @@ CLARIFY: Final = "clarify"
 TODO: Final = "todo"
 MEMORY: Final = "memory"
 REPO_CLONE: Final = "repo_clone"
+SKILLS_LIST: Final = "skills_list"
+SKILL_VIEW: Final = "skill_view"
+SKILL_MANAGE: Final = "skill_manage"
 
 MAX_ERROR_CHARS: Final = 2_000
 """An error result is cut to this length. Argument errors of the SDK can be long."""
 
-_EXPECTED = (ClarifyError, MemoryChangeError, RepoError, SearchError, TodoError)
+_EXPECTED = (ClarifyError, MemoryChangeError, RepoError, SearchError, SkillError, TodoError)
 _NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
 
 
@@ -161,6 +170,8 @@ class ToolServer:
     - ``repos``: clones repositories into the session sandbox. Without it, ``repo_clone`` is
       hidden.
     - ``memory``: the memory service. Without it, ``memory`` is hidden.
+    - ``skills``: the skill library (``skills_list``, ``skill_view``, ``skill_manage``).
+      Without it, these tools are hidden.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -177,6 +188,7 @@ class ToolServer:
         spill: Spill | None = None,
         repos: RepoCloner | None = None,
         memory: MemoryService | None = None,
+        skills: SkillStore | None = None,
         gate: GateBackend | None = None,
     ) -> None:
         self.signer = signer
@@ -188,6 +200,7 @@ class ToolServer:
         self.spill = spill
         self.repos = repos
         self.memory = memory
+        self.skills = skills
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
@@ -427,6 +440,102 @@ class ToolServer:
 
                 arguments = {"repo": repo, "ref": ref, "folder": folder}
                 return await self._call(ctx, REPO_CLONE, arguments, body)
+
+        if self.skills is not None:
+            library = self.skills
+
+            @server.tool(
+                name=SKILLS_LIST,
+                description=(
+                    "List the skills that you can use: name, scope, version, and a short "
+                    "description. A skill is a guide for one kind of task. Give query to "
+                    "search the names, descriptions, and tags."
+                ),
+                annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+                structured_output=False,
+            )
+            async def skills_list(
+                ctx: Context, query: Annotated[str | None, Field(max_length=100)] = None
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return render_list(await library.list(claims, query), query)
+
+                return await self._call(ctx, SKILLS_LIST, {"query": query}, body)
+
+            @server.tool(
+                name=SKILL_VIEW,
+                description=(
+                    "Load a skill: its SKILL.md and the list of its files. Give file_path to "
+                    "read one file of the skill instead. When a skill fits the task, load it "
+                    "and follow it. A file is also in the sandbox folder .sama/skills/<name>/ "
+                    "if the skill existed when the run started, so you can run its scripts."
+                ),
+                annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+                structured_output=False,
+            )
+            async def skill_view(
+                name: Annotated[str, Field(min_length=1, max_length=64)],
+                ctx: Context,
+                file_path: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return render_view(await library.view(claims, name.strip()), file_path)
+
+                return await self._call(
+                    ctx, SKILL_VIEW, {"name": name, "file_path": file_path}, body
+                )
+
+            @server.tool(
+                name=SKILL_MANAGE,
+                description=(
+                    "Create or change a skill. Each change is a new version, and nothing is "
+                    "deleted. Actions: create (name, content = the full SKILL.md with a YAML "
+                    "frontmatter with name, description of at most 60 characters, version, "
+                    "tags), patch (old_string, new_string, replace_all; file_path for a file "
+                    "other than SKILL.md), edit (content = the new full SKILL.md), write_file "
+                    "(file_path in references/, templates/, scripts/, or assets/, and "
+                    "file_content), remove_file (file_path), archive. scope is user "
+                    "(default in a private session), workspace (default in a shared session; "
+                    "needs a workspace admin), or org (needs the org owner). Builtin skills "
+                    "are read-only: create a skill with the same name to override one. "
+                    "Do not put secrets in a skill."
+                ),
+                annotations=ToolAnnotations(
+                    read_only_hint=False, destructive_hint=False, open_world_hint=False
+                ),
+                structured_output=False,
+            )
+            async def skill_manage(
+                action: Literal["create", "patch", "edit", "write_file", "remove_file", "archive"],
+                name: Annotated[str, Field(min_length=1, max_length=64)],
+                ctx: Context,
+                scope: Literal["user", "workspace", "org"] | None = None,
+                content: Annotated[str | None, Field(max_length=MAX_SKILL_MD_CHARS)] = None,
+                old_string: Annotated[str | None, Field(max_length=MAX_FILE_CHARS)] = None,
+                new_string: Annotated[str | None, Field(max_length=MAX_FILE_CHARS)] = None,
+                replace_all: bool = False,
+                file_path: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+                file_content: Annotated[str | None, Field(max_length=MAX_FILE_CHARS)] = None,
+                summary: Annotated[str | None, Field(max_length=500)] = None,
+            ) -> str:
+                request = ManageRequest(
+                    action=action,
+                    name=name.strip(),
+                    scope=scope,
+                    content=content,
+                    old_string=old_string,
+                    new_string=new_string,
+                    replace_all=replace_all,
+                    file_path=file_path,
+                    file_content=file_content,
+                    summary=summary,
+                )
+
+                async def body(claims: RunTokenClaims) -> str:
+                    return render_written(await library.manage(claims, request))
+
+                arguments = {k: v for k, v in asdict(request).items() if v is not None}
+                return await self._call(ctx, SKILL_MANAGE, arguments, body)
 
         return server
 

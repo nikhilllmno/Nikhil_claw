@@ -1,11 +1,11 @@
 """Skills: versioned skills of the org, of a workspace, or of a user (docs/architecture.md,
 Section 9.2).
 
-The tools of the toolset ``skills`` would have no effect for the profiles that exist, so the
-upgrade adds the toolset to every profile.
+The tools of the toolset ``skills`` would have no effect for the default profile of the first
+org, so the upgrade adds the toolset to it (the same way as migration 0012).
 
 Revision ID: 0013
-Revises: 0011
+Revises: 0012
 Create Date: 2026-11-20
 """
 
@@ -16,9 +16,12 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0013"
-down_revision: str | None = "0011"
+down_revision: str | None = "0012"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+OLD_TOOLSETS = '["core", "todo", "web", "clarify", "github", "memory"]'
+NEW_TOOLSETS = '["core", "todo", "web", "clarify", "github", "memory", "skills"]'
 
 
 def upgrade() -> None:
@@ -181,16 +184,17 @@ def upgrade() -> None:
         " WHERE s.org_id = skill_versions.org_id AND s.id = skill_versions.skill_id))"
     )
 
+    # The default profile of the first org (M1.15) gets the new toolset, like in 0012.
     op.execute(
-        "UPDATE public.agent_profiles SET toolsets = toolsets || '[\"skills\"]'::jsonb"
-        " WHERE jsonb_typeof(toolsets) = 'array' AND NOT toolsets @> '[\"skills\"]'::jsonb"
+        f"UPDATE public.agent_profiles SET toolsets = '{NEW_TOOLSETS}'::jsonb"  # noqa: S608
+        f" WHERE toolsets = '{OLD_TOOLSETS}'::jsonb"
     )
 
 
 def downgrade() -> None:
     op.execute(
-        "UPDATE public.agent_profiles SET toolsets = toolsets - 'skills'"
-        " WHERE jsonb_typeof(toolsets) = 'array'"
+        f"UPDATE public.agent_profiles SET toolsets = '{OLD_TOOLSETS}'::jsonb"  # noqa: S608
+        f" WHERE toolsets = '{NEW_TOOLSETS}'::jsonb"
     )
     op.drop_table("skill_versions")
     op.drop_table("skills")

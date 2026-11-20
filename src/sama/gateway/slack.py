@@ -55,6 +55,8 @@ from sama.gateway.sessions import (
 )
 from sama.gateway.slack_client import SlackClient, SlackError
 from sama.orchestrator.queue import QueueError, RunQueue
+from sama.skills import commands
+from sama.skills.service import SkillLibrary
 from sama.tenancy.access import Grants, load_grants
 
 log: Final = logging.getLogger("sama.gateway.slack")
@@ -79,6 +81,8 @@ HELP: Final = (
     "/sama new - start a new session (direct messages)\n"
     "/sama stop - stop the open runs of this conversation\n"
     "/sama pair CODE - link your account, or link this channel with a group code\n"
+    "/sama <skill> <request> - use a skill (direct messages). In a channel, mention the app"
+    " and write /<skill> <request>\n"
     "/sama help - show this help"
 )
 
@@ -246,6 +250,7 @@ class SlackGateway:
         settings: FollowSettings | None = None,
         queue: RunQueue | None = None,
         gate: GateService | None = None,
+        skills: SkillLibrary | None = None,
         lockout: Lockout | None = None,
         followers: set[object] | None = None,
         seen: SeenEvents | None = None,
@@ -258,6 +263,7 @@ class SlackGateway:
         self._settings = settings or FollowSettings()
         self._queue = queue or RunQueue(engine)
         self._gate = gate or GateService(engine)
+        self._skills = skills
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -377,6 +383,8 @@ class SlackGateway:
             log.warning("too many runs to follow; channel=%s must try again", place.channel)
             await self._say(place, BUSY)
             return
+        if text.startswith("/"):
+            text = await self._expand(place, target, grants, text) or text
         holder = object()
         self._followers.add(holder)
         try:
@@ -395,6 +403,49 @@ class SlackGateway:
             self._followers.discard(holder)
             raise
         self._spawn(self._follow(place, target, run_id, holder))
+
+    async def _expand(self, place: _Place, target: Target, grants: Grants, text: str) -> str | None:
+        """The message text for a skill command, or ``None`` if ``text`` is not one."""
+        if self._skills is None or commands.parse(text) is None:
+            return None
+        current = await self._session(place, target, grants, create=False)
+        profile = target.agent_profile_id if current is None else current.agent_profile_id
+        async with self._engine.connect() as connection:
+            actor = await self._skills.actor(
+                connection,
+                org_id=target.org_id,
+                workspace_id=target.workspace_id,
+                profile_id=profile,
+                user_id=target.user_id,
+                private=target.audience == "private",
+            )
+        return await self._skills.expand(actor, text)
+
+    async def _skill(
+        self, sender: str, channel: str, identity: Any, name: str, request: str
+    ) -> str:
+        """``/sama <skill> <request>``. Slack does not allow a new slash command for a skill,
+        so a direct message starts the skill here, and a channel needs a mention."""
+        text = f"/{name} {request}".strip()
+        if commands.parse(text) is None or self._skills is None:
+            return HELP
+        if identity is None:
+            return PAIR_PROMPT if channel.startswith("D") else LINK_FIRST
+        if not channel.startswith("D"):
+            return (
+                f"Mention the sama app in this channel and write /{name} <request> in the message."
+            )
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        if await self._expand(place, target, grants, text) is None:
+            return HELP
+        async with self._locks.hold((place.channel, place.thread_ts)):
+            await self._start(place, target, text)
+        return f"The skill {name} started."
 
     async def _identity(self, sender: str) -> Any:
         """The ``channel_identities`` row of the Slack user, or None."""
@@ -470,6 +521,8 @@ class SlackGateway:
             if name == "pair" and rest:
                 return await self._pair(sender, channel, rest, identity)
             if name not in ("new", "stop"):
+                if name not in ("help", "pair"):
+                    return await self._skill(sender, channel, identity, name, rest)
                 return HELP
             if identity is None:
                 return PAIR_PROMPT if channel.startswith("D") else LINK_FIRST
