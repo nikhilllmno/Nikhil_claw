@@ -681,6 +681,41 @@ async def test_a_record_that_cannot_be_written_blocks_the_org() -> None:
     assert [c.run_id for c in store.calls] == ["run-1", "run-2", "run-1"]
 
 
+class SharedBudgetStore(FailingStore):
+    """Two runs share one budget, like the runs of a worker bot: a recorded call of
+    ``run-2`` spends the budget of ``run-1``."""
+
+    async def authority(self, org_id: str, run_id: str) -> Authority:
+        if any(call.run_id == "run-2" for call in self.calls):
+            return Authority(problem="the worker bot reached its daily budget")
+        return await super().authority(org_id, run_id)
+
+
+async def test_pending_usage_is_written_before_the_live_limits_load() -> None:
+    upstream, store, signer = Upstream(), SharedBudgetStore(), RunTokenSigner(KEY)
+    proxy = make_proxy(upstream, store, signer, record_retry_s=0.0)
+    token = signer.issue(make_scope("run-1"), ttl_s=60)
+    other = signer.issue(make_scope("run-2"), ttl_s=60)
+    payload = {"model": MODEL, "max_tokens": 10, "messages": []}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+    ) as client:
+
+        async def call(key: str) -> httpx.Response:
+            return await client.post(
+                "/anthropic/v1/messages", json=payload, headers={"x-api-key": key}
+            )
+
+        assert (await call(other)).status_code == 200
+        assert len(proxy.unrecorded) == 1, "the call of run-2 is not written yet"
+        store.broken = False
+        refused = await call(token)
+        assert refused.status_code == 403, "the written call of run-2 spent the budget"
+        assert "daily budget" in refused.json()["error"]["message"]
+        assert len(upstream.requests) == 1
+    await proxy.aclose()
+
+
 async def test_a_store_that_cannot_read_refuses_the_call() -> None:
     upstream, store, signer = Upstream(), FailingStore(), RunTokenSigner(KEY)
     store.broken, store.reads_fail = False, True

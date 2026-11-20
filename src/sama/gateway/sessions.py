@@ -251,6 +251,9 @@ async def new_session(
             )
         )
         await _bind(connection, channel, key, target, session_id)
+        details: dict[str, str] = {"audience": target.audience, "channel": channel}
+        if target.worker_bot_id is not None:
+            details["worker_bot_id"] = str(target.worker_bot_id)
         await connection.execute(
             insert(AuditEntry).values(
                 org_id=target.org_id,
@@ -260,15 +263,7 @@ async def new_session(
                 action="session.created",
                 target_type="session",
                 target_id=str(session_id),
-                details={
-                    "audience": target.audience,
-                    "channel": channel,
-                    **(
-                        {}
-                        if target.worker_bot_id is None
-                        else {"worker_bot_id": str(target.worker_bot_id)}
-                    ),
-                },
+                details=details,
             )
         )
     return Bound(session_id, agent_profile_id)
@@ -596,7 +591,7 @@ async def send_ending(
 @dataclass(frozen=True, slots=True)
 class Decided:
     outcome: str
-    """``Approved``, ``Denied``, or ``Expired``."""
+    """``Approved``, ``Always allowed``, ``Denied``, or ``Expired``."""
     tool_name: str
 
 
@@ -628,10 +623,16 @@ async def decide(
                     Session.workspace_id,
                     Session.audience,
                     Session.owner_user_id,
+                    ReviewProposal.id.label("proposal_id"),
                 )
                 .join(
                     Session,
                     (Session.org_id == Approval.org_id) & (Session.id == Approval.session_id),
+                )
+                .outerjoin(
+                    ReviewProposal,
+                    (ReviewProposal.org_id == Approval.org_id)
+                    & (ReviewProposal.approval_id == Approval.id),
                 )
                 .where(Approval.org_id == org_id, Approval.id == approval_id)
             )
@@ -639,6 +640,8 @@ async def decide(
         grants = await load_grants(connection, org_id, user_id)
     if row is None or not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
         raise ApprovalError("You cannot decide this approval.")
+    # The gate ignores "always allow" for a proposal: a rule cannot approve a proposal.
+    always = always_allow and approve and row.proposal_id is None
     try:
         await gate.decide_approval(
             org_id=org_id,
@@ -646,9 +649,9 @@ async def decide(
             call_id=row.call_id,
             user_id=user_id,
             approve=approve,
-            always_allow=always_allow and approve,
+            always_allow=always,
         )
-        outcome = "Approved" if approve else "Denied"
+        outcome = ALWAYS_OUTCOME if always else "Approved" if approve else "Denied"
     except ApprovalExpiredError:
         outcome = "Expired"
     await queue.release_decided(org_id=org_id, run_id=row.run_id)

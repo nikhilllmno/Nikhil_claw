@@ -208,11 +208,8 @@ class PostgresSkillStore:
             plan = await self._plan_as_owner(connection, actor, request)
         except SkillError:
             return None
-        if plan.scope == "workspace" and (actor.workspace_admin or actor.org_owner):
-            return None
-        if plan.scope == "org" and actor.org_owner:
-            return None
-        if plan.scope not in ("workspace", "org"):
+        has_role = actor.org_owner or (plan.scope == "workspace" and actor.workspace_admin)
+        if has_role or plan.scope not in ("workspace", "org"):
             return None
         if actor.session_id is None or actor.run_id is None:
             return None

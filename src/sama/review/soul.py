@@ -8,17 +8,17 @@ always a proposal, also when the user of the run is an admin:
 - A profile of the whole org (no workspace): only the org owner approves it.
 
 The applier (``sama.review.apply``) writes the approved soul with ``set_soul``. The proposal
-keeps a digest of the soul that the agent saw. If the soul changed since then, the proposal
-fails and the agent must propose again. A session keeps the soul that it froze, so the new soul
-applies from the next session.
+keeps a digest of the soul that the agent saw: the soul in the frozen config of the session. If
+the soul of the profile is not that soul at the apply step (a person changed it before or after
+the proposal), the proposal fails and the agent must propose again. A session keeps the soul
+that it froze, so the new soul applies from the next session.
 """
 
 from __future__ import annotations
 
 import hashlib
 import uuid
-from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 from sqlalchemy import and_, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sama.db.models import AgentProfile, AuditEntry, Run, Session
 from sama.profiles import SOUL_MAX_CHARS
 from sama.review.proposals import NewProposal, ProposalScope, ProposalSink
+from sama.tenancy.authority import run_user
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import redact
 
@@ -40,17 +41,12 @@ def soul_digest(soul: str) -> str:
     return hashlib.sha256(soul.encode("utf-8")).hexdigest()
 
 
-@dataclass(frozen=True, slots=True)
-class _RunProfile:
-    workspace_id: uuid.UUID
-    profile_id: uuid.UUID
-    profile_workspace_id: uuid.UUID | None
-    profile_name: str
-    soul: str
-    kind: str
-    unattended: bool
-    lineage: str | None
-    acting_user_id: uuid.UUID | None
+def seen_soul(run_config: Any, live: str) -> str:
+    """The soul that the run saw: the soul in the frozen config of the session. A session
+    without a frozen config uses the soul of the profile now."""
+    if isinstance(run_config, dict) and isinstance(run_config.get("soul"), str):
+        return str(run_config["soul"])
+    return live
 
 
 class SoulProposer:
@@ -77,7 +73,8 @@ class SoulProposer:
             raise SoulError("only a chat run with a person in it can propose a new soul")
         if run.lineage == "delegation":
             raise SoulError("a delegated child run cannot propose a new soul. Ask the parent run")
-        if soul == run.soul:
+        seen = seen_soul(run.run_config, run.soul)
+        if soul == seen:
             return "The soul is already this text. Nothing to propose."
         scope: ProposalScope = "workspace" if run.profile_workspace_id is not None else "org"
         await self._proposals.propose(
@@ -86,28 +83,28 @@ class SoulProposer:
                 workspace_id=run.workspace_id,
                 session_id=uuid.UUID(claims.session_id),
                 run_id=uuid.UUID(claims.run_id),
-                acting_user_id=run.acting_user_id,
+                acting_user_id=run_user(run.triggered_by_user_id, run.audience, run.owner_user_id),
                 kind="soul",
                 scope=scope,
                 payload={
-                    "profile_id": str(run.profile_id),
-                    "profile_name": run.profile_name,
+                    "profile_id": str(run.agent_profile_id),
+                    "profile_name": run.name,
                     "soul": soul,
                     "summary": summary,
-                    "base_digest": soul_digest(run.soul),
+                    "base_digest": soul_digest(seen),
                 },
-                summary=f"set the soul of the agent profile {run.profile_name}: {summary}",
+                summary=f"set the soul of the agent profile {run.name}: {summary}",
                 origin="chat",
             )
         )
         who = "A workspace admin or the org owner" if scope == "workspace" else "Only the org owner"
         return (
-            f"Proposed a new soul for the profile {run.profile_name}. It is not saved. {who}"
+            f"Proposed a new soul for the profile {run.name}. It is not saved. {who}"
             " must approve it first. An approval card shows the change. After the approval,"
             " the new soul applies from the next session. Do not propose it again."
         )
 
-    async def _load(self, claims: RunTokenClaims) -> _RunProfile:
+    async def _load(self, claims: RunTokenClaims) -> Any:
         org_id = uuid.UUID(claims.org_id)
         async with self._engine.connect() as connection:
             row = (
@@ -117,6 +114,7 @@ class SoulProposer:
                         Session.lineage,
                         Session.audience,
                         Session.owner_user_id,
+                        Session.run_config,
                         Run.agent_profile_id,
                         Run.kind,
                         Run.unattended,
@@ -142,20 +140,7 @@ class SoulProposer:
             ).one_or_none()
         if row is None:
             raise SoulError("the run is not known")
-        acting = row.triggered_by_user_id or (
-            row.owner_user_id if row.audience == "private" else None
-        )
-        return _RunProfile(
-            workspace_id=row.workspace_id,
-            profile_id=row.agent_profile_id,
-            profile_workspace_id=row.profile_workspace_id,
-            profile_name=row.name,
-            soul=row.soul,
-            kind=row.kind,
-            unattended=bool(row.unattended),
-            lineage=row.lineage,
-            acting_user_id=acting,
-        )
+        return row
 
 
 async def set_soul(
@@ -167,10 +152,10 @@ async def set_soul(
     base_digest: str,
     actor_user_id: uuid.UUID,
     proposal_id: uuid.UUID,
-) -> uuid.UUID | None:
+) -> None:
     """Writes an approved soul on ``connection`` (in the transaction of the caller) and the
-    audit entry. Returns the workspace of the profile. Raises ``SoulError`` when the profile
-    does not exist, or when its soul changed after the proposal."""
+    audit entry. Raises ``SoulError`` when the profile does not exist, or when its soul is not
+    the soul that the run saw."""
     row = (
         await connection.execute(
             select(AgentProfile.soul, AgentProfile.workspace_id)
@@ -181,7 +166,7 @@ async def set_soul(
     if row is None:
         raise SoulError("the agent profile does not exist now")
     if soul_digest(row.soul) != base_digest:
-        raise SoulError("the soul changed after the proposal. Ask for a new proposal")
+        raise SoulError("the soul changed after the agent saw it. Ask for a new proposal")
     if len(soul) > SOUL_MAX_CHARS or redact(soul) != soul:
         raise SoulError("the soul is not valid now")
     await connection.execute(
@@ -201,5 +186,3 @@ async def set_soul(
             details={"fields": ["soul"], "subagents": [], "proposal_id": str(proposal_id)},
         )
     )
-    workspace_id: uuid.UUID | None = row.workspace_id
-    return workspace_id

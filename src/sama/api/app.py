@@ -109,8 +109,6 @@ from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
-from sama.workerbots import MAX_DAILY_BUDGET_USD
-from sama.workerbots import NAME_MAX_CHARS as BOT_NAME_MAX_CHARS
 
 log = logging.getLogger("sama.api")
 
@@ -157,6 +155,19 @@ class ApiSettings(BaseModel):
 
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class _Edit(_Body):
+    """A body of optional fields to change. It has at least one field, and no field is null."""
+
+    @model_validator(mode="after")
+    def _has_a_field(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field to change")
+        for name in sorted(self.model_fields_set):
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
 
 
 class NewSession(_Body):
@@ -233,10 +244,11 @@ class MemoryRevert(_Body):
 
 
 _BotName = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=BOT_NAME_MAX_CHARS)
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=workerbots.NAME_MAX_CHARS),
 ]
 _BotChannel = Annotated[str, StringConstraints(pattern=r"^[CG][A-Z0-9]{2,31}$")]
-_BotBudget = Annotated[Decimal, Field(gt=0, le=MAX_DAILY_BUDGET_USD, decimal_places=4)]
+_BotBudget = Annotated[Decimal, Field(gt=0, le=workerbots.MAX_DAILY_BUDGET_USD, decimal_places=4)]
 
 
 class NewWorkerBot(_Body):
@@ -249,7 +261,7 @@ class NewWorkerBot(_Body):
     daily_budget_usd: _BotBudget
 
 
-class WorkerBotEdit(_Body):
+class WorkerBotEdit(_Edit):
     """The fields to change. Every field is optional, and a body has at least one."""
 
     name: _BotName | None = None
@@ -258,17 +270,8 @@ class WorkerBotEdit(_Body):
     daily_budget_usd: _BotBudget | None = None
     status: Literal["active", "disabled"] | None = None
 
-    @model_validator(mode="after")
-    def _has_a_field(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("send at least one field to change")
-        for name in sorted(self.model_fields_set):
-            if getattr(self, name) is None:
-                raise ValueError(f"{name} cannot be null")
-        return self
 
-
-class ProfileEdit(_Body):
+class ProfileEdit(_Edit):
     """The fields to change. Every field is optional, and a body has at least one."""
 
     name: (
@@ -283,15 +286,6 @@ class ProfileEdit(_Body):
         Annotated[list[Annotated[str, Field(max_length=100)]], Field(max_length=100)] | None
     ) = None
     subagents: list[Any] | None = None
-
-    @model_validator(mode="after")
-    def _has_a_field(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("send at least one field to change")
-        for name in sorted(self.model_fields_set):
-            if getattr(self, name) is None:
-                raise ValueError(f"{name} cannot be null")
-        return self
 
 
 class Answers(_Body):
@@ -843,6 +837,10 @@ class SamaApi:
             await self._unlink(principal, channel, identity_id)
             return Response(status_code=204)
 
+        @app.exception_handler(workerbots.WorkerBotError)
+        async def worker_bot_error(_: Request, error: workerbots.WorkerBotError) -> JSONResponse:
+            return JSONResponse({"detail": str(error)}, status_code=error.status_code)
+
         @app.get("/workspaces/{workspace_id}/worker-bots")
         async def worker_bots(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
             org_id, _ = await self._workspace_grants(principal, workspace_id)
@@ -859,12 +857,9 @@ class SamaApi:
                 channel_id=body.channel_id,
                 daily_budget_usd=body.daily_budget_usd,
             )
-            try:
-                return await workerbots.create_bot(
-                    self._engine, org_id, workspace_id, grants.user_id, fields
-                )
-            except workerbots.WorkerBotError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return await workerbots.create_bot(
+                self._engine, org_id, workspace_id, grants.user_id, fields
+            )
 
         @app.patch("/workspaces/{workspace_id}/worker-bots/{bot_id}")
         async def edit_worker_bot(
@@ -878,24 +873,16 @@ class SamaApi:
                 daily_budget_usd=body.daily_budget_usd,
                 status=body.status,
             )
-            try:
-                return await workerbots.update_bot(
-                    self._engine, org_id, workspace_id, bot_id, grants.user_id, fields
-                )
-            except workerbots.WorkerBotError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return await workerbots.update_bot(
+                self._engine, org_id, workspace_id, bot_id, grants.user_id, fields
+            )
 
         @app.delete("/workspaces/{workspace_id}/worker-bots/{bot_id}", status_code=204)
         async def delete_worker_bot(
             principal: Me, workspace_id: uuid.UUID, bot_id: uuid.UUID
         ) -> Response:
             org_id, grants = await self._bot_admin(principal, workspace_id)
-            try:
-                await workerbots.delete_bot(
-                    self._engine, org_id, workspace_id, bot_id, grants.user_id
-                )
-            except workerbots.WorkerBotError as error:
-                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            await workerbots.delete_bot(self._engine, org_id, workspace_id, bot_id, grants.user_id)
             return Response(status_code=204)
 
         @app.get("/workspaces/{workspace_id}/memory")
@@ -1564,12 +1551,10 @@ class SamaApi:
                 )
             ).scalar_one_or_none()
             user_id = None if org_id is None else await _user_id(connection, principal, org_id)
-            grants = (
-                None
-                if org_id is None or user_id is None
-                else await load_grants(connection, org_id, user_id)
-            )
-        if org_id is None or grants is None or not grants.sees_workspace(workspace_id):
+            if org_id is None or user_id is None:
+                raise _not_found("the workspace does not exist")
+            grants = await load_grants(connection, org_id, user_id)
+        if not grants.sees_workspace(workspace_id):
             raise _not_found("the workspace does not exist")
         return org_id, grants
 
@@ -1579,7 +1564,7 @@ class SamaApi:
         """Like ``_workspace_grants``, and ``403`` for a user who is not a workspace admin, an
         org admin, or the org owner."""
         org_id, grants = await self._workspace_grants(principal, workspace_id)
-        if not workerbots.may_manage(grants, workspace_id):
+        if not (grants.org_admin or grants.admins_workspace(workspace_id)):
             raise HTTPException(status_code=403, detail=_BOT_ADMIN_ONLY)
         return org_id, grants
 

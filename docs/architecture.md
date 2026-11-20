@@ -1741,9 +1741,12 @@ approval card, applier, and timeout as a proposal of the background review (Sect
 **`change_propose`.** The toolset `self` has the tool `change_propose` (target `soul`, the full
 new `content`, and a `summary` of at most 200 characters). A SOUL changes the agent for every
 user of the profile, so a new SOUL is always a proposal, also for an admin. The proposal keeps a
-SHA-256 digest of the SOUL that the run saw. When a person approves it, the applier writes the
-new SOUL only if the digest still matches; else the proposal is `failed` with "the soul changed
-after the proposal". The applier adds the audit row `profile.updated`. A session keeps its frozen
+SHA-256 digest of the SOUL that the run saw: the frozen SOUL of the session
+(`sessions.run_config.soul`), or the live SOUL of the profile when the session has no frozen
+SOUL. When a person approves it, the applier writes the new SOUL only if the live SOUL still has
+that digest; else the proposal is `failed` with "the soul changed after the proposal". A
+proposal from a session that started before a SOUL change is refused at once: "the soul changed
+after the agent saw it. Ask for a new proposal". The applier adds the audit row `profile.updated`. A session keeps its frozen
 SOUL, so the new SOUL applies from the next session. The tool server hides the tool when it has
 no proposer. The bootstrap presets do not have `self` (Section 10.2), so an admin adds it to a
 profile on purpose.
@@ -2612,13 +2615,21 @@ a daily budget in USD. Code: `src/sama/workerbots.py`. Migration `0021`.
   and the workspace of the bot, also when a group pairing links the channel: the bot wins. The
   sender must be a linked user who can see the workspace. The session keeps the id of the bot
   (`sessions.worker_bot_id`).
+- The bot also wins for delivery. When a channel has a bot, the gateway posts only the output of
+  the sessions of that bot to the channel. A run that started from the group pairing before an
+  admin bound the bot posts nothing more to the channel. A session of a bot that is removed or
+  bound to another channel also posts nothing.
 - The cost of a bot in one day is the sum of `model_calls.cost_usd` of the sessions of the bot
   since 00:00 UTC. The gateway does not start a run when the bot spent its budget. The sender
   gets a message that only the sender sees: "This worker bot reached its daily budget. It works
   again after 00:00 UTC."
 - `load_authority` lowers the cost limit of a run of a bot session to the rest of the budget
   (Section 16.1), so the model proxy and the gate stop a run at the limit. The rest is the budget
-  less the cost of the other runs of the bot today. A bot that is disabled or removed, or that
+  less the cost of the other runs of the bot today. A run that started before 00:00 UTC also
+  keeps its cost from before 00:00 UTC: the limit adds that cost, because the run limit compares
+  with all the cost of the run. So the run gets the full budget of the new day.
+- The model proxy writes its pending usage records before it reads the authority of a call. So
+  the cost of a call of one bot run applies to the next call of every run of that bot. A bot that is disabled or removed, or that
   spent its budget, stops its runs ("the worker bot is disabled or removed", "the worker bot
   reached its daily budget").
 - `/sama stop` in a bot channel stops the runs of the bot threads.
@@ -3226,7 +3237,9 @@ bot, and a disabled, removed, or spent bot is a problem of the authority (Sectio
 - The model proxy refuses a call with `403` (`permission_error`) when the run ended or the
   run user lost access. This applies to every route, also to the free `count_tokens` route.
   A store that cannot read the authority gives `503`. It uses the lower of the token budget and the live budget, so a lower
-  budget applies at the next call.
+  budget applies at the next call. Before it reads the authority, the proxy writes its pending
+  usage records (Section 16.6), so a live budget that more than one run shares (a worker bot)
+  includes all the recorded calls.
 - Before an approve resume, the worker calls `GateService.reconfirm(org_id, run_id,
   call_id)`. It runs `decide_recorded`: all steps except the hardline step, which ran at the
   first check. The user rules are the rules of the run user, as for the live authority. A

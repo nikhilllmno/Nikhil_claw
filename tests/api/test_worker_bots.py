@@ -266,6 +266,24 @@ async def test_a_bot_run_stays_below_the_rest_of_the_daily_budget(
     assert (await authority(engine, tenant, second)).problem == BUDGET_REACHED
 
 
+async def test_a_run_that_crosses_midnight_gets_the_budget_of_the_new_day(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The run spent 0.80 of a budget of 1 yesterday. Today the bot spent nothing, so the run
+    can spend 1 more: its limit is the cost of yesterday plus the full budget of today."""
+    bot_id = await add_bot(engine, tenant, "1")
+    run_id = (await running(engine, tenant, "s1")).run_id
+    yesterday = utc_day_start() - timedelta(minutes=1)
+    await spend(engine, tenant, run_id, "s1", "0.80", at=yesterday)
+    async with engine.connect() as connection:
+        assert await spent_today(connection, tenant.org, bot_id) == Decimal(0)
+    found = await authority(engine, tenant, run_id)
+    assert found.problem is None
+    assert found.max_cost_usd == Decimal("1.80")
+    await spend(engine, tenant, run_id, "s1", "0.25")
+    assert (await authority(engine, tenant, run_id)).max_cost_usd == Decimal("1.80")
+
+
 async def test_a_disabled_bot_stops_its_runs(engine: AsyncEngine, tenant: Tenant) -> None:
     bot_id = await add_bot(engine, tenant)
     run_id = (await running(engine, tenant, "s1")).run_id

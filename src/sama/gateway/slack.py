@@ -42,7 +42,6 @@ from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
-    ALWAYS_OUTCOME,
     COMPACTING,
     PIN_COMMANDS,
     Bound,
@@ -848,8 +847,10 @@ class SlackGateway:
                 return False
             grants = await load_grants(connection, target.org_id, target.user_id)
             return grants.sees_workspace(target.workspace_id)
-        if target.worker_bot_id is not None:
-            bot = await channel_bot(connection, self._app.integration_id, place.channel)
+        # The worker bot of the channel wins over its group link, as in ``_group_target``. So a
+        # bot that is bound later stops the output of a run of the group link.
+        bot = await channel_bot(connection, self._app.integration_id, place.channel)
+        if target.worker_bot_id is not None or bot is not None:
             return bot is not None and bot.id == target.worker_bot_id
         linked = await connection.scalar(
             select(ChannelGroup.id).where(
@@ -929,8 +930,6 @@ class SlackGateway:
             await self._whisper(place, str(error))
             return
         outcome = decided.outcome
-        if match.group(2) == "a" and outcome == "Approved":
-            outcome = ALWAYS_OUTCOME
         card = _card_text(message) or f"Approval needed: {decided.tool_name}"
         ts = message.get("ts")
         if not ts:

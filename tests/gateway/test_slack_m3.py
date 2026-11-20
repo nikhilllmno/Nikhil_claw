@@ -272,8 +272,9 @@ async def add_bot(
     engine: AsyncEngine,  # noqa: F811
     tenant: Tenant,  # noqa: F811
     budget: str = "1",
+    channel: str = BOT_CHANNEL,
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    """A worker bot in ``BOT_CHANNEL`` with its own profile. Returns the bot and profile ids."""
+    """A worker bot in ``channel`` with its own profile. Returns the bot and profile ids."""
     bot_id, profile_id = uuid.uuid4(), uuid.uuid4()
     async with engine.begin() as connection:
         await connection.execute(
@@ -297,7 +298,7 @@ async def add_bot(
                 workspace_id=tenant.ids["ws"],
                 agent_profile_id=profile_id,
                 integration_id=tenant.ids["slack"],
-                external_id=BOT_CHANNEL,
+                external_id=channel,
                 name="Support bot",
                 daily_budget_usd=Decimal(budget),
                 status="active",
@@ -383,3 +384,22 @@ async def test_a_removed_bot_gets_no_more_output(
     assert await harness.worker.run_once()
     await gateway.drain()
     assert "secret answer" not in slack.texts(BOT_CHANNEL)
+
+
+async def test_a_bot_bound_later_stops_the_output_of_a_group_run(
+    gateway: SlackGateway,  # noqa: F811
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    slack: FakeSlack,  # noqa: F811
+) -> None:
+    """A run of the group link starts. Then a worker bot is bound to the channel. The bot wins,
+    so the old run does not post into the channel."""
+    await pair(gateway, engine, tenant)
+    await link_channel(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(FakeScript(events=(RunCompleted(output="old answer"),)))
+    await gateway.handle_event(mention("hi", channel=CHANNEL))
+    await add_bot(engine, tenant, channel=CHANNEL)
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert "old answer" not in slack.texts(CHANNEL)

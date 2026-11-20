@@ -39,7 +39,6 @@ from sama.gate.service import ApprovalError, GateService
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
-    ALWAYS_OUTCOME,
     COMPACTING,
     Bound,
     FollowSettings,
@@ -901,8 +900,6 @@ class TelegramGateway:
             await self._answer(callback_id, str(error))
             return
         outcome = decided.outcome
-        if choice == "a" and outcome == "Approved":
-            outcome = ALWAYS_OUTCOME
         await self._answer(callback_id, outcome)
         if "message_id" in message and "chat" in message:
             name = sender.get("first_name") or sender.get("username") or "a user"

@@ -36,7 +36,6 @@ from sama.db.models import (
     Session,
     WorkerBot,
 )
-from sama.tenancy.access import Grants
 
 NAME_MAX_CHARS: Final = 80
 MAX_DAILY_BUDGET_USD: Final = Decimal("10000")
@@ -65,7 +64,6 @@ async def spent_today(
     bot_id: uuid.UUID,
     *,
     except_run: uuid.UUID | None = None,
-    now: datetime | None = None,
 ) -> Decimal:
     """The model cost of the sessions of the bot since 00:00 UTC. ``except_run`` leaves out
     the calls of one run."""
@@ -78,7 +76,7 @@ async def spent_today(
         .where(
             ModelCall.org_id == org_id,
             Session.worker_bot_id == bot_id,
-            ModelCall.created_at >= utc_day_start(now),
+            ModelCall.created_at >= utc_day_start(),
         )
     )
     if except_run is not None:
@@ -100,11 +98,11 @@ async def bot_limit(
     org_id: uuid.UUID,
     bot_id: uuid.UUID,
     run_id: uuid.UUID | None,
-    *,
-    now: datetime | None = None,
 ) -> BotLimit:
-    """The cost that a run of the bot can still spend today. The run's own calls count
-    against this limit; the calls of the other runs of the bot today lower it."""
+    """The cost limit of a run of the bot. The live authority compares it with the whole cost
+    of the run, so the limit is the rest of the budget of today (the budget less the cost of
+    the other runs of the bot today), plus the cost of the run on earlier days. A run that goes
+    past 00:00 UTC thus gets the full budget of the new day."""
     row = (
         await connection.execute(
             select(WorkerBot.status, WorkerBot.daily_budget_usd).where(
@@ -114,18 +112,27 @@ async def bot_limit(
     ).one_or_none()
     if row is None or row.status != "active":
         return BotLimit(BOT_GONE, None)
-    other = await spent_today(connection, org_id, bot_id, except_run=run_id, now=now)
+    other = await spent_today(connection, org_id, bot_id, except_run=run_id)
     rest = Decimal(row.daily_budget_usd) - other
     if rest <= 0:
         return BotLimit(BUDGET_REACHED, Decimal(0))
+    if run_id is not None:
+        earlier = await connection.scalar(
+            select(func.coalesce(func.sum(ModelCall.cost_usd), 0)).where(
+                ModelCall.org_id == org_id,
+                ModelCall.run_id == run_id,
+                ModelCall.created_at < utc_day_start(),
+            )
+        )
+        rest += Decimal(earlier or 0)
     return BotLimit(None, rest)
 
 
 # -- admin --------------------------------------------------------------------------------
 
 
-def view(row: Any, spent: Decimal | None = None) -> dict[str, Any]:
-    out = {
+def view(row: Any, spent: Decimal) -> dict[str, Any]:
+    return {
         "id": str(row.id),
         "workspace_id": str(row.workspace_id),
         "agent_profile_id": str(row.agent_profile_id),
@@ -136,15 +143,8 @@ def view(row: Any, spent: Decimal | None = None) -> dict[str, Any]:
         "status": row.status,
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
+        "spent_today_usd": str(spent),
     }
-    if spent is not None:
-        out["spent_today_usd"] = str(spent)
-    return out
-
-
-def may_manage(grants: Grants, workspace_id: uuid.UUID) -> bool:
-    """A workspace admin, the org owner, or an org admin."""
-    return grants.org_admin or grants.admins_workspace(workspace_id)
 
 
 async def list_bots(

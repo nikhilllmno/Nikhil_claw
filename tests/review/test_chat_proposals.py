@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import AgentProfile, Approval, AuditEntry, ReviewProposal, Run, Skill
+from sama.db.models import AgentProfile, Approval, AuditEntry, ReviewProposal, Run, Session, Skill
 from sama.gate.service import ApprovalError, GateService
 from sama.memory import MemoryScope, MemoryService, Operation, PostgresMemoryStore, Target
 from sama.memory.core import Action
@@ -286,8 +286,36 @@ async def test_a_soul_that_changed_after_the_proposal_fails(
     await chat.applier.apply_decided()
     (proposal,) = await chat.rows(ReviewProposal)
     assert proposal.status == "failed"
-    assert "the soul changed after the proposal" in proposal.error
+    assert "the soul changed after the agent saw it" in proposal.error
     assert await chat.soul() == "Someone else changed it."
+
+
+async def test_a_soul_proposal_compares_with_the_frozen_soul(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The session froze soul A. A person changes the profile to B before the agent proposes C
+    from the old session. The approval must not overwrite B."""
+    chat = await start_chat(engine, tenant)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Session)
+            .where(Session.id == tenant.ids["s1"])
+            .values(run_config={"soul": "You are a test agent."}, config_fingerprint="test")
+        )
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(soul="A newer soul.")
+        )
+    await chat.souls.propose(chat.claims, "You are brief.", "be brief")
+    await chat.decide("owner")
+    await chat.applier.apply_decided()
+    (proposal,) = await chat.rows(ReviewProposal)
+    assert proposal.status == "failed"
+    assert "the soul changed after the agent saw it" in proposal.error
+    assert await chat.soul() == "A newer soul."
+    text = await chat.souls.propose(chat.claims, "You are a test agent.", "same")
+    assert "Nothing to propose" in text, "the frozen soul is the base, not the live one"
 
 
 async def test_a_rejected_soul_is_discarded(engine: AsyncEngine, tenant: Tenant) -> None:
