@@ -10,12 +10,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.pool import NullPool
 
 from sama.admin.__main__ import main
 from sama.db import create_engine
 from sama.db.models import AgentProfile
+from sama.vault.crypto import VaultKey
+from sama.vault.redact import default_redactor
+from sama.vault.store import SecretName, Vault
 from tests.orchestrator.conftest import add_tenant
 
 SPEC = {
@@ -107,3 +110,106 @@ def test_a_missing_file_or_profile_gives_exit_code_1(
     ids = ("--org", str(uuid.uuid4()), "--profile", str(uuid.uuid4()))
     assert main(["subagents", "set", *ids, "--file", str(tmp_path / "none.json")]) == 1
     assert main(["subagents", "show", *ids]) == 1
+
+
+# -- opaque secrets (the redactor knows the vault and the environment) ---------------------------
+
+OPAQUE = "signing-opaque-0123456789abcdef"  # no pattern of the redactor matches it
+
+
+def _spec_with(text: str) -> str:
+    return json.dumps([{**SPEC, "prompt": f"Use {text} when you call the service."}])
+
+
+async def _put_secret(url: str, key: str, org: uuid.UUID, value: str) -> None:
+    engine = create_engine(url, poolclass=NullPool)
+    try:
+        await Vault(engine, VaultKey.from_text(key)).put(org, SecretName.BRAVE_API_KEY, value)
+    finally:
+        await engine.dispose()
+    default_redactor().forget(value)  # the CLI process must learn it from the vault
+
+
+async def _stored(url: str, profile: uuid.UUID) -> Any:
+    engine = create_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            return (
+                await connection.execute(
+                    select(AgentProfile.subagents).where(AgentProfile.id == profile)
+                )
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+
+
+def test_an_opaque_vault_secret_in_a_spec_is_found_and_not_stored(
+    queue_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    org, profile = asyncio.run(_new_profile(queue_database_url))
+    key = VaultKey.generate()
+    asyncio.run(_put_secret(queue_database_url, key, org, OPAQUE))
+    monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    monkeypatch.setenv("SAMA_VAULT_KEY", key)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_spec_with(OPAQUE)))
+    try:
+        assert main(["subagents", "set", "--org", str(org), "--profile", str(profile)]) == 1
+        captured = capsys.readouterr()
+        assert "has secret" in captured.err
+        assert OPAQUE not in captured.err + captured.out
+        assert asyncio.run(_stored(queue_database_url, profile)) == []
+    finally:
+        default_redactor().forget(OPAQUE)
+
+
+def test_an_opaque_secret_of_the_environment_is_found(
+    queue_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    org, profile = asyncio.run(_new_profile(queue_database_url))
+    monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    monkeypatch.setenv("SAMA_ALERT_SLACK_WEBHOOK_URL", OPAQUE)
+    monkeypatch.delenv("SAMA_VAULT_KEY", raising=False)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_spec_with(OPAQUE)))
+    try:
+        assert main(["subagents", "set", "--org", str(org), "--profile", str(profile)]) == 1
+        assert "has secret" in capsys.readouterr().err
+    finally:
+        default_redactor().forget(OPAQUE)
+
+
+def test_the_command_stops_when_the_vault_cannot_be_read(
+    queue_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    org, profile = asyncio.run(_new_profile(queue_database_url))
+    key = VaultKey.generate()
+    asyncio.run(_put_secret(queue_database_url, key, org, OPAQUE))
+    monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps([SPEC])))
+    argv = ["subagents", "set", "--org", str(org), "--profile", str(profile)]
+    try:
+        # No key, but the org has a vault entry.
+        monkeypatch.delenv("SAMA_VAULT_KEY", raising=False)
+        with pytest.raises(SystemExit, match="SAMA_VAULT_KEY"):
+            main(argv)
+        # Another key: the entry does not decrypt.
+        monkeypatch.setenv("SAMA_VAULT_KEY", VaultKey.generate())
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps([SPEC])))
+        with pytest.raises(SystemExit, match="vault cannot be read"):
+            main(argv)
+        # The database cannot be reached.
+        monkeypatch.setenv("SAMA_VAULT_KEY", key)
+        monkeypatch.setenv("SAMA_DATABASE_URL", "postgresql://u:pw-not-shown@127.0.0.1:1/db")
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps([SPEC])))
+        with pytest.raises(SystemExit, match="vault cannot be read") as caught:
+            main(argv)
+        assert "pw-not-shown" not in str(caught.value)
+    finally:
+        default_redactor().forget(OPAQUE)
+        monkeypatch.setenv("SAMA_DATABASE_URL", queue_database_url)
+    assert asyncio.run(_stored(queue_database_url, profile)) == []
