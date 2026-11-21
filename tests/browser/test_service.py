@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from sama.browser.cdp import BLOCKED_NOTE
 from sama.browser.service import BrowserService, extract_request, render_tabs
 from sama.browser.target import Act, BrowserError, Tab
 from tests.browser.fakes import AllowAll, DenyHosts, FakeTarget
@@ -105,6 +106,33 @@ async def test_notes_stay_outside_the_untrusted_block(
     text = await service.act(claims, Act(action="reload"), snapshot=False)
     note = "\nNote: a new tab opened and is now the active tab\n<untrusted_content"
     assert note in text
+
+
+async def test_an_action_keeps_its_notes_in_the_default_snapshot(
+    service: BrowserService, target: FakeTarget
+) -> None:
+    claims = make_claims()
+    await service.snapshot(claims)
+    session = target.sessions[0]
+    session.notes = (BLOCKED_NOTE,)
+    session.blocked = ("http://10.0.0.1/admin (a private address)",)
+    text = await service.act(claims, Act(action="click", ref="e1"))  # snapshot=True
+    assert session.calls[-2:] == ["act click e1", "snapshot"]
+    trusted, _, block = text.partition("<untrusted_content")
+    assert f"Note: {BLOCKED_NOTE}" in trusted
+    assert "10.0.0.1" not in trusted  # the URL of the page stays in the block
+    assert "- http://10.0.0.1/admin (a private address)" in block
+    assert "[ref=e1]" in block
+
+
+async def test_open_keeps_the_notes_of_the_navigation(
+    service: BrowserService, target: FakeTarget
+) -> None:
+    claims = make_claims()
+    await service.snapshot(claims)
+    target.sessions[0].notes = ("a new tab opened and is now the active tab",)
+    text = await service.open(claims, "https://example.com/")
+    assert "Note: a new tab opened and is now the active tab" in text
 
 
 async def test_page_text_cannot_close_the_untrusted_block(
@@ -256,6 +284,46 @@ async def test_the_limits_per_org_and_per_process(target: FakeTarget) -> None:
         service.end_run("org-1", "run-1")
         await asyncio.sleep(0.01)
         await service.snapshot(make_claims("run-3"))
+    finally:
+        await service.aclose()
+
+
+async def test_concurrent_starts_cannot_pass_the_limits(target: FakeTarget) -> None:
+    target.gate = asyncio.Event()
+    service = BrowserService(target, AllowAll(), max_sessions_per_org=2, max_sessions=3)
+    try:
+        calls = [service.snapshot(make_claims(f"run-{n}")) for n in range(4)]
+        calls.append(service.snapshot(make_claims("run-9", org="org-2")))
+        calls.append(service.snapshot(make_claims("run-8", org="org-3")))
+        tasks = [asyncio.ensure_future(call) for call in calls]
+        await asyncio.sleep(0.01)  # every call is in target.start or failed
+        target.gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [str(r) for r in results if isinstance(r, BaseException)]
+        assert len(target.starts) == 3
+        assert service.open_sessions() == 3
+        assert sum("the org has 2 open browser sessions" in e for e in errors) == 2
+        assert sum("too many browser sessions" in e for e in errors) == 1
+    finally:
+        await service.aclose()
+
+
+async def test_a_failed_or_cancelled_start_frees_its_place(target: FakeTarget) -> None:
+    service = BrowserService(target, AllowAll(), max_sessions_per_org=1)
+    try:
+        target.gate = asyncio.Event()
+        task = asyncio.ensure_future(service.snapshot(make_claims("run-1")))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        target.gate = None
+        target.fail = BrowserError("Browserbase did not answer")
+        with pytest.raises(BrowserError, match="did not answer"):
+            await service.snapshot(make_claims("run-2"))
+        target.fail = None
+        await service.snapshot(make_claims("run-3"))
+        assert service.open_sessions() == 1
     finally:
         await service.aclose()
 

@@ -17,10 +17,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
 
+from sama.tools.output import untrusted
+
 TargetName = Literal["cloud", "my_chrome"]
 CLOUD: Final = "cloud"
 MY_CHROME: Final = "my_chrome"
 TARGETS: Final = (CLOUD, MY_CHROME)
+UNTRUSTED_SOURCE: Final = "browser"
+"""The ``source`` of the ``untrusted_content`` blocks of the browser tools."""
 
 ActionKind = Literal[
     "click",
@@ -46,7 +50,18 @@ ScrollDirection = Literal["up", "down", "left", "right"]
 
 class BrowserError(Exception):
     """A browser call failed in a way that the agent can fix or report. The message is for the
-    agent."""
+    agent and is fixed text of sama. ``detail`` is text from the page or the browser (an error
+    text, a URL): it goes in an ``untrusted_content`` block, never in the message."""
+
+    def __init__(self, message: str, *, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
+
+    def __str__(self) -> str:
+        if not self.detail:
+            return self.message
+        return f"{self.message}\n{untrusted(self.detail, source=UNTRUSTED_SOURCE)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +98,11 @@ class PageState:
     """The index of the active tab."""
     tabs: int = 1
     notes: tuple[str, ...] = ()
-    """What sama did that the agent must know, for example a blocked navigation or a new tab."""
+    """What sama did that the agent must know, for example a blocked navigation or a new tab.
+    Fixed text of sama only: no text of the page."""
+    blocked: tuple[str, ...] = ()
+    """The URLs that the URL policy blocked since the last state, each with the reason. A page
+    chooses these URLs, so they go in the ``untrusted_content`` block."""
 
 
 @dataclass(frozen=True, slots=True)

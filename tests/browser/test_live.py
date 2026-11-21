@@ -15,9 +15,10 @@ import pytest
 from pydantic import SecretStr
 
 from sama.browser.browserbase import API_URL, BrowserbaseTarget
+from sama.browser.cdp import REDIRECT_BLOCKED
 from sama.browser.contexts import MemoryContextStore
 from sama.browser.guard import UrlGuard
-from sama.browser.target import CLOUD, ExtractRequest
+from sama.browser.target import CLOUD, BrowserError, ExtractRequest
 
 LIVE = os.environ.get("SAMA_LIVE_TESTS") == "1"
 KEY = os.environ.get("BROWSERBASE_API_KEY", "")
@@ -30,6 +31,7 @@ pytestmark = [
 ]
 
 COOKIE_SITE = "https://httpbin.org"
+REDIRECT_URL = os.environ.get("SAMA_LIVE_REDIRECT_URL", "")
 
 
 @pytest.fixture
@@ -99,3 +101,25 @@ async def test_the_persistent_context_keeps_cookies_between_runs(
             break
     assert "kept" in seen, seen
     assert tuple(contexts.rows.values()) == (context_id,)
+
+
+@pytest.mark.skipif(not REDIRECT_URL, reason="set SAMA_LIVE_REDIRECT_URL")
+async def test_a_redirect_to_a_private_address_is_blocked(
+    target: tuple[BrowserbaseTarget, MemoryContextStore],
+) -> None:
+    # Public redirect services refuse a private target, so the test needs a public URL of
+    # your own that answers 302 to http://169.254.169.254/latest/meta-data/.
+    browserbase, _ = target
+    session = await browserbase.start(
+        org_id="org-live", user_id="user-live", run_id="run-live-3", guard=UrlGuard()
+    )
+    blocked = "http://169.254.169.254/latest/meta-data/"
+    try:
+        with pytest.raises(BrowserError) as raised:
+            await session.navigate(REDIRECT_URL)
+        page = await session.navigate("https://example.com/")
+    finally:
+        await session.close()
+    assert raised.value.message == REDIRECT_BLOCKED
+    assert blocked in (raised.value.detail or "")
+    assert page.url == "https://example.com/"

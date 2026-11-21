@@ -12,8 +12,12 @@ The target also has a hard time limit (the Browserbase session ``timeout``), so 
 sama fails to close still ends.
 
 The service renders the results for the agent. Page text, titles, and URLs come from the web, so
-they go in an ``untrusted_content`` block. The notes of sama (a blocked URL, a new tab) stay
-outside the block.
+they go in an ``untrusted_content`` block. The notes of sama (a blocked request, a new tab) are
+fixed text and stay outside the block. The blocked URLs come from the page, so they go in the
+block.
+
+The limits on open sessions count a session from the start of ``target.start``: the service
+reserves the place before the call, so calls at the same time cannot pass the limits.
 """
 
 from __future__ import annotations
@@ -24,11 +28,12 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Final
 
 from sama.browser.target import (
     ACTIONS_WITH_REF,
+    UNTRUSTED_SOURCE,
     Act,
     BrowserError,
     BrowserSession,
@@ -53,13 +58,15 @@ DEFAULT_IDLE_S: Final = 600.0
 REAP_EVERY_S: Final = 30.0
 MAX_SESSIONS_PER_ORG: Final = 5
 MAX_SESSIONS: Final = 20
-SOURCE: Final = "browser"
+SOURCE: Final = UNTRUSTED_SOURCE
 
 
 @dataclass(slots=True)
 class _Live:
     org_id: str
     session: BrowserSession | None = None
+    reserved: bool = False
+    """The entry has a place in the limits: its session is open or starting."""
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     used: float = field(default_factory=time.monotonic)
     ended: bool = False
@@ -96,13 +103,19 @@ class BrowserService:
         has none."""
         live = self._live_of(claims)
         if live.session is None:
+            # Check and reserve with no await between them, so concurrent starts see the place.
             self._check_limits(claims.org_id)
-            live.session = await self.target.start(
-                org_id=claims.org_id,
-                user_id=claims.user_id,
-                run_id=claims.run_id,
-                guard=self.guard,
-            )
+            live.reserved = True
+            try:
+                live.session = await self.target.start(
+                    org_id=claims.org_id,
+                    user_id=claims.user_id,
+                    run_id=claims.run_id,
+                    guard=self.guard,
+                )
+            except BaseException:
+                live.reserved = False
+                raise
             self._start_reaper()
         live.used = self._clock()
         return live, live.session
@@ -118,7 +131,7 @@ class BrowserService:
         return live
 
     def _check_limits(self, org_id: str) -> None:
-        open_sessions = [live for live in self._live.values() if live.session is not None]
+        open_sessions = [live for live in self._live.values() if live.reserved]
         if len(open_sessions) >= self._max:
             raise BrowserError("too many browser sessions are open; try again in a few minutes")
         if sum(1 for live in open_sessions if live.org_id == org_id) >= self._max_per_org:
@@ -147,6 +160,7 @@ class BrowserService:
     async def _close(self, live: _Live) -> None:
         async with live.lock:
             session, live.session = live.session, None
+            live.reserved = False
         if session is not None:
             await session.close()
 
@@ -219,7 +233,7 @@ class BrowserService:
             shot = await session.snapshot() if snapshot else None
         finally:
             self._release(live)
-        return render_snapshot(shot) if shot is not None else render_state(state)
+        return render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
 
     async def snapshot(self, claims: RunTokenClaims) -> str:
         live, session = await self._locked_session(claims)
@@ -240,7 +254,7 @@ class BrowserService:
             shot = await session.snapshot() if snapshot else None
         finally:
             self._release(live)
-        return render_snapshot(shot) if shot is not None else render_state(state)
+        return render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
 
     async def screenshot(
         self, claims: RunTokenClaims, *, full_page: bool = False
@@ -309,8 +323,23 @@ class BrowserService:
 # -- rendering -------------------------------------------------------------------------------
 
 
+def _merged(state: PageState, shot: Snapshot) -> Snapshot:
+    """The snapshot after an action, with the notes and blocked URLs of the action first. The
+    snapshot reads the news of the session again, so without this the news of the action is
+    lost."""
+    notes = state.notes + tuple(note for note in shot.page.notes if note not in state.notes)
+    page = replace(shot.page, notes=notes, blocked=state.blocked + shot.page.blocked)
+    return replace(shot, page=page)
+
+
 def _notes(state: PageState) -> str:
     return "".join(f"\nNote: {note}" for note in state.notes)
+
+
+def _blocked(state: PageState) -> str:
+    if not state.blocked:
+        return ""
+    return "\n\nBlocked by the URL policy:\n" + "\n".join(f"- {url}" for url in state.blocked)
 
 
 def _header(state: PageState) -> str:
@@ -318,7 +347,7 @@ def _header(state: PageState) -> str:
 
 
 def render_state(state: PageState) -> str:
-    page = untrusted(f"Title: {state.title}", source=SOURCE, url=state.url)
+    page = untrusted(f"Title: {state.title}{_blocked(state)}", source=SOURCE, url=state.url)
     return f"{_header(state)}{_notes(state)}\n{page}"
 
 
@@ -326,7 +355,7 @@ def render_snapshot(shot: Snapshot) -> str:
     state = shot.page
     if shot.dialog is not None:
         dialog = untrusted(
-            f"A {shot.dialog.kind} dialog is open: {shot.dialog.message}",
+            f"A {shot.dialog.kind} dialog is open: {shot.dialog.message}{_blocked(state)}",
             source=SOURCE,
             url=state.url,
         )
@@ -334,7 +363,7 @@ def render_snapshot(shot: Snapshot) -> str:
             f"{_header(state)}{_notes(state)}\n{dialog}\n"
             'Answer it with browser_act action="dialog" (accept true or false).'
         )
-    body = f"Title: {state.title}\n\n{shot.tree or '(the page is empty)'}"
+    body = f"Title: {state.title}{_blocked(state)}\n\n{shot.tree or '(the page is empty)'}"
     return (
         f"{_header(state)} Use the [ref=...] values with browser_act; a new snapshot makes "
         f"the old refs invalid.{_notes(state)}\n{untrusted(body, source=SOURCE, url=state.url)}"
@@ -345,13 +374,14 @@ def render_screenshot(shot: Screenshot) -> str:
     state = shot.page
     return (
         f"{_header(state)} A screenshot of {len(shot.data)} bytes ({shot.mime_type}) follows."
-        f"{_notes(state)}\n{untrusted(f'Title: {state.title}', source=SOURCE, url=state.url)}"
+        f"{_notes(state)}\n"
+        f"{untrusted(f'Title: {state.title}{_blocked(state)}', source=SOURCE, url=state.url)}"
     )
 
 
 def render_extracted(result: Extracted) -> str:
     state = result.page
-    body = f"Title: {state.title}\nKind: {result.kind}\n\n{result.content}"
+    body = f"Title: {state.title}{_blocked(state)}\nKind: {result.kind}\n\n{result.content}"
     return f"{_header(state)}{_notes(state)}\n{untrusted(body, source=SOURCE, url=state.url)}"
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,7 +12,8 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from sama.browser.browserbase import BrowserbaseTarget
+from sama.browser.browserbase import NOT_KEPT_NOTE, BrowserbaseTarget, PlaywrightConnector
+from sama.browser.cdp import PlaywrightSession
 from sama.browser.contexts import MemoryContextStore
 from sama.browser.target import CLOUD, BrowserError, TargetName
 from tests.browser.fakes import AllowAll
@@ -43,7 +45,7 @@ class FakeContext:
     def set_default_navigation_timeout(self, ms: float) -> None:
         return None
 
-    async def route(self, pattern: str, handler: Callable[..., Any]) -> None:
+    async def route_web_socket(self, pattern: str, handler: Callable[..., Any]) -> None:
         self.routed = True
 
     def on(self, event: str, callback: Callable[..., Any]) -> None:
@@ -56,9 +58,25 @@ class FakeContext:
 
 
 @dataclass
+class FakeCdp:
+    sent: list[tuple[str, Any]] = field(default_factory=list)
+
+    def on(self, event: str, callback: Callable[..., Any]) -> None:
+        return None
+
+    async def send(self, method: str, params: Any = None) -> dict[str, Any]:
+        self.sent.append((method, params))
+        return {}
+
+
+@dataclass
 class FakeBrowser:
     contexts: list[FakeContext] = field(default_factory=lambda: [FakeContext()])
     closed: bool = False
+    cdp: FakeCdp = field(default_factory=FakeCdp)
+
+    async def new_browser_cdp_session(self) -> FakeCdp:
+        return self.cdp
 
     async def close(self) -> None:
         self.closed = True
@@ -124,18 +142,39 @@ class FakeApi:
         return [(method, path) for method, path, _ in self.requests]
 
 
+class FakeTime:
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.slept: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
 def make_target(
     api: FakeApi,
     connector: FakeConnector,
     contexts: Any = None,
+    time: FakeTime | None = None,
 ) -> BrowserbaseTarget:
+    time = time or FakeTime()
     return BrowserbaseTarget(
         api_key=SecretStr(KEY),
         project_id=PROJECT,
         contexts=contexts if contexts is not None else MemoryContextStore(),
         connector=connector,
         transport=httpx.MockTransport(api.handler),
+        clock=time.clock,
+        sleep=time.sleep,
     )
+
+
+def persist_of(api: FakeApi, index: int) -> Any:
+    return api.requests[index][2]["browserSettings"]["context"]["persist"]
 
 
 async def test_a_private_run_gets_the_persistent_context_of_its_user() -> None:
@@ -154,13 +193,78 @@ async def test_a_private_run_gets_the_persistent_context_of_its_user() -> None:
     assert connector.urls == ["wss://connect/2"]
     assert store.rows == {("org-1", "user-1", "cloud"): "ctx-1"}
     assert connector.browsers[0].contexts[0].routed
+    cdp = connector.browsers[0].cdp
+    assert cdp.sent == [("Fetch.enable", {"patterns": [{"urlPattern": "*"}]})]
 
     # The next run of the user uses the same context.
+    await session.close()
     await target.start(org_id="org-1", user_id="user-1", run_id="run-2", guard=AllowAll())
-    assert api.calls()[2:] == [("POST", "/v1/sessions")]
-    assert api.requests[2][2]["browserSettings"]["context"]["id"] == "ctx-1"
+    assert api.calls()[2:] == [("POST", "/v1/sessions/sess-2"), ("POST", "/v1/sessions")]
+    assert api.requests[3][2]["browserSettings"]["context"] == {"id": "ctx-1", "persist": True}
     await target.aclose()
     assert connector.closed
+
+
+async def test_one_session_at_a_time_writes_a_context() -> None:
+    api, connector, time = FakeApi(), FakeConnector(), FakeTime()
+    target = make_target(api, connector, time=time)
+    first = await target.start(org_id="org-1", user_id="user-1", run_id="run-1", guard=AllowAll())
+    second = await target.start(org_id="org-1", user_id="user-1", run_id="run-2", guard=AllowAll())
+    assert persist_of(api, 1) is True
+    assert persist_of(api, 2) is False  # reads the saved state, writes nothing
+    assert isinstance(second, PlaywrightSession)
+    assert NOT_KEPT_NOTE in second._notes  # the agent reads it with the first state
+    await second.close()  # a reader frees nothing and needs no save time
+    assert time.slept == []
+    await first.close()
+    time.now += 3
+    third = await target.start(org_id="org-1", user_id="user-1", run_id="run-3", guard=AllowAll())
+    assert time.slept == [7.0]  # the rest of the save time of the context
+    assert persist_of(api, -1) is True
+    await third.close()
+    await target.aclose()
+
+
+async def test_a_failed_start_frees_the_context() -> None:
+    api, connector = FakeApi(), FakeConnector(fail=True)
+    target = make_target(api, connector)
+    with pytest.raises(BrowserError, match="did not connect"):
+        await target.start(org_id="org-1", user_id="user-1", run_id="run-1", guard=AllowAll())
+    connector.fail = False
+    await target.start(org_id="org-1", user_id="user-1", run_id="run-2", guard=AllowAll())
+    assert persist_of(api, -1) is True
+    await target.aclose()
+
+
+async def test_concurrent_first_connections_start_one_driver() -> None:
+    started: list[object] = []
+    stopped: list[object] = []
+    gate = asyncio.Event()
+
+    class Chromium:
+        async def connect_over_cdp(self, url: str, **options: float) -> str:
+            return url
+
+    class Driver:
+        chromium = Chromium()
+
+        async def stop(self) -> None:
+            stopped.append(self)
+
+    async def start() -> Any:
+        await gate.wait()
+        driver = Driver()
+        started.append(driver)
+        return driver
+
+    connector = PlaywrightConnector(start=start)
+    calls = [asyncio.ensure_future(connector.connect(f"wss://{n}")) for n in range(3)]
+    await asyncio.sleep(0.01)
+    gate.set()
+    assert [str(b) for b in await asyncio.gather(*calls)] == ["wss://0", "wss://1", "wss://2"]
+    await connector.aclose()
+    assert len(started) == 1
+    assert stopped == started
 
 
 async def test_a_shared_run_gets_a_new_context_that_is_not_kept() -> None:

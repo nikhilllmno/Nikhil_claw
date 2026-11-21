@@ -4513,7 +4513,9 @@ use it. One call at a time uses a session. The service closes the session:
 
 The Browserbase session also has a `timeout` of 15 minutes. This is the hard limit when sama
 does not close a session, for example when the process stops or a run waits for an approval.
-An org has at most 5 live sessions, and a process has at most 20.
+An org has at most 5 live sessions, and a process has at most 20. A start keeps its place in
+the limits before it calls Browserbase, so concurrent starts cannot pass the limits. A failed
+or cancelled start frees its place.
 
 **Persistent context.** A run of a user in a private session uses the Browserbase context of
 that user, with `persist: true`. Browserbase keeps the cookies and the local storage when the
@@ -4522,6 +4524,20 @@ context id, not a secret. When two runs of a user make a context at the same tim
 row wins, and the service deletes the other context. When Browserbase does not know a stored
 context, the service forgets it and makes a new one. A run in a shared session gets a new
 context that is not kept.
+
+Browserbase says that two sessions must not write one context at the same time, and that the
+context needs some seconds to save after a session closes. So a process gives each context to
+one writer at a time:
+
+- The first run of a user gets the context with `persist: true`.
+- A second run of the same user at the same time gets the context with `persist: false`. It
+  reads the saved logins but does not save. Its first result has the note "another run of
+  this user uses the browser profile now, so the logins and cookies of this run are not kept".
+- When the writer closes, the next writer waits until 10 seconds after that close.
+- A failed or cancelled start frees the context.
+
+This coordination is for each process. Two processes can write one context, and then the last
+save wins.
 
 **Tools.**
 
@@ -4536,8 +4552,10 @@ context that is not kept.
 
 All results except the image are text. Page text, titles, and URLs come from the web, so they
 are in an `<untrusted_content source="browser" url="...">` block (Section 16.5). The notes of
-sama (a blocked navigation, a new tab, an open dialog) are outside the block. A page cannot
-close the block early.
+sama (a blocked navigation, a new tab, an open dialog) are outside the block, and they are
+fixed text. An error message of sama is fixed text too. When the error has text from the page
+or from the browser (for example the message of a dialog or a Playwright error), that text is
+in a separate untrusted block after the message. A page cannot close the block early.
 
 **Dialogs.** When an action opens a JavaScript dialog (`alert`, `confirm`, `prompt`), the
 action returns at once with a note. The agent answers with `browser_act(action="dialog",
@@ -5564,18 +5582,27 @@ policy for all of them:
 - **Browser (M5.1).** The browser runs in Browserbase, not in sama, but it acts for the org, so
   `sama.browser.guard.UrlGuard` applies the same address rules (`http` is allowed). The
   service checks the URL of `browser_open` and of a new tab with DNS (`OutboundClient.check`)
-  before the browser opens it. A host that does not resolve is refused. The session routes
-  every request of every page through Playwright:
-  - A navigation request (a link, a form, a redirect hop, a frame) gets the full check with
-    DNS. A blocked request is aborted. The tab goes back to the last page and the result has
-    the note "the URL policy blocked a navigation to ...".
-  - Every other request (images, scripts, `fetch`, WebSocket) gets a quick check without DNS.
-    It refuses a private or loopback IP address, `localhost`, and the metadata hosts, and
-    schemes other than `http`, `https`, `ws`, `wss`, `data`, and `blob`.
+  before the browser opens it. A host that does not resolve is refused. The session opens a
+  CDP session on the whole browser (not on one page) and enables `Fetch` for every URL. Chrome
+  then pauses every request before it goes out, also each redirect hop, the requests of
+  frames in other processes, workers, and popups. Playwright routes do not see redirect hops,
+  so sama does not use them for the policy.
+  - A document request (a tab, a frame, a redirect hop of a document) gets the full check with
+    DNS. A blocked request fails with `BlockedByClient` and does not reach the host. The tab
+    goes back to the last page. A blocked `browser_open` returns an error.
+  - Every other request (images, scripts, `fetch`) gets a quick check without DNS. It refuses
+    a private or loopback IP address, `localhost`, and the metadata hosts, and schemes other
+    than `http`, `https`, `data`, and `blob`.
+  - A WebSocket of a page goes through `route_web_socket` and gets the full check with DNS. A
+    blocked handshake closes with code 1008 and does not reach the host.
+  - The check fails closed: when the check raises an error, the request fails.
+  - The blocked URLs come from the page, so the result shows them in the untrusted block, with
+    a fixed note of sama outside the block.
   - Limits: the browser resolves the host again when it connects, so DNS rebinding is not
     fully stopped. A subresource with a host name that resolves to a private address passes
-    the quick check. Browserbase runs outside our network, so it cannot reach our private
-    addresses. The guard stops the agent from asking it to try. The per-org lists come in M5.3.
+    the quick check. A WebSocket of a worker is not checked. Browserbase runs outside our
+    network, so it cannot reach our private addresses. The guard stops the agent from asking
+    it to try. The per-org lists come in M5.3.
 
 ### 16.5 Untrusted content
 

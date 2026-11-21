@@ -6,8 +6,16 @@ Playwright client only, no browser binaries.
 
 - A snapshot is the accessibility tree of the active tab in the ``ai`` mode of Playwright. Each
   element that an action can use has ``[ref=eN]``. A ref is good until the next snapshot.
-- Each navigation request of a page passes the URL guard. Every other request passes the check
-  without DNS. A blocked navigation becomes a note for the agent.
+- The URL guard sees every request of the browser, also each redirect hop. A browser-level CDP
+  session enables the ``Fetch`` domain, so Chrome pauses each request of each target (tabs,
+  popups, frames in other processes, workers) and each redirect hop until sama answers. A
+  document request passes the full check with DNS. Every other request passes the check
+  without DNS. A blocked request fails before it leaves the browser. (Playwright ``route``
+  sees only the first request of a redirect chain, so sama does not use it.)
+- ``route_web_socket`` checks each WebSocket that a page opens before the handshake. The
+  WebSockets of workers do not pass this check.
+- A blocked navigation becomes a note for the agent. The blocked URL comes from the page, so it
+  goes in the untrusted block, not in the note.
 - A JavaScript dialog stays open until ``act`` with ``action="dialog"``. An action that opens a
   dialog returns when the dialog opens, and it ends after the answer. While the dialog is open,
   the snapshot shows the dialog and the other actions fail with a clear error.
@@ -50,10 +58,10 @@ if TYPE_CHECKING:
     from playwright.async_api import (
         Browser,
         BrowserContext,
+        CDPSession,
         Locator,
         Page,
-        Request,
-        Route,
+        WebSocketRoute,
     )
     from playwright.async_api import (
         Dialog as PlaywrightDialog,
@@ -80,6 +88,18 @@ MAX_SCREENSHOT_HEIGHT: Final = 6_000
 """A full-page screenshot stops at this height. A model cannot read a very tall image."""
 SCREENSHOT_QUALITY: Final = 70
 MAX_ERROR_CHARS: Final = 300
+MAX_BLOCKED: Final = 10
+"""The most blocked URLs that one state reports."""
+DOCUMENT: Final = "Document"
+"""The CDP resource type of a navigation request (a tab or a frame)."""
+WS_CLOSE_POLICY: Final = 1008
+BLOCKED_NOTE: Final = (
+    "the URL policy blocked a request of the page; the blocked URLs are in the untrusted block"
+)
+REDIRECT_BLOCKED: Final = (
+    "the URL policy blocked the navigation (for example a redirect to a blocked address); the "
+    "page did not open"
+)
 
 _LINKS_JS: Final = """(root, limit) => {
   const out = [];
@@ -125,6 +145,13 @@ def _ignore_result(task: asyncio.Future[object]) -> None:
         task.exception()
 
 
+def _http_url(url: str) -> str:
+    """The http form of a WebSocket URL, for the URL guard."""
+    scheme, sep, rest = url.partition(":")
+    mapped = {"ws": "http", "wss": "https"}.get(scheme.lower())
+    return f"{mapped}{sep}{rest}" if mapped else url
+
+
 def _short(error: Exception) -> str:
     """The first line of a Playwright error, without the call log."""
     text = str(getattr(error, "message", None) or error).strip().splitlines()
@@ -157,6 +184,10 @@ class PlaywrightSession:
         self._notes: list[str] = []
         self._blocked = False
         """A navigation was blocked since the last state."""
+        self._blocked_urls: list[str] = []
+        """The blocked URLs since the last state, each with the reason. Text of the page."""
+        self._cdp: CDPSession | None = None
+        self._checks: set[asyncio.Task[None]] = set()
         self._closed = False
 
     @classmethod
@@ -167,14 +198,20 @@ class PlaywrightSession:
         *,
         target: TargetName,
         on_close: Callable[[], Awaitable[None]] | None = None,
+        notes: tuple[str, ...] = (),
     ) -> PlaywrightSession:
         """Uses the first context of the browser (the persistent context of a Browserbase
-        session), or a new one."""
+        session), or a new one. ``notes`` go to the agent with the first state."""
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         session = cls(browser, context, guard, target=target, on_close=on_close)
+        session._notes.extend(notes)
         context.set_default_timeout(ACTION_TIMEOUT_MS)
         context.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
-        await context.route("**/*", session._route)
+        cdp = await browser.new_browser_cdp_session()
+        session._cdp = cdp
+        cdp.on("Fetch.requestPaused", session._on_paused)
+        await cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*"}]})
+        await context.route_web_socket("**/*", session._route_web_socket)
         context.on("page", session._on_page)
         for page in context.pages:
             session._watch(page)
@@ -209,9 +246,21 @@ class PlaywrightSession:
             pages = self._context.pages
             self._active = pages[-1] if pages else None
 
-    async def _route(self, route: Route, request: Request) -> None:
-        url = request.url
-        navigation = request.is_navigation_request()
+    def _on_paused(self, event: dict[str, Any]) -> None:
+        """Chrome paused a request (or a redirect hop) of a target. sama must answer each one,
+        so the check runs as a task."""
+        task = asyncio.get_running_loop().create_task(self._check_paused(event))
+        self._checks.add(task)
+        task.add_done_callback(self._checks.discard)
+
+    async def _check_paused(self, event: dict[str, Any]) -> None:
+        cdp = self._cdp
+        request_id = event.get("requestId")
+        if cdp is None or not isinstance(request_id, str):
+            return
+        request = event.get("request") or {}
+        url = str(request.get("url", ""))
+        navigation = event.get("resourceType") == DOCUMENT
         try:
             if navigation:
                 await self._guard.check(url)
@@ -219,15 +268,33 @@ class PlaywrightSession:
                 problem = self._guard.quick_problem(url)
                 if problem is not None:
                     raise BlockedUrlError(problem)
-        except BlockedUrlError as error:
+        except Exception as error:  # the check fails closed
+            reason = str(error) if isinstance(error, BlockedUrlError) else "the check failed"
             if navigation:
                 self._blocked = True
-                self._notes.append(f"the URL policy blocked a navigation to {url}: {error}")
-            with contextlib.suppress(PlaywrightError):
-                await route.abort("blockedbyclient")
+                self._block(url, reason)
+            with contextlib.suppress(Exception):
+                await cdp.send(
+                    "Fetch.failRequest", {"requestId": request_id, "errorReason": "BlockedByClient"}
+                )
             return
-        with contextlib.suppress(PlaywrightError):
-            await route.fallback()
+        with contextlib.suppress(Exception):
+            await cdp.send("Fetch.continueRequest", {"requestId": request_id})
+
+    async def _route_web_socket(self, ws: WebSocketRoute) -> None:
+        try:
+            await self._guard.check(_http_url(ws.url))
+        except Exception as error:  # the check fails closed
+            reason = str(error) if isinstance(error, BlockedUrlError) else "the check failed"
+            self._block(ws.url, reason)
+            with contextlib.suppress(PlaywrightError):
+                await ws.close(code=WS_CLOSE_POLICY, reason="blocked by the URL policy")
+            return
+        ws.connect_to_server()
+
+    def _block(self, url: str, reason: str) -> None:
+        if len(self._blocked_urls) < MAX_BLOCKED:
+            self._blocked_urls.append(f"{url[:500]} ({reason[:MAX_ERROR_CHARS]})")
 
     # -- helpers -----------------------------------------------------------------------------
 
@@ -253,7 +320,10 @@ class PlaywrightSession:
             try:
                 await self._guard.check(url)
             except BlockedUrlError as error:
-                self._notes.append(f"the URL policy blocked {url}: {error}; the tab is now blank")
+                self._block(url, str(error))
+                self._notes.append(
+                    "the URL policy blocked the address of the tab; the tab is blank"
+                )
                 with contextlib.suppress(PlaywrightError):
                     await page.goto(BLANK)
         title = ""
@@ -262,9 +332,14 @@ class PlaywrightSession:
                 title = await asyncio.wait_for(page.title(), timeout=ACTION_TIMEOUT_MS / 1000)
         pages = self._context.pages
         index = pages.index(page) if page in pages else 0
-        notes = tuple(self._notes)
+        if self._blocked_urls and BLOCKED_NOTE not in self._notes:
+            self._notes.append(BLOCKED_NOTE)
+        notes, blocked = tuple(self._notes), tuple(self._blocked_urls)
         self._notes.clear()
-        return PageState(url=page.url, title=title, tab=index, tabs=len(pages), notes=notes)
+        self._blocked_urls.clear()
+        return PageState(
+            url=page.url, title=title, tab=index, tabs=len(pages), notes=notes, blocked=blocked
+        )
 
     async def _leave_error_page(self, page: Page) -> None:
         """After a blocked navigation, goes back to the page before it. Another error page (a
@@ -325,8 +400,8 @@ class PlaywrightSession:
         dialog = self._dialog_of(page)
         if dialog is not None:
             raise BrowserError(
-                f"a {dialog.type} dialog is open ({dialog.message[:200]!r}); accept or dismiss "
-                'it first with browser_act action="dialog"'
+                f"a {dialog.type} dialog is open; take a snapshot to read it, then accept or "
+                'dismiss it with browser_act action="dialog"'
             )
 
     # -- the session -------------------------------------------------------------------------
@@ -339,11 +414,20 @@ class PlaywrightSession:
         except PlaywrightTimeoutError:
             self._notes.append("the page did not finish loading in 30 seconds")
         except PlaywrightError as error:
-            blocked = [note for note in self._notes if "URL policy" in note]
-            if blocked:
+            if self._blocked_urls:
+                detail = "\n".join(self._blocked_urls)
+                self._blocked_urls.clear()
                 self._notes.clear()
-                raise BlockedUrlError(blocked[0]) from None
-            raise BrowserError(f"the page did not open: {_short(error)}") from None
+                # Chrome shows its error page for the blocked request. Wait for it, so it does
+                # not stop the next navigation.
+                with contextlib.suppress(PlaywrightError):
+                    await page.wait_for_url(f"{ERROR_PAGE}**", timeout=SETTLE_TIMEOUT_MS)
+                if page.url.startswith(ERROR_PAGE):
+                    await self._leave_error_page(page)
+                self._blocked = False
+                self._notes.clear()
+                raise BrowserError(REDIRECT_BLOCKED, detail=detail) from None
+            raise BrowserError("the page did not open", detail=_short(error)) from None
         return await self._state(page)
 
     async def snapshot(self) -> Snapshot:
@@ -355,7 +439,7 @@ class PlaywrightSession:
         try:
             tree = await page.aria_snapshot(mode="ai")
         except PlaywrightError as error:
-            raise BrowserError(f"the snapshot failed: {_short(error)}") from None
+            raise BrowserError("the snapshot failed", detail=_short(error)) from None
         return Snapshot(page=await self._state(page), tree=tree)
 
     async def act(self, act: Act) -> PageState:
@@ -371,7 +455,7 @@ class PlaywrightSession:
                 "or disabled. Take a new snapshot."
             ) from None
         except PlaywrightError as error:
-            raise BrowserError(f"the {act.action} failed: {_short(error)}") from None
+            raise BrowserError(f"the {act.action} failed", detail=_short(error)) from None
         if self._dialog_of(page) is None:
             if _opens_pages(act):
                 await asyncio.sleep(SETTLE_DELAY_S)
@@ -435,7 +519,7 @@ class PlaywrightSession:
             else:
                 await dialog.dismiss()
         except PlaywrightError as error:
-            raise BrowserError(f"the dialog did not close: {_short(error)}") from None
+            raise BrowserError("the dialog did not close", detail=_short(error)) from None
         await self._finish_pending()
         await self._settle(page)
         return await self._state(await self._page())
@@ -461,7 +545,7 @@ class PlaywrightSession:
             else:
                 data = await page.screenshot(type="jpeg", quality=SCREENSHOT_QUALITY)
         except PlaywrightError as error:
-            raise BrowserError(f"the screenshot failed: {_short(error)}") from None
+            raise BrowserError("the screenshot failed", detail=_short(error)) from None
         return Screenshot(page=await self._state(page), data=data, mime_type="image/jpeg")
 
     async def extract(self, request: ExtractRequest) -> Extracted:
@@ -470,7 +554,7 @@ class PlaywrightSession:
         try:
             content = await self._extract(page, request)
         except PlaywrightError as error:
-            raise BrowserError(f"the extract failed: {_short(error)}") from None
+            raise BrowserError("the extract failed", detail=_short(error)) from None
         return Extracted(page=await self._state(page), kind=request.kind, content=content)
 
     async def _extract(self, page: Page, request: ExtractRequest) -> str:
@@ -539,6 +623,8 @@ class PlaywrightSession:
         self._closed = True
         if self._pending is not None:
             self._pending.cancel()
+        for task in list(self._checks):
+            task.cancel()
         try:
             async with asyncio.timeout(CLOSE_TIMEOUT_S):
                 await self._browser.close()

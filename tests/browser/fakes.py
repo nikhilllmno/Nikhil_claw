@@ -63,6 +63,7 @@ class FakeSession:
     gate: asyncio.Event | None = None
     """When set, ``snapshot`` waits for it, so a test can hold the lock of the session."""
     notes: tuple[str, ...] = ()
+    blocked: tuple[str, ...] = ()
 
     @property
     def target(self) -> TargetName:
@@ -70,7 +71,10 @@ class FakeSession:
 
     def _state(self) -> PageState:
         notes, self.notes = self.notes, ()
-        return PageState(url=self.url, title=self.title, tab=0, tabs=1, notes=notes)
+        blocked, self.blocked = self.blocked, ()
+        return PageState(
+            url=self.url, title=self.title, tab=0, tabs=1, notes=notes, blocked=blocked
+        )
 
     async def navigate(self, url: str) -> PageState:
         self.calls.append(f"navigate {url}")
@@ -111,6 +115,8 @@ class FakeTarget:
     starts: list[tuple[str, str | None, str]] = field(default_factory=list)
     closed: bool = False
     fail: Exception | None = None
+    gate: asyncio.Event | None = None
+    """When set, ``start`` waits for it, so a test can run starts at the same time."""
 
     @property
     def name(self) -> TargetName:
@@ -119,6 +125,8 @@ class FakeTarget:
     async def start(
         self, *, org_id: str, user_id: str | None, run_id: str, guard: NavigationGuard
     ) -> FakeSession:
+        if self.gate is not None:
+            await self.gate.wait()
         if self.fail is not None:
             raise self.fail
         self.starts.append((org_id, user_id, run_id))
