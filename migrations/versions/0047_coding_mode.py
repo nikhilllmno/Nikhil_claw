@@ -14,7 +14,7 @@ tool only stores a plan that a person decides, so it adds no risk. A session wit
 snapshot gets it from the next session (Section 11.4).
 
 Revision ID: 0047
-Revises: 0045
+Revises: 0046
 Create Date: 2026-11-21
 """
 
@@ -24,7 +24,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0047"
-down_revision: str | None = "0045"
+down_revision: str | None = "0046"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

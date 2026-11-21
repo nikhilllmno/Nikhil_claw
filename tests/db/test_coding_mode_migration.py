@@ -47,7 +47,7 @@ def test_the_upgrade_adds_the_tables_with_rls_and_the_downgrade_removes_them() -
         for table in TABLES:
             assert _policies(url, table) == [f"{table}_select"]
         config = alembic_config(url)
-        command.downgrade(config, "0045")
+        command.downgrade(config, "0046")
         assert "plan_mode" not in _columns(url, "sessions")
         for table in TABLES:
             assert _columns(url, table) == set()
