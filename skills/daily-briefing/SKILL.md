@@ -20,12 +20,13 @@ the news about X", "a daily summary of Y", or "a Monday digest".
    - where the briefing goes: this chat, or another channel.
 2. Write the job prompt. The job runs with no person and does not see this chat, so the
    prompt must stand alone. Put in it the topics, the length, the format, and these rules:
-   use `web_search` and `web_extract`, give a link for each item, skip items older than the
-   last briefing, and say "nothing new" when there is nothing new.
+   use `web_search` and `web_extract`, give a link for each item, skip items that an earlier
+   briefing gave, and say "nothing new" when there is nothing new.
 3. Call `cronjob_manage` with `action: preview`, the schedule, and the time zone. Show the
    next fire times to the user.
 4. When the user agrees, call `cronjob_manage` with `action: create`, a short name, the
-   schedule, the time zone, the prompt, and the deliver target.
+   schedule, the time zone, the prompt, the deliver target, and `attach_to_session: true`, so
+   that each run sees the briefings before it.
 5. Offer a test: `cronjob_manage` with `action: run` fires the job once now.
 
 ## Rules

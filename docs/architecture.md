@@ -1747,10 +1747,16 @@ cover the categories of the Hermes bundled skills (docs/feature-map.md, Section 
 - A skill that writes outside the sandbox (an email, an event, a form, a post) tells the
   agent to show the change to the user first. The gate still asks for an approval where the
   policy says `ask`.
+- A skill that makes a scheduled job (Section 12.1) for a watch or a digest sets
+  `attach_to_session`, so that each run sees the answers of the runs before. It tells the user
+  that each run sends its answer, because a job cannot stay silent unless `deliver` is `none`.
+- A skill that sends data to a public service follows the usage policy of that service. For
+  example, `maps` does not send a private address to Nominatim.
 - The test `tests/skills/test_builtin_library.py` runs on each folder. It checks the lint and
   the injection scan, the secret scan of the redactor, a category tag, a version of the form
-  `x.y.z`, the sections, the tool names against `sama.gate.decide.TOOLSETS`, that the skill
-  hides when a required toolset is missing, and that `/<name>` starts it.
+  `x.y.z`, the sections, and the tool names in code font and in calls against
+  `sama.gate.decide.TOOLSETS`. It also checks that the skill hides when a required toolset is
+  missing, and that `/<name>` starts it.
 - In a profile with all toolsets, the index lines of these skills have about 4,300 characters
   in total. The index has a limit of 200 skills.
 

@@ -24,8 +24,9 @@ products, people in public roles, or a topic, now and on a schedule.
    happened, why it matters to the user, and the link. Group items by name.
 5. When the user agrees, schedule it. Write a job prompt that stands alone: the watch list,
    the exclusions, the material events, the format, and the rule "report only events since
-   the last digest; send 'nothing material' when there are none". Call `cronjob_manage` with
-   `action: preview`, then `action: create`.
+   the last digest; answer 'nothing material' when there are none". Call `cronjob_manage`
+   with `action: preview`, then `action: create` with `attach_to_session: true`. Then each run
+   uses the same session and sees the digests that it sent before.
 
 ## Rules
 

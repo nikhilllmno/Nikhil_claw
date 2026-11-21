@@ -26,8 +26,9 @@ Use this skill when the user asks you to go through their email: "what needs my 
    - read later: newsletters, reports, and updates,
    - ignore: promotions and automatic notices.
 5. For each "act now" thread, give one line: who, what they want, and by when.
-6. Draft replies only for the threads that the user picks. Save each one as a draft with the
-   draft tool. Show the draft text in the chat.
+6. Draft replies only for the threads that the user picks. Show each draft in the chat first:
+   the recipients, the subject, and the text. Save it as a Gmail draft with the draft tool only
+   after the user agrees.
 
 ## Rules
 
