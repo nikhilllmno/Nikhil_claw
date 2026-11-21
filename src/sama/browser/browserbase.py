@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     from playwright.async_api import Browser, Playwright
 
 log = logging.getLogger("sama.browser")
+VIEWPORT: Final = {"width": 1280, "height": 720}
+"""The viewport of a session, in CSS pixels. Without it, a Browserbase session of this project
+has a 2560x1440 viewport. A model sees a smaller image better (Claude Code scales an image
+wider than 2000 pixels down), and its screenshots cost fewer tokens (vision mode, M5.2)."""
 
 API_URL: Final = "https://api.browserbase.com"
 API_TIMEOUT_S: Final = 30.0
@@ -315,7 +319,11 @@ class BrowserbaseTarget:
         }
         # No recording and no logs at Browserbase by default: a recording can show a page with a
         # login, and a log can keep a form body with a password (M5.3).
-        settings: dict[str, Any] = {"recordSession": self._record, "logSession": self._record}
+        settings: dict[str, Any] = {
+            "recordSession": self._record,
+            "logSession": self._record,
+            "viewport": dict(VIEWPORT),
+        }
         if context_id is not None:
             settings["context"] = {"id": context_id, "persist": persist}
         payload["browserSettings"] = settings
