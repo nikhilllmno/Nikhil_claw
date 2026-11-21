@@ -86,6 +86,7 @@ from sama.media.images import (
     is_image,
     with_markers,
 )
+from sama.orchestrator.checkpoints import CheckpointService, checkpoint_reply
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.review.apply import ReviewApplier
 from sama.scheduler.jobs import JobService
@@ -113,6 +114,8 @@ HELP: Final = (
     "/handoff <telegram|slack|web> - move this session to another channel\n"
     "/model - show the agent profiles. /model <name> starts a new session with that profile\n"
     "/compact [focus] - make the context of this session shorter\n"
+    "/undo - restore the session files to before the last run that changed them\n"
+    "/rollback - list the checkpoints of the session files. /rollback <number> restores one\n"
     "/pin <text> - keep a text in the context. /pins lists the pins. /unpin <number> removes one\n"
     "/pair <code> - link this account, or link a group with a group code\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
@@ -138,6 +141,8 @@ OWN_COMMANDS: Final = frozenset(
         "/cron",
         "/steer",
         "/handoff",
+        "/undo",
+        "/rollback",
     }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
@@ -307,6 +312,7 @@ class TelegramGateway:
         pins: PinStore | None = None,
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
+        checkpoints: CheckpointService | None = None,
     ) -> None:
         """``lockout`` and ``followers`` can be shared by the gateways of all bots, so that
         the limits hold for the whole process."""
@@ -321,6 +327,7 @@ class TelegramGateway:
         self._reviews = reviews
         self._connections = connections
         self._handoffs = handoffs
+        self._checkpoints = checkpoints
         self._pins = pins or PinStore(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
@@ -529,6 +536,23 @@ class TelegramGateway:
             return False
         await self._say(chat_id, STEERED, reply_to=message_id)
         return True
+
+    async def _checkpoint(
+        self, chat_id: int, name: str, rest: str, target: Target, grants: Grants
+    ) -> str:
+        """``/undo`` and ``/rollback``: the checkpoints of the session files of a direct chat
+        (Section 15.3)."""
+        if target.audience != "private":
+            return "Checkpoints work in a direct chat with sama."
+        current = await self._session(chat_id, target, grants, create=False)
+        return await checkpoint_reply(
+            self._checkpoints,
+            org_id=target.org_id,
+            user_id=target.user_id,
+            session_id=None if current is None else current.session_id,
+            name=name,
+            rest=rest,
+        )
 
     async def _handoff(self, chat_id: int, to: str, target: Target, grants: Grants) -> str:
         """``/handoff``: moves the session of a direct chat (Section 11.1)."""
@@ -819,6 +843,9 @@ class TelegramGateway:
             await self._say(chat_id, answer, reply_to=message_id)
         elif command == "/connect":
             answer = connect_answer(self._connections, target, grants, rest)
+            await self._say(chat_id, answer, reply_to=message_id)
+        elif command in ("/undo", "/rollback"):
+            answer = await self._checkpoint(chat_id, command[1:], rest, target, grants)
             await self._say(chat_id, answer, reply_to=message_id)
         else:
             await self._say(chat_id, HELP, reply_to=message_id)

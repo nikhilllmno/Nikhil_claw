@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { applyStreamEvent, initialLive, isPaused, openRunIds, parseCommand, parseCompact, sessionTitle } from "./chat";
+import {
+  applyStreamEvent,
+  checkpointListText,
+  initialLive,
+  isPaused,
+  NO_CHECKPOINTS,
+  openRunIds,
+  parseCommand,
+  parseCompact,
+  sessionTitle,
+} from "./chat";
 
 const run = (id: string, status: string, message: string | null = null) => ({
   run_id: id,
@@ -236,10 +246,42 @@ describe("parseCommand", () => {
     expect(parseCommand("/handoff slack now")).toBeNull();
   });
 
+  it("reads the checkpoint commands", () => {
+    expect(parseCommand(" /undo ")).toEqual({ kind: "undo" });
+    expect(parseCommand("/rollback")).toEqual({ kind: "rollback", number: null, valid: true });
+    expect(parseCommand("/Rollback 2")).toEqual({ kind: "rollback", number: 2, valid: true });
+    expect(parseCommand("/rollback two")).toEqual({ kind: "rollback", number: null, valid: false });
+    expect(parseCommand("/rollback 0")).toEqual({ kind: "rollback", number: null, valid: false });
+    expect(parseCommand("/rollback 2 3")).toBeNull();
+    expect(parseCommand("/undo it")).toBeNull();
+  });
+
   it("treats other text as a normal message", () => {
     expect(parseCommand("hello")).toBeNull();
     expect(parseCommand("/steering wheel")).toBeNull();
     expect(parseCommand("/stop now")).toBeNull();
     expect(parseCommand("please /steer")).toBeNull();
+  });
+});
+
+describe("checkpointListText", () => {
+  it("lists the checkpoints in UTC, newest first", () => {
+    expect(
+      checkpointListText([
+        { number: 1, created_at: "2026-11-21T09:30:12+00:00", tool: "", kind: "rollback" },
+        { number: 2, created_at: "2026-11-21T15:00:00+05:30", tool: "Bash", kind: "tool" },
+      ]),
+    ).toBe(
+      [
+        "Checkpoints of the session files, newest first:",
+        "1. 2026-11-21 09:30 UTC - the files before a restore",
+        "2. 2026-11-21 09:30 UTC - before Bash",
+        "Send /rollback NUMBER to restore one. /undo restores the files before the last run.",
+      ].join("\n"),
+    );
+  });
+
+  it("says when there are no checkpoints", () => {
+    expect(checkpointListText([])).toBe(NO_CHECKPOINTS);
   });
 });

@@ -39,6 +39,7 @@ from typing import IO, Any, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
+from sama.runtime.checkpoints import CheckpointGate, Checkpoints
 from sama.runtime.contract import (
     AgentRuntime,
     ContractViolation,
@@ -221,6 +222,8 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
         gate = RemoteGate(job.gate_url, token, steer=kind is RuntimeKind.CLAUDE_AGENT_SDK)
     else:
         gate = StaticGate(job.gate)
+    # A snapshot of the work folder before each call that can change files (Section 15.3).
+    gate = CheckpointGate(gate, Checkpoints(workdir))
 
     if kind is RuntimeKind.OPENAI_AGENTS_SDK:
         from sama.runtime.openai_agents import OpenAIRuntime, OpenAISettings

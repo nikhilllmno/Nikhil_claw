@@ -203,6 +203,23 @@ export interface Handoff {
   text: string;
 }
 
+/** A checkpoint of the session files (`GET /sessions/{id}/checkpoints`). */
+export interface CheckpointItem {
+  number: number;
+  created_at: string;
+  tool: string;
+  kind: string;
+}
+
+/** The answer of `POST /sessions/{id}/undo` and `/rollback`. */
+export interface Restored {
+  created_at: string;
+  files: number;
+  deleted: number;
+  /** The answer for the user. */
+  text: string;
+}
+
 export interface Approval {
   id: string;
   run_id: string;
@@ -1142,6 +1159,10 @@ export class ApiClient {
     this.json<Steered>(`/sessions/${id}/steer`, { method: "POST", body: { text } });
   handoff = (id: string, to: string) =>
     this.json<Handoff>(`/sessions/${id}/handoff`, { method: "POST", body: { to } });
+  listCheckpoints = (id: string) => this.json<CheckpointItem[]>(`/sessions/${id}/checkpoints`);
+  undo = (id: string) => this.json<Restored>(`/sessions/${id}/undo`, { method: "POST" });
+  rollback = (id: string, number: number) =>
+    this.json<Restored>(`/sessions/${id}/rollback`, { method: "POST", body: { number } });
   compact = (id: string, focus: string) =>
     this.json<{ run_id: string }>(`/sessions/${id}/compact`, { method: "POST", body: { focus } });
   cancelRun = (runId: string) => this.json<{ status: string }>(`/runs/${runId}/cancel`, { method: "POST" });

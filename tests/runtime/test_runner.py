@@ -28,6 +28,7 @@ from sama.runtime import (
     run_event_adapter,
     validate_event_stream,
 )
+from sama.runtime.checkpoints import CheckpointGate
 from sama.runtime.fake import FakeScript
 from sama.runtime.runner import (
     FORBIDDEN_ENV,
@@ -256,7 +257,11 @@ def test_the_claude_runtime_gets_the_remote_gate(tmp_path: object) -> None:
     )
     job = RunnerJob(op="run", run=request, gate_url="http://tools:8001/gate")
     runtime = build_runtime(job, {**ENV, "SAMA_WORKDIR": str(tmp_path)})
-    gate = runtime._gate  # type: ignore[attr-defined]
+    checkpoints = runtime._gate  # type: ignore[attr-defined]
+    # A checkpoint gate wraps the gate: a snapshot comes before each file change (M6.4).
+    assert isinstance(checkpoints, CheckpointGate)
+    assert checkpoints._checkpoints.workdir == str(tmp_path)
+    gate = checkpoints._inner
     assert isinstance(gate, RemoteGate)
     assert "http://tools:8001/gate" in repr(gate)
     assert gate._steer  # the Claude runtime takes the notes of /steer
@@ -321,10 +326,12 @@ def test_the_openai_runtime_uses_the_control_plane_for_items_and_the_proxy_for_m
     assert isinstance(items, RemoteSessionItems)
     assert "http://t/session-items" in repr(items)
     assert "token-1" not in repr(items)
-    assert isinstance(runtime._gate, RemoteGate)  # type: ignore[attr-defined]
+    gate = runtime._gate  # type: ignore[attr-defined]
+    assert isinstance(gate, CheckpointGate)
+    assert isinstance(gate._inner, RemoteGate)
     # The OpenAI runtime cannot give the notes of /steer to the model in a run, so it does not
     # take them. The notes go to the session after the run completes.
-    assert not runtime._gate._steer  # type: ignore[attr-defined]
+    assert not gate._inner._steer
     assert not runtime.capabilities().mid_run_steer
     assert isinstance(runtime._archiver, RemoteArchiver)  # type: ignore[attr-defined]
 

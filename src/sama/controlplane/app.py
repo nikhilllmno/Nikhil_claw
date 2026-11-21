@@ -64,6 +64,7 @@ from sama.observability.alerts import ErrorRateAlerter, SlackWebhook
 from sama.observability.langfuse import LangfuseClient
 from sama.observability.traces import TraceExporter
 from sama.orchestrator import PostgresSandboxDirectory, RunQueue, Worker
+from sama.orchestrator.checkpoints import CheckpointService
 from sama.orchestrator.references import ReferenceExpander
 from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
@@ -387,6 +388,8 @@ def build(
         ledger=ledger,
     )
     handoffs = Handoffs(engine, web_url=settings.web_base)
+    # /undo and /rollback restore the files of the session sandbox (Section 15.3).
+    checkpoints = CheckpointService(engine, sandboxed.session_sandbox) if sandboxed else None
     hub = (
         TelegramHub(
             engine,
@@ -398,6 +401,7 @@ def build(
             connections=connections,
             jobs=jobs,
             handoffs=handoffs,
+            checkpoints=checkpoints,
         )
         if vault is not None
         else None
@@ -412,6 +416,7 @@ def build(
             connections=connections,
             jobs=jobs,
             handoffs=handoffs,
+            checkpoints=checkpoints,
         )
         if vault is not None
         else None
@@ -468,6 +473,7 @@ def build(
         search=sessions,
         workflows=workflows,
         handoffs=handoffs,
+        checkpoints=checkpoints,
     )
     api_app = api.app()
     tools_app = tools.app()

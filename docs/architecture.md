@@ -567,7 +567,7 @@ RunEvent = (
 | Compaction | Native auto-compaction. The `PreCompact` hook gives the full transcript to the sama archive first. `/compact [focus]` is a CLI slash command that the adapter sends for a compact request (M2.6, Section 6.3). | The `Compaction` capability turns on server-side compaction. A manual compaction calls `POST /responses/compact` and replaces the items. The adapter archives the dropped items first, so it sets `manual_compaction` and `compaction_archive` (M3.6). |
 | Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with the `Shell` capability (`exec_command`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
 | Limits | `max_turns`, `max_budget_usd`, `task_budget` | `max_turns`; sama budget in the model proxy |
-| Checkpoints | `enable_file_checkpointing` and `rewind_files()` | Sama git snapshot of the workspace (Section 15.3) |
+| Checkpoints | Sama git snapshot of the work folder (Section 15.3). Sama does not use `enable_file_checkpointing`: it covers only the file tools and not `Bash`, and it does not work for the second runtime. | Sama git snapshot of the work folder (Section 15.3) |
 | Tracing | Control-plane trace from the stored rows (Section 18.2) | Control-plane trace from the stored rows (Section 18.2) |
 | Main risks | CLI subprocess and Node in the image. Fast option changes. Claude models only. | Fast-moving API surface (`SandboxAgent` is new). OpenAI models only. |
 
@@ -2943,8 +2943,8 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 4. **Outbound**: stream the reply (edit one message as text arrives), send files and images,
    and split long text by the channel's limits.
 5. **Controls**: render approval cards and `clarify` questions as buttons, and map slash
-   commands (`/new`, `/stop`, `/steer`, `/handoff`, `/resume`, `/model`, `/skills`, `/memory`,
-   `/cron`, `/approve`, `/deny`, `/<skill-name>`). A skill command changes the text of the
+   commands (`/new`, `/stop`, `/steer`, `/handoff`, `/undo`, `/rollback`, `/resume`, `/model`,
+   `/skills`, `/memory`, `/cron`, `/approve`, `/deny`, `/<skill-name>`). A skill command changes the text of the
    message (Section 9.5).
 
 **Busy controls and handoff (M3.9).** The queue, `/stop`, and `/steer` are in Section 4.3. Each
@@ -2956,6 +2956,8 @@ channel shows them in the same way:
 | Stop | `/stop` | `/sama stop` | `/stop` in the composer, or the Stop button. |
 | Steer | `/steer TEXT` | `/sama steer TEXT` in a direct message. In a thread, a mention with `/steer TEXT`, because a Slack command has no thread. | `/steer TEXT` in the composer (`POST /sessions/{id}/steer`). |
 | Handoff | `/handoff slack` or `/handoff web` in the direct chat | `/sama handoff telegram` or `/sama handoff web` in a direct message | `/handoff telegram` or `/handoff slack` in the composer (`POST /sessions/{id}/handoff`). |
+| Undo (M6.4) | `/undo` in the direct chat | `/sama undo` in a direct message | `/undo` in the composer (`POST /sessions/{id}/undo`). |
+| Rollback (M6.4) | `/rollback` lists the checkpoints and `/rollback NUMBER` restores one, in the direct chat | `/sama rollback [NUMBER]` in a direct message | `/rollback [NUMBER]` in the composer (`GET /sessions/{id}/checkpoints`, `POST /sessions/{id}/rollback`). |
 
 A chat follower that follows a run also follows the new run when the notes of the run are
 requeued (Section 4.3), so the answer to a late note comes in the same chat.
@@ -3113,6 +3115,9 @@ cross-org check of Section 17.1 through the API.
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `409` for an archived session. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
+| `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
+| `POST /sessions/{id}/undo` | Restore the session files to before the last run that changed them (`200` with `created_at`, `files`, `deleted`, and `text`). `409` with the reason when the session has an open run, no sandbox, or nothing to undo (Section 15.3, M6.4). |
+| `POST /sessions/{id}/rollback` | Restore the checkpoint `number` (1 is the newest) of `GET /sessions/{id}/checkpoints`. The answer and the `409` reasons are the same as for `undo` (Section 15.3, M6.4). |
 | `POST /sessions/{id}/compact` | Queue a `/compact` run (`202` with `run_id`). The body is optional: `focus`, at most 6,000 characters. `409` if the session is busy, not active, or has nothing to compact. `429` over a rate limit (Section 6.3, M2.6). |
 | `GET /sessions/{id}/compactions` | The compactions of the session, newest first: `trigger`, token counts, the archive session, `completed_at`. |
 | `GET /sessions/{id}/lineage` | The ancestors and the children of the session. A linked session that the user cannot read is not in the answer. |
@@ -3385,7 +3390,9 @@ commands. Since M2.6, `/compact [focus]` makes the context of the session shorte
 the busy rule of Section 6.3 and answers with the token counts), and `/pin <text>`, `/pins`,
 and `/unpin <number>` manage the context pins. They work in direct chats and in linked groups.
 Since M3.9, `/steer <text>` adds a note to the open run, and `/handoff slack` or `/handoff web`
-moves a private session from the direct chat (Section 11.1).
+moves a private session from the direct chat (Section 11.1). Since M6.4, `/undo` and
+`/rollback [number]` restore the session files from a checkpoint. They work only in a direct
+chat (Section 15.3).
 
 **Outbound.** For each run the gateway reads the run status and then the new `run_events`.
 Text deltas go into one reply message that the gateway edits at most once in 1.5 seconds.
@@ -4820,10 +4827,72 @@ Residual risks:
 
 ### 15.3 Checkpoints
 
-Before file changes in a session workspace, sama takes a git snapshot in a shadow repository
-inside the sandbox (Hermes checkpoints), or uses Claude file checkpointing. `/undo` and
-`/rollback` are channel commands for the user, not model tools, so the agent cannot roll
-back the user's view of its own work.
+Since M6.4, sama takes a snapshot of the session files before each tool call that can change
+them. The user can restore a snapshot with `/undo` or `/rollback`. These are channel commands
+for the user, not model tools, so the agent cannot roll back the user's view of its own work.
+The idea comes from Hermes checkpoints. Sama does not copy Hermes code.
+
+**Shadow repository.** `sama.runtime.checkpoints.Checkpoints` keeps a git repository in
+`.sama/checkpoints` of the work folder (`/home/user/work`). The work folder has no `.git` of
+sama: the shadow repository uses `GIT_DIR` and `GIT_WORK_TREE`, a clean environment, no
+global or system git configuration, and its own index. A snapshot is a commit on the ref
+`refs/sama/checkpoints`. The commit message keeps the run id, the tool name, and the kind
+(`tool` or `rollback`). Git stores each file content once, so a snapshot of files that did not
+change costs little. The first snapshot of a small folder takes about 15 ms.
+
+**What a snapshot has.** The files and the symbolic links of the work folder, with the
+executable bit. Files in a nested git repository (for example a `repo_clone`) are normal
+files of the snapshot. A snapshot does not have:
+
+- the folders `.git`, `.hg`, `.svn`, `.sama`, `node_modules`, `.venv`, `venv`, `__pycache__`,
+  `.cache`, and the caches of mypy, pytest, ruff, and tox,
+- files larger than 10 MiB.
+
+If the work folder has more than 50,000 files, sama takes no snapshot and logs a warning.
+A restore does not change the files that a snapshot does not have.
+
+**When.** The runner wraps its tool gate in `CheckpointGate`. For each tool call with the
+decision `allow` or `ask`, the wrapper takes a snapshot before the call runs. A snapshot
+at `ask` covers the call that a human approves later. The tools are `Bash` (and
+`exec_command` of the second runtime, which the gate sees as `Bash`), `Write`, `Edit`,
+`MultiEdit`, `NotebookEdit`, `repo_clone`, and `execute_code`. A snapshot is not taken for a
+`deny`, for tools that only read, or when the files are the same as in the last snapshot of
+the same run. Thus a run gets a new checkpoint only after it changed files. A failed
+snapshot logs a warning and does not stop the tool call. The design works the same in both
+runtimes, because it is in the gate and not in an adapter (Section 5.3).
+
+**Restore.** The control plane runs `python -m sama.runtime.checkpoints` in the session
+sandbox (`sama.orchestrator.checkpoints.CheckpointService`). The command prints one JSON
+line. A restore:
+
+1. refuses when the session has an open run. The runner also holds `.sama/runner.lock`, and
+   a restore waits at most 10 seconds for it.
+2. takes a `rollback` checkpoint of the current files first, so that the user can go back with
+   `/rollback 1`.
+3. deletes the files that are not in the target snapshot, and writes the files of the target
+   snapshot.
+
+The control plane writes the audit entry `session.undo` or `session.rollback` with the commit
+and the counts of files.
+
+**Commands.**
+
+- `/rollback` lists the last 10 checkpoints, newest first, with the time in UTC and the tool.
+  `/rollback NUMBER` restores that checkpoint.
+- `/undo` restores the files to before the last run that changed them. A second `/undo`
+  goes back one more run. A run that did not change the files is skipped. This is not the
+  conversation undo of Hermes: the messages of the session do not change.
+
+The commands work in a Telegram direct chat, a Slack direct message, and the web composer
+(Section 11.1). The HTTP routes are in Section 11.4. The commands need the session sandbox,
+so the standalone gateway (without a sandbox) answers that checkpoints are not available.
+Sama does not delete old checkpoints. They live as long as the session sandbox. A deploy that
+changes the template makes a new sandbox, and the work folder with its checkpoints does not
+stay (Section 16.2). The commands also answer that checkpoints are not available when the
+session has no sandbox yet, or when its sandbox is from an old template.
+
+**Limits.** The agent can change or delete `.sama/checkpoints` with `Bash`. Checkpoints are a
+help for the user, not a security control.
 
 ---
 

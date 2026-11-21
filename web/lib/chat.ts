@@ -1,7 +1,13 @@
 // The live state of one chat session, built from the event stream
 // (`GET /sessions/{id}/events`). The functions here are pure, so tests can run them.
 
-import { OPEN_RUN_STATUSES, type RunEventPayload, type RunsEvent, type StreamRun } from "./api";
+import {
+  type CheckpointItem,
+  OPEN_RUN_STATUSES,
+  type RunEventPayload,
+  type RunsEvent,
+  type StreamRun,
+} from "./api";
 
 export interface ToolCall {
   callId: string;
@@ -176,6 +182,8 @@ export type ChatCommand =
   | { kind: "compact"; focus: string }
   | { kind: "steer"; note: string }
   | { kind: "handoff"; to: HandoffChannel | null }
+  | { kind: "undo" }
+  | { kind: "rollback"; number: number | null; valid: boolean }
   | { kind: "stop" };
 
 /**
@@ -196,9 +204,40 @@ export function parseCommand(text: string): ChatCommand | null {
       to: (HANDOFF_CHANNELS as readonly string[]).includes(to) ? (to as HandoffChannel) : null,
     };
   }
+  if (/^\/undo$/i.test(trimmed)) return { kind: "undo" };
+  const rollback = /^\/rollback(?:\s+(\S*))?\s*$/i.exec(trimmed);
+  if (rollback) {
+    // `/rollback` without a number lists the checkpoints (M6.4).
+    const value = rollback[1] ?? "";
+    if (!value) return { kind: "rollback", number: null, valid: true };
+    const valid = /^[1-9]\d{0,5}$/.test(value);
+    return { kind: "rollback", number: valid ? Number(value) : null, valid };
+  }
   if (/^\/stop$/i.test(trimmed)) return { kind: "stop" };
   return null;
 }
+
+/** The time of a checkpoint in UTC, for example `2026-11-21 09:30 UTC`. */
+export function checkpointStamp(createdAt: string): string {
+  return `${new Date(createdAt).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+/** The text of `/rollback` without a number: the checkpoints, newest first. */
+export function checkpointListText(items: CheckpointItem[]): string {
+  if (items.length === 0) return NO_CHECKPOINTS;
+  const lines = items.map((item) => {
+    const what = item.kind === "rollback" ? "the files before a restore" : `before ${item.tool}`;
+    return `${item.number}. ${checkpointStamp(item.created_at)} - ${what}`;
+  });
+  return [
+    "Checkpoints of the session files, newest first:",
+    ...lines,
+    "Send /rollback NUMBER to restore one. /undo restores the files before the last run.",
+  ].join("\n");
+}
+
+export const NO_CHECKPOINTS = "This session has no checkpoints yet.";
+export const ROLLBACK_USAGE = "Write the number of a checkpoint, for example: /rollback 2";
 
 /** The text that the chat shows when a message waits behind an open run. */
 export const QUEUED_NOTICE =

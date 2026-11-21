@@ -137,6 +137,13 @@ from sama.memory import (
 )
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
+from sama.orchestrator.checkpoints import (
+    LIST_LIMIT,
+    MAX_LIST_LIMIT,
+    CheckpointService,
+    CheckpointServiceError,
+    restored_text,
+)
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
 from sama.profiles import (
@@ -150,6 +157,7 @@ from sama.profiles import (
 )
 from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
+from sama.runtime.checkpoints import MAX_HISTORY
 from sama.runtime.contract import MAX_COMPACT_FOCUS_CHARS, RuntimeKind
 from sama.scheduler.jobs import Actor as JobActor
 from sama.scheduler.jobs import JobService
@@ -265,6 +273,27 @@ class Handoff(_Body):
 
 class HandoffOut(BaseModel):
     to_channel: str
+    text: str
+    """The answer for the user."""
+
+
+class Rollback(_Body):
+    number: int = Field(ge=1, le=MAX_HISTORY)
+    """The number of a checkpoint in ``GET /sessions/{id}/checkpoints``. 1 is the newest."""
+
+
+class CheckpointOut(BaseModel):
+    number: int
+    created_at: datetime
+    tool: str
+    kind: str
+
+
+class RestoreOut(BaseModel):
+    created_at: datetime
+    """The time of the checkpoint that the files are now equal to."""
+    files: int
+    deleted: int
     text: str
     """The answer for the user."""
 
@@ -892,10 +921,12 @@ class SamaApi:
         workflows: WorkflowService | None = None,
         handoffs: Handoffs | None = None,
         orgs: OrgService | None = None,
+        checkpoints: CheckpointService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
-        ``409``. Without ``connections`` the connection routes answer ``409``. Without
+        ``409``, and without ``checkpoints`` the checkpoint routes answer ``409``. Without
+        ``connections`` the connection routes answer ``409``. Without
         ``jobs``, the job routes answer ``409``, and without ``workflows``, the workflow routes
         answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
@@ -909,6 +940,7 @@ class SamaApi:
         self._connections = connections
         self._triggers = triggers
         self._handoffs = handoffs
+        self._checkpoints = checkpoints
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -1055,6 +1087,22 @@ class SamaApi:
         @app.post("/sessions/{session_id}/handoff")
         async def handoff(principal: Me, session_id: uuid.UUID, body: Handoff) -> HandoffOut:
             return await self._handoff(principal, session_id, body.to)
+
+        @app.get("/sessions/{session_id}/checkpoints")
+        async def checkpoints(
+            principal: Me,
+            session_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=MAX_LIST_LIMIT)] = LIST_LIMIT,
+        ) -> list[CheckpointOut]:
+            return await self._checkpoint_list(principal, session_id, limit)
+
+        @app.post("/sessions/{session_id}/undo")
+        async def undo(principal: Me, session_id: uuid.UUID) -> RestoreOut:
+            return await self._restore(principal, session_id, None)
+
+        @app.post("/sessions/{session_id}/rollback")
+        async def rollback(principal: Me, session_id: uuid.UUID, body: Rollback) -> RestoreOut:
+            return await self._restore(principal, session_id, body.number)
 
         @app.post("/sessions/{session_id}/compact", status_code=202)
         async def compact(
@@ -2878,6 +2926,51 @@ class SamaApi:
         except HandoffError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         return HandoffOut(to_channel=moved.to_channel, text=moved.text)
+
+    def _checkpoint_service(self) -> CheckpointService:
+        if self._checkpoints is None:
+            raise HTTPException(status_code=409, detail="checkpoints are not configured")
+        return self._checkpoints
+
+    async def _checkpoint_list(
+        self, principal: Principal, session_id: uuid.UUID, limit: int
+    ) -> list[CheckpointOut]:
+        """``GET /sessions/{id}/checkpoints``: the checkpoints of the session files, newest
+        first (M6.4, Section 15.3)."""
+        access = await self._access(principal, session_id)
+        service = self._checkpoint_service()
+        try:
+            listed = await service.listing(org_id=access.org_id, session_id=session_id, limit=limit)
+        except CheckpointServiceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return [CheckpointOut.model_validate(item, from_attributes=True) for item in listed]
+
+    async def _restore(
+        self, principal: Principal, session_id: uuid.UUID, number: int | None
+    ) -> RestoreOut:
+        """``POST /sessions/{id}/undo`` and ``/rollback`` (M6.4, Section 15.3)."""
+        access = await self._access(principal, session_id)
+        service = self._checkpoint_service()
+        try:
+            if number is None:
+                restored = await service.undo(
+                    org_id=access.org_id, user_id=access.user_id, session_id=session_id
+                )
+            else:
+                restored = await service.rollback(
+                    org_id=access.org_id,
+                    user_id=access.user_id,
+                    session_id=session_id,
+                    number=number,
+                )
+        except CheckpointServiceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return RestoreOut(
+            created_at=restored.created_at,
+            files=restored.files,
+            deleted=restored.deleted,
+            text=restored_text(restored, "/rollback"),
+        )
 
     async def _access(self, principal: Principal, session_id: uuid.UUID) -> SessionAccess:
         async with as_user(self._engine, principal.auth_user_id) as connection:
