@@ -1,8 +1,8 @@
 ---
 name: meeting-notes
 description: Turn a meeting transcript into notes and actions
-version: 1.0.0
-tags: [meetings, notes]
+version: 1.0.1
+tags: [notes, productivity, meetings]
 ---
 
 # Meeting notes
