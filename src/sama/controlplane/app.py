@@ -12,6 +12,8 @@ Paths:
   ``/slack/<integration id>/{events,interactions,commands}``.
 - ``/tools``: the tool server. The sandbox runner uses ``/tools/mcp`` and ``/tools/gate``.
 - ``/model``: the model proxy. The runner uses ``/model/anthropic`` and ``/model/openai``.
+- ``/v1`` and ``/mcp``: sama as a server for other agents (Section 10.7): the
+  OpenAI-compatible endpoint and the MCP server. An org API key is the bearer.
 """
 
 from __future__ import annotations
@@ -29,11 +31,12 @@ from typing import Protocol
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
-from starlette.routing import Mount
+from starlette.routing import Mount, Route
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
 from sama.api.browser import BrowserSettings
+from sama.apikeys import ApiKeyStore
 from sama.billing import BillingService, StripeClient
 from sama.browser.browserbase import BrowserbaseTarget
 from sama.browser.chrome import AuthUsers, ChromeTarget
@@ -100,6 +103,8 @@ from sama.scheduler.delivery import Deliverer, EmailConfig, Sender
 from sama.scheduler.jobs import JobService
 from sama.scheduler.service import Scheduler
 from sama.search import EmbedWorker, OpenAIEmbedder, SessionSearch
+from sama.server import OpenAICompat, SamaMcpServer, ServerCore
+from sama.server.mcp import MCP_PATH as SERVER_MCP_PATH
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
 from sama.skills.importer import SkillImporter
 from sama.tasks.dispatcher import TaskDispatcher
@@ -609,6 +614,13 @@ def build(
     )
     api_app = api.app()
     tools_app = tools.app()
+    # Sama as a server (Section 10.7): the OpenAI-compatible endpoint and the MCP server for
+    # other agents. Both take an org API key and use the same queue, gate, and budgets.
+    api_keys = ApiKeyStore(engine)
+    core = ServerCore(engine, queue=queue, search=sessions, skills=library, workflows=workflows)
+    OpenAICompat(core, api_keys).install(api_app)
+    agents = SamaMcpServer(core, api_keys)
+    agents_app = agents.app()
 
     if hub is not None:
         api_app.include_router(hub.router())
@@ -631,6 +643,7 @@ def build(
                 stack.push_async_callback(_close_sandboxes, sandboxed)
             await stack.enter_async_context(proxy_app.router.lifespan_context(proxy_app))
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
+            await stack.enter_async_context(agents_app.router.lifespan_context(agents_app))
             stack.push_async_callback(connections.aclose)
             if model_keys is not None:
                 stack.push_async_callback(model_keys.aclose)
@@ -682,7 +695,12 @@ def build(
             )
             yield
 
-    routes = [Mount("/tools", app=tools_app), Mount("/model", app=proxy_app)]
+    routes = [
+        Mount("/tools", app=tools_app),
+        Mount("/model", app=proxy_app),
+        # The MCP app routes the path itself, so a ``Route`` (not a ``Mount``) keeps ``/mcp``.
+        Route(SERVER_MCP_PATH, endpoint=agents.guarded(agents_app)),
+    ]
     if github is not None and upstream is not None:
         routes.append(Mount("/git", app=GitProxy(signer, github, upstream).app()))
     app = Starlette(

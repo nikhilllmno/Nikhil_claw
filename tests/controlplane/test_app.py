@@ -14,13 +14,13 @@ import httpx
 import pytest
 import uvicorn
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.connectors.manifest import Catalog
 from sama.controlplane import ControlPlane, ControlPlaneSettings, build
 from sama.controlplane.server import DrainingServer
-from sama.db.models import Run
+from sama.db.models import Membership, Run
 from sama.github.client import GitHubAppConfig
 from sama.runtime.contract import RunCompleted, RuntimeKind, TextDelta, Usage
 from sama.runtime.fake import FakeRuntime, FakeScript
@@ -118,6 +118,45 @@ async def test_a_message_runs_to_the_end_in_the_process(
         )
         assert response.status_code == 202
         await until(lambda: _is(engine, response.json()["run_id"], "completed"))
+
+
+async def test_an_api_key_reaches_the_agent_through_v1_and_mcp(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """Sama as a server (Section 10.7): the process serves ``/v1`` and ``/mcp`` with a key."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(Membership.user_id == tenant.ids["mia"], Membership.workspace_id.is_(None))
+            .values(role="admin")
+        )
+    async with running(fake_plane(engine)) as client:
+        assert (await client.get("/v1/models")).status_code == 401
+        assert (await client.post("/mcp", json={})).status_code == 401
+        made = await client.post(
+            f"/orgs/{tenant.org}/api-keys",
+            headers=bearer(tenant.ids["mia_auth"]),
+            json={"name": "ci", "workspace_id": str(tenant.ids["ws"])},
+        )
+        assert made.status_code == 201
+        key = {"Authorization": f"Bearer {made.json()['key']}"}
+        models = await client.get("/v1/models", headers=key)
+        assert [model["id"] for model in models.json()["data"]] == ["p"]
+        answer = await client.post(
+            "/v1/chat/completions",
+            headers=key,
+            json={"model": "p", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["choices"][0]["message"]["role"] == "assistant"
+        listed = await client.post(
+            "/mcp",
+            headers={**key, "accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert listed.status_code == 200, listed.text
+        names = {tool["name"] for tool in listed.json()["result"]["tools"]}
+        assert {"send_message", "session_read", "workflow_run"} <= names
 
 
 async def test_the_runner_reaches_the_process_by_its_public_url(

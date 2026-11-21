@@ -211,6 +211,13 @@ GENERATED_MEDIA_KINDS: Final = ("image", "audio")
 GENERATED_MEDIA_MIME_TYPES: Final = ("image/png", "audio/ogg")
 """PNG images of ``image_generate`` and Ogg Opus voice notes of ``text_to_speech``."""
 MAX_GENERATED_MEDIA_BYTES: Final = 10 * 1024 * 1024
+API_KEY_SCOPES: Final = ("chat", "mcp")
+"""What an org API key can call (Section 10.7): ``chat`` is the OpenAI-compatible endpoint
+and ``mcp`` is the sama MCP server for other agents."""
+API_KEY_APPROVALS: Final = ("deny", "pending")
+"""What an ``ask`` tool call does in a run of an API key (Section 10.7): ``deny`` makes the run
+unattended, so the gate denies the call. ``pending`` pauses the run until a person decides the
+approval in the web app."""
 SEARCH_VECTOR_CHARS: Final = 100_000
 """The full-text index covers the first characters of a message. A ``tsvector`` has a limit of
 1 MB, so the index must not take an unlimited text."""
@@ -2981,3 +2988,55 @@ class BrowserUrlPolicy(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class ApiKey(Base):
+    """An org API key for sama as a server (docs/architecture.md, Section 10.7, M7.6).
+
+    The key acts as ``user_id`` (the org admin who made it) in one workspace. Only the SHA-256
+    hash of the key is here. Org admins read the rows of their org, but not ``key_hash``. Only
+    the control plane writes the table."""
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["org_id", "revoked_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 80", name="name_length"),
+        CheckConstraint("octet_length(key_hash) = 32", name="key_hash_length"),
+        CheckConstraint(
+            "cardinality(scopes) BETWEEN 1 AND 2 AND scopes <@ ARRAY['chat', 'mcp']::text[]",
+            name="scopes",
+        ),
+        CheckConstraint(_one_of("approvals", API_KEY_APPROVALS), name="approvals"),
+        Index(None, "org_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The user that the key acts as: the org admin who made it."""
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The workspace of the sessions of the key."""
+    agent_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The only agent profile of the key, or null for each profile of the workspace."""
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    prefix: Mapped[str] = mapped_column(Text, nullable=False)
+    """The first characters of the key, to recognise it in a list. Not a secret."""
+    key_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, unique=True)
+    scopes: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    approvals: Mapped[str] = mapped_column(Text, nullable=False, server_default="deny")
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

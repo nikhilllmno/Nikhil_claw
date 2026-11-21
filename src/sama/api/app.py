@@ -61,6 +61,7 @@ from sama.api.admin import (
     OrgUsage,
     OrgViews,
 )
+from sama.api.apikeys import router as api_keys_router
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.billing import router as billing_router
 from sama.api.browser import BrowserSettings, LoginChange, LoginIn, UrlPolicyIn
@@ -100,6 +101,7 @@ from sama.api.tasks import (
     TaskOut,
     TaskStatus,
 )
+from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
 from sama.coding.agents import CodingAgent
 from sama.coding.commands import parse_command, set_direct
@@ -1164,6 +1166,7 @@ class SamaApi:
         settings routes answer ``409``."""
         self._engine = engine
         self._browser = browser
+        self._api_keys = ApiKeyStore(engine)
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._github = github
@@ -1295,6 +1298,7 @@ class SamaApi:
 
         app.include_router(org_router(self._org_service, _principal))
         app.include_router(billing_router(self._billing, _principal))
+        app.include_router(api_keys_router(self._api_keys, _principal, self._org_admin))
 
         @app.get("/me")
         async def me(principal: Me) -> dict[str, Any]:

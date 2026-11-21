@@ -240,7 +240,7 @@ flowchart LR
 
 | Component | Responsibility |
 |---|---|
-| **API** | Auth (Supabase JWT, API keys for services), REST and streaming endpoints, admin endpoints for profiles, skills, memory, jobs, workflows, and connections. The only holder of the database service key. |
+| **API** | Auth (Supabase JWT, org API keys for `/v1` and `/mcp` (Section 10.7)), REST and streaming endpoints, admin endpoints for profiles, skills, memory, jobs, workflows, and connections. The only holder of the database service key. |
 | **Channel gateway** | Receives Slack, Telegram, and extension events. Checks pairing and access. Maps each chat or thread to a user, an agent profile, and a session. Streams replies, renders approval cards, and handles slash commands. Also routes `my_chrome` browser actions to the right extension connection. |
 | **Run orchestrator** | Queues runs in Postgres with leases, one active run per session (Section 4.3). Enforces per-org concurrency, budgets, and rate limits. Creates or resumes the session sandbox, starts the runner, streams events, and handles cancel, timeout, crashed workers, and resume after approval. |
 | **Scheduler** | Fires cron jobs and one-time jobs. Receives webhooks and Composio triggers. Creates runs or workflow instances. One leader at a time through a Postgres lease. |
@@ -3015,11 +3015,129 @@ The command gives one IPv4 and one IPv6 address for the region. Add a region for
 that runs Machines. Then add the addresses to this table and to the database setup help.
 `fly ips release-egress` releases them.
 
-### 10.7 Sama as an MCP server (later)
+### 10.7 Sama as a server: MCP server and OpenAI-compatible endpoint (M7.6)
 
-Hermes can expose its own tools as an MCP server. Sama can expose an agent profile as a
-remote MCP server later, so that other agents (for example Claude Code or Cursor) can call
-sama tools and skills with an org token. This is not planned for M1 to M6.
+Other agents and apps can use sama. The control plane has two entry points for them:
+
+- `/mcp`: the sama MCP server for other agents (for example Claude Code, Cursor, or an OpenAI
+  agent). It speaks streamable HTTP without MCP sessions (stateless, JSON responses).
+- `/v1`: an OpenAI-compatible endpoint. `POST /v1/chat/completions` (also as a stream) and
+  `GET /v1/models`, `GET /v1/models/{id}`.
+
+Both take an **org API key** as the bearer. They are not the tool server of the runs
+(`/tools/mcp`, Section 16.7), which takes run tokens. The code is in `src/sama/apikeys/` and
+`src/sama/server/`.
+
+**Org API keys.** An org owner or admin manages the keys in the web app (Admin, API keys) or
+with the API (Section 11.4).
+
+- A key acts as the admin who made it (`user_id`), in one workspace (`workspace_id`). An
+  optional `agent_profile_id` limits the key to one agent profile. Else the key can use each
+  profile of the org (no workspace) or of its workspace.
+- `scopes` is `chat` (the `/v1` routes), `mcp` (the `/mcp` server), or both.
+- `approvals` is `deny` (the default) or `pending` (below).
+- `expires_in_days` is 1 to 365, or no expiry. An org has at most 50 keys that are active
+  (not revoked and not expired).
+- The key has the form `sama_sk_<43 characters>`. The API shows it one time, in the answer
+  of the create. The table `api_keys` keeps only the SHA-256 hash (`key_hash`) and the first 12
+  characters (`prefix`). Org admins read the rows through the Data API, but not `key_hash`
+  (column grants, as for `org_invites`). Only the control plane writes the table.
+- The redactor knows the form `sama_sk_...`, so a key that a person pastes in a message, a
+  log, or a trace becomes `[REDACTED]` (Section 16.3).
+- A create and a revoke write the audit entries `api_key.created` and `api_key.revoked`. A
+  revoke applies at the next request.
+- Each request checks the key again: it exists, it is not revoked or expired, it has the
+  scope, the region of the org is served here, and its user is still an org owner or admin.
+  When the admin leaves the org or loses the role, the key stops. One answer (`401`, "the API
+  key is not valid") covers each failed check, so a caller does not learn whether a key
+  exists. `last_used_at` changes at most once a minute.
+
+**The same guards.** A request with a key goes through the same code as a request of the user
+in the web app:
+
+- Reads use the session rules of the user (code and RLS, Section 11.4), and the key sees only
+  the sessions of its workspace with its profiles. Any other session gives `404`.
+- A message goes through `RunQueue.enqueue` as the user of the key: the message rate, the
+  quotas of the plan (Section 17.5), and the budget of the profile apply.
+- Each tool call of the run goes through the tool gate (Section 16.1): the toolsets, the
+  hardline list, the org, profile, and user policy rules.
+- **Approvals.** A key with `approvals = deny` makes unattended runs (`runs.unattended`): the
+  gate turns `ask` into `deny` (D13). A key with `approvals = pending` makes attended runs: a
+  tool call that needs an approval pauses the run, and the approval card shows in the session
+  in the web app. Only a person decides it there. The caller sees the status `paused` and the
+  tool that waits. A caller can never approve a call.
+- A new session of a key is a private session of the key user, in the key workspace. The user
+  sees it in the web app. The audit entry `session.created` has `channel` `api` or `mcp` and
+  `api_key_id`.
+
+**OpenAI-compatible endpoint.**
+
+- `GET /v1/models` lists the agent profiles of the key. The model id is the profile name when
+  no other profile of the list has the same name (in any case), else the profile id. The
+  entries also have `sama_profile_id` and `sama_profile_name`.
+- `POST /v1/chat/completions` reads `model`, `messages`, `stream`, and
+  `stream_options.include_usage`. Other fields are allowed and sama does not use them: the
+  agent uses its own tools, so sama ignores `tools`, `tool_choice`, and the sampling settings.
+  `model` is a model id of `/v1/models`, a profile name in any case, a profile id, or `sama`
+  (or none) for the first profile of the key.
+- Only text content is accepted (`400` `unsupported_content` for an image part). The last
+  message must have the role `user`. The body has at most 512 KB and 200 messages.
+- **Session mapping.** The header `X-Sama-Session-Id` (or the body field `session_id`, for
+  example with `extra_body` of the OpenAI SDK) names a session that the key can use. Then
+  only the last user message goes to the session: the session has the earlier messages.
+  Without it, sama makes a new session. The system and developer messages and the earlier
+  messages of the request go into the first user message, with user trust. They are not in
+  the sama system prompt. The message has at most 32,000 characters
+  (`400` `context_length_exceeded`). Each answer has the headers `X-Sama-Session-Id` and
+  `X-Sama-Run-Id`, and the body has `sama.session_id` and `sama.run_id`. A client sends the
+  session id again to continue the conversation.
+- The answer is in the form of the OpenAI API: `id` is `chatcmpl-<run id>`, the content is
+  the stored answer of the run, and `usage` is the sum of the model calls of the run
+  (`prompt_tokens` has the cache tokens). A stream sends one `chat.completion.chunk` for each
+  text delta of the run, then the end chunk with `finish_reason` `stop`, a usage chunk when
+  `include_usage` is true, and `data: [DONE]`. A comment line (`: ping`) goes at least every
+  15 seconds.
+- A request without `stream` waits up to 20 seconds for a normal answer. A longer run gets
+  status `200` at once, then a space every 15 seconds (JSON allows spaces before the value),
+  then the body. The Fly proxy closes a connection with no bytes for 60 seconds, so this
+  keeps it open. A request waits at most 30 minutes; the run goes on in the session after it.
+- Errors have the OpenAI form `{"error": {"message", "type", "param", "code"}}`: `401`
+  `invalid_api_key`, `404` `model_not_found` or `session_not_found`, `429`
+  `rate_limit_exceeded` (with `Retry-After`) or `insufficient_quota` (a quota of the plan),
+  `409` `session_not_active`, `502` with the failure code of the run (for example
+  `budget_exceeded`), `409` `run_cancelled`, and `504` `run_timeout`. After the answer
+  started, or in a stream, the error is in the body or in a `data:` event.
+- One process lets at most 200 requests wait for runs at one time, and one key at most 16
+  (`429`). The answer gives its place back in a `finally` when it ends, also when the client
+  goes away or a send fails. A streamed answer ends at most 60 seconds after the wait limit.
+
+**MCP server for other agents.** The tools give JSON text. Each tool call checks the key
+again. A tool call waits at most 45 seconds, because a stateless MCP answer sends no byte
+before it ends. A longer run gives its `run_id`, and the client asks again with `run_get`.
+
+| Tool | What it does |
+|---|---|
+| `agents_list()` | The agent profiles of the key, with the name to use as `agent`. |
+| `send_message(text, session_id, agent, wait_s)` | Starts a run: a message to a session of the key, or to a new session with the agent. Waits up to `wait_s` (default 30, at most 45) and gives the reply, or the `run_id`, the status, and the approval that the run waits for. |
+| `run_get(run_id, wait_s)` | The status and the reply of a run of the key. |
+| `session_read(session_id, after_seq, limit)` | The user and assistant messages of a session, oldest first, at most 50, each cut at 8,000 characters. |
+| `session_search(query, limit)` | The sessions of the key workspace that the user sees (Section 7.1). A key for one agent profile finds only the sessions of that profile. |
+| `skills_list()` | The skills that the user sees in the key workspace (Section 9.2). |
+| `workflows_list()`, `workflow_run(workflow_id, inputs)`, `workflow_get(instance_id)` | The workflows of the key user in the key workspace (Section 12.3). A version that waits for a human approval does not start. A key for one agent profile cannot use these tools (`403`), because an agent step can name another profile. |
+
+A request without a valid key gets `401` before MCP reads it. The MCP check of the `Host`
+header is off, as in the tool server: a browser cannot add the key. The tool text is redacted
+with the secrets of the vault.
+
+**Data controls.** `api_keys` has `org_id` and an RLS policy. An org export has the keys
+without `key_hash`. A user export has the keys that the user made or revoked. A user delete
+removes the keys of the user (`ON DELETE CASCADE`); `revoked_by_user_id` becomes null. An org
+delete removes all keys (Section 17.4).
+
+**Not in M7.6.** The keys do not open the other routes of the HTTP API. A key has no budget
+of its own: the budget of the profile and the quotas of the org apply. Images and caller tools
+are not supported in `/v1/chat/completions`. The MCP server has no OAuth sign-in: a client
+sends the key in a header.
 
 ---
 
@@ -3203,6 +3321,7 @@ cross-org check of Section 17.1 through the API.
 | `POST /orgs` | Make an org with the user as the owner (`201`). `403` when sign-up is closed, the email is not confirmed, or the domain is blocked. `429` over a rate limit (Section 17.2). |
 | `GET /orgs/{org_id}/members`, `PATCH`, `DELETE /orgs/{org_id}/members/{user_id}` | The members of the org. `PATCH` changes `role` or `workspace_ids` (an admin). `DELETE` removes a member (an admin) or leaves the org (the user). `409` for the last owner (Section 17.2). |
 | `GET`, `POST /orgs/{org_id}/invites`, `DELETE /orgs/{org_id}/invites/{invite_id}` | The invites of the org, for an admin. `POST` takes `email`, `role`, and `workspace_id`, and gives the token one time (`201`). `429` over the plan caps (Section 17.2). |
+| `GET`, `POST /orgs/{org_id}/api-keys`, `DELETE /orgs/{org_id}/api-keys/{key_id}` | The org API keys of sama as a server, for an org admin (`403` for a member). `POST` takes `name`, `workspace_id`, `agent_profile_id`, `scopes`, `approvals`, and `expires_in_days`, and gives the key one time (`201`). `DELETE` revokes the key (`204`). `409` over 50 active keys (Section 10.7). |
 | `GET /billing/plans` | The price list: the free and paid plans, their prices, included usage, and quotas, and `billing_enabled`. No sign-in (Section 17.5). |
 | `GET /orgs/{org_id}/billing` | The plan, the subscription, the usage of the period, and the quotas of the org, for an org admin (`403` for a member). |
 | `POST /orgs/{org_id}/billing/checkout`, `PUT /orgs/{org_id}/billing/plan`, `POST /orgs/{org_id}/billing/portal` | An org admin starts Stripe Checkout for `pro` or `business` (`url` to open), changes the paid plan (Stripe prorates), or opens the Stripe customer portal. `409` when billing is off, for the `team` plan, or for a wrong state. `422` for a plan that is not for sale. `502` or `503` when Stripe does not answer or the prices are missing. |
@@ -3439,7 +3558,8 @@ keys moved to the admin area (Section 17.6).
 
 **Not in M1.12.** `python -m sama.api` runs only the API. The control plane process (Section
 19.1) puts the API, the worker, and the tool server in one process, so that the API answers
-the `clarify` questions of the tool server. API keys for services come later.
+the `clarify` questions of the tool server. Org API keys (M7.6) open only `/v1` and `/mcp`
+(Section 10.7), not these routes.
 
 ### 11.5 Telegram gateway (M1.13)
 
@@ -7022,7 +7142,8 @@ log of the org, so the control plane logs it instead.
   that the user sent, accepted, or got, and the profile changes that the user made (M6.1). Agent profiles,
   vault secrets, and embeddings are not in a user export.
 - The export never has a secret: not the vault columns (`wrapped_key`, `ciphertext`), not
-  `integrations.secret_hash`, not `pairing_codes.code_hash`, and not `org_invites.token_hash`.
+  `integrations.secret_hash`, not `pairing_codes.code_hash`, not `org_invites.token_hash`,
+  and not `api_keys.key_hash` (M7.6).
   Derived columns (`messages.search_vector`, `message_embeddings.embedding`) are also not in
   it. The manifest names the columns that it leaves out.
 - The bytes of `attachments` and `generated_media` go to `files/`. The row gets `data_file`.
@@ -7636,6 +7757,7 @@ engine, one run token signer, one gate service, and one clarify broker.
 | `/` | The API and the web page (Section 11.4), and `/telegram/<integration id>/webhook` when the vault is on (Section 11.6) |
 | `/tools` | The sama MCP tool server: `/tools/mcp`, `/tools/gate`, `/tools/archive`, and `/tools/session-items` (Sections 5.3, 6.3, 16.1, and 16.7) |
 | `/model` | The model proxy: `/model/anthropic` and `/model/openai` (Section 16.6) |
+| `/v1`, `/mcp` | Sama as a server for other agents: the OpenAI-compatible endpoint and the MCP server, with an org API key (Section 10.7) |
 
 - The worker runs runs in E2B sandboxes with the Claude runtime. The sandbox reaches the
   model proxy, the tool server, and the gate at `SAMA_PUBLIC_URL`. The egress allowlist of each

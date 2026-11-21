@@ -40,6 +40,8 @@ PATTERNS: Final = tuple(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*(?:-(?!----)[^-]*)*"
         r"-----END [A-Z ]*PRIVATE KEY-----",
         r"\bsk-[A-Za-z0-9_-]{20,}",
+        # Org API keys of sama as a server (Section 10.7).
+        r"\bsama_sk_[A-Za-z0-9_-]{20,}",
         r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}",
         r"\bgithub_pat_[A-Za-z0-9_]{22,}",
         r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",

@@ -28,6 +28,7 @@ from sama.db import create_engine
 from sama.db.models import (
     EMBEDDING_DIMENSIONS,
     AgentProfile,
+    ApiKey,
     Approval,
     Attachment,
     AuditEntry,
@@ -176,6 +177,19 @@ def plan(
             org_id=ids[org],
             stripe_event_id=f"evt_{uuid.uuid4().hex[:14]}",
             type="customer.subscription.updated",
+        )
+    # An API key in each org (M7.6). Only the admins and owners read it, never the hash.
+    for org, maker, workspace in (("org-a", "carol", "a1"), ("org-b", "bob", "b1")):
+        add(
+            ApiKey,
+            f"api-key:{org}",
+            org_id=ids[org],
+            user_id=ids[maker],
+            workspace_id=ids[workspace],
+            name=f"key {org}",
+            prefix="sama_sk_test",
+            key_hash=uuid.uuid4().bytes * 2,
+            scopes=["chat", "mcp"],
         )
     profiles: tuple[tuple[str, str, str | None], ...] = (
         ("profile-a", "org-a", None),
