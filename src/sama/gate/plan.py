@@ -36,6 +36,7 @@ PLAN_MODE_TOOLS: Final = frozenset(
         "web_extract",
         "clarify",
         PLAN_PROPOSE,
+        "coding_agent_plan",
         "repo_clone",
         "skills_list",
         "skill_view",
@@ -58,7 +59,8 @@ PLAN_MODE_TOOLS: Final = frozenset(
 )
 """The tools that plan mode does not stop. ``repo_clone`` only copies code into the sandbox, so
 the agent can read it. ``Task`` and ``Agent`` start a sub-agent, and each tool call of the
-sub-agent passes the gate again, with plan mode."""
+sub-agent passes the gate again, with plan mode. ``coding_agent_plan`` is a run of Claude Code
+or Codex that starts in its plan mode (Section 15.5); ``coding_agent_run`` stays blocked."""
 
 PLAN_MODE_REASON: Final = (
     "plan mode is on: tools that change files or data are blocked. Read and explore, then "

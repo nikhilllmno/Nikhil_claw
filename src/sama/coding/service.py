@@ -76,6 +76,8 @@ class CodingRequest:
     baseline: Usage | None = None
     """Codex: the usage of the thread at the end of the last request (its counts are for the
     whole thread)."""
+    plan_args: tuple[str, ...] = ()
+    """The plan mode flags of the CLI (coding mode, Section 15.5)."""
 
 
 @dataclass(slots=True)
@@ -165,6 +167,7 @@ class CodingService:
             model_url=self._model_url,
             token=token,
             resume=request.resume,
+            plan_args=request.plan_args,
         )
         stream = stream_for(request.agent, model, self._prices, baseline=request.baseline)
         try:

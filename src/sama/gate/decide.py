@@ -51,7 +51,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "delegation": frozenset({"delegate_task", "delegate_status"}),
     "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
     "code_exec": frozenset({"execute_code"}),
-    "coding_agents": frozenset({"coding_agent_run"}),
+    "coding_agents": frozenset({"coding_agent_run", "coding_agent_plan"}),
     "browser": frozenset(
         {
             "browser_open",

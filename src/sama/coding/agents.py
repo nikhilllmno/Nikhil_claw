@@ -26,6 +26,9 @@ CODEX_VERSION: Final = "0.171.0"
 """The pinned version of ``@openai/codex`` in ``sandbox/Dockerfile``."""
 
 CODING_AGENT_RUN: Final = "coding_agent_run"
+CODING_AGENT_PLAN: Final = "coding_agent_plan"
+"""The name that the gate judges for a run of ``claude_code`` or ``codex`` in plan mode
+(Section 15.5). No MCP tool has this name, so only the runtime asks for it."""
 """The tool of the toolset ``coding_agents``. The gate also judges each request of the runtimes
 ``claude_code`` and ``codex`` as one call of this tool."""
 MAX_PROMPT_CHARS: Final = 50_000
@@ -138,8 +141,11 @@ def cli_command(
     model_url: str,
     token: str,
     resume: str | None = None,
+    plan_args: tuple[str, ...] = (),
 ) -> CliCommand:
-    """The headless command of ``agent``. ``model_url`` is the root URL of the model proxy as
+    """The headless command of ``agent``. ``plan_args`` are the plan mode flags of the CLI
+    (coding mode, Section 15.5): for Claude Code they take the place of
+    ``--dangerously-skip-permissions``. ``model_url`` is the root URL of the model proxy as
     the sandbox sees it. ``resume`` is the CLI session (Claude Code) or thread (Codex) to
     continue. Codex keeps its threads in ``~/.codex`` (its default ``CODEX_HOME``)."""
     root = model_url.rstrip("/")
@@ -153,8 +159,9 @@ def cli_command(
             "--model",
             model,
             # The sandbox is the boundary. The sama gate judged the request before the start.
-            # The sandbox user is not root, so the CLI accepts the flag.
-            "--dangerously-skip-permissions",
+            # The sandbox user is not root, so the CLI accepts the flag. In plan mode the
+            # CLI only reads, and it ends with ``ExitPlanMode``.
+            *(plan_args or ("--dangerously-skip-permissions",)),
             # WebFetch otherwise asks api.anthropic.com about each domain first.
             "--settings",
             '{"skipWebFetchPreflight": true}',

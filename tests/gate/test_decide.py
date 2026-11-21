@@ -954,7 +954,7 @@ def test_an_escalation_also_applies_to_a_wrapped_call() -> None:
 def test_coding_agent_run_asks_by_default() -> None:
     assert "coding_agents" in DEFAULT_TOOLSETS
     assert "coding_agents" not in DEFAULT_GROUP_TOOLSETS
-    assert TOOLSETS["coding_agents"] == frozenset({"coding_agent_run"})
+    assert TOOLSETS["coding_agents"] == frozenset({"coding_agent_run", "coding_agent_plan"})
     arguments = {"agent": "claude_code", "prompt": "fix", "repo": "", "open_pr": False}
     verdict = decide(context(toolsets=frozenset({"coding_agents"})), "coding_agent_run", arguments)
     assert verdict.action == "ask"

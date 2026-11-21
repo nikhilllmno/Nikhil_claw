@@ -76,9 +76,9 @@ async def test_plan_reply_without_a_service_or_a_session(tenant: Tenant) -> None
 def test_the_harness_plan_modes() -> None:
     assert plan_mode_for(CLAUDE_CODE).cli_args == ("--permission-mode", "plan")
     assert plan_mode_for(CLAUDE_CODE).native_plan_tool == "ExitPlanMode"
-    assert plan_mode_for(CODEX).cli_args == ("--sandbox", "read-only")
+    assert plan_mode_for(CODEX).cli_args == ()
     assert plan_mode_for("other").cli_args == ()
-    assert "plan_propose" in plan_mode_for("other").prompt
+    assert "whole answer" in plan_mode_for("other").prompt
 
 
 def test_the_plan_note_follows_the_harness() -> None:

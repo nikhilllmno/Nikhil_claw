@@ -78,7 +78,9 @@ class CodingPreparer:
         self._cloner = cloner
         self._signer = signer
 
-    async def prepare(self, sandbox: Sandbox, scope: RunScope, token: str) -> str:
+    async def prepare(
+        self, sandbox: Sandbox, scope: RunScope, token: str, harness: str | None = None
+    ) -> str:
         """Clones the pending repositories and returns the note for the run input ("" for
         none). It never raises. Each clone has its own time limit, and a failed clone only
         marks its repository ``failed``; the notes of the other repositories and of plan mode
@@ -103,7 +105,7 @@ class CodingPreparer:
                 failed.append(replace(repo, status="failed", error=problem))
         notes = [repo_note(cloned, failed)]
         if plan:
-            notes.append(plan_note(runtime))
+            notes.append(plan_note(harness or runtime))
         return "\n\n".join(note for note in notes if note)
 
     async def _clone(

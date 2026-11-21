@@ -50,6 +50,7 @@ from sama.browser.task import BrowserTaskRunner, ProxyModelClient
 from sama.coding.runtime import CodingAgentRuntime
 from sama.coding.service import CodingService
 from sama.coding.tool import CodingTools
+from sama.coding_mode.harness import HarnessHooks
 from sama.coding_mode.prepare import CodingPreparer
 from sama.coding_mode.service import CodingService as CodingModeService
 from sama.coding_mode.tool import PlanTool
@@ -399,6 +400,7 @@ def build(
     # codex, and the tool coding_agent_run. The CLIs reach models only through the model proxy
     # and git only through the git proxy.
     coding: CodingTools | None = None
+    coding_runtimes: list[CodingAgentRuntime] = []
     if sandboxed is not None:
         coding_service = CodingService(
             model_url=settings.model_url, cloner=cloner, github=github_tools
@@ -410,8 +412,10 @@ def build(
             service=coding_service,
             gate=gate,
         )
+        codex = claude_code.for_kind(RuntimeKind.CODEX)
         registry.register(claude_code)
-        registry.register(claude_code.for_kind(RuntimeKind.CODEX))
+        registry.register(codex)
+        coding_runtimes = [claude_code, codex]
         # The progress lines go to the run events of the run through the worker (Section 15.4).
         coding = CodingTools(coding_service, sandboxed.session_sandbox, progress=worker)
     # ``sama_pr`` changes the code of sama through the GitHub App (Section 15.2).
@@ -523,6 +527,11 @@ def build(
     handoffs = Handoffs(engine, web_url=settings.web_base)
     # /undo and /rollback restore the files of the session sandbox (Section 15.3).
     checkpoints = CheckpointService(engine, sandboxed.session_sandbox) if sandboxed else None
+    # Coding mode for Claude Code and Codex (Section 15.5): clone, note, checkpoint, plan mode.
+    if cloner is not None:
+        hooks = HarnessHooks(CodingPreparer(coding_mode, cloner, signer), coding_mode, checkpoints)
+        for coding_runtime in coding_runtimes:
+            coding_runtime.set_hooks(hooks)
     # The same vault as the proxy: a key that an admin sets applies at once here (M6.7).
     model_keys = ModelKeys(vault, keys) if vault is not None else None
     hub = (

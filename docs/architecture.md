@@ -6601,7 +6601,7 @@ the same for both runtimes and for the coding agent harnesses of M7.2 (below).
 | Chat command | `src/sama/coding_mode/commands.py` | `/plan` in the web composer, Telegram, and Slack. |
 | API | `src/sama/api/coding_mode.py` | The routes below. |
 | Web app | `web/app/(shell)/s/[sessionId]/code/page.tsx`, `web/components/CodingPanel.tsx` | The Code page of a session. |
-| Harness seam | `src/sama/coding_mode/harness.py` | Plan mode for `claude_code` and `codex` (M7.2). |
+| Claude Code and Codex | `src/sama/coding_mode/harness.py`, `src/sama/coding/runtime.py` | `HarnessHooks`: clone, note, checkpoint, and plan mode for the runtimes of M7.2. |
 | Tables | migration `0042` | `sessions.plan_mode`, `session_repos`, `session_plans`. |
 
 **Attach a repository.** `POST /sessions/{id}/repos` takes `repo` (as for `repo_clone`), an
@@ -6745,19 +6745,36 @@ sessions that they can see (`sama_private.can_read_session`). No policy allows w
 control plane writes them. Migration `0042` also adds the toolset `plan` to each profile that has
 the toolset `github`, and `python -m sama.admin bootstrap` gives it to new profiles.
 
-**Harnesses (M7.2).** The coding agent harnesses `claude_code` and `codex` of M7.2 run the CLI
-in the session sandbox. Coding mode works for them through the same parts:
+**Claude Code and Codex (M7.2).** The runtimes `claude_code` and `codex` (Section 15.4) run a
+CLI in the session sandbox, and the runner does not start it. Coding mode works for them, also
+in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding_agent`), through
+`HarnessHooks` (`src/sama/coding_mode/harness.py`), which `CodingAgentRuntime` calls:
 
-- The clone and the note come before the run, in `SandboxedRuntime`, so they need nothing from
-  the harness.
-- The diffs, the checkpoints, `/undo`, the commands, and the pull requests come from the
-  checkpoints of the work folder and from the `tool_call_*` run events. A harness that writes
-  these events and sends its tool calls to the gate gets them as they are.
-- Plan mode: `sama.coding_mode.harness.plan_mode_for(harness)` gives the CLI arguments and the
-  prompt. Claude Code starts with `--permission-mode plan`, and its `ExitPlanMode` input is the
-  plan that the adapter stores with `CodingService.propose`. Codex has no plan mode: it starts
-  with a read-only sandbox (`--sandbox read-only`) and the plan-first prompt, and it calls
-  `plan_propose` or gives the plan as its answer. M7.2 calls this seam.
+- Before the gate check, the runtime reads plan mode. In plan mode the gate judges the name
+  `coding_agent_plan` (toolset `coding_agents`, default `ask`), which plan mode does not
+  block, with `open_pr` false. No MCP tool has this name, so only the runtime asks for it. The
+  tool `coding_agent_run` of a sama agent stays blocked in plan mode, because it starts the CLI
+  with all permissions.
+- After it has the sandbox and before the CLI starts, the hooks clone the pending repositories
+  and give the note (`CodingPreparer`, the same step as for the SDK runtimes; the note goes
+  after the task), and take one checkpoint of the work folder (`CheckpointService.snapshot`,
+  tool `claude_code` or `codex`). The tools of the CLI do not pass the gate of the runner, so
+  they take no checkpoints. With this checkpoint, the diff of the Code page and `/undo` cover
+  the changes of the CLI.
+- In plan mode, Claude Code starts with `--permission-mode plan` in place of
+  `--dangerously-skip-permissions`, and the note asks it to end with `ExitPlanMode`. The parser
+  gives the input `plan` of that tool as `CliPlan`. Codex keeps its flags: its own read-only
+  sandbox (bubblewrap) does not work in the E2B VM, and with it every command fails. So Codex
+  gets only the plan-first note, and its answer is the plan.
+- At the end of a plan mode run, the plan (`CliPlan`, else the answer of the CLI) becomes a
+  proposed plan (`CodingService.propose`), and the answer of the run says how to decide it. An
+  approval sends the plan as a message; in the direct mode that message goes to the same CLI,
+  which then works with all permissions.
+- The commands and the test runs of the CLI come from its `tool_call_*` run events. Their
+  arguments have a one-line `summary` and not the full command, so the Code page shows that
+  summary.
+- The chat shows the progress of `coding_agent_run` (`subagent_event`) as a sub-agent group
+  with the name "Claude Code" or "Codex", as for other sub-agents.
 
 **Limits and risks.**
 
@@ -6771,6 +6788,8 @@ in the session sandbox. Coding mode works for them through the same parts:
   run a program from `git diff`.
 - Plan mode does not stop a call that a person approved before (the recorded decision,
   Section 16.1). The tool server check honors the ticket of such a call once.
+- Codex in plan mode has no technical guard: the CLI runs with all permissions and only the
+  note asks it not to change files. The checkpoint before the run lets a person undo a change.
 - The test detection reads the command text. A test that runs through a script with another
   name is a normal command.
 - A diff of a session with a very large work folder (more than 50,000 files) fails, as a
