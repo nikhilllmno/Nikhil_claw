@@ -26,6 +26,7 @@ from sama.runtime.openai_agents import (
     StoreFailure,
     _Job,
     _kept_count,
+    _model_settings,
     _new_conversation,
     _PendingCall,
     _State,
@@ -209,3 +210,17 @@ def test_a_new_run_keeps_the_items_of_the_run_before() -> None:
     pending = _PendingCall(call_id="call-1", tool_name="Bash")
     paused = done.model_copy(update={"pending": pending, "paused_count": 7})
     assert _kept_count(paused) == 7
+
+
+def test_the_reasoning_effort_of_the_config_goes_to_the_model_settings() -> None:
+    plain = _model_settings(make_config(RuntimeKind.OPENAI_AGENTS_SDK))
+    assert plain.reasoning is None
+    assert plain.parallel_tool_calls is False
+    for effort in ("low", "medium", "high"):
+        config = make_config(RuntimeKind.OPENAI_AGENTS_SDK).model_copy(
+            update={"reasoning_effort": effort}
+        )
+        settings = _model_settings(config)
+        assert settings.reasoning is not None
+        assert settings.reasoning.effort == effort
+        assert settings.parallel_tool_calls is False

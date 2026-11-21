@@ -17,10 +17,10 @@ import { useLoad } from "./useLoad";
 import styles from "./Page.module.css";
 
 /** The most characters of a query (src/sama/search/core.py `MAX_QUERY_CHARS`). */
-const MAX_QUERY_CHARS = 400;
+export const MAX_QUERY_CHARS = 400;
 
 /** A search that the user started. `from` is the workspace that the page showed at that time. */
-type Asked = { q: string; workspace: string | null; org: string; from: string | null; run: number };
+export type Asked = { q: string; workspace: string | null; org: string; from: string | null; run: number };
 
 export function SessionSearch() {
   const { me, meError, reloadMe, workspaces, workspaceId, orgOfWorkspace } = useData();
@@ -85,13 +85,14 @@ export function SessionSearch() {
       )}
       {/* The results are for one search of one workspace. A new workspace hides them. */}
       {asked !== null && asked.from === workspaceId ? (
-        <Results key={`${asked.org}|${asked.workspace ?? ""}|${asked.q}|${asked.run}`} asked={asked} />
+        <SearchResults key={`${asked.org}|${asked.workspace ?? ""}|${asked.q}|${asked.run}`} asked={asked} />
       ) : null}
     </div>
   );
 }
 
-function Results({ asked }: { asked: Asked }) {
+/** The results of one search. */
+export function SearchResults({ asked }: { asked: Asked }) {
   const api = useApi();
   const load = useCallback(
     () => api.searchSessions(asked.org, asked.q, asked.workspace),

@@ -95,6 +95,11 @@ class RuntimeKind(StrEnum):
     FAKE = "fake"  # scripted, for tests
 
 
+ReasoningEffort = Literal["low", "medium", "high"]
+REASONING_EFFORTS: Final[tuple[str, ...]] = ("low", "medium", "high")
+"""The reasoning efforts that an agent profile can set (M7.10). Each adapter maps them."""
+
+
 class Capabilities(_Frozen):
     """What a runtime does natively. Sama fills each gap itself."""
 
@@ -253,6 +258,9 @@ class RunConfig(_Frozen):
     subagents: tuple[SubagentDefinition, ...] = ()
     """Native sub-agents. A runtime without ``native_subagents`` ignores them. The control
     plane does not put them in the config of such a runtime."""
+    reasoning_effort: ReasoningEffort | None = None
+    """How much the model thinks before it answers. ``None``: the default of the model. Each
+    adapter passes it to its SDK."""
 
     @model_validator(mode="after")
     def _names_are_unique(self) -> Self:
@@ -274,6 +282,9 @@ class RunConfig(_Frozen):
         if not self.subagents:
             # A config with no sub-agent keeps the digest that it had before the field existed.
             del payload["subagents"]
+        if self.reasoning_effort is None:
+            # The same for a config with no reasoning effort.
+            del payload["reasoning_effort"]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

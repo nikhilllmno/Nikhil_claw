@@ -38,11 +38,23 @@ import styles from "./Page.module.css";
 
 type Open = { kind: "skill"; name: string; scope: SkillScope } | { kind: "new" } | null;
 
-export function SkillEditor() {
+/**
+ * The skill editor. `embedded`: the settings console (M7.10) shows it inside a section, so the
+ * page frame and the header stay out. `canCreate` is false when the role cannot write skills.
+ */
+export function SkillEditor({ embedded = false, canCreate = true }: { embedded?: boolean; canCreate?: boolean } = {}) {
   const { me, meError, reloadMe, workspaces, workspaceId } = useData();
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the skills" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
+
+  if (embedded) {
+    return workspace === null ? (
+      <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
+    ) : (
+      <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} canCreate={canCreate} />
+    );
+  }
 
   return (
     <div className={styles.page}>
@@ -60,13 +72,13 @@ export function SkillEditor() {
       ) : (
         // The key gives each workspace its own catalog, so one workspace never shows the skills
         // of another one while the new list loads.
-        <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} />
+        <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} canCreate />
       )}
     </div>
   );
 }
 
-function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
+function WorkspaceSkills({ workspaceId, canCreate }: { workspaceId: string; canCreate: boolean }) {
   const api = useApi();
   const [open, setOpen] = useState<Open>(null);
   // The row that the list gives the focus to when it shows again: "new" or `scope:name`.
@@ -127,6 +139,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
         <SkillsHome
           workspaceId={workspaceId}
           catalog={catalog.data}
+          canCreate={canCreate}
           filter={filter}
           onFilter={setFilter}
           focusKey={focusKey}
@@ -153,6 +166,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
 function SkillsHome({
   workspaceId,
   catalog,
+  canCreate,
   filter,
   onFilter,
   focusKey,
@@ -162,6 +176,7 @@ function SkillsHome({
 }: {
   workspaceId: string;
   catalog: SkillCatalog;
+  canCreate: boolean;
   filter: string;
   onFilter: (text: string) => void;
   focusKey: string | null;
@@ -213,12 +228,15 @@ function SkillsHome({
             onChange={(e) => onFilter(e.target.value)}
           />
         </label>
-        {catalog.writable_scopes.length > 0 ? (
+        {catalog.writable_scopes.length > 0 && canCreate ? (
           <button ref={newButton} type="button" className="btn btn-primary" onClick={onNew}>
             New skill
           </button>
         ) : null}
       </div>
+      {!canCreate ? (
+        <p className={styles.meta}>Your role cannot write skills. An org admin can change this.</p>
+      ) : null}
       <SkillList
         skills={filterSkills(catalog.skills, filter)}
         total={catalog.skills.length}

@@ -144,6 +144,12 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "workflow_receipts": _INSTANCES,
     "browser_logins": "user_id = :user OR created_by_user_id = :user",
     "browser_url_policies": None,
+    # The permissions of the roles are settings of the org. A user export has the rows that the
+    # user changed.
+    "org_role_permissions": "updated_by_user_id = :user",
+    "trigger_deliveries": (
+        "trigger_id IN (SELECT id FROM triggers WHERE org_id = :org AND owner_user_id = :user)"
+    ),
 }
 """The rows of a user export, as a filter in each table of the org. None: the table has no
 personal data, or the data is not for an export (secrets, the outbox, embeddings)."""

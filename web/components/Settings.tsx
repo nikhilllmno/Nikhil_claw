@@ -182,7 +182,8 @@ function samePair(a: PairTarget, b: PairTarget | null): boolean {
   return b !== null && a.workspaceId === b.workspaceId && a.profileId === b.profileId && a.channel === b.channel;
 }
 
-function LinkedAccounts({
+/** The chat accounts that the user linked, and the code to link a Telegram account. */
+export function LinkedAccounts({
   orgs,
   workspaceId,
   org,

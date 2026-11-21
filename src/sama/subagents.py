@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Final, NamedTuple, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -28,7 +28,7 @@ from pydantic_core import ErrorDetails
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AgentProfile, AuditEntry
+from sama.db.models import AgentProfile, AuditEntry, Org
 from sama.gate.decide import TOOLSETS, tools_of
 from sama.modelproxy.prices import PriceTable, Provider
 from sama.runtime.contract import (
@@ -284,6 +284,11 @@ class LockedProfile(NamedTuple):
     workspace_id: uuid.UUID | None
     group_toolsets: list[str]
     review_model: str | None = None
+    budget: Mapping[str, Any] | None = None
+    """The run budget of the profile (``agent_profiles.budget``)."""
+    reasoning_effort: str | None = None
+    plan: str | None = None
+    """The plan of the org. A budget change must stay in the caps of the plan (M7.10)."""
 
 
 async def lock_profile(
@@ -305,6 +310,12 @@ async def lock_profile(
                 AgentProfile.workspace_id,
                 AgentProfile.review_model,
                 AgentProfile.group_toolsets,
+                AgentProfile.budget,
+                AgentProfile.reasoning_effort,
+                select(Org.plan)
+                .where(Org.id == AgentProfile.org_id)
+                .scalar_subquery()
+                .label("plan"),
             )
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .with_for_update()
@@ -324,6 +335,9 @@ async def lock_profile(
         group_toolsets=(
             [str(t) for t in row.group_toolsets] if isinstance(row.group_toolsets, list) else []
         ),
+        budget=row.budget if isinstance(row.budget, dict) else {},
+        reasoning_effort=row.reasoning_effort,
+        plan=row.plan,
     )
 
 

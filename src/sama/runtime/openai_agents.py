@@ -62,6 +62,7 @@ from agents.sandbox.snapshot import NoopSnapshotSpec
 from agents.tool import FunctionTool, Tool, ToolOriginType, get_function_tool_origin
 from agents.usage import Usage as SdkUsage
 from openai import AsyncOpenAI
+from openai.types.shared import Reasoning
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sama.runtime.archive import ArchiveEntry, Archiver, TranscriptArchive, bound_for_wire
@@ -956,7 +957,7 @@ class OpenAIRuntime:
             name="sama",
             instructions=job.config.render_prefix() or None,
             model=OpenAIResponsesModel(model=job.config.model, openai_client=self._openai()),
-            model_settings=ModelSettings(parallel_tool_calls=False),
+            model_settings=_model_settings(job.config),
             mcp_servers=list(servers),
             capabilities=[
                 Shell(configure_tools=_shell_tools),
@@ -1183,6 +1184,16 @@ class OpenAIRuntime:
 
 def _new_conversation(run_id: str) -> str:
     return f"c-{uuid.uuid5(uuid.NAMESPACE_URL, run_id).hex}"
+
+
+def _model_settings(config: RunConfig) -> ModelSettings:
+    """The model settings of a run. A reasoning effort of the profile goes to the model; without
+    one, the model keeps its default."""
+    if config.reasoning_effort is None:
+        return ModelSettings(parallel_tool_calls=False)
+    return ModelSettings(
+        parallel_tool_calls=False, reasoning=Reasoning(effort=config.reasoning_effort)
+    )
 
 
 def _shell_tools(toolset: Any) -> None:

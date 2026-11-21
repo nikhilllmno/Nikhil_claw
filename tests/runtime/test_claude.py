@@ -336,6 +336,21 @@ async def pause(gate_reason: str = "write action") -> tuple[ClaudeRuntime, Appro
 # -- options -----------------------------------------------------------------------------------
 
 
+async def test_the_reasoning_effort_of_the_config_goes_to_the_options() -> None:
+    plain = request()
+    assert plain.config.reasoning_effort is None
+    wanted = plain.model_copy(
+        update={"config": plain.config.model_copy(update={"reasoning_effort": "high"})}
+    )
+    efforts = []
+    for given in (plain, wanted):
+        factory = Factory([result()])
+        runtime = ClaudeRuntime(settings=ClaudeSettings(), client_factory=factory)
+        await collect(runtime.run(given))
+        efforts.append(factory.clients[0].options.effort)
+    assert efforts == [None, "high"]
+
+
 async def test_maps_the_request_to_options() -> None:
     factory = Factory([result()])
     settings = ClaudeSettings(cwd="/workspace", env={"ANTHROPIC_BASE_URL": "https://proxy.test"})

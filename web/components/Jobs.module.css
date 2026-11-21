@@ -8,6 +8,18 @@
   padding: var(--space-5) var(--space-4) var(--space-6);
 }
 
+/* The frame inside the settings console: the console gives the width and the padding. */
+.embedded {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.embedded .title {
+  font-size: var(--text-xl);
+}
+
 .header {
   display: flex;
   flex-direction: column;

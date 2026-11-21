@@ -90,6 +90,37 @@ async def test_the_first_run_builds_and_stores_the_config(
     }
 
 
+async def test_the_reasoning_effort_of_the_profile_goes_in_the_frozen_config(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    assembler = PromptAssembler(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(reasoning_effort="high")
+        )
+    first = await claimed(engine, tenant)
+    assert first.reasoning_effort == "high"
+    config = await assembler(first)
+    assert config.reasoning_effort == "high"
+    await end(engine, first)
+    # The session keeps its effort: a new value applies from the next session.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(reasoning_effort=None)
+        )
+    second = await claimed(engine, tenant)
+    assert second.reasoning_effort is None
+    assert (await assembler(second)).reasoning_effort == "high"
+    await end(engine, second)
+    other = await claimed(engine, tenant, "s2")
+    assert (await assembler(other)).reasoning_effort is None
+    await end(engine, other)
+
+
 async def test_later_runs_reuse_the_frozen_config(engine: AsyncEngine, tenant: Tenant) -> None:
     assembler = PromptAssembler(engine)
     first = await claimed(engine, tenant)

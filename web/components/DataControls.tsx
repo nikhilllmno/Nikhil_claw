@@ -27,7 +27,8 @@ export function OrgData({ org }: { org: Org }) {
   );
 }
 
-function Retention({ org }: { org: Org }) {
+/** The retention of the sessions of the org. An org admin changes it. */
+export function Retention({ org }: { org: Org }) {
   const api = useApi();
   const load = useCallback(() => api.dataSettings(org.id), [api, org.id]);
   const settings = useLoad(load, "Could not load the data settings.");

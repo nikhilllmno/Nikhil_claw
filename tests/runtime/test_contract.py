@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 import sys
 import textwrap
@@ -99,6 +101,28 @@ def test_fingerprint_changes_when_the_prefix_changes() -> None:
     assert make_config(RuntimeKind.CLAUDE_AGENT_SDK).fingerprint() != base.fingerprint()
     more_memory = base.model_copy(update={"memory_snapshot": "New fact."})
     assert more_memory.fingerprint() != base.fingerprint()
+
+
+def test_the_reasoning_effort_changes_the_fingerprint_only_when_it_is_set() -> None:
+    base = make_config()
+    assert base.reasoning_effort is None
+    payload = base.model_dump(mode="json")
+    assert "reasoning_effort" in payload
+    # A config with no effort keeps the digest that it had before the field existed.
+    del payload["reasoning_effort"]
+    del payload["subagents"]
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert base.fingerprint() == hashlib.sha256(canonical.encode()).hexdigest()
+    high = base.model_copy(update={"reasoning_effort": "high"})
+    low = base.model_copy(update={"reasoning_effort": "low"})
+    assert len({base.fingerprint(), high.fingerprint(), low.fingerprint()}) == 3
+
+
+def test_the_reasoning_effort_is_low_medium_or_high() -> None:
+    for effort in ("low", "medium", "high"):
+        assert RunConfig(runtime=RuntimeKind.FAKE, model="m", reasoning_effort=effort)
+    with pytest.raises(ValidationError):
+        RunConfig(runtime=RuntimeKind.FAKE, model="m", reasoning_effort="extreme")  # type: ignore[arg-type]
 
 
 def test_fingerprint_is_the_same_in_another_process() -> None:

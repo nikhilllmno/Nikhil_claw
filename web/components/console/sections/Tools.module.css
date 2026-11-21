@@ -1,0 +1,51 @@
+/* The tool policy table of the Tools section. Tokens only. */
+
+.groupRow th {
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+.groupHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.tool {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.ruleTool {
+  flex: 2 1 var(--field-basis);
+  min-width: 0;
+}
+
+.ruleAction {
+  flex: 1 1 var(--stat-min);
+  min-width: 0;
+}

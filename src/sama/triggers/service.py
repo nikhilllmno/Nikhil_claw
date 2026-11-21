@@ -36,22 +36,25 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from datetime import UTC, datetime
+from typing import Any, Final, NoReturn
 
 from pydantic import SecretStr
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.connectors.composio import TRIGGER_EVENT as COMPOSIO_EVENT
 from sama.connectors.service import ConnectionService
 from sama.db.models import (
+    MAX_DELIVERIES_PER_TRIGGER,
     SAFE_TOOLSETS,
     AgentProfile,
     AuditEntry,
     Session,
     Trigger,
+    TriggerDelivery,
     TriggerEvent,
     Workflow,
 )
@@ -93,6 +96,11 @@ WORKFLOW_OWNER: Final = "a trigger can start only a workflow of the same owner"
 ADMIN_ONLY: Final = (
     "only a workspace admin or an org owner or admin can give a trigger more than the safe toolsets"
 )
+MAX_DELIVERY_ID_CHARS: Final = 200
+TEST_MAX_BYTES: Final = 20_000
+"""The largest payload of a test send, as JSON."""
+NO_SIGNING_KEY: Final = "the trigger has no signing secret"
+NOT_AN_EVENT: Final = "the delivery is not a trigger event"
 _SLUG: Final = re.compile(SLUG_PATTERN)
 
 
@@ -488,33 +496,51 @@ class TriggerService:
         self, trigger_id: uuid.UUID, headers: Mapping[str, str], body: bytes
     ) -> dict[str, Any]:
         """A delivery to the URL of a webhook trigger. An unknown trigger and a bad signature
-        get the same ``401``, so the answer does not show which trigger ids exist."""
+        get the same ``401``, so the answer does not show which trigger ids exist. A delivery
+        to a known trigger gets a row in the delivery log, also when sama refuses it."""
         async with self._engine.connect() as connection:
             row = (
                 await connection.execute(select(Trigger).where(Trigger.id == trigger_id))
             ).one_or_none()
-        if row is None or row.kind != "webhook" or self._vault is None:
+        if row is None:
             raise TriggerError(NOT_SIGNED, 401)
+        return await self._receive_webhook(row, headers, body, test=False, start=True)
+
+    async def _receive_webhook(
+        self, row: Any, headers: Mapping[str, str], body: bytes, *, test: bool, start: bool
+    ) -> dict[str, Any]:
+        """The checks and the start of a delivery to a webhook trigger. ``test`` marks the row
+        of the delivery log. Without ``start``, the function stops after the checks."""
+        given = _header_id(headers)
+        if row.kind != "webhook" or self._vault is None:
+            await self._refuse(row, "rejected", NOT_SIGNED, 401, given, test=test)
         secret = await self._vault.get(row.org_id, trigger_secret(row.id))
         if secret is None:
-            raise TriggerError(NOT_SIGNED, 401)
+            await self._refuse(row, "rejected", NOT_SIGNED, 401, given, test=test)
         try:
             delivery = signature.verify(
                 [signature.standard_key(secret.get_secret_value())], headers, body
             )
         except signature.SignatureError as error:
             log.info("a webhook delivery is not valid trigger=%s: %s", row.id, error)
-            raise TriggerError(NOT_SIGNED, 401) from None
+            await self._refuse(row, "bad_signature", NOT_SIGNED, 401, given, test=test)
         if row.status != "active":
-            raise TriggerError(TRIGGER_GONE, 410)
-        payload = parse_event(body)
-        return await self._start(row, delivery, payload, source="webhook")
+            await self._refuse(row, "disabled", TRIGGER_GONE, 410, delivery, test=test)
+        try:
+            payload = parse_event(body)
+        except TriggerError as error:
+            await self._refuse(row, "bad_body", str(error), error.status_code, delivery, test=test)
+        if test and not start:
+            await self._record(row, "test_ok", 200, delivery, test=True)
+            return {"ok": True}
+        return await self._start(row, delivery, payload, source="webhook", test=test)
 
     async def composio(self, headers: Mapping[str, str], body: bytes) -> dict[str, Any]:
         """A delivery from Composio. The trigger instance in ``metadata.trigger_id`` names the
         trigger and its org. The org secret checks the signature when the org has one, else
         the secret of the process. An event for no trigger, or for a disabled trigger, gets
-        ``200``, so Composio does not send it again."""
+        ``200``, so Composio does not send it again. A delivery to a known trigger gets a row
+        in the delivery log, also when sama refuses it."""
         payload = parse_event(body)
         metadata = payload.get("metadata") if isinstance(payload, dict) else None
         instance = metadata.get("trigger_id") if isinstance(metadata, dict) else None
@@ -526,10 +552,13 @@ class TriggerService:
                         select(Trigger).where(Trigger.composio_trigger_id == instance)
                     )
                 ).one_or_none()
+        given = _header_id(headers)
         secret = self._composio_secret
         if row is not None and self._vault is not None:
             secret = await self._vault.get(row.org_id, SecretName.COMPOSIO_WEBHOOK_SECRET) or secret
         if secret is None:
+            if row is not None:
+                await self._refuse(row, "rejected", NOT_SIGNED, 401, given)
             raise TriggerError(NOT_SIGNED, 401)
         try:
             delivery = signature.verify(
@@ -537,20 +566,31 @@ class TriggerService:
             )
         except signature.SignatureError as error:
             log.info("a Composio delivery is not valid: %s", error)
+            if row is not None:
+                await self._refuse(row, "bad_signature", NOT_SIGNED, 401, given)
             raise TriggerError(NOT_SIGNED, 401) from None
+        if row is None:
+            return {"ignored": True}
+        if row.status != "active":
+            await self._record(row, "disabled", 200, delivery, error=TRIGGER_GONE)
+            return {"ignored": True}
         if (
-            row is None
-            or not isinstance(payload, dict)
+            not isinstance(payload, dict)
             or not isinstance(metadata, dict)
             or payload.get("type") != COMPOSIO_EVENT
-            or row.status != "active"
         ):
+            await self._record(row, "rejected", 200, delivery, error=NOT_AN_EVENT)
             return {"ignored": True}
         slug = metadata.get("trigger_slug")
         source = f"composio:{slug if isinstance(slug, str) else row.composio_slug}"
         return await self._start(row, delivery, payload.get("data"), source=source)
 
-    async def _start(self, row: Any, delivery: str, payload: Any, *, source: str) -> dict[str, Any]:
+    async def _start(
+        self, row: Any, delivery: str, payload: Any, *, source: str, test: bool = False
+    ) -> dict[str, Any]:
+        """Starts the run or the workflow instance of one accepted event, and writes the row of
+        the delivery log. ``test`` marks the row of a test send."""
+        original = row
         async with self._engine.connect() as connection:
             seen = (
                 await connection.execute(
@@ -560,9 +600,10 @@ class TriggerService:
                 )
             ).first()
         if seen is not None:
+            await self._record(original, "duplicate", 200, delivery, test=test)
             return {"duplicate": True}
         if row.target == "workflow" and self._workflows is None:
-            raise TriggerError(NO_WORKFLOWS, 409)
+            await self._refuse(original, "rejected", NO_WORKFLOWS, 409, delivery, test=test)
         body = event_body(payload)
         try:
             async with self._engine.begin() as connection:
@@ -589,35 +630,224 @@ class TriggerService:
                     event_id = await _insert_event(
                         connection, row, delivery, workflow_instance_id=started
                     )
+                    ids: tuple[uuid.UUID | None, uuid.UUID | None] = (None, None)
+                    instance: uuid.UUID | None = started
                 else:
                     session_id, started = await self._start_run(connection, row, body, source)
                     event_id = await _insert_event(
                         connection, row, delivery, session_id=session_id, run_id=started
                     )
+                    ids = (session_id, started)
+                    instance = None
                 if event_id is None:
                     raise _Duplicate
+                # The log row is in the transaction of the event: both stay or both go.
+                await self._record(
+                    row,
+                    "accepted",
+                    202,
+                    delivery,
+                    test=test,
+                    connection=connection,
+                    session_id=ids[0],
+                    run_id=ids[1],
+                    workflow_instance_id=instance,
+                )
         except _Duplicate:
+            await self._record(original, "duplicate", 200, delivery, test=test)
             return {"duplicate": True}
         except _Gone:
             if source != "webhook":
+                await self._record(original, "disabled", 200, delivery, error=TRIGGER_GONE)
                 return {"ignored": True}
-            raise TriggerError(TRIGGER_GONE, 410) from None
+            await self._refuse(original, "disabled", TRIGGER_GONE, 410, delivery, test=test)
         except _OwnerGone:
             await self._set_error(row, OWNER_GONE)
-            raise TriggerError(TRIGGER_GONE, 410) from None
+            await self._refuse(row, "rejected", TRIGGER_GONE, 410, delivery, test=test)
         except RateLimitedError as error:
-            raise TriggerError(
-                str(error), 429, headers={"Retry-After": str(error.retry_after_s)}
-            ) from None
+            await self._refuse(
+                row,
+                "rate_limited",
+                str(error),
+                429,
+                delivery,
+                headers={"Retry-After": str(error.retry_after_s)},
+                test=test,
+            )
         except QueueError as error:
-            raise TriggerError(str(error), 409) from None
+            await self._refuse(row, "rejected", str(error), 409, delivery, test=test)
         except WorkflowError as error:
             # The workflow is paused, removed, or waits for an approval. The sender can try
             # again; the owner sees the reason on the trigger.
             await self._set_error(row, str(error))
-            raise TriggerError(str(error), 409) from None
+            await self._refuse(row, "rejected", str(error), 409, delivery, test=test)
         log.info("trigger=%s started %s=%s", row.id, row.target, started)
         return {"accepted": True, "event_id": str(event_id)}
+
+    # -- the delivery log (M7.10) ------------------------------------------------------------
+
+    async def _record(
+        self,
+        row: Any,
+        outcome: str,
+        http_status: int,
+        delivery_id: str | None,
+        *,
+        error: str | None = None,
+        test: bool = False,
+        session_id: uuid.UUID | None = None,
+        run_id: uuid.UUID | None = None,
+        workflow_instance_id: uuid.UUID | None = None,
+        connection: AsyncConnection | None = None,
+    ) -> None:
+        """Writes one row of the delivery log of the trigger and deletes the rows over
+        ``MAX_DELIVERIES_PER_TRIGGER``, in one transaction. With ``connection``, the row is part
+        of the transaction of the caller. Without it, a failed write is logged and the delivery
+        goes on: the log must not stop a delivery. The row has no payload, and the error is
+        redacted and cut to 500 characters."""
+        values: dict[str, Any] = {
+            "org_id": row.org_id,
+            "trigger_id": row.id,
+            "delivery_id": delivery_id,
+            "outcome": outcome,
+            "http_status": http_status,
+            "error": None if error is None else redact(error)[:500],
+            "test": test,
+            "session_id": session_id,
+            "run_id": run_id,
+            "workflow_instance_id": workflow_instance_id,
+        }
+        if connection is not None:
+            await _write_delivery(connection, values)
+            return
+        try:
+            async with self._engine.begin() as own:
+                await _write_delivery(own, values)
+        except SQLAlchemyError as failure:
+            log.warning("a delivery log write failed trigger=%s: %s", row.id, type(failure))
+
+    async def _refuse(
+        self,
+        row: Any,
+        outcome: str,
+        message: str,
+        http_status: int,
+        delivery_id: str | None,
+        *,
+        headers: Mapping[str, str] | None = None,
+        test: bool = False,
+    ) -> NoReturn:
+        """Writes the row of the delivery log for a refused delivery, then raises the error."""
+        await self._record(row, outcome, http_status, delivery_id, error=message, test=test)
+        raise TriggerError(message, http_status, headers)
+
+    async def list_deliveries(
+        self, org_id: uuid.UUID, workspace_id: uuid.UUID, trigger_id: uuid.UUID, limit: int
+    ) -> list[dict[str, Any]]:
+        """The newest rows of the delivery log of a trigger, newest first."""
+        async with self._engine.connect() as connection:
+            await _row(connection, org_id, workspace_id, trigger_id)
+            rows = await connection.execute(
+                select(TriggerDelivery)
+                .where(TriggerDelivery.org_id == org_id, TriggerDelivery.trigger_id == trigger_id)
+                .order_by(TriggerDelivery.received_at.desc(), TriggerDelivery.id.desc())
+                .limit(limit)
+            )
+            return [_delivery_json(delivery) for delivery in rows]
+
+    async def test_send(
+        self,
+        org_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        trigger_id: uuid.UUID,
+        grants: Grants,
+        payload: dict[str, Any] | None,
+        *,
+        start: bool,
+    ) -> dict[str, Any]:
+        """Sends a test delivery to the trigger, as a person who manages it. A webhook trigger
+        gets a body that sama signs with the secret of the trigger, and the delivery goes
+        through the same check of the signature and the body as a real delivery. A Composio
+        trigger has no signature to check, so the delivery goes through the other checks. With
+        ``start`` false, the test stops after the checks and starts nothing. With ``start``
+        true, it starts the run or the workflow like a real delivery. Returns the row of the
+        delivery log, also when a check fails. Writes the audit entry ``trigger.test_sent``."""
+        async with self._engine.connect() as connection:
+            row = await _row(connection, org_id, workspace_id, trigger_id)
+        _check_manage(grants, row)
+        event = (
+            {"type": "sama.test", "sent_at": datetime.now(UTC).isoformat()}
+            if payload is None
+            else payload
+        )
+        body = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode()
+        if len(body) > TEST_MAX_BYTES:
+            raise TriggerError(f"the test payload has at most {TEST_MAX_BYTES} bytes")
+        identifier = f"test_{uuid.uuid4().hex}"
+        headers: dict[str, str] = {}
+        if row.kind == "webhook":
+            if self._vault is None:
+                raise TriggerError("webhook triggers are not set up", 409)
+            secret = await self._vault.get(org_id, trigger_secret(row.id))
+            if secret is None:
+                raise TriggerError(NO_SIGNING_KEY, 409)
+            stamp = int(time.time())
+            key = signature.standard_key(secret.get_secret_value())
+            headers = {
+                "webhook-id": identifier,
+                "webhook-timestamp": str(stamp),
+                "webhook-signature": signature.sign(key, identifier, stamp, body),
+            }
+        try:
+            if row.kind == "webhook":
+                await self._receive_webhook(row, headers, body, test=True, start=start)
+            else:
+                await self._receive_composio_test(row, identifier, event, start=start)
+        except TriggerError:
+            pass  # A refused test delivery has its row in the log: the answer shows it.
+        async with self._engine.begin() as connection:
+            delivery = (
+                await connection.execute(
+                    select(TriggerDelivery)
+                    .where(
+                        TriggerDelivery.org_id == org_id,
+                        TriggerDelivery.trigger_id == trigger_id,
+                        TriggerDelivery.delivery_id == identifier,
+                    )
+                    .order_by(TriggerDelivery.received_at.desc())
+                    .limit(1)
+                )
+            ).one_or_none()
+            if delivery is None:
+                raise TriggerError("the test delivery was not recorded", 500)
+            await _audit(
+                connection,
+                org_id,
+                workspace_id,
+                grants.user_id,
+                "trigger.test_sent",
+                trigger_id,
+                {"start": start, "outcome": delivery.outcome},
+            )
+        return {"delivery": _delivery_json(delivery)}
+
+    async def _receive_composio_test(
+        self, row: Any, delivery: str, event: Any, *, start: bool
+    ) -> dict[str, Any]:
+        """A test delivery to a Composio trigger: the checks of ``composio`` without the
+        signature. The payload is the data of the event."""
+        if row.status != "active":
+            await self._refuse(row, "disabled", TRIGGER_GONE, 200, delivery, test=True)
+        try:
+            parse_event(json.dumps(event).encode())
+        except TriggerError as error:
+            await self._refuse(row, "bad_body", str(error), error.status_code, delivery, test=True)
+        if not start:
+            await self._record(row, "test_ok", 200, delivery, test=True)
+            return {"ok": True}
+        return await self._start(
+            row, delivery, event, source=f"composio:{row.composio_slug}", test=True
+        )
 
     async def _start_run(
         self, connection: AsyncConnection, row: Any, body: str, source: str
@@ -792,6 +1022,53 @@ class _OwnerGone(Exception):
 
 class _Gone(Exception):
     """The trigger is deleted or not active."""
+
+
+def _header_id(headers: Mapping[str, str]) -> str | None:
+    """The ``webhook-id`` header of a delivery for the log, or ``None`` when it is missing or
+    not printable. The sender can send any text, so the log keeps at most 200 characters."""
+    value = headers.get("webhook-id", "").strip()
+    if not value or not value.isprintable():
+        return None
+    return value[:MAX_DELIVERY_ID_CHARS]
+
+
+async def _write_delivery(connection: AsyncConnection, values: dict[str, Any]) -> None:
+    """Inserts a row of the delivery log and deletes the rows over the limit of the trigger."""
+    await connection.execute(insert(TriggerDelivery).values(**values))
+    newest = (
+        select(TriggerDelivery.id)
+        .where(
+            TriggerDelivery.org_id == values["org_id"],
+            TriggerDelivery.trigger_id == values["trigger_id"],
+        )
+        .order_by(TriggerDelivery.received_at.desc(), TriggerDelivery.id.desc())
+        .limit(MAX_DELIVERIES_PER_TRIGGER)
+    )
+    await connection.execute(
+        delete(TriggerDelivery).where(
+            TriggerDelivery.org_id == values["org_id"],
+            TriggerDelivery.trigger_id == values["trigger_id"],
+            TriggerDelivery.id.not_in(newest),
+        )
+    )
+
+
+def _delivery_json(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "delivery_id": row.delivery_id,
+        "received_at": row.received_at.isoformat(),
+        "outcome": row.outcome,
+        "http_status": row.http_status,
+        "error": row.error,
+        "test": row.test,
+        "session_id": None if row.session_id is None else str(row.session_id),
+        "run_id": None if row.run_id is None else str(row.run_id),
+        "workflow_instance_id": (
+            None if row.workflow_instance_id is None else str(row.workflow_instance_id)
+        ),
+    }
 
 
 def _check_widening(grants: Grants, workspace_id: uuid.UUID, toolsets: Sequence[str]) -> None:

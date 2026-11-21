@@ -32,6 +32,7 @@ from sama.db.models import (
     User,
     Workspace,
 )
+from sama.orgs import permissions
 from sama.orgs.emails import DISPOSABLE_DOMAINS, EmailCheck, blocked_domain, normalize_email
 from sama.orgs.plans import SIGNUP_PLAN, limits_for, plan_of
 from sama.tenancy.access import Grants, load_grants
@@ -406,6 +407,10 @@ class OrgService:
         async with self._engine.begin() as connection:
             org = await _lock_org(connection, org_id)
             actor = await _admin(connection, org_id, auth_user_id)
+            try:
+                await permissions.require(connection, org_id, actor, "members.invite")
+            except permissions.PermissionDeniedError as error:
+                raise OrgError(403, str(error)) from None
             if workspace_id is not None:
                 found = await connection.scalar(
                     select(Workspace.id).where(

@@ -261,3 +261,27 @@ async def test_another_workspace_drops_the_links_of_the_old_one(
             select(func.count()).select_from(PairingCode).where(PairingCode.org_id == tenant.org)
         )
     assert codes == 0
+
+
+async def test_an_admin_checks_the_slack_app(
+    http: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, slack: FakeSlack
+) -> None:
+    admin = bearer(await add_user(engine, tenant, workspace_member=True, role="admin"))
+    url = f"/orgs/{tenant.org}/integrations/slack"
+    await http.post(f"{url}/setup", headers=admin)
+    pending = await http.post(f"{url}/check", headers=admin)
+    assert pending.json()["ok"] is False
+    assert pending.json()["detail"] == "the app has no bot token yet"
+    assert (await http.post(url, headers=admin, json=connect_body())).status_code == 201
+
+    ok = await http.post(f"{url}/check", headers=admin)
+
+    assert ok.status_code == 200, ok.text
+    assert (ok.json()["ok"], ok.json()["detail"]) == (True, None)
+    assert ok.json()["integration"]["status"] == "active"
+    assert ok.json()["integration"]["last_error"] is None
+    slack.failing.add("auth.test")
+    failed = await http.post(f"{url}/check", headers=admin)
+    assert failed.json()["ok"] is False
+    assert failed.json()["integration"]["last_error"] == failed.json()["detail"]
+    assert SLACK_TOKEN not in failed.text

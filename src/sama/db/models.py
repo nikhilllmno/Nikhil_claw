@@ -146,6 +146,22 @@ BROWSER_LOGIN_SECRET_PATTERN: Final = "^browser_login:[0-9a-f-]{36}$"  # noqa: S
 ``browser_login:<id>``."""
 TRIGGER_KINDS: Final = ("webhook", "composio")
 TRIGGER_STATUSES: Final = ("active", "disabled")
+TRIGGER_OUTCOMES: Final = (
+    "accepted",
+    "duplicate",
+    "bad_signature",
+    "disabled",
+    "bad_body",
+    "rate_limited",
+    "rejected",
+    "test_ok",
+)
+"""The outcomes of a delivery to a trigger (M7.10). ``test_ok`` is a test send that stopped after
+the checks."""
+MAX_DELIVERIES_PER_TRIGGER: Final = 200
+"""The delivery rows that stay for one trigger. The control plane deletes the older rows."""
+REASONING_EFFORTS: Final = ("low", "medium", "high")
+ROLE_PERMISSION_ROLES: Final = ("admin", "member")
 TRIGGER_TARGETS: Final = ("run", "workflow")
 """What an event starts (Section 12.2). Workflows (M4.5) add ``workflow``."""
 SAFE_TOOLSETS: Final = ("web", "media", "clarify")
@@ -337,6 +353,31 @@ class Membership(Base):
     created_at: Mapped[datetime] = _created_at()
 
 
+class OrgRolePermission(Base):
+    """One permission of one role in one org (docs/architecture.md, Section 17.2, M7.10).
+
+    A permission without a row is allowed, so an org that never changes a permission keeps the
+    behaviour of the roles. The org owner has every permission and has no row. The check of this
+    table adds to the check of the role: it never gives more. An org member reads the rows of the
+    org. Only the control plane writes the table."""
+
+    __tablename__ = "org_role_permissions"
+    __table_args__ = (
+        ForeignKeyConstraint(["org_id", "updated_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "role", "permission"),
+        CheckConstraint(_one_of("role", ROLE_PERMISSION_ROLES), name="role"),
+        CheckConstraint("char_length(permission) BETWEEN 1 AND 80", name="permission_length"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    permission: Mapped[str] = mapped_column(Text, nullable=False)
+    allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    updated_at: Mapped[datetime] = _created_at()
+
+
 class OrgInvite(Base):
     """An invite to an org (docs/architecture.md, Section 17.2).
 
@@ -458,6 +499,10 @@ class AgentProfile(Base):
         ),
         CheckConstraint(_one_of("runtime", RUNTIMES), name="runtime"),
         CheckConstraint("jsonb_typeof(subagents) = 'array'", name="subagents_is_array"),
+        CheckConstraint(
+            f"reasoning_effort IS NULL OR {_one_of('reasoning_effort', REASONING_EFFORTS)}",
+            name="reasoning_effort",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -489,6 +534,9 @@ class AgentProfile(Base):
     )
     """The native sub-agents of the profile: a JSON array of ``SubagentSpec`` (Section 13.1).
     Write it only with ``sama.subagents.set_profile_subagents``."""
+    reasoning_effort: Mapped[str | None] = mapped_column(Text)
+    """How much the model thinks (M7.10): ``low``, ``medium``, or ``high``. ``None``: the default
+    of the model. A session freezes it in its run config."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -2382,6 +2430,46 @@ class TriggerEvent(Base):
     """The workflow instance of an event of a ``workflow`` trigger (M4.5). Such an event has no
     session and no run."""
     received_at: Mapped[datetime] = _created_at()
+
+
+class TriggerDelivery(Base):
+    """One delivery to a trigger, accepted or not (docs/architecture.md, Section 12.2, M7.10).
+
+    The web app shows the rows as the delivery log of the trigger. ``trigger_events`` stays the
+    table of the accepted events and its unique key rejects a replay. A row has no payload. At
+    most ``MAX_DELIVERIES_PER_TRIGGER`` rows stay for each trigger. A user who sees the
+    workspace of the trigger reads the rows. Only the control plane writes the table."""
+
+    __tablename__ = "trigger_deliveries"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "trigger_id"], ["triggers.org_id", "triggers.id"], ondelete="CASCADE"
+        ),
+        CheckConstraint(_one_of("outcome", TRIGGER_OUTCOMES), name="outcome"),
+        CheckConstraint(
+            "delivery_id IS NULL OR char_length(delivery_id) <= 200", name="delivery_id_length"
+        ),
+        CheckConstraint("error IS NULL OR char_length(error) <= 500", name="error_length"),
+        Index(
+            "ix_trigger_deliveries_trigger_id_received_at", "trigger_id", text("received_at DESC")
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    trigger_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    delivery_id: Mapped[str | None] = mapped_column(Text)
+    """The ``webhook-id`` of the delivery, if the sender gave one."""
+    received_at: Mapped[datetime] = _created_at()
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    http_status: Mapped[int] = mapped_column(Integer, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    """A short text without a secret. ``None`` for an accepted delivery."""
+    test: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True for a test send from the web app."""
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    workflow_instance_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
 
 class Workflow(Base):

@@ -38,7 +38,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Model switch per session (`/model`) | `hermes_cli/commands.py` | `/model` starts a child session (lineage) with the new model and a new prefix. The old session keeps its frozen prefix. | Adapt | M1 |
 | Fallback model and credential pools | `agent/credential_pool*.py` | The model proxy retries on a second key or model of the same provider. | Adapt | M3 |
 | Prompt caching | `agent/prompt_caching*.py` | SDK caching plus the frozen prefix. Proxy records cache tokens. | SDK | M1 |
-| Reasoning effort settings | config `agent.reasoning_effort` | Profile setting passed to the SDK (`thinking` for Claude, `reasoning` for OpenAI). | SDK | M1 |
+| Reasoning effort settings | config `agent.reasoning_effort` | Profile setting `reasoning_effort` (`low`, `medium`, `high`, or the model default), set in the Harness section of the settings console. The adapters give it to the SDK (`effort` for Claude, `reasoning.effort` for OpenAI) (§17.7). | SDK | M7 (M7.10 done) |
 | Mixture of Agents (`hermes moa`) | `agent/moa_loop.py` | Not planned. Sub-agents cover most uses. | Defer | — |
 | Codex app-server runtime | `agent/transports/codex_app_server.py` | Not planned. A third runtime would use the same contract. | Skip | — |
 
@@ -164,7 +164,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. Since M3.2: "Always allow for me" on Slack and Telegram cards, chat proposals, and the timeout counts as deny (§9.4.2). | Adapt | M1, M3 (M3.2 done) |
 | Streaming edits to messages | `gateway/stream_consumer*.py` | Edit one message as text arrives, with rate limits per channel. | Adapt | M1 |
 | Slash command registry | `hermes_cli/commands.py` | One command registry for all channels (§11.1). | Adapt | M1 |
-| Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, session search, run traces, connections, and settings (M3.8, M3.12). Since M6.9: a setup guide, an admin area (usage, audit log, agent changes, curator reports, org keys, data controls), and help pages (§11.4, §17.6). | Adapt | M1 (minimal), M3 (M3.8 and M3.12 done), M6 (M6.9 done) |
+| Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, session search, run traces, connections, and settings (M3.8, M3.12). Since M6.9: a setup guide, an admin area (usage, audit log, agent changes, curator reports, org keys, data controls), and help pages (§11.4, §17.6). Since M7.10: one settings console with Setup, Slack, Roles, Harness, Tools, Sub-agents, Skills, MCP servers, Webhooks, Triggers, Schedules, Workflows, and Sessions (§17.7). | Adapt | M1 (minimal), M3 (M3.8 and M3.12 done), M6 (M6.9 done), M7 (M7.10 done) |
 | Chrome extension side panel | none | MV3 extension with chat bound to the current tab, Supabase sign-in, a WebSocket to the API, and "Ask about this page" as untrusted content (§14.2.1). | New | M5 (M5.4 done) |
 
 ## 10. Sub-agents and multi-agent work

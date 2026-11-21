@@ -318,8 +318,9 @@ function useAddForm<T>(
   problemOf: (draft: T) => string | null,
   onAdd: (draft: T) => Promise<void>,
   failed: string,
+  startOpen = false,
 ) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(startOpen);
   const [draft, setDraft] = useState<T>(empty);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -440,12 +441,23 @@ function NameFields({
 }
 
 /** The form to add a remote MCP server by URL. Only a workspace admin can send it. */
-function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) {
+export function AddServer({
+  onAdd,
+  startOpen = false,
+  onClose,
+}: {
+  onAdd: (draft: ServerDraft) => Promise<void>;
+  /** The settings console opens the form at once. */
+  startOpen?: boolean;
+  /** Called when the user cancels the form. */
+  onClose?: () => void;
+}) {
   const { open, setOpen, draft, edit, saving, error, close, submit } = useAddForm(
     EMPTY_SERVER,
     serverProblem,
     onAdd,
     "The server was not added.",
+    startOpen,
   );
 
   if (!open) {
@@ -462,7 +474,10 @@ function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) 
       error={error}
       saving={saving}
       onSubmit={submit}
-      onCancel={close}
+      onCancel={() => {
+        close();
+        onClose?.();
+      }}
     >
       <NameFields name={draft.name} title={draft.title} prefix="mcp" onChange={edit} />
       <label className="field">
@@ -524,12 +539,23 @@ function AddServer({ onAdd }: { onAdd: (draft: ServerDraft) => Promise<void> }) 
  * an egress allowlist. A workspace admin can add a pinned package. Only the org owner can add a
  * custom command.
  */
-function AddStdio({ onAdd }: { onAdd: (draft: StdioDraft) => Promise<void> }) {
+export function AddStdio({
+  onAdd,
+  startOpen = false,
+  onClose,
+}: {
+  onAdd: (draft: StdioDraft) => Promise<void>;
+  /** The settings console opens the form at once. */
+  startOpen?: boolean;
+  /** Called when the user cancels the form. */
+  onClose?: () => void;
+}) {
   const { open, setOpen, draft, edit, saving, error, close, submit } = useAddForm(
     EMPTY_STDIO,
     stdioProblem,
     onAdd,
     "The server was not added.",
+    startOpen,
   );
 
   if (!open) {
@@ -547,7 +573,10 @@ function AddStdio({ onAdd }: { onAdd: (draft: StdioDraft) => Promise<void> }) {
       saving={saving}
       savingLabel="Installing and testing"
       onSubmit={submit}
-      onCancel={close}
+      onCancel={() => {
+        close();
+        onClose?.();
+      }}
     >
       <NameFields name={draft.name} title={draft.title} prefix="mcp" onChange={edit} />
       <label className="field">
@@ -993,7 +1022,7 @@ function ScopeRow({
   );
 }
 
-function ConnectForm({
+export function ConnectForm({
   connector,
   connection,
   onSaved,
@@ -1068,7 +1097,7 @@ function ConnectForm({
 }
 
 /** What a connector host runs and what it can reach. */
-function HostedInfo({ hosted }: { hosted: HostedCustom }) {
+export function HostedInfo({ hosted }: { hosted: HostedCustom }) {
   const egress = hosted.egress.length === 0 ? "only the package registry" : hosted.egress.join(", ");
   return (
     <p className={styles.meta}>
@@ -1079,7 +1108,7 @@ function HostedInfo({ hosted }: { hosted: HostedCustom }) {
 }
 
 /** The tools of a remote MCP server, and the filters that turn tools on and off. */
-function McpTools({ connection, onSaved }: { connection: Connection; onSaved: (connection: Connection) => void }) {
+export function McpTools({ connection, onSaved }: { connection: Connection; onSaved: (connection: Connection) => void }) {
   const api = useApi();
   const mcp = connection.mcp;
   const [include, setInclude] = useState(() => (mcp?.include ?? []).join("\n"));

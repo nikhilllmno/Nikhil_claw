@@ -121,6 +121,8 @@ async def test_a_member_reads_the_profile(client: httpx.AsyncClient, tenant: Ten
         "toolsets",
         "group_toolsets",
         "subagents",
+        "budget",
+        "reasoning_effort",
         "updated_at",
         "editable",
         "options",
@@ -886,3 +888,205 @@ def test_extension_ids_are_exact() -> None:
     ):
         with pytest.raises(ValueError, match="not a Chrome extension id"):
             check_extension_ids([value])
+
+
+# -- budget and reasoning effort (M7.10) -----------------------------------------------------
+
+
+async def set_plan(engine: AsyncEngine, tenant: Tenant, plan: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE orgs SET plan = :plan WHERE id = :id"), {"plan": plan, "id": tenant.org}
+        )
+
+
+async def test_the_profile_shows_the_budget_the_effort_and_the_caps(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    body = (await client.get(agent(tenant), headers=mia(tenant))).json()
+    assert body["budget"] == {
+        "max_turns": None,
+        "max_cost_usd": None,
+        "max_wall_time_s": None,
+        "max_tokens": None,
+    }
+    assert body["reasoning_effort"] is None
+    assert body["options"]["reasoning_efforts"] == ["low", "medium", "high"]
+    assert body["options"]["budget_caps"] == {
+        "max_turns": None,
+        "max_cost_usd": None,
+        "max_wall_time_s": None,
+    }, "the team plan has no cap"
+    await set_plan(engine, tenant, "free")
+    caps = (await client.get(agent(tenant), headers=mia(tenant))).json()["options"]["budget_caps"]
+    assert caps == {"max_turns": 40, "max_cost_usd": "1.00", "max_wall_time_s": 900.0}
+
+
+async def test_an_admin_sets_the_budget_and_the_effort(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    budget = {"max_turns": 30, "max_cost_usd": "2.50", "max_wall_time_s": 600, "max_tokens": 50000}
+
+    response = await client.patch(
+        agent(tenant), headers=admin, json={"budget": budget, "reasoning_effort": "high"}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["budget"] == {**budget, "max_wall_time_s": 600.0}
+    assert body["reasoning_effort"] == "high"
+    row = await stored(engine, tenant)
+    assert (row.reasoning_effort, row.budget["max_cost_usd"]) == ("high", "2.50")
+    entry = (await audits(engine, tenant))[-1]
+    assert entry.details["fields"] == ["budget", "reasoning_effort"]
+    changes = (await client.get(f"{agent(tenant)}/changes", headers=admin)).json()
+    assert changes[0]["kind"] == "profile"
+    assert set(changes[0]["after"]) == {"budget", "reasoning_effort"}
+    assert changes[0]["after"]["reasoning_effort"] == "high"
+    assert changes[0]["before"] == {"budget": {}, "reasoning_effort": None}
+
+
+async def test_a_missing_key_or_null_is_no_limit_and_null_effort_is_the_default(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    await client.patch(
+        agent(tenant),
+        headers=admin,
+        json={"budget": {"max_turns": 5, "max_cost_usd": "1"}, "reasoning_effort": "low"},
+    )
+
+    response = await client.patch(
+        agent(tenant),
+        headers=admin,
+        json={"budget": {"max_turns": None, "max_wall_time_s": 60}, "reasoning_effort": None},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["budget"] == {
+        "max_turns": None,
+        "max_cost_usd": None,
+        "max_wall_time_s": 60.0,
+        "max_tokens": None,
+    }
+    assert response.json()["reasoning_effort"] is None
+    assert (await stored(engine, tenant)).reasoning_effort is None
+
+
+async def test_the_same_budget_and_effort_write_nothing(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    body = {"budget": {"max_cost_usd": "1.00"}, "reasoning_effort": "medium"}
+    await client.patch(agent(tenant), headers=admin, json=body)
+    count = len(await audits(engine, tenant))
+
+    again = {"budget": {"max_cost_usd": "1.0"}, "reasoning_effort": "medium"}
+    response = await client.patch(agent(tenant), headers=admin, json=again)
+
+    assert response.status_code == 200
+    assert len(await audits(engine, tenant)) == count
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"budget": {"max_turns": 0}},
+        {"budget": {"max_turns": 10_001}},
+        {"budget": {"max_turns": 1.5}},
+        {"budget": {"max_cost_usd": "-1"}},
+        {"budget": {"max_cost_usd": "abc"}},
+        {"budget": {"max_wall_time_s": 86_401}},
+        {"budget": {"max_wall_time_s": 0}},
+        {"budget": {"max_tokens": 0}},
+        {"budget": {"max_money": 1}},
+        {"budget": {"max_turns": True}},
+        {"reasoning_effort": "extreme"},
+        {"budget": None},
+        {"reasoning_effort": None, "name": None},
+    ],
+)
+async def test_a_bad_budget_or_effort_gets_422(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, body: dict[str, Any]
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    response = await client.patch(agent(tenant), headers=admin, json=body)
+    assert response.status_code == 422, response.text
+    row = await stored(engine, tenant)
+    assert (row.budget, row.reasoning_effort) == ({}, None)
+
+
+async def test_a_value_over_the_cap_of_the_plan_gets_422(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    await set_plan(engine, tenant, "free")
+    full = {"max_turns": 40, "max_cost_usd": "1.00", "max_wall_time_s": 900}
+    for budget in (
+        {**full, "max_turns": 41},
+        {**full, "max_cost_usd": "1.01"},
+        {**full, "max_wall_time_s": 901},
+    ):
+        response = await client.patch(agent(tenant), headers=admin, json={"budget": budget})
+        assert response.status_code == 422, budget
+        assert "free plan" in response.json()["detail"]
+    ok = {"max_turns": 40, "max_cost_usd": "1.00", "max_wall_time_s": 900}
+    assert (
+        await client.patch(agent(tenant), headers=admin, json={"budget": ok})
+    ).status_code == 200
+    # max_tokens has no cap on any plan, so it may stay null.
+    assert (await stored(engine, tenant)).budget.get("max_tokens") is None
+
+
+async def test_a_capped_plan_refuses_a_missing_or_null_limit_for_a_capped_key(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    await set_plan(engine, tenant, "free")
+    full = {"max_turns": 40, "max_cost_usd": "1.00", "max_wall_time_s": 900}
+    for key, cap in (("max_turns", "40"), ("max_cost_usd", "1.00"), ("max_wall_time_s", "900.0")):
+        for budget in (
+            {k: v for k, v in full.items() if k != key},
+            {**full, key: None},
+        ):
+            response = await client.patch(agent(tenant), headers=admin, json={"budget": budget})
+            assert response.status_code == 422, (key, budget)
+            assert response.json()["detail"] == (
+                f"The plan of the org needs a limit for {key}: at most {cap}."
+            )
+    assert (
+        await client.patch(agent(tenant), headers=admin, json={"budget": {}})
+    ).status_code == 422
+    assert (await stored(engine, tenant)).budget == {}
+    ok = await client.patch(agent(tenant), headers=admin, json={"budget": full | {"max_tokens": 9}})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["budget"]["max_tokens"] == 9
+    # A change of another field does not check the budget.
+    other = await client.patch(agent(tenant), headers=admin, json={"reasoning_effort": "low"})
+    assert other.status_code == 200
+
+
+async def test_a_member_cannot_change_the_budget(client: httpx.AsyncClient, tenant: Tenant) -> None:
+    response = await client.patch(
+        agent(tenant), headers=mia(tenant), json={"budget": {"max_turns": 3}}
+    )
+    assert response.status_code == 403
+
+
+async def test_a_revert_puts_the_budget_and_the_effort_back(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await admin_headers(engine, tenant)
+    await client.patch(
+        agent(tenant),
+        headers=admin,
+        json={"budget": {"max_turns": 9}, "reasoning_effort": "high"},
+    )
+    change = (await client.get(f"{agent(tenant)}/changes", headers=admin)).json()[0]
+
+    response = await client.post(f"{agent(tenant)}/changes/{change['id']}/revert", headers=admin)
+
+    assert response.status_code == 200, response.text
+    row = await stored(engine, tenant)
+    assert (row.budget, row.reasoning_effort) == ({}, None)

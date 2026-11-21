@@ -20,6 +20,8 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any, Final
 
 from sqlalchemy import func, insert, select, text, update
@@ -30,6 +32,7 @@ from sama.db.models import AgentProfile, AuditEntry, Membership, Org, ProfileCha
 from sama.gate.decide import TOOLSETS
 from sama.orgs.plans import plan_of
 from sama.runtime.contract import (
+    REASONING_EFFORTS,
     SUBAGENT_DESCRIPTION_MAX_CHARS,
     SUBAGENT_MAX_TURNS,
     SUBAGENT_NAME_MAX_CHARS,
@@ -63,15 +66,24 @@ PROFILE_FIELDS: Final = (
     "subagents",
     "toolsets",
     "group_toolsets",
+    "budget",
+    "reasoning_effort",
 )
 """The fields of a profile that an edit, a proposal, or a revert can change."""
+ADMIN_ONLY_FIELDS: Final = ("budget", "reasoning_effort")
+"""The fields that only a person changes in the web app. The agent cannot propose them: an agent
+must not raise its own budget."""
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "soul": ("soul",),
-    "profile": ("name", "runtime", "model", "subagents"),
+    "profile": ("name", "runtime", "model", "subagents", "budget", "reasoning_effort"),
     "toolsets": ("toolsets", "group_toolsets"),
     "policy": ("rules",),
 }
 """The fields of each kind of change. ``rules`` are the policy rules of the profile."""
+BUDGET_KEYS: Final = ("max_turns", "max_cost_usd", "max_wall_time_s", "max_tokens")
+"""The keys of the run budget of a profile (``sama.runtime.contract.Budget``)."""
+MAX_TURNS_LIMIT: Final = 10_000
+MAX_WALL_TIME_LIMIT: Final = 86_400.0
 MAX_PROFILES_PER_ORG: Final = 20
 """An org has at most this many agent profiles (M6.9). The web app makes new profiles."""
 _CREATE_LOCK: Final = "sama.profiles.create"
@@ -89,6 +101,15 @@ class ProfileLimitError(Exception):
     """The org has ``MAX_PROFILES_PER_ORG`` profiles. The text is safe to show."""
 
 
+class Unset(Enum):
+    """The marker of a field that a change does not set. ``None`` is a value for some fields."""
+
+    UNSET = "unset"
+
+
+UNSET: Final = Unset.UNSET
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileChanges:
     """The fields to change. ``None`` means: keep the value."""
@@ -100,16 +121,28 @@ class ProfileChanges:
     toolsets: Sequence[str] | None = None
     subagents: Sequence[Any] | None = None
     """The raw JSON of the specs. ``parse_subagents`` checks it."""
+    budget: Mapping[str, Any] | None = None
+    """The whole run budget. A key that is missing or ``None`` is no limit."""
+    reasoning_effort: str | Unset | None = UNSET
+    """``None`` sets the default of the model, so ``None`` is a value and ``UNSET`` keeps it."""
 
 
-def profile_options(runtime: RuntimeKind) -> dict[str, Any]:
-    """What an editor of a profile with this runtime can choose, and the limits."""
+def profile_options(runtime: RuntimeKind, plan: str | None = None) -> dict[str, Any]:
+    """What an editor of a profile with this runtime can choose, and the limits. ``plan`` is the
+    plan of the org: its run budget gives ``budget_caps``."""
+    caps = plan_of(plan).run_budget if plan is not None else {}
     return {
         "toolsets": [
             {"name": name, "tools": sorted(tools)} for name, tools in sorted(TOOLSETS.items())
         ],
         "models": known_models(runtime),
         "subagents": supports_subagents(runtime),
+        "reasoning_efforts": list(REASONING_EFFORTS),
+        "budget_caps": {
+            "max_turns": caps.get("max_turns"),
+            "max_cost_usd": None if caps.get("max_cost_usd") is None else str(caps["max_cost_usd"]),
+            "max_wall_time_s": caps.get("max_wall_time_s"),
+        },
         "runtimes": [
             {
                 "name": kind.value,
@@ -138,6 +171,102 @@ def _check_toolsets(toolsets: Sequence[str]) -> list[str]:
     if unknown:
         raise ProfileError("the toolset is not known: " + ", ".join(sorted(set(unknown))[:5]))
     return list(toolsets)
+
+
+def _positive_int(key: str, value: Any, limit: int | None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise ProfileError(f"{key} is a whole number")
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        raise ProfileError(f"{key} is a whole number") from None
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ProfileError(f"{key} is a whole number")
+    if number <= 0:
+        raise ProfileError(f"{key} is more than 0")
+    if limit is not None and number > limit:
+        raise ProfileError(f"{key} is at most {limit}")
+    return int(number)
+
+
+def _positive_decimal(key: str, value: Any) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, int | float | str | Decimal):
+        raise ProfileError(f"{key} is a number")
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        raise ProfileError(f"{key} is a number") from None
+    if not number.is_finite():
+        raise ProfileError(f"{key} is a number")
+    if number <= 0:
+        raise ProfileError(f"{key} is more than 0")
+    return number
+
+
+def check_budget(raw: Mapping[str, Any], plan: str | None) -> dict[str, Any]:
+    """The stored form of a run budget: only the keys with a limit. A key that is missing or
+    ``None`` is no limit, but not when the plan of the org has a cap for the key: then the
+    budget must give a value, so an org cannot remove the cap of its plan. Every value is more
+    than 0, ``max_turns`` is at most ``MAX_TURNS_LIMIT``, and ``max_wall_time_s`` is at most
+    ``MAX_WALL_TIME_LIMIT``. A value must not be more than the cap of the plan of the org
+    (``sama.orgs.plans``). Raises ``ProfileError``."""
+    unknown = set(raw) - set(BUDGET_KEYS)
+    if unknown:
+        raise ProfileError("the budget key is not known: " + ", ".join(sorted(unknown)[:5]))
+    caps = plan_of(plan).run_budget if plan is not None else {}
+    out: dict[str, Any] = {}
+    for key in BUDGET_KEYS:
+        value = raw.get(key)
+        cap = caps.get(key)
+        if value is None:
+            if cap is not None:
+                raise ProfileError(f"The plan of the org needs a limit for {key}: at most {cap}.")
+            continue
+        if key in ("max_turns", "max_tokens"):
+            checked: Any = _positive_int(
+                key, value, MAX_TURNS_LIMIT if key == "max_turns" else None
+            )
+            stored: Any = checked
+        elif key == "max_cost_usd":
+            checked = _positive_decimal(key, value)
+            stored = format(checked, "f")
+        else:
+            checked = _positive_decimal(key, value)
+            if checked > Decimal(str(MAX_WALL_TIME_LIMIT)):
+                raise ProfileError(f"{key} is at most {MAX_WALL_TIME_LIMIT:g}")
+            stored = float(checked)
+        if cap is not None and Decimal(str(checked)) > Decimal(str(cap)):
+            raise ProfileError(f"{key} is at most {cap} on the {plan} plan")
+        out[key] = stored
+    return out
+
+
+def budget_json(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The run budget as the web app and the history show it: only the keys with a limit, with
+    the cost as text. A stored value that is not a number is left out."""
+    out: dict[str, Any] = {}
+    for key in BUDGET_KEYS:
+        value = (raw or {}).get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = Decimal(str(value))
+        except InvalidOperation:
+            continue
+        if key == "max_cost_usd":
+            out[key] = format(number, "f")
+        elif key == "max_wall_time_s":
+            out[key] = float(number)
+        else:
+            out[key] = int(number)
+    return out
+
+
+def _same_budget(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """True when two budgets have the same limits (``1.0`` and ``1.00`` are the same)."""
+    return {k: Decimal(str(v)) for k, v in budget_json(left).items()} == {
+        k: Decimal(str(v)) for k, v in budget_json(right).items()
+    }
 
 
 def planned_values(profile: LockedProfile, after: Mapping[str, Any]) -> dict[str, Any]:
@@ -202,6 +331,19 @@ def planned_values(profile: LockedProfile, after: Mapping[str, Any]) -> dict[str
             toolsets = _check_toolsets([str(name) for name in after[field] or []])
             if toolsets != getattr(profile, field):
                 values[field] = toolsets
+    if "budget" in after:
+        raw = after["budget"]
+        if not isinstance(raw, Mapping):
+            raise ProfileError("the budget is an object")
+        budget = check_budget(raw, profile.plan)
+        if not _same_budget(budget, profile.budget or {}):
+            values["budget"] = budget
+    if "reasoning_effort" in after:
+        effort = after["reasoning_effort"]
+        if effort is not None and effort not in REASONING_EFFORTS:
+            raise ProfileError("the reasoning effort is low, medium, or high")
+        if effort != profile.reasoning_effort:
+            values["reasoning_effort"] = effort
     final_toolsets = values.get("toolsets", profile.toolsets)
     if "subagents" in after:
         specs = parse_subagents(list(after["subagents"] or []))
@@ -221,6 +363,8 @@ def profile_value(profile: LockedProfile, field: str) -> Any:
     """The JSON value of a field of the profile now."""
     if field == "runtime":
         return profile.runtime.value
+    if field == "budget":
+        return budget_json(profile.budget)
     value = getattr(profile, field)
     return list(value) if isinstance(value, list) else value
 
@@ -288,6 +432,10 @@ async def update_profile(
         after["toolsets"] = list(changes.toolsets)
     if changes.subagents is not None:
         after["subagents"] = list(changes.subagents)
+    if changes.budget is not None:
+        after["budget"] = dict(changes.budget)
+    if not isinstance(changes.reasoning_effort, Unset):
+        after["reasoning_effort"] = changes.reasoning_effort
     if "soul" in after:
         # Checked before the lock, so a bad soul does not wait for the lock.
         if len(after["soul"]) > SOUL_MAX_CHARS:

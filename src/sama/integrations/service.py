@@ -62,6 +62,7 @@ from sama.gateway.whatsapp_providers import (
     build_provider,
 )
 from sama.vault.crypto import VaultError
+from sama.vault.redact import default_redactor
 from sama.vault.store import SecretName, Vault
 
 log: Final = logging.getLogger("sama.integrations")
@@ -828,6 +829,76 @@ class Integrations:
 
     # -- all kinds --------------------------------------------------------------------------
 
+    async def check(
+        self, org_id: uuid.UUID, kind: str, user_id: uuid.UUID
+    ) -> tuple[bool, str | None, IntegrationView]:
+        """Asks the chat app of ``kind`` if its stored token still works: ``getMe`` for Telegram,
+        ``auth.test`` for Slack. Returns ``(ok, detail, view)``. ``detail`` is a short text for
+        a failure and ``None`` for a success. A failure sets ``last_error`` of the row. A success
+        clears ``last_error`` of an ``active`` row. The row keeps its status, because the check
+        does not register a webhook again. Writes the audit entry ``integration.checked``.
+        Raises ``IntegrationError`` with ``404`` when the org has no integration of this kind.
+        """
+        vault, _ = self._require()
+        row = await self._read(org_id, kind)
+        if row is None:
+            raise IntegrationError("the org has no such integration", status_code=404)
+        detail = await self._probe(vault, org_id, kind)
+        ok = detail is None
+        values: dict[str, Any] = {"last_error": detail}
+        if ok and row.status != "active":
+            values = {}
+        async with self._engine.begin() as connection:
+            if values:
+                await connection.execute(
+                    update(Integration)
+                    .where(Integration.org_id == org_id, Integration.id == row.id)
+                    .values(**values, updated_at=func.now())
+                )
+            await _audit(
+                connection, org_id, user_id, "integration.checked", row.id, {"kind": kind, "ok": ok}
+            )
+        fresh = await self._read(org_id, kind)
+        if fresh is None:
+            raise IntegrationError("the org has no such integration", status_code=404)
+        return ok, detail, fresh
+
+    async def _read(self, org_id: uuid.UUID, kind: str) -> IntegrationView | None:
+        async with self._engine.connect() as connection:
+            found = (
+                await connection.execute(
+                    select(*_VIEW).where(Integration.org_id == org_id, Integration.kind == kind)
+                )
+            ).one_or_none()
+        return None if found is None else IntegrationView(*found)
+
+    async def _probe(self, vault: Vault, org_id: uuid.UUID, kind: str) -> str | None:
+        """The answer of the chat app to its stored token: ``None`` when the token works, else a
+        short text without a secret."""
+        try:
+            token = await vault.get(org_id, _SECRETS[kind][0], fresh=True)
+        except VaultError:
+            return "the stored token cannot be read"
+        if token is None:
+            return "the app has no bot token yet"
+        if kind == "telegram":
+            telegram = self._telegram_client(token)
+            try:
+                await telegram.get_me()
+            except TelegramError as error:
+                return _short_error("Telegram did not accept the token", error)
+            finally:
+                await telegram.aclose()
+            return None
+        slack = self._slack_client(token)
+        try:
+            await slack.auth_test()
+        except SlackError as error:
+            return _short_error("Slack did not accept the token", error)
+        finally:
+            await slack.aclose()
+        return None
+
     async def disconnect(self, org_id: uuid.UUID, kind: str, user_id: uuid.UUID) -> bool:
         """Removes the integration of ``kind``. False when the org has none."""
         vault, _ = self._require()
@@ -952,6 +1023,13 @@ _SECRETS: Final = {
     "email": (SecretName.SENDGRID_API_KEY, SecretName.EMAIL_LINK_SECRET),
 }
 _NOUNS: Final = {"whatsapp": "WhatsApp number", "email": "email address"}
+
+
+def _short_error(prefix: str, error: Exception) -> str:
+    """A failure text for ``last_error``: the reason of the app, with known secrets removed and
+    cut to ``MAX_ERROR_CHARS``."""
+    reason = default_redactor().text(str(error))
+    return f"{prefix}: {reason}"[:MAX_ERROR_CHARS]
 
 
 def _org_key(org_id: uuid.UUID, kind: str) -> str:

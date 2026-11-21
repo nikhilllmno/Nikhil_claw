@@ -3,7 +3,7 @@
 // The Jobs screen: the scheduled jobs of the org, a form to make or change one, and the detail of
 // one job with its recent fires and delivery receipts.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { type AgentProfileSummary, type Job, type JobFire, type SchedulePreview, errorText } from "@/lib/api";
 import {
   type JobAction,
@@ -50,6 +50,30 @@ function Badge({ tone, children }: { tone: Tone; children: React.ReactNode }) {
   return <span className={TONE_CLASS[tone]}>{children}</span>;
 }
 
+/**
+ * True inside the settings console (M7.10): the screen has no page frame and its titles are `h2`,
+ * because the section of the console has the `h1`.
+ */
+const EmbeddedContext = createContext(false);
+
+/** The class of the frame of a view: the page, or a plain column inside the console. */
+function useFrame() {
+  return useContext(EmbeddedContext) ? styles.embedded : styles.page;
+}
+
+/** The title of a view. It is an `h2` inside the console. */
+function Title({ children, ...props }: React.ComponentPropsWithRef<"h1">) {
+  return useContext(EmbeddedContext) ? (
+    <h2 {...props} className={styles.title}>
+      {children}
+    </h2>
+  ) : (
+    <h1 {...props} className={styles.title}>
+      {children}
+    </h1>
+  );
+}
+
 /** Puts the focus on a heading when a view opens, so that a screen reader reads the new view. */
 function useHeadingFocus() {
   const ref = useRef<HTMLHeadingElement>(null);
@@ -59,7 +83,7 @@ function useHeadingFocus() {
   return ref;
 }
 
-export function Jobs() {
+export function Jobs({ embedded = false, canCreate = true }: { embedded?: boolean; canCreate?: boolean } = {}) {
   const { me, meError, reloadMe, workspaceId, orgOfWorkspace } = useData();
   const org = orgOfWorkspace(workspaceId);
 
@@ -73,10 +97,22 @@ export function Jobs() {
       />
     );
   }
-  return <JobsScreen key={org.id} orgId={org.id} workspaceId={workspaceId} />;
+  return (
+    <EmbeddedContext.Provider value={embedded}>
+      <JobsScreen key={org.id} orgId={org.id} workspaceId={workspaceId} canCreate={canCreate} />
+    </EmbeddedContext.Provider>
+  );
 }
 
-function JobsScreen({ orgId, workspaceId }: { orgId: string; workspaceId: string }) {
+function JobsScreen({
+  orgId,
+  workspaceId,
+  canCreate,
+}: {
+  orgId: string;
+  workspaceId: string;
+  canCreate: boolean;
+}) {
   const api = useApi();
   const { profilesFor } = useData();
   const [view, setView] = useState<View>({ kind: "list" });
@@ -136,7 +172,7 @@ function JobsScreen({ orgId, workspaceId }: { orgId: string; workspaceId: string
       jobs={jobs}
       error={error}
       onRetry={reload}
-      onNew={() => setView({ kind: "new" })}
+      onNew={canCreate ? () => setView({ kind: "new" }) : null}
       onOpen={(job) => setView({ kind: "detail", id: job.id })}
     />
   );
@@ -154,25 +190,30 @@ function JobList({
   jobs: Job[] | null;
   error: string | null;
   onRetry: () => void;
-  onNew: () => void;
+  /** `null`: the user cannot make jobs, so the list has no New job button. */
+  onNew: (() => void) | null;
   onOpen: (job: Job) => void;
 }) {
   const headingRef = useHeadingFocus();
+  const frame = useFrame();
   const shown = useMemo(() => sortJobs((jobs ?? []).filter((j) => j.status !== "removed")), [jobs]);
   const waiting = shown.filter((j) => j.status === "pending_approval").length;
 
   return (
-    <div className={styles.page}>
+    <div className={frame}>
       <header className={styles.header}>
         <div className={styles.headerRow}>
-          <h1 className={styles.title} ref={headingRef} tabIndex={-1}>
+          <Title ref={headingRef} tabIndex={-1}>
             Jobs
-          </h1>
-          <button type="button" className="btn btn-primary" onClick={onNew}>
-            New job
-          </button>
+          </Title>
+          {onNew ? (
+            <button type="button" className="btn btn-primary" onClick={onNew}>
+              New job
+            </button>
+          ) : null}
         </div>
         <p className={styles.meta}>A job runs the agent, or a script, on a schedule and sends the result.</p>
+        {onNew ? null : <p className={styles.meta}>Your role cannot make jobs. An org admin can change this.</p>}
       </header>
 
       {error && jobs === null ? (
@@ -182,10 +223,16 @@ function JobList({
       ) : shown.length === 0 ? (
         <div className="state">
           <h2>No jobs yet</h2>
-          <p>Make a job to run the agent on a schedule, for example every weekday at 9am.</p>
-          <button type="button" className="btn btn-primary" onClick={onNew}>
-            New job
-          </button>
+          <p>
+            {onNew
+              ? "Make a job to run the agent on a schedule, for example every weekday at 9am."
+              : "Nobody made a job yet."}
+          </p>
+          {onNew ? (
+            <button type="button" className="btn btn-primary" onClick={onNew}>
+              New job
+            </button>
+          ) : null}
         </div>
       ) : (
         <>
@@ -257,6 +304,7 @@ function JobDetail({
 }) {
   const api = useApi();
   const headingRef = useHeadingFocus();
+  const frame = useFrame();
   const load = useMemo(() => () => api.getJob(orgId, jobId), [api, orgId, jobId]);
   const { data: job, setData: setJob, error: loadError, reload } = useLoad(load, "Could not load the job.");
   // The name of the action that runs, or "approve".
@@ -267,7 +315,7 @@ function JobDetail({
 
   if (loadError && job === null) {
     return (
-      <div className={styles.page}>
+      <div className={frame}>
         <button type="button" className={styles.back} onClick={onBack}>
           Back to jobs
         </button>
@@ -332,15 +380,15 @@ function JobDetail({
   const tz = job.schedule.tz;
 
   return (
-    <div className={styles.page}>
+    <div className={frame}>
       <header className={styles.header}>
         <button type="button" className={styles.back} onClick={onBack}>
           Back to jobs
         </button>
         <div className={styles.headerRow}>
-          <h1 className={styles.title} ref={headingRef} tabIndex={-1}>
+          <Title ref={headingRef} tabIndex={-1}>
             {job.name}
-          </h1>
+          </Title>
           <Badge tone={statusTone(job.status)}>{statusLabel(job.status)}</Badge>
         </div>
         <p className={styles.meta}>
@@ -628,6 +676,7 @@ function JobForm({
 }) {
   const api = useApi();
   const headingRef = useHeadingFocus();
+  const frame = useFrame();
   const initial = useMemo<JobDraft | null>(() => (job === null ? null : toDraft(job)), [job]);
   // The draft when the form opened. A new form starts with the time zone of the browser.
   const [baseline] = useState<JobDraft>(() => initial ?? newDraft(browserTimeZone(), profiles[0]?.id ?? ""));
@@ -678,14 +727,14 @@ function JobForm({
 
   const tz = draft.tz.trim() || undefined;
   return (
-    <form className={styles.page} onSubmit={save}>
+    <form className={frame} onSubmit={save}>
       <header className={styles.header}>
         <button type="button" className={styles.back} onClick={onCancel}>
           {job === null ? "Back to jobs" : "Back to the job"}
         </button>
-        <h1 className={styles.title} ref={headingRef} tabIndex={-1}>
+        <Title ref={headingRef} tabIndex={-1}>
           {job === null ? "New job" : `Edit ${job.name}`}
-        </h1>
+        </Title>
         {job !== null && job.status === "pending_approval" ? (
           <p className="alert alert-warning" role="note">
             This job waits for your approval. Your change saves a new version, and you approve it.

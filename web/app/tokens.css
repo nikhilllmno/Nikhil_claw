@@ -45,6 +45,8 @@
   --topbar-height: 3.25rem;
   --content-max: 46rem;
   --settings-max: 52rem;
+  --console-max: 76rem;
+  --console-nav-width: 13rem;
   --touch-target: 2.5rem;
   --field-basis: 14rem;
   --editor-min-height: 16rem;

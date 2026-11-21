@@ -28,6 +28,7 @@ from sama.db.models import (
     Run,
     Session,
     Trigger,
+    TriggerDelivery,
     TriggerEvent,
 )
 from sama.orchestrator.queue import RunQueue
@@ -683,3 +684,282 @@ async def test_a_failed_create_keeps_the_instance_of_a_create_in_flight(
     assert refused.status_code in (404, 409, 422), refused.text
     assert fake.deleted_triggers == []
     assert list(fake.triggers) == ["ti_1"]
+
+
+# -- the delivery log and the test send (M7.10) ----------------------------------------------
+
+
+async def deliveries(
+    client: httpx.AsyncClient, tenant: Tenant, trigger_id: str, **params: Any
+) -> list[dict[str, Any]]:
+    response = await client.get(
+        f"{path(tenant)}/{trigger_id}/deliveries", headers=mia(tenant), params=params
+    )
+    assert response.status_code == 200, response.text
+    body: list[dict[str, Any]] = response.json()
+    return body
+
+
+async def test_each_delivery_to_a_known_trigger_has_a_row_in_the_log(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, key = await make_hook(hooks, tenant)
+    target = f"/triggers/{trigger['id']}/webhook"
+    body = b'{"n": 1}'
+    accepted = await deliver(hooks, trigger["id"], key, {"n": 1}, delivery="msg_1")
+    await deliver(hooks, trigger["id"], key, {"n": 1}, delivery="msg_1")
+    forged = signed(signature.standard_key(signature.new_secret()), body, delivery="msg_bad")
+    assert (await hooks.post(target, content=body, headers=forged)).status_code == 401
+    assert (await hooks.post(target, content=body, headers={})).status_code == 401
+    garbled = b"not json"
+    headers = signed(key, garbled, delivery="msg_garbled")
+    assert (await hooks.post(target, content=garbled, headers=headers)).status_code == 400
+    await hooks.patch(
+        f"{path(tenant)}/{trigger['id']}", headers=mia(tenant), json={"status": "disabled"}
+    )
+    off = await deliver(hooks, trigger["id"], key, {}, delivery="msg_off")
+    assert (accepted.status_code, off.status_code) == (202, 410)
+    unknown = await hooks.post(f"/triggers/{uuid.uuid4()}/webhook", content=body, headers={})
+    assert unknown.status_code == 401
+
+    log = await deliveries(hooks, tenant, trigger["id"])
+
+    assert [(row["outcome"], row["http_status"], row["delivery_id"]) for row in log] == [
+        ("disabled", 410, "msg_off"),
+        ("bad_body", 400, "msg_garbled"),
+        ("bad_signature", 401, None),
+        ("bad_signature", 401, "msg_bad"),
+        ("duplicate", 200, "msg_1"),
+        ("accepted", 202, "msg_1"),
+    ]
+    assert all(row["test"] is False for row in log)
+    newest = log[0]
+    assert set(newest) == {
+        "id",
+        "delivery_id",
+        "received_at",
+        "outcome",
+        "http_status",
+        "error",
+        "test",
+        "session_id",
+        "run_id",
+        "workflow_instance_id",
+    }
+    assert newest["error"] == "the trigger is disabled"
+    first = log[-1]
+    [run] = await runs_of(engine, trigger["id"])
+    assert (first["run_id"], first["error"]) == (str(run.id), None)
+    assert first["session_id"] is not None
+    assert first["workflow_instance_id"] is None
+    assert len(await deliveries(hooks, tenant, trigger["id"], limit=2)) == 2
+    # The unknown id has no row, and the log has no secret.
+    assert trigger["secret"] not in json.dumps(log)
+
+
+async def test_a_rate_limited_delivery_has_a_row(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, key = await make_hook(hooks, tenant)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Org).where(Org.id == tenant.org).values(limits={"user_messages_per_minute": 1})
+        )
+    await deliver(hooks, trigger["id"], key, {"n": 1})
+    limited = await deliver(hooks, trigger["id"], key, {"n": 2}, delivery="msg_late")
+    assert limited.status_code == 429
+
+    log = await deliveries(hooks, tenant, trigger["id"])
+
+    assert [(row["outcome"], row["http_status"]) for row in log] == [
+        ("rate_limited", 429),
+        ("accepted", 202),
+    ]
+    assert log[0]["delivery_id"] == "msg_late"
+    assert log[0]["error"]
+
+
+async def test_the_log_keeps_at_most_200_rows_for_each_trigger(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, key = await make_hook(hooks, tenant)
+    other, _ = await make_hook(hooks, tenant, name="Other")
+    await deliver(hooks, other["id"], key, {}, delivery="msg_other")
+    for number in range(203):
+        body = b"{}"
+        wrong = signed(b"k" * 32, body, delivery=f"msg_{number}")
+        await hooks.post(f"/triggers/{trigger['id']}/webhook", content=body, headers=wrong)
+
+    async with engine.connect() as connection:
+        counts = dict(
+            (
+                await connection.execute(
+                    select(TriggerDelivery.trigger_id, func.count()).group_by(
+                        TriggerDelivery.trigger_id
+                    )
+                )
+            ).all()
+        )
+    assert counts[uuid.UUID(trigger["id"])] == 200
+    assert counts[uuid.UUID(other["id"])] == 1
+    newest = await deliveries(hooks, tenant, trigger["id"], limit=100)
+    assert newest[0]["delivery_id"] == "msg_202"
+    assert len(newest) == 100
+
+
+async def test_the_log_is_hidden_from_a_user_who_cannot_see_the_trigger(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, _ = await make_hook(hooks, tenant)
+    outsider = bearer(await add_user(engine, tenant, workspace_member=False))
+    url = f"{path(tenant)}/{trigger['id']}/deliveries"
+    assert (await hooks.get(url, headers=outsider)).status_code == 404
+    for limit in (0, 101):
+        response = await hooks.get(url, headers=mia(tenant), params={"limit": limit})
+        assert response.status_code == 422
+    missing = f"{path(tenant)}/{uuid.uuid4()}/deliveries"
+    assert (await hooks.get(missing, headers=mia(tenant))).status_code == 404
+
+
+async def test_a_test_send_checks_the_delivery_and_starts_nothing(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, _ = await make_hook(hooks, tenant)
+
+    response = await hooks.post(
+        f"{path(tenant)}/{trigger['id']}/test", headers=mia(tenant), json={}
+    )
+
+    assert response.status_code == 200, response.text
+    delivery = response.json()["delivery"]
+    assert (delivery["outcome"], delivery["http_status"], delivery["test"]) == (
+        "test_ok",
+        200,
+        True,
+    )
+    assert delivery["delivery_id"].startswith("test_")
+    assert (delivery["run_id"], delivery["session_id"], delivery["error"]) == (None, None, None)
+    assert await runs_of(engine, trigger["id"]) == []
+    assert await deliveries(hooks, tenant, trigger["id"]) == [delivery]
+    async with engine.connect() as connection:
+        events = await connection.scalar(select(func.count()).select_from(TriggerEvent))
+        entry = (
+            await connection.execute(
+                select(AuditEntry).where(AuditEntry.action == "trigger.test_sent")
+            )
+        ).one()
+    assert events == 0, "a test that does not start leaves the replay guard alone"
+    assert entry.details == {"start": False, "outcome": "test_ok"}
+    assert (entry.target_type, entry.target_id) == ("trigger", trigger["id"])
+
+
+async def test_a_test_send_with_start_starts_a_run_like_a_real_delivery(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, _ = await make_hook(hooks, tenant)
+
+    response = await hooks.post(
+        f"{path(tenant)}/{trigger['id']}/test",
+        headers=mia(tenant),
+        json={"payload": {"service": "api"}, "start": True},
+    )
+
+    assert response.status_code == 200, response.text
+    delivery = response.json()["delivery"]
+    assert (delivery["outcome"], delivery["http_status"], delivery["test"]) == (
+        "accepted",
+        202,
+        True,
+    )
+    [run] = await runs_of(engine, trigger["id"])
+    assert delivery["run_id"] == str(run.id)
+    assert run.unattended is True
+    async with engine.connect() as connection:
+        text = (
+            await connection.execute(select(Message.content).where(Message.run_id == run.id))
+        ).scalar_one()["text"]
+        entry = (
+            await connection.execute(
+                select(AuditEntry).where(AuditEntry.action == "trigger.test_sent")
+            )
+        ).one()
+    assert '"service":"api"' in text
+    assert entry.details == {"start": True, "outcome": "accepted"}
+
+
+async def test_a_test_send_to_a_disabled_trigger_shows_the_failure_in_the_answer(
+    hooks: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    trigger, _ = await make_hook(hooks, tenant)
+    url = f"{path(tenant)}/{trigger['id']}"
+    await hooks.patch(url, headers=mia(tenant), json={"status": "disabled"})
+
+    response = await hooks.post(f"{url}/test", headers=mia(tenant), json={"start": True})
+
+    assert response.status_code == 200
+    delivery = response.json()["delivery"]
+    assert (delivery["outcome"], delivery["http_status"], delivery["test"]) == (
+        "disabled",
+        410,
+        True,
+    )
+    assert delivery["error"] == "the trigger is disabled"
+
+
+async def test_a_test_send_needs_the_owner_or_an_admin_and_a_small_payload(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    trigger, _ = await make_hook(hooks, tenant)
+    url = f"{path(tenant)}/{trigger['id']}/test"
+    member = bearer(await add_user(engine, tenant, workspace_member=True))
+    assert (await hooks.post(url, headers=member, json={})).status_code == 403
+    outsider = bearer(await add_user(engine, tenant, workspace_member=False))
+    assert (await hooks.post(url, headers=outsider, json={})).status_code == 404
+    big = {"payload": {"text": "x" * 20_000}}
+    assert (await hooks.post(url, headers=mia(tenant), json=big)).status_code == 422
+    assert (await hooks.post(url, headers=mia(tenant), json={"payload": [1]})).status_code == 422
+    unknown = f"{path(tenant)}/{uuid.uuid4()}/test"
+    assert (await hooks.post(unknown, headers=mia(tenant), json={})).status_code == 404
+    assert await deliveries(hooks, tenant, trigger["id"]) == []
+
+
+async def test_a_test_send_to_a_composio_trigger_skips_the_signature(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, fake: FakeComposio
+) -> None:
+    trigger = await make_composio(hooks, tenant, fake)
+    url = f"{path(tenant)}/{trigger['id']}/test"
+
+    checked = await hooks.post(url, headers=mia(tenant), json={})
+    started = await hooks.post(
+        url, headers=mia(tenant), json={"payload": {"subject": "Hi"}, "start": True}
+    )
+
+    assert checked.json()["delivery"]["outcome"] == "test_ok"
+    assert started.json()["delivery"]["outcome"] == "accepted"
+    [run] = await runs_of(engine, trigger["id"])
+    assert started.json()["delivery"]["run_id"] == str(run.id)
+    assert len(await deliveries(hooks, tenant, trigger["id"])) == 2
+
+
+async def test_composio_deliveries_have_rows_when_the_trigger_is_known(
+    hooks: httpx.AsyncClient, tenant: Tenant, fake: FakeComposio
+) -> None:
+    trigger = await make_composio(hooks, tenant, fake)
+    [(instance, _)] = fake.triggers.items()
+    key = signature.composio_key(PROCESS_SECRET)
+    body = composio_event(instance, {"subject": "Hello"})
+    forged = signed(signature.composio_key("not-the-secret"), body, delivery="msg_forged")
+    await hooks.post("/composio/webhook", content=body, headers=forged)
+    await hooks.post("/composio/webhook", content=body, headers=signed(key, body, delivery="m_1"))
+    unknown = composio_event("ti_unknown", {})
+    await hooks.post("/composio/webhook", content=unknown, headers=signed(key, unknown))
+    other = json.dumps({"type": "other", "metadata": {"trigger_id": instance}}).encode()
+    await hooks.post("/composio/webhook", content=other, headers=signed(key, other, delivery="m_2"))
+
+    log = await deliveries(hooks, tenant, trigger["id"])
+
+    assert [(row["outcome"], row["http_status"], row["delivery_id"]) for row in log] == [
+        ("rejected", 200, "m_2"),
+        ("accepted", 202, "m_1"),
+        ("bad_signature", 401, "msg_forged"),
+    ]

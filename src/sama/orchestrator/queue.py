@@ -98,6 +98,7 @@ from sama.runtime.contract import (
     MAX_COMPACT_FOCUS_CHARS,
     ApprovalDecision,
     FailureCode,
+    ReasoningEffort,
     RuntimeKind,
     Usage,
     clip_subagent_text,
@@ -361,6 +362,8 @@ class ClaimedRun:
     lineage: str | None = None
     """The lineage of the session. ``delegation`` for a delegated child (Section 13.2): the
     gate and the prompt take away the toolsets in ``CHILD_BLOCKED_TOOLSETS``."""
+    reasoning_effort: ReasoningEffort | None = None
+    """The reasoning effort of the profile (M7.10). ``None``: the default of the model."""
 
 
 def _stored_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1143,6 +1146,7 @@ class RunQueue:
                     func.coalesce(Run.model, AgentProfile.model).label("model"),
                     AgentProfile.soul,
                     AgentProfile.review_model,
+                    AgentProfile.reasoning_effort,
                     select(Message.content)
                     .where(
                         Message.org_id == Run.org_id,
@@ -1203,6 +1207,7 @@ class RunQueue:
             next_seq=int(next_seq),
             compact=bool(row.compact),
             lineage=row.lineage,
+            reasoning_effort=row.reasoning_effort,
         )
 
     @staticmethod

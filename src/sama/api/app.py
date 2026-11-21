@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
 from importlib import resources
-from typing import Annotated, Any, Final, Literal, Self
+from typing import Annotated, Any, ClassVar, Final, Literal, Self
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -41,12 +41,12 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import and_, delete, func, insert, or_, select
+from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Lifespan
 
-from sama import workerbots
+from sama import tool_policy, workerbots
 from sama.api.admin import (
     DEFAULT_AUDIT_LIMIT,
     DEFAULT_CURATOR_REPORTS,
@@ -172,7 +172,19 @@ from sama.orchestrator.checkpoints import (
 )
 from sama.orchestrator.queue import QueueError, QuotaExceededError, RateLimitedError, RunQueue
 from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
+from sama.orgs.permissions import (
+    MAX_CHANGES as MAX_PERMISSION_CHANGES,
+)
+from sama.orgs.permissions import (
+    PermissionChangeError,
+    PermissionDeniedError,
+    RolePermissions,
+    allowed_keys,
+    stored_rows,
+)
 from sama.orgs.service import OrgError
+from sama.profile_changes import MAX_RULES as MAX_POLICY_RULES
+from sama.profile_changes import TOOL_MAX_CHARS as MAX_TOOL_NAME_CHARS
 from sama.profile_changes import RevertError, StaleChangeError, list_changes, revert_change
 from sama.profiles import (
     NAME_MAX_CHARS,
@@ -182,6 +194,7 @@ from sama.profiles import (
     ProfileChanges,
     ProfileError,
     ProfileLimitError,
+    budget_json,
     create_profile,
     profile_options,
     update_profile,
@@ -272,14 +285,17 @@ class _Body(BaseModel):
 
 
 class _Edit(_Body):
-    """A body of optional fields to change. It has at least one field, and no field is null."""
+    """A body of optional fields to change. It has at least one field, and no field is null,
+    except the fields in ``nullable``."""
+
+    nullable: ClassVar[frozenset[str]] = frozenset()
 
     @model_validator(mode="after")
     def _has_a_field(self) -> Self:
         if not self.model_fields_set:
             raise ValueError("send at least one field to change")
         for name in sorted(self.model_fields_set):
-            if getattr(self, name) is None:
+            if getattr(self, name) is None and name not in self.nullable:
                 raise ValueError(f"{name} cannot be null")
         return self
 
@@ -633,6 +649,13 @@ class ProfileEdit(_Edit):
         Annotated[list[Annotated[str, Field(max_length=100)]], Field(max_length=100)] | None
     ) = None
     subagents: list[Any] | None = None
+    budget: dict[str, Any] | None = None
+    """The whole run budget (M7.10). A key that is missing or null is no limit. ``sama.profiles``
+    checks the values and the caps of the plan."""
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    """``null`` sets the default of the model. It is the only field that may be null."""
+
+    nullable: ClassVar[frozenset[str]] = frozenset({"reasoning_effort"})
 
 
 class ProfileCreate(_Body):
@@ -648,8 +671,46 @@ class ProfileCreate(_Body):
     workspace_id: uuid.UUID | None = None
 
 
+class ToolRuleIn(_Body):
+    """One rule of a tool policy change (M7.10). ``action`` null removes the rule."""
+
+    tool: Annotated[str, Field(min_length=1, max_length=MAX_TOOL_NAME_CHARS)]
+    action: Literal["allow", "ask", "deny"] | None
+
+
+class ToolPolicyEdit(_Body):
+    rules: Annotated[list[ToolRuleIn], Field(min_length=1, max_length=MAX_POLICY_RULES)]
+
+
+class TriggerTest(_Body):
+    """A test send to a trigger (M7.10). Without ``payload``, the test sends a small event.
+    Without ``start``, the test checks the delivery and starts nothing."""
+
+    payload: dict[str, Any] | None = None
+    start: bool = False
+
+
+class RolePermissionsEdit(_Body):
+    """The permissions to change for one role (M7.10): a partial map from a key to a boolean."""
+
+    permissions: Annotated[dict[str, bool], Field(min_length=1, max_length=MAX_PERMISSION_CHANGES)]
+
+
 class Answers(_Body):
     answers: list[str] = Field(min_length=1, max_length=10)
+
+
+class SessionPatch(_Edit):
+    """A rename, an archive, or a restore of a session (M7.10). A body has at least one field."""
+
+    title: (
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_TITLE_CHARS),
+        ]
+        | None
+    ) = None
+    status: Literal["active", "archived"] | None = None
 
 
 class SessionOut(BaseModel):
@@ -1080,6 +1141,7 @@ class SamaApi:
         self._checkpoints = checkpoints
         self._model_keys = model_keys
         self._data = data or DataControls(engine)
+        self._role_permissions = RolePermissions(engine)
         self._views = OrgViews(engine)
         self._skills = skills
         self._reviews = reviews
@@ -1208,9 +1270,17 @@ class SamaApi:
 
         @app.get("/sessions")
         async def list_sessions(
-            principal: Me, limit: Annotated[int, Query(ge=1, le=100)] = 50
+            principal: Me,
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            status: Literal["active", "archived"] = "active",
         ) -> list[SessionOut]:
-            return await self._sessions(principal, limit)
+            return await self._sessions(principal, limit, status)
+
+        @app.patch("/sessions/{session_id}")
+        async def patch_session(
+            principal: Me, session_id: uuid.UUID, body: SessionPatch
+        ) -> SessionOut:
+            return await self._patch_session(principal, session_id, body)
 
         @app.post("/sessions", status_code=201)
         async def create_session(principal: Me, body: NewSession) -> SessionOut:
@@ -1385,6 +1455,21 @@ class SamaApi:
         ) -> dict[str, Any]:
             return await self._create_profile(principal, org_id, body)
 
+        @app.get("/orgs/{org_id}/role-permissions")
+        async def role_permissions(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._role_permissions.view(org_id, grants)
+
+        @app.put("/orgs/{org_id}/role-permissions/{role}")
+        async def set_role_permissions(
+            principal: Me, org_id: uuid.UUID, role: str, body: RolePermissionsEdit
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            try:
+                return await self._role_permissions.change(org_id, grants, role, body.permissions)
+            except PermissionChangeError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+
         @app.get("/orgs/{org_id}/agent-profiles/{profile_id}")
         async def get_agent_profile(
             principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID
@@ -1396,6 +1481,63 @@ class SamaApi:
             principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
         ) -> dict[str, Any]:
             return await self._edit_profile(principal, org_id, profile_id, body)
+
+        @app.get("/orgs/{org_id}/agent-profiles/{profile_id}/tool-policy")
+        async def agent_profile_tool_policy(
+            principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID
+        ) -> dict[str, Any]:
+            return await self._profile_tool_policy(principal, org_id, profile_id)
+
+        @app.put("/orgs/{org_id}/agent-profiles/{profile_id}/tool-policy")
+        async def set_agent_profile_tool_policy(
+            principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID, body: ToolPolicyEdit
+        ) -> dict[str, Any]:
+            _, grants = await self._profile_access(principal, org_id, profile_id)
+            if not grants.org_admin:
+                raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
+            await self._permit(principal, org_id, "agents.manage", grants)
+            try:
+                await tool_policy.set_profile_rules(
+                    self._engine,
+                    org_id,
+                    profile_id,
+                    [(rule.tool, rule.action) for rule in body.rules],
+                    actor_user_id=grants.user_id,
+                )
+            except NotAdminError:
+                raise HTTPException(status_code=403, detail=_ADMIN_ONLY) from None
+            except ProfileError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from None
+            except SubagentError as error:
+                if str(error) == "the profile does not exist":
+                    raise _not_found("the agent profile does not exist") from None
+                raise HTTPException(status_code=422, detail=str(error)) from None
+            return await self._profile_tool_policy(principal, org_id, profile_id)
+
+        @app.get("/orgs/{org_id}/tool-policy")
+        async def org_tool_policy(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            editable = await self._can_manage_agents(org_id, grants)
+            return await tool_policy.org_view(self._engine, org_id, editable=editable)
+
+        @app.put("/orgs/{org_id}/tool-policy")
+        async def set_org_tool_policy(
+            principal: Me, org_id: uuid.UUID, body: ToolPolicyEdit
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            await self._permit(principal, org_id, "agents.manage", grants)
+            try:
+                await tool_policy.set_org_rules(
+                    self._engine,
+                    org_id,
+                    [(rule.tool, rule.action) for rule in body.rules],
+                    actor_user_id=grants.user_id,
+                )
+            except NotAdminError:
+                raise HTTPException(status_code=403, detail=_ADMIN_ONLY) from None
+            except ProfileError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from None
+            return await tool_policy.org_view(self._engine, org_id, editable=True)
 
         @app.get("/orgs/{org_id}/agent-profiles/{profile_id}/changes")
         async def agent_profile_changes(
@@ -1418,7 +1560,7 @@ class SamaApi:
         async def connect_telegram(
             principal: Me, org_id: uuid.UUID, body: TelegramConnect
         ) -> dict[str, Any]:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 view = await self._require_integrations().connect_telegram(
                     org_id, grants.user_id, body.bot_token
@@ -1523,6 +1665,7 @@ class SamaApi:
             principal: Me, org_id: uuid.UUID, body: LoginIn
         ) -> dict[str, Any]:
             grants = await self._org_grants(principal, org_id)
+            await self._permit(principal, org_id, "browser.logins", grants)
             return await self._require_browser().add_login(org_id, grants, body)
 
         @app.patch("/orgs/{org_id}/browser/logins/{login_id}")
@@ -1542,7 +1685,7 @@ class SamaApi:
 
         @app.post("/orgs/{org_id}/integrations/slack/setup")
         async def setup_slack(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 setup = await self._require_integrations().setup_slack(org_id, grants.user_id)
             except IntegrationError as error:
@@ -1553,7 +1696,7 @@ class SamaApi:
         async def connect_slack(
             principal: Me, org_id: uuid.UUID, body: SlackConnect
         ) -> dict[str, Any]:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 view = await self._require_integrations().connect_slack(
                     org_id, grants.user_id, body.bot_token, body.signing_secret
@@ -1562,9 +1705,22 @@ class SamaApi:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             return view.public()
 
+        @app.post("/orgs/{org_id}/integrations/{kind}/check")
+        async def check_integration(
+            principal: Me, org_id: uuid.UUID, kind: Channel
+        ) -> dict[str, Any]:
+            grants = await self._chat_admin(principal, org_id)
+            try:
+                ok, detail, view = await self._require_integrations().check(
+                    org_id, kind, grants.user_id
+                )
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return {"ok": ok, "detail": detail, "integration": view.public()}
+
         @app.delete("/orgs/{org_id}/integrations/{kind}", status_code=204)
         async def disconnect(principal: Me, org_id: uuid.UUID, kind: Channel) -> Response:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 gone = await self._require_integrations().disconnect(org_id, kind, grants.user_id)
             except IntegrationError as error:
@@ -1637,6 +1793,7 @@ class SamaApi:
             principal: Me, workspace_id: uuid.UUID, body: ConnectionStart
         ) -> dict[str, Any]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "connections.add", grants)
             service = self._require_connections()
             started = await service.start(org_id, workspace_id, grants, body.connector, body.scope)
             return started.public()
@@ -1646,6 +1803,7 @@ class SamaApi:
             principal: Me, workspace_id: uuid.UUID, body: McpServerAdd
         ) -> dict[str, Any]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "connections.add", grants)
             started = await self._require_connections().add_mcp(
                 org_id,
                 workspace_id,
@@ -1665,6 +1823,7 @@ class SamaApi:
             principal: Me, workspace_id: uuid.UUID, body: StdioServerAdd
         ) -> dict[str, Any]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "connections.add", grants)
             started = await self._require_connections().add_stdio(
                 org_id,
                 workspace_id,
@@ -1684,6 +1843,7 @@ class SamaApi:
         @app.post("/workspaces/{workspace_id}/connections/api", status_code=201)
         async def add_api(principal: Me, workspace_id: uuid.UUID, body: ApiAdd) -> dict[str, Any]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "connections.add", grants)
             started = await self._require_connections().add_api(
                 org_id,
                 workspace_id,
@@ -1752,6 +1912,12 @@ class SamaApi:
             )
             return saved.public()
 
+        @app.post("/connections/{connection_id}/enable")
+        async def enable_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
+            org_id, view, grants = await self._connection(principal, connection_id, manage=True)
+            done = await self._require_connections().enable(org_id, view.id, actor=grants.user_id)
+            return done.public()
+
         @app.post("/connections/{connection_id}/disable")
         async def disable_connection(principal: Me, connection_id: uuid.UUID) -> dict[str, Any]:
             org_id, view, grants = await self._connection(principal, connection_id, manage=True)
@@ -1786,6 +1952,7 @@ class SamaApi:
 
         @app.post("/orgs/{org_id}/jobs", status_code=201)
         async def create_job(principal: Me, org_id: uuid.UUID, body: JobInput) -> dict[str, Any]:
+            await self._permit(principal, org_id, "jobs.create")
             jobs, actor = await self._job_actor(principal, org_id)
             return (await _job_call(jobs.create(actor, body))).as_json()
 
@@ -1920,6 +2087,7 @@ class SamaApi:
             principal: Me, workspace_id: uuid.UUID, body: NewTriggerBody
         ) -> dict[str, Any]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "triggers.create", grants)
             fields = triggers.NewTrigger(**body.model_dump())
             return await self._require_triggers().create(org_id, workspace_id, grants, fields)
 
@@ -1938,6 +2106,27 @@ class SamaApi:
             changes = triggers.TriggerChanges(**body.model_dump())
             return await self._require_triggers().update(
                 org_id, workspace_id, trigger_id, grants, changes
+            )
+
+        @app.get("/workspaces/{workspace_id}/triggers/{trigger_id}/deliveries")
+        async def trigger_deliveries(
+            principal: Me,
+            workspace_id: uuid.UUID,
+            trigger_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        ) -> list[dict[str, Any]]:
+            org_id, _ = await self._workspace_grants(principal, workspace_id)
+            return await self._require_triggers().list_deliveries(
+                org_id, workspace_id, trigger_id, limit
+            )
+
+        @app.post("/workspaces/{workspace_id}/triggers/{trigger_id}/test")
+        async def test_trigger(
+            principal: Me, workspace_id: uuid.UUID, trigger_id: uuid.UUID, body: TriggerTest
+        ) -> dict[str, Any]:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            return await self._require_triggers().test_send(
+                org_id, workspace_id, trigger_id, grants, body.payload, start=body.start
             )
 
         @app.post("/workspaces/{workspace_id}/triggers/{trigger_id}/secret")
@@ -2068,6 +2257,8 @@ class SamaApi:
         async def write_skill(
             principal: Me, workspace_id: uuid.UUID, body: SkillWrite
         ) -> SkillWritten:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "skills.write", grants)
             return await self._editor().write(principal, workspace_id, body)
 
         @app.get("/workspaces/{workspace_id}/archived-skills")
@@ -2082,6 +2273,8 @@ class SamaApi:
             action: StateAction,
             scope: WritableScope,
         ) -> SkillState:
+            org_id, grants = await self._workspace_grants(principal, workspace_id)
+            await self._permit(principal, org_id, "skills.write", grants)
             return await self._editor().change_state(principal, workspace_id, name, scope, action)
 
         @app.get("/skills/{skill_id}/versions/{version}")
@@ -2133,6 +2326,7 @@ class SamaApi:
                     "admin": grants.org_admin,
                     "role": next(role for ws, role in grants.rows if ws is None),
                     "plan": user.plan,
+                    "permissions": [],
                     "workspaces": [],
                     "agent_profiles": [],
                     "integrations": [],
@@ -2182,7 +2376,12 @@ class SamaApi:
                     )
                 ]
                 entry.update(
-                    workspaces=workspaces, agent_profiles=profiles, integrations=integrations
+                    workspaces=workspaces,
+                    agent_profiles=profiles,
+                    integrations=integrations,
+                    permissions=allowed_keys(
+                        grants.org_role, await stored_rows(connection, user.org_id)
+                    ),
                 )
         return result
 
@@ -2210,7 +2409,13 @@ class SamaApi:
                         AgentProfile.toolsets,
                         AgentProfile.group_toolsets,
                         AgentProfile.subagents,
+                        AgentProfile.budget,
+                        AgentProfile.reasoning_effort,
                         AgentProfile.updated_at,
+                        select(Org.plan)
+                        .where(Org.id == AgentProfile.org_id)
+                        .scalar_subquery()
+                        .label("plan"),
                     ).where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
                 )
             ).one_or_none()
@@ -2223,6 +2428,7 @@ class SamaApi:
     ) -> dict[str, Any]:
         row, grants = await self._profile_access(principal, org_id, profile_id)
         runtime = RuntimeKind(row.runtime)
+        budget = budget_json(row.budget if isinstance(row.budget, dict) else {})
         return {
             "id": str(row.id),
             "org_id": str(row.org_id),
@@ -2234,10 +2440,39 @@ class SamaApi:
             "toolsets": list(row.toolsets),
             "group_toolsets": list(row.group_toolsets),
             "subagents": [s.model_dump(mode="json") for s in parse_subagents(row.subagents)],
+            "budget": {
+                key: budget.get(key)
+                for key in ("max_turns", "max_cost_usd", "max_wall_time_s", "max_tokens")
+            },
+            "reasoning_effort": row.reasoning_effort,
             "updated_at": row.updated_at.isoformat(),
             "editable": grants.org_admin,
-            "options": profile_options(runtime),
+            "options": profile_options(runtime, row.plan),
         }
+
+    async def _can_manage_agents(self, org_id: uuid.UUID, grants: Grants) -> bool:
+        """True for an org owner or admin whose role has the permission ``agents.manage``."""
+        if not grants.org_admin:
+            return False
+        try:
+            await self._role_permissions.require(org_id, grants, "agents.manage")
+        except PermissionDeniedError:
+            return False
+        return True
+
+    async def _profile_tool_policy(
+        self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID
+    ) -> dict[str, Any]:
+        """The tool policy of the profile for the web app. Each member who sees the profile can
+        read it."""
+        row, grants = await self._profile_access(principal, org_id, profile_id)
+        return await tool_policy.profile_view(
+            self._engine,
+            org_id,
+            profile_id,
+            [str(name) for name in row.toolsets],
+            editable=await self._can_manage_agents(org_id, grants),
+        )
 
     async def _edit_profile(
         self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
@@ -2250,6 +2485,7 @@ class SamaApi:
         _, grants = await self._profile_access(principal, org_id, profile_id)
         if not grants.org_admin:
             raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
+        await self._permit(principal, org_id, "agents.manage", grants)
         if body.soul is not None or body.subagents is not None:
             # The redactor must know every vault value before the text is checked. Fail closed.
             try:
@@ -2261,7 +2497,7 @@ class SamaApi:
                 self._engine,
                 org_id,
                 profile_id,
-                ProfileChanges(**body.model_dump()),
+                ProfileChanges(**body.model_dump(exclude_unset=True)),
                 actor_user_id=grants.user_id,
             )
         except NotAdminError:
@@ -2279,6 +2515,7 @@ class SamaApi:
     ) -> dict[str, Any]:
         """Makes an agent profile (M6.9). Only an org owner or admin can do it."""
         grants = await self._org_admin(principal, org_id)
+        await self._permit(principal, org_id, "agents.manage", grants)
         if body.soul:
             # The redactor must know every vault value before the soul is checked.
             try:
@@ -2330,6 +2567,7 @@ class SamaApi:
         _, grants = await self._profile_access(principal, org_id, profile_id)
         if not grants.org_admin:
             raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
+        await self._permit(principal, org_id, "agents.manage", grants)
         try:
             await know_the_secrets(self._engine, org_id)
         except VaultUnreadableError as error:
@@ -2357,12 +2595,129 @@ class SamaApi:
             raise HTTPException(status_code=422, detail=str(error)) from None
         return {"id": str(new_id), "profile": await self._profile(principal, org_id, profile_id)}
 
-    async def _sessions(self, principal: Principal, limit: int) -> list[SessionOut]:
+    async def _patch_session(
+        self, principal: Principal, session_id: uuid.UUID, body: SessionPatch
+    ) -> SessionOut:
+        """Renames, archives, or restores a session (M7.10). The owner of a private session can.
+        For a shared session, the owner, an admin of the workspace, or an org admin can. The
+        archive of a compaction and a session with an archive of a compaction keep their status
+        (``409``), and a session with an open run cannot be archived (``409``). The row is
+        locked, so a second request waits and then sees the new state."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            grants = await load_grants(connection, access.org_id, access.user_id)
+        row = access.session
+        if not (
+            row.owner_user_id == access.user_id
+            or (
+                row.audience == "shared"
+                and (grants.org_admin or grants.admins_workspace(row.workspace_id))
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="only the owner of the session or an admin can change it",
+            )
+        title = None if body.title is None else default_redactor().text(body.title)
+        async with self._engine.begin() as connection:
+            current = (
+                await connection.execute(
+                    select(Session.title, Session.status, Session.lineage)
+                    .where(Session.org_id == access.org_id, Session.id == session_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if current is None:
+                raise _not_found()
+            actions: list[tuple[str, dict[str, Any]]] = []
+            values: dict[str, Any] = {}
+            if title is not None and title != current.title:
+                values["title"] = title
+                actions.append(("session.renamed", {"title_length": len(title)}))
+            if body.status is not None and body.status != current.status:
+                await self._check_status_change(connection, access.org_id, session_id, current)
+                values["status"] = body.status
+                actions.append(
+                    ("session.archived" if body.status == "archived" else "session.restored", {})
+                )
+            if values:
+                await connection.execute(
+                    update(Session)
+                    .where(Session.org_id == access.org_id, Session.id == session_id)
+                    .values(**values, updated_at=func.now())
+                )
+                for action, details in actions:
+                    await connection.execute(
+                        insert(AuditEntry).values(
+                            org_id=access.org_id,
+                            workspace_id=row.workspace_id,
+                            actor_kind="user",
+                            actor_user_id=access.user_id,
+                            action=action,
+                            target_type="session",
+                            target_id=str(session_id),
+                            details=details,
+                        )
+                    )
+            fresh = (
+                await connection.execute(
+                    select(*_SESSION_COLUMNS).where(
+                        Session.org_id == access.org_id, Session.id == session_id
+                    )
+                )
+            ).one()
+        return _session_out(fresh)
+
+    @staticmethod
+    async def _check_status_change(
+        connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, current: Any
+    ) -> None:
+        """Raises ``409`` when the status of the session must not change: it is the archive of
+        a compaction, it has one, or (for an archive) a run is open."""
+        if current.lineage == "compaction":
+            raise HTTPException(
+                status_code=409, detail="the archive of a compaction keeps its status"
+            )
+        compacted = (
+            await connection.execute(
+                select(Session.id)
+                .where(
+                    Session.org_id == org_id,
+                    Session.parent_session_id == session_id,
+                    Session.lineage == "compaction",
+                )
+                .limit(1)
+            )
+        ).first()
+        if compacted is not None:
+            raise HTTPException(
+                status_code=409, detail="a session with a compaction keeps its status"
+            )
+        if current.status == "active":
+            open_run = (
+                await connection.execute(
+                    select(Run.id)
+                    .where(
+                        Run.org_id == org_id,
+                        Run.session_id == session_id,
+                        Run.status.in_(OPEN_RUN_STATUSES),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if open_run is not None:
+                raise HTTPException(
+                    status_code=409, detail="a run is open: stop it before you archive"
+                )
+
+    async def _sessions(
+        self, principal: Principal, limit: int, status: str = "active"
+    ) -> list[SessionOut]:
         async with as_user(self._engine, principal.auth_user_id) as connection:
             rows = (
                 await connection.execute(
                     select(*_SESSION_COLUMNS)
-                    .where(Session.status == "active", served_here(Session.org_id))
+                    .where(Session.status == status, served_here(Session.org_id))
                     .order_by(Session.created_at.desc(), Session.id)
                     .limit(limit)
                 )
@@ -2713,6 +3068,8 @@ class SamaApi:
         org_id, user_id = await self._workspace_access(
             principal, body.workspace_id, body.agent_profile_id
         )
+        if body.audience == "shared":
+            await self._permit(principal, org_id, "sessions.shared")
         session_id = uuid.uuid4()
         async with self._engine.begin() as connection:
             row = (
@@ -3057,6 +3414,7 @@ class SamaApi:
         async def create_workflow(
             principal: Me, org_id: uuid.UUID, body: WorkflowSource
         ) -> dict[str, Any]:
+            await self._permit(principal, org_id, "workflows.create")
             workflows, actor = await self._workflow_actor(principal, org_id)
             return await _workflow_call(
                 workflows.create(
@@ -3197,6 +3555,29 @@ class SamaApi:
         jobs = self._require_jobs()
         grants = await self._org_grants(principal, org_id)
         return jobs, JobActor(org_id=org_id, user_id=grants.user_id, kind="user")
+
+    async def _permit(
+        self,
+        principal: Principal,
+        org_id: uuid.UUID,
+        key: str,
+        grants: Grants | None = None,
+    ) -> Grants:
+        """Checks the permission ``key`` of the role of the user (M7.10) and returns the grants.
+        Call it after the check of the role. Raises ``404`` for a user who is not a member and
+        ``403`` when the owner of the org turned the permission off for the role of the user.
+        With ``grants``, it does not read them again."""
+        grants = grants or await self._org_grants(principal, org_id)
+        try:
+            await self._role_permissions.require(org_id, grants, key)
+        except PermissionDeniedError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
+        return grants
+
+    async def _chat_admin(self, principal: Principal, org_id: uuid.UUID) -> Grants:
+        """An org owner or admin with the permission to manage chat apps."""
+        grants = await self._org_admin(principal, org_id)
+        return await self._permit(principal, org_id, "chat_apps.manage", grants)
 
     async def _org_admin(self, principal: Principal, org_id: uuid.UUID) -> Grants:
         """Raises ``404`` for a user who is not a member and ``403`` for a member who is not an
