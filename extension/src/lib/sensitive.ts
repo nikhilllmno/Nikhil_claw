@@ -4,6 +4,8 @@
 // from the codes of the latest snapshot; the extension checks the live element again before it
 // acts and asks the user itself when nobody approved the call.
 
+import { parseKey } from "./keys";
+
 /** What the extension knows about an element. */
 export interface ElementFacts {
   /** The tag name in lower case (`button`, `input`, `a`). */
@@ -112,9 +114,14 @@ export function actionReason(act: ActFacts, target: ElementFacts | null): Sensit
     case "select":
       return typeReason(target);
     case "press": {
-      const key = (act.key ?? "").split("+").pop();
-      if ((key === "Enter" || key === " ") && clickReason(target) !== null) return clickReason(target);
-      return key === "Enter" && submitsOnEnter(target) ? "submit" : null;
+      // The same parser as the key that the extension sends (lib/keys.ts).
+      const key = parseKey(act.key ?? "");
+      if (key === null) return null;
+      if ((key.key === "Enter" || key.key === " ") && clickReason(target) !== null) return clickReason(target);
+      if (key.key === "Enter" && submitsOnEnter(target)) return "submit";
+      // A key that types text into a password or payment field.
+      if (key.text && key.key !== "Enter" && isTextField(target)) return typeReason(target);
+      return null;
     }
     default:
       return null;

@@ -128,6 +128,12 @@ SENSITIVE = Sensitivity(refs={"e3": "pay", "e4": "password"}, submits=frozenset(
         ({"action": "type", "ref": "e2", "text": "x"}, None),
         ({"action": "press", "ref": "e2", "text": "Enter"}, "submit"),
         ({"action": "press", "ref": "e2", "text": "Tab"}, None),
+        ({"action": "press", "ref": "e3", "text": "Space"}, "pay"),
+        ({"action": "press", "ref": "e3", "text": " "}, "pay"),
+        ({"action": "press", "ref": "e3", "text": "Enter"}, "pay"),
+        ({"action": "press", "ref": "e4", "text": "a"}, "password"),
+        ({"action": "press", "ref": "e4", "text": "Tab"}, None),
+        ({"action": "press", "text": "Enter"}, None),
         ({"action": "click", "ref": "e9"}, None),
         ({"action": "hover", "ref": "e3"}, None),
         ({"action": "scroll"}, None),
@@ -181,7 +187,17 @@ async def test_the_frame_has_the_run_and_the_approval() -> None:
     assert first["session_id"] == "s-1"
     assert first["run_id"] == "run-1"
     assert first["approved"] is False
-    assert second["approved"] is True
+    # A person approved the call, but e1 is not sensitive in the snapshot: nothing to skip.
+    assert second["approved"] is False
+    one.sensitivity = Sensitivity(refs={"e1": "pay"})
+    link.answers.append(ok({"page": page()}))
+    token = human_approved.set(True)
+    try:
+        await one.act(Act(action="click", ref="e1"))
+    finally:
+        human_approved.reset(token)
+    assert link.frames[-1]["approved"] is True
+    assert link.frames[-1]["approved_reason"] == "pay"
     assert 0 < first["timeout_ms"] < chrome.CALL_TIMEOUT_S * 1000
 
 
@@ -255,12 +271,32 @@ async def test_screenshot_extract_and_tabs() -> None:
         await one.screenshot()
 
 
+async def test_a_session_keeps_its_connection_and_releases_each_one() -> None:
+    first, second = FakeLink(), FakeLink()
+    hub = ChromeHub()
+    unregister = hub.register(USER, first)
+    one = ChromeSession(hub, USER, session_id="s", run_id="r")
+    await one.tabs("list")
+    one.sensitivity = Sensitivity(refs={"e1": "pay"})
+    hub.register(USER, second)
+    await one.tabs("list")  # still the first browser: its refs and its tabs
+    assert len(first.frames) == 2
+    assert second.frames == []
+    unregister()
+    await one.tabs("list")  # the first browser went away: the newest one
+    assert len(second.frames) == 1
+    assert one.sensitivity == Sensitivity()
+    await one.close()
+    assert [frame["op"] for frame in second.frames] == ["tabs", "release"]
+
+
 async def test_close_releases_once_and_never_raises() -> None:
-    link = FakeLink({"ok": False, "error": {"code": "failed"}})
+    link = FakeLink({"ok": True, "result": {"tabs": []}}, {"ok": False, "error": {"code": "x"}})
     one = session(link)
+    await one.tabs("list")
     await one.close()
     await one.close()
-    assert [frame["op"] for frame in link.frames] == ["release"]
+    assert [frame["op"] for frame in link.frames] == ["tabs", "release"]
 
 
 # -- the target ---------------------------------------------------------------------------------

@@ -50,7 +50,7 @@ from sama.browser.target import (
     TargetName,
 )
 from sama.db.models import User
-from sama.gateway.chrome import ChromeHub, ChromeOfflineError
+from sama.gateway.chrome import ChromeHub, ChromeLink, ChromeOfflineError
 from sama.tools.approved import human_approved
 
 log = logging.getLogger("sama.browser.chrome")
@@ -183,9 +183,15 @@ def sensitive_reason(sensitivity: Sensitivity, arguments: Mapping[str, Any]) -> 
     if action == "type" and arguments.get("submit") is True and ref in sensitivity.submits:
         return SUBMIT_REASON
     key = arguments.get("text")
-    enter = isinstance(key, str) and key.split("+")[-1] == "Enter"
-    if action == "press" and enter and ref in sensitivity.submits:
-        return SUBMIT_REASON
+    name = key.split("+")[-1] if isinstance(key, str) and key != " " else key
+    if action == "press" and ref:
+        # Enter or Space on a sensitive button activates it; a key with text types into a
+        # sensitive field. Other keys (Tab, arrows) are not sensitive.
+        activates = name in {"Enter", "Space", " "} or (isinstance(name, str) and len(name) == 1)
+        if activates and ref in sensitivity.refs:
+            return sensitivity.refs[ref]
+        if name == "Enter" and ref in sensitivity.submits:
+            return SUBMIT_REASON
     return None
 
 
@@ -410,28 +416,51 @@ class ChromeSession:
         self._timeout_s = timeout_s
         self.sensitivity = Sensitivity()
         self.closed = False
+        self._link: ChromeLink | None = None
+        self._used: list[ChromeLink] = []
+        """The connections that this session used. ``close`` releases the run on each."""
 
     @property
     def target(self) -> TargetName:
         return MY_CHROME
+
+    def _pick(self) -> ChromeLink:
+        """The connection for the next call: the one that the session used, while it is open.
+        When it closed, the newest connection of the user. A new browser has no refs of the
+        old snapshot, so the session forgets them."""
+        if self._link is not None and self._link in self._hub.links(self._auth_user_id):
+            return self._link
+        link = self._hub.link(self._auth_user_id)
+        if link is None:
+            raise BrowserError(OFFLINE)
+        if self._link is not None:
+            self.sensitivity = Sensitivity()
+        self._link = link
+        if link not in self._used:
+            self._used.append(link)
+        return link
 
     def sensitive_reason(self, arguments: Mapping[str, Any]) -> str | None:
         reason = sensitive_reason(self.sensitivity, arguments)
         return None if reason is None else _reason_text(reason)
 
     async def _call(
-        self, op: Op, args: Mapping[str, Any], *, timeout_s: float | None = None
+        self,
+        op: Op,
+        args: Mapping[str, Any],
+        *,
+        timeout_s: float | None = None,
+        approved_reason: str | None = None,
     ) -> Any:
-        link = self._hub.link(self._auth_user_id)
-        if link is None:
-            raise BrowserError(OFFLINE)
+        link = self._pick()
         wait_s = timeout_s or self._timeout_s
         frame = {
             "op": op,
             "args": dict(args),
             "session_id": self._session_id,
             "run_id": self._run_id,
-            "approved": human_approved.get(),
+            "approved": approved_reason is not None,
+            "approved_reason": approved_reason,
             # The extension answers before the API stops waiting.
             "timeout_ms": int(max(1.0, wait_s - ANSWER_MARGIN_S) * 1000),
         }
@@ -476,7 +505,9 @@ class ChromeSession:
             "accept": act.accept,
             "prompt_text": act.prompt_text,
         }
-        return _parse(_Page, await self._call("act", args)).state()
+        # The extension skips its own question only for the reason that the person approved.
+        code = sensitive_reason(self.sensitivity, args) if human_approved.get() else None
+        return _parse(_Page, await self._call("act", args, approved_reason=code)).state()
 
     async def screenshot(self, *, full_page: bool = False) -> Screenshot:
         shot = _parse(_Screenshot, await self._call("screenshot", {"full_page": full_page}))
@@ -511,9 +542,21 @@ class ChromeSession:
         if self.closed:
             return
         self.closed = True
-        try:
-            await self._call("release", {}, timeout_s=RELEASE_TIMEOUT_S)
-        except BrowserError:
-            return
-        except Exception:  # pragma: no cover - a close never fails the run
-            log.warning("the release of a my_chrome session failed", exc_info=True)
+        frame: dict[str, Any] = {
+            "op": "release",
+            "args": {},
+            "session_id": self._session_id,
+            "run_id": self._run_id,
+            "approved": False,
+            "approved_reason": None,
+            "timeout_ms": 1_000,
+        }
+        for link in self._used:
+            if link not in self._hub.links(self._auth_user_id):
+                continue  # A closed connection has no run left.
+            try:
+                await link.call(dict(frame), RELEASE_TIMEOUT_S)
+            except (ChromeOfflineError, TimeoutError):
+                continue
+            except Exception:  # pragma: no cover - a close never fails the run
+                log.warning("the release of a my_chrome session failed", exc_info=True)

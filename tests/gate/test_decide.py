@@ -906,3 +906,12 @@ def test_an_unattended_run_cannot_do_an_escalated_call() -> None:
     verdict = decide(ctx, "browser_act", CLICK, escalate=SENSITIVE)
     assert verdict.action == "deny"
     assert verdict.step == GateStep.CONTEXT
+
+
+def test_an_escalation_also_applies_to_a_wrapped_call() -> None:
+    allowed = context(
+        toolsets=frozenset({"browser", "tool_search"}), rules=(rule("browser_act", "allow"),)
+    )
+    wrapped = {"name": "browser_act", "arguments": CLICK}
+    verdict = decide(allowed, "tool_call", wrapped, escalate=SENSITIVE)
+    assert (verdict.action, verdict.reason) == ("ask", SENSITIVE)

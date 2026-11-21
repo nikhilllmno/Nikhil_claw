@@ -31,6 +31,8 @@ export interface ToolCallFrame {
   run_id: string;
   /** A person approved this call in the approval card of the tool gate. */
   approved: boolean;
+  /** The sensitive reason code that the person approved (from the latest snapshot), or null. */
+  approved_reason?: string | null;
   /** The time that the extension has to answer. */
   timeout_ms: number;
 }

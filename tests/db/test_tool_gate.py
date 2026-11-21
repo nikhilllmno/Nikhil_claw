@@ -1133,3 +1133,17 @@ async def test_a_failing_escalation_check_asks(engine: AsyncEngine, org: Org1) -
     gate = GateService(engine, escalation=escalation)
     verdict = await gate.check(org.claims(), "c1", "Read", {"file_path": "a.txt"})
     assert verdict.action == "ask"
+
+
+async def test_an_approved_call_under_an_allow_rule_uses_up_its_ticket(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """A user approves a call with "always allow". The call then runs under the new allow rule.
+    Its ticket must not stay for a later call with the same arguments (Section 14.2.2)."""
+    gate = GateService(engine, escalation=lambda *_: None)
+    await approve(gate, org)
+    assert (await reconfirm(gate, org)).action == "allow"
+    await add_rule(engine, org, "Bash", "allow")
+    first = await gate.screen(org.claims(), "Bash", ARGS)
+    assert (first.action, first.step) == ("allow", GateStep.POLICY)
+    assert (await call_row(engine, org, "c1")).status == "finished"

@@ -32,7 +32,8 @@ const NAMED: Record<string, [string, number, string]> = {
 
 /** Parses a key such as "Control+A". Returns `null` for a key that is not known. */
 export function parseKey(spec: string): KeyEvent | null {
-  const parts = spec.split("+").map((part) => part.trim());
+  // A space is a key name too, so trim only around the "+".
+  const parts = spec === " " ? [" "] : spec.split("+").map((part) => (part === " " ? part : part.trim()));
   // "Control++" is Control and the plus key.
   if (spec.endsWith("++")) parts.splice(parts.length - 2, 2, "+");
   const name = parts.pop() ?? "";

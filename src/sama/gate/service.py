@@ -282,6 +282,11 @@ class GateService:
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
             escalate = self._escalate(claims, name, effective)
             verdict = decide(run.context, tool_name, arguments, escalate=escalate)
+            if verdict.action == "allow" and self.escalation is not None:
+                # An approved call that now runs under an allow rule (the user chose "always
+                # allow") uses up its ticket here, so a later call with the same arguments
+                # cannot use the old approval (Section 14.2.2).
+                await self._take_ticket(connection, run.ref, name, arguments_digest(effective))
             if verdict.action == "ask":
                 digest = arguments_digest(effective)
                 if await self._take_ticket(connection, run.ref, name, digest):

@@ -102,6 +102,8 @@ interface RunState {
   once: Set<string>;
   stopped: boolean;
   notes: string[];
+  /** The deadline of the call that runs now. */
+  deadline: number;
 }
 
 interface TabState {
@@ -136,6 +138,8 @@ const DIALOG = Symbol("dialog");
 export class Actor {
   private readonly runs = new Map<string, RunState>();
   private readonly tabStates = new Map<number, TabState>();
+  /** The run that owns each tab: a tab belongs to one run from the time it joins the run. */
+  private readonly owners = new Map<number, string>();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -160,8 +164,14 @@ export class Actor {
 
   async handle(frame: ToolCallFrame): Promise<ToolResultFrame> {
     const deadline = this.now() + Math.max(1_000, frame.timeout_ms);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const result = await this.run(frame, deadline);
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ToolFailure("timeout")), Math.max(0, deadline - this.now()));
+      });
+      // The call stops at the deadline. Its work that still runs cannot send more commands:
+      // `cmd` checks the deadline of the run before each one.
+      const result = await Promise.race([this.run(frame, deadline), expired]);
       return { type: "tool_result", call_id: frame.call_id, ok: true, result };
     } catch (error) {
       const failure =
@@ -174,6 +184,8 @@ export class Actor {
         ok: false,
         error: { code: failure.code, message: failure.message.slice(0, 1_000) },
       };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -183,6 +195,7 @@ export class Actor {
       return {};
     }
     const run = await this.runOf(frame);
+    run.deadline = deadline;
     const args = frame.args;
     switch (frame.op) {
       case "navigate":
@@ -190,7 +203,7 @@ export class Actor {
       case "snapshot":
         return this.snapshot(run, deadline);
       case "act":
-        return this.act(run, args, frame.approved, deadline);
+        return this.act(run, args, frame.approved, frame.approved_reason ?? null, deadline);
       case "screenshot":
         return this.screenshot(run, args.full_page === true, deadline);
       case "extract":
@@ -214,13 +227,11 @@ export class Actor {
         once: new Set(),
         stopped: false,
         notes: [],
+        deadline: 0,
       };
       const bound = frame.session_id ? await this.deps.boundTab(frame.session_id) : null;
       if (bound !== null && (await this.deps.tabs.get(bound)) !== null) {
-        const owner = this.tabStates.get(bound)?.runId;
-        if (owner !== undefined && owner !== frame.run_id && this.runs.get(owner)?.stopped === false) {
-          throw new ToolFailure("busy");
-        }
+        this.claim(run, bound);
         run.tabs.push(bound);
         run.active = bound;
       }
@@ -228,6 +239,36 @@ export class Actor {
     }
     if (run.stopped) throw new ToolFailure("stopped");
     return run;
+  }
+
+  /** Makes `run` the owner of a tab. A tab of another live run gives "busy". */
+  private claim(run: RunState, tabId: number): void {
+    const owner = this.owners.get(tabId);
+    if (owner !== undefined && owner !== run.runId) {
+      const other = this.runs.get(owner);
+      if (other !== undefined && !other.stopped) throw new ToolFailure("busy");
+    }
+    this.owners.set(tabId, run.runId);
+  }
+
+  /** Checks that the run still has the tab, before a change of the tab. */
+  private owns(run: RunState, tabId: number): void {
+    if (this.owners.get(tabId) !== run.runId) throw new ToolFailure("busy");
+  }
+
+  /** Throws when the call must stop: the run was stopped or released, or the deadline passed. */
+  private alive(runId: string): RunState {
+    const run = this.runs.get(runId);
+    if (run === undefined) throw new ToolFailure("stopped", "the run ended");
+    if (run.stopped) throw new ToolFailure("stopped");
+    if (this.now() > run.deadline) throw new ToolFailure("timeout");
+    return run;
+  }
+
+  /** A CDP command of a call. It is not sent after Stop, release, or the deadline. */
+  private async cmd<T = unknown>(tab: TabState, method: string, params?: Record<string, unknown>): Promise<T> {
+    this.alive(tab.runId);
+    return this.deps.cdp.send<T>(tab.tabId, method, params);
   }
 
   // -- consent and control ----------------------------------------------------------------------
@@ -240,6 +281,7 @@ export class Actor {
   private async checkSite(run: RunState, tabId: number, url: string, deadline: number): Promise<void> {
     if (!isWebPage(url)) throw new ToolFailure("not_web");
     const state = await this.deps.consent.state(url);
+    this.alive(run.runId);
     if (state === "blocked") throw new ToolFailure("blocked");
     if (state === "never") throw new ToolFailure("never");
     const site = hostOf(url) ?? "";
@@ -247,7 +289,7 @@ export class Actor {
     await this.setMode(tabId, "waiting");
     const answer = await this.deps.prompter.site({ runId: run.runId, tabId, site }, this.remaining(deadline));
     await this.setMode(tabId, "acting");
-    if (run.stopped) throw new ToolFailure("stopped");
+    this.alive(run.runId);
     switch (answer) {
       case "allow":
         await this.deps.consent.set(url, "allow");
@@ -281,19 +323,41 @@ export class Actor {
   /** Checks the site of the active tab, attaches the debugger, and waits while the user has
    * control. Returns the tab state. */
   private async prepare(run: RunState, deadline: number): Promise<TabState> {
-    const tabId = this.activeTab(run);
-    const info = await this.tabInfo(tabId);
-    await this.checkSite(run, tabId, info.url, deadline);
-    const tab = await this.attach(run, tabId);
-    await this.ensureWorld(tab);
-    if (tab.paused) await this.waitForResume(run, tab, deadline);
-    return tab;
+    // The page can change while the call waits for the user (a consent or a takeover). The
+    // site check is good only for the page that it saw, so check again until nothing waits.
+    for (let round = 0; round < 3; round += 1) {
+      const tabId = this.activeTab(run);
+      this.owns(run, tabId);
+      const info = await this.tabInfo(tabId);
+      await this.checkSite(run, tabId, info.url, deadline);
+      const tab = await this.attach(run, tabId);
+      if (tab.dialog === null) await this.ensureWorld(tab);
+      if (tab.paused) await this.waitForResume(run, tab, deadline);
+      const now = await this.tabInfo(tabId);
+      if (hostOf(now.url) === hostOf(info.url) && isWebPage(now.url) && !isBlockedSite(now.url)) return tab;
+    }
+    throw new ToolFailure("failed", "the page keeps changing; take a new snapshot");
+  }
+
+  /** Checks, right before the call reads or changes the page, that the page is still on an
+   * allowed site of the run. */
+  private async stillAllowed(run: RunState, tab: TabState): Promise<void> {
+    this.alive(run.runId);
+    const info = await this.tabInfo(tab.tabId);
+    if (!isWebPage(info.url)) throw new ToolFailure("not_web");
+    const state = await this.deps.consent.state(info.url);
+    if (state === "blocked") throw new ToolFailure("blocked");
+    if (state === "never") throw new ToolFailure("never");
+    if (state !== "allow" && !run.once.has(hostOf(info.url) ?? "")) {
+      throw new ToolFailure("failed", "the page went to another site; take a new snapshot");
+    }
   }
 
   private async attach(run: RunState, tabId: number): Promise<TabState> {
+    this.alive(run.runId);
+    this.claim(run, tabId);
     let tab = this.tabStates.get(tabId);
     if (tab !== undefined && tab.runId !== run.runId) {
-      if (this.runs.get(tab.runId)?.stopped === false) throw new ToolFailure("busy");
       this.tabStates.delete(tabId);
       tab = undefined;
     }
@@ -320,9 +384,9 @@ export class Actor {
       }
       tab.attached = true;
       tab.world = null;
-      await this.deps.cdp.send(tabId, "Page.enable");
-      await this.deps.cdp.send(tabId, "Runtime.enable");
-      await this.deps.cdp.send(tabId, "Runtime.addBinding", {
+      await this.cmd(tab, "Page.enable");
+      await this.cmd(tab, "Runtime.enable");
+      await this.cmd(tab, "Runtime.addBinding", {
         name: OVERLAY_BINDING,
         executionContextName: OVERLAY_WORLD,
       });
@@ -335,24 +399,33 @@ export class Actor {
   private async ensureWorld(tab: TabState): Promise<number> {
     if (tab.world !== null) {
       try {
-        const check = await this.deps.cdp.send<{ result?: { value?: unknown } }>(tab.tabId, "Runtime.evaluate", {
+        const check = await this.cmd<{ result?: { value?: unknown } }>(tab, "Runtime.evaluate", {
           contextId: tab.world,
-          expression: "typeof globalThis.__sama === 'object'",
+          expression:
+            "typeof globalThis.__sama === 'object' && document.getElementById('sama-agent-overlay') !== null",
           returnByValue: true,
         });
         if (check.result?.value === true) return tab.world;
+        // The world is there but the page removed the overlay: build it again in this world.
+        await this.cmd(tab, "Runtime.evaluate", {
+          contextId: tab.world,
+          expression: `(${installOverlay.toString()})(${JSON.stringify(OVERLAY_BINDING)})`,
+          returnByValue: true,
+        });
+        await this.overlay(tab, `mode(${JSON.stringify(tab.paused ? "paused" : tab.mode)})`);
+        return tab.world;
       } catch {
         // The world went away with a navigation.
       }
     }
-    const frames = await this.deps.cdp.send<{ frameTree: { frame: { id: string } } }>(tab.tabId, "Page.getFrameTree");
-    const world = await this.deps.cdp.send<{ executionContextId: number }>(tab.tabId, "Page.createIsolatedWorld", {
+    const frames = await this.cmd<{ frameTree: { frame: { id: string } } }>(tab, "Page.getFrameTree");
+    const world = await this.cmd<{ executionContextId: number }>(tab, "Page.createIsolatedWorld", {
       frameId: frames.frameTree.frame.id,
       worldName: OVERLAY_WORLD,
       grantUniveralAccess: false,
     });
     tab.world = world.executionContextId;
-    await this.deps.cdp.send(tab.tabId, "Runtime.evaluate", {
+    await this.cmd(tab, "Runtime.evaluate", {
       contextId: tab.world,
       expression: `(${installOverlay.toString()})(${JSON.stringify(OVERLAY_BINDING)})`,
       returnByValue: true,
@@ -363,7 +436,8 @@ export class Actor {
 
   /** Calls a function of the overlay. It never fails the call. */
   private async overlay(tab: TabState, call: string): Promise<void> {
-    if (!tab.attached || tab.world === null) return;
+    // JavaScript waits while a dialog is open: do not wait for it.
+    if (!tab.attached || tab.world === null || tab.dialog !== null) return;
     try {
       await this.deps.cdp.send(tab.tabId, "Runtime.evaluate", {
         contextId: tab.world,
@@ -391,7 +465,7 @@ export class Actor {
         resolve(true);
       });
     });
-    if (run.stopped) throw new ToolFailure("stopped");
+    this.alive(run.runId);
     if (!resumed || tab.paused) throw new ToolFailure("taken_over");
   }
 
@@ -456,12 +530,17 @@ export class Actor {
     if (run === undefined) return;
     this.runs.delete(runId);
     this.deps.prompter.drop(runId);
+    for (const tabId of run.tabs) {
+      const tab = this.tabStates.get(tabId);
+      if (tab !== undefined && tab.runId === runId) for (const done of tab.resumed.splice(0)) done();
+    }
     await this.detachRun(run);
     this.deps.onChange();
   }
 
   private async detachRun(run: RunState): Promise<void> {
     for (const tabId of run.tabs) {
+      if (this.owners.get(tabId) === run.runId) this.owners.delete(tabId);
       const tab = this.tabStates.get(tabId);
       if (tab === undefined || tab.runId !== run.runId) continue;
       await this.overlay(tab, "remove()");
@@ -505,7 +584,8 @@ export class Actor {
     if (openerTabId === undefined) return;
     for (const run of this.runs.values()) {
       if (run.stopped || run.active !== openerTabId || run.tabs.includes(tabId)) continue;
-      if (run.tabs.length >= MAX_TABS) return;
+      if (run.tabs.length >= MAX_TABS || this.owners.has(tabId)) return;
+      this.owners.set(tabId, run.runId);
       run.tabs.push(tabId);
       run.opened.add(tabId);
       run.active = tabId;
@@ -517,6 +597,7 @@ export class Actor {
   onTabRemoved(tabId: number): void {
     const tab = this.tabStates.get(tabId);
     this.tabStates.delete(tabId);
+    this.owners.delete(tabId);
     for (const run of this.runs.values()) {
       const index = run.tabs.indexOf(tabId);
       if (index < 0) continue;
@@ -563,7 +644,9 @@ export class Actor {
     if (isBlockedSite(url)) throw new ToolFailure("blocked");
     if (run.active === null) {
       await this.checkSite(run, -1, url, deadline);
+      this.alive(run.runId);
       const created = await this.deps.tabs.create({ url });
+      this.owners.set(created.id, run.runId);
       run.tabs.push(created.id);
       run.opened.add(created.id);
       run.active = created.id;
@@ -572,6 +655,8 @@ export class Actor {
       await this.checkSite(run, tabId, url, deadline);
       const tab = this.tabStates.get(tabId);
       if (tab?.paused) await this.waitForResume(run, tab, deadline);
+      this.alive(run.runId);
+      this.owns(run, tabId);
       await this.deps.tabs.update(tabId, { url, active: true });
       if (tab) tab.world = null;
       await this.sleep(100);
@@ -587,9 +672,9 @@ export class Actor {
     if (tab.dialog !== null) {
       return { page: await this.page(run), tree: "", dialog: tab.dialog, sensitive: {}, submits: [] };
     }
-    const document = await this.deps.cdp.send<{ root: DomNode }>(tab.tabId, "DOM.getDocument", { depth: -1, pierce: true });
+    const document = await this.cmd<{ root: DomNode }>(tab, "DOM.getDocument", { depth: -1, pierce: true });
     const facts = domFacts(document.root);
-    const ax = await this.deps.cdp.send<{ nodes: AXNode[] }>(tab.tabId, "Accessibility.getFullAXTree");
+    const ax = await this.cmd<{ nodes: AXNode[] }>(tab, "Accessibility.getFullAXTree");
     const built = buildTree(ax.nodes, (id) => facts.get(id) ?? null);
     tab.refs = built.refs;
     return { page: await this.page(run), tree: built.tree, sensitive: built.sensitive, submits: built.submits };
@@ -606,7 +691,7 @@ export class Actor {
   private async objectOf(tab: TabState, backendNodeId: number): Promise<string> {
     const world = await this.ensureWorld(tab);
     try {
-      const resolved = await this.deps.cdp.send<{ object: { objectId?: string } }>(tab.tabId, "DOM.resolveNode", {
+      const resolved = await this.cmd<{ object: { objectId?: string } }>(tab, "DOM.resolveNode", {
         backendNodeId,
         executionContextId: world,
       });
@@ -618,8 +703,8 @@ export class Actor {
   }
 
   private async callOn<T>(tab: TabState, objectId: string, fn: (...args: never[]) => unknown, args: unknown[] = []): Promise<T> {
-    const answer = await this.deps.cdp.send<{ result?: { value?: unknown }; exceptionDetails?: { exception?: { description?: string } } }>(
-      tab.tabId,
+    const answer = await this.cmd<{ result?: { value?: unknown }; exceptionDetails?: { exception?: { description?: string } } }>(
+      tab,
       "Runtime.callFunctionOn",
       {
         objectId,
@@ -637,7 +722,7 @@ export class Actor {
 
   private async focusedObject(tab: TabState): Promise<string | null> {
     const world = await this.ensureWorld(tab);
-    const answer = await this.deps.cdp.send<{ result?: { objectId?: string; subtype?: string } }>(tab.tabId, "Runtime.evaluate", {
+    const answer = await this.cmd<{ result?: { objectId?: string; subtype?: string } }>(tab, "Runtime.evaluate", {
       contextId: world,
       expression: "document.activeElement",
     });
@@ -647,12 +732,11 @@ export class Actor {
   /** The center of a node in the viewport, after a scroll into view. */
   private async pointOf(tab: TabState, backendNodeId: number): Promise<Quad> {
     try {
-      await this.deps.cdp.send(tab.tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
+      await this.cmd(tab, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
     } catch {
       // Not all nodes can scroll; the quads tell.
     }
-    const quads = await this.deps.cdp
-      .send<{ quads: number[][] }>(tab.tabId, "DOM.getContentQuads", { backendNodeId })
+    const quads = await this.cmd<{ quads: number[][] }>(tab, "DOM.getContentQuads", { backendNodeId })
       .then((answer) => answer.quads)
       .catch(() => {
         throw new ToolFailure("stale_ref");
@@ -680,7 +764,7 @@ export class Actor {
     await this.overlay(tab, "busy(true)");
     try {
       for (const [method, params] of events) {
-        const sent = this.deps.cdp.send(tab.tabId, method, params);
+        const sent = this.cmd(tab, method, params);
         // After a dialog the send ends later; its error then has no reader.
         sent.catch(() => undefined);
         const dialog = new Promise<typeof DIALOG>((resolve) => tab.dialogWaiters.push(() => resolve(DIALOG)));
@@ -714,6 +798,7 @@ export class Actor {
     tab: TabState,
     args: Record<string, unknown>,
     approved: boolean,
+    approvedReason: string | null,
     deadline: number,
   ): Promise<void> {
     const action = String(args.action ?? "");
@@ -727,7 +812,9 @@ export class Actor {
       { action, submit: args.submit === true, key: typeof args.text === "string" ? args.text : null },
       facts,
     );
-    if (reason === null || approved) return;
+    // A person approved this call in the approval card for this reason. A page that changed
+    // since the snapshot (another reason) still asks.
+    if (reason === null || (approved && approvedReason === reason)) return;
     const info = await this.tabInfo(tab.tabId);
     await this.setMode(tab.tabId, "waiting");
     const answer = await this.deps.prompter.action(
@@ -735,7 +822,7 @@ export class Actor {
       this.remaining(deadline),
     );
     await this.setMode(tab.tabId, "acting");
-    if (run.stopped) throw new ToolFailure("stopped");
+    this.alive(run.runId);
     if (answer === "timeout") throw new ToolFailure("sensitive_timeout");
     if (answer !== "allow") throw new ToolFailure("sensitive_denied");
     run.notes.push("approved");
@@ -745,6 +832,7 @@ export class Actor {
     run: RunState,
     args: Record<string, unknown>,
     approved: boolean,
+    approvedReason: string | null,
     deadline: number,
   ): Promise<Record<string, unknown>> {
     const tab = await this.prepare(run, deadline);
@@ -752,8 +840,9 @@ export class Actor {
     if (tab.dialog !== null && action !== "dialog" && action !== "wait") {
       throw new ToolFailure("failed", "a dialog is open; answer it with action dialog");
     }
-    await this.checkSensitive(run, tab, args, approved, deadline);
+    await this.checkSensitive(run, tab, args, approved, approvedReason, deadline);
     if (tab.paused) await this.waitForResume(run, tab, deadline);
+    await this.stillAllowed(run, tab);
     let settle = false;
     let dialog = false;
     switch (action) {
@@ -778,7 +867,7 @@ export class Actor {
         const node = this.nodeOf(tab, args.ref);
         const point = await this.pointOf(tab, node);
         await this.showTarget(tab, point);
-        await this.deps.cdp.send(tab.tabId, "DOM.focus", { backendNodeId: node }).catch(() => {
+        await this.cmd(tab, "DOM.focus", { backendNodeId: node }).catch(() => {
           throw new ToolFailure("failed", "the element cannot take text");
         });
         await this.callOn(tab, await this.objectOf(tab, node), selectAllText);
@@ -800,7 +889,7 @@ export class Actor {
       }
       case "press": {
         if (typeof args.ref === "string" && args.ref) {
-          await this.deps.cdp.send(tab.tabId, "DOM.focus", { backendNodeId: this.nodeOf(tab, args.ref) }).catch(() => undefined);
+          await this.cmd(tab, "DOM.focus", { backendNodeId: this.nodeOf(tab, args.ref) }).catch(() => undefined);
         }
         dialog = await this.input(tab, this.keyEvents(typeof args.text === "string" ? args.text : ""));
         settle = true;
@@ -811,8 +900,8 @@ export class Actor {
           await this.pointOf(tab, this.nodeOf(tab, args.ref));
           break;
         }
-        const metrics = await this.deps.cdp.send<{ cssLayoutViewport: { clientWidth: number; clientHeight: number } }>(
-          tab.tabId,
+        const metrics = await this.cmd<{ cssLayoutViewport: { clientWidth: number; clientHeight: number } }>(
+          tab,
           "Page.getLayoutMetrics",
         );
         const amount = typeof args.amount === "number" ? args.amount : 600;
@@ -845,25 +934,25 @@ export class Actor {
         break;
       case "back":
       case "forward": {
-        const history = await this.deps.cdp.send<{ currentIndex: number; entries: { id: number }[] }>(
-          tab.tabId,
+        const history = await this.cmd<{ currentIndex: number; entries: { id: number }[] }>(
+          tab,
           "Page.getNavigationHistory",
         );
         const entry = history.entries[history.currentIndex + (action === "back" ? -1 : 1)];
         if (entry === undefined) throw new ToolFailure("failed", `there is no page to go ${action} to`);
-        await this.deps.cdp.send(tab.tabId, "Page.navigateToHistoryEntry", { entryId: entry.id });
+        await this.cmd(tab, "Page.navigateToHistoryEntry", { entryId: entry.id });
         tab.world = null;
         settle = true;
         break;
       }
       case "reload":
-        await this.deps.cdp.send(tab.tabId, "Page.reload");
+        await this.cmd(tab, "Page.reload");
         tab.world = null;
         settle = true;
         break;
       case "dialog": {
         if (tab.dialog === null) throw new ToolFailure("failed", "no dialog is open");
-        await this.deps.cdp.send(tab.tabId, "Page.handleJavaScriptDialog", {
+        await this.cmd(tab, "Page.handleJavaScriptDialog", {
           accept: args.accept !== false,
           promptText: typeof args.prompt_text === "string" ? args.prompt_text : undefined,
         });
@@ -886,8 +975,8 @@ export class Actor {
     const tab = await this.prepare(run, deadline);
     const params: Record<string, unknown> = { format: "jpeg", quality: 70 };
     if (fullPage) {
-      const metrics = await this.deps.cdp.send<{ cssContentSize: { width: number; height: number } }>(
-        tab.tabId,
+      const metrics = await this.cmd<{ cssContentSize: { width: number; height: number } }>(
+        tab,
         "Page.getLayoutMetrics",
       );
       params.captureBeyondViewport = true;
@@ -899,11 +988,12 @@ export class Actor {
         scale: 1,
       };
     }
+    await this.stillAllowed(run, tab);
     await this.overlay(tab, "hidden(true)");
     try {
-      let shot = await this.deps.cdp.send<{ data: string }>(tab.tabId, "Page.captureScreenshot", params);
+      let shot = await this.cmd<{ data: string }>(tab, "Page.captureScreenshot", params);
       if (shot.data.length > MAX_SCREENSHOT_CHARS) {
-        shot = await this.deps.cdp.send<{ data: string }>(tab.tabId, "Page.captureScreenshot", { ...params, quality: 35 });
+        shot = await this.cmd<{ data: string }>(tab, "Page.captureScreenshot", { ...params, quality: 35 });
       }
       if (shot.data.length > MAX_SCREENSHOT_CHARS) throw new ToolFailure("failed", "the screenshot is too large");
       return { page: await this.page(run), data: shot.data, mime_type: "image/jpeg" };
@@ -929,7 +1019,7 @@ export class Actor {
         objectId = await this.objectOf(tab, this.nodeOf(tab, args.ref));
       } else {
         const world = await this.ensureWorld(tab);
-        const body = await this.deps.cdp.send<{ result?: { objectId?: string } }>(tab.tabId, "Runtime.evaluate", {
+        const body = await this.cmd<{ result?: { objectId?: string } }>(tab, "Runtime.evaluate", {
           contextId: world,
           expression: "document.body ?? document.documentElement",
         });
@@ -958,11 +1048,13 @@ export class Actor {
       const url = typeof args.url === "string" && args.url ? args.url : null;
       if (url !== null) await this.checkSite(run, run.active ?? -1, url, deadline);
       const opener = run.active === null ? null : await this.deps.tabs.get(run.active);
+      this.alive(run.runId);
       const created = await this.deps.tabs.create({
         url: url ?? "about:blank",
         windowId: opener?.windowId,
         openerTabId: opener?.id,
       });
+      this.owners.set(created.id, run.runId);
       if (!run.tabs.includes(created.id)) run.tabs.push(created.id);
       run.opened.add(created.id);
       run.active = created.id;
@@ -970,12 +1062,15 @@ export class Actor {
     } else if (action === "select") {
       const tabId = index === null ? undefined : run.tabs[index];
       if (tabId === undefined) throw new ToolFailure("failed", "no tab has this index");
+      this.owns(run, tabId);
       run.active = tabId;
       await this.deps.tabs.update(tabId, { active: true });
     } else if (action === "close") {
       const tabId = index === null ? run.active : run.tabs[index];
       if (tabId === undefined || tabId === null) throw new ToolFailure("failed", "no tab has this index");
       if (!run.opened.has(tabId)) throw new ToolFailure("failed", "sama closes only the tabs that it opened");
+      this.owns(run, tabId);
+      this.alive(run.runId);
       const tab = this.tabStates.get(tabId);
       if (tab?.attached) await this.deps.cdp.detach(tabId).catch(() => undefined);
       await this.deps.tabs.remove(tabId);

@@ -463,7 +463,7 @@ def decide(
     still allows it, and an unattended run gets ``deny`` (a pre-approval does not cover it)."""
     name = canonical_name(tool_name)
     if name == TOOL_CALL:
-        return _decide_wrapped(context, arguments)
+        return _decide_wrapped(context, arguments, escalate)
     early = _authority_and_toolset(context, name)
     if early is not None:
         return early
@@ -473,7 +473,9 @@ def decide(
     return _after_hardline(context, name, arguments_digest(arguments), arguments, escalate)
 
 
-def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdict:
+def _decide_wrapped(
+    context: GateContext, arguments: Mapping[str, Any], escalate: str | None = None
+) -> Verdict:
     """``tool_call`` has no verdict of its own. The run needs the toolset of ``tool_call``,
     and no ``deny`` rule can name ``tool_call``. Then the named tool gets the full gate with
     its own arguments: its toolset, the hardline list, its policy, and the unattended rule.
@@ -492,7 +494,7 @@ def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdi
     name, inner = wrapped
     if name in META_TOOLS or name in TOOL_LOADERS:
         return Verdict("deny", GateStep.TOOLSET, f"{name} cannot be called through tool_call")
-    return decide(context, name, inner)
+    return decide(context, name, inner, escalate=escalate)
 
 
 def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdict:

@@ -97,14 +97,19 @@ function rig(siteAnswers: SiteAnswer[] = ["allow"], actionAnswers: ActionAnswer[
 }
 
 let n = 0;
-const call = (op: ToolCallFrame["op"], args: Record<string, unknown> = {}, approved = false): ToolCallFrame => ({
+const call = (
+  op: ToolCallFrame["op"],
+  args: Record<string, unknown> = {},
+  approvedReason: string | null = null,
+): ToolCallFrame => ({
   type: "tool_call",
   call_id: `c${++n}`,
   op,
   args,
   session_id: "s",
   run_id: "r",
-  approved,
+  approved: approvedReason !== null,
+  approved_reason: approvedReason,
   timeout_ms: 5_000,
 });
 
@@ -152,11 +157,49 @@ describe("actor", () => {
     expect(sent.filter((method) => method === "Input.dispatchMouseEvent")).toHaveLength(0);
     const allowed = await actor.handle(call("act", { action: "click", ref: "e2" }));
     expect(allowed.ok && allowed.result.notes).toEqual(["approved"]);
-    const approved = await actor.handle(call("act", { action: "click", ref: "e2" }, true));
+    const approved = await actor.handle(call("act", { action: "click", ref: "e2" }, "pay"));
     expect(approved.ok).toBe(true);
     expect(asked).toEqual(["site shop.test", "action buy or pay", "action buy or pay"]);
+    // An approval for another reason (the page changed since the snapshot) asks again.
+    const other = await actor.handle(call("act", { action: "click", ref: "e2" }, "submit"));
+    expect(other).toMatchObject({ ok: false, error: { code: "sensitive_denied" } });
     const enter = await actor.handle(call("act", { action: "type", ref: "e1", text: "ada", submit: true }));
     expect(enter).toMatchObject({ ok: false, error: { code: "sensitive_denied" } });
+  });
+
+  it("asks before a key press that activates a sensitive button", async () => {
+    const { actor, asked } = rig(["allow"], []);
+    await actor.handle(call("snapshot"));
+    for (const key of ["Space", " ", "Enter"]) {
+      const result = await actor.handle(call("act", { action: "press", ref: "e2", text: key }));
+      expect(result).toMatchObject({ ok: false, error: { code: "sensitive_denied" } });
+    }
+    expect(asked.filter((item) => item.startsWith("action"))).toHaveLength(3);
+  });
+
+  it("does not act after the run is released during a wait", async () => {
+    const { actor, sent } = rig(["allow"]);
+    await actor.handle(call("snapshot"));
+    actor.onEvent(1, "Runtime.bindingCalled", { name: "__samaSignal", payload: "takeover", executionContextId: 9 });
+    await Promise.resolve();
+    const waiting = actor.handle(call("act", { action: "click", ref: "e3" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await actor.handle(call("release"));
+    expect(await waiting).toMatchObject({ ok: false, error: { code: "stopped" } });
+    expect(sent.filter((method) => method === "Input.dispatchMouseEvent")).toHaveLength(0);
+  });
+
+  it("does not act on a page that went to another site while the user had control", async () => {
+    const { actor, tab, sent } = rig(["allow"]);
+    await actor.handle(call("snapshot"));
+    actor.onEvent(1, "Runtime.bindingCalled", { name: "__samaSignal", payload: "takeover", executionContextId: 9 });
+    await Promise.resolve();
+    const waiting = actor.handle(call("act", { action: "click", ref: "e3" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    tab.url = "https://netbanking.examplebank.test/";
+    actor.resumeTab(1);
+    expect(await waiting).toMatchObject({ ok: false, error: { code: "blocked" } });
+    expect(sent.filter((method) => method === "Input.dispatchMouseEvent")).toHaveLength(0);
   });
 
   it("fails a stale ref", async () => {
