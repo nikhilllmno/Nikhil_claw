@@ -24,6 +24,7 @@ from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
 from sama.modelproxy.usage import Endpoint
 from sama.tenancy.authority import budget_problem, lower
 from sama.tenancy.run_token import RunTokenClaims
+from sama.vault.store import KeySource
 
 log = logging.getLogger("sama.media")
 
@@ -118,6 +119,7 @@ class MediaMeter:
         counts: TokenCounts,
         estimated: bool,
         status: int,
+        key_source: KeySource,
     ) -> None:
         cost = self._prices.media_cost(provider, model, counts)
         log.info(
@@ -142,6 +144,7 @@ class MediaMeter:
                 status_code=status,
                 counts=counts,
                 usage_estimated=estimated,
+                key_source=key_source,
                 cost_usd=cost,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 created_at=self._clock(),

@@ -32,7 +32,7 @@ from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
 from sama.modelproxy.usage import Endpoint, UsageReader, estimate_counts
 from sama.tenancy.authority import Authority, budget_problem, lower
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
-from sama.vault.store import OrgKeys, SecretName
+from sama.vault.store import KeySource, OrgKey, OrgKeys, SecretName
 
 log = logging.getLogger("sama.modelproxy")
 
@@ -110,6 +110,7 @@ class _Call:
     body: dict[str, Any]
     request_bytes: int
     started: float
+    key_source: KeySource
 
 
 class _End(Enum):
@@ -331,12 +332,13 @@ class ModelProxy:
                 **(options if isinstance(options, dict) else {}),
                 "include_usage": True,
             }
+        key, key_source = await self._key(route.provider, claims.org_id)
         started = time.monotonic()
-        upstream = await self._send(route, request, body, claims.org_id)
+        upstream = await self._send(route, request, body, key)
         reader = UsageReader(route.provider, stream=stream)
 
         pump = _Pump(
-            call=_Call(claims, route, model, body, request_bytes, started),
+            call=_Call(claims, route, model, body, request_bytes, started, key_source),
             upstream=upstream,
             reader=reader,
             drain_s=self._settings.drain_s,
@@ -520,23 +522,29 @@ class ModelProxy:
             if spent >= daily:
                 raise _budget("the user reached the daily model limit")
 
-    async def _key(self, provider: Provider, org_id: str) -> SecretStr | None:
+    async def _key(self, provider: Provider, org_id: str) -> tuple[SecretStr, KeySource]:
+        """The key of the org first, then the key of the process. A key of the org that cannot
+        be read gives ``503``: the proxy does not use the key of sama in its place."""
         if provider is Provider.ANTHROPIC:
             name, default = SecretName.ANTHROPIC_API_KEY, self._settings.anthropic_key
         else:
             name, default = SecretName.OPENAI_API_KEY, self._settings.openai_key
-        if self._keys is None:
-            return default
-        try:
-            return await self._keys.get(org_id, name) or default
-        except Exception:
-            log.exception("the provider key of an org cannot be read org=%s", org_id)
-            raise ProxyError(
-                503, "api_error", "the proxy cannot read the provider key now"
-            ) from None
+        found = OrgKey(None, KeySource.SAMA)
+        if self._keys is not None:
+            try:
+                found = await self._keys.lookup(org_id, name)
+            except Exception:
+                log.exception("the provider key of an org cannot be read org=%s", org_id)
+                raise ProxyError(
+                    503, "api_error", "the proxy cannot read the provider key now"
+                ) from None
+        value = found.value or default
+        if value is None:
+            raise ProxyError(503, "api_error", f"the proxy has no {provider} key")
+        return value, found.source
 
     async def _send(
-        self, route: _Route, request: Request, body: dict[str, Any], org_id: str
+        self, route: _Route, request: Request, body: dict[str, Any], key: SecretStr
     ) -> httpx.Response:
         headers = {
             name: value for name, value in request.headers.items() if name in _REQUEST_HEADERS
@@ -544,15 +552,13 @@ class ModelProxy:
         headers["content-type"] = "application/json"
         # Identity encoding: the usage reader parses the bytes that the client gets.
         headers["accept-encoding"] = "identity"
-        key = await self._key(route.provider, org_id)
-        if key is None:
-            raise ProxyError(503, "api_error", f"the proxy has no {route.provider} key")
+        secret = key.get_secret_value()
         if route.provider is Provider.ANTHROPIC:
             base = self._settings.anthropic_url
-            headers["x-api-key"] = key.get_secret_value()
+            headers["x-api-key"] = secret
         else:
             base = self._settings.openai_url
-            headers["authorization"] = f"Bearer {key.get_secret_value()}"
+            headers["authorization"] = f"Bearer {secret}"
         upstream = self._client.build_request(
             "POST",
             base.rstrip("/") + route.upstream_path,
@@ -571,13 +577,14 @@ class ModelProxy:
         claims, route, model = request.claims, request.route, request.model
         cost = self._prices.cost(route.provider, model, counts)
         log.info(
-            "model call run=%s model=%s status=%s tokens=%s cost_usd=%s estimated=%s",
+            "model call run=%s model=%s status=%s tokens=%s cost_usd=%s estimated=%s key_source=%s",
             claims.run_id,
             model,
             status_code,
             counts.total_tokens,
             cost,
             estimated,
+            request.key_source,
         )
         return CallRecord(
             org_id=claims.org_id,
@@ -591,6 +598,7 @@ class ModelProxy:
             status_code=status_code,
             counts=counts,
             usage_estimated=estimated,
+            key_source=request.key_source,
             cost_usd=cost,
             duration_ms=int((time.monotonic() - request.started) * 1000),
             created_at=self._clock(),

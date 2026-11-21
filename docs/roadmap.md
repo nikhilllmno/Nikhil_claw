@@ -470,7 +470,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2,
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. Done (Telegram, Slack, and web; architecture §15.3). |
 | M6.5 | Customer sign-up | Self-serve sign-up, org creation, invites, roles. Done (architecture §17.2): Supabase Auth sign-up, a rate limit and a confirmed-email check on org creation, invite links, and a plan seam per org. |
 | M6.6 | Billing and quotas | Stripe plans and usage billing from proxy cost. Quotas per plan. |
-| M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys (its own Telegram bot came in M1.19). Region per org. |
+| M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys (its own Telegram bot came in M1.19). Region per org. Done: the keys go in the vault, and the model proxy and the media tools use the org key first and record `key_source`. An org admin sets the keys on the settings page. Each org has a region. A deployment serves only its home region (`SAMA_REGION`), and the API sends members of an org in another region to its deployment (`421`). A second region is not deployed: the setting, the routing seam, and the operator steps are in architecture §17.3. |
 | M6.8 | Data controls | Export and delete per user and per org. Retention per plan. |
 | M6.9 | Customer-ready web app | Onboarding, billing pages, admin views, and docs. |
 

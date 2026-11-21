@@ -33,8 +33,8 @@ from sama.orchestrator.queue import RunQueue
 from sama.tenancy.authority import Authority
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import REDACTED, Redactor
-from sama.vault.store import OrgKeys, SecretName
-from tests.media.support import PNG
+from sama.vault.store import KeySource, OrgKeys, SecretName
+from tests.media.support import PNG, OwnKeys
 from tests.orchestrator.conftest import Tenant
 
 KEY = "sk-openai-media-key-0001"
@@ -104,10 +104,13 @@ async def build(
     key: str | None = KEY,
     redactor: Redactor | None = None,
     usage: MemoryUsageStore | None = None,
+    keys: OrgKeys | None = None,
 ) -> Rig:
     api = OpenAI()
     usage = usage or MemoryUsageStore()
-    keys = OrgKeys(None, {SecretName.OPENAI_API_KEY: None if key is None else SecretStr(key)})
+    keys = keys or OrgKeys(
+        None, {SecretName.OPENAI_API_KEY: None if key is None else SecretStr(key)}
+    )
     meter = MediaMeter(usage=usage, prices=PriceTable.load(), ledger=UsageLedger(usage, retry_s=0))
     store = GeneratedMediaStore(engine)
     http = httpx.AsyncClient(transport=httpx.MockTransport(api))
@@ -175,6 +178,22 @@ async def test_an_image_is_stored_for_the_run_and_recorded(rig: Rig) -> None:
     assert call.usage_estimated is False
     assert call.cost_usd > 0
     assert call.run_id == str(rig.run_id)
+
+
+@pytest.mark.parametrize("own", [False, True])
+async def test_a_voice_note_uses_the_key_of_the_org_and_records_its_source(
+    engine: AsyncEngine, tenant: Tenant, own: bool
+) -> None:
+    """M6.7: the key of the org first. The cost is the same; only the source differs."""
+    own_key = "sk-own-key-of-the-org"
+    keys = OwnKeys(SecretName.OPENAI_API_KEY, own_key) if own else None
+    rig = await build(engine, tenant, keys=keys)
+    result = await rig.speech.speak(rig.claims(), "hello")
+    assert result.status is MediaStatus.OK
+    assert rig.api.requests[-1].headers["authorization"] == f"Bearer {own_key if own else KEY}"
+    [call] = rig.usage.calls
+    assert call.key_source is (KeySource.ORG if own else KeySource.SAMA)
+    assert call.cost_usd > 0
 
 
 async def test_an_image_without_usage_records_an_estimate(rig: Rig) -> None:

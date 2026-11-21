@@ -54,6 +54,24 @@ export interface Org {
   workspaces: Workspace[];
   agent_profiles: AgentProfileSummary[];
   integrations: IntegrationSummary[];
+  /** The region of the org, for example `ap-south-1` (Section 17.3). */
+  region: string;
+  /** True when this deployment serves the region. Else the lists above are empty. */
+  region_here: boolean;
+  /** The address of the deployment that serves the region, if it is known. */
+  region_url: string | null;
+}
+
+export type ModelProvider = "anthropic" | "openai";
+
+/** The model key of one provider for an org. It has no part of the key. */
+export interface ModelKeyStatus {
+  provider: ModelProvider;
+  /** True when the org has its own key in the vault. */
+  org_key: boolean;
+  updated_at: string | null;
+  /** True when sama has a key for orgs without their own key. */
+  default_key: boolean;
 }
 
 export interface Me {
@@ -1345,6 +1363,15 @@ export class ApiClient {
     });
   disconnectIntegration = (orgId: string, kind: ChatChannel) =>
     this.json<null>(`/orgs/${encodeURIComponent(orgId)}/integrations/${kind}`, { method: "DELETE" });
+  modelKeys = (orgId: string) =>
+    this.json<ModelKeyStatus[]>(`/orgs/${encodeURIComponent(orgId)}/model-keys`);
+  setModelKey = (orgId: string, provider: ModelProvider, apiKey: string) =>
+    this.json<ModelKeyStatus>(`/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`, {
+      method: "PUT",
+      body: { api_key: apiKey },
+    });
+  removeModelKey = (orgId: string, provider: ModelProvider) =>
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`, { method: "DELETE" });
   listIdentities = (channel: ChatChannel) =>
     this.json<ChannelIdentity[]>(`/channels/${channel}/identities`);
   unlinkIdentity = (channel: ChatChannel, identityId: string) =>

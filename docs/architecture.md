@@ -5331,13 +5331,14 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 - **Access.** Only the control plane decrypts. It writes the table as the owner. RLS lets
   org admins see which names exist, never a value. Each change writes an audit row
   (`vault.secret_set`, `vault.secret_deleted`) without the value.
-- **Use.** The model proxy and `web_search` use the org key first and our environment key
-  second. An org with no key and no default gets an error, not another org's key. The vault
-  keeps each value in memory for 60 seconds. If the vault cannot be read, the proxy returns
-  `503` and `web_search` returns an error. They do not fall back to our key.
+- **Use.** The model proxy, the media tools, and `web_search` use the org key first and our
+  environment key second. An org with no key and no default gets an error, not another org's
+  key. The vault keeps each value in memory for 60 seconds. If the vault cannot be read, the
+  proxy returns `503` and the tools return an error. They do not fall back to our key. An org
+  admin sets the Anthropic and OpenAI keys of the org on the settings page (Section 17.3).
 - **Admin CLI.** `python -m sama.admin secret set|list|delete --org <uuid> --name <name>`
-  reads the value from stdin and never prints it. An HTTP API comes with the org settings
-  (M3).
+  reads the value from stdin and never prints it. The HTTP API has routes only for the model
+  keys (Section 17.3).
 - **Redaction.** One redactor in each process removes known secret values and secret
   patterns (provider keys, bearer tokens, the password in a database URL, private keys, JWTs)
   and puts `[REDACTED]` in their place. The known values are the secrets from the environment
@@ -5479,7 +5480,9 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
    cannot be reached, the call gets `502`.
 5. **Record.** The proxy reads the usage from the response or from the stream events
    (`message_start` and `message_delta`, `response.completed`, or the last chunk). It
-   computes the cost and writes one row to `model_calls` before the response ends.
+   computes the cost and writes one row to `model_calls` before the response ends. The row
+   has `key_source`: `org` when the call used the key of the org from the vault, else `sama`
+   (M6.7). The cost and the budgets are the same for both sources.
 
 **Missing usage is never free.** A pump task reads the provider response, separately from
 the client. It holds at most 16 chunks for a slow client, then it waits, so a slow client
@@ -5661,8 +5664,8 @@ environment as the default (Section 16.3).
   the Supabase JWT. The API also checks scope in code (two guards).
 - **Now (team)**: one org for our team, invite-only sign-up.
 - **Customers (M6)**: self-serve sign-up, org creation, invites, and roles are done (M6.5,
-  Section 17.2). Plans and usage billing (Stripe), quotas, org-level keys, data export and
-  delete, and a region per org come later.
+  Section 17.2). Org keys and a region per org are done (M6.7, Section 17.3). Plans and usage
+  billing (Stripe), quotas, and data export and delete come later.
 - **Products on top**: vorflux creates one sama workspace per hotel and adds its own tables
   and tools through the extension points (D16).
 
@@ -5836,6 +5839,78 @@ history of the org stays complete. The audit rows are `member.role_changed`,
 the open invites and, when sign-up is open, the form for a new org. `/invite` reads the token
 of a link, keeps it in `localStorage` for one hour while the person signs in, and accepts it.
 `/members` shows the members, the roles, the invite form, and the open invites.
+### 17.3 Org keys and regions (M6.7)
+
+**Org keys.** An org can bring its own Anthropic key and its own OpenAI key. Its own Telegram
+bot and Slack app came earlier (Section 11.6).
+
+- An org admin sets, replaces, or removes a key in the web app (Settings, "Org keys and
+  region"). The routes are `GET /orgs/{org_id}/model-keys`,
+  `PUT /orgs/{org_id}/model-keys/{provider}` with `{"api_key": ...}`, and
+  `DELETE /orgs/{org_id}/model-keys/{provider}`. `provider` is `anthropic` or `openai`. A
+  member who is not an admin gets `403`. Without the vault key the routes answer `503`.
+- Before it stores a key, sama checks the form of the key (`sk-ant-` or `sk-`, 20 to 512
+  characters, no spaces). Then it calls `GET /v1/models` of the provider with the key. If the
+  provider refuses the key (`401` or `403`), the API answers `400` and stores nothing. If the
+  provider cannot be reached or gives another error, the API answers `502`.
+- The key goes in the vault as `anthropic_api_key` or `openai_api_key` (Section 16.3), with the
+  audit rows `vault.secret_set` and `vault.secret_deleted`. No answer, log line, or audit row
+  has the key or a part of it. The list shows only if the org has a key, when it changed, and
+  if sama has a default key.
+- The model proxy, `vision_analyze`, `image_generate`, and `text_to_speech` use the org key
+  first and the key of sama second. Each `model_calls` row records `key_source` (`org` or
+  `sama`). The cost, the budgets, and the usage pages count both sources the same way. Billing
+  can use `key_source` later (M6.6).
+- The routes use the vault of the model proxy in the same process, so a change applies at once
+  there. Another machine keeps a vault value in its cache for at most 60 seconds.
+
+**Regions.** Each org has a region (`orgs.region`, for example `ap-south-1`). A check
+constraint allows only region ids. Sama has one deployment now, in `ap-south-1`. A second
+region is not deployed. M6.7 adds the setting, the routing seam, and the operator steps.
+
+- One deployment serves one region: its home region, `SAMA_REGION` (default `ap-south-1`).
+  `SAMA_REGION_URLS` gives the web address of the deployment of each other region, as
+  `region=url` pairs with commas. The address of the home region is the first
+  `SAMA_WEB_ORIGINS` value, else `SAMA_PUBLIC_URL`.
+- **Queue.** The worker claims only the runs of orgs in the home region. A run of an org in
+  another region stays `queued`. Only a claimed run gets a run token, so the model proxy, the
+  tool gate, and the sama tools serve only orgs of the home region. The scheduler, the
+  workflows, and the deliveries need no check of their own: in a real setup each region has
+  its own database, and a run that they make waits in the queue.
+- **API.** For a member of an org in another region, the org routes answer
+  `421 Misdirected Request` with `{"detail", "region", "url"}`. `url` is the address from
+  `SAMA_REGION_URLS`, or `null`. A person who is not a member gets `404` as before and does
+  not learn the region. `GET /me` gives `region`, `region_here`, and `region_url` for each org.
+  For an org in another region, its workspaces, agent profiles, and integrations are empty
+  lists. The web app shows the region and a link to the other deployment. A list that spans
+  orgs (`GET /sessions`, the linked chat accounts) leaves out the rows of an org in another
+  region, so one such org does not stop the list. A route that finds the org from a row (a
+  skill version, a linked chat account) also answers `421` for an org in another region.
+  The member and invite routes of Section 17.2 answer `421` the same way. An org that a user
+  makes with self-serve sign-up gets the home region of the deployment.
+- **Change.** Only an operator changes the region of an org:
+  `python -m sama.admin region show|set --org <uuid> [--region <region>]`. `set` accepts only
+  the home region and the regions of `SAMA_REGION_URLS`. It writes the audit row
+  `org.region_changed` with the old and the new region. The web app shows the region but
+  cannot change it.
+
+**Operator steps for a second region.**
+
+1. Make a Supabase project in the new region and a Fly.io app near it (Section 19.3). Set
+   `SAMA_REGION` to the new region and `SAMA_REGION_URLS` to the address of each other
+   region. Give each existing deployment the address of the new one in `SAMA_REGION_URLS`.
+2. Deploy. The release command applies the migrations to the new database.
+3. To move an org: stop new work of the org, and wait until its runs end. Then copy the rows
+   of the org (all tables with its `org_id`) and its Supabase Auth users to the new database.
+   The vault entries open only with the same `SAMA_VAULT_KEY`, so use the same key or set
+   the secrets again.
+4. Run `region set` on both databases. The old deployment then answers `421` with the new
+   address, and the new deployment runs the queued runs of the org.
+5. Connect the Telegram bot and the Slack app of the org again on the new deployment, so the
+   webhooks go to its address. Check the jobs and the triggers of the org.
+6. When the new deployment works, delete the rows of the org from the old database.
+
+Until step 4 is done on the new database, the runs of the org stay queued there.
 
 ---
 
@@ -6053,10 +6128,11 @@ the start with a message that names the variable but not its value.
 | `SAMA_SIGNUP` | No | `open` lets a user with a confirmed email make an org. The default, `invite_only`, adds users only with an invite (Section 17.2). |
 | `SAMA_SIGNUP_BLOCKED_DOMAINS` | No | More email domains that cannot make an org, comma-separated (Section 17.2). |
 | `SAMA_EXTENSION_IDS` | No | The Chrome extension ids that may open the extension WebSocket (Section 14.2.1). Without it, every `chrome-extension://` origin may connect with a valid token. |
+| `SAMA_REGION`, `SAMA_REGION_URLS` | No | The home region of the deployment (default `ap-south-1`) and the `region=url` pairs of the other regions (Section 17.3) |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first
-(Section 16.3).
+(Sections 16.3 and 17.3).
 
 ### 19.3 Fly.io apps and CI (M1.15)
 
@@ -6065,6 +6141,8 @@ The provider and search keys are the defaults. An org key in the vault comes fir
 | Staging | `sama-staging` | `sama-staging` (`ap-south-1`) | `deploy/fly.staging.toml` |
 | Production | `sama-production` | `sama` (`ap-south-1`) | `deploy/fly.production.toml` |
 
+- Both apps serve the sama region `ap-south-1` (`SAMA_REGION` is not set, so it is the
+  default). A second region needs its own Fly.io app and Supabase project (Section 17.3).
 - Both apps run in `sin` (Singapore), the Fly.io region nearest to `ap-south-1` (Q4). Each app
   has one machine with `shared-cpu-1x` and 1 GB of memory. The machine does not stop when it is
   idle, because the worker must listen on the queue (Section 4.3).

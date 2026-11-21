@@ -36,7 +36,7 @@ from sama.runtime import Budget
 from sama.tenancy.authority import Authority
 from sama.tenancy.run_token import RunTokenSigner
 from sama.vault.crypto import VaultError
-from sama.vault.store import OrgKeys, SecretName
+from sama.vault.store import KeySource, OrgKey, OrgKeys, SecretName
 from tests.conformance.scripted_model import serve
 from tests.support import make_scope
 
@@ -138,11 +138,13 @@ class FakeKeys(OrgKeys):
         self.values = values
         self.fail = fail
 
-    async def get(self, org_id: Any, name: SecretName) -> SecretStr | None:
+    async def lookup(self, org_id: Any, name: SecretName) -> OrgKey:
         if self.fail:
             raise VaultError("the entry does not decrypt")
         value = self.values.get((str(org_id), name))
-        return SecretStr(value) if value is not None else None
+        if value is None:
+            return OrgKey(None, KeySource.SAMA)
+        return OrgKey(SecretStr(value), KeySource.ORG)
 
 
 def make_proxy(
@@ -192,6 +194,7 @@ def record(cost: str, *, user_id: str | None = None, at: datetime = NOW) -> Call
         endpoint=Endpoint.MESSAGES,
         status_code=200,
         counts=TokenCounts(),
+        key_source=KeySource.SAMA,
         cost_usd=Decimal(cost),
         duration_ms=1,
         created_at=at,
@@ -399,14 +402,22 @@ async def test_a_provider_without_a_key_gives_503() -> None:
 
 
 @pytest.mark.parametrize(
-    ("values", "sent_key"),
+    ("values", "sent_key", "source"),
     [
-        ({("org-1", SecretName.ANTHROPIC_API_KEY): "sk-ant-of-org-1"}, "sk-ant-of-org-1"),
-        ({("org-2", SecretName.ANTHROPIC_API_KEY): "sk-ant-of-org-2"}, ANTHROPIC_KEY),
+        (
+            {("org-1", SecretName.ANTHROPIC_API_KEY): "sk-ant-of-org-1"},
+            "sk-ant-of-org-1",
+            KeySource.ORG,
+        ),
+        (
+            {("org-2", SecretName.ANTHROPIC_API_KEY): "sk-ant-of-org-2"},
+            ANTHROPIC_KEY,
+            KeySource.SAMA,
+        ),
     ],
 )
 async def test_the_call_uses_the_key_of_the_org_first(
-    values: dict[tuple[str, SecretName], str], sent_key: str
+    values: dict[tuple[str, SecretName], str], sent_key: str, source: KeySource
 ) -> None:
     upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
     proxy = make_proxy(upstream, store, signer, keys=FakeKeys(values))
@@ -421,6 +432,10 @@ async def test_the_call_uses_the_key_of_the_org_first(
     await proxy.aclose()
     assert response.status_code == 200
     assert upstream.requests[0].headers["x-api-key"] == sent_key
+    # The cost is the same for both keys: only the source differs.
+    [call] = store.calls
+    assert call.key_source is source
+    assert call.cost_usd > 0
 
 
 async def test_a_key_that_cannot_be_read_gives_503() -> None:

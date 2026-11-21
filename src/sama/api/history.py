@@ -23,10 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.api.auth import Principal
 from sama.db.engine import as_user
-from sama.db.models import Message, ModelCall, Run, RunEvent, ToolCall, User
+from sama.db.models import Message, ModelCall, Run, RunEvent, ToolCall
 from sama.search.core import MAX_LIMIT, MAX_QUERY_CHARS, SessionSearchError
 from sama.search.service import SessionSearch
 from sama.tenancy.access import load_grants
+from sama.tenancy.regions import member_user_id
 from sama.vault.redact import default_redactor, redact
 
 ExportFormat = Literal["markdown", "json"]
@@ -206,13 +207,7 @@ class SessionHistory:
                 status_code=422, detail=f"the query has more than {MAX_QUERY_CHARS} characters"
             )
         async with as_user(self._engine, principal.auth_user_id) as connection:
-            user_id = (
-                await connection.execute(
-                    select(User.id).where(
-                        User.org_id == org_id, User.auth_user_id == principal.auth_user_id
-                    )
-                )
-            ).scalar_one_or_none()
+            user_id = await member_user_id(connection, principal.auth_user_id, org_id)
             grants = None if user_id is None else await load_grants(connection, org_id, user_id)
         if user_id is None or grants is None or not grants.org_member:
             raise _not_found("the org does not exist")

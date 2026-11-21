@@ -18,6 +18,7 @@ from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
 from sama.media.vision import DEFAULT_VISION_MODEL
 from sama.orgs.service import SignupPolicy
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
+from sama.tenancy.regions import RegionError, Regions, regions_from_env
 from sama.vault.crypto import VaultKey
 
 DEFAULT_SANDBOX_HOSTS: Final = (
@@ -159,6 +160,9 @@ class ControlPlaneSettings:
     Section 15.2)."""
     signup: SignupPolicy = field(default_factory=SignupPolicy)
     """Self-serve sign-up (``SAMA_SIGNUP``, ``SAMA_SIGNUP_BLOCKED_DOMAINS``, Section 17.2)."""
+    regions: Regions = field(default_factory=Regions)
+    """The home region of the deployment (``SAMA_REGION``) and the web address of the
+    deployment of each other region (``SAMA_REGION_URLS``), Section 17.3."""
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -247,10 +251,15 @@ class ControlPlaneSettings:
             extension_ids = parse_extension_ids(env.get("SAMA_EXTENSION_IDS", ""))
         except ValueError as error:
             raise SettingsError(f"SAMA_EXTENSION_IDS: {error}") from None
+        public_url = _public_url(_required(env, "SAMA_PUBLIC_URL"))
+        try:
+            regions = regions_from_env(env, web_origins[0] if web_origins else public_url)
+        except RegionError as error:
+            raise SettingsError(f"SAMA_REGION: {error}") from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
             github=_github(env),
-            public_url=_public_url(_required(env, "SAMA_PUBLIC_URL")),
+            public_url=public_url,
             run_token_key=SecretStr(key),
             supabase_url=_required(env, "SAMA_SUPABASE_URL").rstrip("/"),
             supabase_anon_key=_required(env, "SAMA_SUPABASE_ANON_KEY"),
@@ -278,4 +287,5 @@ class ControlPlaneSettings:
             email_from=env.get("SAMA_EMAIL_FROM", "").strip() or None,
             self_repo=_self_repo(env),
             signup=signup,
+            regions=regions,
         )

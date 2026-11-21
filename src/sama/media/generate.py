@@ -36,7 +36,7 @@ from sama.modelproxy.usage import Endpoint
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.crypto import VaultError
 from sama.vault.redact import Redactor, default_redactor
-from sama.vault.store import OrgKeys, SecretName
+from sama.vault.store import KeySource, OrgKeys, SecretName
 
 log = logging.getLogger("sama.media")
 
@@ -217,6 +217,12 @@ class GeneratedMediaStore:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class _Key:
+    value: str = field(repr=False)
+    source: KeySource
+
+
 class _OpenAIMedia:
     """The shared part of the two services: the key, the budget, the call, and the record."""
 
@@ -252,18 +258,21 @@ class _OpenAIMedia:
     async def aclose(self) -> None:
         await self._meter.aclose(self._http.aclose)
 
-    async def _key(self, claims: RunTokenClaims) -> str | None:
+    async def _key(self, claims: RunTokenClaims) -> _Key | None:
+        """The key of the org, else the key of sama; ``None`` when there is no key."""
         try:
-            key = await self._keys.get(claims.org_id, SecretName.OPENAI_API_KEY)
+            found = await self._keys.lookup(claims.org_id, SecretName.OPENAI_API_KEY)
         except VaultError:
             log.warning("the OpenAI key of org=%s does not decrypt", claims.org_id)
             return None
-        return key.get_secret_value() if key is not None else None
+        if found.value is None:
+            return None
+        return _Key(found.value.get_secret_value(), found.source)
 
     async def _post(
         self,
         claims: RunTokenClaims,
-        key: str,
+        key: _Key,
         path: str,
         body: dict[str, Any],
         estimate: TokenCounts,
@@ -284,12 +293,13 @@ class _OpenAIMedia:
                 counts=counts,
                 estimated=estimated,
                 status=status,
+                key_source=key.source,
             )
 
         try:
             response = await self._http.post(
                 f"{self._base_url}{path}",
-                headers={"authorization": f"Bearer {key}"},
+                headers={"authorization": f"Bearer {key.value}"},
                 json=body,
             )
         except asyncio.CancelledError:
