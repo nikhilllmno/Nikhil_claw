@@ -48,7 +48,11 @@ log: Final = logging.getLogger("sama.datacontrols")
 class Cleanup(Protocol):
     """Removes the accounts outside sama before a delete: the Composio accounts and trigger
     instances, the connector hosts, the Telegram webhook, and the Slack token. A failure is
-    logged. The delete goes on: the rows and the vault secrets go in any case."""
+    logged. The delete goes on: the rows and the vault secrets go in any case.
+
+    This is the hook for each account outside sama. A new service with such an account adds a
+    step that is safe to run again. Billing (M6.6) cancels the Stripe subscription of the org
+    in ``before_org_delete``."""
 
     async def before_user_delete(
         self, org_id: uuid.UUID, user_id: uuid.UUID, actor_user_id: uuid.UUID

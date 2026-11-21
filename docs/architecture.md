@@ -6056,6 +6056,9 @@ log of the org, so the control plane logs it instead.
   the transaction and is not undone. Sama checks the last owner and the running runs before the
   cleanup, so a `409` after the cleanup is rare: a run that starts or an owner that leaves in
   between. The cleanup does the same work again without harm, so the client tries again.
+- `Cleanup` is the hook for each account outside sama. A new service with such an account adds
+  its step to `before_user_delete` or `before_org_delete`, and the step must be safe to run
+  again. Billing (M6.6) cancels the Stripe subscription of the org in `before_org_delete`.
 - In the same transaction the delete writes `data_purges` rows: the sandboxes of the deleted
   sessions (or all sandboxes of a deleted org) and the Langfuse traces of the deleted runs
   that the exporter sent (at most 1,000 trace ids in one row). A trace row waits one hour
