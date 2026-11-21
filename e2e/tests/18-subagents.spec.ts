@@ -22,7 +22,12 @@ let agentId = "";
 
 test("make a personal sub-agent in the console and run its test", async ({ ownerPage: page, ownerApi, world }) => {
   await page.goto("/console/subagents");
-  await page.getByRole("button", { name: "New sub-agent" }).click();
+  // The section has two parts: the sub-agents of the agent, then the library (M7.4). Each has a
+  // "New sub-agent" button; the library is the second one.
+  const newButtons = page.getByRole("button", { name: "New sub-agent", exact: true });
+  await expect(newButtons).toHaveCount(2);
+  await expect(page.getByRole("region", { name: /^Sub-agents of / })).toBeVisible();
+  await newButtons.last().click();
   const form = page.getByRole("form", { name: "New sub-agent" });
   await form.getByRole("textbox", { name: /^Name/ }).fill(name);
   await form.getByRole("textbox", { name: /^Description/ }).fill("Answers short questions for the e2e test.");
