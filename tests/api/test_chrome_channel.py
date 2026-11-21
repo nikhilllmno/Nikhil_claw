@@ -245,7 +245,7 @@ async def test_a_message_runs_and_its_events_come_over_the_socket(
         assert ids == sorted(ids)
 
         def completed(frame: dict[str, Any]) -> bool:
-            return frame["type"] == "run" and frame["data"]["status"] == "completed"
+            return bool(frame["type"] == "run" and frame["data"]["status"] == "completed")
 
         if not any(completed(frame) for frame in socket.frames):
             await socket.until(completed)

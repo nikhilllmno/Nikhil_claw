@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -103,8 +103,8 @@ async def open_socket(
     async def receive() -> dict[str, Any]:
         return await socket.inbox.get()
 
-    async def send(message: dict[str, Any]) -> None:
-        await socket.outbox.put(message)
+    async def send(message: MutableMapping[str, Any]) -> None:
+        await socket.outbox.put(dict(message))
 
     await socket.inbox.put({"type": "websocket.connect"})
     task = asyncio.create_task(app(scope, receive, send))
