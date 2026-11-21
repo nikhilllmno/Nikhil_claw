@@ -78,6 +78,7 @@ from sama.db.models import (
     Attachment,
     AuditEntry,
     Message,
+    ModelCall,
     Org,
     Run,
     RunEvent,
@@ -88,7 +89,8 @@ from sama.db.models import (
 from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
 from sama.media.images import NewAttachment
-from sama.orchestrator.limits import QueueLimits
+from sama.orchestrator.limits import ModelQuotas, QueueLimits
+from sama.orgs.plans import plan_of
 from sama.review import policy as review_policy
 from sama.review.transcript import build_transcript
 from sama.review.trigger import after_completed_run
@@ -129,6 +131,15 @@ class RateLimitedError(QueueError):
         self.retry_after_s = retry_after_s
 
 
+class QuotaExceededError(QueueError):
+    """The org or the user used the model quota of the plan (Section 17.5). The message names
+    the quota and the Billing page, where an org admin can change the plan."""
+
+    def __init__(self, message: str, quota: str) -> None:
+        super().__init__(message)
+        self.quota = quota
+
+
 def _lock(name: str, org_id: uuid.UUID) -> Any:
     """A transaction-level advisory lock for one org and one purpose."""
     return select(func.pg_advisory_xact_lock(func.hashtextextended(f"{name}:{org_id}", 0)))
@@ -167,11 +178,29 @@ def _rate_columns(org_id: uuid.UUID, user_id: uuid.UUID | None) -> list[Any]:
             f"{name}_flow", WorkflowInstance.created_at, *starts
         )
 
-    columns = [select(Org.limits).where(Org.id == org_id).scalar_subquery().label("limits")]
+    def spend(name: str, start: Any, *scope: Any) -> Any:
+        return (
+            select(func.coalesce(func.sum(ModelCall.cost_usd), 0))
+            .where(ModelCall.org_id == org_id, ModelCall.created_at >= start, *scope)
+            .scalar_subquery()
+            .label(f"{name}_spend")
+        )
+
+    columns = [
+        select(Org.limits).where(Org.id == org_id).scalar_subquery().label("limits"),
+        select(Org.plan).where(Org.id == org_id).scalar_subquery().label("plan"),
+        spend("org", _utc_start("month")),
+    ]
     columns += recent("org", user=False)
     if user_id is not None:
         columns += recent("user", user=True)
+        columns.append(spend("user", _utc_start("day"), ModelCall.user_id == user_id))
     return columns
+
+
+def _utc_start(unit: str) -> Any:
+    """The start of the calendar month or day of now, in UTC, as the model proxy counts."""
+    return func.timezone("UTC", func.date_trunc(unit, func.timezone("UTC", func.now())))
 
 
 def steer_block(notes: Sequence[str]) -> str:
@@ -190,6 +219,7 @@ def _check_rate(row: Any) -> None:
     """Raises ``RateLimitedError`` if a row with ``_rate_columns`` is over a limit. The rate
     lock puts the enqueues of one org in a sequence, so two messages at the same time cannot
     both take the last place."""
+    _check_quota(row)
     limits = QueueLimits.from_json(row.limits)
     checks = [("org", limits.org_messages_per_minute, "the org")]
     if "user_count" in row._fields:
@@ -204,6 +234,28 @@ def _check_rate(row: Any) -> None:
                 f"{who} sent {limit} messages in the last minute. Try again in {retry} s.",
                 retry,
             )
+
+
+def _check_quota(row: Any) -> None:
+    """Raises ``QuotaExceededError`` if the model cost of the org this month, or of the user
+    today, is at the quota of ``orgs.limits``. A run that started before goes on: the model
+    proxy stops its next model call."""
+    quotas = ModelQuotas.from_json(row.limits)
+    title = plan_of(row.plan).title or row.plan
+    cap = quotas.model_usd_per_month
+    if cap is not None and Decimal(row.org_spend) >= cap:
+        raise QuotaExceededError(
+            f"The org used its model quota of USD {cap:.2f} for this month on the {title}"
+            " plan. An org admin can change the plan on the Billing page.",
+            "model_usd_per_month",
+        )
+    cap = quotas.model_usd_per_user_day
+    if cap is not None and "user_spend" in row._fields and Decimal(row.user_spend) >= cap:
+        raise QuotaExceededError(
+            f"You used your model quota of USD {cap:.2f} for today on the {title} plan. Try"
+            " again tomorrow (UTC), or ask an org admin to change the plan on the Billing page.",
+            "model_usd_per_user_day",
+        )
 
 
 BUDGET_KEYS: Final = ("max_turns", "max_tokens", "max_cost_usd", "max_wall_time_s")
@@ -397,7 +449,8 @@ class RunQueue:
         (Section 6.1). If the session has an active run, the new run waits in the queue.
 
         Raises ``RateLimitedError`` when the user or the org is over its message rate
-        (``QueueLimits``).
+        (``QueueLimits``), and ``QuotaExceededError`` when it used a model quota (Section
+        17.5).
         """
         async with self._engine.begin() as connection:
             return await self.enqueue_in(

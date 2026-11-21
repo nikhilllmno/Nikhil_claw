@@ -39,9 +39,16 @@ async def complete_chat(
 ) -> ClaimedRun:
     """Sends one message, claims the run, and completes it with ``tools`` tool calls."""
     queue = queue or RunQueue(engine)
-    await queue.enqueue(
-        org_id=tenant.org, session_id=tenant.ids[session], text=text, user_id=tenant.ids["mia"]
-    )
+    # No rate or quota check at enqueue: the tests of a spent quota check the review trigger.
+    async with engine.begin() as connection:
+        await queue.enqueue_in(
+            connection,
+            org_id=tenant.org,
+            session_id=tenant.ids[session],
+            text=text,
+            user_id=tenant.ids["mia"],
+            check_rate=False,
+        )
     run = await queue.claim(OWNER)
     assert run is not None
     assert run.kind == "chat"

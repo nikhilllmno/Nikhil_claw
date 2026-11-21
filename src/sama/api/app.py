@@ -48,6 +48,7 @@ from starlette.types import ASGIApp, Lifespan
 
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
+from sama.api.billing import router as billing_router
 from sama.api.chrome import ChromeChannel
 from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
 from sama.api.history import (
@@ -84,6 +85,7 @@ from sama.api.tasks import (
     TaskOut,
     TaskStatus,
 )
+from sama.billing import BillingService
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
@@ -152,8 +154,9 @@ from sama.orchestrator.checkpoints import (
     CheckpointServiceError,
     restored_text,
 )
-from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
+from sama.orchestrator.queue import QueueError, QuotaExceededError, RateLimitedError, RunQueue
 from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
+from sama.orgs.service import OrgError
 from sama.profile_changes import RevertError, StaleChangeError, list_changes, revert_change
 from sama.profiles import (
     NAME_MAX_CHARS,
@@ -903,6 +906,9 @@ async def _data_call[T](call: Awaitable[T]) -> T:
         raise HTTPException(status_code=error.status, detail=str(error)) from None
     except RetentionError as error:
         raise HTTPException(status_code=400, detail=str(error)) from None
+    except OrgError as error:
+        # ``BillingError``: the Stripe subscription did not end, so the org delete stopped.
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from None
 
 
 def _zip(result: ExportFile) -> FileResponse:
@@ -938,6 +944,12 @@ async def _workflow_call[T](call: Awaitable[T]) -> T:
 # -- the service ----------------------------------------------------------------------------
 
 
+def _quota_answer(error: QuotaExceededError) -> JSONResponse:
+    """``402``: the org or the user used a model quota of the plan (Section 17.5). The web app
+    shows the message and a link to the Billing page."""
+    return JSONResponse(status_code=402, content={"detail": str(error), "quota": error.quota})
+
+
 class SamaApi:
     """The API of one control plane process."""
 
@@ -968,6 +980,7 @@ class SamaApi:
         model_keys: ModelKeys | None = None,
         data: DataControls | None = None,
         chrome: ChromeHub | None = None,
+        billing: BillingService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
@@ -979,7 +992,8 @@ class SamaApi:
         command. Without ``search``, the session search of the web app uses full-text search
         only. Without ``orgs``, sign-up reads the verified emails from ``auth.users`` and uses
         ``settings.signup``. Without ``model_keys`` (no vault), the model key
-        routes answer ``503``."""
+        routes answer ``503``. Without ``billing``, billing is off: the billing pages show the
+        plan and the quotas, and a purchase answers ``409``."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
@@ -1010,8 +1024,12 @@ class SamaApi:
         self._gate = gate or GateService(engine)
         self._clarify = clarify
         self._settings = settings or ApiSettings()
+        self._billing = billing or BillingService(engine, web_origins=self._settings.web_origins)
         self._org_service = orgs or OrgService(
-            engine, AuthUsersEmails(engine), self._settings.signup
+            engine,
+            AuthUsersEmails(engine),
+            self._settings.signup,
+            plan_quotas=lambda: self._billing.enabled,
         )
         self._streams: Counter[uuid.UUID] = Counter()
         self.chrome = chrome or ChromeHub()
@@ -1101,9 +1119,11 @@ class SamaApi:
                 "integrations": self._integrations is not None and self._integrations.enabled,
                 "connections": self._connections is not None,
                 "signup": self._org_service.policy.mode,
+                "billing": self._billing.enabled,
             }
 
         app.include_router(org_router(self._org_service, _principal))
+        app.include_router(billing_router(self._billing, _principal))
 
         @app.get("/me")
         async def me(principal: Me) -> dict[str, Any]:
@@ -3078,9 +3098,10 @@ class SamaApi:
             headers = {}
             if error.retry_after_s is not None:
                 headers["Retry-After"] = str(error.retry_after_s)
-            return JSONResponse(
-                status_code=error.status, content={"detail": error.detail}, headers=headers
-            )
+            content: dict[str, Any] = {"detail": error.detail}
+            if error.quota is not None:
+                content["quota"] = error.quota
+            return JSONResponse(status_code=error.status, content=content, headers=headers)
         return JSONResponse(status_code=202, content=sent.model_dump(mode="json"))
 
     async def submit(
@@ -3125,6 +3146,8 @@ class SamaApi:
             )
         except RateLimitedError as error:
             raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None
+        except QuotaExceededError as error:
+            raise SendError(402, str(error), quota=error.quota) from None
         except QueueError as error:
             raise SendError(409, str(error)) from None
         queued = await self._queue.waits(org_id=access.org_id, run_id=run_id)
@@ -3152,6 +3175,8 @@ class SamaApi:
                 content={"detail": str(error)},
                 headers={"Retry-After": str(error.retry_after_s)},
             )
+        except QuotaExceededError as error:
+            return _quota_answer(error)
         except QueueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         queued = await self._queue.waits(org_id=access.org_id, run_id=run_id)
@@ -3242,6 +3267,8 @@ class SamaApi:
                 content={"detail": str(error)},
                 headers={"Retry-After": str(error.retry_after_s)},
             )
+        except QuotaExceededError as error:
+            return _quota_answer(error)
         except QueueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         return JSONResponse(status_code=202, content={"run_id": str(run_id)})

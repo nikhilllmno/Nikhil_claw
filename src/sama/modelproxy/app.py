@@ -516,11 +516,17 @@ class ModelProxy:
         if monthly is not None:
             spent = await self._store.org_cost(claims.org_id, month_start(now))
             if spent >= monthly:
-                raise _budget("the org reached its monthly model limit")
+                raise _budget(
+                    "the org used its monthly model quota. An org admin can change the plan"
+                    " on the Billing page."
+                )
         if daily is not None and user is not None:
             spent = await self._store.user_cost(claims.org_id, user, day_start(now))
             if spent >= daily:
-                raise _budget("the user reached the daily model limit")
+                raise _budget(
+                    "the user used the daily model quota (UTC day). An org admin can change"
+                    " the plan on the Billing page."
+                )
 
     async def _key(self, provider: Provider, org_id: str) -> tuple[SecretStr, KeySource]:
         """The key of the org first, then the key of the process. A key of the org that cannot

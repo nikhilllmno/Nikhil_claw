@@ -76,6 +76,7 @@ CLOSE_AUTH_TIMEOUT: Final = 4408
 CLOSE_TOO_MANY: Final = 4429
 
 _ERROR_CODES: Final = {
+    402: "quota_exceeded",
     403: "forbidden",
     404: "not_found",
     409: "busy",

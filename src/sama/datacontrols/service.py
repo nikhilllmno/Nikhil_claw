@@ -51,8 +51,9 @@ class Cleanup(Protocol):
     logged. The delete goes on: the rows and the vault secrets go in any case.
 
     This is the hook for each account outside sama. A new service with such an account adds a
-    step that is safe to run again. Billing (M6.6) cancels the Stripe subscription of the org
-    in ``before_org_delete``."""
+    step that is safe to run again. Billing (M6.6, Section 17.5) ends the Stripe subscription
+    of the org first in ``before_org_delete``. A billing failure stops the org delete, so no
+    subscription stays without its org."""
 
     async def before_user_delete(
         self, org_id: uuid.UUID, user_id: uuid.UUID, actor_user_id: uuid.UUID
@@ -312,6 +313,10 @@ class IntegrationsLike(Protocol):
     async def disconnect(self, org_id: uuid.UUID, kind: str, user_id: uuid.UUID) -> bool: ...
 
 
+class BillingLike(Protocol):
+    async def close_org(self, org_id: uuid.UUID) -> bool: ...
+
+
 class ServiceCleanup:
     """``Cleanup`` with the sama services. Each service delete also removes its account
     outside sama: ``ConnectionService.delete`` (the Composio account and the connector host),
@@ -325,11 +330,13 @@ class ServiceCleanup:
         connections: ConnectorsLike | None = None,
         triggers: TriggersLike | None = None,
         integrations: IntegrationsLike | None = None,
+        billing: BillingLike | None = None,
     ) -> None:
         self._engine = engine
         self._connections = connections
         self._triggers = triggers
         self._integrations = integrations
+        self._billing = billing
 
     async def before_user_delete(
         self, org_id: uuid.UUID, user_id: uuid.UUID, actor_user_id: uuid.UUID
@@ -337,6 +344,10 @@ class ServiceCleanup:
         await self._clean(org_id, actor_user_id, user_id)
 
     async def before_org_delete(self, org_id: uuid.UUID, actor_user_id: uuid.UUID) -> None:
+        if self._billing is not None:
+            # First, and not in ``_try``: a billing error (``BillingError``, an ``OrgError``)
+            # stops the delete before sama removes anything that it cannot undo.
+            await self._billing.close_org(org_id)
         await self._clean(org_id, actor_user_id, None)
         if self._integrations is None:
             return

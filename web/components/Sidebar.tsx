@@ -16,6 +16,7 @@ const SETTINGS_LINKS = [
   { href: "/skills", title: "Skills", meta: "The guides that the agents follow" },
   { href: "/connections", title: "Connections", meta: "The tools that the agent can use" },
   { href: "/members", title: "Members", meta: "The people of your org and their roles" },
+  { href: "/billing", title: "Billing", meta: "The plan, usage, and quotas", admin: true },
   { href: "/settings", title: "Settings", meta: "Account, chat apps, and agents" },
 ] as const;
 
@@ -46,6 +47,7 @@ export function Sidebar({
     reloadMe,
     reloadSessions,
   } = useData();
+  const isOrgAdmin = me?.orgs.some((o) => o.admin) ?? false;
   // The time that the list uses for "5 min ago". It moves once a minute.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -213,7 +215,7 @@ export function Sidebar({
         ) : null}
         <nav aria-label="Settings">
           <ul className={styles.list}>
-            {SETTINGS_LINKS.map((link) => (
+            {SETTINGS_LINKS.filter((link) => !("admin" in link) || isOrgAdmin).map((link) => (
               <li key={link.href}>
                 <Link
                   href={link.href}

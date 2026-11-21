@@ -377,6 +377,70 @@ class OrgInvite(Base):
     created_at: Mapped[datetime] = _created_at()
 
 
+class OrgBilling(Base):
+    """The Stripe customer and subscription of an org (docs/architecture.md, Section 17.5).
+
+    Org admins read the row of their org. Only the control plane writes the table. The
+    ``usage_*`` columns are the outbox of the usage report: ``usage_pending_cents`` is set
+    before the meter event goes to Stripe, and becomes ``usage_reported_cents`` after."""
+
+    __tablename__ = "org_billing"
+    __table_args__ = (
+        CheckConstraint("usage_reported_cents >= 0", name="usage_reported_cents"),
+        CheckConstraint(
+            "usage_pending_cents IS NULL OR usage_pending_cents > usage_reported_cents",
+            name="usage_pending_cents",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    stripe_customer_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(Text, unique=True)
+    plan: Mapped[str] = mapped_column(Text, nullable=False, server_default="free")
+    """The plan of the subscription. ``orgs.plan`` follows it."""
+    status: Mapped[str | None] = mapped_column(Text)
+    """The Stripe status of the subscription, for example ``active`` or ``past_due``."""
+    current_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=false()
+    )
+    usage_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """The billing period of ``usage_reported_cents``."""
+    usage_reported_cents: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0"
+    )
+    """The billable usage of the period that Stripe has, in US cents."""
+    usage_pending_cents: Mapped[int | None] = mapped_column(BigInteger)
+    """The billable usage of a meter event that is maybe not in Stripe yet."""
+    usage_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When ``usage_pending_cents`` was set. An old pending event is not sent again."""
+    usage_reported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checkout_session_id: Mapped[str | None] = mapped_column(Text)
+    """The open Stripe Checkout session of the org. An org has at most one."""
+    checkout_url: Mapped[str | None] = mapped_column(Text)
+    checkout_plan: Mapped[str | None] = mapped_column(Text)
+    checkout_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class BillingEvent(Base):
+    """A Stripe event that sama applied (Section 17.5). A retry of the event does nothing."""
+
+    __tablename__ = "billing_events"
+    __table_args__ = (Index(None, "org_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    stripe_event_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+
 class AgentProfile(Base):
     __tablename__ = "agent_profiles"
     __table_args__ = (

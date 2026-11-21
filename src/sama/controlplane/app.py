@@ -33,6 +33,7 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.billing import BillingService, StripeClient
 from sama.browser.browserbase import BrowserbaseTarget
 from sama.browser.chrome import AuthUsers, ChromeTarget
 from sama.browser.contexts import PostgresContextStore
@@ -462,6 +463,20 @@ def build(
         public_url=settings.public_url,
         on_change=forget if vault is not None else None,
     )
+    stripe_key = settings.stripe_key()
+    if stripe_key is None and settings.stripe_secret_key is not None:
+        log.error(
+            "billing is off: SAMA_STRIPE_WEBHOOK_SECRET is missing, or the key is a live key"
+            " without SAMA_STRIPE_ALLOW_LIVE"
+        )
+    billing = BillingService(
+        engine,
+        StripeClient(stripe_key) if stripe_key is not None else None,
+        webhook_secret=settings.stripe_webhook_secret.get_secret_value()
+        if settings.stripe_webhook_secret is not None
+        else None,
+        web_origins=settings.web_origins,
+    )
     triggers = TriggerService(
         engine,
         queue=RunQueue(engine),
@@ -478,6 +493,7 @@ def build(
             connections=connections,
             triggers=triggers,
             integrations=integrations if integrations.enabled else None,
+            billing=billing,
         ),
     )
     api = SamaApi(
@@ -511,6 +527,7 @@ def build(
         checkpoints=checkpoints,
         model_keys=model_keys,
         data=data,
+        billing=billing,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -557,6 +574,9 @@ def build(
             stack.push_async_callback(scheduler.aclose)
             loops.append(scheduler)
             loops.append(workflow_engine)
+            stack.push_async_callback(billing.aclose)
+            await billing.start()
+            loops.append(billing)
             plane.tasks = [
                 asyncio.create_task(worker.serve(stop, concurrency=settings.worker_concurrency)),
                 *(asyncio.create_task(loop.serve(stop)) for loop in loops),

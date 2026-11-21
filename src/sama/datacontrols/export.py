@@ -75,6 +75,9 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "audit_log": "actor_user_id = :user",
     "agent_profiles": None,
     "profile_changes": "actor_user_id = :user",
+    # The billing of the org (Section 17.5) is org data: only the org export has it.
+    "org_billing": None,
+    "billing_events": None,
     "vault_secrets": None,
     "data_purges": None,
     "message_embeddings": None,

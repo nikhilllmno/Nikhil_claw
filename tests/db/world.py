@@ -31,6 +31,7 @@ from sama.db.models import (
     Approval,
     Attachment,
     AuditEntry,
+    BillingEvent,
     ChannelGroup,
     ChannelIdentity,
     Connection,
@@ -51,6 +52,7 @@ from sama.db.models import (
     MessageEmbedding,
     ModelCall,
     Org,
+    OrgBilling,
     OrgInvite,
     PairingCode,
     PersistentBrowserContext,
@@ -156,6 +158,24 @@ def plan(
             token_hash=uuid.uuid4().bytes * 2,
             invited_by_user_id=ids[inviter],
             expires_at=text("now() + interval '7 days'"),
+        )
+    # A Stripe customer and one applied event in each org. Only the admins and owners read them.
+    for org in ("org-a", "org-b"):
+        add(
+            OrgBilling,
+            f"billing:{org}",
+            org_id=ids[org],
+            stripe_customer_id=f"cus_{uuid.uuid4().hex[:14]}",
+            stripe_subscription_id=f"sub_{uuid.uuid4().hex[:14]}",
+            plan="pro",
+            status="active",
+        )
+        add(
+            BillingEvent,
+            f"billing-event:{org}",
+            org_id=ids[org],
+            stripe_event_id=f"evt_{uuid.uuid4().hex[:14]}",
+            type="customer.subscription.updated",
         )
     profiles: tuple[tuple[str, str, str | None], ...] = (
         ("profile-a", "org-a", None),

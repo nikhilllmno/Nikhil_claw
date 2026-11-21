@@ -17,7 +17,7 @@ from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.db.models import AgentProfile, AuditEntry, Membership, Org, OrgInvite, User
 from sama.orgs import OrgService, SignupPolicy
 from sama.orgs import service as org_service
-from sama.orgs.plans import FREE, Plan
+from sama.orgs.plans import FREE, Plan, limits_for
 from sama.tenancy.regions import Regions, set_home_regions
 from tests.api.conftest import ISSUER, SECRET, bearer
 
@@ -162,7 +162,8 @@ async def test_a_verified_user_makes_an_org_and_owns_it(
                 select(AuditEntry.action).where(AuditEntry.org_id == uuid.UUID(org["id"]))
             )
         ).all()
-    assert limits == dict(FREE.limits)
+    # Billing is off in these tests: the plan adds no model quota (Section 17.5).
+    assert limits == limits_for(FREE, None, quotas=False)
     assert budget == dict(FREE.run_budget)
     assert actions == ["org.created"]
     # The same name again gets a free slug.

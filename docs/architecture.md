@@ -3150,16 +3150,20 @@ cross-org check of Section 17.1 through the API.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /config` | The Supabase URL and the public anon key, for the web page. `signup` is `open` or `invite_only` (Section 17.2). |
+| `GET /config` | The Supabase URL and the public anon key, for the web page. `signup` is `open` or `invite_only` (Section 17.2). `billing` is true when billing is on (Section 17.5). |
 | `GET /me` | The orgs, workspaces, and agent profiles that the user can see. Each org has the `role` and the `plan` of the user. |
 | `POST /orgs` | Make an org with the user as the owner (`201`). `403` when sign-up is closed, the email is not confirmed, or the domain is blocked. `429` over a rate limit (Section 17.2). |
 | `GET /orgs/{org_id}/members`, `PATCH`, `DELETE /orgs/{org_id}/members/{user_id}` | The members of the org. `PATCH` changes `role` or `workspace_ids` (an admin). `DELETE` removes a member (an admin) or leaves the org (the user). `409` for the last owner (Section 17.2). |
 | `GET`, `POST /orgs/{org_id}/invites`, `DELETE /orgs/{org_id}/invites/{invite_id}` | The invites of the org, for an admin. `POST` takes `email`, `role`, and `workspace_id`, and gives the token one time (`201`). `429` over the plan caps (Section 17.2). |
+| `GET /billing/plans` | The price list: the free and paid plans, their prices, included usage, and quotas, and `billing_enabled`. No sign-in (Section 17.5). |
+| `GET /orgs/{org_id}/billing` | The plan, the subscription, the usage of the period, and the quotas of the org, for an org admin (`403` for a member). |
+| `POST /orgs/{org_id}/billing/checkout`, `PUT /orgs/{org_id}/billing/plan`, `POST /orgs/{org_id}/billing/portal` | An org admin starts Stripe Checkout for `pro` or `business` (`url` to open), changes the paid plan (Stripe prorates), or opens the Stripe customer portal. `409` when billing is off, for the `team` plan, or for a wrong state. `422` for a plan that is not for sale. `502` or `503` when Stripe does not answer or the prices are missing. |
+| `POST /stripe/webhook` | Signed Stripe events (Section 17.5). `400` for a bad signature, `404` when billing is off, `503` when Stripe must send the event again. |
 | `GET /invites`, `POST /invites/accept` | The open invites for the confirmed email of the user. Accept with `token` or `invite_id`. `403` for another email, `410` for an ended invite (Section 17.2). |
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
 | `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
-| `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `409` for an archived session. |
+| `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `402` with `detail` and `quota` when the org or the user used a model quota of the plan (Section 17.5). `409` for an archived session. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
@@ -4643,7 +4647,7 @@ then asks for the host permission of the new address and signs out.
 | Client | `ping` | Keep the connection and the service worker alive (every 20 seconds). |
 | Server | `ready {protocol, expires_at, max_frame_chars}`, `auth_ok {expires_at}` | The connection is signed in until `expires_at` (epoch seconds, from the token). |
 | Server | `runs`, `run_event`, `run`, `end` with `session_id`, `data`, `event_id` | The same events as the SSE stream of Section 11.4. |
-| Server | `sent {id, run_id, queued}`, `error {id?, code, message, retry_after_s?}`, `pong` | Replies. The error codes are `forbidden`, `not_found`, `busy`, `invalid`, and `rate_limited`. |
+| Server | `sent {id, run_id, queued}`, `error {id?, code, message, retry_after_s?}`, `pong` | Replies. The error codes are `forbidden`, `not_found`, `busy`, `invalid`, `rate_limited`, and `quota_exceeded` (a model quota of the plan, Section 17.5). |
 
 Close codes: `4400` frame that is not valid, `4401` token that expired or is not valid,
 `4403` origin that is not allowed or a token of a different user, `4408` no `auth` in time,
@@ -5829,6 +5833,9 @@ runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run to
    - the user: `model_usd_per_user_day` in `orgs.limits` (calendar day, UTC), for runs whose
      token names a user (private sessions).
 
+   The plan of the org sets the two quotas while billing is on (Section 17.5). An operator can
+   also set them by hand.
+
    A refused call gets `402` with the error type `budget_exceeded`, in the error format of
    the provider. The check fails closed: if the store cannot read the spend, or a record of
    the org is not written yet, the call gets `503`. The SDKs do not retry `402`. The Claude adapter maps it to
@@ -6035,8 +6042,8 @@ environment as the default (Section 16.3).
 - **Now (team)**: one org for our team, invite-only sign-up.
 - **Customers (M6)**: self-serve sign-up, org creation, invites, and roles are done (M6.5,
   Section 17.2). Org keys and a region per org are done (M6.7, Section 17.3). Data export,
-  delete, and retention are done (M6.8, Section 17.4). Plans and usage billing (Stripe) and
-  quotas come later.
+  delete, and retention are done (M6.8, Section 17.4). Plans, usage billing with Stripe, and
+  quotas per plan are done (M6.6, Section 17.5).
 - **Products on top**: vorflux creates one sama workspace per hotel and adds its own tables
   and tools through the extension points (D16).
 
@@ -6179,8 +6186,8 @@ a member cap, an invite cap per day, the org limits (Section 4.3), and the run b
 default agent profile. A new org gets the `free` plan: 5 members (with open invites), 20
 invites in a day, 2 running runs, 10 messages per user and 30 per org in a minute, and a run
 budget of 40 turns, USD 1.00, and 15 minutes. The `team` plan has no caps. An unknown plan name
-counts as `free`. `GET /me` gives the plan and the role of the user for each org. Spend
-enforcement per plan comes in M6.6.
+counts as `free`. `GET /me` gives the plan and the role of the user for each org. M6.6 adds
+the paid plans and the model quotas (Section 17.5).
 
 **Invites.** An org owner or admin invites an email address with the role `admin` or
 `member`. A `member` invite can name one workspace. An invite never gives the role `owner`.
@@ -6231,8 +6238,8 @@ bot and Slack app came earlier (Section 11.6).
   if sama has a default key.
 - The model proxy, `vision_analyze`, `image_generate`, and `text_to_speech` use the org key
   first and the key of sama second. Each `model_calls` row records `key_source` (`org` or
-  `sama`). The cost, the budgets, and the usage pages count both sources the same way. Billing
-  can use `key_source` later (M6.6).
+  `sama`). The cost, the budgets, the quotas, and the usage pages count both sources the same
+  way. Usage billing counts only `sama` (M6.6, Section 17.5).
 - The routes use the vault of the model proxy in the same process, so a change applies at once
   there. Another machine keeps a vault value in its cache for at most 60 seconds.
 
@@ -6355,7 +6362,9 @@ log of the org, so the control plane logs it instead.
   between. The cleanup does the same work again without harm, so the client tries again.
 - `Cleanup` is the hook for each account outside sama. A new service with such an account adds
   its step to `before_user_delete` or `before_org_delete`, and the step must be safe to run
-  again. Billing (M6.6) cancels the Stripe subscription of the org in `before_org_delete`.
+  again. Billing (M6.6) ends the Stripe subscription of the org first in `before_org_delete`
+  (`BillingService.close_org`, Section 17.5). A billing failure stops the org delete with the
+  status of the error, before sama removes anything.
 - In the same transaction the delete writes `data_purges` rows: the sandboxes of the deleted
   sessions (or all sandboxes of a deleted org), with the checkpoints of M6.4 in the work
   folder, and the Langfuse traces of the deleted runs that the exporter sent (at most 1,000
@@ -6384,8 +6393,8 @@ with `FOR UPDATE SKIP LOCKED` and a lease of 5 minutes.
 
 **Retention.** `orgs.retention_days` is the setting of the org. Null means the default of
 the plan. `PLAN_RETENTION` in `retention.py` is the seam for the plans of M6.6: each plan can
-set a default and a maximum. Until M6.6, every plan keeps everything, and only an org setting
-turns the sweep on.
+set a default and a maximum. The plans of M6.6 do not set a retention yet: every plan keeps
+everything, and only an org setting turns the sweep on.
 
 - `RetentionSweep` runs in the monitor every hour. For each org with a retention, it deletes
   the root sessions (and their `compaction` and `delegation` children) with no activity after
@@ -6397,6 +6406,153 @@ turns the sweep on.
   alone, as the first delete of a pass. Each pass writes the audit row `data.retention`.
 - The retention does not apply to the audit log, memory, skills, or other rows that are not
   in a session.
+### 17.5 Billing and quotas (M6.6)
+
+An org admin buys a plan with Stripe. The plan sets the caps of the org and its model quotas.
+The model cost over the amount that the plan includes goes to Stripe as usage. The code is in
+`sama.billing` (`BillingService`, the Stripe client, the webhook signature, and the setup
+script), `sama.orgs.plans`, and `sama.api.billing`. Migration `0037` adds the tables
+`org_billing` and `billing_events`.
+
+**Plans.** `sama.orgs.plans` has four plans. Amounts are in US dollars.
+
+| Plan | Price each month | Included model usage | Members | Runs at the same time | Model quota each month | Model quota each user and day |
+|---|---|---|---|---|---|---|
+| `free` | 0 | 0 | 5 | 2 | 5.00 | 2.00 |
+| `pro` | 20 | 10.00 | 10 | 5 | 200.00 | 50.00 |
+| `business` | 99 | 60.00 | 50 | 10 | 1000.00 | 200.00 |
+| `team` | Not for sale | - | No cap | Default | No quota | No quota |
+
+Each plan also sets the message rates and the run budget of the default agent profile. The
+`team` plan is for the team of the operator. It has no billing, and Checkout refuses it.
+
+**Billing on and off.** Billing is on only when the control plane has a Stripe key
+(`SAMA_STRIPE_SECRET_KEY`) and the webhook secret (`SAMA_STRIPE_WEBHOOK_SECRET`). A live key
+(`sk_live_`, `rk_live_`) also needs `SAMA_STRIPE_ALLOW_LIVE=true`. At start, the control plane
+checks the key with one Stripe call. When Stripe refuses the key (`401` or `403`), billing is
+off. A network error keeps billing on. When billing is off:
+
+- The Billing page shows the plan, the usage, and the quotas, but no purchase. The purchase
+  routes give `409`, and the webhook gives `404`. `GET /config` gives `billing: false`.
+- A new org gets no model quota from its plan, because an admin cannot buy more. The other
+  caps of the plan (members, runs, message rates, and run budget) stay.
+- The usage report does not run.
+
+When billing is on, a new free org gets the model quotas of the free plan. At start, each
+free org that does not have them gets them too. A key that an operator set wins. To give one
+free org no cap, use a larger value or the `team` plan. When an operator turns billing off
+after it was on, the free orgs keep their quotas until the operator removes the keys.
+
+**Stripe objects.** `python -m sama.billing.setup` makes the Stripe objects. A second run finds
+them and changes only what is different. It uses lookup keys, so the code never stores a Stripe
+id of a price:
+
+- one product and one monthly base price for each paid plan (lookup keys `sama_pro_monthly`
+  and `sama_business_monthly`, and the metadata `plan`). A changed price is a new price that
+  takes the lookup key (`transfer_lookup_key`), because a Stripe price cannot change. The old
+  price keeps its `plan` metadata, so sama still knows the plan of its subscribers;
+- the billing meter `sama_model_usage` and its metered price (lookup key `sama_model_usage`,
+  one US cent for each unit);
+- the customer portal configuration: payment method, invoices, and cancel at the end of the
+  period. A plan change in the portal is off, because a plan change is on the sama Billing page;
+- with `--webhook-url`, the webhook endpoint. Stripe shows its signing secret only when it
+  makes the endpoint. The script writes the secret to `--secret-file` with mode `0600` and
+  never prints it. `--rotate-webhook` makes a new endpoint and deletes the old one.
+
+The script refuses a live key without `--allow-live`.
+
+**Checkout.** `POST /orgs/{org_id}/billing/checkout` makes the Stripe customer of the org one
+time (an idempotency key), and a Checkout session in `subscription` mode with two prices: the
+base price of the plan and the metered usage price. The success and cancel URLs go to
+`/billing?org=<org_id>` on the origin of the request when it is in `SAMA_WEB_ORIGINS`, else on
+the first origin. The audit row is `billing.checkout_started`. An org has at most one open
+Checkout session (`org_billing.checkout_*`, open for one hour). The org row stays locked during
+the Stripe calls. A second request for the same plan gets the open session again. A request for
+another plan ends the open session first. When a session is paid but its webhook did not come
+yet, a new request gets `409`. An org that pays changes the plan with
+`PUT /orgs/{org_id}/billing/plan`: sama changes the base price of the subscription, and Stripe
+prorates it. There is no change to `free` through the API: the admin cancels in the portal,
+and the org gets `free` when the subscription ends.
+
+**Webhook.** `POST /stripe/webhook` checks the `Stripe-Signature` header (HMAC-SHA256 with the
+webhook secret, at most 5 minutes old) before it reads the event. It uses
+`checkout.session.completed` and the `customer.subscription.*` events. For each event, sama
+gets the subscription again from Stripe and copies its state, so the order of the events does
+not matter. In one transaction, with the org row locked before the Stripe call, it records the
+event id in `billing_events` (a second delivery does nothing), gets the subscription, writes
+`org_billing`, and applies the plan. The lock stops a slow handler from writing an older state
+over a newer one. The plan change of the Billing page uses the same path. The steps:
+
+- `orgs.plan` and the plan keys of `orgs.limits` (other keys stay);
+- the run budget of the org-wide agent profiles that still have the budget of the old plan
+  (a budget that an admin changed stays);
+- the audit row `org.plan_changed` with `via`.
+
+A subscription with the status `active`, `trialing`, or `past_due` keeps the paid plan. Other
+statuses give `free`. The end of an old subscription does not end a newer one. When an org has
+two paid subscriptions, sama follows the newer one, logs an error, and writes the audit row
+`billing.duplicate_subscription`, so an operator refunds the other. An event of the
+other mode (`livemode`), of an unknown customer, or of a type that sama does not use gets
+`200` and is not applied. When Stripe does not answer, the webhook gives `503`, and Stripe
+sends the event again.
+
+**Usage billing.** The ledger of the model proxy (`model_calls.cost_usd`, Section 16.6) is the
+source. The control plane does these steps every 5 minutes for each paying org:
+
+1. It adds the model cost of the current subscription period. The sum stops at the period end,
+   also when the renewal webhook did not come yet. It counts only the calls on the keys of
+   sama (`key_source = 'sama'`, Section 17.3): the org pays the provider itself for a call on
+   its own key. The quotas count both sources, as the model proxy does.
+2. It takes away the included amount of the plan, and rounds down to whole US cents.
+3. It sends the new part to the meter as one meter event.
+
+`org_billing` is an outbox. sama writes the target first (`usage_pending_cents`, with
+`usage_pending_at`). Then it sends the event with the identifier
+`sama-<org>-<period start>-<target>`. Then it marks the event sent. A crash or a failed call
+sends the same event again, and Stripe drops the second copy. Stripe keeps the identifiers for
+at least 24 hours. Thus sama does not send a pending event again after 12 hours: it logs an
+error, and an operator checks the meter events in Stripe and clears the row. When the period
+changes, sama first closes the old period with an event in its last second. Then it starts the
+new period.
+
+**Org delete.** The org delete (Section 17.4) calls `BillingService.close_org` first, in
+`ServiceCleanup.before_org_delete`. It sends the last usage, then ends the subscription at
+once with a final invoice (`invoice_now`), so Stripe bills the last usage and nothing more.
+The Stripe customer stays, so Stripe can collect the final invoice. It raises an error, and
+the delete stops, when billing is off and the org has a Stripe customer (`503`), when the last
+usage is not in Stripe (`409`), or when Stripe does not end the subscription (`502`).
+
+**Quotas.** The model quotas are the keys `model_usd_per_month` (the org, calendar month in
+UTC) and `model_usd_per_user_day` (one user, calendar day in UTC) in `orgs.limits`. Two places
+check them:
+
+- The run queue, before it queues a message from the web app or a channel. Over a quota, the
+  API gives `402` with `detail` and `quota`. Telegram and Slack reply with the same text. The
+  web app shows a link to the Billing page. Jobs and workflows skip this check.
+- The model proxy, before each model call (Section 16.6). A run then ends with
+  `budget_exceeded`, and the message names the Billing page.
+
+**Row-level security.** An org admin reads `org_billing` and `billing_events` of the org
+through the Data API. No role writes them: the control plane writes as the table owner.
+
+**Web app.** `/billing` is for org owners and admins, and the sidebar shows it only to them. It
+shows the plan, the subscription status and renewal date, the model use of the month against
+the quota, the usage of the period over the included amount, the member count, and the plans
+with an upgrade or change button. "Payment method, invoices, and cancel" opens the Stripe
+portal. The return from Stripe has `?org=`, so the admin comes back to the same org. After
+Checkout, the page asks the API again every 3 seconds, at most 10 times, until the webhook
+changed the plan. It does not say that the payment is done before then.
+
+**Known limits.**
+
+- Usage that sama reports after Stripe finalizes the invoice of the period is not billed.
+- The Stripe calls of Checkout and of the webhook run with the org row locked. A slow Stripe
+  answer (at most 20 seconds) delays other writes to that org row.
+- A model call that the proxy records late, with an older `created_at`, can miss its period.
+- A plan change in the middle of a period that lowers the billable amount gives no refund of
+  usage that sama already reported.
+- When a subscription ends, the last usage (at most 5 minutes) can be missed.
+- Existing members stay when a plan with a lower member cap starts.
 
 ---
 
@@ -6619,6 +6775,8 @@ the start with a message that names the variable but not its value.
 | `SAMA_SIGNUP_BLOCKED_DOMAINS` | No | More email domains that cannot make an org, comma-separated (Section 17.2). |
 | `SAMA_EXTENSION_IDS` | No | The Chrome extension ids that may open the extension WebSocket (Section 14.2.1). Without it, every `chrome-extension://` origin may connect with a valid token. |
 | `SAMA_REGION`, `SAMA_REGION_URLS` | No | The home region of the deployment (default `ap-south-1`) and the `region=url` pairs of the other regions (Section 17.3) |
+| `SAMA_STRIPE_SECRET_KEY`, `SAMA_STRIPE_WEBHOOK_SECRET` | No | Billing (Section 17.5). Without both, or when Stripe refuses the key at start, billing is off and the plans add no model quota. |
+| `SAMA_STRIPE_ALLOW_LIVE` | No | `true` accepts a live Stripe key. Without it, a live key turns billing off. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first

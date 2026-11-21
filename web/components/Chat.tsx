@@ -29,6 +29,7 @@ import {
   STEER_USAGE,
   STEERED_NOTICE,
 } from "@/lib/chat";
+import { isQuotaError } from "@/lib/billing";
 import { saveFile } from "@/lib/history";
 import { runEventStream } from "@/lib/stream";
 import { ApprovalCard } from "./ApprovalCard";
@@ -62,6 +63,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  /** The last send failed on a model quota of the plan (HTTP 402). */
+  const [quotaError, setQuotaError] = useState(false);
   // The answer of a busy control: queued, steered, or moved (M3.9).
   const [notice, setNotice] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
@@ -188,6 +191,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
     const clearDraft = () => setDraft((current) => (current === submitted ? "" : current));
     const command = parseCommand(text);
     setSendError(null);
+    setQuotaError(false);
     setNotice(null);
     if (command?.kind === "stop") {
       clearDraft();
@@ -279,6 +283,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
     } catch (e) {
       // The text stays in the composer: nothing was sent.
       setSendError(errorText(e, "The message was not sent."));
+      setQuotaError(isQuotaError(e));
     } finally {
       setSending(false);
     }
@@ -287,6 +292,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const stop = async () => {
     setStopping(true);
     setSendError(null);
+    setQuotaError(false);
     const results = await Promise.allSettled(openRunIds(liveRef.current).map((id) => api.cancelRun(id)));
     const failed = results.find((r) => r.status === "rejected");
     if (failed && failed.status === "rejected") {
@@ -459,6 +465,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
         {sendError ? (
           <p className={`alert alert-error ${styles.banner}`} role="alert">
             {sendError}
+            {quotaError ? (
+              <>
+                {" "}
+                <Link href="/billing">Open the Billing page</Link>
+              </>
+            ) : null}
           </p>
         ) : null}
         {shownNotice ? (

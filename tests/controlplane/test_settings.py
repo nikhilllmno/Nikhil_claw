@@ -282,3 +282,22 @@ def test_the_region_has_a_default_and_can_be_set() -> None:
 def test_a_bad_region_is_refused(changes: dict[str, str], message: str) -> None:
     with pytest.raises(SettingsError, match=message):
         settings(**changes)
+
+
+def test_billing_needs_the_key_and_the_webhook_secret() -> None:
+    assert settings().stripe_key() is None
+    assert settings(SAMA_STRIPE_SECRET_KEY="sk_test_a").stripe_key() is None
+    assert settings(SAMA_STRIPE_WEBHOOK_SECRET="whsec_a").stripe_key() is None
+    both = settings(SAMA_STRIPE_SECRET_KEY="sk_test_a", SAMA_STRIPE_WEBHOOK_SECRET="whsec_a")
+    assert both.stripe_key() == "sk_test_a"
+    assert "sk_test_a" in both.secret_values()
+    assert "whsec_a" in both.secret_values()
+    assert "sk_test_a" not in repr(both)
+
+
+def test_a_live_stripe_key_turns_billing_off_unless_it_is_allowed() -> None:
+    live = {"SAMA_STRIPE_SECRET_KEY": "sk_live_a", "SAMA_STRIPE_WEBHOOK_SECRET": "whsec_a"}
+    assert settings(**live).stripe_key() is None
+    assert settings(**live, SAMA_STRIPE_ALLOW_LIVE="true").stripe_key() == "sk_live_a"
+    restricted = {**live, "SAMA_STRIPE_SECRET_KEY": "rk_live_a"}
+    assert settings(**restricted).stripe_key() is None
