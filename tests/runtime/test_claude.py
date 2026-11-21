@@ -672,6 +672,22 @@ async def test_hook_gives_the_steer_notes_to_the_model(action: str) -> None:
     assert output["permissionDecision"] == action
 
 
+async def test_the_model_gets_the_original_request_with_the_joined_messages() -> None:
+    """M7.1: the scripted model sees the original request and both added messages."""
+    from sama.orchestrator.queue import steer_block
+
+    block = steer_block(
+        ["Also put the word STEERx at the end of your reply.", "Reply with the word SECONDx."],
+        request="Use session_search three times, then reply with the word FIRSTx",
+    )
+    factory = Factory([call_hook("Bash", "t1"), result()])
+    gate = ScriptedGate(GateDecision("allow", "ok", steer=block))
+    await collect(ClaudeRuntime(gate=gate, client_factory=factory).run(request()))
+    context = factory.clients[0].hook_outputs[0]["hookSpecificOutput"]["additionalContext"]
+    assert "Keep doing the original request" in context
+    assert all(word in context for word in ("FIRSTx", "STEERx", "SECONDx"))
+
+
 async def test_hook_without_notes_has_no_extra_context() -> None:
     factory = Factory([call_hook("Bash", "t1"), result()])
     await collect(

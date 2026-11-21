@@ -350,7 +350,13 @@ open. Sama has three controls, and they work in Telegram, Slack, and the web app
   waits for the insert and sees the note.
 
 The tool gate gives the notes to the run. At each tool call of a `running` run, `take_steers`
-marks the pending notes as `delivered` and returns one text block, oldest note first. The gate
+marks the pending notes as `delivered` and returns one text block (`steer_block`). A note adds
+to the request of the run and does not replace it (M7.1). So the block, in an
+`<added_messages>` tag, tells the model to keep doing the original request and to also handle
+each added message, and to follow an added message only for the part that it changes. The
+block repeats the original request (the first user message of the run, cut to 2,000
+characters) and lists every open note of the run, oldest first: the notes of earlier steps are
+marked "you got this one before", then the new ones. A note cannot close the tag. The gate
 answer has the block in the field `steer`, but only for a runner that sends the header
 `x-sama-steer: 1` (an older runner does not know the field). The runner sends the header only
 for a runtime with `Capabilities.mid_run_steer`. The Claude adapter has it: it puts the block
@@ -359,7 +365,8 @@ tool call. The OpenAI adapter (M3.6) does not have it, because its tool gate has
 text for the model. So in an OpenAI run the notes stay pending. A run that calls no more tools
 does not read the note. Then, when the run completes,
 `complete` sends the pending notes as one new user message of the session (status `requeued`,
-with `requeued_run_id`). That message does not need the rate check, because each note passed it.
+with `requeued_run_id`). The run answered the original request already, so the new run answers
+the notes, and both requests get an answer. That message does not need the rate check, because each note passed it.
 `requeued_run(org_id, run_id)` gives the new run, and the chat followers follow it. The worker
 maintenance calls `sweep_steers()`: it sends the pending notes of completed runs (a note that
 came in after `complete`) as a new message, and it drops (status `dropped`) the pending notes of
