@@ -1,4 +1,4 @@
-"""Migration 0031: change proposals and the profile history (docs/architecture.md, Sections
+"""Migration 0032: change proposals and the profile history (docs/architecture.md, Sections
 9.4.2 and 11.4)."""
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def test_the_upgrade_adds_the_history_and_the_downgrade_removes_it() -> None:
         )
         assert rls[0]["relrowsecurity"]
         config = alembic_config(url)
-        command.downgrade(config, "0030")
+        command.downgrade(config, "0031")
         assert _state(url) == (False, [], False)
         command.upgrade(config, "head")
         assert _state(url) == (True, ["profile_changes_select"], True)
