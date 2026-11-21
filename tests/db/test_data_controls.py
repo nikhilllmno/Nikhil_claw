@@ -31,6 +31,7 @@ from sama.db.models import (
     Base,
     DataPurge,
     Membership,
+    Org,
     OrgInvite,
     ProfileChange,
     Run,
@@ -105,6 +106,8 @@ async def test_an_org_delete_removes_every_row_of_the_org_and_no_row_of_the_othe
     refs = {(row.kind, json.dumps(row.refs, sort_keys=True)) for row in purges}
     assert ("sandboxes", '{"all": true}') in refs
     assert ("browser_contexts", '{"context_ids": ["ctx-bob"]}') in refs
+    # The Mem0 memories of each user of the org go too (M7.5).
+    assert ("mem0", json.dumps({"user_ids": [str(fresh.ids["bob"])]})) in refs
     trace = fresh.ids["run:b1-shared"].hex
     assert ("traces", json.dumps({"trace_ids": [trace]})) in refs
     async with engine.connect() as connection:
@@ -215,6 +218,12 @@ async def test_a_user_delete_removes_the_private_data_and_keeps_the_shared_data(
                 )
             )
         ).scalar_one()
+        memories = (
+            await connection.execute(
+                select(DataPurge.refs).where(DataPurge.org_id == org_a, DataPurge.kind == "mem0")
+            )
+        ).scalar_one()
+    assert memories == {"user_ids": [str(alice)]}  # the Mem0 memories go too (M7.5)
     assert sessions == {fresh.ids["a1-shared"], fresh.ids["a2-shared"]}
     assert users == {fresh.ids["carol"], fresh.ids["dave"]}
     assert members == 0
@@ -534,3 +543,41 @@ async def test_the_retention_setting_is_checked_and_audited(
     assert view.effective_days == 30
     assert (await data.retention(org_a)).retention_days == 30
     assert (await data.retention(fresh.ids["org-b"])).retention_days is None
+
+
+class _Memories:
+    """A fake Mem0 provider for the cleanup before an org delete (M7.5, Section 8.2)."""
+
+    def __init__(self, *, own: bool, fail: bool = False) -> None:
+        self.own, self.fail = own, fail
+        self.forgotten: list[tuple[str, list[str]]] = []
+
+    async def own_key(self, org_id: str) -> bool:
+        return self.own
+
+    async def forget(self, org_id: str, user_ids: Any) -> None:
+        if self.fail:
+            raise RuntimeError("Mem0 is down")
+        self.forgotten.append((org_id, sorted(user_ids)))
+
+
+async def test_an_org_with_its_own_mem0_key_loses_its_memories_before_the_key(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    from sama.datacontrols.service import ServiceCleanup
+
+    org_b, bob = fresh.ids["org-b"], fresh.ids["bob"]
+    failing = _Memories(own=True, fail=True)
+    with pytest.raises(DataBusyError, match="Mem0"):
+        await DataControls(engine, cleanup=ServiceCleanup(engine, memories=failing)).delete_org(
+            org_b, actor_user_id=bob
+        )
+    async with engine.connect() as connection:
+        assert (
+            await connection.execute(select(func.count()).select_from(Org).where(Org.id == org_b))
+        ).scalar_one() == 1  # nothing deleted
+    own = _Memories(own=True)
+    await DataControls(engine, cleanup=ServiceCleanup(engine, memories=own)).delete_org(
+        org_b, actor_user_id=bob
+    )
+    assert own.forgotten == [(str(org_b), [str(bob)])]

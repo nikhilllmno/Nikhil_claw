@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
@@ -317,6 +317,14 @@ class BillingLike(Protocol):
     async def close_org(self, org_id: uuid.UUID) -> bool: ...
 
 
+class MemoriesLike(Protocol):
+    """``Mem0Provider`` (Section 8.2)."""
+
+    async def own_key(self, org_id: str) -> bool: ...
+
+    async def forget(self, org_id: str, user_ids: Sequence[str]) -> None: ...
+
+
 class ServiceCleanup:
     """``Cleanup`` with the sama services. Each service delete also removes its account
     outside sama: ``ConnectionService.delete`` (the Composio account and the connector host),
@@ -331,12 +339,14 @@ class ServiceCleanup:
         triggers: TriggersLike | None = None,
         integrations: IntegrationsLike | None = None,
         billing: BillingLike | None = None,
+        memories: MemoriesLike | None = None,
     ) -> None:
         self._engine = engine
         self._connections = connections
         self._triggers = triggers
         self._integrations = integrations
         self._billing = billing
+        self._memories = memories
 
     async def before_user_delete(
         self, org_id: uuid.UUID, user_id: uuid.UUID, actor_user_id: uuid.UUID
@@ -348,6 +358,7 @@ class ServiceCleanup:
             # First, and not in ``_try``: a billing error (``BillingError``, an ``OrgError``)
             # stops the delete before sama removes anything that it cannot undo.
             await self._billing.close_org(org_id)
+        await self._forget_memories(org_id)
         await self._clean(org_id, actor_user_id, None)
         if self._integrations is None:
             return
@@ -364,6 +375,28 @@ class ServiceCleanup:
                 f"the {kind} integration",
                 self._integrations.disconnect(org_id, kind, actor_user_id),
             )
+
+    async def _forget_memories(self, org_id: uuid.UUID) -> None:
+        """An org with its own Mem0 key loses the key with the org (the vault rows cascade),
+        so the purge worker could not delete the memories later. Delete them now, and stop
+        the delete when Mem0 fails (Section 17.4). With the key of sama, the purge row of the
+        delete does the work."""
+        if self._memories is None or not await self._memories.own_key(str(org_id)):
+            return
+        async with self._engine.connect() as connection:
+            users = [
+                str(user)
+                for user in (
+                    await connection.execute(select(User.id).where(User.org_id == org_id))
+                ).scalars()
+            ]
+        try:
+            await self._memories.forget(str(org_id), users)
+        except Exception as error:
+            log.warning("the Mem0 delete of org=%s failed: %s", org_id, type(error).__name__)
+            raise DataBusyError(
+                "the Mem0 memories of the org cannot be deleted now; try again later"
+            ) from None
 
     async def _clean(
         self, org_id: uuid.UUID, actor_user_id: uuid.UUID, user_id: uuid.UUID | None

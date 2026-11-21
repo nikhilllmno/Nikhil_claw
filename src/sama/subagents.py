@@ -294,6 +294,8 @@ class LockedProfile(NamedTuple):
     max_parallel_runs: int = 3
     library_subagents: list[str] | None = None
     """The ids of the library agents of the profile (Section 13.3)."""
+    delegation_model: str | None = None
+    memory_provider: str = "builtin"
 
 
 async def lock_profile(
@@ -324,6 +326,8 @@ async def lock_profile(
                 AgentProfile.busy_mode,
                 AgentProfile.max_parallel_runs,
                 AgentProfile.library_subagents,
+                AgentProfile.delegation_model,
+                AgentProfile.memory_provider,
             )
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .with_for_update()
@@ -353,6 +357,8 @@ async def lock_profile(
             if isinstance(row.library_subagents, list)
             else []
         ),
+        delegation_model=row.delegation_model,
+        memory_provider=row.memory_provider,
     )
 
 

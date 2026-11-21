@@ -66,6 +66,9 @@ ENV_SECRETS = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "BRAVE_API_KEY",
+    "GEMINI_API_KEY",
+    "X_BEARER_TOKEN",
+    "MEM0_API_KEY",
 )
 """The environment variables that hold a secret of the control plane. The redactor knows their
 values before a write checks text for secrets."""

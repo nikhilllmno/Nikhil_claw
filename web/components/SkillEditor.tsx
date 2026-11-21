@@ -13,6 +13,7 @@ import {
   type SkillCatalog,
   type SkillDetail,
   type SkillScope,
+  type SkillSettings as SkillSettingsData,
   type SkillSummary,
   type SkillVersionDetail,
   type SkillWriteBody,
@@ -24,6 +25,11 @@ import {
   nameProblem,
   pathProblem,
   SCOPE_LABELS,
+  SETTINGS_NOTE,
+  settingsBody,
+  settingsChanged,
+  settingsForm,
+  type SettingsForm,
   skillTemplate,
   STALE_TEXT,
 } from "@/lib/skills";
@@ -692,6 +698,7 @@ function SkillView({
             </p>
           </>
         )}
+        <SkillSettings workspaceId={workspaceId} skill={skill} />
         <Files
           skill={skill}
           writable={writable}
@@ -723,6 +730,158 @@ function BackButton({ onBack }: { onBack: () => void }) {
       <button type="button" className="btn btn-quiet btn-small" onClick={onBack}>
         All skills
       </button>
+    </div>
+  );
+}
+
+function SkillSettings({ workspaceId, skill }: { workspaceId: string; skill: SkillDetail }) {
+  const api = useApi();
+  const load = useCallback(() => api.getSkillSettings(workspaceId, skill.name), [api, workspaceId, skill.name]);
+  const loaded = useLoad(load, "Could not load the settings.");
+  if (loaded.error) {
+    return (
+      <div className={styles.section}>
+        <h3 className={styles.subheading}>Settings</h3>
+        <p className="alert alert-error" role="alert">
+          {loaded.error}
+        </p>
+      </div>
+    );
+  }
+  const settings = loaded.data;
+  if (settings === null) return null;
+  if (settings.problem === null && settings.specs.length === 0) return null;
+  return <SettingsFields workspaceId={workspaceId} settings={settings} skill={skill} onSaved={loaded.setData} />;
+}
+
+function SettingsFields({
+  workspaceId,
+  settings,
+  skill,
+  onSaved,
+}: {
+  workspaceId: string;
+  settings: SkillSettingsData;
+  skill: SkillDetail;
+  onSaved: (settings: SkillSettingsData) => void;
+}) {
+  const api = useApi();
+  const { specs } = settings;
+  const [saved, setSaved] = useState<SettingsForm>(() => settingsForm(settings));
+  const [form, setForm] = useState<SettingsForm>(saved);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+  const readOnly = !settings.can_edit;
+  const changed = settingsChanged(specs, form, saved);
+
+  const edit = (key: string, value: string | boolean) => {
+    setForm((f) => ({ ...f, [key]: value }));
+    setErrors((e) => Object.fromEntries(Object.entries(e).filter(([k]) => k !== key)));
+    setDone(false);
+  };
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (readOnly) return;
+    const body = settingsBody(specs, form, settings.values);
+    setErrors(body.errors);
+    setError(null);
+    setDone(false);
+    if (Object.keys(body.errors).length > 0) return;
+    setBusy(true);
+    try {
+      const result = await api.putSkillSettings(workspaceId, skill.name, body.values);
+      const fresh = settingsForm(result);
+      setSaved(fresh);
+      setForm(fresh);
+      setDone(true);
+      onSaved(result);
+    } catch (e) {
+      setError(errorText(e, "The settings were not saved."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={styles.section}>
+      <h3 className={styles.subheading}>Settings</h3>
+      {settings.problem !== null ? (
+        <p className="alert alert-error" role="alert">
+          {settings.problem}
+        </p>
+      ) : (
+        <form className={styles.form} onSubmit={submit} aria-label={`Settings of ${skill.name}`}>
+          <p className={styles.meta}>{SETTINGS_NOTE}</p>
+          {settings.scope !== skill.scope ? (
+            <p className={styles.meta}>These settings are for the {settings.scope} skill. Agents use that skill.</p>
+          ) : null}
+          {readOnly ? <p className={styles.meta}>Only a workspace admin sets these values.</p> : null}
+          {specs.map((spec) => {
+            const problem = errors[spec.key];
+            const hintId = `setting-${spec.key}-hint`;
+            const fallback = spec.default === null ? "" : String(spec.default);
+            return (
+              <label key={spec.key} className="field">
+                <span className="label">
+                  {spec.key}
+                  {spec.required ? " (required)" : ""}
+                </span>
+                {spec.type === "boolean" ? (
+                  <input
+                    type="checkbox"
+                    checked={form[spec.key] === true}
+                    disabled={readOnly || busy}
+                    aria-describedby={hintId}
+                    onChange={(e) => edit(spec.key, e.target.checked)}
+                  />
+                ) : (
+                  <input
+                    className="input"
+                    type={spec.type === "number" ? "number" : "text"}
+                    step={spec.type === "number" ? "any" : undefined}
+                    value={typeof form[spec.key] === "string" ? (form[spec.key] as string) : ""}
+                    placeholder={fallback}
+                    maxLength={spec.type === "string" ? 500 : undefined}
+                    readOnly={readOnly}
+                    aria-invalid={problem !== undefined}
+                    aria-describedby={hintId}
+                    onChange={(e) => edit(spec.key, e.target.value)}
+                  />
+                )}
+                <span className="hint" id={hintId}>
+                  {spec.description}
+                  {spec.type === "boolean" && spec.default !== null ? ` Default: ${spec.default ? "on" : "off"}.` : ""}
+                </span>
+                {problem !== undefined ? (
+                  <span className="alert alert-error" role="alert">
+                    {problem}
+                  </span>
+                ) : null}
+              </label>
+            );
+          })}
+          {error ? (
+            <p className="alert alert-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+          {done ? (
+            <p className="alert alert-success" role="status">
+              The settings are saved.
+            </p>
+          ) : null}
+          {!readOnly ? (
+            <div className={styles.actions}>
+              <button type="submit" className="btn btn-primary btn-small" disabled={busy || !changed}>
+                {busy ? "Saving" : "Save"}
+              </button>
+            </div>
+          ) : null}
+        </form>
+      )}
     </div>
   );
 }

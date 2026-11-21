@@ -30,13 +30,14 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
         {"Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch"}
     ),
     "todo": frozenset({"todo", "TodoWrite"}),
-    "web": frozenset({"web_search", "web_extract"}),
+    "web": frozenset({"web_search", "web_extract", "x_search"}),
     "clarify": frozenset({"clarify"}),
     "github": frozenset({"repo_clone", "pr_create", "pr_comment", "repo_push_approval"}),
-    "memory": frozenset({"memory"}),
+    "memory": frozenset({"memory", "memory_recall"}),
     "skills": frozenset({"skills_list", "skill_view", "skill_manage", "skill_import"}),
     "sessions": frozenset({"session_search", "session_read"}),
-    "media": frozenset({"vision_analyze", "image_generate", "text_to_speech"}),
+    "media": frozenset({"vision_analyze", "image_generate", "text_to_speech", "video_analyze"}),
+    "moa": frozenset({"moa"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
     "cron": frozenset({"cronjob_manage"}),
@@ -95,9 +96,11 @@ DEFAULT_ALLOW: Final = frozenset(
         "TodoWrite",
         "web_search",
         "web_extract",
+        "x_search",
         "clarify",
         "repo_clone",
         "memory",
+        "memory_recall",
         "skills_list",
         "skill_view",
         "skill_manage",
@@ -107,6 +110,8 @@ DEFAULT_ALLOW: Final = frozenset(
         "vision_analyze",
         "image_generate",
         "text_to_speech",
+        "video_analyze",
+        "moa",
         "tool_search",
         "tool_describe",
         "Task",
@@ -161,6 +166,7 @@ CHILD_BLOCKED_TOOLSETS: Final = frozenset(
         "connections",
         "integrations",
         "browser",
+        "moa",
     }
 )
 """The toolsets that a delegated child never has (Section 13.2). ``delegation`` keeps the depth
@@ -170,7 +176,8 @@ none. ``cron`` and ``workflows`` stop a child that outlives its parent. ``connec
 ``integrations`` are out for the reason of sub-agents (Section 13.1): a connection acts with the
 authority of the user, and only a run that the user watches asks the user to connect
 (Section 10.3). ``browser`` is out for the same reason: the browser has the logins of the user
-(Section 14.1)."""
+(Section 14.1). ``moa`` is out because one call spends the money of several model calls, and a
+child has a small budget (Section 10.2.2)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify", "repo_push_approval"})
 """Tools that wait for a human. Unattended runs cannot use them."""

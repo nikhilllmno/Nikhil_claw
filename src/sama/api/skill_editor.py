@@ -10,6 +10,7 @@ use ``PostgresSkillStore.edit``, which writes as the table owner after ``authori
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Final, Literal
 
@@ -32,6 +33,14 @@ from sama.skills.lint import (
     MAX_SUMMARY_CHARS,
 )
 from sama.skills.service import SkillLibrary
+from sama.skills.settings import (
+    MAX_SETTINGS,
+    SkillSettingsStore,
+    check_values,
+    effective,
+    read_settings,
+    skill_specs,
+)
 from sama.skills.sql import copy_version, load_docs, scope_filter
 from sama.skills.store import PostgresSkillStore
 from sama.tenancy.access import Grants, load_grants
@@ -130,12 +139,42 @@ class SkillState(BaseModel):
     version: int
 
 
+class SkillSettingsOut(BaseModel):
+    """The settings of a skill for one workspace (Section 9.8). ``specs`` come from the
+    ``config`` block of the skill that a session of the person uses. ``values`` are the
+    stored values, ``effective`` the values that ``skill_view`` shows (a default for a value
+    that is not set)."""
+
+    name: str
+    scope: str
+    specs: list[dict[str, Any]]
+    values: dict[str, Any]
+    effective: dict[str, Any]
+    can_edit: bool
+    problem: str | None = None
+    """Why the ``config`` block cannot be read. Then ``specs`` is empty."""
+
+
+class SkillSettingsWrite(BaseModel):
+    """The new values. A key with ``null`` goes back to its default. The body replaces all
+    stored values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    values: dict[str, str | bool | int | float | None] = Field(max_length=MAX_SETTINGS)
+
+
 StateAction = Literal["pin", "unpin", "restore"]
 MAX_ARCHIVED: Final = 500
 
 
 def _not_found(what: str = "the skill does not exist") -> HTTPException:
     return HTTPException(status_code=404, detail=what)
+
+
+def _can_edit_settings(grants: Grants, workspace_id: uuid.UUID) -> bool:
+    """A workspace admin or the org owner changes the skill settings (Section 9.8)."""
+    return grants.admins_workspace(workspace_id) or grants.org_owner
 
 
 def _status(doc: SkillDoc) -> str:
@@ -151,6 +190,50 @@ class SkillEditor:
         self._engine = engine
         self._library = library
         self._store = store
+        self._settings = SkillSettingsStore(engine)
+
+    async def settings(
+        self, principal: Principal, workspace_id: uuid.UUID, name: str
+    ) -> SkillSettingsOut:
+        """The settings of the skill that a session of the person uses in the workspace."""
+        found = await self.detail(principal, workspace_id, name, None)
+        actor, grants = await self._actor(principal, workspace_id)
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            stored = await read_settings(connection, actor.org_id, workspace_id, found.name)
+        try:
+            specs = skill_specs(found.skill_md)
+            problem = None
+        except SkillError as error:
+            specs, problem = (), str(error)
+        return SkillSettingsOut(
+            name=found.name,
+            scope=found.scope,
+            specs=[asdict(spec) for spec in specs],
+            values=stored,
+            effective=effective(specs, stored),
+            can_edit=_can_edit_settings(grants, workspace_id),
+            problem=problem,
+        )
+
+    async def put_settings(
+        self, principal: Principal, workspace_id: uuid.UUID, name: str, body: SkillSettingsWrite
+    ) -> SkillSettingsOut:
+        """Replaces the values. Needs a workspace admin or the org owner."""
+        found = await self.detail(principal, workspace_id, name, None)
+        actor, grants = await self._actor(principal, workspace_id)
+        if not _can_edit_settings(grants, workspace_id):
+            raise HTTPException(
+                status_code=403,
+                detail="only a workspace admin or the org owner can change skill settings",
+            )
+        try:
+            values = check_values(skill_specs(found.skill_md), body.values)
+        except SkillError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        await self._settings.put(
+            actor.org_id, workspace_id, found.name, values, actor_user_id=grants.user_id
+        )
+        return await self.settings(principal, workspace_id, name)
 
     async def _actor(self, principal: Principal, workspace_id: uuid.UUID) -> tuple[Actor, Grants]:
         """The person as a skill actor in a private session of the workspace. Raises ``404``

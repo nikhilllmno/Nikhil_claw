@@ -90,6 +90,28 @@ async def test_the_worker_deletes_the_browser_contexts_of_deleted_users(
     assert (await purge_row(engine, traces)).done_at is None  # no Langfuse in this worker
 
 
+@dataclass
+class FakeMemories:
+    forgotten: list[tuple[str, list[str]]] = field(default_factory=list)
+
+    async def forget(self, org_id: str, user_ids: Sequence[str]) -> None:
+        self.forgotten.append((org_id, list(user_ids)))
+
+
+async def test_the_worker_deletes_the_mem0_memories_of_deleted_users(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    """M7.5: the external memory of the deleted users (Section 8.2)."""
+    org_a = fresh.ids["org-a"]
+    row = await add_purge(engine, org_a, "mem0", {"user_ids": ["u-1", "u-2"]})
+    fake = FakeMemories()
+
+    await PurgeWorker(engine, memories=fake).run_once()
+
+    assert fake.forgotten == [(str(org_a), ["u-1", "u-2"])]
+    assert (await purge_row(engine, row)).done_at is not None
+
+
 async def add_purge(engine: AsyncEngine, org_id: uuid.UUID, kind: str, refs: object) -> uuid.UUID:
     async with engine.begin() as connection:
         return (

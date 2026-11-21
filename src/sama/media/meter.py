@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Final, TypeVar
 
 from sama.modelproxy.ledger import UsageLedger
@@ -59,8 +60,26 @@ class MediaMeter:
         self._clock = clock
         self._tasks: set[asyncio.Task[Any]] = set()
 
-    def has_price(self, provider: Provider, model: str) -> bool:
+    def has_price(self, provider: Provider, model: str, *, chat: bool = False) -> bool:
+        """``chat``: a model of the ``models`` table (``moa``, ``video_analyze``), not of the
+        ``media`` table."""
+        if chat:
+            return self._prices.lookup(provider, model) is not None
         return self._prices.media(provider, model) is not None
+
+    @property
+    def prices(self) -> PriceTable:
+        return self._prices
+
+    async def remaining_usd(self, claims: RunTokenClaims) -> Decimal | None:
+        """The money that the run can still spend, or ``None`` when the run has no cost
+        limit. ``moa`` uses it to cap its plan (Section 10.2.2). Call ``check`` first."""
+        authority = await self._usage.authority(claims.org_id, claims.run_id)
+        max_cost = lower(claims.max_cost_usd, authority.max_cost_usd)
+        if max_cost is None:
+            return None
+        spend = await self._usage.run_spend(claims.org_id, claims.run_id)
+        return max(Decimal(0), Decimal(str(max_cost)) - Decimal(str(spend.cost_usd)))
 
     async def check(self, claims: RunTokenClaims, label: str) -> None:
         """Fails closed, like the model proxy: a run without authority or without budget, and
@@ -120,8 +139,12 @@ class MediaMeter:
         estimated: bool,
         status: int,
         key_source: KeySource,
+        chat: bool = False,
     ) -> None:
-        cost = self._prices.media_cost(provider, model, counts)
+        if chat:
+            cost = self._prices.cost(provider, model, counts)
+        else:
+            cost = self._prices.media_cost(provider, model, counts)
         log.info(
             "media call run=%s model=%s tokens=%d cost_usd=%s estimated=%s",
             claims.run_id,

@@ -8,6 +8,7 @@ import {
   type Draft,
   type DraftSubagent,
   diffDraft,
+  memoryProviderLabel,
   newSubagent,
   runtimeLabel,
   runtimeOption,
@@ -221,6 +222,41 @@ function SettingsForm({
               </option>
             ))}
           </select>
+        </label>
+        <label className="field">
+          <span className="label">Model for delegated tasks</span>
+          <select
+            className="input"
+            value={draft.delegationModel}
+            disabled={readOnly}
+            onChange={(e) => edit({ delegationModel: e.target.value })}
+          >
+            <option value="">Same as the agent model</option>
+            {withCurrent(runtime.models, draft.delegationModel).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span className="label">Long-term memory</span>
+          <select
+            className="input"
+            value={draft.memoryProvider}
+            disabled={readOnly}
+            onChange={(e) => edit({ memoryProvider: e.target.value as Draft["memoryProvider"] })}
+          >
+            {withCurrent(options.memory_providers ?? ["builtin", "mem0"], draft.memoryProvider).map((p) => (
+              <option key={p} value={p}>
+                {memoryProviderLabel(p)}
+              </option>
+            ))}
+          </select>
+          <span className="hint">
+            With Mem0, sama sends the turns of private chats to Mem0, and the agent can search them with
+            memory_recall.
+          </span>
         </label>
       </section>
 

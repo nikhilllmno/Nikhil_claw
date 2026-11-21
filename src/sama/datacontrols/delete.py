@@ -299,8 +299,10 @@ async def write_purges(
     all_sandboxes: bool = False,
     trace_ids: Sequence[str] = (),
     browser_contexts: Sequence[str] = (),
+    memory_users: Sequence[uuid.UUID] = (),
 ) -> None:
-    """Writes the cleanups outside Postgres for the purge worker."""
+    """Writes the cleanups outside Postgres for the purge worker. ``memory_users``: the users
+    whose external memories (Mem0) the worker deletes (Section 8.2)."""
     rows: list[dict[str, Any]] = []
     if all_sandboxes:
         rows.append({"org_id": org_id, "kind": "sandboxes", "refs": {"all": True}})
@@ -309,6 +311,19 @@ async def write_purges(
         rows.append({"org_id": org_id, "kind": "sandboxes", "refs": refs})
     if rows:
         await connection.execute(insert(DataPurge), rows)
+    users = sorted({str(user) for user in memory_users})
+    if users:
+        await connection.execute(
+            insert(DataPurge),
+            [
+                {
+                    "org_id": org_id,
+                    "kind": "mem0",
+                    "refs": {"user_ids": users[start : start + MAX_DELETE_IDS]},
+                }
+                for start in range(0, len(users), MAX_DELETE_IDS)
+            ],
+        )
     contexts = sorted(set(browser_contexts))
     if contexts:
         await connection.execute(
@@ -541,12 +556,13 @@ async def delete_user(
             ),
         )
     )
-    # The rows of ``browser_contexts`` cascade from the user. The contexts at Browserbase go
-    # through the purge worker.
+    # The rows of ``browser_contexts`` cascade from the user. The contexts at Browserbase and
+    # the memories at Mem0 go through the purge worker.
     await write_purges(
         connection,
         org_id,
         browser_contexts=await browser_contexts(connection, org_id, user_id),
+        memory_users=[user_id],
     )
     # The personal library agents cascade from the user. The profiles stop naming them
     # (Section 13.3).
@@ -624,6 +640,9 @@ async def delete_org(connection: AsyncConnection, org_id: uuid.UUID) -> Removed:
         all_sandboxes=True,
         trace_ids=removed.trace_ids,
         browser_contexts=await browser_contexts(connection, org_id),
+        memory_users=list(
+            (await connection.execute(select(User.id).where(User.org_id == org_id))).scalars()
+        ),
     )
     await connection.execute(text("SET LOCAL sama.audit_purge = 'on'"))
     await connection.execute(delete(Org).where(Org.id == org_id))

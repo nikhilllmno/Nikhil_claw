@@ -130,6 +130,8 @@ async def load_run(engine: AsyncEngine, claims: RunTokenClaims) -> Any:
                     AgentProfile.toolsets,
                     AgentProfile.group_toolsets,
                     AgentProfile.subagents,
+                    AgentProfile.delegation_model,
+                    AgentProfile.memory_provider,
                 )
                 .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
                 .join(

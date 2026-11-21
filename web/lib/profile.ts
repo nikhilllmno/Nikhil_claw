@@ -6,6 +6,7 @@ import type {
   AgentProfileOptions,
   AgentProfilePatch,
   BusyMode,
+  MemoryProvider,
   RuntimeOption,
   Subagent,
 } from "./api";
@@ -36,6 +37,20 @@ export interface Draft {
   maxParallelRuns: string;
   /** The ids of the library sub-agents (M7.4), in order. */
   librarySubagents: string[];
+  /** Empty: the model of the agent. */
+  delegationModel: string;
+  memoryProvider: MemoryProvider;
+}
+
+/** The names of the memory providers for people. */
+export const MEMORY_PROVIDER_LABELS: Record<MemoryProvider, string> = {
+  builtin: "Built-in only",
+  mem0: "Built-in and Mem0",
+};
+
+/** The label of a memory provider. An unknown provider shows its name. */
+export function memoryProviderLabel(provider: string): string {
+  return (MEMORY_PROVIDER_LABELS as Record<string, string>)[provider] ?? provider;
 }
 
 /** The busy modes, with their text for people (M7.1). */
@@ -86,6 +101,8 @@ export function toDraft(profile: AgentProfile): Draft {
       maxTurns: s.max_turns === null ? "" : String(s.max_turns),
     })),
     librarySubagents: [...profile.library_subagents],
+    delegationModel: profile.delegation_model ?? "",
+    memoryProvider: profile.memory_provider,
   };
 }
 
@@ -126,6 +143,8 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
   if (draft.librarySubagents.join("\n") !== profile.library_subagents.join("\n")) {
     patch.library_subagents = draft.librarySubagents;
   }
+  if (draft.delegationModel !== (profile.delegation_model ?? "")) patch.delegation_model = draft.delegationModel;
+  if (draft.memoryProvider !== profile.memory_provider) patch.memory_provider = draft.memoryProvider;
   return patch;
 }
 
@@ -151,7 +170,7 @@ export function runtimeOption(options: AgentProfileOptions, saved: string, runti
  * The draft after the user chooses `runtime`. A model of another runtime cannot stay, so the
  * draft takes the saved model (back on the saved runtime) or the first model of the runtime.
  */
-export function withRuntime<D extends { runtime: string; model: string }>(
+export function withRuntime<D extends { runtime: string; model: string; delegationModel?: string }>(
   draft: D,
   profile: AgentProfile,
   runtime: string,
@@ -160,7 +179,12 @@ export function withRuntime<D extends { runtime: string; model: string }>(
   let model = draft.model;
   if (runtime === profile.runtime) model = profile.model;
   else if (!models.includes(model)) model = models[0] ?? "";
-  return { ...draft, runtime, model };
+  if (draft.delegationModel === undefined) return { ...draft, runtime, model };
+  // A model for delegated tasks of another runtime cannot stay either.
+  let delegationModel = draft.delegationModel;
+  if (runtime === profile.runtime) delegationModel = profile.delegation_model ?? "";
+  else if (!models.includes(delegationModel)) delegationModel = "";
+  return { ...draft, runtime, model, delegationModel };
 }
 
 /** `list` with `value` in it, so that a select shows a value that the options do not have. */

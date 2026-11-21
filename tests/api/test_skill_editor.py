@@ -426,3 +426,78 @@ async def test_the_curator_controls_follow_the_write_roles(
         if s["name"] == "team-notes"
     ]
     assert skill["pinned"] is True
+
+
+CONFIG = (
+    "config:\n"
+    "  - key: city\n"
+    "    description: The default city\n"
+    "    default: London\n"
+    "  - key: days\n"
+    "    type: number\n"
+)
+
+
+async def test_a_workspace_admin_sets_the_settings_of_a_skill(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """M7.5: per-skill settings for the workspace (Section 9.8)."""
+    admin = await add_member(engine, tenant, org_role="member", workspace_role="admin")
+    created = await client.post(
+        base(tenant),
+        headers=admin,
+        json={
+            "action": "create",
+            "name": "weather",
+            "scope": "workspace",
+            "content": md("weather", "Gives the weather", extra=CONFIG),
+        },
+    )
+    assert created.status_code == 200, created.text
+    url = f"{base(tenant)}/weather/settings"
+
+    member = await client.get(url, headers=mia(tenant))
+    assert member.status_code == 200
+    body = member.json()
+    assert [spec["key"] for spec in body["specs"]] == ["city", "days"]
+    assert body["values"] == {}
+    assert body["effective"] == {"city": "London", "days": None}
+    assert body["can_edit"] is False
+    refused = await client.put(url, headers=mia(tenant), json={"values": {"city": "Paris"}})
+    assert refused.status_code == 403
+
+    saved = await client.put(url, headers=admin, json={"values": {"city": "Paris", "days": 3}})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["values"] == {"city": "Paris", "days": 3}
+    assert saved.json()["can_edit"] is True
+    # The member reads the new values (RLS: the member sees the workspace).
+    assert (await client.get(url, headers=mia(tenant))).json()["effective"] == {
+        "city": "Paris",
+        "days": 3,
+    }
+    for bad in ({"days": "three"}, {"colour": "red"}, {"city": "sk-ant-api03-" + "a" * 40}):
+        response = await client.put(url, headers=admin, json={"values": bad})
+        assert response.status_code == 422, bad
+    # null goes back to the default.
+    reset = await client.put(url, headers=admin, json={"values": {"city": None}})
+    assert reset.json()["effective"] == {"city": "London", "days": None}
+    async with engine.connect() as connection:
+        keys = (
+            await connection.execute(
+                select(AuditEntry.details).where(
+                    AuditEntry.org_id == tenant.org,
+                    AuditEntry.action == "skill.settings_updated",
+                )
+            )
+        ).scalars()
+        assert sorted(entry["keys"] for entry in keys) == [[], ["city", "days"]]
+
+
+async def test_a_skill_without_config_has_no_settings(
+    client: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    response = await client.get(f"{base(tenant)}/summarize/settings", headers=mia(tenant))
+    assert response.status_code == 200
+    assert (response.json()["specs"], response.json()["problem"]) == ([], None)
+    missing = await client.get(f"{base(tenant)}/nope/settings", headers=mia(tenant))
+    assert missing.status_code == 404

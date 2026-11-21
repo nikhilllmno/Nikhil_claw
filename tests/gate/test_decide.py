@@ -964,3 +964,20 @@ def test_coding_agent_run_asks_by_default() -> None:
         toolsets=frozenset({"coding_agents"}), rules=(rule("coding_agent_run", "allow"),)
     )
     assert decide(allowed, "coding_agent_run", arguments).action == "allow"
+
+
+def test_the_hermes_parity_tools_have_their_toolsets() -> None:
+    """M7.5 (Section 10.2.2): the new tools, their toolsets, and the child rule."""
+    assert "x_search" in TOOLSETS["web"]
+    assert "video_analyze" in TOOLSETS["media"]
+    assert "memory_recall" in TOOLSETS["memory"]
+    assert TOOLSETS["moa"] == frozenset({"moa"})
+    assert "moa" in DEFAULT_TOOLSETS
+    assert "moa" not in DEFAULT_GROUP_TOOLSETS
+    assert "moa" in CHILD_BLOCKED_TOOLSETS
+    for name in ("x_search", "video_analyze", "memory_recall", "moa"):
+        assert decide(context(toolsets=frozenset(TOOLSETS)), name, {}).action == "allow"
+    child = effective_toolsets(
+        DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="private", lineage="delegation"
+    )
+    assert "moa" not in child

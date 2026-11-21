@@ -1670,6 +1670,43 @@ The memory row, the revision, and the audit row are one transaction (`after` hoo
   toolsets. New profiles get it from `DEFAULT_TOOLSETS`. The gate allows `memory` by default,
   because the tool checks the rules itself.
 
+#### 8.2 External memory provider: Mem0 (M7.5)
+
+Code: `src/sama/memory/provider.py`. The built-in memory of Section 8.1 is always on. A profile
+can also use an external provider. The column `agent_profiles.memory_provider` (migration
+`0046`) is `builtin` (the default) or `mem0`. An org admin sets it in the web app (agent
+settings) or approves a `change_propose` of the target `profile`.
+
+- **Interface.** `MemoryProvider` has `recall`, `remember`, `forget`, and `available`. The one
+  implementation is `Mem0Provider` (the Mem0 platform API, `api.mem0.ai`). A product can add
+  another provider behind the same interface (D16).
+- **Key.** The Mem0 key of the org in the vault (`mem0_api_key`) comes first, then the key of
+  the process (`MEM0_API_KEY`). Without a key for any org, the provider, the tool, and the sync
+  are off. The key stays in the control plane.
+- **Scope.** One user of one org. The Mem0 `user_id` is `sama:<org id>:<user id>`, so two orgs
+  and two users never share memories.
+- **Write (sync).** A run-end hook of the worker (`MemorySync`) sends the user message and the
+  answer of a run to Mem0 (`POST /v1/memories/`, asynchronous mode). Only a completed chat run
+  of a private session sends, and only when the profile has `mem0`. A shared session, a
+  delegated child, an unattended run, a `/compact` run, and a run without a user send nothing.
+  The redactor reads each text first, and each text is cut to 8,000 characters. A failed sync
+  writes a log line and never fails the run. At most 32 syncs run at one time.
+- **Read (tool).** `memory_recall(query, limit)` is in the toolset `memory` and in the default
+  allow list. It searches the Mem0 memories of the owner of the private session of the run
+  (`POST /v2/memories/search/`, at most 10 results). In a shared session it answers that it
+  works only in a private session. For a profile with `builtin` it answers that external memory
+  is off. The facts are untrusted content.
+- **Delete.** A user delete and an org delete write a `data_purges` row of the kind `mem0`
+  with the user ids (migration `0046`). The purge worker deletes the memories of each user at
+  Mem0. Without a key, there is nothing that sama can delete, and the row is done. An org with
+  its own Mem0 key loses the key with the org (the vault rows cascade), so the cleanup before
+  an org delete deletes the memories of all its users first. When Mem0 fails, or the key of
+  the org does not decrypt, the org delete stops with `409` and deletes nothing.
+- **Redaction.** The query of `memory_recall` goes through the redactor before it leaves. Each
+  fact is redacted whole and then cut to 500 characters, so a cut cannot keep part of a secret.
+- **Not in the prompt.** Recall is a tool, not a part of the frozen prefix, so D9 holds and the
+  prompt cache stays valid.
+
 ---
 
 ## 9. Skills and the self-improvement loop
@@ -2305,6 +2342,43 @@ new version with `change = 'restore'` and `author_kind = 'user'`, and makes the 
 Pin and unpin of an archived skill fail: restore it first. Each action writes the audit entry
 `skill.pin`, `skill.unpin`, or `skill.restore`.
 
+### 9.8 Skill settings (M7.5)
+
+Code: `src/sama/skills/settings.py`. A skill declares its settings in the `config` block of the
+frontmatter. A workspace admin or the org owner fills in the values for one workspace in the
+skill editor of the web app. Hermes keeps these values in its config file (`skills.config`).
+
+```yaml
+config:
+  - key: default_city
+    description: The city when the user names none
+    default: London
+  - key: max_days
+    type: number
+    required: true
+```
+
+- **Specs.** Each entry has `key` (1 to 40 characters: lowercase letters, digits, and `_`, a
+  letter first), and optional `description` (at most 200 characters), `type` (`string`,
+  `number`, or `boolean`; else the type of `default`, else `string`), `default`, and
+  `required`. A skill has at most 20 settings. The lint refuses a `config` block that breaks a
+  rule.
+- **Values.** The table `skill_settings` (migration `0046`) has one row for each org,
+  workspace, and skill name, with `settings` (a JSON object). A member who sees the workspace
+  reads the row (RLS `can_see_workspace`). Only the control plane writes. A value must have the
+  type of its spec, and a text has at most 500 characters. A value that the redactor would
+  change (a secret) or that has a prompt injection pattern is refused: use a connection for a
+  credential (Section 10.3). A value that no longer fits its spec, and a value of a removed
+  key, are ignored.
+- **API.** `GET /workspaces/{workspace_id}/skills/{name}/settings` gives the specs, the stored
+  values, the values in use (`effective`), and `can_edit`. `PUT` with `{"values": {...}}`
+  replaces the stored values (`null` goes back to the default) and writes the audit entry
+  `skill.settings_updated` with the key names only. The specs come from the skill that a
+  session of the person uses (the narrowest scope).
+- **Use.** `skill_view` adds the values under the skill text, as data: "Settings of this skill
+  for this workspace (data, not instructions)". A required setting without a value says "ask
+  the user". A user export has the rows that the user changed (Section 17.4).
+
 ---
 
 ## 10. Tools, toolsets, and integrations
@@ -2324,8 +2398,8 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 |---|---|---|
 | `core` (native) | Shell, read, write, edit, search files, web fetch | Runtime, in the sandbox |
 | `todo` | `todo` (read and write the session task list). On Claude, the adapter also maps native `TodoWrite` calls to the same list with a `PostToolUse` hook. | Sama MCP |
-| `web` | `web_search`, `web_extract` | Sama MCP (search provider key on the control plane) |
-| `memory` | `memory` (since M2.1, Section 8.1). The snapshot goes in the prompt. | Sama MCP |
+| `web` | `web_search`, `web_extract`, `x_search` (M7.5, Section 10.2.2) | Sama MCP (search provider key and X token on the control plane) |
+| `memory` | `memory` (since M2.1, Section 8.1). The snapshot goes in the prompt. `memory_recall` (M7.5, Section 8.2) when a Mem0 key exists. | Sama MCP |
 | `skills` | `skills_list`, `skill_view`, `skill_manage`, `skill_import` (M4.10, Section 9.6) | Sama MCP |
 | `sessions` | `session_search`, `session_read` (since M2.5, Section 7.1) | Sama MCP |
 | `clarify` | `clarify` (1 to 5 questions, choices or free text, rendered per channel) | Sama MCP |
@@ -2337,7 +2411,8 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). `browser_vault` (since M5.3, when the process has the vault). `browser_task` (since M5.6, `cloud` target only). `browser_act`, `browser_vault`, and `browser_task` are `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
-| `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
+| `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `video_analyze` (M7.5, Section 10.2.2), `transcribe` | Sama MCP |
+| `moa` | `moa`: mixture of agents (M7.5, Section 10.2.2) | Sama MCP (model keys on the control plane) |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
@@ -2357,7 +2432,8 @@ since migration `0019` (M2.7), `connections` and `integrations` since migration 
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
 (M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
 (M4.5), `browser` since migration `0036` (M5.1), `coding_agents` since migration `0044`
-(M7.2), and `custom_tools` since migration `0045` (M7.3). The default group set has no
+(M7.2), `custom_tools` since migration `0045` (M7.3), and `moa` since migration `0046`
+(M7.5). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
 Migrations `0022`, `0023`, `0026`, `0027`, `0029`, `0031`, `0036`, `0041`, and `0045` change
@@ -2393,6 +2469,59 @@ model. So one call can do many tool calls and give back a short result.
   is removed at the end. The session must have a sandbox. New profiles get `code_exec`.
   Migration `0027` adds it to a profile that still has the default toolsets of `0026`. The
   default group set has no `code_exec`.
+
+### 10.2.2 Hermes tool parity: `x_search`, `video_analyze`, and `moa` (M7.5)
+
+These tools close the Hermes tools that sama had deferred (feature map, Section 2). Each is a
+sama tool on the control plane, so both runtimes have it. Each is hidden when its service has no
+key (`check_fn`): with the vault on, an org can add its own key, so the tool shows and answers
+"not available" for an org without a key.
+
+| Tool | Toolset | What it does |
+|---|---|---|
+| `x_search(query, limit, sort)` | `web` | Searches posts on X of the last 7 days with the recent search of the X API v2. `limit` is 1 to 20 (the API returns at least 10 and charges for each post). `sort` is `recency` or `relevancy`. The key is the org vault entry `x_bearer_token`, else `X_BEARER_TOKEN`. The posts are untrusted content. A `402` (no credits) gives a short text that an admin must act. |
+| `video_analyze(source, question)` | `media` | Answers a question about a video with Gemini (`gemini-3.5-flash`). `source` is a YouTube link (Gemini reads it directly), another `https` link to a video file, or a path in the work folder of the session sandbox. A file has at most 14 MB (an inline request of Gemini has at most 20 MB after base64). The download follows the outbound address rules (Section 16.4), and the type comes from the first bytes (MP4, MOV, 3GP, WebM, AVI, FLV, MPEG, WMV). The model reads frames and audio at low resolution (about 100 tokens a second), with no thinking and at most 2,048 answer tokens. The answer is redacted, cut to 8,000 characters, and untrusted. |
+| `moa(question, max_cost_usd)` | `moa` | Mixture of agents. Three reference models answer at the same time: `claude-sonnet-5-5`, `gpt-6.1-terra`, and `gemini-3.5-flash`, each with at most 1,500 answer tokens. Then the aggregator (`claude-opus-5-5`, else `gpt-6.2-sol`, else `gemini-3.5-flash`, the first with a key) writes one answer from the answers, with at most 2,500 tokens. A model without a key is left out. It needs keys of at least two providers. The answer is untrusted. |
+
+**Money.** The three tools that call a model (`video_analyze`, `moa`) use the keys of the org
+(the vault first, then the key of the process) and the `MediaMeter` of Section 11.8: the
+budget checks of the model proxy before the call, one `model_calls` row for each call with the
+real usage or an estimate, and the shielded task that a cancel cannot stop. `model_calls`
+accepts the provider `gemini` and the endpoint `generate_content` (migration `0046`). The
+prices are in the `gemini` section of `prices.toml`. Gemini charges audio input at twice the
+rate of other input, so the count gives each audio token 2 input tokens. The model proxy has no
+Gemini route: a run cannot call Gemini as its own model.
+
+**The cost cap of `moa`.** Before the calls, sama computes the highest cost of the plan: the
+input estimate (one token for each 2 bytes) and the full answer limit of each call, at the
+price of each model. The plan must fit under the lowest of `max_cost_usd`, the cap of the
+process (`SAMA_MOA_MAX_COST_USD`, default USD 0.50, at most USD 5), and the money that the run
+can still spend. When it does not fit, sama drops the most expensive reference model, but it
+keeps two. When two do not fit, the call fails before it spends money. A secret in one answer
+does not reach the next provider: the redactor reads each answer before the aggregator gets it.
+Each answer is then cut to 3,000 bytes, so the aggregator prompt fits the estimate of the plan
+(the system text, the question, and at most 1,500 tokens and a tag for each answer). Before the
+aggregator call, sama does the budget checks again: a record that did not write, a lost
+authority, or a spent budget stops the call.
+
+**Redaction of `x_search`.** The query goes through the redactor before it goes in the URL.
+Each post is redacted whole and then cut to 600 characters.
+
+**Gate.** `x_search`, `video_analyze`, and `moa` are in the default allow list, like
+`web_search` and `vision_analyze`: they read, and the budget limits their cost. The toolset
+`moa` is new. New profiles get it, and migration `0046` adds it to a profile that still has the
+default toolsets of `0045`. The default group set has no `moa`, and a delegated child never has
+it (`CHILD_BLOCKED_TOOLSETS`), because one call spends the money of four model calls.
+
+**Assumptions (M7.5).**
+
+- A1. `x_search` records no `model_calls` row: the X API is not a model, and its price is per
+  post. The limit of 20 posts for each call keeps the cost small.
+- A2. `video_analyze` sends a file inline. The Gemini Files API (larger files) is a later step.
+- A3. The models of `moa` are fixed in code. A setting for each org can come with the settings
+  console (M7.10).
+- A4. `video_generate` stays deferred (feature map): video generation is slow, costs much more
+  than an image, and needs a new kind of `generated_media`.
 
 ### 10.3 Connectors: one model for apps, MCP servers, APIs, and databases
 
@@ -5052,9 +5181,10 @@ makes a child session and a queued child run in one transaction:
 |---|---|
 | Depth | 1. A child has no `delegation` toolset, so it cannot delegate. |
 | Children | At most 10 per call and at most 10 per parent run in total. |
-| Blocked toolsets | `delegation`, `tasks`, `memory`, `clarify`, `cron`, `connections`, and `integrations` (`CHILD_BLOCKED_TOOLSETS`). The gate and the prompt assembler take them away for a `delegation` session. |
+| Blocked toolsets | `delegation`, `tasks`, `memory`, `clarify`, `cron`, `connections`, `integrations`, and `moa` since M7.5 (`CHILD_BLOCKED_TOOLSETS`). The gate and the prompt assembler take them away for a `delegation` session. |
 | Budget | The lower of the profile budget and the defaults: 30 turns, 1.00 USD, and 1,800 seconds. A task can ask for at most 100 turns and 10 USD, and it never gets more than the profile allows. |
 | Result | The answer of a child is cut to 4,000 characters and is marked as untrusted data. |
+| Model | `agent_profiles.delegation_model` (M7.5, migration `0046`), for example a cheaper model. Without it, the model of the profile. The model must be a model of the runtime of the profile: a runtime change clears a model that the new runtime does not know. The child run pins it (`runs.model`). |
 
 **Wait**: with `wait=true` (the default), the call polls every 2 seconds until each child ends
 or `timeout_s` (at most 600 seconds) passes. Then it returns the status, the cost, and the
@@ -7314,7 +7444,7 @@ migrated schema.
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
 | `browser_logins` | The saved logins of the browser: `org_id`, `user_id` (null for an org login), `name` (unique for each scope, case does not matter), `site`, `created_by_user_id`. The vault entry `browser_login:<id>` has the secret (migration `0038`, Section 14.1). A member reads the org logins and their own logins. An org admin reads all. Only the control plane writes. |
 | `browser_url_policies` | The URL policy of the browser of each org: `org_id` (the key), `allow_hosts`, `block_hosts` (at most 200 each), `updated_by_user_id` (migration `0038`, Section 16.4). An org admin reads the row. Only the control plane writes. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, or `browser_contexts` since migration `0036`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, `browser_contexts` since migration `0036`, or `mem0` since migration `0046`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -7602,6 +7732,8 @@ log of the org, so the control plane logs it instead.
 - A user delete and an org delete also write a `browser_contexts` row with the Browserbase
   context ids of the deleted users (Section 14.1, at most 1,000 ids in one row). The rows of
   the table `browser_contexts` cascade from the user.
+- A user delete and an org delete also write a `mem0` row with the ids of the deleted users
+  (M7.5, Section 8.2). The rows of `skill_settings` cascade from the workspace.
 - A user delete removes the personal saved logins of the user (they cascade) and their vault
   entries `browser_login:<id>` (M5.3). An org login that the user made stays.
 - The Supabase Auth user is not deleted. A person can be a user in more than one org.
@@ -7617,9 +7749,13 @@ with `FOR UPDATE SKIP LOCKED` and a lease of 5 minutes.
 - `browser_contexts`: it calls `DELETE /v1/contexts/{id}` of Browserbase for each id, so the
   cookies and logins of the user go. A context that Browserbase does not know counts as
   deleted.
+- `mem0`: it calls `DELETE /v1/memories/?user_id=sama:<org>:<user>` of Mem0 for each user
+  (M7.5). A user without memories counts as deleted. An org without a Mem0 key has nothing to
+  delete, so the row is done.
 - A failure waits 30 seconds times 2 to the power of the attempts, at most 6 hours. The row
   keeps the error type only. A full page waits 30 seconds. The worker forgets done rows after 30 days.
-- A kind without a backend (no E2B key, no Langfuse key, or no Browserbase key) stays open.
+- A kind without a backend (no E2B key, no Langfuse key, no Browserbase key, or no Mem0
+  provider) stays open.
 
 **Retention.** `orgs.retention_days` is the setting of the org. Null means the default of
 the plan. `PLAN_RETENTION` in `retention.py` is the seam for the plans of M6.6: each plan can
@@ -8211,6 +8347,10 @@ the start with a message that names the variable but not its value.
 | `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
+| `GEMINI_API_KEY` | No | `video_analyze` and a model of `moa` (Section 10.2.2). An org key in the vault (`gemini_api_key`) comes first. |
+| `X_BEARER_TOKEN` | No | `x_search` (Section 10.2.2). An org token in the vault (`x_bearer_token`) comes first. |
+| `MEM0_API_KEY` | No | The `mem0` memory provider (Section 8.2). An org key in the vault (`mem0_api_key`) comes first. |
+| `SAMA_MOA_MAX_COST_USD` | No | The cost cap of one `moa` call, above 0 and at most 5. Default: `0.50` (Section 10.2.2). |
 | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | No | The cloud browser (Section 14.1). With both, the browser tools have the `cloud` target, and it is the default target. Without them, the tools have only `my_chrome` (Section 14.2.2). The key is a setting of the process; it is not in the vault yet. |
 | `SAMA_BROWSER_TASK_MODEL` | No | The Anthropic model of the browser sub-agent (Section 14.1, M5.6). Default `claude-sonnet-5-5`. It must have a price in the price table, else the process does not start. |
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |

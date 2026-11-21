@@ -10,6 +10,7 @@ from sama.prompt.scan import scan
 from sama.skills.commands import RESERVED
 from sama.skills.errors import SkillError
 from sama.skills.format import ParsedSkill, parse
+from sama.skills.settings import parse_config
 from sama.vault.redact import redact
 
 MAX_NAME_CHARS: Final = 64
@@ -49,6 +50,7 @@ KNOWN_TOOLSETS: Final = frozenset(
         "subagents",
         "tasks",
         "coding_agents",
+        "moa",
     }
 )
 """The toolsets of docs/architecture.md, Section 10.2."""
@@ -169,6 +171,10 @@ def _meta_problems(name: str, parsed: ParsedSkill) -> list[str]:
         found.append(f"requires_toolsets has unknown toolsets: {', '.join(unknown)}.")
     if not parsed.body.strip():
         found.append("The body of SKILL.md is empty.")
+    try:
+        parse_config(meta.fields.get("config"))
+    except SkillError as error:
+        found.append(str(error))
     return found
 
 
