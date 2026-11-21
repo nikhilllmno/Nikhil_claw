@@ -4504,7 +4504,11 @@ The API (`sama.gateway.chrome.page_message`):
   private data;
 - accepts only `http` and `https` URLs without user info;
 - redacts secrets in the URL, the title, and the text, then cuts the text to 20,000
-  characters with a note (redaction first, so a cut cannot leave part of a secret);
+  characters with a note (redaction first, so a cut cannot leave part of a secret). The
+  extension sends at most 28,000 characters. When it cuts the text, it drops the last 8,000
+  characters of the part that it cut, and the API drops the last 8,000 characters of a text of
+  28,000 characters, because a cut can go through a secret that the redactor then cannot find.
+  A known secret longer than 8,000 characters is not covered;
 - puts the title, the URL, the selection, and the text in an
   `<untrusted_content source="chrome_page">` block after a header that tells the model to treat
   it as data (Section 16.5);

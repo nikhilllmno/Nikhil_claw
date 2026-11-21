@@ -3,8 +3,14 @@
 
 import type { PageContext } from "./protocol";
 
-/** The API cuts the text at 20 000 characters. Send a little more, so that it knows. */
-export const MAX_PAGE_TEXT = 20_001;
+/**
+ * The API keeps 20 000 characters of the text. The extension sends more: when it cuts the text,
+ * the cut can go through a secret, and the redactor cannot find a part of a secret. The API drops
+ * the last PAGE_TAIL characters of a text of MAX_PAGE_TEXT characters (src/sama/gateway/chrome.py,
+ * MAX_PAGE_TEXT_SENT and PAGE_TAIL_CHARS).
+ */
+export const PAGE_TAIL = 8_000;
+export const MAX_PAGE_TEXT = 20_000 + PAGE_TAIL;
 export const MAX_TITLE = 300;
 export const MAX_URL = 2_048;
 export const MAX_SCREENSHOT = 5_000_000;
@@ -45,17 +51,20 @@ export interface PageRead {
 
 /**
  * Runs in the tab (chrome.scripting.executeScript). It must not use anything from outside the
- * function. It reads only the visible text: no form values, no cookies, no storage.
+ * function. It reads only the visible text: no form values, no cookies, no storage. A text that is
+ * longer than `maxText` also loses its last `tail` characters, so that no part of a secret stays
+ * in the middle of the page frame.
  */
-export function readPage(maxText: number): PageRead {
+export function readPage(maxText: number, tail: number): PageRead {
+  const cut = (value: string) => (value.length > maxText ? value.slice(0, maxText - tail) : value);
   const selection = String(globalThis.getSelection?.() ?? "").trim();
   const body = document.body;
   const text = body ? body.innerText : (document.documentElement?.textContent ?? "");
   return {
     url: location.href,
     title: document.title,
-    text: text.slice(0, maxText),
-    selection: selection.slice(0, maxText),
+    text: cut(text),
+    selection: cut(selection),
   };
 }
 

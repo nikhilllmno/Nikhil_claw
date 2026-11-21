@@ -15,6 +15,7 @@ from sama.gateway.chrome import (
     HEADER,
     MAX_ASK_CHARS,
     MAX_PAGE_TEXT_CHARS,
+    MAX_PAGE_TEXT_SENT,
     ChromeHub,
     PageContext,
     PageError,
@@ -170,6 +171,47 @@ def test_page_message_redacts_a_secret_before_the_cut() -> None:
     finally:
         default_redactor().forget(custom)
     assert custom[:-1] not in message.text
+
+
+@pytest.mark.parametrize("missing", [1, 2, 10])
+def test_page_message_drops_a_secret_that_the_extension_cut(missing: int) -> None:
+    # The extension cuts at MAX_PAGE_TEXT_SENT (extension/src/lib/page.ts), maybe through a
+    # secret. The part of the secret is not a known value, so only the dropped tail removes it.
+    custom = "my-very-private-value-123"
+    part = custom[:-missing]
+    text = "a " * MAX_PAGE_TEXT_SENT
+    text = text[: MAX_PAGE_TEXT_SENT - len(part)] + part
+    default_redactor().add(custom)
+    try:
+        message = page_message("q", _page(text=text))
+    finally:
+        default_redactor().forget(custom)
+    assert custom[:8] not in message.text
+    assert message.text.endswith(CUT_NOTE + "\n</untrusted_content>")
+
+
+def test_page_message_drops_a_cut_secret_also_after_earlier_redactions() -> None:
+    # Each "-----BEGIN ... -----END" block becomes "[REDACTED]", so the text gets much shorter
+    # and the part of a secret at the end moves under MAX_PAGE_TEXT_CHARS.
+    key = "-----BEGIN RSA PRIVATE KEY-----" + "k" * 3_000 + "-----END RSA PRIVATE KEY-----"
+    custom = "my-very-private-value-123"
+    part = custom[:-1]
+    head = (key + " ") * 4
+    text = head + "a" * (MAX_PAGE_TEXT_SENT - len(head) - len(part)) + part
+    default_redactor().add(custom)
+    try:
+        message = page_message("q", _page(text=text))
+    finally:
+        default_redactor().forget(custom)
+    assert part not in message.text
+    assert "k" * 100 not in message.text
+
+
+def test_page_message_keeps_the_end_of_a_text_that_the_extension_did_not_cut() -> None:
+    text = "b" * (MAX_PAGE_TEXT_CHARS - 1) + "Z"
+    message = page_message("q", _page(text=text))
+    assert "bZ" in message.text
+    assert CUT_NOTE not in message.text
 
 
 def test_page_message_adds_the_screenshot_with_a_marker() -> None:

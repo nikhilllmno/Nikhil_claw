@@ -31,6 +31,11 @@ from sama.vault.redact import redact
 
 MAX_PAGE_TEXT_CHARS: Final = 20_000
 """The page text in a message is cut at this length."""
+PAGE_TAIL_CHARS: Final = 8_000
+"""The end of a page text that the extension cut. It can hold a part of a secret, which the
+redactor cannot find, so the API drops it. Longer secrets are not covered."""
+MAX_PAGE_TEXT_SENT: Final = MAX_PAGE_TEXT_CHARS + PAGE_TAIL_CHARS
+"""The extension cuts the page text at this length (extension/src/lib/page.ts)."""
 MAX_PAGE_TEXT_IN: Final = 200_000
 """The longest page text that the API takes. The extension cuts the text first."""
 MAX_ASK_CHARS: Final = 8_000
@@ -127,8 +132,15 @@ def page_message(question: str, page: PageContext) -> PageMessage:
     url = redact(page_url(page.url))
     # Redact before the cut: a cut through a secret leaves a part that the redactor cannot find.
     body = redact(page.text.strip())
+    cut = len(page.text) >= MAX_PAGE_TEXT_SENT
+    if cut:
+        # The extension cut this text, maybe through a secret. Text after the last redaction is
+        # the same as the text that came in, so the part of a secret is in this tail.
+        body = body[:-PAGE_TAIL_CHARS]
     if len(body) > MAX_PAGE_TEXT_CHARS:
-        body = body[:MAX_PAGE_TEXT_CHARS] + CUT_NOTE
+        body, cut = body[:MAX_PAGE_TEXT_CHARS], True
+    if cut:
+        body = body.rstrip() + CUT_NOTE
     title = redact(" ".join(page.title.split()))
     content = f"Title: {title}\n\n{body}" if title else body
     attachments = () if page.screenshot is None else (screenshot_image(page.screenshot),)

@@ -19,6 +19,7 @@ import type { PanelState, PanelToWorker, Request, WorkerToPanel } from "../lib/m
 import { PORT_NAME } from "../lib/messages";
 import {
   MAX_PAGE_TEXT,
+  PAGE_TAIL,
   MAX_QUESTION,
   originPattern,
   pageContext,
@@ -495,7 +496,7 @@ async function askAboutPage(): Promise<void> {
       const [injection] = await chrome.scripting.executeScript({
         target: { tabId: tab.id as number },
         func: readPage,
-        args: [MAX_PAGE_TEXT],
+        args: [MAX_PAGE_TEXT, PAGE_TAIL],
       });
       const read = injection?.result as PageRead | undefined;
       if (!read) throw new Error("sama could not read this page.");

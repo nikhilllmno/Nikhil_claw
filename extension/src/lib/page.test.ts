@@ -1,13 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_QUESTION,
   MAX_PAGE_TEXT,
   MAX_SCREENSHOT,
+  PAGE_TAIL,
   originPattern,
   pageContext,
   pageProblem,
   pageQuestion,
+  readPage,
   splitPageMessage,
   tidy,
 } from "./page";
@@ -79,5 +81,34 @@ describe("helpers", () => {
     ].join("\n\n");
     expect(splitPageMessage(text)).toEqual({ question: "What is the price?", url: 'https://e.com/p?a=1&b="2"' });
     expect(splitPageMessage("plain")).toEqual({ question: "plain", url: null });
+  });
+});
+
+describe("readPage", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function page(text: string, selection: string) {
+    vi.stubGlobal("document", { title: "T", body: { innerText: text } });
+    vi.stubGlobal("location", { href: "https://e.com/" });
+    vi.stubGlobal("getSelection", () => selection);
+    return readPage(100, 30);
+  }
+
+  it("keeps a text that fits", () => {
+    const read = page("x".repeat(100), "y".repeat(100));
+    expect(read.text).toHaveLength(100);
+    expect(read.selection).toHaveLength(100);
+  });
+
+  it("drops the tail of a text that it cuts, so no part of a secret stays", () => {
+    const read = page("x".repeat(90) + "SECRET-VALUE", "y".repeat(95) + "SECRET-VALUE");
+    expect(read.text).toBe("x".repeat(70));
+    expect(read.selection).toBe("y".repeat(70));
+  });
+});
+
+describe("MAX_PAGE_TEXT", () => {
+  it("is the limit of the API plus the tail that the API drops", () => {
+    expect(MAX_PAGE_TEXT - PAGE_TAIL).toBe(20_000);
   });
 });
