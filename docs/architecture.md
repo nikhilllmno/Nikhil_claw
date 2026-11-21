@@ -6016,12 +6016,13 @@ log of the org, so the control plane logs it instead.
 - The user export has the rows of the user only: the private sessions with their rows, the
   user rows (memberships, personal memory, rules, chat links, jobs, triggers, workflows, and
   connections), the rows that the user made or decided (task cards, approvals, audit rows),
-  and the messages, steers, and pins that the user wrote in shared sessions. Agent profiles,
+  and the messages, steers, and pins that the user wrote in shared sessions, and the invites
+  that the user sent, accepted, or got. Agent profiles,
   vault secrets, and embeddings are not in a user export.
 - The export never has a secret: not the vault columns (`wrapped_key`, `ciphertext`), not
-  `integrations.secret_hash`, and not `pairing_codes.code_hash`. Derived columns
-  (`messages.search_vector`, `message_embeddings.embedding`) are also not in it. The
-  manifest names the columns that it leaves out.
+  `integrations.secret_hash`, not `pairing_codes.code_hash`, and not `org_invites.token_hash`.
+  Derived columns (`messages.search_vector`, `message_embeddings.embedding`) are also not in
+  it. The manifest names the columns that it leaves out.
 - The bytes of `attachments` and `generated_media` go to `files/`. The row gets `data_file`.
 - The export reads one snapshot (`REPEATABLE READ`), so the tables agree. The control plane
   writes the ZIP to a temporary file and deletes the file after the download.
@@ -6038,7 +6039,9 @@ log of the org, so the control plane logs it instead.
 - A user delete removes the private sessions, the private task cards, the memberships, the
   personal memory, skills, connections, rules, chat links, jobs, triggers, workflows, and the
   vault secrets of the personal connections and triggers. Shared content stays. Its user
-  columns get a null. The last owner of an org cannot be deleted.
+  columns get a null. The last owner of an org cannot be deleted. The invites that the user
+  accepted and the open invites to the email of the user go too. The invites that the user sent
+  stay without the user.
 - A user delete also ends the open runs that the user started in shared sessions. A queued or
   paused run is cancelled. A running run blocks the delete, as above. A run with no user has
   no user limits (the live authority, Section 16.6), so a run of a deleted user must not go on.

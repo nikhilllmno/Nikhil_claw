@@ -26,7 +26,16 @@ from sama.datacontrols.delete import (
 from sama.datacontrols.export import SECRET_COLUMNS, export_tables
 from sama.datacontrols.service import DataControls
 from sama.db.engine import as_user
-from sama.db.models import AuditEntry, Base, DataPurge, Membership, Run, Session, User
+from sama.db.models import (
+    AuditEntry,
+    Base,
+    DataPurge,
+    Membership,
+    OrgInvite,
+    Run,
+    Session,
+    User,
+)
 from tests.db.world import World
 
 
@@ -152,6 +161,54 @@ async def test_a_user_delete_removes_the_private_data_and_keeps_the_shared_data(
     async with as_user(engine, fresh.auth["alice"]) as connection:
         seen = (await connection.execute(select(func.count()).select_from(Session))).scalar_one()
     assert seen == 0
+
+
+async def test_a_user_delete_removes_the_invites_of_the_user_and_keeps_sent_ones(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    org_a, alice = fresh.ids["org-a"], fresh.ids["alice"]
+    async with engine.begin() as connection:
+        email = (await connection.execute(select(User.email).where(User.id == alice))).scalar_one()
+        accepted, pending, sent = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        base = {"org_id": org_a, "role": "member", "expires_at": text("now() + interval '1 day'")}
+        await connection.execute(
+            insert(OrgInvite).values(
+                id=accepted,
+                email="old-" + (email or "alice@example.test").lower(),
+                token_hash=uuid.uuid4().bytes * 2,
+                accepted_at=func.now(),
+                accepted_user_id=alice,
+                **base,
+            )
+        )
+        if email is not None:
+            await connection.execute(
+                insert(OrgInvite).values(
+                    id=pending, email=email.lower(), token_hash=uuid.uuid4().bytes * 2, **base
+                )
+            )
+        await connection.execute(
+            insert(OrgInvite).values(
+                id=sent,
+                email="friend@example.test",
+                token_hash=uuid.uuid4().bytes * 2,
+                invited_by_user_id=alice,
+                **base,
+            )
+        )
+
+    await DataControls(engine).delete_user(org_a, alice, actor_user_id=fresh.ids["carol"])
+
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                select(OrgInvite.id, OrgInvite.invited_by_user_id).where(
+                    OrgInvite.id.in_([accepted, pending, sent])
+                )
+            )
+        ).all()
+    # The accepted invite must name its user, so it goes. The sent invite stays without alice.
+    assert [(row.id, row.invited_by_user_id) for row in rows] == [(sent, None)]
 
 
 async def test_the_last_owner_cannot_be_deleted(engine: AsyncEngine, fresh: World) -> None:

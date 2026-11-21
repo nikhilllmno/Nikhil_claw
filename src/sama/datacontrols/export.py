@@ -38,6 +38,7 @@ SECRET_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
     "vault_secrets": frozenset({"wrapped_key", "ciphertext"}),
     "integrations": frozenset({"secret_hash"}),
     "pairing_codes": frozenset({"code_hash"}),
+    "org_invites": frozenset({"token_hash"}),
 }
 """Secret material. No export has it, also not in a hashed or encrypted form."""
 DERIVED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
@@ -64,6 +65,10 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "orgs": "id = :org",
     "users": "id = :user",
     "memberships": "user_id = :user",
+    "org_invites": (
+        "invited_by_user_id = :user OR accepted_user_id = :user"
+        " OR email = (SELECT lower(email) FROM users WHERE org_id = :org AND id = :user)"
+    ),
     "workspaces": (
         "id IN (SELECT workspace_id FROM memberships WHERE org_id = :org AND user_id = :user)"
     ),

@@ -26,7 +26,18 @@ from datetime import timedelta
 from functools import cache
 from typing import Any, Final
 
-from sqlalchemy import Table, bindparam, delete, func, insert, select, text, update
+from sqlalchemy import (
+    Table,
+    and_,
+    bindparam,
+    delete,
+    func,
+    insert,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import DBAPIError
@@ -40,6 +51,7 @@ from sama.db.models import (
     DataPurge,
     Membership,
     Org,
+    OrgInvite,
     Run,
     Session,
     Task,
@@ -443,6 +455,25 @@ async def delete_user(
             delete(VaultSecret).where(VaultSecret.org_id == org_id, VaultSecret.name.in_(names))
         )
 
+    # An accepted invite must name its user (``ck_org_invites_accepted``), and the open
+    # invites to the email of the user are personal data. The invites that the user sent stay.
+    email = (
+        await connection.execute(
+            select(User.email).where(User.org_id == org_id, User.id == user_id)
+        )
+    ).scalar_one()
+    await connection.execute(
+        delete(OrgInvite).where(
+            OrgInvite.org_id == org_id,
+            or_(
+                OrgInvite.accepted_user_id == user_id,
+                and_(
+                    OrgInvite.email == func.lower(email),
+                    OrgInvite.accepted_at.is_(None),
+                ),
+            ),
+        )
+    )
     await null_refs(connection, org_id, "users", [user_id])
     await connection.execute(delete(User).where(User.org_id == org_id, User.id == user_id))
     await connection.execute(
