@@ -302,6 +302,27 @@ describe("busy controls", () => {
   });
 });
 
+describe("checkpoints", () => {
+  it("lists the checkpoints, undoes, and rolls back", async () => {
+    const restored = { created_at: "2026-11-21T09:30:00Z", files: 2, deleted: 1, kept: 0, text: "back" };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, [{ number: 1, created_at: "2026-11-21T09:30:00Z", tool: "Bash", kind: "tool" }]))
+      .mockResolvedValueOnce(json(200, restored))
+      .mockResolvedValueOnce(json(200, restored));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.listCheckpoints("s1")).resolves.toHaveLength(1);
+    await expect(client.undo("s1")).resolves.toEqual(restored);
+    await expect(client.rollback("s1", 2)).resolves.toEqual(restored);
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method ?? "GET", init.body])).toEqual([
+      ["https://api.test/sessions/s1/checkpoints", "GET", undefined],
+      ["https://api.test/sessions/s1/undo", "POST", undefined],
+      ["https://api.test/sessions/s1/rollback", "POST", '{"number":2}'],
+    ]);
+  });
+});
+
 describe("errorText", () => {
   it("uses the message of an Error and the fallback for anything else", () => {
     expect(errorText(new Error("boom"), "fallback")).toBe("boom");

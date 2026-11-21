@@ -89,6 +89,11 @@ from sama.media.images import (
     is_image,
     with_markers,
 )
+from sama.orchestrator.checkpoints import (
+    CHECKPOINT_COMMANDS,
+    CheckpointService,
+    checkpoint_reply,
+)
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.review.apply import ReviewApplier
 from sama.scheduler.jobs import JobService
@@ -122,6 +127,9 @@ HELP: Final = (
     " the app and write /steer TEXT\n"
     "/sama handoff telegram|web - move the session of the direct message to another channel\n"
     "/sama compact [focus] - make the context shorter (direct messages)\n"
+    "/sama undo - restore the session files to before the last run that changed them. /sama"
+    " rollback lists the checkpoints of the files; /sama rollback NUMBER restores one (direct"
+    " messages)\n"
     "/sama pin TEXT - keep a text in the context. /sama pins lists the pins. /sama unpin NUMBER"
     " removes one (direct messages)\n"
     "/sama cron - list and make scheduled jobs. /sama cron help shows more (direct messages)\n"
@@ -362,6 +370,7 @@ class SlackGateway:
         pins: PinStore | None = None,
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
+        checkpoints: CheckpointService | None = None,
     ) -> None:
         """``lockout``, ``followers``, and ``seen`` can be shared by all gateways of the process,
         so that the limits and the repeat check hold for the whole process."""
@@ -377,6 +386,7 @@ class SlackGateway:
         self._pins = pins or PinStore(engine)
         self._jobs = jobs
         self._handoffs = handoffs
+        self._checkpoints = checkpoints
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -748,6 +758,7 @@ class SlackGateway:
                 "steer",
                 "handoff",
                 *PIN_COMMANDS,
+                *CHECKPOINT_COMMANDS,
             ):
                 if name not in ("help", "pair"):
                     return await self._skill(sender, channel, identity, name, rest)
@@ -768,6 +779,8 @@ class SlackGateway:
                 return await self._steer_command(sender, channel, identity, rest)
             if name == "handoff":
                 return await self._handoff(sender, channel, identity, rest)
+            if name in CHECKPOINT_COMMANDS:
+                return await self._checkpoint(sender, channel, identity, name, rest)
             return await self._stop(sender, channel, identity)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
@@ -915,6 +928,29 @@ class SlackGateway:
         current = await self._session(place, target, grants, create=False)
         return await pin_reply(
             self._pins, target, None if current is None else current.session_id, name, rest
+        )
+
+    async def _checkpoint(
+        self, sender: str, channel: str, identity: Any, name: str, rest: str
+    ) -> str:
+        """``/sama undo`` and ``/sama rollback`` in a direct message (Section 15.3)."""
+        if not channel.startswith("D"):
+            return "Checkpoints work in a direct message with the sama app."
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        current = await self._session(place, target, grants, create=False)
+        return await checkpoint_reply(
+            self._checkpoints,
+            org_id=target.org_id,
+            user_id=target.user_id,
+            session_id=None if current is None else current.session_id,
+            name=name,
+            rest=rest,
+            prefix="/sama ",
         )
 
     async def _connect(self, channel: str, identity: Any, name: str) -> str:

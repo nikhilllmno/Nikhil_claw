@@ -19,10 +19,12 @@ import {
   initialLive,
   isPaused,
   type LiveState,
+  checkpointListText,
   HANDOFF_USAGE,
   openRunIds,
   parseCommand,
   QUEUED_NOTICE,
+  ROLLBACK_USAGE,
   sessionTitle,
   STEER_USAGE,
   STEERED_NOTICE,
@@ -201,6 +203,10 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setSendError(HANDOFF_USAGE);
       return;
     }
+    if (command?.kind === "rollback" && !command.valid) {
+      setSendError(ROLLBACK_USAGE);
+      return;
+    }
     setSending(true);
     setStopping(false);
     try {
@@ -209,6 +215,16 @@ export function Chat({ sessionId }: { sessionId: string }) {
         clearDraft();
         setNotice(moved.text);
         reloadSessions();
+        return;
+      }
+      if (command?.kind === "undo" || command?.kind === "rollback") {
+        // The checkpoints of the session files (M6.4).
+        let text: string;
+        if (command.kind === "undo") text = (await api.undo(sessionId)).text;
+        else if (command.number === null) text = checkpointListText(await api.listCheckpoints(sessionId));
+        else text = (await api.rollback(sessionId, command.number)).text;
+        clearDraft();
+        setNotice(text);
         return;
       }
       let runId: string;

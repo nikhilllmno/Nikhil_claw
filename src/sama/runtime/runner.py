@@ -39,6 +39,7 @@ from typing import IO, Any, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
+from sama.runtime.checkpoints import RUNNER_LOCK, CheckpointGate, Checkpoints
 from sama.runtime.contract import (
     AgentRuntime,
     ContractViolation,
@@ -63,7 +64,7 @@ log: Final = logging.getLogger("sama.runner")
 RUN_TOKEN_ENV: Final = "SAMA_RUN_TOKEN"  # noqa: S105 -- a variable name
 MODEL_URL_ENV: Final = "SAMA_MODEL_URL"
 WORKDIR_ENV: Final = "SAMA_WORKDIR"
-LOCK_FILE: Final = ".sama/runner.lock"
+LOCK_FILE: Final = RUNNER_LOCK
 """The runner lock, in the work folder."""
 LOCK_WAIT_S: Final = 20.0
 """The longest wait for the runner of the last run. The orchestrator kills a runner that does
@@ -221,6 +222,8 @@ def build_runtime(job: RunnerJob, env: Mapping[str, str]) -> AgentRuntime:
         gate = RemoteGate(job.gate_url, token, steer=kind is RuntimeKind.CLAUDE_AGENT_SDK)
     else:
         gate = StaticGate(job.gate)
+    # A snapshot of the work folder before each call that can change files (Section 15.3).
+    gate = CheckpointGate(gate, Checkpoints(workdir))
 
     if kind is RuntimeKind.OPENAI_AGENTS_SDK:
         from sama.runtime.openai_agents import OpenAIRuntime, OpenAISettings

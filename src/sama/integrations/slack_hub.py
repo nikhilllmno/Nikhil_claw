@@ -49,6 +49,7 @@ from sama.gateway.slack import SeenEvents, SlackApp, SlackGateway, escape
 from sama.gateway.slack_client import SlackClient, signed
 from sama.integrations.hub import GatewayCache
 from sama.integrations.service import SlackClientFactory, secret_hash
+from sama.orchestrator.checkpoints import CheckpointService
 from sama.orchestrator.queue import RunQueue
 from sama.review.apply import ReviewApplier
 from sama.scheduler.jobs import JobService
@@ -90,6 +91,7 @@ class SlackHub(GatewayCache[_App]):
         connections: ConnectionService | None = None,
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
+        checkpoints: CheckpointService | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__()
@@ -104,6 +106,7 @@ class SlackHub(GatewayCache[_App]):
         self._connections = connections
         self._jobs = jobs
         self._handoffs = handoffs
+        self._checkpoints = checkpoints
         self._clock = clock
         self._lockout = Lockout()
         self._followers: set[object] = set()
@@ -266,6 +269,7 @@ class SlackHub(GatewayCache[_App]):
             connections=self._connections,
             jobs=self._jobs,
             handoffs=self._handoffs,
+            checkpoints=self._checkpoints,
             lockout=self._lockout,
             followers=self._followers,
             seen=self._seen,

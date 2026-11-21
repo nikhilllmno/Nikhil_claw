@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2, M6.3, M6.5 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2, M6.3, M6.4, M6.5 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -467,7 +467,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2,
 | M6.1 | `change_propose` | The agent proposes changes to SOUL, profile, toolsets, and policy. An approval card shows the diff. Approved changes apply from the next session. History and revert in the web app. The SOUL target is done in M3.2 (no diff on the card). |
 | M6.2 | `sama_pr` | The agent clones the sama repo, changes code, runs tests, and opens a pull request with a summary. Changes to protected paths request the owner's review (CODEOWNERS). The agent cannot merge. Done. A person still creates the real App, installs it on the sama repo, and adds the ruleset with "Require review from Code Owners" (architecture §19.5). |
 | M6.3 | Curator | Weekly job per workspace. Usage counts, active to stale to archived, pins, report to the owner. Never deletes. Done (memory is report-only; merging near-duplicates is later, Section 9.7). |
-| M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. |
+| M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. Done (Telegram, Slack, and web; architecture §15.3). |
 | M6.5 | Customer sign-up | Self-serve sign-up, org creation, invites, roles. Done (architecture §17.2): Supabase Auth sign-up, a rate limit and a confirmed-email check on org creation, invite links, and a plan seam per org. |
 | M6.6 | Billing and quotas | Stripe plans and usage billing from proxy cost. Quotas per plan. |
 | M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys (its own Telegram bot came in M1.19). Region per org. |
