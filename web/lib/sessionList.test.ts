@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { SessionOut } from "./api";
 import {
+  directAgent,
+  directBadge,
+  directChoice,
+  hasDirectMode,
   archiveConfirmText,
   canManageSession,
   checkTitle,
@@ -106,5 +110,27 @@ describe("canManageSession", () => {
 
   it("treats a missing can_manage as true", () => {
     expect(canManageSession({})).toBe(true);
+  });
+});
+
+describe("direct mode", () => {
+  it("shows the control only when the API gives the mode and the session is active", () => {
+    expect(hasDirectMode({ status: "active" })).toBe(false);
+    expect(hasDirectMode({ status: "active", coding_agent: null })).toBe(true);
+    expect(hasDirectMode({ status: "archived", coding_agent: "codex" })).toBe(false);
+  });
+
+  it("maps the choice to the body and back", () => {
+    expect(directChoice({ coding_agent: null })).toBe("sama");
+    expect(directChoice({ coding_agent: "claude_code" })).toBe("claude_code");
+    expect(directAgent("sama")).toBeNull();
+    expect(directAgent("codex")).toBe("codex");
+  });
+
+  it("gives a badge only in the direct mode", () => {
+    expect(directBadge({ coding_agent: null })).toBeNull();
+    expect(directBadge({})).toBeNull();
+    expect(directBadge({ coding_agent: "claude_code" })).toBe("Direct: Claude Code");
+    expect(directBadge({ coding_agent: "codex" })).toBe("Direct: Codex");
   });
 });

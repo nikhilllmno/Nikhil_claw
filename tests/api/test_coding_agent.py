@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.coding.commands import DIRECT_OFF, DIRECT_ON, NOT_ALLOWED, NOT_DIRECT
-from sama.db.models import Membership, Message, Run, Session
+from sama.db.models import AuditEntry, Membership, Message, Run, Session
 from tests.api.conftest import bearer
 from tests.orchestrator.conftest import Tenant
 
@@ -133,3 +133,38 @@ async def test_a_member_cannot_switch_a_shared_session_but_can_send_a_task(
     )
     assert allowed.status_code == 200
     assert await mode(engine, shared) == "codex"
+
+
+async def test_the_session_shows_the_mode_and_a_switch_has_an_audit_row(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    session = tenant.ids["mine"]
+    route = f"/sessions/{session}/coding-agent"
+    detail = await client.get(f"/sessions/{session}", headers=mia(tenant))
+    assert detail.json()["coding_agent"] is None
+    assert (
+        await client.post(route, headers=mia(tenant), json={"agent": "codex"})
+    ).status_code == 200
+    detail = await client.get(f"/sessions/{session}", headers=mia(tenant))
+    assert detail.json()["coding_agent"] == "codex"
+    listed = await client.get("/sessions", headers=mia(tenant))
+    assert {s["id"]: s["coding_agent"] for s in listed.json()}[str(session)] == "codex"
+    # A second switch to the same agent changes nothing and writes no second row.
+    await client.post(route, headers=mia(tenant), json={"agent": "codex"})
+    await client.post(route, headers=mia(tenant), json={"agent": None})
+    async with engine.connect() as connection:
+        rows = (
+            (
+                await connection.execute(
+                    select(AuditEntry.details)
+                    .where(
+                        AuditEntry.action == "session.coding_agent_changed",
+                        AuditEntry.target_id == str(session),
+                    )
+                    .order_by(AuditEntry.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows == [{"from": None, "to": "codex"}, {"from": "codex", "to": None}]

@@ -23,11 +23,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Final
 
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.coding.agents import CodingAgent, label
-from sama.db.models import Session
+from sama.db.models import AuditEntry, Session
 from sama.tenancy.access import Grants, load_grants
 
 COMMANDS: Final = {"/claude": CodingAgent.CLAUDE_CODE, "/codex": CodingAgent.CODEX}
@@ -101,10 +101,12 @@ async def set_direct(
     agent: CodingAgent | None,
     *,
     user_id: uuid.UUID,
+    audit: bool = False,
 ) -> str:
     """Starts or ends the direct mode of a session for ``user_id`` and returns the answer for
     the user. Raises ``SwitchNotAllowedError`` when the user may not switch the session
-    (``may_switch``) or cannot see it."""
+    (``may_switch``) or cannot see it. With ``audit`` (the web app and the settings console,
+    M7.10), a change writes the audit entry ``session.coding_agent_changed``."""
     async with engine.begin() as connection:
         row = (
             await connection.execute(
@@ -135,6 +137,19 @@ async def set_direct(
             .where(Session.org_id == org_id, Session.id == session_id)
             .values(coding_agent=None if agent is None else agent.value)
         )
+        now = None if agent is None else agent.value
+        if audit and now != row.coding_agent:
+            await connection.execute(
+                insert(AuditEntry).values(
+                    org_id=org_id,
+                    actor_kind="user",
+                    actor_user_id=user_id,
+                    action="session.coding_agent_changed",
+                    target_type="session",
+                    target_id=str(session_id),
+                    details={"from": row.coding_agent, "to": now},
+                )
+            )
     return direct_answer(agent, row.coding_agent)
 
 

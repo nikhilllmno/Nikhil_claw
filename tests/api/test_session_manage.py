@@ -59,6 +59,7 @@ async def test_the_owner_renames_a_private_session(
         "created_at",
         "lineage",
         "parent_session_id",
+        "coding_agent",
         "can_manage",
     }
     assert await audit_actions(engine, mine) == ["session.renamed"]

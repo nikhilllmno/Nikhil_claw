@@ -2,7 +2,7 @@
 // sessions of one workspace, an Active and an Archived list, and the rename and archive rules
 // that the screen shows. The API checks every change again.
 
-import type { SessionOut } from "./api";
+import type { CodingAgentName, SessionOut } from "./api";
 
 export type SessionFilter = "active" | "archived";
 
@@ -72,4 +72,33 @@ export function maybeTruncated(total: number): boolean {
  */
 export function canManageSession(session: Pick<SessionOut, "can_manage">): boolean {
   return session.can_manage !== false;
+}
+
+/** Who gets the messages of a session: sama, or a coding agent in the direct mode (M7.2). */
+export type DirectChoice = "sama" | CodingAgentName;
+
+export const DIRECT_CHOICES: readonly { value: DirectChoice; label: string }[] = [
+  { value: "sama", label: "sama (the agent)" },
+  { value: "claude_code", label: "Claude Code" },
+  { value: "codex", label: "Codex" },
+];
+
+/** True when the API gives the direct mode of the session and the session is active. */
+export function hasDirectMode(session: Pick<SessionOut, "coding_agent" | "status">): boolean {
+  return session.coding_agent !== undefined && session.status === "active";
+}
+
+export function directChoice(session: Pick<SessionOut, "coding_agent">): DirectChoice {
+  return session.coding_agent ?? "sama";
+}
+
+/** The body value of `POST /sessions/{id}/coding-agent` for a choice. */
+export function directAgent(choice: DirectChoice): CodingAgentName | null {
+  return choice === "sama" ? null : choice;
+}
+
+/** The badge text of a session in the direct mode, else `null`. */
+export function directBadge(session: Pick<SessionOut, "coding_agent">): string | null {
+  if (!session.coding_agent) return null;
+  return session.coding_agent === "claude_code" ? "Direct: Claude Code" : "Direct: Codex";
 }

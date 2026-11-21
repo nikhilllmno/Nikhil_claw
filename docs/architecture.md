@@ -8262,7 +8262,7 @@ The console reuses their screens. Each write goes to the API, and the API writes
 | Automation | Triggers | The `composio` triggers, with the same screens as the webhooks |
 | Automation | Schedules | The jobs of Section 12.1, with "Run now" |
 | Automation | Workflows | The workflows of Section 12.3: a YAML editor with a check, approve, start, pause, resume, delete, and the recent instances |
-| Activity | Sessions | Search, rename, archive, restore, export, and the retention of the org |
+| Activity | Sessions | Search, rename, archive, restore, export, the direct mode of a coding agent (M7.2), and the retention of the org |
 
 Each section has a list, a detail view, a create form, and a delete with a confirm. A section
 shows its fields as read-only when the role of the user cannot change them, and says who can.
@@ -8351,7 +8351,10 @@ without a change of the web app.
 private session changes it. An admin of the workspace or the org changes a shared session. A
 compaction archive (Section 6.3) and a session with a compaction child keep their status, and a
 session with an open run cannot be archived (`409`). The audit rows are `session.renamed`,
-`session.archived`, and `session.restored`.
+`session.archived`, and `session.restored`. Each session also gives `coding_agent` (`claude_code`,
+`codex`, or null; Section 15.4). The Sessions section sets it with `POST
+/sessions/{session_id}/coding-agent`, and a change from the web writes the audit row
+`session.coding_agent_changed` with the old and the new value.
 
 **Test of a chat app.** `POST /orgs/{org_id}/integrations/{kind}/check` (an admin with
 `chat_apps.manage`) calls Telegram `getMe` or Slack `auth.test` with the stored token and gives
