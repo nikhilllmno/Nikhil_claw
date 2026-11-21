@@ -74,9 +74,19 @@ def test_the_last_matching_line_wins() -> None:
 
 def test_unsupported_lines_are_skipped() -> None:
     owners = parse_codeowners("!/secret @a\n/x[ab]/ @b\n/ok/ @c\n/bad/ not-an-owner\n\\#hash @d\n")
-    assert owners.skipped == (1, 2, 4)
-    assert [rule.pattern for rule in owners.rules] == ["/ok/", "#hash"]
-    assert owners.owners_of("#hash") == ("@d",)
+    assert owners.skipped == (1, 2, 4, 5), "GitHub does not support an escaped leading #"
+    assert [rule.pattern for rule in owners.rules] == ["/ok/"]
+    assert owners.owners_of("#hash") == ()
+
+
+def test_an_escaped_space_is_part_of_the_pattern() -> None:
+    owners = parse_codeowners("/my\\ directory/ @owner  # spaces\nfile\\ name.txt\t@other\n")
+    assert not owners.skipped
+    assert [rule.pattern for rule in owners.rules] == ["/my directory/", "file name.txt"]
+    assert owners.owners_of("my directory/a.py") == ("@owner",)
+    assert owners.owners_of("my/a.py") == ()
+    assert owners.owners_of("x/file name.txt") == ("@other",)
+    assert owners.owners_of("a#b") == ()
 
 
 def test_owners_split_into_users_and_teams() -> None:

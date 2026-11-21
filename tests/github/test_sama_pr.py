@@ -34,8 +34,11 @@ from sama.tenancy import RunTokenClaims, RunTokenSigner
 from sama.tools import MemoryTodoStore, RepoCloner, RepoError, ToolServer
 from sama.tools.code import BLOCKED_TOOLS
 from sama.tools.sama_pr import (
+    MAX_BODY_CHARS,
     MAX_COMPARE_FILES,
     MAX_LISTED_FILES,
+    MAX_SUMMARY_CHARS,
+    MAX_TESTS_CHARS,
     OWNER_REVIEW_HEADING,
     ChangedFile,
     SamaPr,
@@ -93,10 +96,13 @@ class FakeClient:
         return {"status": "ahead", "ahead_by": self.ahead_by, "files": self.files}
 
     async def file_text(
-        self, installation_id: int, owner: str, name: str, path: str, ref: str
+        self, installation_id: int, owner: str, name: str, path: str, ref: str, *, max_bytes: int
     ) -> str | None:
         self.asked_files.append((path, ref))
-        return self.owners_files.get(path)
+        text = self.owners_files.get(path)
+        if text is not None and len(text.encode()) > max_bytes:
+            raise GitHubError(f"{path} has {len(text.encode())} bytes, more than {max_bytes}")
+        return text
 
     async def create_pull(self, installation_id: int, owner: str, name: str, **kw: Any) -> Any:
         if self.pull_error is not None:
@@ -339,7 +345,7 @@ async def test_a_large_codeowners_file_is_refused(
     sama_pr: SamaPr, service: FakeService, signer: RunTokenSigner
 ) -> None:
     service.client.owners_files = {".github/CODEOWNERS": "#" * (3 * 1024 * 1024 + 1)}
-    with pytest.raises(SamaPrError, match="larger than 3 MB"):
+    with pytest.raises(SamaPrError, match=r"did not give \.github/CODEOWNERS of main: .* more"):
         await open_pr(sama_pr, signer)
 
 
@@ -398,6 +404,31 @@ def test_the_body_lists_at_most_100_files() -> None:
     assert body.count("(added)") == MAX_LISTED_FILES
     assert "- and 5 more files" in body
     assert "session `s1`" in body
+
+
+def test_the_body_stays_below_the_github_limit() -> None:
+    """299 renamed, owned, and protected files with long paths, the longest summary, and the
+    longest tests."""
+    long = "d/" * 80
+    files = tuple(
+        ChangedFile(f".github/{long}new{i}.py", "renamed", f".github/{long}old{i}.py")
+        for i in range(MAX_COMPARE_FILES - 1)
+    )
+    owners = parse_codeowners("* @owner @acme/security @acme/platform\n")
+    review = owner_review(files, owners, (".github/",))
+    assert len(review.owned) == 2 * len(files)
+    body = pull_body(
+        summary="s" * MAX_SUMMARY_CHARS,
+        tests="t" * MAX_TESTS_CHARS,
+        files=files,
+        review=review,
+        codeowners=owners,
+        session_id=str(uuid.uuid4()),
+    )
+    assert len(body) < MAX_BODY_CHARS
+    assert "more files" in body
+    assert body.count("more paths") == 2
+    assert body.endswith("The agent cannot merge it.")
 
 
 def test_owner_review_collects_each_owner_once() -> None:

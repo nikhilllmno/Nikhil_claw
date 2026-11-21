@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -301,17 +302,25 @@ class GitHubClient:
         )
 
     async def file_text(
-        self, installation_id: int, owner: str, name: str, path: str, ref: str
+        self,
+        installation_id: int,
+        owner: str,
+        name: str,
+        path: str,
+        ref: str,
+        *,
+        max_bytes: int,
     ) -> str | None:
         """The text of a file at ``ref``, or ``None`` if the file does not exist. Raises
-        ``GitHubError`` if the path is not a regular file or GitHub does not give its
-        content."""
+        ``GitHubError`` if the path is not a regular file, the file is larger than
+        ``max_bytes``, or GitHub does not give its content. The contents API gives no content
+        for a file larger than 1 MB, so the method then reads the blob of the file."""
+        repo = f"/repos/{_path(owner)}/{_path(name)}"
         try:
             body = await self._as(
                 installation_id,
                 "GET",
-                f"/repos/{_path(owner)}/{_path(name)}/contents/{quote(path, safe='/')}"
-                f"?ref={quote(ref, safe='')}",
+                f"{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}",
             )
         except GitHubError as error:
             if error.status_code == 404:
@@ -319,12 +328,24 @@ class GitHubClient:
             raise
         if body.get("type") != "file":
             raise GitHubError(f"{path} is not a file")
-        if body.get("encoding") != "base64" or not isinstance(body.get("content"), str):
+        size = body.get("size")
+        if isinstance(size, int) and size > max_bytes:
+            raise GitHubError(f"{path} has {size} bytes, more than {max_bytes}")
+        if body.get("encoding") != "base64" or not body.get("content"):
+            sha = body.get("sha")
+            if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                raise GitHubError(f"GitHub did not give the content of {path}")
+            body = await self._as(installation_id, "GET", f"{repo}/git/blobs/{sha}")
+        content = body.get("content")
+        if body.get("encoding") != "base64" or not isinstance(content, str):
             raise GitHubError(f"GitHub did not give the content of {path}")
         try:
-            return base64.b64decode(body["content"]).decode("utf-8", errors="replace")
+            data = base64.b64decode(content)
         except ValueError:
             raise GitHubError(f"GitHub gave content of {path} that is not base64") from None
+        if len(data) > max_bytes:
+            raise GitHubError(f"{path} has {len(data)} bytes, more than {max_bytes}")
+        return data.decode("utf-8", errors="replace")
 
     async def request_reviewers(
         self,
@@ -390,6 +411,9 @@ async def convert_manifest(
     if response.status_code >= 400:
         raise GitHubError(_problem(response.status_code, body), response.status_code)
     return body
+
+
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def _path(segment: str) -> str:

@@ -51,7 +51,12 @@ MAX_SUMMARY_CHARS: Final = 10_000
 MAX_TESTS_CHARS: Final = 10_000
 MAX_NAME_CHARS: Final = 60
 MAX_LISTED_FILES: Final = 100
-"""The body lists at most this many changed files."""
+"""Each list in the body has at most this many lines."""
+MAX_LIST_CHARS: Final = 12_000
+"""Each list in the body has at most this many characters. With the summary and the tests, the
+body stays below the 65,536 characters that GitHub takes."""
+MAX_BODY_CHARS: Final = 65_536
+"""GitHub refuses a pull request body that is longer."""
 MAX_COMPARE_FILES: Final = 300
 """GitHub gives at most 300 files in a comparison. With 300 files, the tool cannot see every
 changed path, so it refuses the pull request."""
@@ -326,14 +331,17 @@ class SamaPr:
         for path in CODEOWNERS_PATHS:
             try:
                 text = await client.file_text(
-                    found.installation_id, found.owner, found.name, path, base
+                    found.installation_id,
+                    found.owner,
+                    found.name,
+                    path,
+                    base,
+                    max_bytes=MAX_CODEOWNERS_BYTES,
                 )
             except GitHubError as error:
                 raise SamaPrError(f"GitHub did not give {path} of {base}: {error}") from None
             if text is None:
                 continue
-            if len(text.encode("utf-8")) > MAX_CODEOWNERS_BYTES:
-                raise SamaPrError(f"{path} is larger than 3 MB, and GitHub ignores it")
             return parse_codeowners(text, path=path)
         return None
 
@@ -366,10 +374,11 @@ def pull_body(
     codeowners: CodeOwners | None,
     session_id: str,
 ) -> str:
-    """The body of the pull request, in Markdown."""
+    """The body of the pull request, in Markdown. Each list has at most ``MAX_LISTED_FILES``
+    lines and ``MAX_LIST_CHARS`` characters, so the body stays below the GitHub limit."""
     owned = dict(review.owned)
-    lines = ["## Summary", "", summary.strip()[:MAX_SUMMARY_CHARS], "", "## Changes", ""]
-    for changed in files[:MAX_LISTED_FILES]:
+    changes: list[str] = []
+    for changed in files:
         word = _STATUS_WORDS.get(changed.status, changed.status)
         line = f"- `{changed.path}` ({word}"
         if changed.previous:
@@ -378,16 +387,17 @@ def pull_body(
         owners = owned.get(changed.path) or (owned.get(changed.previous or "") or ())
         if owners:
             line += f": owner review by {' '.join(owners)}"
-        lines.append(line)
-    if len(files) > MAX_LISTED_FILES:
-        lines.append(f"- and {len(files) - MAX_LISTED_FILES} more files")
+        changes.append(line)
+    lines = ["## Summary", "", summary.strip()[:MAX_SUMMARY_CHARS], "", "## Changes", ""]
+    lines += _capped(changes, "files")
     lines += ["", "## Tests", "", tests.strip()[:MAX_TESTS_CHARS], "", OWNER_REVIEW_HEADING, ""]
     if codeowners is None:
         lines.append("The base branch has no code owners file.")
     elif review.owned:
         lines.append(f"These changed paths have code owners in `{codeowners.path}`:")
         lines.append("")
-        lines += [f"- `{path}`: {' '.join(owners)}" for path, owners in review.owned]
+        owned_lines = [f"- `{path}`: {' '.join(owners)}" for path, owners in review.owned]
+        lines += _capped(owned_lines, "paths")
     else:
         lines.append(f"No changed path has a code owner in `{codeowners.path}`.")
     if review.protected:
@@ -397,7 +407,7 @@ def pull_body(
             "the push:",
             "",
         ]
-        lines += [f"- `{path}`" for path in review.protected]
+        lines += _capped([f"- `{path}`" for path in review.protected], "paths")
     lines += [
         "",
         "---",
@@ -405,3 +415,18 @@ def pull_body(
         "merges this pull request. The agent cannot merge it.",
     ]
     return "\n".join(lines)
+
+
+def _capped(entries: list[str], noun: str) -> list[str]:
+    """``entries`` up to ``MAX_LISTED_FILES`` lines and ``MAX_LIST_CHARS`` characters, then one
+    line with the number of the other entries."""
+    kept: list[str] = []
+    used = 0
+    for entry in entries:
+        if len(kept) >= MAX_LISTED_FILES or used + len(entry) + 1 > MAX_LIST_CHARS:
+            break
+        kept.append(entry)
+        used += len(entry) + 1
+    if len(kept) < len(entries):
+        kept.append(f"- and {len(entries) - len(kept)} more {noun}")
+    return kept

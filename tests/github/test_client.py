@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 from collections.abc import Callable
 from typing import Any
@@ -330,13 +331,31 @@ async def test_file_text_decodes_a_file_and_gives_none_for_no_file(fake: Fake) -
         200, json={"type": "file", "encoding": "none", "content": ""}
     )
     client = fake.client()
-    assert await client.file_text(7, "acme", "demo", ".github/CODEOWNERS", "main") == "* @owner\n"
+    read = functools.partial(client.file_text, 7, "acme", "demo", max_bytes=100)
+    assert await read(".github/CODEOWNERS", "main") == "* @owner\n"
     assert seen == ["ref=main"]
-    assert await client.file_text(7, "acme", "demo", "CODEOWNERS", "main") is None
+    assert await read("CODEOWNERS", "main") is None
     with pytest.raises(GitHubError, match="docs is not a file"):
-        await client.file_text(7, "acme", "demo", "docs", "main")
+        await read("docs", "main")
     with pytest.raises(GitHubError, match="did not give the content of big"):
-        await client.file_text(7, "acme", "demo", "big", "main")
+        await read("big", "main")
+
+
+async def test_file_text_reads_a_large_file_from_its_blob(fake: Fake) -> None:
+    """The contents API gives no content for a file larger than 1 MB."""
+    sha = "a" * 40
+    text = "* @owner\n" * 10
+    fake.routes["GET /repos/acme/demo/contents/CODEOWNERS"] = lambda _: httpx.Response(
+        200, json={"type": "file", "encoding": "none", "content": "", "sha": sha, "size": 90}
+    )
+    fake.routes[f"GET /repos/acme/demo/git/blobs/{sha}"] = lambda _: httpx.Response(
+        200, json={"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
+    )
+    client = fake.client()
+    assert await client.file_text(7, "acme", "demo", "CODEOWNERS", "main", max_bytes=90) == text
+    with pytest.raises(GitHubError, match="has 90 bytes, more than 89"):
+        await client.file_text(7, "acme", "demo", "CODEOWNERS", "main", max_bytes=89)
+    assert fake.paths().count(f"GET /repos/acme/demo/git/blobs/{sha}") == 1
 
 
 async def test_file_text_raises_on_a_server_error(fake: Fake) -> None:
@@ -344,7 +363,7 @@ async def test_file_text_raises_on_a_server_error(fake: Fake) -> None:
         500, json={"message": "boom"}
     )
     with pytest.raises(GitHubError) as caught:
-        await fake.client().file_text(7, "acme", "demo", "CODEOWNERS", "main")
+        await fake.client().file_text(7, "acme", "demo", "CODEOWNERS", "main", max_bytes=100)
     assert caught.value.status_code == 500
 
 

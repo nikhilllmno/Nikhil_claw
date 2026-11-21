@@ -6,7 +6,9 @@ before a merge (Section 19.5).
 
 The match follows the GitHub rules for ``CODEOWNERS``:
 
-- Each line is a pattern and zero or more owners. ``#`` starts a comment.
+- Each line is a pattern and zero or more owners. ``#`` starts a comment. ``\\ `` is a space
+  in a pattern. GitHub does not support ``\\#`` at the start of a pattern, so sama skips such
+  a line.
 - The last line that matches a path decides its owners. A line with no owners means that the
   path has no owner.
 - ``*`` matches in one folder level. ``**`` matches in any number of levels. ``?`` matches one
@@ -72,6 +74,9 @@ def parse_codeowners(text: str, *, path: str = ".github/CODEOWNERS") -> CodeOwne
     skipped: list[int] = []
     for number, raw in enumerate(text.splitlines(), start=1):
         tokens = _tokens(raw)
+        if tokens is None:
+            skipped.append(number)
+            continue
         if not tokens:
             continue
         pattern, *owners = tokens
@@ -102,16 +107,32 @@ def split_owners(owners: Iterable[str]) -> tuple[tuple[str, ...], tuple[str, ...
     return tuple(users), tuple(teams)
 
 
-def _tokens(line: str) -> list[str]:
-    """The pattern and the owners of a line, without the comment. ``\\#`` at the start of a
-    pattern is a literal ``#``."""
+def _tokens(line: str) -> list[str] | None:
+    """The pattern and the owners of a line, without the comment. ``\\ `` in a pattern is a
+    literal space. ``None`` for a line that GitHub does not support: a pattern that starts
+    with ``\\#`` (GitHub does not support this escape)."""
     tokens: list[str] = []
-    for token in line.split():
-        if token.startswith("#"):
+    current: list[str] = []
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == "\\" and index + 1 < len(line) and line[index + 1] in " \t":
+            current.append(line[index + 1])
+            index += 2
+            continue
+        if char in " \t\r\n\f\v":
+            if current:
+                tokens.append("".join(current))
+                current = []
+        elif char == "#" and not current:
             break
-        tokens.append(token)
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
     if tokens and tokens[0].startswith("\\#"):
-        tokens[0] = tokens[0][1:]
+        return None
     return tokens
 
 

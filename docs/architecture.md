@@ -4546,7 +4546,7 @@ cannot call the tool.
 |---|---|
 | `start(name, folder)` | Clones the repository into the sandbox through the git proxy (as `repo_clone`) and makes the branch `sama/<name>`. A clone that does not use the proxy fails. The result tells the agent what to do next: change the code and the docs, run `ruff`, `mypy`, and `pytest`, commit, `git push origin sama/<name>`, and call `sama_pr` with `open`. |
 | `open(branch, title, summary, tests, draft)` | Opens a pull request from the pushed `sama/*` branch to the default branch. `summary` and `tests` (the tests that the agent ran and their results) are required. The tool compares the branch with the default branch on GitHub. A branch that is not pushed, has no new commits, or changes 300 files or more fails. |
-| Body | `## Summary`, `## Changes` (at most 100 files, each with its owners), `## Tests`, `## Owner review` (the changed paths with code owners, and the changed protected paths of the git proxy), and a line that says that a person merges. |
+| Body | `## Summary`, `## Changes` (the changed files, each with its owners), `## Tests`, `## Owner review` (the changed paths with code owners, and the changed protected paths of the git proxy), and a line that says that a person merges. Each list has at most 100 lines and 12,000 characters, then a line with the number of the other entries. The summary and the tests have at most 10,000 characters each. So the body stays below the GitHub limit of 65,536 characters. The review request still goes to all owners. |
 | Owner review | The tool reads the code owners file of the default branch (`.github/CODEOWNERS`, then `CODEOWNERS`, then `docs/CODEOWNERS`), because GitHub uses that file for the review rule. A change to the file on the branch does not change the owners of the pull request. The old path of a renamed file counts. The tool asks the user and team owners for a review. A failed review request does not fail the tool, because the ruleset still requires the approval. |
 
 The repository has `.github/CODEOWNERS`. It names an owner for the protected paths: CI and
@@ -4556,8 +4556,11 @@ with `sama_pr`. The code owners file is also a protected path of the git proxy, 
 that changes it needs a `repo_push_approval`.
 
 The parser supports the patterns of GitHub: `*`, `**`, `?`, a leading `/`, a trailing `/`,
-and the rule that the last matching line wins. It skips lines with `!` or `[ ]`, which
-GitHub does not support either. Matching is case-sensitive, as on GitHub.
+and the rule that the last matching line wins. A backslash before a space makes the space
+part of the pattern (`/my\ dir/`). It skips lines with `!`, `[ ]`, or a leading `\#`,
+which GitHub does not support either. Matching is case-sensitive, as on GitHub. The tool
+reads a code owners file of up to 3 MB, the GitHub limit. The contents API gives no content
+for a file larger than 1 MB, so the tool then reads the git blob of the file.
 
 The agent cannot merge:
 
