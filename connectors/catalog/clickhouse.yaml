@@ -1,0 +1,21 @@
+# The ClickHouse connector (docs/architecture.md, Section 10.4, "What M4.13 builds"). The
+# gateway uses the HTTP interface of ClickHouse (port 8443 with TLS).
+name: clickhouse
+title: ClickHouse
+description: Read the schema and the rows of a ClickHouse database with read-only SQL. Change
+  rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: clickhouse
+  sslmode: require
+  hints:
+    host: The host name of the server, for example abc123.us-east-1.aws.clickhouse.cloud.
+      sama connects only to public addresses, or through the SSH tunnel below.
+    port: The HTTPS port of the server. The default is 8443.
+    database: The default database of the connection. The default is default. To let the
+      agent read only some databases, put them in Schemas.
+    user: Use a user with only the grants that the agent needs. For read only, grant SELECT
+      only. The grants of the user are the strongest control.

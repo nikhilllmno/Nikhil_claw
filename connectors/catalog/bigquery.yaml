@@ -1,0 +1,15 @@
+# The BigQuery connector (docs/architecture.md, Section 10.4, "What M4.13 builds"). The gateway
+# uses the BigQuery REST API with a service account. Each query has a maximum of bytes billed.
+name: bigquery
+title: BigQuery
+description: Read the schema and the rows of BigQuery datasets with read-only SQL. Each query
+  has a maximum of bytes billed. Change rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: bigquery
+  hints:
+    service_account_json: The JSON key of a service account. Give the account only the roles
+      that the agent needs, for example BigQuery Data Viewer and BigQuery Job User.

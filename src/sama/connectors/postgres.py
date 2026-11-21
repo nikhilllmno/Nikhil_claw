@@ -1,6 +1,5 @@
 """The PostgreSQL side of the database gateway (docs/architecture.md, Section 10.4).
 
-- ``DbSettings``: the form values of a connection, checked.
 - ``pinned_tls``: a TLS context that sends the real host name (SNI, certificate check) while
   the socket goes to the checked IP address.
 - ``to_json`` and ``to_csv``: the cell values for the model and for the files.
@@ -13,138 +12,25 @@ Supabase and Neon are PostgreSQL: the same code connects to them.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
-import ipaddress
 import json
 import math
 import re
 import ssl
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final
 
 import certifi
 
+from sama.connectors.dbsettings import TlsMode
 from sama.connectors.http_api import DriverError
-from sama.connectors.manifest import Manifest, SslMode
-from sama.connectors.sql import Policy, parse_names, policy_of
 
-DEFAULT_PORT: Final = 5432
 MAX_CELL_CHARS: Final = 1_000
 """A longer cell is cut in the model text. The files keep the full value."""
 
-_HOST: Final = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9]([a-z0-9-]{0,62}))*$")
-_NAME: Final = re.compile(r"^[a-z_][a-z0-9_$]{0,62}$")
 _ON: Final = frozenset({"on", "yes", "true", "1"})
 _OFF: Final = frozenset({"", "off", "no", "false", "0"})
-SSL_MODES: Final[tuple[SslMode, ...]] = ("require", "verify-full")
-
-
-@dataclass(frozen=True, slots=True)
-class DbSettings:
-    """The checked form of one database connection. ``password`` never goes to a log."""
-
-    host: str
-    port: int
-    database: str
-    user: str
-    password: str
-    sslmode: SslMode
-    writes: bool
-    policy: Policy
-
-    @classmethod
-    def parse(cls, manifest: Manifest, values: Mapping[str, str]) -> DbSettings:
-        """Raises ``DriverError`` with the field that is not valid."""
-        host = (values.get("host") or "").strip().lower().rstrip(".")
-        if host.startswith("[") and host.endswith("]"):
-            host = host[1:-1]
-        if not host:
-            raise DriverError("the host is empty")
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            if not _HOST.match(host):
-                raise DriverError(
-                    "the host must be a host name or an IP address, not a URL"
-                ) from None
-        port_text = (values.get("port") or "").strip()
-        try:
-            port = int(port_text) if port_text else DEFAULT_PORT
-        except ValueError:
-            raise DriverError("the port must be a number") from None
-        if not 0 < port < 65_536:
-            raise DriverError("the port must be 1 to 65535")
-        database = (values.get("database") or "").strip()
-        user = (values.get("user") or "").strip()
-        if not database or not user:
-            raise DriverError("the database and the user are required")
-        default = manifest.database.sslmode if manifest.database is not None else "require"
-        mode = (values.get("sslmode") or "").strip().lower() or default
-        sslmode = next((m for m in SSL_MODES if m == mode), None)
-        if sslmode is None:
-            raise DriverError("the TLS mode must be require or verify-full")
-        writes = _switch(values.get("writes"), "Allow writes")
-        ddl = _switch(values.get("ddl"), "Allow schema changes")
-        if ddl and not writes:
-            raise DriverError("Allow schema changes needs Allow writes on")
-        schemas = parse_names(values.get("schemas") or "")
-        tables = parse_names(values.get("tables") or "")
-        hidden = parse_names(values.get("hidden_columns") or "")
-        for label, items, parts in (
-            ("Allowed schemas", schemas, 1),
-            ("Allowed tables", tables, 2),
-            ("Hidden columns", hidden, 3),
-        ):
-            for item in items:
-                names = item.split(".")
-                if len(names) > parts or not all(_NAME.match(n) for n in names):
-                    raise DriverError(f"{label}: {item[:60]} is not a valid name")
-        return cls(
-            host=host,
-            port=port,
-            database=database,
-            user=user,
-            password=values.get("password") or "",
-            sslmode=sslmode,
-            writes=writes,
-            policy=policy_of(schemas=schemas, tables=tables, hidden_columns=hidden, ddl=ddl),
-        )
-
-    def fingerprint(self) -> str:
-        """A hash of all values. A changed form gives a new pool."""
-        data = json.dumps(
-            [
-                self.host,
-                self.port,
-                self.database,
-                self.user,
-                self.password,
-                self.sslmode,
-                self.writes,
-                sorted(self.policy.schemas),
-                sorted(map(str, self.policy.tables)),
-                sorted(map(str, self.policy.hidden)),
-                self.policy.ddl,
-            ]
-        )
-        return hashlib.sha256(data.encode()).hexdigest()
-
-
-def writes_on(fields: Mapping[str, str]) -> bool:
-    """True if the ``writes`` field of a connection is on. A value that is not valid is off."""
-    return (fields.get("writes") or "").strip().lower() in _ON
-
-
-def _switch(value: str | None, label: str) -> bool:
-    text = (value or "").strip().lower()
-    if text in _ON:
-        return True
-    if text in _OFF:
-        return False
-    raise DriverError(f"{label} must be on or off")
 
 
 class _PinnedContext(ssl.SSLContext):
@@ -171,7 +57,7 @@ class _PinnedContext(ssl.SSLContext):
         )
 
 
-def pinned_tls(hostname: str, mode: SslMode) -> ssl.SSLContext:
+def pinned_tls(hostname: str, mode: TlsMode) -> ssl.SSLContext:
     """The TLS context for a connection to ``hostname`` at a pinned address. ``require``
     encrypts and does not check the certificate (as libpq ``sslmode=require``);
     ``verify-full`` checks the certificate chain and the host name."""

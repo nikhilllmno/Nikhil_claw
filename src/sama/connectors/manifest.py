@@ -42,6 +42,13 @@ from typing import Annotated, Any, Final, Literal, get_args
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from sama.connectors.dbforms import (
+    ENGINES,
+    Engine,
+    database_fields,
+    database_tool_prefix,
+    database_tools,
+)
 from sama.gate.decide import ToolAccess
 
 ENV_DIRECTORY: Final = "SAMA_CONNECTORS_DIR"
@@ -416,7 +423,7 @@ class Composio(_Strict):
 class Database(_Strict):
     """The database block of a ``database`` connector (Section 10.4)."""
 
-    engine: Literal["postgres"]
+    engine: Engine
     sslmode: SslMode = "require"
     """The TLS mode when the form leaves ``sslmode`` empty."""
     hints: Mapping[str, Annotated[str, Field(max_length=400)]] = Field(default_factory=dict)
@@ -500,14 +507,19 @@ class Manifest(_Strict):
         hints = block.get("hints") or {}
         if not isinstance(hints, dict):
             return data
-        if unknown := sorted(set(hints) - {f["name"] for f in DATABASE_FIELDS}):
+        engine = block.get("engine", "postgres")
+        if engine not in ENGINES:
+            return data  # The field checks give the error.
+        standard = database_fields(engine)
+        if unknown := sorted(set(hints) - {f["name"] for f in standard}):
             raise ValueError(f"hints for unknown fields: {', '.join(unknown)}")
         fields = [
             {**f, "help": str(hints[f["name"]])} if f["name"] in hints else dict(f)
-            for f in DATABASE_FIELDS
+            for f in standard
         ]
         title = data.get("title") if isinstance(data.get("title"), str) else name
-        return {**data, "fields": fields, "tools": database_tools(name, str(title))}
+        tools = database_tools(name, str(title), engine)
+        return {**data, "fields": fields, "tools": tools}
 
     @model_validator(mode="after")
     def _fits_kind(self) -> Manifest:
@@ -738,195 +750,3 @@ def parse(text: str, *, source: str = "manifest") -> Manifest:
 
 def path_params(path: str) -> list[str]:
     return _PATH_PARAM.findall(path)
-
-
-# -- database connectors (Section 10.4) -----------------------------------------------------
-
-MAX_SQL_CHARS: Final = 20_000
-MAX_EXECUTE_SQL_CHARS: Final = 1_000
-"""The SQL of ``execute`` must fit on the approval card in full."""
-MAX_PARAMS: Final = 100
-MAX_SAMPLE_ROWS: Final = 20
-
-DATABASE_FIELDS: Final[tuple[dict[str, Any], ...]] = (
-    {"name": "host", "label": "Host", "help": "The host name of the database server."},
-    {
-        "name": "port",
-        "label": "Port",
-        "required": False,
-        "help": "The port of the database server. Empty means 5432.",
-    },
-    {"name": "database", "label": "Database", "help": "The name of the database."},
-    {
-        "name": "user",
-        "label": "User",
-        "help": (
-            "A database user for sama. Give it only the access that the agent needs: a user "
-            "without access to a table or a column is the strongest control."
-        ),
-    },
-    {"name": "password", "label": "Password", "secret": True, "help": "The password."},
-    {
-        "name": "sslmode",
-        "label": "TLS mode",
-        "required": False,
-        "help": (
-            "require (encrypt, do not check the certificate) or verify-full (encrypt and "
-            "check the certificate and the host name). Empty means the connector default."
-        ),
-    },
-    {
-        "name": "schemas",
-        "label": "Allowed schemas",
-        "required": False,
-        "help": "A comma list of the schemas that the agent can read, for example public. "
-        "Empty means all schemas that the user can read.",
-    },
-    {
-        "name": "tables",
-        "label": "Allowed tables",
-        "required": False,
-        "help": "A comma list of the tables that the agent can use, as schema.table or "
-        "table. Empty means all tables of the allowed schemas.",
-    },
-    {
-        "name": "hidden_columns",
-        "label": "Hidden columns",
-        "required": False,
-        "help": "A comma list of columns that never show in a result, as column or "
-        "table.column, for example email, users.password_hash.",
-    },
-    {
-        "name": "writes",
-        "label": "Allow writes (on or off)",
-        "required": False,
-        "help": "on lets the agent change rows with an approved db_<conn>_execute call. "
-        "Empty means off.",
-    },
-    {
-        "name": "ddl",
-        "label": "Allow schema changes (on or off)",
-        "required": False,
-        "help": "on lets an approved db_<conn>_execute call also run DDL (CREATE, ALTER, "
-        "DROP, TRUNCATE). It needs writes on. Empty means off.",
-    },
-)
-"""The form of every ``database`` connector. Only ``password`` is a secret."""
-
-
-def database_tool_prefix(connector: str) -> str:
-    """``db_<conn>_``, where ``<conn>`` is the connector name with ``_`` for ``-``."""
-    return f"db_{connector.replace('-', '_')}_"
-
-
-_PARAMS_SCHEMA: Final[dict[str, Any]] = {
-    "type": "array",
-    "maxItems": MAX_PARAMS,
-    "items": {"type": ["string", "number", "integer", "boolean", "null"]},
-    "description": "The values of $1, $2, ... in the SQL. Use them for values from the user.",
-}
-
-
-def database_tools(connector: str, title: str) -> list[dict[str, Any]]:
-    """The five tools of a ``database`` connector, as manifest data."""
-    prefix = database_tool_prefix(connector)
-    return [
-        {
-            "name": f"{prefix}schema",
-            "access": "read",
-            "description": (
-                f"Show the schemas, tables, columns, types, keys, indexes, and comments of the "
-                f"{title} database. Give schema or table to see less. Use this before you "
-                "write SQL."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "schema": {"type": "string", "maxLength": 63},
-                    "table": {"type": "string", "maxLength": 63},
-                    "refresh": {
-                        "type": "boolean",
-                        "description": "Read the catalog again (the result is kept 10 min).",
-                    },
-                },
-            },
-        },
-        {
-            "name": f"{prefix}sample",
-            "access": "read",
-            "description": (
-                f"Show some rows of one table of the {title} database (at most {MAX_SAMPLE_ROWS})."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "table": {
-                        "type": "string",
-                        "maxLength": 130,
-                        "description": "schema.table or table.",
-                    },
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SAMPLE_ROWS},
-                },
-                "required": ["table"],
-            },
-        },
-        {
-            "name": f"{prefix}query",
-            "access": "read",
-            "description": (
-                f"Run one read-only SQL statement (SELECT, WITH, VALUES, or EXPLAIN) on the "
-                f"{title} database (PostgreSQL). The statement runs in a read-only "
-                "transaction and stops after 30 seconds. You get at most 1,000 rows and "
-                "50 KB; the full result goes to a CSV file in the sandbox. Use LIMIT, and "
-                "use export for large results."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARS},
-                    "params": _PARAMS_SCHEMA,
-                },
-                "required": ["sql"],
-            },
-        },
-        {
-            "name": f"{prefix}export",
-            "access": "read",
-            "description": (
-                f"Run one read-only SQL statement on the {title} database and write all "
-                "rows to a CSV file in the sandbox (.sama/exports/). You get the path and "
-                "the row count, not the rows."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARS},
-                    "params": _PARAMS_SCHEMA,
-                    "format": {"type": "string", "enum": ["csv"]},
-                },
-                "required": ["sql"],
-            },
-        },
-        {
-            "name": f"{prefix}execute",
-            "access": "destructive",
-            "description": (
-                f"Run one SQL statement that changes data (INSERT, UPDATE, DELETE, MERGE) on "
-                f"the {title} database. A person must approve each call, and the approval "
-                "shows the SQL. DDL runs only if the connection allows it. The connection "
-                "must allow writes."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": MAX_EXECUTE_SQL_CHARS,
-                    },
-                    "params": {**_PARAMS_SCHEMA, "maxItems": 20},
-                },
-                "required": ["sql"],
-            },
-        },
-    ]

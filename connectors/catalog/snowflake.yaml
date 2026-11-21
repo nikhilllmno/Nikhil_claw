@@ -1,0 +1,16 @@
+# The Snowflake connector (docs/architecture.md, Section 10.4, "What M4.13 builds"). The gateway
+# uses the Snowflake SQL API with key-pair authentication.
+name: snowflake
+title: Snowflake
+description: Read the schema and the rows of a Snowflake database with read-only SQL. Change
+  rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: snowflake
+  hints:
+    user: A Snowflake user with key-pair authentication (ALTER USER ... SET RSA_PUBLIC_KEY).
+    role: Use a role with only the grants that the agent needs. For read only, grant USAGE
+      and SELECT only. The grants of the role are the strongest control.

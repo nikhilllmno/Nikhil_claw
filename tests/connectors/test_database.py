@@ -13,26 +13,24 @@ from typing import Any, cast
 
 import pytest
 
-from sama.connectors import database
 from sama.connectors.database import (
     MAX_CARD_CHARS,
-    MAX_MODEL_BYTES,
-    MAX_ROWS,
     TIMEOUT_S,
     DatabaseGateway,
     _check_card,
     _render,
-    _Rows,
 )
+from sama.connectors.dbcore import MAX_MODEL_BYTES, MAX_ROWS, Rows
+from sama.connectors.dbforms import MAX_EXECUTE_SQL_CHARS
+from sama.connectors.dbsettings import DbSettings, writes_on
 from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import (
     DATABASE_OPERATIONS,
-    MAX_EXECUTE_SQL_CHARS,
     Catalog,
     ManifestError,
     parse,
 )
-from sama.connectors.postgres import DbSettings, coerce, model_cell, pinned_tls, to_csv, writes_on
+from sama.connectors.postgres import coerce, model_cell, pinned_tls, to_csv
 from sama.gate.decide import PolicyRule, RuleLevel, always_asks, policy_verdict
 from sama.gateway.sessions import MAX_ARGUMENT_CHARS
 from sama.tools.output import MAX_OUTPUT_BYTES, untrusted
@@ -69,7 +67,7 @@ def test_a_database_manifest_gets_the_form_and_the_five_tools() -> None:
     }
     assert [found.operation(t) for t in found.tools] == list(DATABASE_OPERATIONS)
     fields = {f.name: f for f in found.fields}
-    assert [n for n, f in fields.items() if f.secret] == ["password"]
+    assert [n for n, f in fields.items() if f.secret] == ["password", "ssh_private_key"]
     assert fields["host"].help == "The host of the main database."
     assert {n for n, f in fields.items() if f.required} == {"host", "database", "user", "password"}
     execute = found.tools[-1].input_schema
@@ -93,7 +91,7 @@ def test_a_bad_hint_or_engine_is_refused() -> None:
     with pytest.raises(ManifestError):
         manifest(PG.replace("host: The host", "nothing: The host"))
     with pytest.raises(ManifestError):
-        manifest(PG.replace("engine: postgres", "engine: mysql"))
+        manifest(PG.replace("engine: postgres", "engine: oracle"))
     with pytest.raises(ManifestError):
         parse(PG.replace("kind: database", "kind: http_api"))
 
@@ -207,7 +205,7 @@ def test_the_default_timeout_is_30_seconds() -> None:
     assert DatabaseGateway().timeout_s == 30.0
 
 
-def rows(count: int, width: int = 10) -> _Rows:
+def rows(count: int, width: int = 10) -> Rows:
     shown: list[str] = []
     used = 0
     for i in range(count):
@@ -216,7 +214,7 @@ def rows(count: int, width: int = 10) -> _Rows:
             break
         shown.append(line)
         used += len(line) + 1
-    return _Rows(["id", "name"], 0, shown, count, True, "csv", "")
+    return Rows(["id", "name"], 0, shown, count, True, "csv", "")
 
 
 @pytest.mark.parametrize(("count", "width"), [(5_000, 10), (400, 400), (2_000, 30)])
@@ -250,8 +248,8 @@ async def test_the_gateway_connects_only_to_public_addresses() -> None:
 
 
 def test_the_module_keeps_the_limits() -> None:
-    assert database.MAX_ROWS == 1_000
-    assert database.MAX_MODEL_BYTES + 1_500 < MAX_OUTPUT_BYTES
+    assert MAX_ROWS == 1_000
+    assert MAX_MODEL_BYTES + 1_500 < MAX_OUTPUT_BYTES
 
 
 def test_database_execute_always_asks() -> None:
@@ -280,4 +278,15 @@ async def test_a_workflow_tool_step_cannot_call_a_database_tool() -> None:
     scope = RunScope(org_id=uuid.uuid4(), workspace_id=uuid.uuid4(), user_id=None, shared=False)
     with pytest.raises(ConnectorError, match="Use an agent step"):
         await service.call_as(scope, "db_postgres_query", {"sql": "select 1"})
+    # Every engine of M3.11 and M4.13: each tool of each database connector is refused.
+    engines = {m.name for m in catalog if m.kind == "database"}
+    assert {"mysql", "mariadb", "sqlserver", "clickhouse", "bigquery", "snowflake", "mongodb"} <= (
+        engines
+    )
+    for manifest in catalog:
+        if manifest.kind != "database":
+            continue
+        for tool in manifest.tools:
+            with pytest.raises(ConnectorError, match="Use an agent step"):
+                await service.call_as(scope, tool.name, {})
     await service.aclose()

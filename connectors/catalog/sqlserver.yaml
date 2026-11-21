@@ -1,0 +1,20 @@
+# The SQL Server connector (docs/architecture.md, Section 10.4, "What M4.13 builds"). The
+# gateway also connects to Azure SQL Database. It does not follow a redirect to another host.
+name: sqlserver
+title: SQL Server
+description: Read the schema and the rows of a Microsoft SQL Server or Azure SQL database
+  with read-only SQL. Change rows with SQL that a person approves.
+kind: database
+scopes:
+- workspace
+- personal
+database:
+  engine: mssql
+  sslmode: require
+  hints:
+    host: The host name of the server, for example db.example.com or
+      <server>.database.windows.net. sama connects only to public addresses, or through the
+      SSH tunnel below. For Azure SQL, set the connection policy of the server to Proxy.
+    database: The database that the agent uses. The agent cannot read other databases.
+    user: A SQL login. Use a user with only the grants that the agent needs. For read only,
+      add the user to db_datareader only. The grants of the user are the strongest control.
