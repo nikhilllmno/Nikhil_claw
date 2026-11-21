@@ -3884,13 +3884,15 @@ class SamaApi:
         *,
         page: PageContext | None = None,
         parallel: bool = False,
+        join: bool = True,
     ) -> Sent:
         """Queues a user message, as ``POST /sessions/{id}/messages`` does. Raises
         ``SendError``.
 
         Busy modes (M7.1): in the mode ``steer`` (the default), a plain text message while a run
         of the session is running joins that run as a note (``steered``). ``parallel`` starts
-        a run next to the open runs, whatever the mode.
+        a run next to the open runs, whatever the mode. ``join=False`` never adds the message to
+        a running run: the Chrome extension shows no notes.
 
         With ``page`` (the extension channel, M5.4), the message has the page of the tab as
         untrusted content, and a skill command is not expanded. Page content can hold private

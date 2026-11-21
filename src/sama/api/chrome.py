@@ -474,8 +474,10 @@ class _Connection:
 
     async def _send(self, frame: SendFrame) -> None:
         try:
+            # The extension shows only the messages of the session, not the notes that join a
+            # run (M7.1), so its messages always start or queue a run.
             sent = await self._api.submit(
-                self.principal, frame.session_id, frame.text, page=frame.page
+                self.principal, frame.session_id, frame.text, page=frame.page, join=False
             )
         except SendError as error:
             extra: dict[str, Any] = {"session_id": str(frame.session_id)}

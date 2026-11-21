@@ -16,6 +16,7 @@ from sama.api import SamaApi
 from sama.api import chrome as channel
 from sama.db.models import Attachment, Message
 from sama.gateway.chrome import ChromeHub, ChromeOfflineError
+from sama.orchestrator.queue import RunQueue
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
 from tests.api.conftest import STREAM_LIFETIME_S, token
@@ -478,3 +479,18 @@ async def test_the_hub_gives_the_newest_connection(
         async with open_socket(chrome_app) as second:
             await signed_in(second, user)
             assert chrome_api.chrome.link(user) is chrome_api.chrome.links(user)[-1]
+
+
+async def test_an_extension_message_never_joins_the_running_run(
+    chrome_app: FastAPI, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """M7.1: the extension shows no notes, so its message queues behind the running run."""
+    s1 = str(tenant.ids["s1"])
+    queue = RunQueue(engine)
+    await queue.enqueue(org_id=tenant.org, session_id=tenant.ids["s1"], text="first")
+    assert await queue.claim("test-owner") is not None
+    async with open_socket(chrome_app) as socket:
+        await signed_in(socket, tenant.ids["mia_auth"])
+        await socket.send({"type": "send", "id": "m1", "session_id": s1, "text": "second"})
+        sent = await socket.until(lambda f: f["type"] == "sent")
+        assert sent["queued"] is True

@@ -11,6 +11,7 @@ import {
   type ClarifyRequest,
   type ExportFormat,
   OPEN_RUN_STATUSES,
+  type OpenRun,
   type SessionDetail,
   type SteerNote,
 } from "@/lib/api";
@@ -198,13 +199,35 @@ export function Chat({ sessionId }: { sessionId: string }) {
     return () => clearInterval(timer);
   }, [running, loadQuestions]);
 
-  // A message that joined a run is pending until the run reads it at its next step.
+  // A message that joined a run is pending until the run reads it at its next step. Look while a
+  // run works too: another tab or person can add a message to the run (M7.1).
   const notePending = hasPendingNote(notes);
   useEffect(() => {
-    if (!notePending) return;
+    if (!notePending && !running) return;
     const timer = setInterval(() => void loadNotes(), NOTE_POLL_MS);
     return () => clearInterval(timer);
-  }, [notePending, loadNotes]);
+  }, [notePending, running, loadNotes]);
+
+  // The numbers of the open runs come from the server, so `/stop NUMBER` and the list agree.
+  const [serverRuns, setServerRuns] = useState<OpenRun[] | null>(null);
+  const openKey = openRuns.join(",");
+  useEffect(() => {
+    if (openRuns.length < 2) return;
+    let live = true;
+    api
+      .listOpenRuns(sessionId)
+      .then((runs) => {
+        if (live) setServerRuns(runs);
+      })
+      .catch(() => {
+        // The list falls back to the order of the requests.
+      });
+    return () => {
+      live = false;
+    };
+    // `openKey` stands for the open runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, sessionId, openKey]);
 
   // The queued, steered, and joined notices are about the open runs: hide them when no run is open.
   const runNotices = [QUEUED_NOTICE, STEERED_NOTICE, JOINED_NOTICE];
@@ -285,6 +308,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
         if (answer.steered) {
           clearDraft();
           setNotice(STEERED_NOTICE);
+          void loadNotes();
           return;
         }
         // No run was open: the API sent the note as a message.
@@ -434,11 +458,21 @@ export function Chat({ sessionId }: { sessionId: string }) {
     for (const m of messages ?? []) {
       if (m.role === "user" && m.run_id && !requests.has(m.run_id)) requests.set(m.run_id, m);
     }
+    const order = new Map((serverRuns ?? []).map((run) => [run.run_id, run]));
     return openRuns
-      .map((id) => ({ id, status: live.runs[id]?.status ?? "queued", request: requests.get(id) }))
-      .sort((a, b) => (a.request?.seq ?? Number.MAX_SAFE_INTEGER) - (b.request?.seq ?? Number.MAX_SAFE_INTEGER));
-  }, [openRuns, live.runs, messages]);
-  const runNumber = new Map(runRows.map((row, index) => [row.id, index + 1]));
+      .map((id) => ({
+        id,
+        status: live.runs[id]?.status ?? "queued",
+        text: requests.get(id)?.text ?? order.get(id)?.text ?? null,
+        number: order.get(id)?.number ?? null,
+        seq: requests.get(id)?.seq ?? Number.MAX_SAFE_INTEGER,
+      }))
+      .sort((a, b) => (a.number ?? Number.MAX_SAFE_INTEGER) - (b.number ?? Number.MAX_SAFE_INTEGER) || a.seq - b.seq);
+  }, [openRuns, live.runs, messages, serverRuns]);
+  // A run that the server list does not have yet shows no number: `/stop NUMBER` uses the server list.
+  const runNumber = new Map(
+    runRows.filter((row) => row.number !== null).map((row) => [row.id, row.number as number]),
+  );
 
   if (loadError) {
     return (
@@ -607,11 +641,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
           <section className={styles.runs} aria-label="Runs that work at the same time">
             <h2 className={styles.runsTitle}>{runRows.length} runs at the same time</h2>
             <ol className={styles.runList}>
-              {runRows.map((row, index) => (
+              {runRows.map((row) => (
                 <li key={row.id} className={styles.runRow}>
-                  <span className={styles.runNumber}>Run {index + 1}</span>
-                  <span className={styles.runText} title={row.request?.text}>
-                    {row.request?.text ?? "Waiting for the request"}
+                  <span className={styles.runNumber}>{row.number === null ? "Run" : `Run ${row.number}`}</span>
+                  <span className={styles.runText} title={row.text ?? undefined}>
+                    {row.text ?? "Waiting for the request"}
                   </span>
                   <span className={`badge ${row.status === "paused" ? "badge-warning" : "badge-accent"}`}>
                     {row.status === "paused" ? "Waiting for you" : row.status === "queued" ? "Waiting" : "Working"}
@@ -619,7 +653,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
                   <button
                     type="button"
                     className="btn btn-quiet btn-small"
-                    aria-label={`Stop run ${index + 1}`}
+                    aria-label={row.number === null ? "Stop this run" : `Stop run ${row.number}`}
                     onClick={() => void stopOne(row.id)}
                   >
                     Stop
