@@ -66,9 +66,9 @@ from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.billing import router as billing_router
 from sama.api.browser import BrowserSettings, LoginChange, LoginIn, UrlPolicyIn
 from sama.api.chrome import ChromeChannel
-from sama.api.custom_tools import router as custom_tools_router
 from sama.api.coding_mode import Access as CodingAccess
 from sama.api.coding_mode import router as coding_router
+from sama.api.custom_tools import router as custom_tools_router
 from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
 from sama.api.history import (
     DEFAULT_RUNS,
