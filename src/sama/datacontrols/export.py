@@ -39,6 +39,7 @@ SECRET_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
     "integrations": frozenset({"secret_hash"}),
     "pairing_codes": frozenset({"code_hash"}),
     "org_invites": frozenset({"token_hash"}),
+    "api_keys": frozenset({"key_hash"}),
 }
 """Secret material. No export has it, also not in a hashed or encrypted form."""
 DERIVED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
@@ -150,6 +151,8 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "trigger_deliveries": (
         "trigger_id IN (SELECT id FROM triggers WHERE org_id = :org AND owner_user_id = :user)"
     ),
+    # The keys that the user made or revoked (Section 10.7), without the hash.
+    "api_keys": "user_id = :user OR revoked_by_user_id = :user",
 }
 """The rows of a user export, as a filter in each table of the org. None: the table has no
 personal data, or the data is not for an export (secrets, the outbox, embeddings)."""

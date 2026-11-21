@@ -25,7 +25,7 @@ TABLES = sorted(Base.metadata.tables)
 COLUMNS = ("attachments", "generated_media")
 """The tables whose grant is on columns: the bytes of an image or a voice note are not
 readable."""
-SECRET_COLUMNS = {"org_invites": "token_hash"}
+SECRET_COLUMNS = {"org_invites": "token_hash", "api_keys": "key_hash"}
 """More tables whose grant is on columns: the column has a secret (Section 17.2)."""
 SESSION_CHILDREN = (
     "runs",
@@ -54,6 +54,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "alice": {
         "orgs": {"org-a"},
         "org_invites": set(),
+        "api_keys": set(),
         "org_billing": set(),
         "billing_events": set(),
         "users": {"alice", "carol", "dave"},
@@ -87,6 +88,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "carol": {
         "orgs": {"org-a"},
         "org_invites": {"invite:org-a"},
+        "api_keys": {"api-key:org-a"},
         "org_billing": {"billing:org-a"},
         "billing_events": {"billing-event:org-a"},
         "users": {"alice", "carol", "dave"},
@@ -120,6 +122,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "dave": {
         "orgs": {"org-a"},
         "org_invites": set(),
+        "api_keys": set(),
         "org_billing": set(),
         "billing_events": set(),
         "users": {"alice", "carol", "dave"},
@@ -153,6 +156,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "bob": {
         "orgs": {"org-b"},
         "org_invites": {"invite:org-b"},
+        "api_keys": {"api-key:org-b"},
         "org_billing": {"billing:org-b"},
         "billing_events": {"billing-event:org-b"},
         "users": {"bob"},
@@ -186,6 +190,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "stranger": {
         "orgs": set(),
         "org_invites": set(),
+        "api_keys": set(),
         "org_billing": set(),
         "billing_events": set(),
         "users": set(),

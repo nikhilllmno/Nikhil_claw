@@ -279,6 +279,14 @@ export const HELP_TOPICS: HelpTopic[] = [
         ],
       },
       {
+        heading: "API keys",
+        paragraphs: [
+          "Other agents and apps can use sama with an API key: the OpenAI-compatible chat endpoint at /v1 and the MCP server at /mcp. A key acts as the admin who made it, in one workspace.",
+          "The runs of a key use the policy, the approvals, and the budgets of the agent. With Deny, a tool call that needs an approval is denied. With Wait, it waits for a person in the web app.",
+          "Sama shows a new key one time. Revoke a key when you do not need it. A key also stops when its admin leaves the org or is no longer an admin.",
+        ],
+      },
+      {
         heading: "Curator reports",
         paragraphs: [
           "Each week the curator checks the skills and the memory of each workspace. Its reports show the stale and archived skills and the memory that is nearly full.",
@@ -289,6 +297,7 @@ export const HELP_TOPICS: HelpTopic[] = [
       { href: "/admin", label: "Open the Admin area" },
       { href: "/admin/usage", label: "Usage" },
       { href: "/admin/audit", label: "Audit log" },
+      { href: "/admin/api-keys", label: "API keys" },
     ],
   },
   {

@@ -23,6 +23,7 @@ export const ADMIN_TABS = [
   { href: "/admin/changes", label: "Agent changes" },
   { href: "/admin/curator", label: "Curator reports" },
   { href: "/admin/keys", label: "Org keys and region" },
+  { href: "/admin/api-keys", label: "API keys" },
   { href: "/admin/data", label: "Data controls" },
 ] as const;
 
@@ -119,6 +120,7 @@ const TILES = [
   { href: "/admin/changes", title: "Agent changes", text: "The history of the soul, the settings, and the tools of each agent." },
   { href: "/admin/curator", title: "Curator reports", text: "The weekly reports about stale skills and full memory." },
   { href: "/admin/keys", title: "Org keys and region", text: "Use your own Anthropic and OpenAI keys. See the region of the org." },
+  { href: "/admin/api-keys", title: "API keys", text: "Connect other agents and apps to sama with the OpenAI API or MCP." },
   { href: "/admin/data", title: "Data controls", text: "Retention, the export of the org, and the delete of the org." },
   { href: "/help/admin", title: "Admin help", text: "How each admin page works." },
 ] as const;

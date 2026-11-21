@@ -78,6 +78,44 @@ export interface ModelKeyStatus {
   default_key: boolean;
 }
 
+export type ApiKeyScope = "chat" | "mcp";
+export type ApiKeyApprovals = "deny" | "pending";
+
+/** An org API key for sama as a server (Section 10.7). It has no part of the key after the prefix. */
+export interface ApiKey {
+  id: string;
+  name: string;
+  /** The first characters of the key, to recognise it. */
+  prefix: string;
+  workspace_id: string;
+  workspace_name: string;
+  agent_profile_id: string | null;
+  agent_profile_name: string | null;
+  scopes: ApiKeyScope[];
+  approvals: ApiKeyApprovals;
+  user_id: string;
+  user_name: string;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  status: "active" | "revoked" | "expired";
+}
+
+export interface ApiKeyCreate {
+  name: string;
+  workspace_id: string;
+  agent_profile_id: string | null;
+  scopes: ApiKeyScope[];
+  approvals: ApiKeyApprovals;
+  expires_in_days: number | null;
+}
+
+/** The answer of a key create. `key` shows one time only. */
+export interface ApiKeyCreated extends ApiKey {
+  key: string;
+}
+
 /** A saved login of the browser vault. It has no user name and no password. */
 export interface BrowserLogin {
   id: string;
@@ -1971,6 +2009,14 @@ export class ApiClient {
     });
   removeModelKey = (orgId: string, provider: ModelProvider) =>
     this.json<null>(`/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`, { method: "DELETE" });
+  apiKeys = (orgId: string) => this.json<ApiKey[]>(`/orgs/${encodeURIComponent(orgId)}/api-keys`);
+  /** The answer has the key. It shows one time only. */
+  createApiKey = (orgId: string, body: ApiKeyCreate) =>
+    this.json<ApiKeyCreated>(`/orgs/${encodeURIComponent(orgId)}/api-keys`, { method: "POST", body });
+  revokeApiKey = (orgId: string, keyId: string) =>
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/api-keys/${encodeURIComponent(keyId)}`, {
+      method: "DELETE",
+    });
   browserLogins = (orgId: string) =>
     this.json<BrowserLogin[]>(`/orgs/${encodeURIComponent(orgId)}/browser/logins`);
   /** Sends the user name and the password. They go only to this call, never to the chat. */
