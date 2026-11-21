@@ -262,3 +262,47 @@ async def test_own_key_is_true_only_for_a_key_of_the_org() -> None:
     assert not await sama_key.own_key("org-1")
     own = Mem0Provider(OwnKeys(SecretName.MEM0_API_KEY, "own-key"), base_url="https://mem0.test")
     assert await own.own_key("org-1")
+
+
+async def test_forget_fails_when_the_key_of_the_org_does_not_decrypt() -> None:
+    """An unreadable own key must stop an org delete (the cleanup turns this into 409)."""
+    from sama.vault.crypto import VaultError
+    from sama.vault.store import OrgKey
+
+    class BrokenKeys(OrgKeys):
+        def __init__(self) -> None:
+            super().__init__(None, {})
+
+        async def lookup(self, org_id: str | uuid.UUID, name: SecretName) -> OrgKey:
+            raise VaultError("bad")
+
+    api = Mem0()
+    mem0 = Mem0Provider(
+        BrokenKeys(),
+        base_url="https://mem0.test",
+        http=httpx.AsyncClient(transport=httpx.MockTransport(api)),
+    )
+    assert await mem0.own_key("org-1")
+    with pytest.raises(MemoryProviderError, match="cannot be read"):
+        await mem0.forget("org-1", ["user-1"])
+    assert api.requests == []
+
+
+async def test_the_org_cleanup_stops_on_an_unreadable_key(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    from sama.datacontrols.delete import DataBusyError
+    from sama.datacontrols.service import ServiceCleanup
+    from sama.vault.crypto import VaultError
+    from sama.vault.store import OrgKey
+
+    class BrokenKeys(OrgKeys):
+        def __init__(self) -> None:
+            super().__init__(None, {})
+
+        async def lookup(self, org_id: str | uuid.UUID, name: SecretName) -> OrgKey:
+            raise VaultError("bad")
+
+    cleanup = ServiceCleanup(engine, memories=Mem0Provider(BrokenKeys()))
+    with pytest.raises(DataBusyError, match="Mem0"):
+        await cleanup.before_org_delete(tenant.org, tenant.ids["mia"])

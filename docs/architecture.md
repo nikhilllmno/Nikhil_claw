@@ -1700,8 +1700,8 @@ settings) or approves a `change_propose` of the target `profile`.
   with the user ids (migration `0039`). The purge worker deletes the memories of each user at
   Mem0. Without a key, there is nothing that sama can delete, and the row is done. An org with
   its own Mem0 key loses the key with the org (the vault rows cascade), so the cleanup before
-  an org delete deletes the memories of all its users first. When Mem0 fails, the org delete
-  stops with `409` and deletes nothing.
+  an org delete deletes the memories of all its users first. When Mem0 fails, or the key of
+  the org does not decrypt, the org delete stops with `409` and deletes nothing.
 - **Redaction.** The query of `memory_recall` goes through the redactor before it leaves. Each
   fact is redacted whole and then cut to 500 characters, so a cut cannot keep part of a secret.
 - **Not in the prompt.** Recall is a tool, not a part of the frozen prefix, so D9 holds and the

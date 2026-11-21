@@ -203,6 +203,12 @@ class Mem0Provider:
         await self._send(org_id, "POST", "/v1/memories/", json=body)
 
     async def forget(self, org_id: str, user_ids: Sequence[str]) -> None:
+        try:
+            await self._keys.get(org_id, SecretName.MEM0_API_KEY)
+        except VaultError:
+            # An own key that does not decrypt is not "no key": the memories can exist. Fail,
+            # so the org delete stops and the purge row tries again.
+            raise MemoryProviderError("the Mem0 key of the org cannot be read") from None
         for user_id in user_ids:
             response = await self._send(
                 org_id, "DELETE", "/v1/memories/", params={"user_id": mem0_user(org_id, user_id)}
