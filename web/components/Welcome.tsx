@@ -42,7 +42,7 @@ export function Welcome() {
     try {
       await api.createOrg(checked.name, null);
       done();
-      // A new owner continues with the setup guide (Section 17.5).
+      // A new owner continues with the setup guide (Section 17.6).
       router.push("/onboarding");
     } catch (e) {
       setError(errorText(e, "Could not create the org."));

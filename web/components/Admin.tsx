@@ -1,6 +1,6 @@
 "use client";
 
-// The admin area (docs/architecture.md, Section 17.5, M6.9). Only an org owner or admin sees
+// The admin area (docs/architecture.md, Section 17.6, M6.9). Only an org owner or admin sees
 // it. The frame chooses the org, shows the tabs, and gives the org to each admin page.
 
 import Link from "next/link";
@@ -113,6 +113,7 @@ export function AdminFrame({ children }: { children: React.ReactNode }) {
 
 const TILES = [
   { href: "/members", title: "Members", text: "Invite people, change roles, and choose their workspaces." },
+  { href: "/billing", title: "Billing", text: "The plan of the org, the cost against its quotas, and the payment." },
   { href: "/admin/usage", title: "Usage", text: "The model cost and the tokens of each day, person, agent, and model." },
   { href: "/admin/audit", title: "Audit log", text: "Who changed what in the org, and when." },
   { href: "/admin/changes", title: "Agent changes", text: "The history of the soul, the settings, and the tools of each agent." },

@@ -1,13 +1,14 @@
 "use client";
 
-// The setup guide after sign-up (docs/architecture.md, Section 17.5, M6.9): the org exists,
+// The setup guide after sign-up (docs/architecture.md, Section 17.6, M6.9): the org exists,
 // then the user connects a chat app, picks or creates an agent, and sends a first message. The
 // progress is kept in this browser for each org. Each step can be skipped or opened again.
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { errorText, type Org } from "@/lib/api";
+import { usd } from "@/lib/billing";
 import {
   currentStep,
   FIRST_PROMPTS,
@@ -25,6 +26,7 @@ import { ChatApps } from "./ChatApps";
 import { useData } from "./DataProvider";
 import { NewAgentForm } from "./NewAgentForm";
 import { ErrorState, LoadingState } from "./ui";
+import { useLoad } from "./useLoad";
 import { Welcome } from "./Welcome";
 import styles from "./Page.module.css";
 import own from "./Admin.module.css";
@@ -69,7 +71,7 @@ function Guide({ org }: { org: Org }) {
           Back to sessions
         </Link>
         <h1 className={styles.title}>Set up {org.name}</h1>
-        <p className={styles.meta}>Four short steps. You can skip a step and come back to it later.</p>
+        <p className={styles.meta}>Five short steps. You can skip a step and come back to it later.</p>
       </header>
       <ol className={own.steps}>
         {steps.map((step, index) => (
@@ -155,12 +157,69 @@ function StepPanel({
   onFinished: (sessionId: string) => void;
   onPickAgain: () => void;
 }) {
+  if (step === "plan") return <PlanStep org={org} onDone={onDone} />;
   if (step === "channel") return <ChannelStep org={org} onDone={onDone} />;
   if (step === "agent") return <AgentStep org={org} progress={progress} onDone={onDone} />;
   if (step === "message") {
     return <MessageStep org={org} progress={progress} onFinished={onFinished} onPickAgain={onPickAgain} />;
   }
   return null;
+}
+
+function PlanStep({ org, onDone }: { org: Org; onDone: (change: Partial<Progress>) => void }) {
+  const api = useApi();
+  const load = useCallback(() => api.billingPlans(), [api]);
+  const { data, error, reload } = useLoad(load, "Could not load the plans.");
+  const current = data?.plans.find((p) => p.name === org.plan) ?? null;
+  return (
+    <div className={styles.form}>
+      {error ? (
+        <p className={styles.error}>
+          {error}{" "}
+          <button type="button" className="btn btn-small" onClick={reload}>
+            Try again
+          </button>
+        </p>
+      ) : data === null ? (
+        <LoadingState label="Loading the plans" />
+      ) : (
+        <>
+          <ul className={own.choices}>
+            {data.plans.map((plan) => (
+              <li key={plan.name} className={`${own.choice} ${own.static}`} aria-current={plan.name === org.plan ? "true" : undefined}>
+                <span className={own.choiceText}>
+                  <strong>
+                    {plan.title}
+                    {plan.name === org.plan ? " (your plan)" : ""}
+                  </strong>
+                  <span className="hint">
+                    {plan.paid ? `${usd(plan.price_usd, "Price on request")} a month` : "Free"} ·{" "}
+                    {plan.max_members === null ? "No member limit" : `Up to ${plan.max_members} members`} ·{" "}
+                    {`Model use: ${usd(plan.model_usd_per_month)} a month`}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+          {!data.billing_enabled ? (
+            <p className={styles.meta}>This deployment of sama sells no plans. Your org keeps its plan.</p>
+          ) : !org.admin ? (
+            <p className={styles.meta}>An owner or an admin of {org.name} changes the plan.</p>
+          ) : null}
+        </>
+      )}
+      <div className={styles.actions}>
+        <button type="button" className="btn btn-primary btn-small" onClick={() => onDone({ plan: "kept" })}>
+          {`Keep the ${current?.title ?? org.plan} plan`}
+        </button>
+        {org.admin && data?.billing_enabled ? (
+          <Link href="/billing" className="btn btn-small">
+            Compare and buy plans
+          </Link>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function ChannelStep({ org, onDone }: { org: Org; onDone: (change: Partial<Progress>) => void }) {

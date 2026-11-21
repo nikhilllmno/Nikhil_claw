@@ -147,7 +147,7 @@ export default function HomePage() {
   );
 }
 
-/** The card that brings an admin back to the setup guide until it is done (Section 17.5). */
+/** The card that brings an admin back to the setup guide until it is done (Section 17.6). */
 function SetupCard({ org }: { org: Org | null }) {
   const [hidden, setHidden] = useState(false);
   if (org === null || hidden || !org.region_here) return null;

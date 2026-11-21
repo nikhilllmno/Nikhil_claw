@@ -1,5 +1,5 @@
 """Tests of the admin views and of the agent profile create route (docs/architecture.md,
-Section 17.5, M6.9)."""
+Section 17.6, M6.9)."""
 
 from __future__ import annotations
 

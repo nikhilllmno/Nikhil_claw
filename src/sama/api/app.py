@@ -2899,7 +2899,7 @@ class SamaApi:
             return view.as_json()
 
     def _admin_routes(self, app: FastAPI) -> None:
-        """The admin views of the web app (Section 17.5, M6.9): usage, audit log, and curator
+        """The admin views of the web app (Section 17.6, M6.9): usage, audit log, and curator
         reports. Only an org owner or admin reads them."""
         views = self._views
 

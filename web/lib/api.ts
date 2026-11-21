@@ -1024,7 +1024,7 @@ export interface NewAgentProfile {
   workspace_id?: string | null;
 }
 
-// -- admin views (Section 17.5, M6.9) -----------------------------------------------------------
+// -- admin views (Section 17.6, M6.9) -----------------------------------------------------------
 
 export interface UsageTotals {
   /** A decimal number as a string. */

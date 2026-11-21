@@ -1,6 +1,6 @@
 "use client";
 
-// The form for a new agent profile (docs/architecture.md, Section 17.5, M6.9). Only an org owner
+// The form for a new agent profile (docs/architecture.md, Section 17.6, M6.9). Only an org owner
 // or admin sees it. A template fills the name and the soul; the admin can change both. The new
 // agent gets the tools of a new org and the run budget of the plan.
 

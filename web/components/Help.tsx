@@ -1,6 +1,6 @@
 "use client";
 
-// The help pages (docs/architecture.md, Section 17.5, M6.9). They need no sign-in, so a person
+// The help pages (docs/architecture.md, Section 17.6, M6.9). They need no sign-in, so a person
 // who cannot sign in can read them too. The text is in `lib/help.ts`.
 
 import Link from "next/link";

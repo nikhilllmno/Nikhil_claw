@@ -1,6 +1,6 @@
 "use client";
 
-// The curator reports of the admin area (docs/architecture.md, Sections 9.7 and 17.5, M6.3 and
+// The curator reports of the admin area (docs/architecture.md, Sections 9.7 and 17.6, M6.3 and
 // M6.9): the weekly curator job of each workspace and its newest reports.
 
 import Link from "next/link";

@@ -1,4 +1,4 @@
-"""The admin views of the web app (docs/architecture.md, Section 17.5, M6.9): the usage, the
+"""The admin views of the web app (docs/architecture.md, Section 17.6, M6.9): the usage, the
 audit log, and the curator reports of an org.
 
 The API checks that the caller is an org owner or admin before it calls these methods. The

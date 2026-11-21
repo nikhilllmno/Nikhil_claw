@@ -341,6 +341,15 @@ a.tile:hover {
   background: var(--accent-soft);
 }
 
+/* A choice card that shows a fact, not a control. */
+.static {
+  cursor: default;
+}
+
+.choice[aria-current="true"] {
+  border-color: var(--accent);
+}
+
 .choice input {
   margin-top: var(--space-1);
   accent-color: var(--accent);

@@ -24,6 +24,7 @@ function memory() {
 const org = (over: Partial<Org> = {}) =>
   ({
     admin: true,
+    plan: "free",
     integrations: [],
     agent_profiles: [{ id: "p1", name: "sama", workspace_id: null, runtime: "claude_agent_sdk", model: "m" }],
     ...over,
@@ -47,23 +48,33 @@ describe("progress", () => {
 });
 
 describe("steps", () => {
-  it("starts at the chat app step", () => {
+  it("starts at the plan step", () => {
     const steps = onboardingSteps(org(), {});
-    expect(steps.map((s) => s.done)).toEqual([true, false, false, false]);
-    expect(currentStep(steps)).toBe("channel");
+    expect(steps.map((s) => s.id)).toEqual(["org", "plan", "channel", "agent", "message"]);
+    expect(steps.map((s) => s.done)).toEqual([true, false, false, false, false]);
+    expect(currentStep(steps)).toBe("plan");
+  });
+
+  it("counts a kept plan or a paid plan as done", () => {
+    expect(currentStep(onboardingSteps(org(), { plan: "kept" }))).toBe("channel");
+    expect(currentStep(onboardingSteps(org({ plan: "pro" }), {}))).toBe("channel");
+    const store = memory();
+    saveProgress(store, "o1", { plan: "kept" });
+    expect(loadProgress(store, "o1")).toEqual({ plan: "kept" });
   });
 
   it("counts an active chat app as done", () => {
     const active = org({ integrations: [{ kind: "slack", status: "active", name: "x" }] });
     expect(hasActiveChatApp(active)).toBe(true);
     expect(hasActiveChatApp(org({ integrations: [{ kind: "telegram", status: "pending", name: null }] }))).toBe(false);
-    expect(currentStep(onboardingSteps(active, {}))).toBe("agent");
+    expect(currentStep(onboardingSteps(active, { plan: "kept" }))).toBe("agent");
   });
 
   it("needs an agent that still exists", () => {
-    expect(currentStep(onboardingSteps(org(), { channel: "skipped", agentId: "gone" }))).toBe("agent");
-    expect(currentStep(onboardingSteps(org(), { channel: "skipped", agentId: "p1" }))).toBe("message");
-    expect(currentStep(onboardingSteps(org(), { channel: "skipped", agentId: "p1", done: true }))).toBeNull();
+    const base = { plan: "kept", channel: "skipped" } as const;
+    expect(currentStep(onboardingSteps(org(), { ...base, agentId: "gone" }))).toBe("agent");
+    expect(currentStep(onboardingSteps(org(), { ...base, agentId: "p1" }))).toBe("message");
+    expect(currentStep(onboardingSteps(org(), { ...base, agentId: "p1", done: true }))).toBeNull();
   });
 
   it("shows the setup card only to an admin with open steps", () => {

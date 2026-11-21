@@ -3179,8 +3179,8 @@ cross-org check of Section 17.1 through the API.
 | `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_approval`, then `RunQueue.release_decided`. `always_allow` writes the user rule. `409` if the approval is decided or expired. |
 | `GET /workspaces/{id}/memory`, `GET .../memory/{target}/revisions`, `PUT .../memory/{target}`, `POST .../memory/{target}/revisions/{seq}/revert` | The memory of the workspace (Section 8.1). `target` is `agent`, `user`, or `workspace`. The `agent` target needs `agent_profile_id` (query or body). `user` is the notes of the caller. A user who cannot see the workspace gets `404`. A `workspace` write needs a workspace admin (`403`). A change that is not valid gets `422`. |
 | `GET /sessions/{id}/questions`, `POST .../questions/{request_id}/answer` | The open `clarify` questions of the session, when the process has a `ClarifyBroker` (Section 16.7). |
-| `POST /orgs/{org_id}/agent-profiles` | Make an agent profile (an org owner or admin, `201`). `409` over 20 profiles (Section 17.5, M6.9). |
-| `GET /orgs/{org_id}/usage`, `GET /orgs/{org_id}/audit`, `GET /orgs/{org_id}/curator-reports` | The admin views: usage, audit log, and curator reports (an org owner or admin, Section 17.5, M6.9). |
+| `POST /orgs/{org_id}/agent-profiles` | Make an agent profile (an org owner or admin, `201`). `409` over 20 profiles (Section 17.6, M6.9). |
+| `GET /orgs/{org_id}/usage`, `GET /orgs/{org_id}/audit`, `GET /orgs/{org_id}/curator-reports` | The admin views: usage, audit log, and curator reports (an org owner or admin, Section 17.6, M6.9). |
 | `GET /orgs/{org_id}/session-search?q=&workspace_id=&limit=` | Search the sessions of the org that the user can read (M3.12, below). At most 10 hits. `q` has at most 400 characters (`422`). An empty `q` gives the latest sessions. |
 | `GET /sessions/{id}/export?format=markdown\|json` | The transcript as a file to download (M3.12, below). |
 | `GET /sessions/{id}/runs?limit=` | The runs of the session, newest first, with the token use and the cost. Default 50, at most 200. |
@@ -3387,7 +3387,7 @@ The web app routes are `/search`, `/memory`, `/skills`, `/settings`, and `/s/{id
 header has the export buttons and a link to the runs. The settings page shows the account, the
 chat apps of each org (an admin connects and disconnects the Telegram bot there), the linked chat
 accounts, and the agents. Since M6.9 an admin also connects the Slack app there, and the model
-keys moved to the admin area (Section 17.5).
+keys moved to the admin area (Section 17.6).
 
 **Not in M1.12.** `python -m sama.api` runs only the API. The control plane process (Section
 19.1) puts the API, the worker, and the tool server in one process, so that the API answers
@@ -6735,21 +6735,27 @@ changed the plan. It does not say that the payment is done before then.
 - When a subscription ends, the last usage (at most 5 minutes) can be missed.
 - Existing members stay when a plan with a lower member cap starts.
 
-### 17.5 Customer web app (M6.9)
+### 17.6 Customer web app (M6.9)
 
 The web app (`web/`) is ready for customers: a setup guide after sign-up, an admin area, a
 help center, and the same navigation, empty states, errors, and loading states on each page.
-The billing pages of M6.6 plug into the navigation and the setup guide.
+The Billing page of M6.6 (Section 17.5) is in the navigation, the setup guide, the admin
+overview, and the help.
 
 **Navigation.** The sidebar has the sessions, then three groups: Workspace (Jobs, Search,
-Memory, Skills, Connections), Agents, and Org (Members, Admin, Settings, Help). Only an org
-owner or admin sees Admin. A user without an org sees only the welcome page, Settings, and
+Memory, Skills, Connections), Agents, and Org (Members, Admin, Billing, Settings, Help). Only
+an owner or admin of an org sees Admin and Billing. A user without an org sees only the welcome page, Settings, and
 Help. While the setup guide has open steps, an admin sees "Finish the setup" in the sidebar and
 a card on the home page.
 
 **Setup guide (`/onboarding`).** After a person creates an org, the web app opens the guide.
-It has four steps: create the org (done), connect a chat app, pick or create an agent, and send
-a first message.
+It has five steps: create the org (done), choose a plan, connect a chat app, pick or create an
+agent, and send a first message.
+
+- Plan: the guide lists the plans of `GET /billing/plans` and marks the plan of the org. The
+  person keeps the plan, or an admin opens the Billing page to buy one (Section 17.5). The step
+  is done when the person keeps the plan or the org has a plan other than `free`. Without
+  billing (`billing_enabled` false), the guide says that the deployment sells no plans.
 
 - Chat app: an admin connects the Telegram bot or the Slack app of the org. The Slack form
   calls `POST /orgs/{org_id}/integrations/slack/setup`, shows the link that makes the Slack app
@@ -6777,7 +6783,9 @@ writes no history row: the history of Section 11.4 starts with the first change.
 
 **Admin area (`/admin`).** Only an org owner or admin sees it. The tabs are Overview, Usage,
 Audit log, Agent changes, Curator reports, Org keys and region, and Data controls. Members stays
-at `/members`, because every member reads it. For an org in another region the area shows the
+at `/members`, because every member reads it, and Billing stays at `/billing` (Section 17.5).
+The overview links to both. The usage tab shows the model cost of each day, person, agent, and
+model; the Billing page shows the cost against the quotas of the plan. For an org in another region the area shows the
 link to that deployment (Section 17.3).
 
 | Route | Who | Result |
@@ -6811,7 +6819,8 @@ Content-Disposition`, so the web app reads the file name of an export (Section 1
 **Help (`/help`).** The help pages need no sign-in. Each topic has short sections in
 ASD-STE100 Simplified Technical English and links to the pages that it explains: getting
 started, sessions and chat, agents, Telegram and Slack, connections, memory and skills, jobs
-and the task board, members and roles, the admin area, data and privacy, and troubleshooting.
+and the task board, members and roles, the admin area, plans and billing, data and privacy, and
+troubleshooting.
 The text is in `web/lib/help.ts`. The sign-in page links to it.
 
 ---

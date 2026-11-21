@@ -1,7 +1,7 @@
 "use client";
 
 // The change history of all the agents of the org (docs/architecture.md, Sections 11.4 and
-// 17.5, M6.1 and M6.9), newest first. The revert is on the page of each agent.
+// 17.6, M6.1 and M6.9), newest first. The revert is on the page of each agent.
 
 import Link from "next/link";
 import { useCallback, useState } from "react";

@@ -1,6 +1,6 @@
 "use client";
 
-// The usage page of the admin area (docs/architecture.md, Section 17.5, M6.9): the model cost
+// The usage page of the admin area (docs/architecture.md, Section 17.6, M6.9): the model cost
 // and the tokens of the org for 7, 30, or 90 UTC days, by day, person, agent, model, and key.
 
 import { useCallback, useState } from "react";

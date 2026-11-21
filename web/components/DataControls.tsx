@@ -1,6 +1,6 @@
 "use client";
 
-// The data controls (docs/architecture.md, Section 17.4) in the web app (Section 17.5, M6.9).
+// The data controls (docs/architecture.md, Section 17.4) in the web app (Section 17.6, M6.9).
 // `OrgData` is the admin page: the retention of the org, the export of the org (an owner), and
 // the delete of the org (an owner, who types the slug). `MyData` is on the settings page: each
 // user exports or deletes the own data in an org. A delete cannot be undone, so each one asks

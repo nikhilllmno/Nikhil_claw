@@ -1,4 +1,4 @@
-// The admin views of the web app (docs/architecture.md, Section 17.5, M6.9): usage, audit log,
+// The admin views of the web app (docs/architecture.md, Section 17.6, M6.9): usage, audit log,
 // data controls, curator reports, and the change history of the agents. The API checks every
 // rule again; these helpers only shape what the screens show.
 

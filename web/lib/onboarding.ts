@@ -1,5 +1,5 @@
-// The first-run flow after sign-up (docs/architecture.md, Section 17.5, M6.9): create the org,
-// connect a chat app, pick or create an agent, and send a first message. The progress of each
+// The first-run flow after sign-up (docs/architecture.md, Section 17.6, M6.9): create the org,
+// choose a plan, connect a chat app, pick or create an agent, and send a first message. The progress of each
 // org is kept in localStorage of this browser. It only chooses what the screens show: the API
 // checks every rule again.
 
@@ -8,9 +8,14 @@ import type { KeyValueStore } from "./pkce";
 
 export const ONBOARDING_PREFIX = "sama.onboarding.";
 
-export type StepId = "org" | "channel" | "agent" | "message";
+export type StepId = "org" | "plan" | "channel" | "agent" | "message";
+
+/** The plan that a new org starts on (Section 17.5). */
+export const START_PLAN = "free";
 
 export interface Progress {
+  /** The person kept the plan of the org. A paid plan counts as done without it. */
+  plan?: "kept";
   /** `connected`: a chat app is active. `skipped`: the user chose the web app only. */
   channel?: "connected" | "skipped";
   /** The agent that the user picked or created. */
@@ -37,6 +42,7 @@ export function loadProgress(store: KeyValueStore, orgId: string): Progress {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
     const progress: Progress = {};
+    if (value.plan === "kept") progress.plan = "kept";
     if (value.channel === "connected" || value.channel === "skipped") progress.channel = value.channel;
     if (typeof value.agentId === "string" && value.agentId !== "") progress.agentId = value.agentId;
     if (value.done === true) progress.done = true;
@@ -56,10 +62,19 @@ export function hasActiveChatApp(org: Pick<Org, "integrations">): boolean {
 }
 
 /** The steps of the guide for an org, with what is done. */
-export function onboardingSteps(org: Pick<Org, "integrations" | "agent_profiles">, progress: Progress): Step[] {
+export function onboardingSteps(
+  org: Pick<Org, "integrations" | "agent_profiles" | "plan">,
+  progress: Progress,
+): Step[] {
   const agentKnown = progress.agentId !== undefined && org.agent_profiles.some((p) => p.id === progress.agentId);
   return [
     { id: "org", title: "Create your org", hint: "Your org, a workspace, and an agent are ready.", done: true },
+    {
+      id: "plan",
+      title: "Choose a plan",
+      hint: "Your org starts on the free plan. Keep it, or buy a plan with larger quotas.",
+      done: progress.plan === "kept" || org.plan !== START_PLAN,
+    },
     {
       id: "channel",
       title: "Connect a chat app",
@@ -105,7 +120,10 @@ export function currentStep(steps: Step[]): StepId | null {
 }
 
 /** True when the home page shows the "Finish setting up" card for this org. */
-export function showSetupCard(org: Pick<Org, "admin" | "integrations" | "agent_profiles">, progress: Progress): boolean {
+export function showSetupCard(
+  org: Pick<Org, "admin" | "integrations" | "agent_profiles" | "plan">,
+  progress: Progress,
+): boolean {
   if (!org.admin || progress.done === true) return false;
   return currentStep(onboardingSteps(org, progress)) !== null;
 }

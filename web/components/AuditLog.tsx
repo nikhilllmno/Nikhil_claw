@@ -1,6 +1,6 @@
 "use client";
 
-// The audit log of the admin area (docs/architecture.md, Sections 17.1 and 17.5, M6.9): the
+// The audit log of the admin area (docs/architecture.md, Sections 17.1 and 17.6, M6.9): the
 // entries of the org, newest first, with a filter by kind and a button for older entries.
 
 import { useCallback, useState } from "react";

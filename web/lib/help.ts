@@ -1,4 +1,4 @@
-// The help pages of the web app (docs/architecture.md, Section 17.5, M6.9). The text is for
+// The help pages of the web app (docs/architecture.md, Section 17.6, M6.9). The text is for
 // customers, in ASD-STE100 Simplified Technical English. Each topic has short sections and
 // links to the pages that it explains.
 
@@ -38,7 +38,7 @@ export const HELP_TOPICS: HelpTopic[] = [
         steps: [
           "Create an account on the sign-in page with your email address. Confirm the email.",
           "Create an org. You become its owner. Sama adds a workspace called Main and an agent called sama.",
-          "Follow the setup guide: connect a chat app, pick or create an agent, and send a first message.",
+          "Follow the setup guide: choose a plan, connect a chat app, pick or create an agent, and send a first message.",
           "Invite your team on the Members page.",
         ],
       },
@@ -286,6 +286,40 @@ export const HELP_TOPICS: HelpTopic[] = [
     ],
   },
   {
+    id: "billing",
+    title: "Plans and billing",
+    summary: "Choose a plan, see the cost against the quotas, and change or cancel the plan.",
+    audience: "admin",
+    sections: [
+      {
+        heading: "Plans",
+        paragraphs: [
+          "A new org starts on the free plan. Each plan has quotas: the model cost in each month, the model cost of each person in each day, and the number of members.",
+          "When the org uses all of a quota, sama stops new runs and shows a message with a link to the Billing page.",
+        ],
+      },
+      {
+        heading: "Buy or change a plan (an owner or an admin)",
+        steps: [
+          "Open Billing in the sidebar.",
+          "Click the button of the plan that you want. Stripe opens and asks for the card.",
+          "After the payment, sama shows the new plan. This can take a few seconds.",
+          "To change the card, see the invoices, or cancel, click Payment method, invoices, and cancel.",
+        ],
+      },
+      {
+        heading: "Your own model keys",
+        paragraphs: [
+          "When the org uses its own Anthropic or OpenAI key, the cost of those calls goes to your key. The Usage page shows that cost as On org keys.",
+        ],
+      },
+    ],
+    links: [
+      { href: "/billing", label: "Billing" },
+      { href: "/admin/usage", label: "Usage" },
+    ],
+  },
+  {
     id: "data",
     title: "Your data and privacy",
     summary: "Export your data, delete it, and set how long sama keeps sessions.",
@@ -329,6 +363,7 @@ export const HELP_TOPICS: HelpTopic[] = [
           "Your sign-in ended: sign in again. Sama signs you out when the browser tab closes.",
           "You do not have permission to do this: ask an owner or an admin of your org.",
           "Too many requests: wait a minute, then try again. Your plan limits the messages in each minute.",
+          "The org used a quota of its plan: an owner or an admin buys a larger plan on the Billing page, or waits for the next month.",
           "The org is in another region: open the link to the deployment of that region.",
           "No key for a provider: an admin sets an org key on the Org keys page, or chooses a model of another provider.",
         ],
