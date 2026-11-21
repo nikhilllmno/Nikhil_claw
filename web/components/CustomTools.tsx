@@ -91,6 +91,8 @@ export function CustomToolsPanel({ workspaceId }: { workspaceId: string }) {
       <ToolEditor
         workspaceId={workspaceId}
         scopes={scopeChoices(scopes.data?.scopes ?? null)}
+        scopesError={scopes.error}
+        onRetryScopes={scopes.reload}
         open={open}
         onDone={done}
         onCancel={() => setOpen(null)}
@@ -170,7 +172,7 @@ function ToolCard({
           <span className="mono">{tool.tool_name}</span>
           <span className={tool.scope === "user" ? "badge" : "badge badge-accent"}>{SCOPE_LABELS[tool.scope]}</span>
           <span className="badge">{shown?.kind === "script" ? `${shown.script?.language} script` : "HTTP"}</span>
-          {tool.current_version === null ? <span className="badge badge-warning">Not approved</span> : null}
+          {tool.current_version === null ? <span className="badge badge-warning">No running version</span> : null}
         </div>
         <span className={styles.meta}>{toolState(tool)}</span>
       </div>
@@ -434,6 +436,8 @@ function History({ tool, onChanged }: { tool: CustomTool; onChanged: (notice: st
 function ToolEditor({
   workspaceId,
   scopes,
+  scopesError,
+  onRetryScopes,
   open,
   onDone,
   onCancel,
@@ -441,6 +445,9 @@ function ToolEditor({
   workspaceId: string;
   /** The scopes in which the user can add a tool. */
   scopes: CustomToolScope[];
+  /** Set when the scopes did not load: the form offers "Only me" and a retry. */
+  scopesError: string | null;
+  onRetryScopes: () => void;
   open: Exclude<Open, null>;
   onDone: (notice: string) => void;
   onCancel: () => void;
@@ -478,7 +485,7 @@ function ToolEditor({
       return;
     }
     // Only a person who manages the scope reaches this form, so the credential goes with it.
-    const body = createBody(draft, true);
+    const body = createBody(draft);
     if (typeof body === "string") {
       setError(body);
       return;
@@ -529,7 +536,14 @@ function ToolEditor({
                 </option>
               ))}
             </select>
-            {scopes.length === 1 ? (
+            {scopesError ? (
+              <span className="hint" role="alert">
+                The scopes that you can use did not load, so only &quot;Only me&quot; shows.{" "}
+                <button type="button" className="btn btn-quiet btn-small" onClick={onRetryScopes}>
+                  Try again
+                </button>
+              </span>
+            ) : scopes.length === 1 ? (
               <span className="hint">An admin adds the tools for the workspace and for the org.</span>
             ) : null}
           </label>
@@ -802,8 +816,8 @@ function ScriptFields({ draft, set }: { draft: Draft; set: Setter }) {
   );
 }
 
-/** The whole definition of one version, so an admin reads a proposal before approving it, and
- *  a test of that version. The definition never holds a credential. */
+/** The whole definition of one version, and a test of that version for a person who manages the
+ *  tool. The definition never holds a credential. */
 function VersionDetails({ tool, version }: { tool: CustomTool; version: CustomToolVersion }) {
   const { kind, description, input_schema, policy, http, script } = version;
   const shown = {
@@ -820,7 +834,7 @@ function VersionDetails({ tool, version }: { tool: CustomTool; version: CustomTo
       <pre className={styles.pre} aria-label={`Definition of version ${version.version}`}>
         {JSON.stringify(shown, null, 2)}
       </pre>
-      {tool.can_manage && version.review !== "rejected" ? <TestPanel tool={tool} version={version} /> : null}
+      {tool.can_manage ? <TestPanel tool={tool} version={version} /> : null}
     </details>
   );
 }

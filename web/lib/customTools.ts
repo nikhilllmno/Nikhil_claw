@@ -246,12 +246,12 @@ export function credentialOf(draft: Draft): CustomToolCredential | null {
 }
 
 /** The body of a new tool, or the first problem of the draft. */
-export function createBody(draft: Draft, canSetCredential: boolean): CustomToolCreate | string {
+export function createBody(draft: Draft): CustomToolCreate | string {
   if (!NAME_PATTERN.test(draft.name))
     return "The name must have 2 to 40 characters: lower-case letters, digits, and _, and start with a letter.";
   const definition = definitionOf(draft);
   if (typeof definition === "string") return definition;
-  const credential = canSetCredential ? credentialOf(draft) : null;
+  const credential = credentialOf(draft);
   return {
     ...definition,
     name: draft.name,

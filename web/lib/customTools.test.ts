@@ -28,7 +28,7 @@ describe("custom tools", () => {
       responseFields: "id, name ,",
       secret: "k-1",
     };
-    const body = createBody(draft, true);
+    const body = createBody(draft);
     expect(typeof body).toBe("object");
     if (typeof body === "string") return;
     expect(body.http).toEqual({
@@ -44,8 +44,6 @@ describe("custom tools", () => {
       },
     });
     expect(body.credential).toEqual({ value: "k-1" });
-    // A member who cannot set the credential sends none.
-    expect((createBody(draft, false) as { credential: unknown }).credential).toBeNull();
   });
 
   it("turns a script draft into a definition", () => {
@@ -65,7 +63,7 @@ describe("custom tools", () => {
 
   it("finds the problems of a draft", () => {
     const good = { ...emptyDraft("http"), name: "ok_name", description: "x" };
-    expect(createBody({ ...good, name: "Bad" }, true)).toMatch(/name/);
+    expect(createBody({ ...good, name: "Bad" })).toMatch(/name/);
     expect(definitionOf({ ...good, description: " " })).toMatch(/description/);
     expect(definitionOf({ ...good, schema: "{" })).toMatch(/not valid JSON/);
     expect(definitionOf({ ...good, schema: '{"type": "array"}' })).toMatch(/type/);

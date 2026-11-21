@@ -562,7 +562,7 @@ class CustomToolService:
             if not can_manage(row.scope, grants, row.workspace_id, row.user_id):
                 raise CustomToolError(_ADMIN_ONLY, status_code=403)
             if row.current_version is None:
-                raise CustomToolError("approve a version of the tool first", status_code=409)
+                raise CustomToolError("the tool has no running version", status_code=409)
             version = (
                 await connection.execute(
                     select(CustomToolVersion).where(
