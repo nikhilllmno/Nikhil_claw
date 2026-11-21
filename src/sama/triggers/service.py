@@ -1034,7 +1034,17 @@ def _header_id(headers: Mapping[str, str]) -> str | None:
 
 
 async def _write_delivery(connection: AsyncConnection, values: dict[str, Any]) -> None:
-    """Inserts a row of the delivery log and deletes the rows over the limit of the trigger."""
+    """Inserts a row of the delivery log and deletes the rows over the limit of the trigger. A
+    lock of the trigger, until the end of the transaction, puts the writes of one trigger in a
+    sequence, so two deliveries at the same time cannot both miss the row of the other. It is
+    the last lock of each transaction that takes it, so it cannot make a deadlock."""
+    await connection.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                func.hashtextextended(f"sama.trigger-deliveries:{values['trigger_id']}", 0)
+            )
+        )
+    )
     await connection.execute(insert(TriggerDelivery).values(**values))
     newest = (
         select(TriggerDelivery.id)

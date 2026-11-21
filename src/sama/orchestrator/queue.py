@@ -95,6 +95,7 @@ from sama.review import policy as review_policy
 from sama.review.transcript import build_transcript
 from sama.review.trigger import after_completed_run
 from sama.runtime.contract import (
+    BUDGET_KEYS,
     MAX_COMPACT_FOCUS_CHARS,
     ApprovalDecision,
     FailureCode,
@@ -257,9 +258,6 @@ def _check_quota(row: Any) -> None:
             " again tomorrow (UTC), or ask an org admin to change the plan on the Billing page.",
             "model_usd_per_user_day",
         )
-
-
-BUDGET_KEYS: Final = ("max_turns", "max_tokens", "max_cost_usd", "max_wall_time_s")
 
 
 def narrow_budget(
@@ -512,6 +510,11 @@ class RunQueue:
                     ),
                 )
                 .where(Session.org_id == org_id, Session.id == session_id)
+                # A share lock on the session row, after the rate lock: an archive of the
+                # session (``PATCH /sessions/{id}``) takes the row for update, so it waits for
+                # this enqueue or this enqueue sees the new status (M7.10). The run insert
+                # takes the same share lock.
+                .with_for_update(read=True, of=Session)
             )
         ).one_or_none()
         if session is None:

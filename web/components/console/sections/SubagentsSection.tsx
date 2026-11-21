@@ -4,7 +4,7 @@
 // prompt and tools that the agent can hand work to. The whole list is saved through
 // `PATCH /orgs/{org_id}/agent-profiles/{id}` (`subagents`).
 
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { type AgentProfile, errorText } from "@/lib/api";
 import { canManageAgents } from "@/lib/console";
 import {
@@ -17,17 +17,14 @@ import {
   validateDraft,
 } from "@/lib/profile";
 import { useApi } from "../../AuthProvider";
-import { useData } from "../../DataProvider";
-import { ErrorState, LoadingState } from "../../ui";
-import { useLoad } from "../../useLoad";
+import { ToneBadge } from "../../ui";
 import styles from "../../Page.module.css";
 import admin from "../../Admin.module.css";
-import { ToneBadge, useAgentChoice } from "../kit";
-import { ComingCard, ProfilePicker, SectionHeader } from "../parts";
+import { AgentProfileEditor, ComingCard, SectionHeader, useAgentChoice } from "../parts";
 
 export function SubagentsSection() {
-  const { org, profileId, setProfileId } = useAgentChoice();
-  const mayManage = canManageAgents(org);
+  const choice = useAgentChoice();
+  const mayManage = canManageAgents(choice.org);
 
   return (
     <>
@@ -35,43 +32,16 @@ export function SubagentsSection() {
         id="subagents"
         meta={mayManage ? null : "Only an org admin with the right to manage agents can change sub-agents."}
       />
-      {profileId === null ? (
-        <div className="state">
-          <h2>No agents</h2>
-          <p>This org has no agent yet. Make one in the section Harness.</p>
-        </div>
-      ) : (
-        <>
-          <ProfilePicker profiles={org.agent_profiles} value={profileId} onChange={setProfileId} />
-          <AgentSubagents key={profileId} orgId={org.id} profileId={profileId} manage={mayManage} />
-        </>
-      )}
+      <AgentProfileEditor choice={choice}>
+        {({ profile, readOnly, onSaved }) => (
+          <SubagentList orgId={choice.org.id} profile={profile} readOnly={readOnly} onSaved={onSaved} />
+        )}
+      </AgentProfileEditor>
       <ComingCard title="Sub-agent library">
         Personal, workspace, and org sub-agents will come with the sub-agent library. Today a sub-agent belongs to one
         agent.
       </ComingCard>
     </>
-  );
-}
-
-function AgentSubagents({ orgId, profileId, manage }: { orgId: string; profileId: string; manage: boolean }) {
-  const api = useApi();
-  const { reloadMe } = useData();
-  const load = useCallback(() => api.getAgentProfile(orgId, profileId), [api, orgId, profileId]);
-  const { data: profile, setData: setProfile, error, reload } = useLoad(load, "Could not load the agent.");
-
-  if (error) return <ErrorState title="The agent did not load" message={error} onRetry={reload} />;
-  if (profile === null) return <LoadingState label="Loading the agent" />;
-  return (
-    <SubagentList
-      orgId={orgId}
-      profile={profile}
-      readOnly={!manage || !profile.editable}
-      onSaved={(saved) => {
-        setProfile(saved);
-        reloadMe();
-      }}
-    />
   );
 }
 

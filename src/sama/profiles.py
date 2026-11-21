@@ -32,6 +32,7 @@ from sama.db.models import AgentProfile, AuditEntry, Membership, Org, ProfileCha
 from sama.gate.decide import TOOLSETS
 from sama.orgs.plans import plan_of
 from sama.runtime.contract import (
+    BUDGET_KEYS,
     REASONING_EFFORTS,
     SUBAGENT_DESCRIPTION_MAX_CHARS,
     SUBAGENT_MAX_TURNS,
@@ -80,8 +81,6 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "policy": ("rules",),
 }
 """The fields of each kind of change. ``rules`` are the policy rules of the profile."""
-BUDGET_KEYS: Final = ("max_turns", "max_cost_usd", "max_wall_time_s", "max_tokens")
-"""The keys of the run budget of a profile (``sama.runtime.contract.Budget``)."""
 MAX_TURNS_LIMIT: Final = 10_000
 MAX_WALL_TIME_LIMIT: Final = 86_400.0
 MAX_PROFILES_PER_ORG: Final = 20

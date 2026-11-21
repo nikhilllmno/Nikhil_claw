@@ -963,3 +963,30 @@ async def test_composio_deliveries_have_rows_when_the_trigger_is_known(
         ("accepted", 202, "m_1"),
         ("bad_signature", 401, "msg_forged"),
     ]
+
+
+async def test_parallel_deliveries_keep_exactly_200_rows_for_a_trigger(
+    hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, vault: Vault
+) -> None:
+    trigger, _ = await make_hook(hooks, tenant)
+    service = TriggerService(engine, queue=RunQueue(engine), vault=vault)
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(select(Trigger).where(Trigger.id == uuid.UUID(trigger["id"])))
+        ).one()
+
+    for batch in range(8):  # 8 rounds of 30: more than 200 rows, with 30 connections at a time
+        await asyncio.gather(
+            *(service._record(row, "rejected", 401, f"p_{batch}_{n}") for n in range(30))
+        )
+        async with engine.connect() as connection:
+            count = await connection.scalar(
+                select(func.count()).where(TriggerDelivery.trigger_id == row.id)
+            )
+        assert count == min(30 * (batch + 1), 200)
+
+    async with engine.connect() as connection:
+        count = await connection.scalar(
+            select(func.count()).where(TriggerDelivery.trigger_id == row.id)
+        )
+    assert count == 200

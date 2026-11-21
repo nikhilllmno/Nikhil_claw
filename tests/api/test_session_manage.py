@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import AuditEntry, Session
+from sama.orchestrator.queue import QueueError, RunQueue
 from tests.api.conftest import bearer
 from tests.api.test_app import add_user, mia
 from tests.orchestrator.conftest import Tenant
@@ -57,6 +59,7 @@ async def test_the_owner_renames_a_private_session(
         "created_at",
         "lineage",
         "parent_session_id",
+        "can_manage",
     }
     assert await audit_actions(engine, mine) == ["session.renamed"]
     again = await client.patch(
@@ -201,3 +204,92 @@ async def test_a_compaction_keeps_its_status(
     assert await status_of(engine, archive) == "archived"
     assert await status_of(engine, live) == "active"
     assert rename.status_code == 200
+
+
+async def test_an_enqueue_waits_for_an_archive_of_the_session_and_then_refuses(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    mine = tenant.ids["mine"]
+    queue = RunQueue(engine)
+    async with engine.connect() as holder, holder.begin():
+        # The archive holds the row for update.
+        await holder.execute(select(Session.id).where(Session.id == mine).with_for_update())
+        task = asyncio.create_task(
+            queue.enqueue(
+                org_id=tenant.org, session_id=mine, text="late", user_id=tenant.ids["mia"]
+            )
+        )
+        await asyncio.sleep(0.3)
+        assert not task.done(), "the enqueue waits for the lock of the row"
+        await holder.execute(update(Session).where(Session.id == mine).values(status="archived"))
+    with pytest.raises(QueueError, match="not active"):
+        await task
+
+
+async def test_an_archive_waits_for_an_enqueue_and_then_sees_the_open_run(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    mine = tenant.ids["mine"]
+    queue = RunQueue(engine)
+    async with engine.connect() as holder, holder.begin():
+        await queue.enqueue_in(
+            holder, org_id=tenant.org, session_id=mine, text="first", user_id=tenant.ids["mia"]
+        )
+        task = asyncio.create_task(
+            client.patch(f"/sessions/{mine}", headers=mia(tenant), json={"status": "archived"})
+        )
+        await asyncio.sleep(0.3)
+        assert not task.done(), "the archive waits for the enqueue"
+    response = await task
+    assert response.status_code == 409
+    assert await status_of(engine, mine) == "active"
+
+
+async def test_each_session_answer_says_if_the_caller_can_manage_it(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    mine, shared = str(tenant.ids["mine"]), str(tenant.ids["s1"])
+    admin = bearer(await add_user(engine, tenant, workspace_member=False, role="admin"))
+    member = bearer(await add_user(engine, tenant, workspace_member=True))
+
+    async def listed(headers: dict[str, str]) -> dict[str, bool]:
+        rows = (await client.get("/sessions", headers=headers)).json()
+        return {row["id"]: row["can_manage"] for row in rows}
+
+    owner_view = await listed(mia(tenant))
+    assert (owner_view[mine], owner_view[shared]) == (True, False)
+    admin_view = await listed(admin)
+    assert admin_view[shared] is True
+    assert mine not in admin_view, "a private session of another user stays hidden"
+    assert (await listed(member))[shared] is False
+    detail = (await client.get(f"/sessions/{mine}", headers=mia(tenant))).json()
+    assert detail["can_manage"] is True
+    assert (await client.get(f"/sessions/{shared}", headers=mia(tenant))).json()[
+        "can_manage"
+    ] is False
+    assert (await client.get(f"/sessions/{shared}", headers=admin)).json()["can_manage"] is True
+    created = await client.post(
+        "/sessions",
+        headers=mia(tenant),
+        json={
+            "workspace_id": str(tenant.ids["ws"]),
+            "agent_profile_id": str(tenant.ids["profile"]),
+        },
+    )
+    assert created.json()["can_manage"] is True
+    shared_new = await client.post(
+        "/sessions",
+        headers=mia(tenant),
+        json={
+            "workspace_id": str(tenant.ids["ws"]),
+            "agent_profile_id": str(tenant.ids["profile"]),
+            "audience": "shared",
+        },
+    )
+    assert shared_new.json()["can_manage"] is False
+    patched = await client.patch(f"/sessions/{shared}", headers=admin, json={"title": "t"})
+    assert patched.json()["can_manage"] is True
+    # The flag agrees with the PATCH rule.
+    assert (
+        await client.patch(f"/sessions/{shared}", headers=mia(tenant), json={"title": "x"})
+    ).status_code == 403

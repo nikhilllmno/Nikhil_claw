@@ -1,7 +1,20 @@
 // Small shared pieces for the states that every screen has: loading, error with retry, and the
 // screen of a sign-in status that has no content yet.
 
+import type { Tone } from "@/lib/jobs";
 import type { Status } from "./AuthProvider";
+
+const TONE_CLASS: Record<Tone, string> = {
+  accent: "badge badge-accent",
+  warning: "badge badge-warning",
+  danger: "badge badge-danger",
+  neutral: "badge",
+};
+
+/** A small status label. The tone gives the color. */
+export function ToneBadge({ tone, children }: { tone: Tone; children: React.ReactNode }) {
+  return <span className={TONE_CLASS[tone]}>{children}</span>;
+}
 
 function Spinner({ label }: { label?: string }) {
   return (

@@ -65,3 +65,11 @@ export function emptyText(filter: SessionFilter, workspaceName: string): string 
 export function maybeTruncated(total: number): boolean {
   return total >= LIST_LIMIT;
 }
+
+/**
+ * True when the screen offers rename, archive, and restore for the session. An API without
+ * `can_manage` (an old API) gives `true`, and the API still checks each change.
+ */
+export function canManageSession(session: Pick<SessionOut, "can_manage">): boolean {
+  return session.can_manage !== false;
+}

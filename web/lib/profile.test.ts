@@ -42,7 +42,11 @@ const profile: AgentProfile = {
       subagent_prompt_max_chars: 20000,
       subagent_max_turns: 50,
     },
+    reasoning_efforts: ["low", "medium", "high"],
+    budget_caps: { max_turns: null, max_cost_usd: null, max_wall_time_s: null },
   },
+  budget: { max_turns: null, max_cost_usd: null, max_wall_time_s: null, max_tokens: null },
+  reasoning_effort: null,
 };
 
 describe("diffDraft", () => {

@@ -391,3 +391,42 @@ async def test_only_a_manager_enables_a_connection(
     assert (
         await web.post(f"/connections/{connection_id}/enable", headers=other)
     ).status_code == 404
+
+
+async def test_each_connection_answer_says_if_the_caller_can_manage_it(
+    web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, fake: FakeComposio
+) -> None:
+    await make_admin(engine, tenant)
+    mine = (await web.post(path(tenant), headers=mia(tenant), json={"connector": "gmail"})).json()
+    assert mine["connection"]["can_manage"] is True
+    shared = (
+        await web.post(
+            path(tenant),
+            headers=mia(tenant),
+            json={"connector": "notion", "scope": "workspace"},
+        )
+    ).json()
+    assert shared["connection"]["can_manage"] is True
+    member = bearer(await add_user(engine, tenant, workspace_member=True))
+
+    as_member = {
+        c["id"]: c["can_manage"] for c in (await web.get(path(tenant), headers=member)).json()
+    }
+    assert as_member == {shared["connection"]["id"]: False}
+    as_admin = {
+        c["id"]: c["can_manage"] for c in (await web.get(path(tenant), headers=mia(tenant))).json()
+    }
+    assert as_admin == {mine["connection"]["id"]: True, shared["connection"]["id"]: True}
+    # The detail answers of the actions have it too, and it follows the manage rule.
+    fake.status = "ACTIVE"
+    checked = await web.post(f"/connections/{mine['connection']['id']}/check", headers=mia(tenant))
+    assert checked.json()["can_manage"] is True
+    seen = await web.post(f"/connections/{shared['connection']['id']}/check", headers=member)
+    assert seen.status_code == 200
+    assert seen.json()["can_manage"] is False
+    disabled = await web.post(
+        f"/connections/{mine['connection']['id']}/disable", headers=mia(tenant)
+    )
+    assert disabled.json()["can_manage"] is True
+    enabled = await web.post(f"/connections/{mine['connection']['id']}/enable", headers=mia(tenant))
+    assert enabled.json()["can_manage"] is True

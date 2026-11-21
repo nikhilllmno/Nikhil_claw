@@ -10,8 +10,6 @@ import {
   newTriggerDraft,
   outcomeLabel,
   outcomeTone,
-  parseConfig,
-  parsePayload,
   targetText,
   toTriggerDraft,
   triggerStatusLabel,
@@ -94,23 +92,6 @@ describe("permissions and choices", () => {
       ({ id, workspace_id, status }) as Workflow;
     const list = [flow("a", "w1", "active"), flow("b", "w2", "active"), flow("c", "w1", "removed"), flow("d", "w1", "paused")];
     expect(workflowChoices(list, "w1").map((w) => w.id)).toEqual(["a", "d"]);
-  });
-});
-
-describe("payload and config", () => {
-  it("parses a payload", () => {
-    expect(parsePayload("")).toEqual({ ok: true, payload: null });
-    expect(parsePayload('{"a":1}')).toEqual({ ok: true, payload: { a: 1 } });
-    expect(parsePayload("[1]").ok).toBe(false);
-    expect(parsePayload("{").ok).toBe(false);
-    const big = JSON.stringify({ x: "a".repeat(20_001) });
-    expect(parsePayload(big)).toEqual({ ok: false, error: "The payload has more than 20,000 bytes." });
-  });
-
-  it("parses a config", () => {
-    expect(parseConfig("")).toEqual({ ok: true, config: null });
-    expect(parseConfig('{"repo":"x"}')).toEqual({ ok: true, config: { repo: "x" } });
-    expect(parseConfig("nope")).toEqual({ ok: false, error: "The config is not valid JSON." });
   });
 });
 

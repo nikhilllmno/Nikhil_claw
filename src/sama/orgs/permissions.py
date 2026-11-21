@@ -22,7 +22,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AuditEntry, OrgRolePermission
-from sama.tenancy.access import Grants, lock_grants
+from sama.tenancy.access import Grants, load_grants, lock_grants
 
 ROLES: Final = ("admin", "member")
 MAX_CHANGES: Final = 20
@@ -181,6 +181,17 @@ async def require(connection: AsyncConnection, org_id: uuid.UUID, grants: Grants
     stored = await stored_rows(connection, org_id)
     if not stored.get((role, key), True):
         raise PermissionDeniedError(permission.label)
+
+
+async def require_user(
+    connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID | None, key: str
+) -> None:
+    """``require`` for the user row of an actor. The service write paths call it, so the API and
+    the agent tools refuse in the same way. Without a user (a run with no user), nothing is
+    checked: a person did not ask for the write. Raises ``PermissionDeniedError``."""
+    if user_id is None:
+        return
+    await require(connection, org_id, await load_grants(connection, org_id, user_id), key)
 
 
 class RolePermissions:

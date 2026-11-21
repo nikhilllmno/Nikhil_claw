@@ -8,7 +8,6 @@ import { type AgentProfileSummary, type Job, type JobFire, type SchedulePreview,
 import {
   type JobAction,
   type JobDraft,
-  type Tone,
   CURATOR_TEXT,
   approvalNotice,
   availableActions,
@@ -33,22 +32,11 @@ import {
 } from "@/lib/jobs";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
-import { ErrorState, LoadingState } from "./ui";
+import { ErrorState, LoadingState, ToneBadge } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./Jobs.module.css";
 
 type View = { kind: "list" } | { kind: "new" } | { kind: "detail"; id: string } | { kind: "edit"; job: Job };
-
-const TONE_CLASS: Record<Tone, string> = {
-  accent: "badge badge-accent",
-  warning: "badge badge-warning",
-  danger: `badge ${styles.badgeDanger}`,
-  neutral: "badge",
-};
-
-function Badge({ tone, children }: { tone: Tone; children: React.ReactNode }) {
-  return <span className={TONE_CLASS[tone]}>{children}</span>;
-}
 
 /**
  * True inside the settings console (M7.10): the screen has no page frame and its titles are `h2`,
@@ -256,7 +244,7 @@ function JobList({
                   <button type="button" className={styles.jobName} onClick={() => onOpen(job)}>
                     {job.name}
                   </button>
-                  <Badge tone={statusTone(job.status)}>{statusLabel(job.status)}</Badge>
+                  <ToneBadge tone={statusTone(job.status)}>{statusLabel(job.status)}</ToneBadge>
                 </div>
                 <dl className={styles.details}>
                   <dt>Schedule</dt>
@@ -389,7 +377,7 @@ function JobDetail({
           <Title ref={headingRef} tabIndex={-1}>
             {job.name}
           </Title>
-          <Badge tone={statusTone(job.status)}>{statusLabel(job.status)}</Badge>
+          <ToneBadge tone={statusTone(job.status)}>{statusLabel(job.status)}</ToneBadge>
         </div>
         <p className={styles.meta}>
           Version {job.version} · made by {creatorLabel(job.created_by_kind)}
@@ -584,7 +572,7 @@ function FireItem({ fire, tz }: { fire: JobFire; tz: string | undefined }) {
           {formatWhen(fire.scheduled_for, tz)}
           {fire.manual ? " · started by you" : ""}
         </span>
-        <Badge tone={fireStatusTone(fire.status)}>{fireStatusLabel(fire.status)}</Badge>
+        <ToneBadge tone={fireStatusTone(fire.status)}>{fireStatusLabel(fire.status)}</ToneBadge>
       </div>
       {fire.error ? (
         <p className="alert alert-error" role="note">
@@ -596,7 +584,7 @@ function FireItem({ fire, tz }: { fire: JobFire; tz: string | undefined }) {
         <ul className={styles.receipts} aria-label="Delivery receipts">
           {fire.deliveries.map((delivery, index) => (
             <li key={`${delivery.target}-${index}`} className={styles.receipt}>
-              <Badge tone={deliveryStatusTone(delivery.status)}>{deliveryStatusLabel(delivery.status)}</Badge>
+              <ToneBadge tone={deliveryStatusTone(delivery.status)}>{deliveryStatusLabel(delivery.status)}</ToneBadge>
               <span>{formatTarget(delivery.target)}</span>
               {delivery.error ? <span className={styles.errorText}>{delivery.error}</span> : null}
             </li>

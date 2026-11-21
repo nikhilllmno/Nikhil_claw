@@ -19,13 +19,12 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import delete, func, insert, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy import insert
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import AuditEntry, ToolPolicy
+from sama.db.models import AuditEntry
 from sama.gate.decide import DEFAULT_ALLOW, TOOLSETS, always_asks
-from sama.profile_changes import MAX_RULES, POLICY_KEY, check_rules, profile_rules, write_change
+from sama.profile_changes import MAX_RULES, check_rules, profile_rules, set_rule, write_change
 from sama.profiles import ProfileError, lock_admin
 from sama.subagents import lock_profile
 
@@ -66,18 +65,6 @@ def _sorted_rules(rules: dict[str, str]) -> list[dict[str, str]]:
     return [{"tool": tool, "action": action} for tool, action in sorted(rules.items())]
 
 
-async def org_rules(connection: AsyncConnection, org_id: uuid.UUID) -> dict[str, str]:
-    """The org rules as ``{tool: action}``: no profile and no user."""
-    rows = await connection.execute(
-        select(ToolPolicy.tool, ToolPolicy.action).where(
-            ToolPolicy.org_id == org_id,
-            ToolPolicy.agent_profile_id.is_(None),
-            ToolPolicy.user_id.is_(None),
-        )
-    )
-    return {str(tool): str(action) for tool, action in rows}
-
-
 async def profile_view(
     engine: AsyncEngine,
     org_id: uuid.UUID,
@@ -89,7 +76,7 @@ async def profile_view(
     """The answer of ``GET .../agent-profiles/{id}/tool-policy``."""
     async with engine.connect() as connection:
         rules = await profile_rules(connection, org_id, profile_id)
-        org = await org_rules(connection, org_id)
+        org = await profile_rules(connection, org_id, None)
     return {
         "editable": editable,
         "max_rules": MAX_RULES,
@@ -102,7 +89,7 @@ async def profile_view(
 async def org_view(engine: AsyncEngine, org_id: uuid.UUID, *, editable: bool) -> dict[str, Any]:
     """The answer of ``GET .../orgs/{id}/tool-policy``."""
     async with engine.connect() as connection:
-        org = await org_rules(connection, org_id)
+        org = await profile_rules(connection, org_id, None)
     return {"editable": editable, "max_rules": MAX_RULES, "rules": _sorted_rules(org)}
 
 
@@ -155,34 +142,12 @@ async def set_org_rules(
     wanted = _wanted(rules)
     async with engine.begin() as connection:
         await lock_admin(connection, org_id, actor_user_id)
-        current = await org_rules(connection, org_id)
+        current = await profile_rules(connection, org_id, None, list(wanted), lock=True)
         changed = {tool: action for tool, action in wanted.items() if current.get(tool) != action}
         if not changed:
             return
         for tool, action in changed.items():
-            if action is None:
-                await connection.execute(
-                    delete(ToolPolicy).where(
-                        ToolPolicy.org_id == org_id,
-                        ToolPolicy.agent_profile_id.is_(None),
-                        ToolPolicy.user_id.is_(None),
-                        ToolPolicy.tool == tool,
-                    )
-                )
-                continue
-            statement = pg_insert(ToolPolicy).values(
-                org_id=org_id,
-                agent_profile_id=None,
-                user_id=None,
-                tool=tool,
-                action=action,
-                created_by_user_id=actor_user_id,
-            )
-            await connection.execute(
-                statement.on_conflict_do_update(
-                    constraint=POLICY_KEY, set_={"action": action, "updated_at": func.now()}
-                )
-            )
+            await set_rule(connection, org_id, None, tool, action, actor_user_id)
         await connection.execute(
             insert(AuditEntry).values(
                 org_id=org_id,

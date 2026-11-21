@@ -32,6 +32,7 @@ from sama.db.models import (
     Workspace,
 )
 from sama.orchestrator.queue import QueueError, RunQueue
+from sama.orgs import permissions
 from sama.scheduler import schedule as sched
 from sama.scheduler.fire import FireBlockedError, fire_running, owner_email, start_fire
 from sama.scheduler.spec import (
@@ -338,6 +339,12 @@ class JobService:
         if given.schedule is None:
             raise JobError("a job needs a schedule")
         async with self._engine.begin() as connection:
+            try:
+                await permissions.require_user(
+                    connection, actor.org_id, actor.user_id, "jobs.create"
+                )
+            except permissions.PermissionDeniedError as error:
+                raise JobError(str(error)) from None
             count = (
                 await connection.execute(
                     select(func.count()).where(

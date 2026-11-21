@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { SessionOut } from "./api";
 import {
   archiveConfirmText,
+  canManageSession,
   checkTitle,
   emptyText,
   maybeTruncated,
@@ -94,5 +95,16 @@ describe("text", () => {
   it("knows when the list is full", () => {
     expect(maybeTruncated(100)).toBe(true);
     expect(maybeTruncated(99)).toBe(false);
+  });
+});
+
+describe("canManageSession", () => {
+  it("follows can_manage", () => {
+    expect(canManageSession({ can_manage: true })).toBe(true);
+    expect(canManageSession({ can_manage: false })).toBe(false);
+  });
+
+  it("treats a missing can_manage as true", () => {
+    expect(canManageSession({})).toBe(true);
   });
 });

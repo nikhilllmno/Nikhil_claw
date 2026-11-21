@@ -192,6 +192,8 @@ export interface SessionOut {
   /** `compaction` for the archive of a transcript, else `null`. */
   lineage: string | null;
   parent_session_id: string | null;
+  /** True when the user can rename or archive the session (M7.10). An old API has none. */
+  can_manage?: boolean;
 }
 
 export type RunStatus =
@@ -350,9 +352,9 @@ export interface AgentProfileOptions {
   runtimes: RuntimeOption[];
   limits: AgentProfileLimits;
   /** The reasoning efforts that a profile can choose (M7.10). */
-  reasoning_efforts?: ReasoningEffort[];
+  reasoning_efforts: ReasoningEffort[];
   /** The run budget of the plan of the org. `null`: no cap. */
-  budget_caps?: BudgetCaps;
+  budget_caps: BudgetCaps;
   /** The busy modes (M7.1). The API gives them only when it has the busy mode. */
   busy_modes?: BusyMode[];
 }
@@ -384,10 +386,10 @@ export interface AgentProfile {
   /** True if the user is an org owner or admin. */
   editable: boolean;
   options: AgentProfileOptions;
-  /** The run budget of the profile (M7.10). An old API has none. */
-  budget?: ProfileBudget;
+  /** The run budget of the profile (M7.10). */
+  budget: ProfileBudget;
   /** `null`: the default of the model. */
-  reasoning_effort?: ReasoningEffort | null;
+  reasoning_effort: ReasoningEffort | null;
   /** The busy mode (M7.1). Only when the API has it. */
   busy_mode?: BusyMode;
 }
@@ -626,6 +628,8 @@ export interface Connection {
   has_secret: boolean;
   /** Only for a remote MCP server. */
   mcp?: ConnectionMcp | null;
+  /** True when the user can change or delete the connection (M7.10). An old API has none. */
+  can_manage?: boolean;
 }
 
 /** The answer to a new connection: the sign-in link of Composio, or `null` for a form. */

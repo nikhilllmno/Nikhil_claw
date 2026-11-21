@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { withRuntime } from "./profile";
 import type { AgentProfile } from "./api";
 import {
   budgetChanged,
@@ -8,12 +9,12 @@ import {
   capHint,
   harnessPatch,
   reasoningLabel,
+  EMPTY_BUDGET,
   secondsToMinutes,
   toBudgetDraft,
   toHarnessDraft,
   validateBudget,
   validateHarness,
-  withHarnessRuntime,
 } from "./harness";
 
 function profile(overrides: Partial<AgentProfile> = {}): AgentProfile {
@@ -71,7 +72,7 @@ describe("budget draft", () => {
   });
 
   it("shows empty fields when there is no budget", () => {
-    expect(toBudgetDraft(undefined)).toEqual({
+    expect(toBudgetDraft(EMPTY_BUDGET)).toEqual({
       maxTurns: "",
       maxCostUsd: "",
       maxWallMinutes: "",
@@ -116,7 +117,7 @@ describe("budget draft", () => {
 
 describe("validateBudget", () => {
   const caps = { max_turns: 100, max_cost_usd: "5.00", max_wall_time_s: 3600 };
-  const empty = toBudgetDraft(undefined);
+  const empty = toBudgetDraft(EMPTY_BUDGET);
   // A draft that sets every capped value, so one test checks one field.
   const full = { ...empty, maxTurns: "100", maxCostUsd: "5", maxWallMinutes: "60" };
 
@@ -175,10 +176,10 @@ describe("harnessPatch", () => {
 
   it("sends the model with a new runtime", () => {
     const p = profile();
-    const draft = withHarnessRuntime(toHarnessDraft(p), p, "openai_agents_sdk");
+    const draft = withRuntime(toHarnessDraft(p), p, "openai_agents_sdk");
     expect(draft.model).toBe("gpt-5");
     expect(harnessPatch(p, draft)).toEqual({ runtime: "openai_agents_sdk", model: "gpt-5" });
-    expect(withHarnessRuntime(draft, p, "claude_agent_sdk").model).toBe("claude-sonnet");
+    expect(withRuntime(draft, p, "claude_agent_sdk").model).toBe("claude-sonnet");
   });
 
   it("sends the reasoning effort, and null for the model default", () => {
@@ -186,12 +187,6 @@ describe("harnessPatch", () => {
     expect(harnessPatch(p, { ...toHarnessDraft(p), reasoning: "high" })).toEqual({ reasoning_effort: "high" });
     const set = profile({ reasoning_effort: "low" });
     expect(harnessPatch(set, { ...toHarnessDraft(set), reasoning: "" })).toEqual({ reasoning_effort: null });
-  });
-
-  it("does not send the reasoning effort when the API has none", () => {
-    const p = profile();
-    p.options.reasoning_efforts = undefined;
-    expect(harnessPatch(p, { ...toHarnessDraft(p), reasoning: "high" })).toEqual({});
   });
 
   it("sends the busy mode only when the API has it", () => {

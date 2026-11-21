@@ -12,6 +12,7 @@ import {
   runtimeOption,
   toDraft,
   validateDraft,
+  withCurrent,
   withRuntime,
 } from "@/lib/profile";
 import { useApi } from "./AuthProvider";
@@ -20,11 +21,6 @@ import { ProfileHistory } from "./ProfileHistory";
 import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./AgentSettings.module.css";
-
-/** `list` with `value` in it, so that a select shows a value that the options do not have. */
-function withCurrent(list: string[], value: string): string[] {
-  return value === "" || list.includes(value) ? list : [value, ...list];
-}
 
 export function AgentSettings({ profileId }: { profileId: string }) {
   const api = useApi();

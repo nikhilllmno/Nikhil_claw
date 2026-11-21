@@ -6,25 +6,12 @@ import {
   canStart,
   instanceStatusLabel,
   instanceStatusTone,
-  parseInputs,
   pauseAction,
   validateYamlText,
   validationNotes,
-  workflowStatusLabel,
-  workflowStatusTone,
 } from "./workflows";
 
 describe("labels", () => {
-  it("names the status of a workflow", () => {
-    expect(workflowStatusLabel("active")).toBe("Active");
-    expect(workflowStatusLabel("paused")).toBe("Paused");
-    expect(workflowStatusLabel("pending_approval")).toBe("Needs approval");
-    expect(workflowStatusLabel("removed")).toBe("Removed");
-    expect(workflowStatusTone("active")).toBe("accent");
-    expect(workflowStatusTone("pending_approval")).toBe("warning");
-    expect(workflowStatusTone("paused")).toBe("neutral");
-  });
-
   it("names the status of an instance", () => {
     expect(instanceStatusLabel("running")).toBe("Running");
     expect(instanceStatusLabel("waiting")).toBe("Waiting");
@@ -54,9 +41,10 @@ describe("actions", () => {
     expect(pauseAction("removed")).toBeNull();
   });
 
-  it("starts an active workflow only", () => {
+  it("starts an active or a paused workflow, not one that waits for approval", () => {
     expect(canStart("active")).toBe(true);
-    expect(canStart("paused")).toBe(false);
+    expect(canStart("paused")).toBe(true);
+    expect(canStart("removed")).toBe(false);
     expect(canStart("pending_approval")).toBe(false);
   });
 });
@@ -71,13 +59,6 @@ describe("text checks", () => {
   it("has a template with a name and steps", () => {
     expect(WORKFLOW_TEMPLATE).toContain("name:");
     expect(WORKFLOW_TEMPLATE).toContain("steps:");
-  });
-
-  it("parses the inputs of a start", () => {
-    expect(parseInputs("")).toEqual({ ok: true, inputs: {} });
-    expect(parseInputs('{"topic":"x"}')).toEqual({ ok: true, inputs: { topic: "x" } });
-    expect(parseInputs("[]")).toMatchObject({ ok: false });
-    expect(parseInputs("{")).toEqual({ ok: false, error: "The inputs field is not valid JSON." });
   });
 
   it("writes the notes of a check", () => {

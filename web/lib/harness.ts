@@ -10,7 +10,6 @@ import type {
   ProfileBudget,
   ReasoningEffort,
 } from "./api";
-import { runtimeOption } from "./profile";
 
 export const MAX_TURNS_LIMIT = 10_000;
 export const MAX_WALL_TIME_LIMIT_S = 86_400;
@@ -45,8 +44,7 @@ export function secondsToMinutes(seconds: number): string {
   return String(Number((seconds / 60).toFixed(2)));
 }
 
-export function toBudgetDraft(budget: ProfileBudget | undefined): BudgetDraft {
-  const b = budget ?? EMPTY_BUDGET;
+export function toBudgetDraft(b: ProfileBudget): BudgetDraft {
   return {
     maxTurns: b.max_turns === null ? "" : String(b.max_turns),
     maxCostUsd: b.max_cost_usd ?? "",
@@ -65,21 +63,12 @@ export function toHarnessDraft(profile: AgentProfile): HarnessDraft {
   };
 }
 
-/** The draft after the user chooses `runtime`: a model of another runtime cannot stay. */
-export function withHarnessRuntime(draft: HarnessDraft, profile: AgentProfile, runtime: string): HarnessDraft {
-  const { models } = runtimeOption(profile.options, profile.runtime, runtime);
-  let model = draft.model;
-  if (runtime === profile.runtime) model = profile.model;
-  else if (!models.includes(model)) model = models[0] ?? "";
-  return { ...draft, runtime, model };
-}
-
 const WHOLE = /^\d+$/;
 const DECIMAL = /^\d+(\.\d+)?$/;
 
 /** The budget that a draft means. A field that the user did not change keeps its saved value. */
-export function budgetFromDraft(draft: BudgetDraft, saved: ProfileBudget | undefined): ProfileBudget {
-  const base = saved ?? EMPTY_BUDGET;
+export function budgetFromDraft(draft: BudgetDraft, saved: ProfileBudget): ProfileBudget {
+  const base = saved;
   const before = toBudgetDraft(saved);
   const turns = draft.maxTurns.trim();
   const cost = draft.maxCostUsd.trim();
@@ -98,7 +87,7 @@ export function budgetFromDraft(draft: BudgetDraft, saved: ProfileBudget | undef
   };
 }
 
-export function budgetChanged(draft: BudgetDraft, saved: ProfileBudget | undefined): boolean {
+export function budgetChanged(draft: BudgetDraft, saved: ProfileBudget): boolean {
   const before = toBudgetDraft(saved);
   return (
     draft.maxTurns.trim() !== before.maxTurns ||
@@ -176,14 +165,12 @@ export function harnessPatch(profile: AgentProfile, draft: HarnessDraft): AgentP
   } else if (draft.model !== profile.model) {
     patch.model = draft.model;
   }
-  if (profile.options.reasoning_efforts !== undefined) {
-    const effort = draft.reasoning === "" ? null : draft.reasoning;
-    if (effort !== (profile.reasoning_effort ?? null)) patch.reasoning_effort = effort;
-  }
+  const effort = draft.reasoning === "" ? null : draft.reasoning;
+  if (effort !== profile.reasoning_effort) patch.reasoning_effort = effort;
   if (profile.options.busy_modes !== undefined && draft.busyMode !== (profile.busy_mode ?? "steer")) {
     patch.busy_mode = draft.busyMode;
   }
-  if (profile.budget !== undefined && budgetChanged(draft.budget, profile.budget)) {
+  if (budgetChanged(draft.budget, profile.budget)) {
     patch.budget = budgetFromDraft(draft.budget, profile.budget);
   }
   return patch;

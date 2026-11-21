@@ -5,7 +5,7 @@
 // connected Composio app. Both have a list, a form, a detail with a test, and a delivery log.
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type Connection,
   type Trigger,
@@ -17,9 +17,10 @@ import {
 } from "@/lib/api";
 import { can } from "@/lib/console";
 import { formatWhen } from "@/lib/jobs";
-import { prettyJson } from "@/lib/jsonText";
+import { parseJsonObject, prettyJson } from "@/lib/jsonText";
 import {
   NAME_MAX_CHARS,
+  PAYLOAD_MAX_BYTES,
   PROMPT_MAX_CHARS,
   SAFE_TOOLSETS,
   SIGNATURE_HEADERS,
@@ -35,7 +36,6 @@ import {
   newTriggerDraft,
   outcomeLabel,
   outcomeTone,
-  parsePayload,
   targetText,
   toTriggerDraft,
   triggerStatusLabel,
@@ -45,13 +45,13 @@ import {
   workflowChoices,
 } from "@/lib/triggers";
 import { useApi } from "../AuthProvider";
-import { ErrorState, LoadingState } from "../ui";
+import { ErrorState, LoadingState, ToneBadge } from "../ui";
 import { useLoad } from "../useLoad";
 import admin from "../Admin.module.css";
 import styles from "../Page.module.css";
 import { useConsole } from "./Console";
-import { CopyBox, ToneBadge, useAgentChoice } from "./kit";
-import { SectionHeader } from "./parts";
+import { CopyBox } from "./kit";
+import { SectionHeader, useAgentChoice } from "./parts";
 import own from "./TriggerScreens.module.css";
 
 /** The trigger of an answer that can have the secret. The secret stays out of the state. */
@@ -59,6 +59,21 @@ function withoutSecret(answer: TriggerWithSecret): Trigger {
   const { secret, ...trigger } = answer;
   void secret;
   return trigger;
+}
+
+/**
+ * True while the component is on the screen. An answer that comes after the user left must not
+ * put a secret back into the state, so a screen checks it after each request that gives one.
+ */
+function useAlive() {
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  return alive;
 }
 
 type View = { kind: "list" } | { kind: "new" } | { kind: "detail"; id: string };
@@ -233,7 +248,8 @@ function TriggerForm({
   onSaved: (trigger: TriggerWithSecret) => void;
 }) {
   const api = useApi();
-  const { org, workspaceId, profileId } = useAgentChoice();
+  const { org, workspaceId, profiles, profileId } = useAgentChoice();
+  const alive = useAlive();
   const noun = kindNoun(kind);
   const isNew = trigger === null;
   const [draft, setDraft] = useState<TriggerDraft>(() =>
@@ -273,12 +289,10 @@ function TriggerForm({
     setBusy(true);
     setError(null);
     try {
-      if (trigger) {
-        const saved = await api.updateTrigger(workspaceId, trigger.id, changes ?? {});
-        onSaved(saved);
-      } else {
-        onSaved(await api.createTrigger(workspaceId, buildNewTrigger(draft, kind)));
-      }
+      const saved = trigger
+        ? await api.updateTrigger(workspaceId, trigger.id, changes ?? {})
+        : await api.createTrigger(workspaceId, buildNewTrigger(draft, kind));
+      if (alive.current) onSaved(saved);
     } catch (e) {
       setError(errorText(e, isNew ? `The ${noun} was not created.` : "The changes were not saved."));
     } finally {
@@ -396,7 +410,7 @@ function TriggerForm({
                 disabled={busy}
                 onChange={(e) => edit({ agentId: e.target.value })}
               >
-                {org.agent_profiles.map((p) => (
+                {profiles.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
                   </option>
@@ -508,6 +522,7 @@ function TriggerDetail({
 }) {
   const api = useApi();
   const { org, workspaceId } = useConsole();
+  const alive = useAlive();
   const noun = kindNoun(kind);
   const load = useCallback(() => api.getTrigger(workspaceId, triggerId), [api, workspaceId, triggerId]);
   const { data: trigger, setData: setTrigger, error, reload } = useLoad(load, `Could not load the ${noun}.`);
@@ -563,6 +578,8 @@ function TriggerDetail({
     }
     await run(async () => {
       const rotated = await api.rotateTriggerSecret(workspaceId, trigger.id);
+      // The user can have left this screen. Then the new secret is not shown, and the user rotates again.
+      if (!alive.current) return;
       setTrigger(withoutSecret(rotated));
       if (rotated.secret) onReveal(rotated.secret);
       onChanged();
@@ -581,7 +598,7 @@ function TriggerDetail({
   return (
     <>
       <div className={styles.actions}>
-        <button type="button" className="btn btn-quiet btn-small" onClick={onBack}>
+        <button type="button" className="btn btn-quiet btn-small" disabled={busy} onClick={onBack}>
           Back to the list
         </button>
       </div>
@@ -769,7 +786,7 @@ function TestCard({
 
   const send = async (event: React.FormEvent) => {
     event.preventDefault();
-    const parsed = parsePayload(text);
+    const parsed = parseJsonObject(text, "The payload", PAYLOAD_MAX_BYTES);
     if (!parsed.ok) {
       setError(parsed.error);
       return;
@@ -778,7 +795,7 @@ function TestCard({
     setError(null);
     setResult(null);
     try {
-      const answer = await api.testTrigger(workspaceId, trigger.id, { payload: parsed.payload, start });
+      const answer = await api.testTrigger(workspaceId, trigger.id, { payload: parsed.value, start });
       setResult(answer.delivery);
       onSent();
     } catch (e) {

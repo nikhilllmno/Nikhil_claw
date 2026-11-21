@@ -3,14 +3,16 @@ routes that they limit (docs/architecture.md, Section 17.2; roadmap M7.10)."""
 
 from __future__ import annotations
 
+import uuid
+from dataclasses import replace
 from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import AuditEntry, OrgInvite, OrgRolePermission
+from sama.db.models import AuditEntry, OrgInvite, OrgRolePermission, Skill
 from sama.orgs.permissions import BY_KEY, CATALOG, KEYS, allowed_keys, matrix
 from tests.api.conftest import bearer
 from tests.api.test_app import add_user, mia
@@ -361,3 +363,69 @@ async def test_an_admin_without_the_permission_cannot_invite_or_manage_agents(
         assert response.json()["detail"] == f"{DENIED}{BY_KEY[key].label}.", path
     async with engine.connect() as connection:
         assert (await connection.execute(select(OrgInvite))).all() != [], "the first invite stays"
+
+
+async def test_the_agent_tools_refuse_in_the_same_way_as_the_api(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    from sama.db.models import Run
+    from sama.skills import ManageRequest, PostgresSkillStore
+    from sama.skills.errors import SkillError
+    from sama.tenancy.run_token import RunTokenClaims
+    from tests.skills.helpers import md
+
+    run_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Run).values(
+                id=run_id,
+                org_id=tenant.org,
+                session_id=tenant.ids["mine"],
+                agent_profile_id=tenant.ids["profile"],
+                triggered_by_user_id=tenant.ids["mia"],
+                runtime="fake",
+                status="queued",
+            )
+        )
+    claims = RunTokenClaims(
+        org_id=str(tenant.org),
+        workspace_id=str(tenant.ids["ws"]),
+        session_id=str(tenant.ids["mine"]),
+        run_id=str(run_id),
+        user_id=str(tenant.ids["mia"]),
+        token_id="t-1",
+        expires_at=2_000_000_000,
+    )
+    request = ManageRequest(action="create", name="notes", scope="user", content=md("notes", "x"))
+    store = PostgresSkillStore(engine, {})
+    written = await store.manage(claims, request)
+    assert written.name == "notes"
+    owner = await user(engine, tenant, "owner")
+    await turn_off(client, tenant, owner, "member", "skills.write")
+
+    with pytest.raises(SkillError) as raised:
+        await store.manage(claims, replace(request, name="other"))
+
+    assert str(raised.value) == f"{DENIED}{BY_KEY['skills.write'].label}."
+    async with engine.connect() as connection:
+        names = (await connection.execute(select(Skill.name))).scalars().all()
+    assert names == ["notes"]
+
+
+async def test_the_profile_is_editable_only_when_the_patch_would_pass(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    owner = await user(engine, tenant, "owner")
+    admin = await user(engine, tenant, "admin")
+    profile = f"/orgs/{tenant.org}/agent-profiles/{tenant.ids['profile']}"
+
+    async def state(headers: dict[str, str]) -> tuple[bool, int]:
+        editable = (await client.get(profile, headers=headers)).json()["editable"]
+        patched = await client.patch(profile, headers=headers, json={"reasoning_effort": "low"})
+        return editable, patched.status_code
+
+    assert await state(admin) == (True, 200)
+    assert await state(mia(tenant)) == (False, 403)
+    await turn_off(client, tenant, owner, "admin", "agents.manage")
+    assert await state(admin) == (False, 403)
+    assert await state(owner) == (True, 200)

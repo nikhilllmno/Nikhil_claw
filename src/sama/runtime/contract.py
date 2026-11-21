@@ -337,6 +337,10 @@ class Budget(_Frozen):
     max_wall_time_s: float | None = Field(default=None, gt=0)
 
 
+BUDGET_KEYS: Final = tuple(Budget.model_fields)
+"""The keys of a run budget: ``max_turns``, ``max_tokens``, ``max_cost_usd``, and
+``max_wall_time_s``. The profile, the queue, and the API use this one list."""
+
 MAX_COMPACT_FOCUS_CHARS: Final = 6_000
 """The most text that a ``/compact`` request can give to the summary (the focus and the pins)."""
 

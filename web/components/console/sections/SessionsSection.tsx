@@ -12,6 +12,7 @@ import { saveFile } from "@/lib/admin";
 import { sessionTitle } from "@/lib/chat";
 import {
   archiveConfirmText,
+  canManageSession,
   checkTitle,
   emptyText,
   LIST_LIMIT,
@@ -27,7 +28,7 @@ import { relativeTime } from "@/lib/time";
 import { useApi } from "../../AuthProvider";
 import { Retention } from "../../DataControls";
 import { useData } from "../../DataProvider";
-import { type Asked, MAX_QUERY_CHARS, SearchResults } from "../../SessionSearch";
+import { SessionSearchForm } from "../../SessionSearch";
 import { ErrorState, LoadingState } from "../../ui";
 import { useFocusWhen } from "../../useFocusWhen";
 import { useLoad } from "../../useLoad";
@@ -54,56 +55,14 @@ export function SessionsSection() {
 
 function SessionSearchBox() {
   const { org, workspaceId } = useConsole();
-  const [text, setText] = useState("");
-  const [onlyHere, setOnlyHere] = useState(true);
-  const [asked, setAsked] = useState<Asked | null>(null);
-
-  const submit = (event: React.FormEvent) => {
-    event.preventDefault();
-    const q = text.trim();
-    if (q === "") return;
-    setAsked((previous) => ({
-      q,
-      workspace: onlyHere ? workspaceId : null,
-      org: org.id,
-      from: workspaceId,
-      run: (previous?.run ?? 0) + 1,
-    }));
-  };
-
+  const workspace = org.workspaces.find((w) => w.id === workspaceId);
   return (
-    <>
-      <section className={`card ${styles.card}`} aria-labelledby="sessions-search">
-        <h2 id="sessions-search" className={styles.heading}>
-          Search
-        </h2>
-        <form className={styles.form} role="search" onSubmit={submit}>
-          <div className={styles.toolbar}>
-            <label className={`field ${styles.grow}`}>
-              <span className="label">Words to find</span>
-              <input
-                className="input"
-                type="search"
-                value={text}
-                maxLength={MAX_QUERY_CHARS}
-                onChange={(e) => setText(e.target.value)}
-              />
-            </label>
-            <button type="submit" className="btn btn-primary" disabled={text.trim() === ""}>
-              Search
-            </button>
-          </div>
-          <label className={styles.name}>
-            <input type="checkbox" checked={onlyHere} onChange={(e) => setOnlyHere(e.target.checked)} />
-            <span>Only this workspace</span>
-          </label>
-        </form>
-      </section>
-      {/* The results are for one search of one workspace. A new workspace mounts the section again. */}
-      {asked !== null ? (
-        <SearchResults key={`${asked.org}|${asked.workspace ?? ""}|${asked.q}|${asked.run}`} asked={asked} />
-      ) : null}
-    </>
+    <section className={styles.card} aria-labelledby="sessions-search">
+      <h2 id="sessions-search" className={styles.heading}>
+        Search
+      </h2>
+      <SessionSearchForm orgId={org.id} workspaceId={workspaceId} workspaceLabel={workspace?.name ?? "this workspace"} />
+    </section>
   );
 }
 
@@ -203,6 +162,7 @@ function SessionRow({
   useFocusWhen(renaming, titleInput, renameButton);
   const title = sessionTitle(session);
   const archived = session.status === "archived";
+  const manage = canManageSession(session);
 
   const run = async (label: string, action: () => Promise<void>, fallback: string) => {
     setBusy(label);
@@ -301,28 +261,32 @@ function SessionRow({
           <Link href={`/s/${session.id}`} className="btn btn-small">
             Open
           </Link>
-          <button
-            ref={renameButton}
-            type="button"
-            className="btn btn-small"
-            disabled={busy !== null}
-            onClick={() => {
-              setDraft(session.title ?? "");
-              setError(null);
-              setRenaming(true);
-            }}
-          >
-            Rename
-          </button>
-          {archived ? (
-            <button type="button" className="btn btn-small" disabled={busy !== null} onClick={() => setStatus("active")}>
-              {busy === "active" ? "Restoring…" : "Restore"}
+          {manage ? (
+            <>
+            <button
+              ref={renameButton}
+              type="button"
+              className="btn btn-small"
+              disabled={busy !== null}
+              onClick={() => {
+                setDraft(session.title ?? "");
+                setError(null);
+                setRenaming(true);
+              }}
+            >
+              Rename
             </button>
-          ) : (
-            <button type="button" className="btn btn-small" disabled={busy !== null} onClick={() => setStatus("archived")}>
-              {busy === "archived" ? "Archiving…" : "Archive"}
-            </button>
-          )}
+            {archived ? (
+              <button type="button" className="btn btn-small" disabled={busy !== null} onClick={() => setStatus("active")}>
+                {busy === "active" ? "Restoring…" : "Restore"}
+              </button>
+            ) : (
+              <button type="button" className="btn btn-small" disabled={busy !== null} onClick={() => setStatus("archived")}>
+                {busy === "archived" ? "Archiving…" : "Archive"}
+              </button>
+            )}
+            </>
+          ) : null}
           <button type="button" className="btn btn-quiet btn-small" disabled={busy !== null} onClick={() => void download("markdown")}>
             {busy === "markdown" ? "Preparing…" : "Export as Markdown"}
           </button>

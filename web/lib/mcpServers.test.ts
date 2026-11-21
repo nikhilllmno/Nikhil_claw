@@ -115,6 +115,12 @@ describe("canChangeServer", () => {
     expect(canChangeServer({ admin: true, user_id: "u9" }, { scope: "workspace", owner_user_id: null })).toBe(true);
   });
 
+  it("uses can_manage of the API when it is there", () => {
+    const connection = { scope: "workspace", owner_user_id: null } as const;
+    expect(canChangeServer({ admin: true, user_id: "u9" }, { ...connection, can_manage: false })).toBe(false);
+    expect(canChangeServer(member, { ...connection, can_manage: true })).toBe(true);
+  });
+
   it("lets a member change only the own personal server", () => {
     expect(canChangeServer(member, { scope: "personal", owner_user_id: "u1" })).toBe(true);
     expect(canChangeServer(member, { scope: "personal", owner_user_id: "u2" })).toBe(false);

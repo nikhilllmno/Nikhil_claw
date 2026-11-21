@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Job
+from sama.db.models import Job, OrgRolePermission
 from sama.gateway.cron import cron_reply
 from sama.gateway.sessions import Target
 from sama.scheduler.jobs import JobService
+from sama.scheduler.spec import JobError
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.cron import CronRequest, job_input, manage
 from tests.scheduler.conftest import Tenant
@@ -96,3 +98,39 @@ async def test_the_tool_makes_a_job_of_the_agent(
     )
     assert job.status == "pending_approval", "an outside email target needs the owner"
     assert "approve" in text.lower()
+
+
+async def test_the_tool_and_the_service_refuse_a_role_without_the_permission(
+    engine: AsyncEngine, jobs: JobService, tenant: Tenant
+) -> None:
+    claims = RunTokenClaims(
+        org_id=str(tenant.org),
+        workspace_id=str(tenant.ids["ws"]),
+        session_id=str(tenant.ids["chat"]),
+        run_id=str(tenant.ids["chat-run"]),
+        user_id=str(tenant.ids["ana"]),
+        token_id="t",
+        expires_at=2_000_000_000,
+    )
+    fields = job_input(name="report", schedule="every day at 9am", prompt="Write it")
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(OrgRolePermission).values(
+                org_id=tenant.org, role="member", permission="jobs.create", allowed=False
+            )
+        )
+
+    with pytest.raises(JobError) as raised:
+        await manage(jobs, claims, CronRequest(action="create", fields=fields))
+    assert str(raised.value) == "Your role in this org cannot do this: Create scheduled jobs."
+
+    # The slash command goes through the same service.
+    async def session_of() -> uuid.UUID | None:
+        return tenant.ids["chat"]
+
+    reply = await cron_reply(jobs, _target(tenant), "add every day at 9am | Send news", session_of)
+    assert "cannot do this: Create scheduled jobs" in reply
+    async with engine.connect() as connection:
+        assert (await connection.execute(select(Job))).all() == []
+    # An owner is not limited, and other actions of the tool still work.
+    await manage(jobs, claims, CronRequest(action="list", fields=job_input()))

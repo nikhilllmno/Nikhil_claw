@@ -15,7 +15,7 @@ export function SkillsSection() {
   return (
     <>
       <SectionHeader id="skills" />
-      <SkillEditor embedded canCreate={canWrite} />
+      <SkillEditor embedded canWrite={canWrite} />
     </>
   );
 }

@@ -32,13 +32,11 @@ import {
   wantedRules,
 } from "@/lib/policy";
 import { useApi } from "../../AuthProvider";
-import { useData } from "../../DataProvider";
-import { ErrorState, LoadingState } from "../../ui";
+import { ErrorState, LoadingState, ToneBadge } from "../../ui";
 import { useLoad } from "../../useLoad";
 import admin from "../../Admin.module.css";
 import styles from "../../Page.module.css";
-import { ToneBadge, useAgentChoice } from "../kit";
-import { ComingCard, ProfilePicker, SectionHeader } from "../parts";
+import { AgentProfileEditor, ComingCard, SectionHeader, useAgentChoice } from "../parts";
 import own from "./Tools.module.css";
 
 const ACTION_TONE = { allow: "accent", ask: "warning", deny: "danger" } as const;
@@ -51,7 +49,8 @@ const HARDLINE_NOTE =
   "The hardline deny list always applies. It blocks, for example, a recursive delete of the root folder. No rule can change it.";
 
 export function ToolsSection() {
-  const { org, profileId, setProfileId } = useAgentChoice();
+  const choice = useAgentChoice();
+  const { org } = choice;
   const mayManage = canManageAgents(org);
 
   return (
@@ -60,17 +59,11 @@ export function ToolsSection() {
         id="tools"
         meta={mayManage ? null : "Only an org admin with the right to manage agents can change these settings."}
       />
-      {profileId === null ? (
-        <div className="state">
-          <h2>No agents</h2>
-          <p>This org has no agent yet. Make one in the section Harness.</p>
-        </div>
-      ) : (
-        <>
-          <ProfilePicker profiles={org.agent_profiles} value={profileId} onChange={setProfileId} />
-          <AgentTools key={profileId} orgId={org.id} profileId={profileId} manage={mayManage} />
-        </>
-      )}
+      <AgentProfileEditor choice={choice}>
+        {({ profile, readOnly, onSaved }) => (
+          <AgentTools orgId={org.id} profile={profile} readOnly={readOnly} onSaved={onSaved} />
+        )}
+      </AgentProfileEditor>
       <OrgRules orgId={org.id} manage={mayManage} />
       <ComingCard title="Custom tools">
         Members will add tools in their own scope. Admins will add tools for the workspace and for the org. This comes
@@ -82,35 +75,35 @@ export function ToolsSection() {
 
 // -- one agent ------------------------------------------------------------------------------------
 
-function AgentTools({ orgId, profileId, manage }: { orgId: string; profileId: string; manage: boolean }) {
+function AgentTools({
+  orgId,
+  profile,
+  readOnly,
+  onSaved,
+}: {
+  orgId: string;
+  profile: AgentProfile;
+  readOnly: boolean;
+  onSaved: (profile: AgentProfile) => void;
+}) {
   const api = useApi();
-  const loadProfile = useCallback(() => api.getAgentProfile(orgId, profileId), [api, orgId, profileId]);
+  const profileId = profile.id;
   const loadPolicy = useCallback(() => api.toolPolicy(orgId, profileId), [api, orgId, profileId]);
-  const profileState = useLoad(loadProfile, "Could not load the agent.");
-  const policyState = useLoad(loadPolicy, "Could not load the tool policy.");
-  const { data: profile, error: profileError } = profileState;
-  const { data: policy, setData: setPolicy, error: policyError } = policyState;
-  const reloadPolicy = policyState.reload;
+  const { data: policy, setData: setPolicy, error, reload } = useLoad(loadPolicy, "Could not load the tool policy.");
 
   return (
     <>
-      {profileError ? (
-        <ErrorState title="The agent did not load" message={profileError} onRetry={profileState.reload} />
-      ) : profile === null ? (
-        <LoadingState label="Loading the agent" />
-      ) : (
-        <ToolsetsCard
-          orgId={orgId}
-          profile={profile}
-          readOnly={!manage || !profile.editable}
-          onSaved={(saved) => {
-            profileState.setData(saved);
-            reloadPolicy(); // The tools of a group that is off show as off.
-          }}
-        />
-      )}
-      {policyError ? (
-        <ErrorState title="The tool policy did not load" message={policyError} onRetry={reloadPolicy} />
+      <ToolsetsCard
+        orgId={orgId}
+        profile={profile}
+        readOnly={readOnly}
+        onSaved={(saved) => {
+          onSaved(saved);
+          reload(); // The tools of a group that is off show as off.
+        }}
+      />
+      {error ? (
+        <ErrorState title="The tool policy did not load" message={error} onRetry={reload} />
       ) : policy === null ? (
         <LoadingState label="Loading the tool policy" />
       ) : (
@@ -121,7 +114,7 @@ function AgentTools({ orgId, profileId, manage }: { orgId: string; profileId: st
           rules={policy.rules}
           orgRules={policy.org_rules}
           maxRules={policy.max_rules}
-          readOnly={!policy.editable || !manage}
+          readOnly={readOnly || !policy.editable}
           onSaved={setPolicy}
         />
       )}
@@ -141,7 +134,6 @@ function ToolsetsCard({
   onSaved: (profile: AgentProfile) => void;
 }) {
   const api = useApi();
-  const { reloadMe } = useData();
   const [selected, setSelected] = useState<string[]>(profile.toolsets);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,7 +156,6 @@ function ToolsetsCard({
       onSaved(result);
       setSelected(result.toolsets);
       setSaved(true);
-      reloadMe();
     } catch (e) {
       setError(errorText(e, "The tool groups were not saved."));
     } finally {
@@ -181,7 +172,7 @@ function ToolsetsCard({
         The groups of tools that the agent can use. A group that you turn off stops at the next tool call in every
         session. A risky tool still asks for approval.
       </p>
-      <fieldset className={admin.choices} disabled={readOnly}>
+      <fieldset className={admin.choices} disabled={readOnly || saving}>
         <legend className="sr-only">Tool groups</legend>
         {profile.options.toolsets.map((set) => (
           <label key={set.name} className={admin.choice}>
@@ -246,6 +237,8 @@ function PolicyCard({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  // An edit while a save runs would be lost when the answer comes, so the form locks.
+  const locked = readOnly || saving;
 
   const groups = useMemo(() => groupTools(tools), [tools]);
   const names = useMemo(() => new Set(tools.map((t) => t.name)), [tools]);
@@ -309,7 +302,7 @@ function PolicyCard({
                 group={group}
                 table={table}
                 orgRules={orgRules}
-                readOnly={readOnly}
+                readOnly={locked}
                 onChoose={choose}
               />
             ))}
@@ -332,7 +325,7 @@ function PolicyCard({
                 className="input"
                 value={row.tool}
                 maxLength={200}
-                readOnly={readOnly}
+                readOnly={locked}
                 onChange={(e) => updateRow(row.uid, { tool: e.target.value })}
               />
             </label>
@@ -341,7 +334,7 @@ function PolicyCard({
               <select
                 className="input"
                 value={row.action}
-                disabled={readOnly}
+                disabled={locked}
                 onChange={(e) => updateRow(row.uid, { action: e.target.value as PolicyAction })}
               >
                 {(["allow", "ask", "deny"] as const).map((a) => (
@@ -355,6 +348,7 @@ function PolicyCard({
               <button
                 type="button"
                 className="btn btn-small btn-danger"
+                disabled={saving}
                 onClick={() => {
                   setRows((list) => list.filter((r) => r.uid !== row.uid));
                   setSaved(false);
@@ -371,6 +365,7 @@ function PolicyCard({
           <button
             type="button"
             className="btn btn-small"
+            disabled={saving}
             onClick={() => {
               setRows((list) => [...list, newRuleRow()]);
               setSaved(false);
@@ -539,6 +534,8 @@ function OrgRulesForm({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  // An edit while a save runs would be lost when the answer comes, so the form locks.
+  const locked = readOnly || saving;
 
   const rowsProblem = validateRuleRows(rows);
   const changes = useMemo(
@@ -584,7 +581,7 @@ function OrgRulesForm({
                 className="input"
                 value={row.tool}
                 maxLength={200}
-                readOnly={readOnly}
+                readOnly={locked}
                 onChange={(e) => updateRow(row.uid, { tool: e.target.value })}
               />
             </label>
@@ -593,7 +590,7 @@ function OrgRulesForm({
               <select
                 className="input"
                 value={row.action}
-                disabled={readOnly}
+                disabled={locked}
                 onChange={(e) => updateRow(row.uid, { action: e.target.value as PolicyAction })}
               >
                 {(["allow", "ask", "deny"] as const).map((a) => (
@@ -607,6 +604,7 @@ function OrgRulesForm({
               <button
                 type="button"
                 className="btn btn-small btn-danger"
+                disabled={saving}
                 onClick={() => updateRows((list) => list.filter((r) => r.uid !== row.uid))}
               >
                 Remove
@@ -632,7 +630,7 @@ function OrgRulesForm({
         </p>
       ) : (
         <div className={styles.actions}>
-          <button type="button" className="btn btn-small" onClick={() => updateRows((list) => [...list, newRuleRow()])}>
+          <button type="button" className="btn btn-small" disabled={saving} onClick={() => updateRows((list) => [...list, newRuleRow()])}>
             Add a rule
           </button>
           <button type="submit" className="btn btn-primary btn-small" disabled={!dirty || saving || problem !== null}>

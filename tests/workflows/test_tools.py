@@ -11,11 +11,11 @@ from typing import Any
 import pytest
 from mcp.client import Client
 from mcp_types import CallToolResult, TextContent
-from sqlalchemy import update
+from sqlalchemy import insert, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db import create_engine
-from sama.db.models import Run
+from sama.db.models import OrgRolePermission, Run
 from sama.orchestrator.queue import RunQueue
 from sama.tenancy import RunTokenClaims, RunTokenSigner
 from sama.tools import MemoryTodoStore, ToolServer
@@ -390,6 +390,21 @@ async def test_manage_refuses_a_secret_in_the_yaml(
     source = READ.replace("default: tea", "default: sk-ant-api03-" + "a" * 40)
     with pytest.raises(WorkflowError, match="contains a secret"):
         await manage(service, claims_of(tenant), "create", yaml=source)
+
+
+async def test_manage_create_refuses_a_role_without_the_permission(
+    tenant: Tenant, service: WorkflowService, engine: AsyncEngine
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(OrgRolePermission).values(
+                org_id=tenant.org, role="member", permission="workflows.create", allowed=False
+            )
+        )
+    with pytest.raises(WorkflowError) as raised:
+        await manage(service, claims_of(tenant), "create", yaml=READ)
+    assert str(raised.value) == "Your role in this org cannot do this: Create workflows."
+    assert await manage(service, claims_of(tenant), "list") == "You have no workflows."
 
 
 async def test_manage_needs_a_person_for_the_run(

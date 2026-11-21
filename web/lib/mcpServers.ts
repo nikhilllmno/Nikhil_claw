@@ -46,13 +46,15 @@ export function serverAddress(connection: Pick<Connection, "kind" | "mcp">): str
 }
 
 /**
- * True when the user can change the connection: an org admin, or the owner of a personal
- * connection. The API decides again (the owner, a workspace admin, or the org owner).
+ * True when the user can change the connection. The API says it with `can_manage`. An API
+ * without it (an old API) gives an approximation: an org admin, or the owner of a personal
+ * connection. The API checks each change again.
  */
 export function canChangeServer(
   org: { admin: boolean; user_id: string },
-  connection: Pick<Connection, "owner_user_id" | "scope">,
+  connection: Pick<Connection, "owner_user_id" | "scope" | "can_manage">,
 ): boolean {
+  if (connection.can_manage !== undefined) return connection.can_manage;
   if (org.admin) return true;
   return connection.scope === "personal" && connection.owner_user_id === org.user_id;
 }

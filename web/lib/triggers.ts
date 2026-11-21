@@ -14,6 +14,7 @@ import type {
   Workflow,
 } from "./api";
 import { parseJsonObject } from "./jsonText";
+import { sameList } from "./profile";
 import type { Tone } from "./jobs";
 
 export const NAME_MAX_CHARS = 80;
@@ -108,24 +109,6 @@ export function workflowChoices(workflows: readonly Workflow[], workspaceId: str
   return workflows.filter((w) => w.workspace_id === workspaceId && w.status !== "removed");
 }
 
-// -- test payload and config --------------------------------------------------------------------
-
-export type PayloadResult = { ok: true; payload: Record<string, unknown> | null } | { ok: false; error: string };
-
-/** The payload of a test. An empty field gives `null`: the API sends its own payload. */
-export function parsePayload(text: string): PayloadResult {
-  const result = parseJsonObject(text, "The payload", PAYLOAD_MAX_BYTES);
-  return result.ok ? { ok: true, payload: result.value } : result;
-}
-
-export type ConfigResult = { ok: true; config: Record<string, unknown> | null } | { ok: false; error: string };
-
-/** The config of a Composio trigger. An empty field gives `null`. */
-export function parseConfig(text: string): ConfigResult {
-  const result = parseJsonObject(text, "The config", CONFIG_MAX_BYTES);
-  return result.ok ? { ok: true, config: result.value } : result;
-}
-
 // -- signature help -----------------------------------------------------------------------------
 
 export const SIGNATURE_HEADERS: readonly { name: string; text: string }[] = [
@@ -200,7 +183,7 @@ export function validateNewTrigger(draft: TriggerDraft, kind: TriggerKind): stri
   if (kind === "composio") {
     if (draft.connectionId === "") return "Choose a connected app.";
     if (!SLUG.test(draft.slug.trim())) return "Write the name of the trigger type, for example GITHUB_COMMIT_EVENT.";
-    const config = parseConfig(draft.config);
+    const config = parseJsonObject(draft.config, "The config", CONFIG_MAX_BYTES);
     if (!config.ok) return config.error;
   }
   return null;
@@ -233,14 +216,11 @@ export function buildNewTrigger(draft: TriggerDraft, kind: TriggerKind): NewTrig
   if (kind === "composio") {
     body.connection_id = draft.connectionId;
     body.composio_slug = draft.slug.trim();
-    const config = parseConfig(draft.config);
-    if (config.ok && config.config !== null) body.composio_config = config.config;
+    const config = parseJsonObject(draft.config, "The config", CONFIG_MAX_BYTES);
+    if (config.ok && config.value !== null) body.composio_config = config.value;
   }
   return body;
 }
-
-const sameSet = (a: readonly string[], b: readonly string[]) =>
-  a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
 
 /** Only the fields of the edit that differ from the saved trigger. An empty object: no change. */
 export function buildTriggerEdit(trigger: Trigger, draft: TriggerDraft): TriggerEdit {
@@ -248,7 +228,7 @@ export function buildTriggerEdit(trigger: Trigger, draft: TriggerDraft): Trigger
   if (draft.name.trim() !== trigger.name) edit.name = draft.name.trim();
   if (trigger.target === "run") {
     if (draft.prompt.trim() !== (trigger.prompt ?? "")) edit.prompt = draft.prompt.trim();
-    if (!sameSet(draft.toolsets, trigger.toolsets)) edit.toolsets = draft.toolsets;
+    if (!sameList(draft.toolsets, trigger.toolsets)) edit.toolsets = draft.toolsets;
   }
   return edit;
 }

@@ -4,7 +4,6 @@
 
 import type { InstanceStatus, WorkflowStatus, WorkflowValidation } from "./api";
 import type { Tone } from "./jobs";
-import { parseJsonObject } from "./jsonText";
 
 export const MAX_YAML_BYTES = 50_000;
 export const MAX_INPUTS_BYTES = 20_000;
@@ -23,32 +22,6 @@ steps:
     agent:
       prompt: "Write a short summary of {{inputs.topic}}."
 `;
-
-export function workflowStatusLabel(status: WorkflowStatus): string {
-  switch (status) {
-    case "active":
-      return "Active";
-    case "paused":
-      return "Paused";
-    case "pending_approval":
-      return "Needs approval";
-    case "removed":
-      return "Removed";
-    default:
-      return status;
-  }
-}
-
-export function workflowStatusTone(status: WorkflowStatus): Tone {
-  switch (status) {
-    case "active":
-      return "accent";
-    case "pending_approval":
-      return "warning";
-    default:
-      return "neutral";
-  }
-}
 
 export function instanceStatusLabel(status: InstanceStatus | string): string {
   switch (status) {
@@ -92,9 +65,9 @@ export function pauseAction(status: WorkflowStatus): "pause" | "resume" | null {
   return null;
 }
 
-/** Start is possible for an active workflow only. */
+/** A manual start is possible for an active or a paused workflow. The approval guard is separate. */
 export function canStart(status: WorkflowStatus): boolean {
-  return status === "active";
+  return status === "active" || status === "paused";
 }
 
 /** The first problem of the YAML text that the browser can see, or `null`. */
@@ -104,15 +77,6 @@ export function validateYamlText(text: string): string | null {
     return `The YAML text has more than ${MAX_YAML_BYTES.toLocaleString("en-US")} bytes.`;
   }
   return null;
-}
-
-export type InputsResult = { ok: true; inputs: Record<string, unknown> } | { ok: false; error: string };
-
-/** The inputs of a start. An empty field gives no inputs. */
-export function parseInputs(text: string): InputsResult {
-  const result = parseJsonObject(text, "The inputs field", MAX_INPUTS_BYTES);
-  if (!result.ok) return result;
-  return { ok: true, inputs: result.value ?? {} };
 }
 
 /** The sentences about the result of a check, one for each fact. */

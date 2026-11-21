@@ -14,29 +14,26 @@ import {
   errorText,
 } from "@/lib/api";
 import { can } from "@/lib/console";
-import { formatWhen } from "@/lib/jobs";
-import { prettyJson } from "@/lib/jsonText";
+import { formatWhen, statusLabel, statusTone } from "@/lib/jobs";
+import { parseJsonObject, prettyJson } from "@/lib/jsonText";
 import {
+  MAX_INPUTS_BYTES,
   WORKFLOW_TEMPLATE,
   canCancelInstance,
   canStart,
   instanceStatusLabel,
   instanceStatusTone,
-  parseInputs,
   pauseAction,
   validateYamlText,
   validationNotes,
-  workflowStatusLabel,
-  workflowStatusTone,
 } from "@/lib/workflows";
 import { useApi } from "../../AuthProvider";
-import { ErrorState, LoadingState } from "../../ui";
+import { ErrorState, LoadingState, ToneBadge } from "../../ui";
 import { useLoad } from "../../useLoad";
 import admin from "../../Admin.module.css";
 import styles from "../../Page.module.css";
 import { useConsole } from "../Console";
-import { ToneBadge, useAgentChoice } from "../kit";
-import { SectionHeader } from "../parts";
+import { SectionHeader, useAgentChoice } from "../parts";
 import own from "../TriggerScreens.module.css";
 
 type View = { kind: "list" } | { kind: "new" } | { kind: "edit"; id: string } | { kind: "detail"; id: string };
@@ -113,7 +110,7 @@ function WorkflowRow({ workflow, onOpen }: { workflow: Workflow; onOpen: () => v
       <div className={styles.row}>
         <div className={styles.name}>
           {workflow.name}
-          <ToneBadge tone={workflowStatusTone(workflow.status)}>{workflowStatusLabel(workflow.status)}</ToneBadge>
+          <ToneBadge tone={statusTone(workflow.status)}>{statusLabel(workflow.status)}</ToneBadge>
           <span className="badge">Version {workflow.version}</span>
         </div>
         <div className={styles.actions}>
@@ -166,12 +163,16 @@ function WorkflowEditorForm({
   onSaved: (workflow: WorkflowDetail) => void;
 }) {
   const api = useApi();
-  const { org, workspaceId, profileId: firstProfile } = useAgentChoice();
+  const { org, workspaceId, profiles, profileId: firstProfile } = useAgentChoice();
   const isNew = existing === null;
   const [yaml, setYaml] = useState(existing?.source ?? WORKFLOW_TEMPLATE);
   const [agentId, setAgentId] = useState(firstProfile ?? "");
-  const [check, setCheck] = useState<WorkflowValidation | null>(null);
-  const [checkError, setCheckError] = useState<string | null>(null);
+  // The result of a check belongs to the YAML that it checked. It shows only while the text is the same.
+  const [checked, setChecked] = useState<{
+    yaml: string;
+    result: WorkflowValidation | null;
+    error: string | null;
+  } | null>(null);
   const [checking, setChecking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -179,24 +180,20 @@ function WorkflowEditorForm({
   const problem = validateYamlText(yaml);
   const unchanged = !isNew && yaml === (existing.source ?? "");
 
-  const change = (text: string) => {
-    setYaml(text);
-    setCheck(null);
-    setCheckError(null);
-  };
+  const shown = checked !== null && checked.yaml === yaml ? checked : null;
 
   const runCheck = async () => {
+    const submitted = yaml;
     if (problem) {
-      setCheckError(problem);
+      setChecked({ yaml: submitted, result: null, error: problem });
       return;
     }
     setChecking(true);
-    setCheck(null);
-    setCheckError(null);
+    setChecked(null);
     try {
-      setCheck(await api.validateWorkflow(yaml));
+      setChecked({ yaml: submitted, result: await api.validateWorkflow(submitted), error: null });
     } catch (e) {
-      setCheckError(errorText(e, "The check did not run."));
+      setChecked({ yaml: submitted, result: null, error: errorText(e, "The check did not run.") });
     } finally {
       setChecking(false);
     }
@@ -244,7 +241,7 @@ function WorkflowEditorForm({
         <label className="field">
           <span className="label">Agent</span>
           <select className="input" value={agentId} disabled={saving} onChange={(e) => setAgentId(e.target.value)}>
-            {org.agent_profiles.map((p) => (
+            {profiles.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
               </option>
@@ -261,15 +258,15 @@ function WorkflowEditorForm({
           value={yaml}
           spellCheck={false}
           disabled={saving}
-          onChange={(e) => change(e.target.value)}
+          onChange={(e) => setYaml(e.target.value)}
         />
       </label>
-      {checkError ? (
+      {shown?.error ? (
         <p className="alert alert-error" role="alert">
-          {checkError}
+          {shown.error}
         </p>
       ) : null}
-      {check ? <CheckResult check={check} /> : null}
+      {shown?.result ? <CheckResult check={shown.result} /> : null}
       {error ? (
         <p className="alert alert-error" role="alert">
           {error}
@@ -391,7 +388,7 @@ function WorkflowDetailView({
             {workflow.name}
           </h2>
           <span className={admin.chips}>
-            <ToneBadge tone={workflowStatusTone(workflow.status)}>{workflowStatusLabel(workflow.status)}</ToneBadge>
+            <ToneBadge tone={statusTone(workflow.status)}>{statusLabel(workflow.status)}</ToneBadge>
             <span className="badge">Version {workflow.version}</span>
           </span>
         </div>
@@ -530,7 +527,7 @@ function StartCard({
 
   const start = async (event: React.FormEvent) => {
     event.preventDefault();
-    const parsed = parseInputs(text);
+    const parsed = parseJsonObject(text, "The inputs field", MAX_INPUTS_BYTES);
     if (!parsed.ok) {
       setError(parsed.error);
       return;
@@ -539,7 +536,7 @@ function StartCard({
     setError(null);
     setNotice(null);
     try {
-      const instance = await api.startWorkflow(org.id, workflow.id, parsed.inputs);
+      const instance = await api.startWorkflow(org.id, workflow.id, parsed.value ?? {});
       setNotice("The workflow started.");
       onStarted(instance);
     } catch (e) {
@@ -575,11 +572,12 @@ function StartCard({
           {notice}
         </p>
       ) : null}
+      {startable && workflow.status === "paused" ? (
+        <p className="hint">The workflow is paused. Its schedule does not run, but a manual start works.</p>
+      ) : null}
       {!startable ? (
         <p className="hint">
-          {workflow.needs_approval
-            ? "Approve the version first."
-            : "Only an active workflow can start. Resume it first."}
+          {workflow.needs_approval ? "Approve the version first." : "A workflow in this state cannot start."}
         </p>
       ) : null}
       <div className={styles.actions}>

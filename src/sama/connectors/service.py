@@ -252,7 +252,9 @@ class ConnectionView:
             out.append(McpTool(name, remote, cast(ToolAccess, access), enabled, operation))
         return out
 
-    def public(self) -> dict[str, Any]:
+    def public(self, can_manage: bool | None = None) -> dict[str, Any]:
+        """The view for the API. ``can_manage`` is whether the caller can change the connection
+        (``ConnectionService.can_manage``). It is in the view only when the caller gives it."""
         out: dict[str, Any] = {
             "id": str(self.id),
             "workspace_id": str(self.workspace_id),
@@ -270,6 +272,8 @@ class ConnectionView:
             "has_secret": self.has_secret,
             "mcp": None,
         }
+        if can_manage is not None:
+            out["can_manage"] = can_manage
         if self.has_tool_list:
             include, exclude = self.filters
             cache = self.tool_cache or {}
@@ -302,8 +306,11 @@ class Started:
     connection: ConnectionView
     redirect_url: str | None
 
-    def public(self) -> dict[str, Any]:
-        return {"connection": self.connection.public(), "redirect_url": self.redirect_url}
+    def public(self, can_manage: bool | None = None) -> dict[str, Any]:
+        return {
+            "connection": self.connection.public(can_manage),
+            "redirect_url": self.redirect_url,
+        }
 
 
 @dataclass(frozen=True, slots=True)

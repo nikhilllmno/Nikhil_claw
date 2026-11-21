@@ -4,7 +4,7 @@
 // the run budget of an agent. It writes through `PATCH /orgs/{org_id}/agent-profiles/{id}`.
 
 import Link from "next/link";
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { type AgentProfile, errorText } from "@/lib/api";
 import { canManageAgents } from "@/lib/console";
 import {
@@ -16,26 +16,18 @@ import {
   reasoningLabel,
   toHarnessDraft,
   validateHarness,
-  withHarnessRuntime,
 } from "@/lib/harness";
-import { runtimeLabel, runtimeOption } from "@/lib/profile";
+import { runtimeLabel, runtimeOption, withCurrent, withRuntime } from "@/lib/profile";
 import { useApi } from "../../AuthProvider";
 import { useData } from "../../DataProvider";
 import { NewAgentForm } from "../../NewAgentForm";
-import { ErrorState, LoadingState } from "../../ui";
-import { useLoad } from "../../useLoad";
 import admin from "../../Admin.module.css";
 import styles from "../../Page.module.css";
-import { useAgentChoice } from "../kit";
-import { ComingCard, ProfilePicker, SectionHeader } from "../parts";
-
-/** `list` with `value` in it, so that a select shows a value that the options do not have. */
-function withCurrent(list: string[], value: string): string[] {
-  return value === "" || list.includes(value) ? list : [value, ...list];
-}
+import { AgentProfileEditor, ComingCard, SectionHeader, useAgentChoice } from "../parts";
 
 export function HarnessSection() {
-  const { org, workspaceId, profileId, setProfileId } = useAgentChoice();
+  const choice = useAgentChoice();
+  const { org, workspaceId, setProfileId } = choice;
   const { reloadMe } = useData();
   const [creating, setCreating] = useState(false);
   const mayCreate = canManageAgents(org);
@@ -70,43 +62,19 @@ export function HarnessSection() {
           />
         </section>
       ) : null}
-      {profileId === null ? (
-        <div className="state">
-          <h2>No agents</h2>
-          <p>
-            {mayCreate
-              ? "This org has no agent yet. Make the first agent with the button New agent."
-              : "This org has no agent yet. Ask an org admin to make one."}
-          </p>
-        </div>
-      ) : (
-        <>
-          <ProfilePicker profiles={org.agent_profiles} value={profileId} onChange={setProfileId} />
-          <HarnessEditor key={profileId} orgId={org.id} profileId={profileId} manage={mayCreate} />
-        </>
-      )}
+      <AgentProfileEditor
+        choice={choice}
+        emptyText={
+          mayCreate
+            ? "This org has no agent yet. Make the first agent with the button New agent."
+            : "This org has no agent yet. Ask an org admin to make one."
+        }
+      >
+        {({ profile, readOnly, onSaved }) => (
+          <HarnessForm orgId={org.id} profile={profile} readOnly={readOnly} onSaved={onSaved} />
+        )}
+      </AgentProfileEditor>
     </>
-  );
-}
-
-function HarnessEditor({ orgId, profileId, manage }: { orgId: string; profileId: string; manage: boolean }) {
-  const api = useApi();
-  const { reloadMe } = useData();
-  const load = useCallback(() => api.getAgentProfile(orgId, profileId), [api, orgId, profileId]);
-  const { data: profile, setData: setProfile, error, reload } = useLoad(load, "Could not load the agent.");
-
-  if (error) return <ErrorState title="The agent did not load" message={error} onRetry={reload} />;
-  if (profile === null) return <LoadingState label="Loading the agent" />;
-  return (
-    <HarnessForm
-      profile={profile}
-      readOnly={!manage || !profile.editable}
-      onSaved={(saved) => {
-        setProfile(saved);
-        reloadMe(); // The model shows in the sidebar.
-      }}
-      orgId={orgId}
-    />
   );
 }
 
@@ -188,7 +156,7 @@ function HarnessForm({
             value={draft.runtime}
             disabled={readOnly}
             onChange={(e) => {
-              setDraft((d) => withHarnessRuntime(d, profile, e.target.value));
+              setDraft((d) => withRuntime(d, profile, e.target.value));
               setSaved(false);
             }}
           >
@@ -214,25 +182,23 @@ function HarnessForm({
             ))}
           </select>
         </label>
-        {options.reasoning_efforts !== undefined ? (
-          <label className="field">
-            <span className="label">Reasoning effort</span>
-            <select
-              className="input"
-              value={draft.reasoning}
-              disabled={readOnly}
-              onChange={(e) => edit({ reasoning: e.target.value as HarnessDraft["reasoning"] })}
-            >
-              <option value="">{reasoningLabel("")}</option>
-              {options.reasoning_efforts.map((effort) => (
-                <option key={effort} value={effort}>
-                  {reasoningLabel(effort)}
-                </option>
-              ))}
-            </select>
-            <span className="hint">More effort gives better answers to hard tasks. It costs more time and tokens.</span>
-          </label>
-        ) : null}
+        <label className="field">
+          <span className="label">Reasoning effort</span>
+          <select
+            className="input"
+            value={draft.reasoning}
+            disabled={readOnly}
+            onChange={(e) => edit({ reasoning: e.target.value as HarnessDraft["reasoning"] })}
+          >
+            <option value="">{reasoningLabel("")}</option>
+            {options.reasoning_efforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {reasoningLabel(effort)}
+              </option>
+            ))}
+          </select>
+          <span className="hint">More effort gives better answers to hard tasks. It costs more time and tokens.</span>
+        </label>
       </section>
 
       {options.busy_modes !== undefined ? (
@@ -266,74 +232,72 @@ function HarnessForm({
         </ComingCard>
       )}
 
-      {profile.budget !== undefined ? (
-        <section className={`card ${styles.card}`} aria-labelledby="harness-budget">
-          <h2 id="harness-budget" className={styles.heading}>
-            Run budget
-          </h2>
-          <p className="hint">The most that one run can use. A run that reaches a limit stops.</p>
-          <div className={admin.grid}>
-            <label className="field">
-              <span className="label">Max turns</span>
-              <input
-                className="input"
-                type="number"
-                inputMode="numeric"
-                min={1}
-                step={1}
-                value={draft.budget.maxTurns}
-                readOnly={readOnly}
-                onChange={(e) => editBudget({ maxTurns: e.target.value })}
-              />
-              <span className="hint">{capHint(caps?.max_turns, "turns")}</span>
-            </label>
-            <label className="field">
-              <span className="label">Max cost (US dollars)</span>
-              <input
-                className="input"
-                type="number"
-                inputMode="decimal"
-                min={0}
-                step="any"
-                value={draft.budget.maxCostUsd}
-                readOnly={readOnly}
-                onChange={(e) => editBudget({ maxCostUsd: e.target.value })}
-              />
-              <span className="hint">{capHint(caps?.max_cost_usd, "US dollars")}</span>
-            </label>
-            <label className="field">
-              <span className="label">Max wall time (minutes)</span>
-              <input
-                className="input"
-                type="number"
-                inputMode="decimal"
-                min={0}
-                step="any"
-                value={draft.budget.maxWallMinutes}
-                readOnly={readOnly}
-                onChange={(e) => editBudget({ maxWallMinutes: e.target.value })}
-              />
-              <span className="hint">
-                {capHint(caps?.max_wall_time_s == null ? null : caps.max_wall_time_s / 60, "minutes")}
-              </span>
-            </label>
-            <label className="field">
-              <span className="label">Max tokens</span>
-              <input
-                className="input"
-                type="number"
-                inputMode="numeric"
-                min={1}
-                step={1}
-                value={draft.budget.maxTokens}
-                readOnly={readOnly}
-                onChange={(e) => editBudget({ maxTokens: e.target.value })}
-              />
-              <span className="hint">Empty means no limit.</span>
-            </label>
-          </div>
-        </section>
-      ) : null}
+      <section className={`card ${styles.card}`} aria-labelledby="harness-budget">
+        <h2 id="harness-budget" className={styles.heading}>
+          Run budget
+        </h2>
+        <p className="hint">The most that one run can use. A run that reaches a limit stops.</p>
+        <div className={admin.grid}>
+          <label className="field">
+            <span className="label">Max turns</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              step={1}
+              value={draft.budget.maxTurns}
+              readOnly={readOnly}
+              onChange={(e) => editBudget({ maxTurns: e.target.value })}
+            />
+            <span className="hint">{capHint(caps.max_turns, "turns")}</span>
+          </label>
+          <label className="field">
+            <span className="label">Max cost (US dollars)</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step="any"
+              value={draft.budget.maxCostUsd}
+              readOnly={readOnly}
+              onChange={(e) => editBudget({ maxCostUsd: e.target.value })}
+            />
+            <span className="hint">{capHint(caps.max_cost_usd, "US dollars")}</span>
+          </label>
+          <label className="field">
+            <span className="label">Max wall time (minutes)</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step="any"
+              value={draft.budget.maxWallMinutes}
+              readOnly={readOnly}
+              onChange={(e) => editBudget({ maxWallMinutes: e.target.value })}
+            />
+            <span className="hint">
+              {capHint(caps.max_wall_time_s === null ? null : caps.max_wall_time_s / 60, "minutes")}
+            </span>
+          </label>
+          <label className="field">
+            <span className="label">Max tokens</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              step={1}
+              value={draft.budget.maxTokens}
+              readOnly={readOnly}
+              onChange={(e) => editBudget({ maxTokens: e.target.value })}
+            />
+            <span className="hint">Empty means no limit.</span>
+          </label>
+        </div>
+      </section>
 
       {readOnly ? (
         <p className="alert" role="note">
