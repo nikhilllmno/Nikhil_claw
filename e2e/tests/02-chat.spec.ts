@@ -3,12 +3,15 @@
 
 import { readFile } from "node:fs/promises";
 import { marker } from "../lib/names.ts";
+import { calledTool, sessionToolUses } from "../lib/trace.ts";
 import { replies, send, startSession, waitForReply, waitIdle } from "../lib/ui.ts";
 import { expect, test } from "../fixtures.ts";
 
 test.describe.configure({ mode: "serial" });
 
 const word = marker("chat");
+/** A cheap model of the OpenAI runtime (src/sama/modelproxy/prices.toml). */
+const OPENAI_MODEL = "gpt-6-luna";
 let sessionId = "";
 
 test("chat on the Claude runtime gets an answer", async ({ ownerPage: page }) => {
@@ -81,6 +84,26 @@ test("chat on the OpenAI runtime gets an answer", async ({ ownerPage: page, owne
     await startSession(page, `e2e openai ${other}`);
     await send(page, `Reply with the word ${other} and nothing else.`);
     await waitForReply(page, other);
+  } finally {
+    await ownerApi.patch(path, { runtime: before.runtime, model: before.model });
+  }
+});
+
+test("an OpenAI-runtime chat calls a slow tool", async ({ ownerPage: page, ownerApi, world }) => {
+  // PR 77: the OpenAI runtime waits longer for a slow MCP call, such as a browser start.
+  const path = `/orgs/${world.org.id}/agent-profiles/${world.org.profileId}`;
+  const before = await ownerApi.get<{ runtime: string; model: string }>(path);
+  try {
+    await ownerApi.patch(path, { runtime: "openai_agents_sdk", model: OPENAI_MODEL });
+    const sessionId = await startSession(page, `e2e openai browser ${marker("ob")}`);
+    await send(
+      page,
+      "Use the browser_open tool to open https://example.com in the cloud browser. " +
+        "Then reply with the main heading of the page.",
+    );
+    await waitForReply(page, /Example Domain/i);
+    const uses = await sessionToolUses(ownerApi, sessionId);
+    expect(uses.some((u) => calledTool(u, /browser_open$/) && u.ok)).toBe(true);
   } finally {
     await ownerApi.patch(path, { runtime: before.runtime, model: before.model });
   }
