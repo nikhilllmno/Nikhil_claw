@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import sys
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import select
@@ -112,6 +115,42 @@ async def test_a_session_with_an_open_run_cannot_restore(
     assert (Path(sandbox.workdir) / "b.txt").exists()
     # The list works during a run.
     assert len(await service.listing(org_id=org, session_id=session)) == 2
+
+
+class _Slow:
+    """A sandbox whose command waits until the test lets it go."""
+
+    def __init__(self, inner: LocalSandbox) -> None:
+        self.inner = inner
+        self.workdir = inner.workdir
+        self.started = asyncio.Event()
+        self.go = asyncio.Event()
+
+    async def exec(self, argv: Sequence[str], **kwargs: Any) -> ExecResult:
+        self.started.set()
+        await self.go.wait()
+        return await self.inner.exec(argv, **kwargs)
+
+
+async def test_no_run_can_start_during_a_restore(
+    engine: AsyncEngine, tenant: Tenant, sandbox: LocalSandbox
+) -> None:
+    _two_runs(Path(sandbox.workdir))
+    slow = _Slow(sandbox)
+    service = CheckpointService(engine, _Sandboxes(cast(Sandbox, slow)), argv=ARGV)
+    org, session = tenant.org, tenant.ids["mine"]
+    undo = asyncio.create_task(service.undo(org_id=org, user_id=None, session_id=session))
+    await asyncio.wait_for(slow.started.wait(), 10)
+    enqueue = asyncio.create_task(
+        RunQueue(engine).enqueue(org_id=org, session_id=session, text="hi", user_id=None)
+    )
+    await asyncio.sleep(0.5)
+    # The restore holds the session row: the new run waits for it.
+    assert not enqueue.done()
+    slow.go.set()
+    await asyncio.wait_for(undo, 30)
+    await asyncio.wait_for(enqueue, 10)
+    assert not (Path(sandbox.workdir) / "b.txt").exists()
 
 
 async def test_a_session_without_a_sandbox_has_no_checkpoints(

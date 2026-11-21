@@ -3116,7 +3116,7 @@ cross-org check of Section 17.1 through the API.
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
-| `POST /sessions/{id}/undo` | Restore the session files to before the last run that changed them (`200` with `created_at`, `files`, `deleted`, and `text`). `409` with the reason when the session has an open run, no sandbox, or nothing to undo (Section 15.3, M6.4). |
+| `POST /sessions/{id}/undo` | Restore the session files to before the last run that changed them (`200` with `created_at`, `files`, `deleted`, `kept`, and `text`). `409` with the reason when the session has an open run, no sandbox, or nothing to undo (Section 15.3, M6.4). |
 | `POST /sessions/{id}/rollback` | Restore the checkpoint `number` (1 is the newest) of `GET /sessions/{id}/checkpoints`. The answer and the `409` reasons are the same as for `undo` (Section 15.3, M6.4). |
 | `POST /sessions/{id}/compact` | Queue a `/compact` run (`202` with `run_id`). The body is optional: `focus`, at most 6,000 characters. `409` if the session is busy, not active, or has nothing to compact. `429` over a rate limit (Section 6.3, M2.6). |
 | `GET /sessions/{id}/compactions` | The compactions of the session, newest first: `trigger`, token counts, the archive session, `completed_at`. |
@@ -4838,7 +4838,13 @@ sama: the shadow repository uses `GIT_DIR` and `GIT_WORK_TREE`, a clean environm
 global or system git configuration, and its own index. A snapshot is a commit on the ref
 `refs/sama/checkpoints`. The commit message keeps the run id, the tool name, and the kind
 (`tool` or `rollback`). Git stores each file content once, so a snapshot of files that did not
-change costs little. The first snapshot of a small folder takes about 15 ms.
+change costs little. The first snapshot of a small folder takes about 15 ms. In a live E2B
+sandbox, the first snapshot of 1,000 files took about 0.2 s, and a later snapshot about 40 ms.
+
+Git stores the bytes of each file as they are. The file `info/attributes` of the shadow
+repository turns off the attributes that change the content (`text`, `filter`, `ident`, and
+`working-tree-encoding`). It has a higher priority than the `.gitattributes` files of the work
+folder. The user and system attribute files are off too.
 
 **What a snapshot has.** The files and the symbolic links of the work folder, with the
 executable bit. Files in a nested git repository (for example a `repo_clone`) are normal
@@ -4865,15 +4871,24 @@ runtimes, because it is in the gate and not in an adapter (Section 5.3).
 sandbox (`sama.orchestrator.checkpoints.CheckpointService`). The command prints one JSON
 line. A restore:
 
-1. refuses when the session has an open run. The runner also holds `.sama/runner.lock`, and
-   a restore waits at most 10 seconds for it.
+1. refuses when the session has an open run. The service locks the session row
+   (`FOR UPDATE`) for the whole restore. `RunQueue.enqueue` locks the same row, and a new run
+   row takes a key share lock on it, so no run can start during a restore. The lock is only on
+   this session: other sessions of the org do not wait. The runner also holds
+   `.sama/runner.lock`, and a restore waits at most 10 seconds for it.
 2. takes a `rollback` checkpoint of the current files first, so that the user can go back with
    `/rollback 1`.
-3. deletes the files that are not in the target snapshot, and writes the files of the target
-   snapshot.
+3. finds the files of the target that it cannot write without data loss. To write a file,
+   git must remove what is at its place. The restore removes only a file or a link that the
+   `rollback` checkpoint has, or a folder that has only such files. It does not write a target
+   file at the place of a large file, or of a folder that has excluded or large files (for
+   example a clone with its `.git` folder). It keeps these items as they are and counts them as
+   `kept`. The answer to the user names the count.
+4. deletes the files that the `rollback` checkpoint has and the target does not have, and
+   writes the other files of the target.
 
 The control plane writes the audit entry `session.undo` or `session.rollback` with the commit
-and the counts of files.
+and the counts of files (`files`, `deleted`, `kept`).
 
 **Commands.**
 

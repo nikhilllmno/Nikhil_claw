@@ -6,7 +6,8 @@ the list, and it restores a checkpoint. The rules:
 
 - The caller checks that the user can see the session.
 - The session must have no open run (queued, running, or paused): a restore must not change
-  the files under a run. The command in the sandbox also waits for the runner lock.
+  the files under a run. A restore holds a lock on the session row for the whole command, so
+  no run can start during it. The command in the sandbox also waits for the runner lock.
 - A session without a sandbox, or with an outdated sandbox, has no checkpoints.
 - Each restore writes an audit entry.
 """
@@ -23,7 +24,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from sqlalchemy import insert, select
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import ENDED_RUN_STATUSES, AuditEntry, Run, Session
 from sama.sandbox.base import Sandbox, SandboxError
@@ -64,6 +65,8 @@ class RestoreView:
     """The time of the checkpoint that the files are now equal to."""
     files: int
     deleted: int
+    kept: int = 0
+    """Large or excluded items that the restore did not replace (Section 15.3)."""
 
 
 class CheckpointService:
@@ -101,7 +104,7 @@ class CheckpointService:
         self, *, org_id: uuid.UUID, user_id: uuid.UUID | None, session_id: uuid.UUID
     ) -> RestoreView:
         """Restores the files before the latest run that changed files."""
-        return await self._restore(org_id, user_id, session_id, ["undo"], "session.undo")
+        return await self._restore(org_id, user_id, session_id, None)
 
     async def rollback(
         self, *, org_id: uuid.UUID, user_id: uuid.UUID | None, session_id: uuid.UUID, number: int
@@ -109,70 +112,81 @@ class CheckpointService:
         """Restores checkpoint ``number`` of ``list``."""
         if number < 1:
             raise CheckpointServiceError("The checkpoint number must be 1 or more.")
-        args = ["restore", "--number", str(number)]
-        return await self._restore(org_id, user_id, session_id, args, "session.rollback")
+        return await self._restore(org_id, user_id, session_id, number)
 
     async def _restore(
         self,
         org_id: uuid.UUID,
         user_id: uuid.UUID | None,
         session_id: uuid.UUID,
-        args: list[str],
-        action: str,
+        number: int | None,
     ) -> RestoreView:
-        workspace_id = await self._check_idle(org_id, session_id)
-        result = await self._run(org_id, session_id, args)
-        if result is None:
-            raise CheckpointServiceError(NO_CHECKPOINTS)
-        restored: dict[str, Any] = result["restored"]
+        """Runs a restore with the session row locked (``FOR UPDATE``) for the whole command.
+
+        A new run needs a lock on the session row: ``RunQueue.enqueue`` locks the row, and the
+        insert of a run takes a key share lock on it. So no run can start while the restore
+        changes the files. The lock does not take the rate lock of the org, so the other
+        sessions of the org do not wait."""
+        args = ["undo"] if number is None else ["restore", "--number", str(number)]
         async with self._engine.begin() as connection:
+            workspace_id = await self._reserve(connection, org_id, session_id)
+            result = await self._run(org_id, session_id, args)
+            if result is None:
+                raise CheckpointServiceError(NO_CHECKPOINTS)
+            restored: dict[str, Any] = result["restored"]
+            view = RestoreView(
+                created_at=_time(restored["created_at"]),
+                files=int(restored.get("written", 0)),
+                deleted=int(restored.get("deleted", 0)),
+                kept=int(restored.get("kept", 0)),
+            )
             await connection.execute(
                 insert(AuditEntry).values(
                     org_id=org_id,
                     workspace_id=workspace_id,
                     actor_kind="user" if user_id is not None else "system",
                     actor_user_id=user_id,
-                    action=action,
+                    action="session.undo" if number is None else "session.rollback",
                     target_type="session",
                     target_id=str(session_id),
                     details={
                         "commit": str(restored.get("commit", "")),
                         "saved": str(restored.get("saved", "")),
-                        "number": int(args[-1]) if args[0] == "restore" else None,
-                        "files": int(restored.get("written", 0)),
-                        "deleted": int(restored.get("deleted", 0)),
+                        "number": number,
+                        "files": view.files,
+                        "deleted": view.deleted,
+                        "kept": view.kept,
                     },
                 )
             )
-        return RestoreView(
-            created_at=_time(restored["created_at"]),
-            files=int(restored.get("written", 0)),
-            deleted=int(restored.get("deleted", 0)),
-        )
+        return view
 
-    async def _check_idle(self, org_id: uuid.UUID, session_id: uuid.UUID) -> uuid.UUID:
-        """Returns the workspace of the session. Raises when the session has an open run."""
-        async with self._engine.connect() as connection:
-            workspace_id = (
-                await connection.execute(
-                    select(Session.workspace_id).where(
-                        Session.org_id == org_id, Session.id == session_id
-                    )
+    @staticmethod
+    async def _reserve(
+        connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID
+    ) -> uuid.UUID:
+        """Locks the session row and returns its workspace. Raises when the session has an
+        open run."""
+        workspace_id = (
+            await connection.execute(
+                select(Session.workspace_id)
+                .where(Session.org_id == org_id, Session.id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if workspace_id is None:
+            raise CheckpointServiceError("The session does not exist.")
+        busy = (
+            await connection.execute(
+                select(Run.id)
+                .where(
+                    Run.org_id == org_id,
+                    Run.session_id == session_id,
+                    Run.status.not_in(ENDED_RUN_STATUSES),
                 )
-            ).scalar_one_or_none()
-            if workspace_id is None:
-                raise CheckpointServiceError("The session does not exist.")
-            busy = (
-                await connection.execute(
-                    select(Run.id)
-                    .where(
-                        Run.org_id == org_id,
-                        Run.session_id == session_id,
-                        Run.status.not_in(ENDED_RUN_STATUSES),
-                    )
-                    .limit(1)
-                )
-            ).first()
+                .limit(1)
+            )
+        ).first()
         if busy is not None:
             raise CheckpointServiceError(BUSY)
         return workspace_id
@@ -274,7 +288,11 @@ def list_text(listed: Sequence[CheckpointView], rollback: str, undo: str) -> str
 
 
 def restored_text(restored: RestoreView, rollback: str) -> str:
+    kept = (
+        f" sama kept {restored.kept} large or excluded items as they are." if restored.kept else ""
+    )
     return (
         f"The session files are back to the checkpoint of {_stamp(restored.created_at)}"
-        f" ({restored.files} files, {restored.deleted} deleted). To go back, send {rollback} 1."
+        f" ({restored.files} files, {restored.deleted} deleted).{kept}"
+        f" To go back, send {rollback} 1."
     )

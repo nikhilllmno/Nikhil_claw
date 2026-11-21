@@ -216,6 +216,8 @@ export interface Restored {
   created_at: string;
   files: number;
   deleted: number;
+  /** Large or excluded items that the restore did not replace. */
+  kept: number;
   /** The answer for the user. */
   text: string;
 }

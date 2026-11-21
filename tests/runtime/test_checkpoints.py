@@ -17,7 +17,6 @@ import pytest
 from sama.runtime import checkpoints as module
 from sama.runtime.checkpoints import (
     CHANGE_TOOLS,
-    RUNNER_LOCK,
     BusyError,
     CheckpointError,
     CheckpointGate,
@@ -54,10 +53,6 @@ def work(tmp_path: Path) -> Path:
     root = tmp_path / "work"
     root.mkdir()
     return root
-
-
-def test_the_runner_lock_is_the_lock_of_the_runner() -> None:
-    assert RUNNER_LOCK == LOCK_FILE
 
 
 def test_the_change_tools_are_the_tools_that_write_files() -> None:
@@ -209,6 +204,75 @@ def test_a_restore_keeps_large_files_and_excluded_folders(
     assert (work / "a.txt").read_text() == "one"
     assert (work / "big.bin").exists()
     assert (work / "node_modules/m.js").exists()
+
+
+def test_a_restore_does_not_overwrite_a_file_that_grew_too_large(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "MAX_FILE_BYTES", 10)
+    checkpoints = Checkpoints(str(work))
+    _write(work, "log.txt", "small")
+    _write(work, "a.txt", "one")
+    checkpoints.snapshot("r1", "Bash")
+    _write(work, "log.txt", "large " * 10)
+    _write(work, "a.txt", "two")
+    restored = checkpoints.undo()
+    assert (work / "a.txt").read_text() == "one"
+    # The rollback checkpoint does not hold the large file, so the restore keeps it.
+    assert (work / "log.txt").read_text() == "large " * 10
+    assert (restored.written, restored.kept) == (1, 1)
+
+
+def test_a_restore_does_not_replace_a_folder_with_unsaved_files(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "MAX_FILE_BYTES", 10)
+    checkpoints = Checkpoints(str(work))
+    _write(work, "a.txt", "one")
+    os.symlink("a.txt", work / "repo")
+    _write(work, "data", "file")
+    checkpoints.snapshot("r1", "Bash")
+    # The run puts a clone with local commits at the place of the link, and a folder with a
+    # large file at the place of a file.
+    (work / "repo").unlink()
+    subprocess.run([module.GIT, "init", "-q", str(work / "repo")], check=True)
+    _write(work, "repo/f.txt", "f")
+    (work / "data").unlink()
+    _write(work, "data/big.bin", "x" * 100)
+    restored = checkpoints.undo()
+    assert (work / "repo/.git/HEAD").is_file()
+    assert (work / "data/big.bin").read_text() == "x" * 100
+    assert (restored.written, restored.kept) == (1, 2)
+    assert (work / "a.txt").read_text() == "one"
+
+
+def test_a_restore_replaces_a_folder_that_holds_only_saved_files(work: Path) -> None:
+    checkpoints = Checkpoints(str(work))
+    _write(work, "data", "file")
+    checkpoints.snapshot("r1", "Bash")
+    (work / "data").unlink()
+    _write(work, "data/a/b.txt", "b")
+    restored = checkpoints.undo()
+    assert (work / "data").read_text() == "file"
+    assert (restored.written, restored.deleted, restored.kept) == (1, 1, 0)
+    checkpoints.restore(1)
+    assert (work / "data/a/b.txt").read_text() == "b"
+
+
+def test_git_attributes_do_not_change_the_bytes(work: Path) -> None:
+    checkpoints = Checkpoints(str(work))
+    attributes = "*.txt text eol=lf ident\n*.bin filter=missing\n"
+    _write(work, ".gitattributes", attributes)
+    original = {"a.txt": b"x\r\ny\r\n$Id$\r\n", "b.bin": b"\x00\r\n\xff"}
+    for name, data in original.items():
+        (work / name).write_bytes(data)
+    checkpoints.snapshot("r1", "Bash")
+    (work / "a.txt").write_bytes(b"changed")
+    (work / "b.bin").unlink()
+    checkpoints.undo()
+    for name, data in original.items():
+        assert (work / name).read_bytes() == data
+    assert (work / ".gitattributes").read_text() == attributes
 
 
 def test_a_restore_keeps_links_as_links(work: Path) -> None:

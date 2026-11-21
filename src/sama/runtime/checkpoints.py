@@ -25,7 +25,11 @@ Rules:
 - A restore waits for the runner lock: it does not change files while a runner works. First it
   takes a snapshot of the current files (kind ``rollback``), so a restore can be undone with
   ``/rollback``. Then it deletes the files that are not in the target snapshot and writes the
-  files of the target snapshot. Excluded and large files stay as they are.
+  files of the target snapshot. Excluded and large files stay as they are: the restore does not
+  replace a large file, or a folder that holds excluded or large files, with a file of the
+  target. It counts these items as ``kept``.
+- Git stores the bytes of each file as they are. The shadow repository turns off the git
+  attributes (``.gitattributes``) that change files, such as line ends and filters.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -65,8 +70,7 @@ SHADOW_DIR: Final = ".sama/checkpoints"
 """The git folder of the shadow repository, in the work folder."""
 CHECKPOINT_LOCK: Final = ".sama/checkpoints.lock"
 RUNNER_LOCK: Final = ".sama/runner.lock"
-"""The same file as ``sama.runtime.runner.LOCK_FILE``. This module does not import the runner,
-because the runner imports this module. A test checks that the two values are equal."""
+"""The lock that a runner holds while it works (``sama.runtime.runner.LOCK_FILE``)."""
 REF: Final = "refs/sama/checkpoints"
 
 EXCLUDED_DIRS: Final = frozenset(
@@ -96,6 +100,9 @@ MAX_HISTORY: Final = 1_000
 RUNNER_LOCK_WAIT_S: Final = 10.0
 GIT_TIMEOUT_S: Final = 60.0
 GIT: Final = shutil.which("git") or "/usr/bin/git"
+ATTRIBUTES: Final = "* -text -filter -ident -working-tree-encoding\n"
+"""``info/attributes`` of the shadow repository. It has the highest priority of all attribute
+files, so the ``.gitattributes`` files of the work folder cannot change the stored bytes."""
 
 CHANGE_TOOLS: Final = frozenset(
     {
@@ -145,13 +152,16 @@ class Restored:
     deleted: int
     saved: str
     """The ``rollback`` checkpoint: the files before the restore."""
+    kept: int = 0
+    """Files of the target that the restore did not write: writing them would remove a large
+    file or excluded files, which the ``rollback`` checkpoint does not hold."""
 
 
 @dataclass(frozen=True, slots=True)
 class _Files:
     paths: list[str]
     skipped: set[str]
-    """Files that are too large. A restore does not touch them."""
+    """Files that are too large. A snapshot does not hold them."""
 
 
 class Checkpoints:
@@ -171,6 +181,7 @@ class Checkpoints:
             "GIT_WORK_TREE": self.workdir,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
             "GIT_AUTHOR_NAME": "sama",
             "GIT_AUTHOR_EMAIL": "sama@localhost",
             "GIT_COMMITTER_NAME": "sama",
@@ -185,7 +196,12 @@ class Checkpoints:
         self, *args: str, data: bytes | None = None, index: str | None = None, check: bool = True
     ) -> bytes:
         done = subprocess.run(  # noqa: S603 -- fixed git arguments, no shell
-            [GIT, "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", *args],
+            [
+                GIT,
+                *("-c", "core.autocrlf=false", "-c", "core.safecrlf=false"),
+                *("-c", f"core.attributesFile={os.devnull}"),
+                *args,
+            ],
             input=data,
             capture_output=True,
             env=self._env(index),
@@ -198,10 +214,23 @@ class Checkpoints:
             raise CheckpointError(f"git {args[0]} failed: {message}")
         return done.stdout
 
+    def _exists(self) -> bool:
+        return os.path.isfile(os.path.join(self.git_dir, "HEAD"))
+
     def _ensure(self) -> None:
-        if not os.path.isfile(os.path.join(self.git_dir, "HEAD")):
+        if not self._exists():
             os.makedirs(self.git_dir, exist_ok=True)
             self._git("init", "-q")
+        path = os.path.join(self.git_dir, "info", "attributes")
+        try:
+            with open(path, encoding="utf-8") as file:
+                if file.read() == ATTRIBUTES:
+                    return
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(ATTRIBUTES)
 
     @contextlib.contextmanager
     def _lock(self, name: str, *, wait_s: float | None = None) -> Iterator[None]:
@@ -253,12 +282,12 @@ class Checkpoints:
                     continue
                 rel = name if rel_root == "." else os.path.join(rel_root, name)
                 try:
-                    stat = os.lstat(os.path.join(root, name))
+                    st = os.lstat(os.path.join(root, name))
                 except OSError:
                     continue
-                if not (_is_file(stat.st_mode) or _is_link(stat.st_mode)):
+                if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
                     continue
-                if _is_file(stat.st_mode) and stat.st_size > MAX_FILE_BYTES:
+                if stat.S_ISREG(st.st_mode) and st.st_size > MAX_FILE_BYTES:
                     skipped.add(rel)
                     continue
                 paths.append(rel)
@@ -346,7 +375,7 @@ class Checkpoints:
         return commit if new else None
 
     def listing(self, limit: int = LIST_LIMIT) -> list[Checkpoint]:
-        if not os.path.isfile(os.path.join(self.git_dir, "HEAD")):
+        if not self._exists():
             return []
         with self._lock(CHECKPOINT_LOCK):
             return self._history(limit)
@@ -364,12 +393,13 @@ class Checkpoints:
         return self._restore(_undo_target)
 
     def _restore(self, choose: Callable[[Sequence[Checkpoint], str], Checkpoint]) -> Restored:
-        if not os.path.isfile(os.path.join(self.git_dir, "HEAD")):
+        if not self._exists():
             raise CheckpointError("This session has no checkpoints yet.")
         with (
             self._lock(RUNNER_LOCK, wait_s=RUNNER_LOCK_WAIT_S),
             self._lock(CHECKPOINT_LOCK),
         ):
+            self._ensure()
             history = self._history(MAX_HISTORY)
             if not history:
                 raise CheckpointError("This session has no checkpoints yet.")
@@ -380,24 +410,32 @@ class Checkpoints:
                 )
             current = self._tree(files)
             target: Checkpoint = choose(history, current)
+            wanted = _split(self._git("ls-tree", "-r", "-z", "--name-only", target.commit))
+            # Decide before any change: a path is not written when the write would remove
+            # files that the rollback checkpoint does not hold.
+            guard = _Guard(self.workdir, set(files.paths))
+            write = [rel for rel in wanted if guard.safe(rel)]
             saved, _ = self._commit(current, "rollback", "rollback", "rollback", target.commit)
-            wanted = set(_split(self._git("ls-tree", "-r", "-z", "--name-only", target.commit)))
             deleted = 0
-            for rel in sorted(set(files.paths) - wanted, reverse=True):
+            for rel in sorted(guard.saved - set(wanted), reverse=True):
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(os.path.join(self.workdir, rel))
                     deleted += 1
                 _prune(self.workdir, os.path.dirname(rel))
-            with tempfile.TemporaryDirectory(dir=self.git_dir) as scratch:
-                index = os.path.join(scratch, "index")
-                self._git("read-tree", target.commit, index=index)
-                self._git("checkout-index", "-a", "-f", index=index)
+            if write:
+                with tempfile.TemporaryDirectory(dir=self.git_dir) as scratch:
+                    index = os.path.join(scratch, "index")
+                    self._git("read-tree", target.commit, index=index)
+                    self._git(
+                        "checkout-index", "-f", "-z", "--stdin", data=_join(write), index=index
+                    )
             return Restored(
                 commit=target.commit,
                 created_at=target.created_at,
-                written=len(wanted),
+                written=len(write),
                 deleted=deleted,
                 saved=saved,
+                kept=len(wanted) - len(write),
             )
 
 
@@ -426,10 +464,10 @@ class CheckpointGate:
             scope, tool_name, arguments, call_id=call_id, child=child
         )
         if decision.action != "deny" and tool_name in CHANGE_TOOLS:
-            await self.take(scope.run_id, tool_name)
+            await self._take(scope.run_id, tool_name)
         return decision
 
-    async def take(self, run_id: str, tool_name: str) -> None:
+    async def _take(self, run_id: str, tool_name: str) -> None:
         started = time.monotonic()
         try:
             commit = await asyncio.to_thread(self._checkpoints.snapshot, run_id, tool_name)
@@ -486,12 +524,55 @@ def _prune(workdir: str, rel_dir: str) -> None:
         rel_dir = os.path.dirname(rel_dir)
 
 
-def _is_file(mode: int) -> bool:
-    return (mode & 0o170000) == 0o100000
+class _Guard:
+    """Finds the paths of a target that a restore cannot write without data loss.
 
+    ``saved`` holds the files of the ``rollback`` checkpoint. To write a target path, the
+    restore can remove a file or a link that is in ``saved``, or a folder that holds only files
+    in ``saved``. It must not remove anything else: a large file, an excluded folder (such as a
+    ``.git`` folder), or a special file. ``git checkout-index -f`` would remove them."""
 
-def _is_link(mode: int) -> bool:
-    return (mode & 0o170000) == 0o120000
+    def __init__(self, workdir: str, saved: set[str]) -> None:
+        self.workdir = workdir
+        self.saved = saved
+        self._lossy: dict[str, bool] = {}
+
+    def safe(self, rel: str) -> bool:
+        parts = rel.split("/")
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            lossy = self._lossy.get(prefix)
+            if lossy is None:
+                lossy = self._lossy[prefix] = self._replace_loses(prefix, depth == len(parts))
+            if lossy:
+                return False
+        return True
+
+    def _replace_loses(self, rel: str, last: bool) -> bool:
+        """True if a write at (or under) ``rel`` removes something that is not saved."""
+        try:
+            st = os.lstat(os.path.join(self.workdir, rel))
+        except (FileNotFoundError, NotADirectoryError):
+            # Nothing is there, or a file on the path goes first (it is saved, or the check
+            # of that file stops the write).
+            return False
+        except OSError:
+            return True
+        if stat.S_ISDIR(st.st_mode):
+            # A folder on the path of a file stays. A folder at the place of a file goes.
+            return last and self._holds_unsaved(rel)
+        if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            return rel not in self.saved
+        return True
+
+    def _holds_unsaved(self, rel: str) -> bool:
+        for root, dirs, files in os.walk(os.path.join(self.workdir, rel), followlinks=False):
+            names = files + [name for name in dirs if os.path.islink(os.path.join(root, name))]
+            for name in names:
+                path = os.path.relpath(os.path.join(root, name), self.workdir)
+                if path not in self.saved:
+                    return True
+        return False
 
 
 def _split(data: bytes) -> list[str]:
@@ -510,7 +591,7 @@ def _meta(body: str) -> dict[str, str]:
     meta: dict[str, str] = {}
     for line in body.splitlines():
         key, sep, value = line.partition(": ")
-        if sep and key in {"run", "tool", "kind", "restored"}:
+        if sep:
             meta[key] = value.strip()
     return meta
 
@@ -530,7 +611,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result: dict[str, Any]
     try:
         if args.command == "list":
-            limit = max(1, min(int(args.limit), 100))
+            limit = max(1, min(args.limit, 100))
             result = {"ok": True, "checkpoints": [asdict(c) for c in checkpoints.listing(limit)]}
         elif args.command == "undo":
             result = {"ok": True, "restored": asdict(checkpoints.undo())}

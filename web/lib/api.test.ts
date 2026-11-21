@@ -304,7 +304,7 @@ describe("busy controls", () => {
 
 describe("checkpoints", () => {
   it("lists the checkpoints, undoes, and rolls back", async () => {
-    const restored = { created_at: "2026-11-21T09:30:00Z", files: 2, deleted: 1, text: "back" };
+    const restored = { created_at: "2026-11-21T09:30:00Z", files: 2, deleted: 1, kept: 0, text: "back" };
     const fetcher = vi
       .fn()
       .mockResolvedValueOnce(json(200, [{ number: 1, created_at: "2026-11-21T09:30:00Z", tool: "Bash", kind: "tool" }]))

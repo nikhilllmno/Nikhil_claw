@@ -294,6 +294,8 @@ class RestoreOut(BaseModel):
     """The time of the checkpoint that the files are now equal to."""
     files: int
     deleted: int
+    kept: int
+    """Large or excluded items that the restore did not replace."""
     text: str
     """The answer for the user."""
 
@@ -2969,6 +2971,7 @@ class SamaApi:
             created_at=restored.created_at,
             files=restored.files,
             deleted=restored.deleted,
+            kept=restored.kept,
             text=restored_text(restored, "/rollback"),
         )
 
