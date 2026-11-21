@@ -30,8 +30,17 @@ class Sent(BaseModel):
 class SendError(Exception):
     """A message was not queued. ``status`` is the HTTP status of the answer."""
 
-    def __init__(self, status: int, detail: str, *, retry_after_s: int | None = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        detail: str,
+        *,
+        retry_after_s: int | None = None,
+        quota: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status = status
         self.detail = detail
         self.retry_after_s = retry_after_s
+        self.quota = quota
+        """The model quota of a ``402`` (Section 17.5)."""

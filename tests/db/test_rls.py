@@ -54,6 +54,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "alice": {
         "orgs": {"org-a"},
         "org_invites": set(),
+        "org_billing": set(),
+        "billing_events": set(),
         "users": {"alice", "carol", "dave"},
         "workspaces": {"a1"},
         "agent_profiles": {"profile-a"},
@@ -85,6 +87,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "carol": {
         "orgs": {"org-a"},
         "org_invites": {"invite:org-a"},
+        "org_billing": {"billing:org-a"},
+        "billing_events": {"billing-event:org-a"},
         "users": {"alice", "carol", "dave"},
         "workspaces": {"a1", "a2"},
         "agent_profiles": {"profile-a", "profile-a2"},
@@ -116,6 +120,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "dave": {
         "orgs": {"org-a"},
         "org_invites": set(),
+        "org_billing": set(),
+        "billing_events": set(),
         "users": {"alice", "carol", "dave"},
         "workspaces": set(),
         "agent_profiles": {"profile-a"},
@@ -147,6 +153,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "bob": {
         "orgs": {"org-b"},
         "org_invites": {"invite:org-b"},
+        "org_billing": {"billing:org-b"},
+        "billing_events": {"billing-event:org-b"},
         "users": {"bob"},
         "workspaces": {"b1"},
         "agent_profiles": {"profile-b"},
@@ -178,6 +186,8 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     "stranger": {
         "orgs": set(),
         "org_invites": set(),
+        "org_billing": set(),
+        "billing_events": set(),
         "users": set(),
         "workspaces": set(),
         "agent_profiles": set(),

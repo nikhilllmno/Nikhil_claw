@@ -906,7 +906,10 @@ class OpenAIRuntime:
         if status == _PROXY_BUDGET_STATUS:
             return RunFailed(
                 code=FailureCode.BUDGET_EXCEEDED,
-                message="the model proxy refused the call: the run is over a budget",
+                message=(
+                    "the model proxy refused the call: a run budget or a model quota of the plan"
+                    " is used up. An org admin can see the quotas on the Billing page."
+                ),
                 usage=job.usage,
             )
         if status is not None:

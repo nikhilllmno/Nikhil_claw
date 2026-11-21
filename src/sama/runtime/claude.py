@@ -504,7 +504,10 @@ class _Translator:
         if result.is_error and result.api_error_status == _PROXY_BUDGET_STATUS:
             return RunFailed(
                 code=FailureCode.BUDGET_EXCEEDED,
-                message="the model proxy refused the call: a budget is used up",
+                message=(
+                    "the model proxy refused the call: a run budget or a model quota of the plan"
+                    " is used up. An org admin can see the quotas on the Billing page."
+                ),
                 usage=usage,
             )
         if result.is_error or result.subtype != "success":

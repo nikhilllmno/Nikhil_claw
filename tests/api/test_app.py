@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.api import SamaApi
 from sama.api.app import STREAM_GRACE_S, _EventStream
 from sama.db.models import AgentProfile, AuditEntry, Membership, Org, Run, Session, User, Workspace
+from sama.orchestrator.queue import RunQueue
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
 from sama.tenancy.run_token import RunTokenClaims
@@ -24,6 +25,7 @@ from sama.tools.clarify import ClarifyBroker, ClarifyQuestion
 from tests.api.conftest import STREAM_LIFETIME_S, bearer
 from tests.api.streams import open_stream
 from tests.orchestrator.conftest import Tenant, add_tenant
+from tests.orchestrator.test_quotas import spend
 from tests.orchestrator.test_worker import Harness, approval_script
 from tests.waiting import async_wait_until
 
@@ -91,6 +93,7 @@ async def test_the_page_and_the_config_are_public(client: httpx.AsyncClient) -> 
         "integrations": False,
         "connections": False,
         "signup": "invite_only",
+        "billing": False,
     }
 
 
@@ -499,6 +502,25 @@ async def test_too_many_messages_get_429(
     assert response.status_code == 429
     assert 1 <= int(response.headers["retry-after"]) <= 60
     assert "you sent 2 messages" in response.json()["detail"]
+
+
+async def test_a_used_model_quota_gets_402(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await spend(engine, tenant, RunQueue(engine), "5.00", user=False)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Org)
+            .where(Org.id == tenant.org)
+            .values(plan="free", limits={"model_usd_per_month": "5.00"})
+        )
+    response = await client.post(
+        f"/sessions/{tenant.ids['s2']}/messages", headers=mia(tenant), json={"text": "hi"}
+    )
+    assert response.status_code == 402
+    body = response.json()
+    assert body["quota"] == "model_usd_per_month"
+    assert "Billing page" in body["detail"]
 
 
 async def test_a_closed_session_refuses_messages(

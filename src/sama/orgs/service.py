@@ -12,7 +12,7 @@ import hashlib
 import re
 import secrets
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Final, Literal
 
@@ -33,7 +33,7 @@ from sama.db.models import (
     Workspace,
 )
 from sama.orgs.emails import DISPOSABLE_DOMAINS, EmailCheck, blocked_domain, normalize_email
-from sama.orgs.plans import SIGNUP_PLAN, plan_of
+from sama.orgs.plans import SIGNUP_PLAN, limits_for, plan_of
 from sama.tenancy.access import Grants, load_grants
 from sama.tenancy.regions import home_regions, member_user_id
 
@@ -204,11 +204,19 @@ def _invite_out(row: Any) -> dict[str, Any]:
 
 class OrgService:
     def __init__(
-        self, engine: AsyncEngine, emails: EmailCheck, policy: SignupPolicy | None = None
+        self,
+        engine: AsyncEngine,
+        emails: EmailCheck,
+        policy: SignupPolicy | None = None,
+        *,
+        plan_quotas: Callable[[], bool] = lambda: False,
     ) -> None:
+        """``plan_quotas`` tells if billing is on. Only then does a new org get the model
+        quotas of its plan (Section 17.5)."""
         self._engine = engine
         self._emails = emails
         self.policy = policy or SignupPolicy()
+        self._plan_quotas = plan_quotas
 
     async def _verified_email(self, auth_user_id: uuid.UUID) -> str:
         email = await self._emails.verified_email(auth_user_id)
@@ -251,7 +259,7 @@ class OrgService:
                         name=name,
                         slug=slug,
                         plan=plan.name,
-                        limits=dict(plan.limits),
+                        limits=limits_for(plan, None, quotas=self._plan_quotas()),
                         created_by_auth_user_id=auth_user_id,
                         # A new org is in the home region of the deployment (Section 17.3).
                         region=home_regions().home,

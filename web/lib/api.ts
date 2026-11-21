@@ -996,6 +996,68 @@ export function attachmentName(header: string | null, fallback: string): string 
   return name && !/[\\/]/.test(name) ? name : fallback;
 }
 
+// -- billing (docs/architecture.md, Section 17.5) -----------------------------------------------
+
+/** A plan of the price list. Amounts are US dollars as decimal strings, for example `"20.00"`. */
+export interface BillingPlan {
+  name: string;
+  title: string;
+  price_usd: string | null;
+  included_usd: string;
+  paid: boolean;
+  max_members: number | null;
+  model_usd_per_month: string | null;
+  model_usd_per_user_day: string | null;
+  max_running_runs: number;
+  run_budget: Record<string, unknown>;
+}
+
+export interface BillingPlans {
+  /** False when the server has no Stripe: nobody can buy a plan. */
+  billing_enabled: boolean;
+  plans: BillingPlan[];
+}
+
+export interface BillingOverview {
+  org_id: string;
+  billing_enabled: boolean;
+  plan: BillingPlan;
+  subscription: {
+    status: string;
+    plan: string;
+    current_period_start: string | null;
+    current_period_end: string | null;
+    cancel_at_period_end: boolean;
+    has_subscription: boolean;
+  } | null;
+  usage: {
+    period_start: string | null;
+    period_end: string | null;
+    model_usd: string | null;
+    included_usd: string | null;
+    billable_usd: string | null;
+    reported_usd: string | null;
+  };
+  quotas: {
+    model_usd_per_month: string | null;
+    model_usd_this_month: string | null;
+    model_usd_per_user_day: string | null;
+    max_members: number | null;
+    members: number;
+    max_running_runs: number;
+    user_messages_per_minute: number;
+    org_messages_per_minute: number;
+  };
+  can_buy: boolean;
+  can_change: boolean;
+  can_open_portal: boolean;
+}
+
+/** The answer of Checkout and of the portal: the Stripe page to open. */
+export interface StripeRedirect {
+  url: string;
+}
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -1031,6 +1093,7 @@ export function errorMessage(status: number, body: unknown): string {
   }
   if (status === 401) return "Your sign-in ended. Sign in again.";
   if (status === 403) return "You do not have permission to do this.";
+  if (status === 402) return "The org used a model quota of its plan.";
   if (status === 404) return "Not found.";
   if (status === 429) return "Too many requests. Wait a moment and try again.";
   return `The request failed (${status}).`;
@@ -1139,6 +1202,26 @@ export class ApiClient {
     this.json<CreatedOrg>("/orgs", {
       method: "POST",
       body: displayName ? { name, display_name: displayName } : { name },
+    });
+  billingPlans = () => this.json<BillingPlans>("/billing/plans");
+  billingOverview = (orgId: string) =>
+    this.json<BillingOverview>(`/orgs/${encodeURIComponent(orgId)}/billing`);
+  /** Starts Stripe Checkout for a paid plan. Open the returned URL. */
+  startCheckout = (orgId: string, plan: string) =>
+    this.json<StripeRedirect>(`/orgs/${encodeURIComponent(orgId)}/billing/checkout`, {
+      method: "POST",
+      body: { plan },
+    });
+  /** Moves a paid subscription to another paid plan. Stripe prorates the price. */
+  changePlan = (orgId: string, plan: string) =>
+    this.json<BillingOverview>(`/orgs/${encodeURIComponent(orgId)}/billing/plan`, {
+      method: "PUT",
+      body: { plan },
+    });
+  /** Opens the Stripe customer portal: payment method, invoices, and cancel. */
+  openBillingPortal = (orgId: string) =>
+    this.json<StripeRedirect>(`/orgs/${encodeURIComponent(orgId)}/billing/portal`, {
+      method: "POST",
     });
   listMembers = (orgId: string) =>
     this.json<OrgMember[]>(`/orgs/${encodeURIComponent(orgId)}/members`);

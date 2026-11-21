@@ -252,5 +252,5 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Versioned and revertible self-improvement | D14 | M2 |
 | GitHub App and git proxy: no token in the sandbox, `sama/*` branches only, no force-push or delete, pull requests by tool | §15.1 | M3 (M3.7 done) |
 | Self-modification through pull requests | §15.2 | M6 |
-| Customer sign-up, billing, quotas | §17 (sign-up, invites, and roles in §17.2) | M6 (M6.5 done) |
+| Customer sign-up, billing, quotas | §17 (sign-up, invites, and roles in §17.2; billing and quotas in §17.5) | M6 (M6.5 and M6.6 done) |
 | Org keys (own Anthropic and OpenAI keys) and a region per org, with a routing seam for more regions | §17.3 | M6 (M6.7 done) |

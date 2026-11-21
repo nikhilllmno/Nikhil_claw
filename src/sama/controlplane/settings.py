@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr
 
 from sama.api.origins import parse_extension_ids, parse_origins
+from sama.billing.stripe import is_live_key
 from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
 from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
@@ -168,6 +169,24 @@ class ControlPlaneSettings:
     regions: Regions = field(default_factory=Regions)
     """The home region of the deployment (``SAMA_REGION``) and the web address of the
     deployment of each other region (``SAMA_REGION_URLS``), Section 17.3."""
+    stripe_secret_key: SecretStr | None = None
+    """The Stripe secret key of billing (``SAMA_STRIPE_SECRET_KEY``, Section 17.5). Billing is
+    on only with the key and the webhook secret."""
+    stripe_webhook_secret: SecretStr | None = None
+    """The signing secret of the Stripe webhook endpoint (``SAMA_STRIPE_WEBHOOK_SECRET``)."""
+    stripe_allow_live: bool = False
+    """Accept a live Stripe key (``SAMA_STRIPE_ALLOW_LIVE``). Without it, a live key turns
+    billing off."""
+
+    def stripe_key(self) -> str | None:
+        """The Stripe key that billing can use, or ``None``: billing is off. Billing needs the
+        key and the webhook secret. A live key needs ``stripe_allow_live``."""
+        if self.stripe_secret_key is None or self.stripe_webhook_secret is None:
+            return None
+        key = self.stripe_secret_key.get_secret_value()
+        if is_live_key(key) and not self.stripe_allow_live:
+            return None
+        return key
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -184,6 +203,8 @@ class ControlPlaneSettings:
             self.composio_webhook_secret,
             self.slack_webhook_url,
             self.sendgrid_key,
+            self.stripe_secret_key,
+            self.stripe_webhook_secret,
         ]
         if self.langfuse is not None:
             secrets.append(self.langfuse.secret_key)
@@ -296,4 +317,8 @@ class ControlPlaneSettings:
             self_repo=_self_repo(env),
             signup=signup,
             regions=regions,
+            stripe_secret_key=_secret(env, "SAMA_STRIPE_SECRET_KEY"),
+            stripe_webhook_secret=_secret(env, "SAMA_STRIPE_WEBHOOK_SECRET"),
+            stripe_allow_live=env.get("SAMA_STRIPE_ALLOW_LIVE", "").strip().lower()
+            in ("1", "true", "yes"),
         )
