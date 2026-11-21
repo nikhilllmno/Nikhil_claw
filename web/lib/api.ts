@@ -582,7 +582,7 @@ export interface Job {
   prompt: string;
   skills: string[];
   model: string | null;
-  mode: "agent" | "script" | (string & {});
+  mode: "agent" | "script" | "curator" | (string & {});
   script: string | null;
   deliver: string;
   failure_deliver: string | null;
@@ -592,7 +592,7 @@ export interface Job {
   agent_profile_id: string;
   consecutive_failures: number;
   paused_reason: string | null;
-  created_by_kind: "user" | "agent" | (string & {});
+  created_by_kind: "user" | "agent" | "system" | (string & {});
   created_at: string;
   updated_at: string;
   /** The last fires, newest first. Only `GET /orgs/{org_id}/jobs/{job_id}` fills it. */
@@ -738,6 +738,10 @@ export interface SkillSummary {
   version: string;
   tags: string[];
   can_edit: boolean;
+  /** `stale`: no agent used the skill for 30 days (Section 9.7). It still works. */
+  status: "active" | "stale" | (string & {});
+  /** A pinned skill stays active. */
+  pinned: boolean;
 }
 
 export interface SkillCatalog {
@@ -794,6 +798,27 @@ export interface SkillWritten {
   scope: WritableSkillScope;
   version: number;
   change: string;
+}
+
+export interface ArchivedSkill {
+  id: string;
+  name: string;
+  scope: WritableSkillScope;
+  description: string;
+  version: number;
+  archived_at: string;
+  can_restore: boolean;
+}
+
+export type SkillStateAction = "pin" | "unpin" | "restore";
+
+export interface SkillState {
+  id: string;
+  name: string;
+  scope: WritableSkillScope;
+  status: string;
+  pinned: boolean;
+  version: number;
 }
 
 export interface SearchSnippet {
@@ -1256,6 +1281,14 @@ export class ApiClient {
       method: "POST",
       body,
     });
+  listArchivedSkills = (workspaceId: string) =>
+    this.json<ArchivedSkill[]>(`/workspaces/${encodeURIComponent(workspaceId)}/archived-skills`);
+  /** Pins, unpins, or restores a stored skill (Section 9.7). */
+  setSkillState = (workspaceId: string, name: string, scope: WritableSkillScope, action: SkillStateAction) =>
+    this.json<SkillState>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/${action}${query({ scope })}`,
+      { method: "POST" },
+    );
   listSkillVersions = (skillId: string) =>
     this.json<SkillVersion[]>(`/skills/${encodeURIComponent(skillId)}/versions`);
   getSkillVersion = (skillId: string, version: number) =>

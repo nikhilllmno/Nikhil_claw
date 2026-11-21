@@ -13,7 +13,7 @@ from sama.runtime.contract import RunScope
 from sama.skills import commands
 from sama.skills.library import SKILLS_TOOLSET, Actor, SkillDoc, index
 from sama.skills.lint import KNOWN_TOOLSETS
-from sama.skills.sql import load_actor, load_docs, profile_limits
+from sama.skills.sql import count_usage, load_actor, load_docs, profile_limits
 
 
 class SkillLibrary:
@@ -119,10 +119,13 @@ class SkillLibrary:
         if parsed is None:
             return None
         name, request = parsed
-        async with self._engine.connect() as connection:
+        async with self._engine.begin() as connection:
             skills = await self.index(connection, actor)
-        if all(skill.name != name for skill in skills):
-            return None
+            skill = next((skill for skill in skills if skill.name == name), None)
+            if skill is None:
+                return None
+            if skill.skill_id is not None:
+                await count_usage(connection, actor.org_id, skill.skill_id, "use")
         return commands.expansion(name, request)
 
 

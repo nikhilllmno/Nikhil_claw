@@ -63,8 +63,12 @@ RUN_KINDS: Final = ("chat", "review")
 """``chat`` answers a user message. ``review`` is the background review of a session
 (docs/architecture.md, Section 9.4)."""
 JOB_STATUSES: Final = ("active", "paused", "pending_approval", "removed")
-JOB_MODES: Final = ("agent", "script")
+JOB_MODES: Final = ("agent", "script", "curator")
+"""``curator`` is the weekly curator job of a workspace (docs/architecture.md, Section 9.7).
+Only sama creates it."""
 JOB_CREATORS: Final = ("user", "agent")
+JOB_CREATED_BY: Final = (*JOB_CREATORS, "system")
+"""Who created a job. ``system`` is sama itself: the curator job of a workspace."""
 WORKFLOW_STATUSES: Final = ("active", "paused", "pending_approval", "removed")
 WORKFLOW_INSTANCE_STATUSES: Final = ("running", "waiting", "completed", "failed", "cancelled")
 ENDED_WORKFLOW_INSTANCE_STATUSES: Final = ("completed", "failed", "cancelled")
@@ -137,8 +141,18 @@ GITHUB_ACCOUNT_TYPES: Final = ("User", "Organization", "Enterprise")
 """The GitHub account types that can install the sama GitHub App (Section 15.1)."""
 SKILL_SCOPES: Final = ("org", "workspace", "user")
 """The stored scopes of a skill. The scope ``builtin`` is in the repo, not in the database."""
-SKILL_STATUSES: Final = ("active", "archived")
-SKILL_CHANGES: Final = ("create", "patch", "edit", "write_file", "remove_file", "archive")
+SKILL_STATUSES: Final = ("active", "stale", "archived")
+"""The curator marks an unused skill ``stale``, then ``archived`` (Section 9.7). A ``stale``
+skill still works."""
+SKILL_CHANGES: Final = (
+    "create",
+    "patch",
+    "edit",
+    "write_file",
+    "remove_file",
+    "archive",
+    "restore",
+)
 SKILL_AUTHOR_KINDS: Final = ("user", "agent", "system")
 TASK_STATUSES: Final = ("todo", "running", "blocked", "done", "cancelled")
 """The columns of the task board (docs/architecture.md, Section 12.4)."""
@@ -951,7 +965,8 @@ class Skill(Base):
     """A skill of the org, of a workspace, or of a user (docs/architecture.md, Section 9.2).
 
     The row holds the name and the status. The text and the files are in ``skill_versions``.
-    A skill is never deleted: ``archive`` sets the status.
+    A skill is never deleted: ``archive`` sets the status. The counters and the pin are for
+    the curator (Section 9.7).
     """
 
     __tablename__ = "skills"
@@ -975,6 +990,8 @@ class Skill(Base):
             name="scope_columns",
         ),
         CheckConstraint("current_version >= 1", name="current_version"),
+        CheckConstraint("(status = 'stale') = (stale_since IS NOT NULL)", name="stale_since"),
+        CheckConstraint("view_count >= 0 AND use_count >= 0 AND patch_count >= 0", name="counts"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -985,6 +1002,18 @@ class Skill(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'active'"))
     current_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """A pinned skill is never marked stale or archived by the curator (Section 9.7)."""
+    view_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The ``skill_view`` calls that read the skill."""
+    use_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The slash commands that used the skill."""
+    patch_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The writes that changed the text or the files of the skill."""
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """The last view, use, or change. The curator measures the idle time from it."""
+    stale_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the curator marked the skill ``stale``. ``NULL`` for any other status."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -1907,7 +1936,7 @@ class Job(Base):
         ForeignKeyConstraint(["org_id", "approved_by_user_id"], ["users.org_id", "users.id"]),
         CheckConstraint(_one_of("status", JOB_STATUSES), name="status"),
         CheckConstraint(_one_of("mode", JOB_MODES), name="mode"),
-        CheckConstraint(_one_of("created_by_kind", JOB_CREATORS), name="created_by_kind"),
+        CheckConstraint(_one_of("created_by_kind", JOB_CREATED_BY), name="created_by_kind"),
         CheckConstraint("(mode = 'script') = (script IS NOT NULL)", name="script"),
         CheckConstraint("char_length(name) BETWEEN 1 AND 200", name="name_length"),
         CheckConstraint("jsonb_typeof(schedule) = 'object'", name="schedule_is_object"),
@@ -1926,6 +1955,13 @@ class Job(Base):
         CheckConstraint("consecutive_failures >= 0", name="consecutive_failures"),
         Index(None, "org_id", "owner_user_id"),
         Index("ix_jobs_due", "next_fire_at", postgresql_where=text("status = 'active'")),
+        Index(
+            "uq_jobs_curator",
+            "org_id",
+            "workspace_id",
+            unique=True,
+            postgresql_where=text("mode = 'curator'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

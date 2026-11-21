@@ -589,7 +589,11 @@ def _scheduler(
     )
     queue = RunQueue(engine)
     return Scheduler(
-        engine, queue, Deliverer(engine, Sender(secret, email=email)), scripts=sandboxed
+        engine,
+        queue,
+        Deliverer(engine, Sender(secret, email=email)),
+        scripts=sandboxed,
+        curator=True,
     )
 
 

@@ -1733,7 +1733,7 @@ flowchart LR
   C -->|"workspace, org,<br/>SOUL"| E["Approval card"]
   D --> F["Next session<br/>uses it"]
   E --> F
-  G["Curator<br/>(weekly)"] --> H["Mark stale,<br/>archive, merge"]
+  G["Curator<br/>(weekly)"] --> H["Mark stale,<br/>archive, report"]
 ```
 
 1. **Nudge.** Sama counts user turns and tool iterations per session. When a run ends, sama
@@ -1747,8 +1747,9 @@ flowchart LR
    to `workspace` scope and SOUL changes need an approval from a workspace `admin` or the
    org `owner`. Writes to `org` scope need the org `owner` (Q5).
 4. **Curate.** A weekly curator job tracks skill usage (views, uses, patches). It marks
-   unused agent-written skills `stale`, then `archived`. It merges near-duplicates with an
-   approval. It never deletes. Pinned skills and skills that jobs or workflows use are exempt.
+   unused agent-written skills `stale`, then `archived`. It never deletes. Pinned skills and
+   skills that jobs or workflows use are exempt. It reports on the memory, but does not change
+   it. Section 9.7 has the details (M6.3). Merging near-duplicates is not built yet.
 5. **Check.** Every new or changed skill passes a linter (frontmatter, length, tool names)
    and a scan (secrets, network calls to unknown hosts, prompt-injection patterns) before it
    becomes active.
@@ -2022,6 +2023,80 @@ to the write: a user skill in a private session. A shared skill is a direct writ
 has the role (as for `skill_import`), else a proposal. The command needs the
 `skills` toolset. Without it, Telegram shows the help, and the web API and Slack keep the text
 as it is.
+
+### 9.7 Curator (M6.3)
+
+Code: `src/sama/curator/`. Migration `0032`. There is no new table.
+
+**The job.** Each workspace has one weekly job with `mode: curator` and the name `Curator`.
+The scheduler adds it (Section 12.1): each tick of the leader runs an ensure step before the
+due jobs. The step adds the job to at most 50 workspaces that have none. The owner of the job is
+the oldest workspace `owner`, else the oldest org `owner`. The profile is the oldest profile of
+the workspace, else of the org. A workspace without an owner or a profile gets no job yet. The
+partial unique index `uq_jobs_curator` on `(org_id, workspace_id)` keeps one curator job for
+each workspace. The ensure step also counts a `removed` curator job, so a person who removes
+the job does not get it back. The job has `created_by_kind = 'system'`, and the audit log has
+`job.created` with `actor_kind = 'system'`.
+
+- **Schedule.** Every Monday in UTC. The minute and the hour come from a hash of the workspace
+  id, so the fires of many workspaces do not come at the same time.
+- **Changes.** A person can rename, reschedule, pause, resume, run, or remove the job, and
+  change `deliver` and `failure_deliver`. The mode, prompt, script, skills, model, pre-approved
+  tools, and `attach_to_session` are fixed. `JobService` refuses a change to them. A curator
+  job does not count in the cap of 50 jobs for each user. It has no tools, so it needs an
+  approval only when a person sends it to a target that is not the owner (the rule of
+  Section 12.1).
+- **Fire.** A curator fire runs in the control plane, with no run, no model, and no sandbox.
+  The fire curates, writes the report as an assistant message in the fire session, and ends
+  `completed` with the report as its output. The report goes to `deliver` as a normal
+  `result` delivery (Section 12.1). `origin` keeps it in the fire session. A failed fire is a
+  normal failed fire.
+
+**Skills.** The curator manages only the skills that an agent wrote: version 1 has
+`author_kind = 'agent'`. It does not manage built-in skills or skills that a person wrote.
+
+- **Counters (`skills` columns).** `view_count` adds one for each `skill_view`. `use_count` adds
+  one for each slash command of the skill (Section 9.5). `patch_count` adds one for each content
+  write (`patch`, `edit`, `write_file`, `remove_file`). `last_used_at` is the time of the last
+  view, use, or write. A job fire that names the skill does not count as a use, but such a
+  skill is exempt (below).
+- **States.** `skills.status` is `active`, `stale`, or `archived`. `stale_since` is set only
+  for `stale` (a check constraint).
+  - An `active` skill with no view, use, or write for 30 days becomes `stale`.
+  - A `stale` skill becomes `archived` after 90 days with no activity, and only when it was
+    `stale` for at least 7 days, so the owner sees it in one report first. The archive writes a
+    new version with `change = 'archive'` and `author_kind = 'system'`.
+  - A view, a use, a write, or a pin makes a `stale` skill `active` at once. The curator also
+    makes it `active` again when it is pinned or exempt.
+  - A stale skill still works and is still in the skill index. Only an archived skill is gone
+    from the agents.
+- **Exempt.** A pinned skill, and a skill whose name is in the `skills` of a job or a
+  workflow that is not removed. A name match exempts the skill in each scope.
+- **Never deletes.** The curator changes only `status`, `stale_since`, and the archive
+  version. Each change writes the audit entry `skill.stale`, `skill.active`, or
+  `skill.archive` with `actor_kind = 'system'`.
+- **Coverage.** Each job covers the workspace skills of its workspace. The first workspace of
+  the org (the oldest) also covers the org skills and the user skills. The report shows the
+  user skills only as counts, because the owner cannot read them.
+
+**Memory.** The curator only reports on the memory. Memory is always in the prompt and has no
+usage signal of its own, so the curator does not change it. The report shows each agent and
+workspace memory: the entries, the characters of the cap, the entries that did not change for
+90 days, and a note when 90% of the cap or more is used. The first workspace also shows how
+many users have a profile and how many of them are nearly full.
+
+**Pins and restore.** The web page `/skills` shows a `Stale` or `Pinned` badge, a Pin button,
+and a list of the archived skills with a Restore button. The API:
+
+| Route | What it does |
+|---|---|
+| `GET /workspaces/{workspace_id}/archived-skills` | The archived skills that the user can read (at most 500), with `can_restore`. |
+| `POST /workspaces/{workspace_id}/skills/{name}/{pin\|unpin\|restore}?scope=` | Pins, unpins, or restores a stored skill. The roles of a skill write apply (Section 9.2). |
+
+A pin sets `pinned` and makes the skill `active`. A restore copies the current version into a
+new version with `change = 'restore'` and `author_kind = 'user'`, and makes the skill `active`.
+Pin and unpin of an archived skill fail: restore it first. Each action writes the audit entry
+`skill.pin`, `skill.unpin`, or `skill.restore`.
 
 ---
 
@@ -3767,7 +3842,7 @@ not allow these models, so a run cannot call them through the proxy.
 | `prompt`, `skills` | What the run does. |
 | `agent_profile`, `model` | Pins. The default is the profile default when the job fires. |
 | `deliver` | `origin` (the chat that created it), a channel target (`slack:#ops`, `telegram:<chat>`, `email:<address>`), or `none`. Plus `failure_deliver`. |
-| `mode` | `agent` (an LLM run) or `script` (run a script in the sandbox and deliver its output, no LLM). |
+| `mode` | `agent` (an LLM run) or `script` (run a script in the sandbox and deliver its output, no LLM). Sama adds one `curator` job to each workspace (migration `0032`, Section 9.7). |
 | `preapproved_tools` | Tools that may run without a human in this job, each bound to a connection and optional argument limits (for example "Slack post to `#eng` only"). Everything else that needs `ask` is denied. Adding or widening a pre-approval needs a human approval, which is bound to that job version. A change to the job's prompt, schedule, or target creates a new version, and write pre-approvals then need approval again. |
 | `attach_to_session` | Run inside one long-lived session (heartbeat) instead of a fresh session. |
 
@@ -5372,7 +5447,7 @@ migrated schema.
 | `approvals` | One row per tool call that asks a human (migration `0004`, Section 16.1) |
 | `tool_policies` | Tool gate rules per org, profile, and user (migration `0004`, Section 16.1) |
 | `context_files` | Context files per org, workspace, and profile (migration `0006`, Section 6.1) |
-| `skills` | One row per skill and scope, with the current version and the status (migration `0013`, Section 9.2) |
+| `skills` | One row per skill and scope, with the current version and the status (migration `0013`, Section 9.2). The curator columns `pinned`, `view_count`, `use_count`, `patch_count`, `last_used_at`, `stale_since` and the status `stale` (migration `0032`, Section 9.7) |
 | `skill_versions` | One row per version of a skill: text, files, and provenance (migration `0013`, Section 9.2) |
 | `channel_identities`, `channel_groups`, `pairing_codes` | Telegram links and pairing codes (migration `0008`, Section 11.5) |
 | `integrations` | The chat apps of each org, for example its Telegram bot (migration `0011`, Section 11.6) |

@@ -9,10 +9,12 @@ import {
   type JobAction,
   type JobDraft,
   type Tone,
+  CURATOR_TEXT,
   approvalNotice,
   availableActions,
   browserTimeZone,
   buildInput,
+  creatorLabel,
   deliveryStatusLabel,
   deliveryStatusTone,
   failureNotice,
@@ -20,6 +22,8 @@ import {
   fireStatusTone,
   formatTarget,
   formatWhen,
+  isCurator,
+  modeLabel,
   newDraft,
   sortJobs,
   statusLabel,
@@ -340,7 +344,7 @@ function JobDetail({
           <Badge tone={statusTone(job.status)}>{statusLabel(job.status)}</Badge>
         </div>
         <p className={styles.meta}>
-          Version {job.version} · made by {job.created_by_kind === "agent" ? "an agent" : "a person"}
+          Version {job.version} · made by {creatorLabel(job.created_by_kind)}
         </p>
       </header>
 
@@ -361,9 +365,11 @@ function JobDetail({
             <button type="button" className="btn btn-primary" disabled={busy !== null} onClick={approve}>
               {busy === "approve" ? "Approving…" : `Approve version ${job.version}`}
             </button>
-            <button type="button" className="btn" disabled={busy !== null} onClick={() => onEdit(job)}>
-              Change the job
-            </button>
+            {isCurator(job) ? null : (
+              <button type="button" className="btn" disabled={busy !== null} onClick={() => onEdit(job)}>
+                Change the job
+              </button>
+            )}
           </div>
         </section>
       ) : null}
@@ -397,9 +403,11 @@ function JobDetail({
       ) : null}
 
       <div className={styles.actions}>
-        <button type="button" className="btn" disabled={busy !== null} onClick={() => onEdit(job)}>
-          Edit
-        </button>
+        {isCurator(job) ? null : (
+          <button type="button" className="btn" disabled={busy !== null} onClick={() => onEdit(job)}>
+            Edit
+          </button>
+        )}
         {actions.map((action) =>
           action === "remove" ? null : (
             <button
@@ -469,11 +477,15 @@ function JobDetail({
       </section>
 
       <section className={`card ${styles.section}`}>
-        <h2 className={styles.heading}>{job.mode === "script" ? "Script" : "Prompt"}</h2>
-        <pre className={styles.pre}>{job.mode === "script" ? job.script : job.prompt}</pre>
+        <h2 className={styles.heading}>{isCurator(job) ? "What it does" : job.mode === "script" ? "Script" : "Prompt"}</h2>
+        {isCurator(job) ? (
+          <p>{CURATOR_TEXT}</p>
+        ) : (
+          <pre className={styles.pre}>{job.mode === "script" ? job.script : job.prompt}</pre>
+        )}
         <dl className={styles.details}>
           <dt>Mode</dt>
-          <dd>{job.mode === "script" ? "Script" : "Agent"}</dd>
+          <dd>{modeLabel(job.mode)}</dd>
           <dt>Send to</dt>
           <dd>{formatTarget(job.deliver)}</dd>
           <dt>On failure</dt>

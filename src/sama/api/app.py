@@ -59,13 +59,17 @@ from sama.api.history import (
 from sama.api.orgs import router as org_router
 from sama.api.origins import check_origins
 from sama.api.skill_editor import (
+    ArchivedSkill,
     ReadScope,
     SkillCatalog,
     SkillDetail,
     SkillEditor,
+    SkillState,
     SkillVersionDetail,
     SkillWrite,
     SkillWritten,
+    StateAction,
+    WritableScope,
 )
 from sama.api.tasks import (
     CommentOut,
@@ -1708,6 +1712,20 @@ class SamaApi:
             principal: Me, workspace_id: uuid.UUID, body: SkillWrite
         ) -> SkillWritten:
             return await self._editor().write(principal, workspace_id, body)
+
+        @app.get("/workspaces/{workspace_id}/archived-skills")
+        async def archived_skills(principal: Me, workspace_id: uuid.UUID) -> list[ArchivedSkill]:
+            return await self._editor().archived(principal, workspace_id)
+
+        @app.post("/workspaces/{workspace_id}/skills/{name}/{action}")
+        async def skill_state(
+            principal: Me,
+            workspace_id: uuid.UUID,
+            name: str,
+            action: StateAction,
+            scope: WritableScope,
+        ) -> SkillState:
+            return await self._editor().change_state(principal, workspace_id, name, scope, action)
 
         @app.get("/skills/{skill_id}/versions/{version}")
         async def skill_version(

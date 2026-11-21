@@ -126,7 +126,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Background review fork (memory and skills) | `agent/background_review.py` | A separate review run after the main run, with a cheap model, recursion off, and only `memory` and `skills` tools (§9.4.1). | Adapt | M2 (M2.4 done) |
 | Skill creation nudge (10 tool iterations) | `agent/agent_init.py` | Same default (§9.4.1). | Adapt | M2 (M2.4 done) |
 | `/learn` (skill from sources) | `learn_prompt.py` | `/learn <urls or topic>` asks the agent to read the sources and write one draft skill with `skill_manage` (§9.6). | Adapt | M4 (M4.10 done) |
-| Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace. Archive, never delete. Pins (§9). | Adapt | M6 |
+| Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace (`mode: curator`, `src/sama/curator/`). Usage counts, active to stale (30 days) to archived (90 days), pins and restore, a report to the owner. Memory is report-only. Never deletes (§9.7). | Adapt | M6 (M6.3 done) |
 | Checkpoints and `/rollback`, `/undo` | `agent/checkpoints/` | Shadow git in the sandbox or Claude file checkpointing. User commands, not model tools (§15.3). | Adapt | M6 |
 | Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). The SOUL target is done in M3.2 (§9.4.2). | Adapt | M6 |
 | Changes to its own code | `self_repo_guard.py`, `hermes update` | `sama_pr`: the agent clones the sama repo, changes it, runs the tests, and opens a pull request that a human merges. Code owners of changed paths get a review request. CI deploys (§15.2). | New | M6 (M6.2 done) |

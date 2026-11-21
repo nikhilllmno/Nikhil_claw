@@ -3,7 +3,8 @@
 The loop runs in the control plane process, next to the worker. It has four steps:
 
 - ``tick`` (each ``TICK_S``): one process holds the leader lease (a transaction advisory lock)
-  and fires the due jobs. A fire runs once, also when two schedulers tick at the same time:
+  and fires the due jobs. With ``curator``, it first adds the missing curator jobs of the
+  workspaces (Section 9.7). A fire runs once, also when two schedulers tick at the same time:
   the due rows are locked with ``SKIP LOCKED``, the fire row is unique on
   ``(job_id, scheduled_for)``, and the same transaction moves ``next_fire_at``.
 - ``finish`` (each ``POLL_S``): writes the result of each fire whose run ended.
@@ -24,6 +25,7 @@ from typing import Any, Final, Protocol
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.curator.ensure import ensure_curator_jobs
 from sama.db.models import ENDED_RUN_STATUSES, Job, JobFire, Message, Run
 from sama.orchestrator.queue import RunQueue
 from sama.runtime.contract import Audience, RunScope
@@ -70,8 +72,10 @@ class Scheduler:
         tick_s: float = TICK_S,
         poll_s: float = POLL_S,
         script_timeout_s: float = SCRIPT_TIMEOUT_S,
+        curator: bool = False,
     ) -> None:
         self._engine = engine
+        self._curator = curator
         self._queue = queue
         self._deliverer = deliverer
         self._scripts = scripts
@@ -123,6 +127,8 @@ class Scheduler:
             ).scalar_one()
             if not leader:
                 return -1
+            if self._curator:
+                await self._ensure_curators(connection)
             jobs = (
                 await connection.execute(
                     select(Job)
@@ -135,6 +141,14 @@ class Scheduler:
             for job in jobs:
                 await self._due(connection, job)
             return len(jobs)
+
+    async def _ensure_curators(self, connection: AsyncConnection) -> None:
+        """Adds the missing curator jobs. A failure does not stop the due jobs."""
+        try:
+            async with connection.begin_nested():
+                await ensure_curator_jobs(connection)
+        except Exception:
+            log.exception("the curator jobs were not added")
 
     async def _due(self, connection: AsyncConnection, job: Any) -> None:
         now = datetime.now(UTC)

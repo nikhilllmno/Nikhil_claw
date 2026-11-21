@@ -11,16 +11,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import and_, func, insert, literal, select, update
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api.auth import Principal
 from sama.db.engine import as_user
-from sama.db.models import Skill, SkillVersion, User, Workspace
+from sama.db.models import AuditEntry, Skill, SkillVersion, User, Workspace
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, authorize, resolve
 from sama.skills.lint import (
@@ -32,7 +33,7 @@ from sama.skills.lint import (
     MAX_SUMMARY_CHARS,
 )
 from sama.skills.service import SkillLibrary
-from sama.skills.sql import load_docs
+from sama.skills.sql import load_docs, scope_filter
 from sama.skills.store import PostgresSkillStore
 from sama.tenancy.access import Grants, load_grants
 
@@ -66,6 +67,9 @@ class SkillSummary(BaseModel):
     version: str
     tags: list[str]
     can_edit: bool
+    status: str = "active"
+    """``active`` or ``stale``. The curator marks an unused skill stale (Section 9.7)."""
+    pinned: bool = False
 
 
 class SkillCatalog(BaseModel):
@@ -103,8 +107,39 @@ class SkillWritten(BaseModel):
     change: str
 
 
+class ArchivedSkill(BaseModel):
+    """An archived skill. Sama never deletes a skill, so a person can restore it."""
+
+    id: uuid.UUID
+    name: str
+    scope: str
+    description: str
+    version: int
+    archived_at: datetime
+    can_restore: bool
+
+
+class SkillState(BaseModel):
+    """The curator state of a stored skill after a pin, an unpin, or a restore."""
+
+    id: uuid.UUID
+    name: str
+    scope: str
+    status: str
+    pinned: bool
+    version: int
+
+
+StateAction = Literal["pin", "unpin", "restore"]
+MAX_ARCHIVED: Final = 500
+
+
 def _not_found(what: str = "the skill does not exist") -> HTTPException:
     return HTTPException(status_code=404, detail=what)
+
+
+def _status(doc: SkillDoc) -> str:
+    return "stale" if doc.stale else "active"
 
 
 class SkillEditor:
@@ -182,6 +217,8 @@ class SkillEditor:
                     version=doc.version,
                     tags=list(doc.tags),
                     can_edit=self._can_edit(doc.scope, actor),
+                    status=_status(doc),
+                    pinned=doc.pinned,
                 )
                 for doc in docs
             ],
@@ -218,6 +255,8 @@ class SkillEditor:
             version=found.version,
             tags=list(found.tags),
             can_edit=self._can_edit(found.scope, actor),
+            status=_status(found),
+            pinned=found.pinned,
             requires_toolsets=list(found.requires_toolsets),
             skill_md=found.skill_md,
             files=dict(found.files),
@@ -285,4 +324,158 @@ class SkillEditor:
             raise HTTPException(status_code=422, detail=str(error)) from None
         return SkillWritten(
             name=written.name, scope=written.scope, version=written.version, change=written.change
+        )
+
+    async def archived(self, principal: Principal, workspace_id: uuid.UUID) -> list[ArchivedSkill]:
+        """The archived skills that the person sees in the workspace, the newest first."""
+        actor, _ = await self._actor(principal, workspace_id)
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            rows = (
+                await connection.execute(
+                    select(
+                        Skill.id,
+                        Skill.name,
+                        Skill.scope,
+                        Skill.current_version,
+                        Skill.updated_at,
+                        SkillVersion.description,
+                    )
+                    .join(
+                        SkillVersion,
+                        and_(
+                            SkillVersion.org_id == Skill.org_id,
+                            SkillVersion.skill_id == Skill.id,
+                            SkillVersion.version_no == Skill.current_version,
+                        ),
+                    )
+                    .where(scope_filter(actor), Skill.status == "archived")
+                    .order_by(Skill.updated_at.desc(), Skill.id)
+                    .limit(MAX_ARCHIVED)
+                )
+            ).all()
+        return [
+            ArchivedSkill(
+                id=row.id,
+                name=row.name,
+                scope=row.scope,
+                description=row.description,
+                version=row.current_version,
+                archived_at=row.updated_at,
+                can_restore=self._can_edit(row.scope, actor),
+            )
+            for row in rows
+        ]
+
+    async def change_state(
+        self,
+        principal: Principal,
+        workspace_id: uuid.UUID,
+        name: str,
+        scope: WritableScope,
+        action: StateAction,
+    ) -> SkillState:
+        """Pins, unpins, or restores a stored skill (Section 9.7). The rules of a write apply:
+        ``403`` without a role for the scope, ``404`` for no skill, ``409`` for a wrong state.
+        A pin makes a stale skill active. A restore makes an archived skill active with a new
+        version that has the same text."""
+        actor, _ = await self._actor(principal, workspace_id)
+        try:
+            authorize(scope, actor)
+        except SkillError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from None
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    select(Skill.id, Skill.status, Skill.pinned, Skill.current_version)
+                    .where(scope_filter(actor), Skill.scope == scope, Skill.name == name)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if row is None:
+                raise _not_found()
+            version = int(row.current_version)
+            values: dict[str, Any] = {"updated_at": func.now()}
+            if action == "restore":
+                if row.status != "archived":
+                    raise HTTPException(status_code=409, detail="the skill is not archived")
+                version += 1
+                await connection.execute(
+                    insert(SkillVersion).from_select(
+                        [
+                            "org_id",
+                            "skill_id",
+                            "version_no",
+                            "name",
+                            "description",
+                            "skill_md",
+                            "files",
+                            "tags",
+                            "requires_toolsets",
+                            "change",
+                            "summary",
+                            "author_kind",
+                            "author_user_id",
+                        ],
+                        select(
+                            SkillVersion.org_id,
+                            SkillVersion.skill_id,
+                            literal(version),
+                            SkillVersion.name,
+                            SkillVersion.description,
+                            SkillVersion.skill_md,
+                            SkillVersion.files,
+                            SkillVersion.tags,
+                            SkillVersion.requires_toolsets,
+                            literal("restore"),
+                            literal("A person restored the archived skill."),
+                            literal("user"),
+                            literal(actor.user_id, type_=PG_UUID(as_uuid=True)),
+                        ).where(
+                            SkillVersion.org_id == actor.org_id,
+                            SkillVersion.skill_id == row.id,
+                            SkillVersion.version_no == row.current_version,
+                        ),
+                    )
+                )
+                values |= {
+                    "status": "active",
+                    "stale_since": None,
+                    "current_version": version,
+                    "last_used_at": func.now(),
+                }
+            else:
+                if row.status == "archived":
+                    raise HTTPException(
+                        status_code=409, detail="the skill is archived. Restore it first."
+                    )
+                values["pinned"] = action == "pin"
+                if action == "pin":
+                    values |= {"status": "active", "stale_since": None}
+            state = (
+                await connection.execute(
+                    update(Skill)
+                    .where(Skill.org_id == actor.org_id, Skill.id == row.id)
+                    .values(**values)
+                    .returning(Skill.status, Skill.pinned)
+                )
+            ).one()
+            await connection.execute(
+                insert(AuditEntry).values(
+                    org_id=actor.org_id,
+                    workspace_id=workspace_id,
+                    actor_kind="user",
+                    actor_user_id=actor.user_id,
+                    action=f"skill.{action}",
+                    target_type="skill",
+                    target_id=str(row.id),
+                    details={"name": name, "scope": scope, "version": version},
+                )
+            )
+        return SkillState(
+            id=row.id,
+            name=name,
+            scope=scope,
+            status=state.status,
+            pinned=state.pinned,
+            version=version,
         )

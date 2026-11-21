@@ -2,11 +2,14 @@
 
 // The skill editor (docs/architecture.md, Section 9.6). The user reads the skills of the
 // workspace, writes the skills of the scopes that they can change, and reads old versions.
-// A built-in skill is read-only. A save is a new version with the author "user".
+// A built-in skill is read-only. A save is a new version with the author "user". The curator
+// (Section 9.7) marks unused skills as stale and archives them. The user pins a skill to keep it,
+// and restores an archived skill.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorText,
+  type ArchivedSkill,
   type SkillCatalog,
   type SkillDetail,
   type SkillScope,
@@ -15,7 +18,15 @@ import {
   type SkillWriteBody,
   type WritableSkillScope,
 } from "@/lib/api";
-import { filterSkills, nameProblem, pathProblem, SCOPE_LABELS, skillTemplate } from "@/lib/skills";
+import {
+  curatorBadges,
+  filterSkills,
+  nameProblem,
+  pathProblem,
+  SCOPE_LABELS,
+  skillTemplate,
+  STALE_TEXT,
+} from "@/lib/skills";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
@@ -114,6 +125,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
         />
       ) : (
         <SkillsHome
+          workspaceId={workspaceId}
           catalog={catalog.data}
           filter={filter}
           onFilter={setFilter}
@@ -128,6 +140,10 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
             setFocusKey(`${s.scope}:${s.name}`);
             setOpen({ kind: "skill", name: s.name, scope: s.scope });
           }}
+          onRestored={(name) => {
+            setNotice(`The skill ${name} is restored.`);
+            catalog.reload();
+          }}
         />
       )}
     </>
@@ -135,19 +151,23 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
 }
 
 function SkillsHome({
+  workspaceId,
   catalog,
   filter,
   onFilter,
   focusKey,
   onNew,
   onOpen,
+  onRestored,
 }: {
+  workspaceId: string;
   catalog: SkillCatalog;
   filter: string;
   onFilter: (text: string) => void;
   focusKey: string | null;
   onNew: () => void;
   onOpen: (skill: SkillSummary) => void;
+  onRestored: (name: string) => void;
 }) {
   const newButton = useRef<HTMLButtonElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
@@ -195,7 +215,77 @@ function SkillsHome({
         registerRow={registerRow}
         onOpen={onOpen}
       />
+      <ArchivedSkills workspaceId={workspaceId} onRestored={onRestored} />
     </>
+  );
+}
+
+function ArchivedSkills({ workspaceId, onRestored }: { workspaceId: string; onRestored: (name: string) => void }) {
+  const api = useApi();
+  const load = useCallback(() => api.listArchivedSkills(workspaceId), [api, workspaceId]);
+  const archived = useLoad(load, "Could not load the archived skills.");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [now] = useState(() => Date.now());
+
+  const restore = async (skill: ArchivedSkill) => {
+    setBusy(skill.id);
+    setError(null);
+    try {
+      await api.setSkillState(workspaceId, skill.name, skill.scope, "restore");
+      archived.reload();
+      onRestored(skill.name);
+    } catch (e) {
+      setError(errorText(e, "The skill was not restored."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (archived.error) {
+    return <ErrorState title="The archived skills did not load" message={archived.error} onRetry={archived.reload} />;
+  }
+  if (archived.data === null || archived.data.length === 0) return null;
+  return (
+    <details className={`card ${styles.card}`}>
+      <summary>Archived skills ({archived.data.length})</summary>
+      <p className={styles.meta}>
+        The agents cannot load an archived skill. The curator archives the skills that agents wrote
+        and nobody used for 90 days. It never deletes a skill. Restore a skill to use it again.
+      </p>
+      {error ? (
+        <p className="alert alert-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      <ul className={styles.list} aria-label="Archived skills">
+        {archived.data.map((s) => (
+          <li key={s.id} className={styles.row}>
+            <div className={styles.cardHead}>
+              <h3 className={styles.heading}>{s.name}</h3>
+              <div className={styles.name}>
+                <span className="badge">{SCOPE_LABELS[s.scope]}</span>
+                <span className={styles.meta}>archived {relativeTime(s.archived_at, now)}</span>
+              </div>
+            </div>
+            <p className={styles.text}>{s.description}</p>
+            {s.can_restore ? (
+              <div className={styles.actions}>
+                <button
+                  type="button"
+                  className="btn btn-small"
+                  disabled={busy !== null}
+                  onClick={() => void restore(s)}
+                >
+                  {busy === s.id ? "Restoring" : "Restore"}
+                  <span className="sr-only"> {s.name}</span>
+                </button>
+              </div>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
@@ -223,6 +313,11 @@ function SkillList({
                 <span className={s.scope === "builtin" ? "badge" : "badge badge-accent"}>
                   {SCOPE_LABELS[s.scope]}
                 </span>
+                {curatorBadges(s).map((b) => (
+                  <span key={b.label} className={`badge badge-${b.tone}`}>
+                    {b.label}
+                  </span>
+                ))}
                 <span className={styles.meta}>v{s.version}</span>
               </div>
             </div>
@@ -381,7 +476,8 @@ function SkillView({
   const [summary, setSummary] = useState("");
   const [versionsTick, setVersionsTick] = useState(0);
   // A new write ends the notice of the last one, so an old success never sits beside a new error.
-  const { busy, error, write } = useWrite(workspaceId, () => onSaved(null));
+  const { busy, error, setError, write } = useWrite(workspaceId, () => onSaved(null));
+  const [pinning, setPinning] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   // The skill is open when it has loaded: the focus goes to its name.
   useFocusWhen(detail.data !== null, heading);
@@ -435,6 +531,22 @@ function SkillView({
     if (done) onArchived();
   };
 
+  const pin = async () => {
+    const action = skill.pinned ? "unpin" : "pin";
+    setPinning(true);
+    setError(null);
+    onSaved(null);
+    try {
+      await api.setSkillState(workspaceId, skill.name, skill.scope as WritableSkillScope, action);
+      onSaved(skill.pinned ? `The skill ${skill.name} is not pinned now.` : `The skill ${skill.name} is pinned.`);
+      detail.reload();
+    } catch (e) {
+      setError(errorText(e, "The pin did not change."));
+    } finally {
+      setPinning(false);
+    }
+  };
+
   return (
     <>
       <BackButton onBack={onBack} />
@@ -447,10 +559,20 @@ function SkillView({
             <span className={skill.scope === "builtin" ? "badge" : "badge badge-accent"}>
               {SCOPE_LABELS[skill.scope]}
             </span>
+            {curatorBadges(skill).map((b) => (
+              <span key={b.label} className={`badge badge-${b.tone}`}>
+                {b.label}
+              </span>
+            ))}
             <span className={styles.meta}>v{skill.version}</span>
           </div>
         </div>
         <p className={styles.text}>{skill.description}</p>
+        {skill.status === "stale" && !skill.pinned ? (
+          <p className="alert alert-warning" role="note">
+            {STALE_TEXT}
+          </p>
+        ) : null}
         {skill.requires_toolsets.length > 0 ? (
           <p className={styles.meta}>Needs the toolsets: {skill.requires_toolsets.join(", ")}</p>
         ) : null}
@@ -506,6 +628,15 @@ function SkillView({
                 onClick={() => void archive()}
               >
                 {busy === "archive" ? "Archiving" : "Archive"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-quiet btn-small"
+                disabled={busy !== null || pinning}
+                aria-pressed={skill.pinned}
+                onClick={() => void pin()}
+              >
+                {pinning ? "Saving" : skill.pinned ? "Unpin" : "Pin"}
               </button>
             </div>
           </form>
