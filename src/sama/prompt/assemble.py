@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Final
 from sqlalchemy import and_, case, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.coding.agents import agent_for, coding_model
 from sama.db.engine import autocommit
 from sama.db.models import (
     AgentProfile,
@@ -141,9 +142,18 @@ def environment(run: ClaimedRun, now: datetime, channel: str | None = None) -> s
 
 
 def _checked(config: RunConfig, run: ClaimedRun) -> RunConfig:
-    if config.runtime != RuntimeKind(run.runtime):
-        raise ValueError("the run runtime is not the runtime of the session")
-    return config
+    runtime = RuntimeKind(run.runtime)
+    if config.runtime == runtime:
+        return config
+    agent = agent_for(runtime)
+    if agent is not None:
+        # A ``/claude`` or ``/codex`` run, or the direct mode (Section 15.4): the coding agent
+        # gets the session config with its own runtime and a model of its provider. The frozen
+        # config of the session does not change.
+        return config.model_copy(
+            update={"runtime": runtime, "model": coding_model(agent, config.model)}
+        )
+    raise ValueError("the run runtime is not the runtime of the session")
 
 
 class PromptAssembler:
@@ -250,9 +260,22 @@ class PromptAssembler:
                 .limit(1)
             )
         ).scalar_one_or_none()
+        runtime = RuntimeKind(run.runtime)
+        if agent_for(runtime) is not None:
+            # The first run of the session goes to a coding agent (``/claude <task>`` or the
+            # direct mode). The frozen config keeps the runtime of the profile, so ``/sama``
+            # goes back to it (Section 15.4).
+            profile_runtime = (
+                await connection.execute(
+                    select(AgentProfile.runtime).where(
+                        AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id
+                    )
+                )
+            ).scalar_one()
+            runtime = RuntimeKind(profile_runtime)
         return RunConfig(
             memory_snapshot=await _memory_snapshot(connection, run),
-            runtime=RuntimeKind(run.runtime),
+            runtime=runtime,
             model=run.model,
             system=self._system,
             soul=run.soul,
@@ -260,7 +283,7 @@ class PromptAssembler:
             environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
             skill_index=await self._skill_index(connection, run),
-            subagents=await _subagents(connection, run),
+            subagents=await _subagents(connection, run, runtime),
             reasoning_effort=run.reasoning_effort,
         )
 
@@ -316,7 +339,7 @@ async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[s
 
 
 async def _subagents(
-    connection: AsyncConnection, run: ClaimedRun
+    connection: AsyncConnection, run: ClaimedRun, runtime: RuntimeKind
 ) -> tuple[SubagentDefinition, ...]:
     """The native sub-agents of the run (Section 13.1): the sub-agents of the profile, limited
     to the toolsets of the run. A run without the toolset ``subagents`` has none, and a runtime
@@ -339,7 +362,7 @@ async def _subagents(
             "the sub-agents of a profile are not valid profile=%s: %s", run.agent_profile_id, error
         )
         return ()
-    return resolve_subagents(specs, toolsets=toolsets, runtime=RuntimeKind(run.runtime))
+    return resolve_subagents(specs, toolsets=toolsets, runtime=runtime)
 
 
 async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:

@@ -183,7 +183,9 @@ class _Active:
         return max(0.0, self.cancelled_at + CANCEL_DEADLINE_S - time.monotonic())
 
 
-CARRY_DIRS: Final = (".claude",)
+CARRY_DIRS: Final = (".claude", ".codex")
+"""The Claude CLI folder (the transcripts of the Claude runtime and of Claude Code) and the Codex
+folder (its threads, Section 15.4)."""
 CARRY_MAX_BYTES: Final = 64 * 1024 * 1024
 """A larger archive of ``carry_dirs`` does not go to the new sandbox."""
 CARRY_FILE: Final = ".sama-carry.tgz"
@@ -461,6 +463,16 @@ class SandboxedRuntime:
                         log.exception("could not store the session sandbox=%s", sandbox.id)
             self._session_runs[key] = self._session_runs.get(key, 0) + 1
             return sandbox
+
+    async def release(self, scope: RunScope, sandbox: Sandbox) -> None:
+        """Ends the use of a sandbox from ``acquire``: after the last run of the session, it
+        sets the idle timeout back. The coding agent runtimes use it (Section 15.4)."""
+        await self._end_session_run((scope.org_id, scope.session_id), sandbox)
+
+    def issue_token(self, scope: RunScope, budget: Budget) -> str:
+        """A run token for ``scope`` with the budget of the run, as the runner gets it."""
+        ttl = min(_wall_time_s(budget) + TOKEN_MARGIN_S, RUN_TOKEN_MAX_TTL_S)
+        return self._signer.issue(scope, ttl_s=ttl, budget=budget)
 
     async def _carry(self, old: Sandbox, new: Sandbox) -> None:
         """Moves ``carry_dirs`` from the outdated sandbox to the new one. A failure only logs:

@@ -32,6 +32,10 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sama.browser.target import BrowserError
+from sama.coding.agents import CODING_AGENT_RUN, CodingAgent, CodingError
+from sama.coding.agents import DEFAULT_TIMEOUT_S as CODING_DEFAULT_TIMEOUT_S
+from sama.coding.agents import MAX_PROMPT_CHARS as CODING_MAX_PROMPT_CHARS
+from sama.coding.agents import MAX_TIMEOUT_S as CODING_MAX_TIMEOUT_S
 from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
 from sama.delegation import DelegationError, DelegationService
@@ -177,6 +181,7 @@ from sama.workflows.spec import WorkflowError
 if TYPE_CHECKING:
     from sama.browser.service import BrowserService
     from sama.browser.task import BrowserTaskRunner
+    from sama.coding.tool import CodingTools
     from sama.connectors.service import ConnectionService
     from sama.skills.importer import SkillImporter
 
@@ -215,6 +220,7 @@ MAX_ERROR_CHARS: Final = 2_000
 
 _EXPECTED = (
     BrowserError,
+    CodingError,
     ClarifyError,
     ConnectorError,
     JobError,
@@ -438,8 +444,10 @@ class ToolServer:
         sama_pr: SamaPr | None = None,
         browser: BrowserService | None = None,
         browser_tasks: BrowserTaskRunner | None = None,
+        coding: CodingTools | None = None,
     ) -> None:
         self.signer = signer
+        self.coding = coding
         self.browser = browser
         self.browser_tasks = browser_tasks if browser is not None else None
         self.importer = importer
@@ -1072,6 +1080,8 @@ class ToolServer:
             register_browser(server, self._call, self.browser)
             if self.browser_tasks is not None:
                 register_browser_task(server, self._call, self.browser_tasks)
+        if self.coding is not None:
+            self._coding_tool(server, self.coding)
         if self.importer is not None:
             importer = self.importer
 
@@ -1274,6 +1284,61 @@ class ToolServer:
 
             arguments = {"repo": repo, "branch": branch, "commit": commit}
             return await self._call(ctx, REPO_PUSH_APPROVAL, arguments, run)
+
+    def _coding_tool(self, server: MCPServer, coding: CodingTools) -> None:
+        """``coding_agent_run`` (Section 15.4)."""
+
+        @server.tool(
+            name=CODING_AGENT_RUN,
+            description=(
+                "Hand a coding task to a coding agent CLI that runs in your sandbox: agent "
+                "claude_code (Claude Code) or codex (OpenAI Codex). repo is a GitHub "
+                "repository (owner/name); the agent works in the clone <work>/<name>, the "
+                "same folder as repo_clone, and a later call sees the earlier changes. Without "
+                "repo it works in your work folder. Write prompt as a complete task: the goal, "
+                "the files or area, the constraints, and how to test. open_pr=true commits "
+                "the changes to a sama/* branch, pushes it, and opens a pull request (the repo "
+                "must be on the allowlist of the org). The result has the answer of the agent, "
+                "the diff, and a session id: give session to continue the same agent session. "
+                f"timeout_s is the time limit (default {CODING_DEFAULT_TIMEOUT_S}, at most "
+                f"{CODING_MAX_TIMEOUT_S})."
+            ),
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            structured_output=False,
+        )
+        async def coding_agent_run(
+            agent: Literal["claude_code", "codex"],
+            prompt: Annotated[str, Field(min_length=1, max_length=CODING_MAX_PROMPT_CHARS)],
+            ctx: Context,
+            repo: Annotated[str | None, Field(min_length=3, max_length=200)] = None,
+            open_pr: bool = False,
+            session: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+            timeout_s: Annotated[
+                int, Field(ge=30, le=CODING_MAX_TIMEOUT_S)
+            ] = CODING_DEFAULT_TIMEOUT_S,
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                return await coding.run(
+                    claims,
+                    bearer_of(ctx.headers) or "",
+                    agent=CodingAgent(agent),
+                    prompt=prompt,
+                    repo=repo,
+                    open_pr=open_pr,
+                    session=session,
+                    timeout_s=timeout_s,
+                )
+
+            arguments = {
+                "agent": agent,
+                "prompt": prompt,
+                "repo": repo,
+                "open_pr": open_pr,
+                "session": session,
+                "timeout_s": timeout_s,
+            }
+            present = {key: value for key, value in arguments.items() if value is not None}
+            return await self._call(ctx, CODING_AGENT_RUN, present, body)
 
     def _sama_pr_tool(self, server: MCPServer, sama_pr: SamaPr) -> None:
         @server.tool(

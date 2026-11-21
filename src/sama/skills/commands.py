@@ -34,6 +34,8 @@ RESERVED: Final = frozenset(
         "settings",
         "cancel",
         "sama",
+        "claude",
+        "codex",
     }
 )
 """Command names of the channels. A skill cannot have one of these names."""

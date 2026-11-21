@@ -109,10 +109,11 @@ _PROXY_BUDGET_STATUS: Final = 402
 _RETRYABLE_STATUS: Final = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _PREVIEW_CHARS: Final = 2_000
 _CLEANUP_S: Final = 10.0
-MCP_CALL_TIMEOUT_S: Final = 1_200.0
+MCP_CALL_TIMEOUT_S: Final = 3_600.0
 """How long the runtime waits for one call of a sama MCP tool. The SDK default is 5 seconds,
 and many sama tools take longer: a browser session starts in more than 5 seconds, ``clarify``
-waits up to 600 seconds, ``browser_task`` and ``repo_clone`` up to 600 and 300 seconds. The tool
+waits up to 600 seconds, ``browser_task`` and ``repo_clone`` up to 600 and 300 seconds, and
+``coding_agent_run`` up to 50 minutes (M7.2), so the limit is 1 hour, the longest run. The tool
 server has its own limit for each tool, so this is only the outer limit."""
 _NOT_RUN_OUTPUT: Final = "The call did not run: the run ended before it."
 

@@ -12,11 +12,12 @@ from typing import Any
 
 import pytest
 
+from sama.prompt.scan import scan
 from sama.sandbox.base import ExecResult
 from sama.sandbox.local import LocalSandbox
 from sama.skills import BuiltinSkills, ManageRequest, MemorySkillStore, SkillError, commands
 from sama.skills.builtin import ENV_DIRECTORY, builtin_directory, load
-from sama.skills.lint import MAX_DESCRIPTION_CHARS
+from sama.skills.lint import MAX_DESCRIPTION_CHARS, validate
 from sama.skills.render import render_list, render_view
 from sama.skills.sync import (
     _CHECK,
@@ -99,6 +100,20 @@ def test_the_builtin_skills_all_load() -> None:
         assert skill.scope == "builtin"
         assert 0 < len(skill.description) <= MAX_DESCRIPTION_CHARS
         assert skill.name not in commands.RESERVED
+
+
+def test_the_coding_agent_skills_load_and_need_the_coding_agents_toolset() -> None:
+    skills = BuiltinSkills(ROOT_DIR).all()
+    for name in ("claude-code", "openai-codex"):
+        skill = skills[name]
+        assert skill.requires_toolsets == ("coding_agents",)
+        assert name not in commands.RESERVED
+        skill_md = (ROOT_DIR / name / "SKILL.md").read_text(encoding="utf-8")
+        assert validate(name, skill_md, {}) is not None
+        assert "coding_agent_run" in skill_md
+        assert not scan(skill_md)
+    assert {"claude", "codex", "sama"} <= commands.RESERVED
+    assert "codex" not in skills
 
 
 def test_the_builtin_folder_can_be_set_by_the_environment(

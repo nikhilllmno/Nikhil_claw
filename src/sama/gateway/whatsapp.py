@@ -57,6 +57,8 @@ HELP: Final = (
     "/stop - stop the current run\n"
     "/steer <text> - add a note to the current run\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
+    "/claude <task> or /codex <task> - send a coding task to Claude Code or Codex. /claude or\n"
+    "/codex alone sends each message to it until /sama\n"
     "/pair <code> - link this number with a code from the sama web page\n"
     "yes <code> or no <code> - decide an approval"
 )

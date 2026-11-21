@@ -39,6 +39,7 @@ DEFAULT_TOOLSETS: Final = (
     "code_exec",
     "workflows",
     "browser",
+    "coding_agents",
 )
 DEFAULT_GROUP_TOOLSETS: Final = ("todo", "web", "clarify", "memory", "sessions", "media", "tasks")
 """The toolsets of a shared session (Section 10.2): no shell, no code edit, no outbound write.

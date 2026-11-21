@@ -221,6 +221,13 @@ export function Chat({ sessionId }: { sessionId: string }) {
         reloadSessions();
         return;
       }
+      if (command?.kind === "coding") {
+        // The direct mode of the session (M7.2).
+        const answer = await api.codingAgent(sessionId, command.agent);
+        clearDraft();
+        setNotice(answer.text);
+        return;
+      }
       if (command?.kind === "undo" || command?.kind === "rollback") {
         // The checkpoints of the session files (M6.4).
         let text: string;

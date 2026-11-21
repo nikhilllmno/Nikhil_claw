@@ -423,8 +423,11 @@ async def test_an_admin_switches_the_runtime_with_a_model_of_the_new_runtime(
     admin = await admin_headers(engine, tenant)
     options = (await client.get(agent(tenant), headers=admin)).json()["options"]
     runtimes = {r["name"]: r for r in options["runtimes"]}
-    assert list(runtimes) == ["claude_agent_sdk", "openai_agents_sdk"]
+    assert list(runtimes) == ["claude_agent_sdk", "openai_agents_sdk", "claude_code", "codex"]
     assert "gpt-6.2-sol" in runtimes["openai_agents_sdk"]["models"]
+    # The coding agents use the models of their provider (Section 15.4).
+    assert "gpt-6.2-sol" in runtimes["codex"]["models"]
+    assert "claude-opus-5-5" in runtimes["claude_code"]["models"]
     assert "claude-opus-5-5" in runtimes["claude_agent_sdk"]["models"]
     assert (
         runtimes["claude_agent_sdk"]["subagents"],

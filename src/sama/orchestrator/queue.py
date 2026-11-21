@@ -439,8 +439,12 @@ class RunQueue:
         user_id: uuid.UUID | None = None,
         unattended: bool = False,
         attachments: Sequence[NewAttachment] = (),
+        coding_agent: str | None = None,
     ) -> uuid.UUID:
         """Stores a user message and queues a run for it. Returns the run id.
+
+        ``coding_agent`` (``claude_code`` or ``codex``) sends this one message to that coding
+        agent (``/claude <task>``, Section 15.4).
 
         ``attachments`` are the images of the message (Section 11.7). The database takes them
         in the same transaction as the message: both exist, or neither.
@@ -462,6 +466,7 @@ class RunQueue:
                 user_id=user_id,
                 unattended=unattended,
                 attachments=attachments,
+                coding_agent=coding_agent,
             )
 
     async def enqueue_in(
@@ -478,6 +483,7 @@ class RunQueue:
         model: str | None = None,
         check_rate: bool = True,
         toolsets: Sequence[str] | None = None,
+        coding_agent: str | None = None,
     ) -> uuid.UUID:
         """``enqueue`` in the transaction of the caller. A caller that makes the session in
         the same transaction (delegation, the task dispatcher, an event trigger) gets the
@@ -496,9 +502,11 @@ class RunQueue:
                 select(
                     Session.status,
                     Session.agent_profile_id,
-                    func.coalesce(Session.run_config["runtime"].astext, AgentProfile.runtime).label(
-                        "runtime"
-                    ),
+                    func.coalesce(
+                        Session.coding_agent,
+                        Session.run_config["runtime"].astext,
+                        AgentProfile.runtime,
+                    ).label("runtime"),
                     AgentProfile.budget,
                     *_rate_columns(org_id, user_id),
                 )
@@ -545,10 +553,11 @@ class RunQueue:
                         session_id=session_id,
                         agent_profile_id=session.agent_profile_id,
                         triggered_by_user_id=user_id,
-                        runtime=session.runtime,
+                        runtime=coding_agent or session.runtime,
                         budget=narrow_budget(session.budget, budget),
                         unattended=unattended,
                         model=model,
+                        coding_agent=coding_agent,
                         toolsets=list(toolsets) if toolsets is not None else null(),
                     )
                     .cte("new_run")
@@ -1115,11 +1124,17 @@ class RunQueue:
                     started_at=func.coalesce(Run.started_at, func.now()),
                     # A chat run that starts takes the runtime of the session now, as the
                     # model: the profile can switch runtime while the run waits (Section 11.4).
+                    # A ``/claude`` or ``/codex`` run keeps its coding agent, and the direct mode
+                    # of the session sends its other chat runs to the coding agent. A compact
+                    # run compacts the context of the session runtime (Section 15.4).
                     runtime=case(
                         (
                             and_(Run.kind == "chat", ~resumes),
                             func.coalesce(
-                                Session.run_config["runtime"].astext, AgentProfile.runtime
+                                case((Run.compact, null()), else_=Run.coding_agent),
+                                case((Run.compact, null()), else_=Session.coding_agent),
+                                Session.run_config["runtime"].astext,
+                                AgentProfile.runtime,
                             ),
                         ),
                         else_=Run.runtime,
