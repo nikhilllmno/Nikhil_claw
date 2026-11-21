@@ -59,15 +59,17 @@ from sama.gate.decide import (
     always_asks,
     arguments_digest,
     canonical_name,
+    context_policy,
     decide,
     decide_recorded,
     effective_call,
     effective_toolsets,
+    frozen_toolsets,
     json_default,
     merged_catalog,
-    policy_verdict,
     run_limit,
     tools_of,
+    with_frozen_profile_rules,
 )
 from sama.review.policy import REVIEW_TOOLSETS
 from sama.scheduler.spec import job_of_run
@@ -285,10 +287,7 @@ class GateService:
         return frozenset(
             name
             for name in tools_of(context.toolsets, context.catalog)
-            if policy_verdict(
-                context.rules, name, shared=context.shared, access=context.access
-            ).action
-            != "deny"
+            if context_policy(context, name).action != "deny"
         )
 
     async def reconfirm(self, *, org_id: uuid.UUID, run_id: uuid.UUID, call_id: str) -> Verdict:
@@ -441,6 +440,7 @@ class GateService:
                     Session.audience,
                     Session.owner_user_id,
                     Session.lineage,
+                    Session.profile_snapshot,
                 )
                 .join(
                     AgentProfile,
@@ -466,9 +466,11 @@ class GateService:
         user_id = run_user(row.triggered_by_user_id, row.audience, row.owner_user_id)
         if user_id is None and claims is not None and claims.user_id:
             user_id = uuid.UUID(claims.user_id)
+        # A session uses only the toolsets that its snapshot also has (Section 11.4).
+        snapshot = row.profile_snapshot
         toolsets = effective_toolsets(
-            _names(row.toolsets),
-            _names(row.group_toolsets),
+            frozen_toolsets(_names(row.toolsets), snapshot, "toolsets"),
+            frozen_toolsets(_names(row.group_toolsets), snapshot, "group_toolsets"),
             audience=row.audience,
             kind=row.kind,
             lineage=row.lineage,
@@ -506,9 +508,11 @@ class GateService:
                 extra[name] = extra.get(name, frozenset()) | tools
             # A fixed tool keeps its own access.
             access = {**more_access, **access}
+        rules = await self._rules(connection, org_id, row.agent_profile_id, user_id)
         context = GateContext(
             toolsets=toolsets,
-            rules=await self._rules(connection, org_id, row.agent_profile_id, user_id),
+            rules=rules,
+            frozen_rules=with_frozen_profile_rules(rules, snapshot),
             unattended=bool(row.unattended),
             shared=row.audience == "shared" and row.kind != "review",
             recorded=(await self._recorded(connection, ref, call_id) if call_id else None),

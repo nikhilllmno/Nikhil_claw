@@ -24,11 +24,11 @@ from sqlalchemy import and_, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AgentProfile, AuditEntry, Run, Session
-from sama.profiles import SOUL_MAX_CHARS
+from sama.profiles import SOUL_MAX_CHARS, record_change
 from sama.review.proposals import NewProposal, ProposalScope, ProposalSink
 from sama.tenancy.authority import run_user
 from sama.tenancy.run_token import RunTokenClaims
-from sama.vault.redact import redact
+from sama.vault.redact import default_redactor, redact
 
 SUMMARY_MAX_CHARS: Final = 200
 
@@ -68,11 +68,7 @@ class SoulProposer:
             raise SoulError(f"the soul has at most {SOUL_MAX_CHARS} characters")
         if redact(soul) != soul:
             raise SoulError("the soul contains a secret. Remove it")
-        run = await self._load(claims)
-        if run.kind != "chat" or run.unattended:
-            raise SoulError("only a chat run with a person in it can propose a new soul")
-        if run.lineage == "delegation":
-            raise SoulError("a delegated child run cannot propose a new soul. Ask the parent run")
+        run = await load_run(self._engine, claims)
         seen = seen_soul(run.run_config, run.soul)
         if soul == seen:
             return "The soul is already this text. Nothing to propose."
@@ -90,6 +86,8 @@ class SoulProposer:
                     "profile_id": str(run.agent_profile_id),
                     "profile_name": run.name,
                     "soul": soul,
+                    # For the diff on the card only. The digest checks the soul.
+                    "before_soul": default_redactor().text(seen),
                     "summary": summary,
                     "base_digest": soul_digest(seen),
                 },
@@ -104,43 +102,57 @@ class SoulProposer:
             " the new soul applies from the next session. Do not propose it again."
         )
 
-    async def _load(self, claims: RunTokenClaims) -> Any:
-        org_id = uuid.UUID(claims.org_id)
-        async with self._engine.connect() as connection:
-            row = (
-                await connection.execute(
-                    select(
-                        Session.workspace_id,
-                        Session.lineage,
-                        Session.audience,
-                        Session.owner_user_id,
-                        Session.run_config,
-                        Run.agent_profile_id,
-                        Run.kind,
-                        Run.unattended,
-                        Run.triggered_by_user_id,
-                        AgentProfile.workspace_id.label("profile_workspace_id"),
-                        AgentProfile.name,
-                        AgentProfile.soul,
-                    )
-                    .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
-                    .join(
-                        AgentProfile,
-                        and_(
-                            AgentProfile.org_id == Run.org_id,
-                            AgentProfile.id == Run.agent_profile_id,
-                        ),
-                    )
-                    .where(
-                        Session.org_id == org_id,
-                        Session.id == uuid.UUID(claims.session_id),
-                        Run.id == uuid.UUID(claims.run_id),
-                    )
+
+async def load_run(engine: AsyncEngine, claims: RunTokenClaims) -> Any:
+    """The run, its session, and the profile of the run for ``change_propose``. Raises
+    ``SoulError`` when the run cannot propose a change: only a chat run with a person in it
+    can, and not a delegated child run."""
+    org_id = uuid.UUID(claims.org_id)
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                select(
+                    Session.workspace_id,
+                    Session.lineage,
+                    Session.audience,
+                    Session.owner_user_id,
+                    Session.run_config,
+                    Run.agent_profile_id,
+                    Run.kind,
+                    Run.unattended,
+                    Run.triggered_by_user_id,
+                    AgentProfile.workspace_id.label("profile_workspace_id"),
+                    AgentProfile.name,
+                    AgentProfile.soul,
+                    AgentProfile.runtime,
+                    AgentProfile.model,
+                    AgentProfile.review_model,
+                    AgentProfile.toolsets,
+                    AgentProfile.group_toolsets,
+                    AgentProfile.subagents,
                 )
-            ).one_or_none()
-        if row is None:
-            raise SoulError("the run is not known")
-        return row
+                .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
+                .join(
+                    AgentProfile,
+                    and_(
+                        AgentProfile.org_id == Run.org_id,
+                        AgentProfile.id == Run.agent_profile_id,
+                    ),
+                )
+                .where(
+                    Session.org_id == org_id,
+                    Session.id == uuid.UUID(claims.session_id),
+                    Run.id == uuid.UUID(claims.run_id),
+                )
+            )
+        ).one_or_none()
+    if row is None:
+        raise SoulError("the run is not known")
+    if row.kind != "chat" or row.unattended:
+        raise SoulError("only a chat run with a person in it can propose a change")
+    if row.lineage == "delegation":
+        raise SoulError("a delegated child run cannot propose a change. Ask the parent run")
+    return row
 
 
 async def set_soul(
@@ -152,10 +164,11 @@ async def set_soul(
     base_digest: str,
     actor_user_id: uuid.UUID,
     proposal_id: uuid.UUID,
+    summary: str | None = None,
 ) -> None:
-    """Writes an approved soul on ``connection`` (in the transaction of the caller) and the
-    audit entry. Raises ``SoulError`` when the profile does not exist, or when its soul is not
-    the soul that the run saw."""
+    """Writes an approved soul on ``connection`` (in the transaction of the caller), the
+    audit entry, and the history row (``profile_changes``). Raises ``SoulError`` when the
+    profile does not exist, or when its soul is not the soul that the run saw."""
     row = (
         await connection.execute(
             select(AgentProfile.soul, AgentProfile.workspace_id)
@@ -185,4 +198,17 @@ async def set_soul(
             target_id=str(profile_id),
             details={"fields": ["soul"], "subagents": [], "proposal_id": str(proposal_id)},
         )
+    )
+    await record_change(
+        connection,
+        org_id=org_id,
+        workspace_id=row.workspace_id,
+        profile_id=profile_id,
+        kind="soul",
+        source="proposal",
+        before={"soul": row.soul},
+        after={"soul": soul},
+        actor_user_id=actor_user_id,
+        proposal_id=proposal_id,
+        summary=summary,
     )

@@ -393,19 +393,19 @@ async def test_viewing_an_unknown_skill_or_file_is_a_tool_error() -> None:
     assert "no file x.md" in text_of(no_file)
 
 
-class FakeSouls:
-    """Records the soul proposals; a soul with the word ``bad`` is refused."""
+class FakeChanges:
+    """Records the change proposals; a soul with the word ``bad`` is refused."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str]] = []
+        self.calls: list[tuple[str, object]] = []
 
-    async def propose(self, claims: object, soul: str, summary: str) -> str:
+    async def propose(self, claims: object, request: object) -> str:
         from sama.review.soul import SoulError
 
-        if "bad" in soul:
+        if "bad" in (getattr(request, "content", None) or ""):
             raise SoulError("the soul contains a secret. Remove it")
-        self.calls.append((getattr(claims, "run_id", ""), soul, summary))
-        return "Proposed a new soul."
+        self.calls.append((getattr(claims, "run_id", ""), request))
+        return f"Proposed a change of the {getattr(request, 'target', '')}."
 
 
 async def test_change_propose_is_hidden_without_a_proposer() -> None:
@@ -415,10 +415,12 @@ async def test_change_propose_is_hidden_without_a_proposer() -> None:
     assert "change_propose" not in names
 
 
-async def test_change_propose_sends_the_soul_to_the_proposer() -> None:
+async def test_change_propose_sends_the_change_to_the_proposer() -> None:
+    from sama.review.change import ChangeRequest
+
     signer = RunTokenSigner(secrets.token_bytes(32))
-    souls = FakeSouls()
-    server = ToolServer(signer=signer, todos=MemoryTodoStore(), souls=souls)  # type: ignore[arg-type]
+    changes = FakeChanges()
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), changes=changes)  # type: ignore[arg-type]
     with serve(server.app()) as base:
         token = signer.issue(make_scope("run-7"), ttl_s=600)
         async with connect(base + "/mcp", token) as client:
@@ -428,12 +430,37 @@ async def test_change_propose_sends_the_soul_to_the_proposer() -> None:
             refused = await client.call_tool(
                 "change_propose", {"target": "soul", "content": "bad", "summary": "x"}
             )
-            wrong = await client.call_tool(
-                "change_propose", {"target": "toolsets", "content": "x", "summary": "x"}
+            policy = await client.call_tool(
+                "change_propose",
+                {
+                    "target": "policy",
+                    "summary": "ask first",
+                    "rules": [{"tool": "web_*", "action": "ask"}],
+                },
+            )
+            tools = await client.call_tool(
+                "change_propose",
+                {"target": "toolsets", "summary": "web", "toolsets": ["files", "web"]},
+            )
+            wrong_target = await client.call_tool(
+                "change_propose", {"target": "other", "summary": "x"}
+            )
+            wrong_action = await client.call_tool(
+                "change_propose",
+                {"target": "policy", "summary": "x", "rules": [{"tool": "a", "action": "maybe"}]},
             )
     assert not ok.is_error
-    assert text_of(ok) == "Proposed a new soul."
-    assert souls.calls == [("run-7", "Be kind.", "kind")]
+    assert text_of(ok) == "Proposed a change of the soul."
     assert refused.is_error
     assert "secret" in text_of(refused)
-    assert wrong.is_error
+    assert not policy.is_error
+    assert not tools.is_error
+    assert wrong_target.is_error
+    assert wrong_action.is_error
+    assert [run for run, _ in changes.calls] == ["run-7", "run-7", "run-7"]
+    soul, rules, toolsets = (request for _, request in changes.calls)
+    assert soul == ChangeRequest(target="soul", summary="kind", content="Be kind.")
+    assert rules == ChangeRequest(target="policy", summary="ask first", rules=[("web_*", "ask")])
+    assert toolsets == ChangeRequest(target="toolsets", summary="web", toolsets=["files", "web"])
+    assert toolsets.fields() == {"toolsets": ["files", "web"]}
+    assert rules.fields() == {"rules": [["web_*", "ask"]]}

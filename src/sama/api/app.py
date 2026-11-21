@@ -148,6 +148,7 @@ from sama.orchestrator.checkpoints import (
 )
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
 from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
+from sama.profile_changes import RevertError, StaleChangeError, list_changes, revert_change
 from sama.profiles import (
     NAME_MAX_CHARS,
     SOUL_MAX_CHARS,
@@ -176,6 +177,7 @@ from sama.tenancy.regions import OrgInOtherRegion, home_regions, member_user_id,
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.triggers import router as trigger_routes
 from sama.triggers import service as triggers
+from sama.vault.redact import default_redactor
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
 from sama.workflows.service import WorkflowService
 from sama.workflows.spec import WorkflowError, WorkflowNotFoundError
@@ -1253,6 +1255,18 @@ class SamaApi:
         ) -> dict[str, Any]:
             return await self._edit_profile(principal, org_id, profile_id, body)
 
+        @app.get("/orgs/{org_id}/agent-profiles/{profile_id}/changes")
+        async def agent_profile_changes(
+            principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID
+        ) -> list[dict[str, Any]]:
+            return await self._profile_changes(principal, org_id, profile_id)
+
+        @app.post("/orgs/{org_id}/agent-profiles/{profile_id}/changes/{change_id}/revert")
+        async def revert_agent_profile_change(
+            principal: Me, org_id: uuid.UUID, profile_id: uuid.UUID, change_id: uuid.UUID
+        ) -> dict[str, Any]:
+            return await self._revert_profile_change(principal, org_id, profile_id, change_id)
+
         @app.get("/orgs/{org_id}/integrations")
         async def list_integrations(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
             await self._org_grants(principal, org_id)
@@ -1992,8 +2006,10 @@ class SamaApi:
         self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID, body: ProfileEdit
     ) -> dict[str, Any]:
         """Changes the profile. A session keeps its frozen soul, runtime, model, and sub-agents:
-        those changes apply from the next session. A change to the toolsets applies at the next tool
-        call of every session, because the gate reads them on every call."""
+        those changes apply from the next session. A session also keeps a snapshot of its
+        toolsets (M6.1): a new toolset applies from the next session, and a removed toolset
+        applies at the next tool call of every session, because the gate reads the toolsets of
+        now on every call and uses only the toolsets that the snapshot also has."""
         _, grants = await self._profile_access(principal, org_id, profile_id)
         if not grants.org_admin:
             raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
@@ -2020,6 +2036,57 @@ class SamaApi:
                 raise _not_found("the agent profile does not exist") from None
             raise HTTPException(status_code=422, detail=str(error)) from None
         return await self._profile(principal, org_id, profile_id)
+
+    async def _profile_changes(
+        self, principal: Principal, org_id: uuid.UUID, profile_id: uuid.UUID
+    ) -> list[dict[str, Any]]:
+        """The history of the profile (M6.1): each member who can see the profile can read it."""
+        await self._profile_access(principal, org_id, profile_id)
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            changes = await list_changes(connection, org_id, profile_id)
+        redactor = default_redactor()
+        return [redactor.json(change) for change in changes]
+
+    async def _revert_profile_change(
+        self,
+        principal: Principal,
+        org_id: uuid.UUID,
+        profile_id: uuid.UUID,
+        change_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Writes the old values of one change of the history again (M6.1). Only an org owner
+        or admin can do it, as for an edit. It fails with ``409`` when the profile changed
+        after the change, or when the change is already reverted. As for an edit, the old
+        values apply from the next session."""
+        _, grants = await self._profile_access(principal, org_id, profile_id)
+        if not grants.org_admin:
+            raise HTTPException(status_code=403, detail=_ADMIN_ONLY)
+        try:
+            await know_the_secrets(self._engine, org_id)
+        except VaultUnreadableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from None
+        try:
+            async with self._engine.begin() as connection:
+                new_id = await revert_change(
+                    connection,
+                    org_id=org_id,
+                    profile_id=profile_id,
+                    change_id=change_id,
+                    actor_user_id=grants.user_id,
+                )
+        except LookupError:
+            raise _not_found("the change does not exist") from None
+        except NotAdminError:
+            raise HTTPException(status_code=403, detail=_ADMIN_ONLY) from None
+        except (RevertError, StaleChangeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        except ProfileError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        except SubagentError as error:
+            if str(error) == "the profile does not exist":
+                raise _not_found("the agent profile does not exist") from None
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        return {"id": str(new_id), "profile": await self._profile(principal, org_id, profile_id)}
 
     async def _sessions(self, principal: Principal, limit: int) -> list[SessionOut]:
         async with as_user(self._engine, principal.auth_user_id) as connection:
@@ -2154,14 +2221,14 @@ class SamaApi:
 
     @staticmethod
     def _approval_entry(row: Any) -> dict[str, Any]:
-        arguments, reason = row.arguments, row.reason
+        arguments, reason, diff = row.arguments, row.reason, None
         if row.proposal_payload is not None:
             # A proposal of a background review or a chat run. The stored text is not shown:
             # the redactor may know more secrets now (Section 9.4).
             shown = shown_proposal(
                 row.proposal_kind, row.proposal_scope, row.proposal_payload, row.proposal_origin
             )
-            arguments, reason = shown.arguments, shown.reason
+            arguments, reason, diff = shown.arguments, shown.reason, shown.diff
         return {
             "id": str(row.id),
             "run_id": str(row.run_id),
@@ -2169,6 +2236,8 @@ class SamaApi:
             "tool_name": row.tool_name,
             "arguments": arguments,
             "reason": reason,
+            "proposal": row.proposal_payload is not None,
+            "diff": diff,
             "created_at": row.created_at.isoformat(),
             "expires_at": row.expires_at.isoformat(),
         }
@@ -3250,6 +3319,7 @@ class SamaApi:
                     "scope": row.scope,
                     "summary": shown.reason,
                     "proposal": shown.payload,
+                    "diff": shown.diff,
                     "created_at": row.created_at.isoformat(),
                     "expires_at": row.expires_at.isoformat(),
                 }

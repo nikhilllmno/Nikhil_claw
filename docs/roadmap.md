@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2, M6.3, M6.4, M6.5 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.1, M6.2, M6.3, M6.4, M6.5 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -159,8 +159,8 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2,
   checks the role). Slack and Telegram cards have "Always allow for me", which writes a user
   policy rule; a proposal card does not have it. A click after the timeout counts as deny and
   shows "Expired". A decided proposal applies at once and in the worker sweep. Not in M3.2: the
-  `change_propose` targets profile, toolsets, and policy (M6.1), and copies of a proposal card in
-  the direct messages of the admins.
+  `change_propose` targets profile, toolsets, and policy (done in M6.1), and copies of a proposal
+  card in the direct messages of the admins.
 - M3.3: shared sessions in Slack (architecture Section 11.6). A channel thread is a shared
   session; its run has no user, so it gets no `user` memory, and `session_search` sees only the
   shared sessions of the workspace. Delivery checks the link of the channel (or the worker bot)
@@ -378,6 +378,18 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2,
   not sent again. Three failed fires in a row pause the job with one alert. Not in M4.1 to
   M4.3: an approval card for a job in a chat, email from a provider other than SendGrid, and
   an admin view of the jobs of other users.
+- M6.1: `change_propose` for the soul, the settings (name, runtime, model, sub-agents), the
+  toolsets, and the profile policy rules (architecture Sections 9.4.2 and 11.4). Migration `0034`
+  adds the proposal kinds `profile`, `toolsets`, and `policy`, `sessions.profile_snapshot`, and
+  `profile_changes` (the history, with RLS like `agent_profiles`). The approval card in the web
+  app, Telegram, and Slack shows a diff. An approval, an admin edit, and a revert each write a
+  history row and the audit row `profile.updated`. A session keeps the toolsets and the profile
+  rules of its snapshot, so a new toolset or a looser rule applies from the next session, and a
+  removal or a stricter rule applies at once. The settings page of the web app has a History
+  section. An org owner or admin reverts a change there; a revert gets `409` when the profile
+  changed after the change. Not in M6.1: a history row for `python -m sama.admin subagents set`
+  and for a reset of the review model, user policy rules, and a policy rule editor in the web
+  app.
 
 | # | Item | Acceptance criteria |
 |---|---|---|
@@ -464,7 +476,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2,
 
 | # | Item | Acceptance criteria |
 |---|---|---|
-| M6.1 | `change_propose` | The agent proposes changes to SOUL, profile, toolsets, and policy. An approval card shows the diff. Approved changes apply from the next session. History and revert in the web app. The SOUL target is done in M3.2 (no diff on the card). |
+| M6.1 | `change_propose` | The agent proposes changes to SOUL, profile, toolsets, and policy. An approval card shows the diff. Approved changes apply from the next session. History and revert in the web app. The SOUL target is done in M3.2 (no diff on the card). Done. |
 | M6.2 | `sama_pr` | The agent clones the sama repo, changes code, runs tests, and opens a pull request with a summary. Changes to protected paths request the owner's review (CODEOWNERS). The agent cannot merge. Done. A person still creates the real App, installs it on the sama repo, and adds the ruleset with "Require review from Code Owners" (architecture §19.5). |
 | M6.3 | Curator | Weekly job per workspace. Usage counts, active to stale to archived, pins, report to the owner. Never deletes. Done (memory is report-only; merging near-duplicates is later, Section 9.7). |
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. Done (Telegram, Slack, and web; architecture §15.3). |

@@ -302,6 +302,11 @@ class GateContext:
     """The tools of each toolset. The default is the fixed table."""
     access: Mapping[str, ToolAccess] = field(default_factory=dict)
     """What each deferred tool does, for its default policy (``ToolsetSource.access``)."""
+    frozen_rules: tuple[PolicyRule, ...] | None = None
+    """``rules`` with the profile rules of the session snapshot in place of the profile rules
+    of now (Section 11.4), or ``None`` for a session without a snapshot. The policy step uses
+    the stricter verdict of the two, so a looser profile rule applies from the next session
+    and a stricter one applies at once."""
 
 
 def canonical_name(tool_name: str) -> str:
@@ -437,7 +442,7 @@ def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdi
     early = _authority_and_toolset(context, TOOL_CALL)
     if early is not None:
         return early
-    own = policy_verdict(context.rules, TOOL_CALL, shared=context.shared, access=context.access)
+    own = context_policy(context, TOOL_CALL)
     if own.action == "deny":
         return own
     wrapped = wrapped_call(arguments)
@@ -472,7 +477,7 @@ def _after_hardline(
     context: GateContext, name: str, digest: str, arguments: Mapping[str, Any] | None
 ) -> Verdict:
     # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
-    policy = policy_verdict(context.rules, name, shared=context.shared, access=context.access)
+    policy = context_policy(context, name)
     if policy.action == "deny":
         return policy
     verdict = _recorded(context.recorded, name, digest) or policy
@@ -493,6 +498,51 @@ def _recorded(recorded: Recorded | None, name: str, digest: str) -> Verdict | No
             return Verdict("deny", GateStep.RECORDED, "the approval timed out")
         case "pending":
             return Verdict("ask", GateStep.RECORDED, "the approval is still open")
+
+
+_STRICTNESS: Final = {"allow": 0, "ask": 1, "deny": 2}
+
+
+def context_policy(context: GateContext, name: str) -> Verdict:
+    """Step 4 with the live rules and, for a session with a snapshot, with the frozen profile
+    rules. The stricter verdict wins."""
+    live = policy_verdict(context.rules, name, shared=context.shared, access=context.access)
+    if context.frozen_rules is None:
+        return live
+    frozen = policy_verdict(
+        context.frozen_rules, name, shared=context.shared, access=context.access
+    )
+    if _STRICTNESS[frozen.action] > _STRICTNESS[live.action]:
+        return Verdict(frozen.action, frozen.step, f"{frozen.reason} (until the next session)")
+    return live
+
+
+def with_frozen_profile_rules(
+    rules: Iterable[PolicyRule], snapshot: Any
+) -> tuple[PolicyRule, ...] | None:
+    """``rules`` with the profile rules of a session snapshot (``sessions.profile_snapshot``)
+    in place of the live profile rules. ``None`` when the session has no snapshot."""
+    if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("rules"), list):
+        return None
+    frozen = [
+        PolicyRule(tool=str(item["tool"]), action=item["action"], level=RuleLevel.PROFILE)
+        for item in snapshot["rules"]
+        if isinstance(item, Mapping)
+        and isinstance(item.get("tool"), str)
+        and item.get("action") in _STRICTNESS
+    ]
+    return tuple(rule for rule in rules if rule.level is not RuleLevel.PROFILE) + tuple(frozen)
+
+
+def frozen_toolsets(live: Iterable[str], snapshot: Any, key: str) -> list[str]:
+    """The live toolsets that the session snapshot also has (Section 11.4). A session without
+    a snapshot uses the live toolsets. So a removed toolset applies at once, and a new toolset
+    applies from the next session."""
+    names = [str(name) for name in live]
+    if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get(key), list):
+        return names
+    kept = {str(name) for name in snapshot[key]}
+    return [name for name in names if name in kept]
 
 
 def policy_verdict(

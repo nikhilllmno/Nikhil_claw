@@ -62,9 +62,9 @@ async def stored(engine: AsyncEngine, tenant: Tenant, session: str = "s1") -> An
     async with engine.connect() as connection:
         return (
             await connection.execute(
-                select(Session.run_config, Session.config_fingerprint).where(
-                    Session.id == tenant.ids[session]
-                )
+                select(
+                    Session.run_config, Session.config_fingerprint, Session.profile_snapshot
+                ).where(Session.id == tenant.ids[session])
             )
         ).one()
 
@@ -82,6 +82,12 @@ async def test_the_first_run_builds_and_stores_the_config(
     row = await stored(engine, tenant)
     assert RunConfig.model_validate(row.run_config) == config
     assert row.config_fingerprint == config.fingerprint()
+    # The gate keeps these toolsets and profile rules until the next session (M6.1).
+    assert row.profile_snapshot == {
+        "toolsets": ["core", "todo", "web", "clarify"],
+        "group_toolsets": ["core", "todo", "web", "clarify"],
+        "rules": [],
+    }
 
 
 async def test_later_runs_reuse_the_frozen_config(engine: AsyncEngine, tenant: Tenant) -> None:

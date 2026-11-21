@@ -786,3 +786,42 @@ def test_narrow_toolsets_keeps_every_limit() -> None:
     assert narrow_toolsets(["web", "media"], None) == ["web", "media"]
     assert narrow_toolsets(None, ["web", "media"], ["media", "core"]) == ["media"]
     assert narrow_toolsets(["web"], "not a list") == []
+
+
+# -- frozen profile rules (M6.1, Section 11.4) -------------------------------------------------
+
+
+def test_a_looser_profile_rule_waits_for_the_next_session() -> None:
+    from sama.gate.decide import with_frozen_profile_rules
+
+    live = (rule("web_search", "allow", RuleLevel.PROFILE), rule("todo", "deny"))
+    snapshot = {"rules": [{"tool": "web_search", "action": "ask"}]}
+    frozen = with_frozen_profile_rules(live, snapshot)
+    assert frozen == (rule("todo", "deny"), rule("web_search", "ask", RuleLevel.PROFILE))
+    verdict = decide(context(rules=live, frozen_rules=frozen), "mcp__sama__web_search", {})
+    assert verdict.action == "ask"
+    assert verdict.reason.endswith("(until the next session)")
+    assert decide(context(rules=live), "mcp__sama__web_search", {}).action == "allow"
+
+
+def test_a_stricter_profile_rule_applies_at_once() -> None:
+    from sama.gate.decide import with_frozen_profile_rules
+
+    live = (rule("web_search", "deny", RuleLevel.PROFILE),)
+    frozen = with_frozen_profile_rules(live, {"rules": []})
+    verdict = decide(context(rules=live, frozen_rules=frozen), "mcp__sama__web_search", {})
+    assert verdict.action == "deny"
+    assert "next session" not in verdict.reason
+
+
+def test_a_session_without_a_snapshot_uses_the_live_rules() -> None:
+    from sama.gate.decide import frozen_toolsets, with_frozen_profile_rules
+
+    assert with_frozen_profile_rules((), None) is None
+    assert with_frozen_profile_rules((), {"toolsets": []}) is None
+    bad = {"rules": [{"tool": "x", "action": "maybe"}, "y", {"tool": 1, "action": "ask"}]}
+    assert with_frozen_profile_rules((), bad) == ()
+    assert frozen_toolsets(["core", "web"], None, "toolsets") == ["core", "web"]
+    assert frozen_toolsets(["core", "web"], {"toolsets": ["core"]}, "toolsets") == ["core"]
+    assert frozen_toolsets(["core"], {"toolsets": ["core", "web"]}, "toolsets") == ["core"]
+    assert frozen_toolsets(["core"], {"toolsets": ["web"]}, "group_toolsets") == ["core"]

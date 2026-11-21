@@ -247,6 +247,10 @@ export interface Approval {
   tool_name: string;
   arguments: Record<string, unknown>;
   reason: string;
+  /** True for a proposal of a change. A proposal has no "Always allow". */
+  proposal?: boolean;
+  /** The diff of a change of an agent profile (M6.1), or null. */
+  diff?: string | null;
   created_at: string;
   expires_at: string;
 }
@@ -349,6 +353,28 @@ export interface AgentProfilePatch {
   model?: string;
   toolsets?: string[];
   subagents?: Subagent[];
+}
+
+export type ProfileChangeKind = "soul" | "profile" | "toolsets" | "policy";
+export type ProfileChangeSource = "proposal" | "edit" | "revert";
+
+/** One row of `GET /orgs/{org_id}/agent-profiles/{profile_id}/changes`, newest first. */
+export interface ProfileChange {
+  id: string;
+  kind: ProfileChangeKind;
+  source: ProfileChangeSource;
+  summary: string | null;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  diff: string;
+  actor_user_id: string | null;
+  actor_name: string | null;
+  proposal_id: string | null;
+  reverts_change_id: string | null;
+  reverted_by_change_id: string | null;
+  /** True when sama redacted a secret in the values. Such a change cannot be reverted. */
+  redacted: boolean;
+  created_at: string;
 }
 
 export type ConnectionScope = "personal" | "workspace";
@@ -1210,6 +1236,13 @@ export class ApiClient {
       method: "PATCH",
       body: patch,
     });
+  listAgentProfileChanges = (orgId: string, profileId: string) =>
+    this.json<ProfileChange[]>(`/orgs/${orgId}/agent-profiles/${profileId}/changes`);
+  revertAgentProfileChange = (orgId: string, profileId: string, changeId: string) =>
+    this.json<{ id: string; profile: AgentProfile }>(
+      `/orgs/${orgId}/agent-profiles/${profileId}/changes/${changeId}/revert`,
+      { method: "POST", body: {} },
+    );
   listConnectors = () => this.json<Connector[]>("/connectors");
   listConnections = (workspaceId: string) =>
     this.json<Connection[]>(`/workspaces/${workspaceId}/connections`);

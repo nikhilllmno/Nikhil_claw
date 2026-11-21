@@ -70,8 +70,8 @@ from sama.orchestrator.references import ReferenceExpander
 from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, SandboxSettings
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
+from sama.review.change import ChangeProposer
 from sama.review.proposals import PostgresProposalStore
-from sama.review.soul import SoulProposer
 from sama.runtime.archive import ARCHIVE_PATH
 from sama.runtime.contract import AgentRuntime, McpServerConfig, RuntimeKind, RuntimeRegistry
 from sama.runtime.session_items import SESSION_ITEMS_PATH
@@ -343,7 +343,7 @@ def build(
         ),
         memory=MemoryService(memory_store, proposals),
         skills=skill_store,
-        souls=SoulProposer(engine, proposals),
+        changes=ChangeProposer(engine, proposals),
         sessions=sessions,
         vision=(
             VisionService(

@@ -4,7 +4,8 @@ A review run can change user memory and user skills at once. It cannot change sh
 or a shared skill alone: no person is in the run. It proposes the change instead. A chat run
 also proposes a change when its user does not have the role for it (a workspace write of a
 member who is not an admin, an org skill of a user who is not the org owner), and every change
-of a soul is a proposal (M3.2). A proposal is one ``approvals`` row (the human decision, shown
+of a soul is a proposal (M3.2), and so is every change of a profile, its toolsets, or its
+policy rules (M6.1). A proposal is one ``approvals`` row (the human decision, shown
 with the other approvals of the session) and one ``review_proposals`` row (the full change).
 ``sama.review.apply`` applies the change after a person with the right role approves it.
 """
@@ -29,13 +30,16 @@ from sama.vault.redact import default_redactor, redact
 CALL_PREFIX: Final = "review:"
 """The ``call_id`` of the approval of a proposal starts with this text."""
 
-ProposalKind = Literal["memory", "skill", "soul"]
+ProposalKind = Literal["memory", "skill", "soul", "profile", "toolsets", "policy"]
 ProposalScope = Literal["agent", "workspace", "org"]
 ProposalOrigin = Literal["review", "chat"]
 TOOL_OF_KIND: Final[dict[str, str]] = {
     "memory": "memory",
     "skill": "skill_manage",
     "soul": "change_propose",
+    "profile": "change_propose",
+    "toolsets": "change_propose",
+    "policy": "change_propose",
 }
 
 
@@ -57,7 +61,10 @@ class NewProposal:
     scope: ProposalScope
     payload: Mapping[str, Any]
     """The full change. For memory: ``target``, ``operations``, ``reason``. For a skill: the
-    fields of ``ManageRequest``."""
+    fields of ``ManageRequest``. For a soul: ``profile_id``, ``profile_name``, ``soul``,
+    ``before_soul``, ``summary``, ``base_digest``. For a profile, toolsets, or policy change:
+    ``profile_id``, ``profile_name``, ``summary``, ``before``, ``after``
+    (``sama.profile_changes``)."""
     summary: str
     """One line for the person who decides."""
     origin: ProposalOrigin = "review"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { type AgentProfile, errorText } from "@/lib/api";
 import {
@@ -16,6 +16,7 @@ import {
 } from "@/lib/profile";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
+import { ProfileHistory } from "./ProfileHistory";
 import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./AgentSettings.module.css";
@@ -40,6 +41,8 @@ export function AgentSettings({ profileId }: { profileId: string }) {
     error: loadError,
     reload,
   } = useLoad(loadProfile, "Could not load the agent.");
+  // A revert changes the saved values under the form, so the form starts again from them.
+  const [revision, setRevision] = useState(0);
 
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the agent" />;
@@ -57,14 +60,24 @@ export function AgentSettings({ profileId }: { profileId: string }) {
   if (profile === null) return <LoadingState label="Loading the agent" />;
   return (
     <SettingsForm
-      key={profile.id}
+      key={`${profile.id}:${revision}`}
       orgId={org.id}
       profile={profile}
       onSaved={(saved) => {
         setProfile(saved);
         reloadMe(); // The name and the model show in the sidebar.
       }}
-    />
+    >
+      <ProfileHistory
+        orgId={org.id}
+        profile={profile}
+        onReverted={(reverted) => {
+          setProfile(reverted);
+          setRevision((n) => n + 1);
+          reloadMe();
+        }}
+      />
+    </SettingsForm>
   );
 }
 
@@ -72,10 +85,13 @@ function SettingsForm({
   orgId,
   profile,
   onSaved,
+  children,
 }: {
   orgId: string;
   profile: AgentProfile;
   onSaved: (profile: AgentProfile) => void;
+  /** More sections after the settings, such as the history. */
+  children?: ReactNode;
 }) {
   const api = useApi();
   const { options } = profile;
@@ -161,7 +177,7 @@ function SettingsForm({
         </p>
       ) : (
         <p className="alert" role="note">
-          Soul, runtime, model, and sub-agent changes apply to new sessions. Toolset changes apply at the next tool call in every session.
+          Changes apply to new sessions. A tool group that you turn off stops at the next tool call in every session.
         </p>
       )}
 
@@ -388,6 +404,8 @@ function SettingsForm({
           </ul>
         )}
       </section>
+
+      {children}
 
       {!readOnly ? (
         <div className={styles.bar}>

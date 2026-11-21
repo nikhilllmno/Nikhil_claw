@@ -40,11 +40,14 @@ from sama.memory.core import (
 )
 from sama.memory.service import action_of, scope_of
 from sama.memory.store import MemoryState, MemoryStore, Writer
+from sama.profile_changes import write_change
+from sama.review.change import CHANGE_LABELS
 from sama.review.soul import SoulError, set_soul
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest
 from sama.skills.store import Expected, PostgresSkillStore
-from sama.tenancy.access import Grants, load_grants
+from sama.subagents import lock_profile
+from sama.tenancy.access import Grants, load_grants, lock_grants
 from sama.vault.redact import redact
 
 log: Final = logging.getLogger("sama.review")
@@ -145,30 +148,51 @@ class ReviewApplier:
             grants = await load_grants(connection, row.org_id, decider)
         if row.kind == "memory":
             await self._apply_memory(row, grants)
-        elif row.kind == "soul":
-            await self._apply_soul(row, grants)
+        elif row.kind == "soul" or row.kind in CHANGE_LABELS:
+            await self._apply_profile_change(row, grants)
         else:
             await self._apply_skill(row, grants)
 
-    async def _apply_soul(self, row: Any, grants: Grants) -> None:
-        """A new soul of a profile (M3.2). The scope ``org`` needs the org owner, the scope
-        ``workspace`` a workspace admin or the org owner, with the roles of now."""
+    async def _apply_profile_change(self, row: Any, grants: Grants) -> None:
+        """A new soul (M3.2), or a change of the settings, the toolsets, or the policy rules of a
+        profile (M6.1). The scope ``org`` needs the org owner, the scope ``workspace`` a
+        workspace admin or the org owner, with the roles of now. The change fails when the
+        profile does not have the values that the agent saw."""
         payload = row.payload
-        allowed = (
-            grants.org_owner if row.scope == "org" else grants.admins_workspace(row.workspace_id)
-        )
-        if not allowed:
+        if not _approves(grants, row):
             raise SoulError("the person who approved it does not have the role now")
+        profile_id = uuid.UUID(payload["profile_id"])
+        summary = str(payload.get("summary") or "") or None
         async with self._engine.begin() as connection:
-            await set_soul(
-                connection,
-                org_id=row.org_id,
-                profile_id=uuid.UUID(payload["profile_id"]),
-                soul=str(payload["soul"]),
-                base_digest=str(payload["base_digest"]),
-                actor_user_id=grants.user_id,
-                proposal_id=row.id,
-            )
+            # The role again, after the lock of the profile and with a share lock on the
+            # memberships: a demotion while the write waits for the lock stops the write.
+            await lock_profile(connection, row.org_id, profile_id)
+            if not _approves(await lock_grants(connection, row.org_id, grants.user_id), row):
+                raise SoulError("the person who approved it does not have the role now")
+            if row.kind == "soul":
+                await set_soul(
+                    connection,
+                    org_id=row.org_id,
+                    profile_id=profile_id,
+                    soul=str(payload["soul"]),
+                    base_digest=str(payload["base_digest"]),
+                    actor_user_id=grants.user_id,
+                    proposal_id=row.id,
+                    summary=summary,
+                )
+            else:
+                await write_change(
+                    connection,
+                    org_id=row.org_id,
+                    profile_id=profile_id,
+                    kind=row.kind,
+                    before=dict(payload["before"]),
+                    after=dict(payload["after"]),
+                    actor_user_id=grants.user_id,
+                    source="proposal",
+                    proposal_id=row.id,
+                    summary=summary,
+                )
             await self._mark(connection, row, "applied", None)
 
     async def _apply_memory(self, row: Any, grants: Grants) -> None:
@@ -287,3 +311,11 @@ class ReviewApplier:
                 },
             )
         )
+
+
+def _approves(grants: Grants, row: Any) -> bool:
+    """The role that approves a change of a profile: the org owner for the scope ``org``, and
+    a workspace admin or the org owner for the scope ``workspace``."""
+    if row.scope == "org":
+        return grants.org_owner
+    return grants.admins_workspace(row.workspace_id)

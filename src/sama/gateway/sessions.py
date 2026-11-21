@@ -436,6 +436,9 @@ class ShownApproval:
     proposal: bool = False
     """True for a proposal (M3.2). A proposal card has no "always allow" button: a policy rule
     cannot approve a proposal."""
+    diff: str | None = None
+    """The diff of a change of a profile (M6.1). The card shows it in place of the
+    arguments."""
 
 
 def offers_always(row: Any) -> bool:
@@ -497,6 +500,7 @@ def _shown_approval(row: Any) -> ShownApproval:
             shown.arguments,
             PROPOSAL_ANSWERERS.get(row.proposal_scope),
             proposal=True,
+            diff=shown.diff,
         )
     answerers = (
         answerers_text(
@@ -511,8 +515,13 @@ def _shown_approval(row: Any) -> ShownApproval:
 
 
 def approval_text(row: Any) -> str:
-    """The text of an approval card: the tool, the reason, and the arguments (cut)."""
-    arguments = json.dumps(row.arguments, ensure_ascii=False, indent=1)
+    """The text of an approval card: the tool, the reason, and the arguments (cut). A change of
+    a profile shows its diff in place of the arguments (M6.1)."""
+    diff = getattr(row, "diff", None)
+    if diff:
+        arguments = f"Change:\n{diff}"
+    else:
+        arguments = json.dumps(row.arguments, ensure_ascii=False, indent=1)
     if len(arguments) > MAX_ARGUMENT_CHARS:
         arguments = arguments[:MAX_ARGUMENT_CHARS] + "\n..."
     head = f"Approval needed: {row.tool_name}\n{row.reason}"

@@ -858,6 +858,10 @@ Rules:
   (migration `0006`). So all runs of a session use the same prefix, also when two runs start
   at the same time. A change to the profile SOUL, model, or runtime, or to a context file,
   applies from the next session.
+- Since M6.1, the assembler also writes `sessions.profile_snapshot` when it freezes the config
+  (migration `0034`): the toolsets, the group toolsets, and the policy rules of the profile at
+  that time. The gate uses it (Section 16.1), so a new toolset or a looser profile rule applies
+  from the next session. A session from before M6.1 has no snapshot and uses the live values.
 - `RunQueue.enqueue` takes the runtime from the frozen config of the session, if there is
   one. The claim of a chat run that starts sets the runtime again, from the frozen config or
   else from the profile, because the profile can switch runtime while the run waits
@@ -1915,7 +1919,7 @@ approval card, applier, and timeout as a proposal of the background review (Sect
   "A workspace admin or the org owner can decide this." or "Only the org owner can decide this."
 
 **`change_propose`.** The toolset `self` has the tool `change_propose` (target `soul`, the full
-new `content`, and a `summary` of at most 200 characters). A SOUL changes the agent for every
+new `content`, and a `summary` of at most 200 characters; the other targets are below). A SOUL changes the agent for every
 user of the profile, so a new SOUL is always a proposal, also for an admin. The proposal keeps a
 SHA-256 digest of the SOUL that the run saw: the frozen SOUL of the session
 (`sessions.run_config.soul`), or the live SOUL of the profile when the session has no frozen
@@ -1926,6 +1930,47 @@ fails when a person approves it. The applier adds the audit row `profile.updated
 SOUL, so the new SOUL applies from the next session. The tool server hides the tool when it has
 no proposer. The bootstrap presets do not have `self` (Section 10.2), so an admin adds it to a
 profile on purpose.
+
+**More targets (M6.1).** `change_propose` also has these targets. Each one takes only its own
+fields and a `summary`:
+
+- `profile`: `name`, `runtime`, `model`, and `subagents` (the full list). The same checks as the
+  `PATCH` of the web app apply (Section 11.4).
+- `toolsets`: `toolsets` and `group_toolsets`, each one the full new list.
+- `policy`: `rules`, at most 20 pairs of `tool` and `action` (`allow`, `ask`, `deny`, or `none`).
+  A rule is a policy rule of the profile (Section 16.1), for every user. The tool is a name or a
+  prefix with `*` as the last character. `none` removes the rule of the profile.
+
+The tool refuses a change that has a secret, and it returns "Nothing to propose" when the profile
+already has the values. A change of the setup is always a proposal, with the roles of a SOUL
+proposal. The proposal keeps the values that the agent saw (`before`) and the new values
+(`after`), only for the fields that change. When a person approves it, the applier locks the
+profile and writes the change only if the profile still has the `before` values. Else the
+proposal is `failed` with "the profile changed after this change was made". After the lock, the
+applier also checks the role of the approver again, with a share lock on the membership rows. If
+the approver lost the role, the proposal is `failed` with "the person who approved it does not
+have the role now". A change that is not
+valid now (for example, a sub-agent that uses a removed toolset) also fails.
+
+The card shows a diff in place of the arguments, in the web app, Telegram, and Slack
+(`approval_text`, "Change:"): a line diff for a SOUL, `+` and `-` lines for toolsets, and
+`old -> new` lines for the other fields. A diff has at most 1,500 characters. The web card says
+that the change applies to new sessions.
+
+Each approved change, each edit of an admin (Section 11.4), and each revert writes one row of
+`profile_changes` (the history, migration `0034`) and the audit row `profile.updated` with the
+`change_id`. A row has the kind (`soul`, `profile`, `toolsets`, or `policy`), the source
+(`proposal`, `edit`, or `revert`), `before`, `after`, the actor, and the proposal. RLS on
+`profile_changes` is the same as for `agent_profiles`: an org owner or admin sees every row of
+the org, and a member sees the rows of the org profiles and of the profiles of the workspaces
+of the member.
+
+A member can read `profile_changes` directly (RLS), so the row has redacted values: sama replaces
+each known secret in `before`, `after`, and `summary` before the write, and sets `redacted` to
+true when the redaction changed a value. An example is a secret that an admin removes from a
+SOUL. A redacted change cannot be reverted (`409`), because sama does not keep the old values.
+The history redacts the values again before it makes the diff, because the `-` and `+` in front
+of each line can hide a secret of many lines from the redactor.
 
 **Approvals over chat.** A Slack card and a Telegram card have three buttons for a tool call:
 Approve, Deny, and "Always allow for me". A proposal card has Approve and Deny only, because a
@@ -1947,7 +1992,7 @@ Section 15.1) or for `db_<conn>_execute` (Section 10.4) also has Approve and Den
 **Assumptions in M3.2.**
 
 - `change_propose` has only the target `soul`. The targets profile, toolsets, and policy, the
-  diff on the card, the history, and the revert come in M6.1.
+  diff on the card, the history, and the revert came in M6.1 (above).
 - The tool description says that a workspace admin or the org owner approves. For an org profile
   only the org owner can approve; the card and the gate say so.
 - A proposal of a shared session goes to the card in the channel of the session. Sama does not
@@ -2140,7 +2185,7 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
-| `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets come in M6. `sama_pr` is done in M6.2 (Section 15.2.1). | Sama MCP |
+| `self` | `change_propose` (SOUL, profile, toolsets, policy), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul`; since M6.1, also `profile`, `toolsets`, and `policy` (Section 9.4.2). `sama_pr` is done in M6.2 (Section 15.2.1). | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run). | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
@@ -3241,9 +3286,11 @@ The rules of an update:
   the table owner, as the other writes do, after the code checked the role.
 - A session keeps the soul, the runtime, the model, and the sub-agents that it froze. A change
   to them applies from the next session. A run uses the runtime of `sessions.run_config` when
-  it has one, and else the runtime of the profile. The gate reads the toolsets of the profile on every tool call,
-  so a change to the toolsets applies at the next tool call, also in a session that is running.
-  This keeps a revoked toolset immediate (Section 5.1). The web app shows this note.
+  it has one, and else the runtime of the profile. Since M6.1, the gate uses only the toolsets
+  that both the profile of now and the snapshot of the session have (Section 16.1). So a new
+  toolset applies from the next session, and a removed toolset applies at the next tool call,
+  also in a session that is running. This keeps a revoked toolset immediate (Section 5.1). The
+  web app shows this note.
 - A change to the soul or to the sub-agents needs a redactor that knows every secret of the org,
   as `python -m sama.admin subagents set` does (`sama.vault.standalone.know_the_secrets`). It
   fails closed with `503`, and the message has no secret, when the org has vault entries but the
@@ -3254,10 +3301,29 @@ The rules of an update:
   while the write waits for the lock gets `403`, and nothing is written.
 
 In-place edits by an admin are the M3.8 interim. Since M3.2, the agent proposes a new SOUL with
-`change_propose`, and the SOUL changes when a person approves the card (Section 9.4.2). The other
-fields of a profile have no proposal yet. When `change_propose` gets the targets profile and
-toolsets (M6.1), a change to a profile goes through an approval card, and the history and the
-revert are in the web app.
+`change_propose`, and since M6.1 also a change of the settings, the toolsets, and the policy
+rules of the profile (Section 9.4.2). The change applies when a person approves the card.
+
+**History and revert (M6.1).** Each edit writes a history row (Section 9.4.2), one row for each
+kind that it changes.
+
+- `GET /orgs/{org_id}/agent-profiles/{profile_id}/changes` returns the newest 50 changes of the
+  profile to each member who can see the profile (`404` for another user). Each change has
+  `id`, `kind`, `source`, `summary`, `before`, `after`, `diff`, `actor_user_id`, `actor_name`,
+  `proposal_id`, `reverts_change_id`, `reverted_by_change_id`, `redacted`, and `created_at`.
+  The answer is redacted with the secrets of the org.
+- `POST /orgs/{org_id}/agent-profiles/{profile_id}/changes/{change_id}/revert` writes the
+  `before` values of the change again, as a new change with the source `revert`. Only an org
+  owner or admin can do it (`403`). It needs the redactor of the org, as an edit does (`503`).
+  It gives `404` for an unknown change, `409` when the change is already reverted, when the
+  change is redacted, or when the profile does not have the `after` values of the change now, and `422` when the old values are
+  not valid now. The answer has the `id` of the new change and the profile.
+- The settings page of the web app has a History section below the form. It shows each change
+  with its diff, who made it, and when. An org owner or admin has a Revert button with a
+  confirm step. A redacted change shows a note in place of the button. The web app has no editor for policy rules, so a policy change shows only in
+  the history.
+- `python -m sama.admin subagents set` and the reset of the review model on a runtime switch do
+  not write a history row.
 
 **Telegram pairing.** `POST /channels/telegram/pairing-codes` with `workspace_id`,
 `agent_profile_id`, and `kind` (`user` or `group`) makes a pairing code (Section 11.5). It does
@@ -4772,7 +4838,7 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
 
 | Level | What | How it applies |
 |---|---|---|
-| Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through sama tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. Prompt content (SOUL, memory, skills) applies from the next session. Restrictions (deny rules, removed tools, revoked connections, lower budgets) apply at once (Section 5.1). Every change can be reverted from the history view. |
+| Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through sama tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. Prompt content (SOUL, memory, skills) applies from the next session. New toolsets and looser profile rules also apply from the next session (M6.1). Restrictions (deny rules, removed tools, revoked connections, lower budgets) apply at once (Section 5.1). Since M6.1, a change to the SOUL, the settings, the toolsets, or the policy rules of a profile can be reverted from the history in the web app (Section 11.4). |
 | Code | Sama itself (and later products such as vorflux) | The agent uses `sama_pr`: it clones the sama repo in its sandbox, makes the change, runs the tests, and opens a pull request. A human reviews and merges. CI deploys. Changes to protected paths (auth, tenancy, approvals, model proxy, sandbox, CI) need the owner's review (Section 15.2.1). |
 
 The agent never edits the running service, its database schema, or its secrets directly.
@@ -4923,7 +4989,9 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 0. **Authority** (M1.18): the run must not be ended, the run user must still see the
    session, and the run must not have spent its live budget. Otherwise `deny`.
 1. **Toolset**: the tool must be in the run's toolsets. Otherwise `deny`. In a shared
-   session the toolsets are the group set of the profile (Section 11.3).
+   session the toolsets are the group set of the profile (Section 11.3). Since M6.1, a
+   session with `sessions.profile_snapshot` uses only the toolsets that both the profile of
+   now and the snapshot have.
 2. **Hardline**: a fixed deny list that nothing overrides (for example `rm -rf /`, fork
    bombs, disk wipes, piping a remote script to a shell as root).
 3. **Recorded decision**: a one-time human decision for this call id, if any. A `deny`
@@ -4933,7 +5001,11 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
    mode. The default for unknown tools is `ask`. In a shared session, `memory` also has the
    default `ask` (Section 11.3). Since M3.4, a deferred tool gets its default from the access
    of the tool in the catalog: `read` is `allow`, `write` and `destructive` are `ask`
-   (Section 10.3). A policy rule wins over this default.
+   (Section 10.3). A policy rule wins over this default. Since M6.1, a session with a snapshot
+   also gets the verdict of the rules with the profile rules of the snapshot in place of the
+   live profile rules. The stricter verdict wins, and the reason of a stricter frozen verdict
+   ends with "(until the next session)". So a looser profile rule applies from the next
+   session, and a stricter one applies at once.
 5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
    pre-approval for this tool in this job version, and the call fits its connection and
    argument limits (Section 12.1).

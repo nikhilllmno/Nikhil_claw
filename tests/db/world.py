@@ -52,6 +52,7 @@ from sama.db.models import (
     Org,
     OrgInvite,
     PairingCode,
+    ProfileChange,
     ReviewProposal,
     Run,
     RunEvent,
@@ -167,6 +168,19 @@ def plan(
             workspace_id=ids[workspace] if workspace else None,
             name=profile,
             model="claude-sonnet-5-5",
+        )
+    # A row of the change history of each profile (M6.1). It follows the profile.
+    for profile, org, workspace in profiles:
+        add(
+            ProfileChange,
+            f"change:{profile}",
+            org_id=ids[org],
+            workspace_id=ids[workspace] if workspace else None,
+            agent_profile_id=ids[profile],
+            kind="profile",
+            source="edit",
+            before={"name": "old"},
+            after={"name": profile},
         )
     sessions = (
         ("a1-shared", "org-a", "a1", "profile-a", "shared", None),
