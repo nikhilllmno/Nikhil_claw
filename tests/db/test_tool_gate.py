@@ -1147,3 +1147,45 @@ async def test_an_approved_call_under_an_allow_rule_uses_up_its_ticket(
     first = await gate.screen(org.claims(), "Bash", ARGS)
     assert (first.action, first.step) == ("allow", GateStep.POLICY)
     assert (await call_row(engine, org, "c1")).status == "finished"
+
+
+# -- steps of a sub-agent tool (M5.6) ---------------------------------------------------------
+
+
+async def test_inner_judges_a_step_of_browser_task_without_a_record(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == org.ids["profile"])
+            .values(toolsets=["browser"])
+        )
+    gate = GateService(engine)
+    claims = org.claims("secret-run", session_id=str(org.ids["secret"]))
+    assert (await gate.inner(claims, "browser_open", {"url": "https://a.test"})).action == "allow"
+    assert (await gate.inner(claims, "browser_act", {"action": "click"})).action == "ask"
+    assert (await gate.inner(claims, "mcp__sama__browser_task", {"goal": "g"})).action == "ask"
+    # Without the toolset, and for an ended run, the step is denied.
+    assert (await gate.inner(claims, "web_search", {"query": "q"})).action == "deny"
+    gone = org.claims("secret-run", session_id=str(org.ids["secret"]), run_id=str(uuid.uuid4()))
+    assert (await gate.inner(gone, "browser_open", {})).action == "deny"
+    await add_rule(engine, org, "browser_act", "deny")
+    denied = await gate.inner(claims, "browser_act", {"action": "click"})
+    assert (denied.action, denied.step) == ("deny", GateStep.POLICY)
+    actions = [(action, details["tool"]) for action, _, details in await audit(engine, org)]
+    assert actions == [("tool_gate.inner", "web_search"), ("tool_gate.inner", "browser_act")]
+    # In an unattended run, the approval of browser_task covers the ask of its steps (the
+    # gate judged browser_task with the unattended rule), but a deny rule still wins.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["secret-run"]).values(unattended=True)
+        )
+    assert (await gate.inner(claims, "browser_tabs", {"action": "list"})).action == "allow"
+    assert (await gate.inner(claims, "browser_task", {"goal": "g"})).action == "ask"
+    assert (await gate.inner(claims, "browser_act", {"action": "click"})).action == "deny"
+    async with engine.connect() as connection:
+        calls = (
+            await connection.execute(select(ToolCall).where(ToolCall.org_id == org.ids["org"]))
+        ).all()
+    assert calls == []

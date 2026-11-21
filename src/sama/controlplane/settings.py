@@ -17,6 +17,7 @@ from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
 from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
 from sama.media.vision import DEFAULT_VISION_MODEL
+from sama.modelproxy.prices import PriceTable, Provider
 from sama.orgs.service import SignupPolicy
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
 from sama.tenancy.regions import RegionError, Regions, regions_from_env
@@ -47,6 +48,13 @@ def _required(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise SettingsError(f"set {name}")
     return value
+
+
+def _browser_task_model(env: Mapping[str, str]) -> str:
+    model = env.get("SAMA_BROWSER_TASK_MODEL", "").strip() or DEFAULT_VISION_MODEL
+    if PriceTable.load().lookup(Provider.ANTHROPIC, model) is None:
+        raise SettingsError("SAMA_BROWSER_TASK_MODEL must be an Anthropic model with a price")
+    return model
 
 
 def _public_url(value: str) -> str:
@@ -141,6 +149,9 @@ class ControlPlaneSettings:
     """``SAMA_BROWSERBASE_RECORD=1`` turns on the session recording and the session logs of
     Browserbase, for a test. They are off by default: a recording can show a page with a
     login, and a log can keep a form with a password (Section 14.1)."""
+    browser_task_model: str = DEFAULT_VISION_MODEL
+    """The Anthropic model of the browser sub-agent (``SAMA_BROWSER_TASK_MODEL``, M5.6). It
+    must have a price in the price table of the model proxy."""
     composio_key: SecretStr | None = None
     """The Composio API key of the process (``COMPOSIO_API_KEY``). An org can set its own key
     in the vault (``composio_api_key``)."""
@@ -307,6 +318,7 @@ class ControlPlaneSettings:
             browserbase_key=_secret(env, "BROWSERBASE_API_KEY"),
             browserbase_project_id=env.get("BROWSERBASE_PROJECT_ID", "").strip() or None,
             browserbase_record=env.get("SAMA_BROWSERBASE_RECORD", "").strip() == "1",
+            browser_task_model=_browser_task_model(env),
             composio_key=_secret(env, "COMPOSIO_API_KEY"),
             composio_webhook_secret=_secret(env, "SAMA_COMPOSIO_WEBHOOK_SECRET"),
             langfuse=langfuse,

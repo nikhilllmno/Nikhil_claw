@@ -108,6 +108,9 @@ class _Writer:
         self._seq = run.next_seq
         self._pending: list[tuple[int, str, dict[str, Any]]] = []
         self._last = time.monotonic()
+        self._flushing = asyncio.Lock()
+        """A tool of the process can add events too (``Worker.emit``), so one flush writes at
+        a time and the events keep their order."""
 
     async def add(self, event: RunEvent) -> None:
         payload = event.model_dump(mode="json", exclude={"runtime_state"})
@@ -121,14 +124,15 @@ class _Writer:
             await self.flush()
 
     async def flush(self) -> None:
-        events, self._pending = self._pending, []
-        self._last = time.monotonic()
-        if (
-            events
-            and not self._watch.lost
-            and not await self._queue.add_events(self._run, self._owner, events)
-        ):
-            self._watch.lost = True
+        async with self._flushing:
+            events, self._pending = self._pending, []
+            self._last = time.monotonic()
+            if (
+                events
+                and not self._watch.lost
+                and not await self._queue.add_events(self._run, self._owner, events)
+            ):
+                self._watch.lost = True
 
 
 class Worker:
@@ -163,6 +167,8 @@ class Worker:
         self._maintenance_s = maintenance_s
         self._flush_s = flush_s
         self._wakeup = QueueWakeup(queue.engine)
+        self._writers: dict[tuple[str, str], _Writer] = {}
+        """The event writers of the runs that stream now, by ``(org_id, run_id)``."""
 
     # -- loops ------------------------------------------------------------------------------
 
@@ -286,6 +292,8 @@ class Worker:
         stream = _stream(runtime, run, scope, config, budget)
         watch = _Watch()
         writer = _Writer(self._queue, run, self.owner, watch, self._flush_s)
+        key = (str(run.org_id), str(run.run_id))
+        self._writers[key] = writer
         heart = asyncio.create_task(self._watch(run, runtime, budget, watch))
         terminal: RunEvent | None = None
         usage = Usage()
@@ -302,11 +310,13 @@ class Worker:
                     if is_terminal(event):
                         terminal = event
                         break
+            self._writers.pop(key, None)
             await writer.flush()
             steps.mark("stream")
         except Exception:
             log.exception("the run stream failed run=%s", run.run_id)
         finally:
+            self._writers.pop(key, None)
             heart.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heart
@@ -443,6 +453,17 @@ class Worker:
                 watch.cancel = True
                 log.info("cancel requested run=%s", run_id)
                 await _cancel(runtime, run_id)
+
+    async def emit(self, org_id: str, run_id: str, event: RunEvent) -> bool:
+        """Adds ``event`` to the stream of a run that streams in this worker now, for example
+        the progress of ``browser_task`` (Section 14.1, M5.6). The event gets the next ``seq``
+        and is stored with the events of the runtime. Returns False when the run does not
+        stream here: it ended, or another process runs it."""
+        writer = self._writers.get((org_id, run_id))
+        if writer is None:
+            return False
+        await writer.add(event)
+        return True
 
     def _ended(self, org_id: uuid.UUID, run_id: uuid.UUID) -> None:
         for hook in self._on_run_end:

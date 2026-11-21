@@ -183,6 +183,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 |---|---|---|---|---|
 | Browser over CDP (`browser_exec`, `browser_cdp`) | `tools/browser_*.py` | Typed tools on snapshots with refs: `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (§14.1). No raw CDP tool. Done in M5.1. | Adapt | M5 (done, M5.1) |
 | Cloud browsers (Browserbase, Browser Use cloud) | `agent/browser_session_cloud*.py` | Browserbase with a persistent context per user (§14.1, table `browser_contexts`). Browser Use cloud is not used. Done in M5.1. | Adapt | M5 (done, M5.1) |
+| Browser sub-agent (`browser-use` style) | — | `browser_task(goal)`: a sama sub-agent loop with the typed browser tools on the cloud browser of the run. Model calls go through the model proxy. `browser-use` is not used, because version 1.0 runs model-written Python and version 0.x conflicts with the sama dependencies (§14.1). Done in M5.6. | New | M5 (done, M5.6) |
 | Local Chromium and real profile | `agent/browser_launcher*.py` | Not in the cloud. The Chrome extension replaces the real-profile mode. | Skip | — |
 | Attach to the user's Chrome over CDP | `/browser connect` | The `my_chrome` target: the extension uses `chrome.debugger` in the tabs of the run, on the M5.4 WebSocket (§14.2.2). | New | M5 (done, M5.5) |
 | `browser_dialog` | `tools/browser_*.py` | `browser_act(action="dialog", accept, prompt_text)` answers a dialog. An action that opens a dialog returns at once with a note. Done in M5.1. | Adapt | M5 (done, M5.1) |

@@ -31,6 +31,8 @@ Optional environment:
   ``SAMA_SANDBOX_TEMPLATE``, ``SAMA_SANDBOX_ALLOW_OUT`` (comma-separated hosts),
   ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_VISION_MODEL`` (the model of
   ``vision_analyze``, default ``claude-sonnet-5-5``).
+- ``SAMA_BROWSER_TASK_MODEL``: the Anthropic model of ``browser_task`` (default
+  ``claude-sonnet-5-5``; it must have a price).
 - ``SAMA_CONNECTOR_HOST_TEMPLATE``: the E2B template of the connector hosts of stdio MCP
   servers (default ``base``).
 - ``SAMA_REGION``: the home region of this deployment (default ``ap-south-1``).
