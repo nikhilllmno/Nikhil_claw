@@ -4,9 +4,11 @@
   the provider (a Browserbase context for ``cloud``). The provider keeps the cookies, so the row
   has no secret. A member reads only their own rows. Only the control plane writes the table.
 - The default profile gets the toolset ``browser``.
+- ``data_purges`` gets the kind ``browser_contexts``: a user or org delete deletes the contexts at
+  Browserbase through the purge worker (Section 17.4).
 
-Revision ID: 0035
-Revises: 0034
+Revision ID: 0036
+Revises: 0035
 Create Date: 2026-11-21
 """
 
@@ -15,8 +17,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0035"
-down_revision: str | None = "0034"
+revision: str = "0036"
+down_revision: str | None = "0035"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -92,9 +94,20 @@ def upgrade() -> None:
         f"UPDATE public.agent_profiles SET toolsets = '{NEW_TOOLSETS}'::jsonb"  # noqa: S608
         f" WHERE toolsets = '{OLD_TOOLSETS}'::jsonb"
     )
+    op.drop_constraint(op.f("ck_data_purges_kind"), "data_purges", type_="check")
+    op.create_check_constraint(
+        op.f("ck_data_purges_kind"),
+        "data_purges",
+        "kind IN ('sandboxes', 'traces', 'browser_contexts')",
+    )
 
 
 def downgrade() -> None:
+    op.execute("DELETE FROM public.data_purges WHERE kind = 'browser_contexts'")
+    op.drop_constraint(op.f("ck_data_purges_kind"), "data_purges", type_="check")
+    op.create_check_constraint(
+        op.f("ck_data_purges_kind"), "data_purges", "kind IN ('sandboxes', 'traces')"
+    )
     op.execute(
         f"UPDATE public.agent_profiles SET toolsets = '{OLD_TOOLSETS}'::jsonb"  # noqa: S608
         f" WHERE toolsets = '{NEW_TOOLSETS}'::jsonb"

@@ -7,9 +7,11 @@ tries again with a backoff until it works:
 - ``sandboxes``: kills the E2B sandboxes of the deleted sessions. It finds them by their
   labels, so it kills only a sandbox of the org and of a deleted session;
 - ``traces``: asks Langfuse to delete the traces of the deleted runs. The delete writes these
-  rows with a later ``next_attempt_at`` (``TRACE_DELAY``).
+  rows with a later ``next_attempt_at`` (``TRACE_DELAY``);
+- ``browser_contexts``: deletes the Browserbase contexts (cookies and logins) of the deleted
+  users (M5.1).
 
-A process without E2B or without Langfuse leaves those rows for a process that has them.
+A process without E2B, Langfuse, or Browserbase leaves those rows for a process that has them.
 """
 
 from __future__ import annotations
@@ -63,6 +65,13 @@ class TraceDeleter(Protocol):
     async def delete_traces(self, trace_ids: Sequence[str]) -> None: ...
 
 
+class BrowserContextDeleter(Protocol):
+    """``BrowserbaseTarget`` in production. A context that the provider does not know counts
+    as deleted."""
+
+    async def delete_contexts(self, context_ids: Sequence[str]) -> None: ...
+
+
 class PurgeWorker:
     def __init__(
         self,
@@ -70,17 +79,23 @@ class PurgeWorker:
         *,
         sandboxes: SandboxBackend | None = None,
         traces: TraceDeleter | None = None,
+        browser_contexts: BrowserContextDeleter | None = None,
     ) -> None:
         self._engine = engine
         self._sandboxes = sandboxes
         self._traces = traces
+        self._browser_contexts = browser_contexts
 
     @property
     def kinds(self) -> tuple[str, ...]:
         """The kinds of rows that this worker can do."""
         return tuple(
             kind
-            for kind, backend in (("sandboxes", self._sandboxes), ("traces", self._traces))
+            for kind, backend in (
+                ("sandboxes", self._sandboxes),
+                ("traces", self._traces),
+                ("browser_contexts", self._browser_contexts),
+            )
             if backend is not None
         )
 
@@ -153,6 +168,12 @@ class PurgeWorker:
             if self._traces is None:
                 return False
             await self._traces.delete_traces([str(trace) for trace in refs.get("trace_ids", [])])
+            return True
+        if kind == "browser_contexts":
+            if self._browser_contexts is None:
+                return False
+            ids = [str(context) for context in refs.get("context_ids", [])]
+            await self._browser_contexts.delete_contexts(ids)
             return True
         if self._sandboxes is None:
             return False

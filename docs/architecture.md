@@ -2200,7 +2200,7 @@ default profile of the first org has `tool_search` since migration `0018` (M2.6)
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
 (M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
-(M4.5), and `browser` since migration `0035` (M5.1). The default group set has no
+(M4.5), and `browser` since migration `0036` (M5.1). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
 Migrations `0022`, `0023`, `0026`, `0027`, `0029`, and `0031` change only the lists that are
@@ -4500,7 +4500,7 @@ tools when the control plane has `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_
 | Target | `sama.browser.target` | The `BrowserTarget` and `BrowserSession` protocols. One target for each name: `cloud` now, `my_chrome` in M5.5. The tools do not know the target. |
 | Cloud target | `sama.browser.browserbase` | Creates a Browserbase session with the REST API and connects Playwright to it over CDP. The process has no browser binaries. |
 | CDP session | `sama.browser.cdp` | `PlaywrightSession`: snapshots, actions, tabs, dialogs, screenshots, and extracts on a Playwright browser. The `my_chrome` target can use other code with the same protocol. |
-| Contexts | `sama.browser.contexts` | The table `browser_contexts` (migration `0035`): one provider context for each org, user, and target. |
+| Contexts | `sama.browser.contexts` | The table `browser_contexts` (migration `0036`): one provider context for each org, user, and target. |
 | Guard | `sama.browser.guard` | The outbound URL policy for navigation (Section 16.4). |
 | Service | `sama.browser.service` | `BrowserService`: one session for each run, limits, idle close, and the text for the agent. |
 
@@ -4523,7 +4523,9 @@ session ends, so logins stay from run to run. The table `browser_contexts` keeps
 context id, not a secret. When two runs of a user make a context at the same time, the first
 row wins, and the service deletes the other context. When Browserbase does not know a stored
 context, the service forgets it and makes a new one. A run in a shared session gets a new
-context that is not kept.
+context that is not kept. A user export has the rows of the user in `browser_contexts`. A user
+or org delete deletes the rows and, through the purge worker, the contexts at Browserbase
+(Section 17.4).
 
 Browserbase says that two sessions must not write one context at the same time, and that the
 context needs some seconds to save after a session closes. So a process gives each context to
@@ -5908,7 +5910,7 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, or `browser_contexts` since migration `0036`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -6190,6 +6192,9 @@ log of the org, so the control plane logs it instead.
   trace ids in one row). A trace row waits one hour
   first: the exporter marks a run as sent before it sends the trace, and Langfuse stores a
   trace some time after it gets it.
+- A user delete and an org delete also write a `browser_contexts` row with the Browserbase
+  context ids of the deleted users (Section 14.1, at most 1,000 ids in one row). The rows of
+  the table `browser_contexts` cascade from the user.
 - The Supabase Auth user is not deleted. A person can be a user in more than one org.
 
 **Purge worker.** `PurgeWorker` runs in the monitor of each control plane. It claims rows
@@ -6200,9 +6205,12 @@ with `FOR UPDATE SKIP LOCKED` and a lease of 5 minutes.
   pass.
 - `traces`: it calls `DELETE /api/public/traces` of Langfuse with the trace ids. Langfuse
   deletes them later.
+- `browser_contexts`: it calls `DELETE /v1/contexts/{id}` of Browserbase for each id, so the
+  cookies and logins of the user go. A context that Browserbase does not know counts as
+  deleted.
 - A failure waits 30 seconds times 2 to the power of the attempts, at most 6 hours. The row
   keeps the error type only. A full page waits 30 seconds. The worker forgets done rows after 30 days.
-- A kind without a backend (no E2B key or no Langfuse key) stays open.
+- A kind without a backend (no E2B key, no Langfuse key, or no Browserbase key) stays open.
 
 **Retention.** `orgs.retention_days` is the setting of the org. Null means the default of
 the plan. `PLAN_RETENTION` in `retention.py` is the seam for the plans of M6.6: each plan can

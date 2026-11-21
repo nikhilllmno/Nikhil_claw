@@ -67,6 +67,29 @@ class FakeTraces:
         self.deleted.extend(trace_ids)
 
 
+@dataclass
+class FakeBrowserContexts:
+    deleted: list[str] = field(default_factory=list)
+
+    async def delete_contexts(self, context_ids: Sequence[str]) -> None:
+        self.deleted.extend(context_ids)
+
+
+async def test_the_worker_deletes_the_browser_contexts_of_deleted_users(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    org_a = fresh.ids["org-a"]
+    row = await add_purge(engine, org_a, "browser_contexts", {"context_ids": ["ctx-1", "ctx-2"]})
+    traces = await add_purge(engine, org_a, "traces", {"trace_ids": ["c" * 32]})
+    fake = FakeBrowserContexts()
+
+    await PurgeWorker(engine, browser_contexts=fake).run_once()
+
+    assert fake.deleted == ["ctx-1", "ctx-2"]
+    assert (await purge_row(engine, row)).done_at is not None
+    assert (await purge_row(engine, traces)).done_at is None  # no Langfuse in this worker
+
+
 async def add_purge(engine: AsyncEngine, org_id: uuid.UUID, kind: str, refs: object) -> uuid.UUID:
     async with engine.begin() as connection:
         return (

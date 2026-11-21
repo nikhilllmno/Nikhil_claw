@@ -248,7 +248,7 @@ class Base(DeclarativeBase):
 
 MAX_RETENTION_DAYS: Final = 3650
 """The upper limit of ``orgs.retention_days`` (docs/architecture.md, Section 17.4)."""
-PURGE_KINDS: Final = ("sandboxes", "traces")
+PURGE_KINDS: Final = ("sandboxes", "traces", "browser_contexts")
 
 
 class Org(Base):
@@ -2695,7 +2695,8 @@ class DataPurge(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     refs: Mapped[dict[str, Any]] = _json()
     """``sandboxes``: ``{"session_ids": [...]}`` or ``{"all": true}``. ``traces``:
-    ``{"trace_ids": [...]}``."""
+    ``{"trace_ids": [...]}``. ``browser_contexts``: ``{"context_ids": [...]}`` (Browserbase
+    context ids, M5.1)."""
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     next_attempt_at: Mapped[datetime] = _created_at()
     last_error: Mapped[str | None] = mapped_column(Text)

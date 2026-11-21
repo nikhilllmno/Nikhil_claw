@@ -27,7 +27,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import httpx
@@ -345,6 +345,18 @@ class BrowserbaseTarget:
             )
             return False
         return True
+
+    async def delete_contexts(self, context_ids: Sequence[str]) -> None:
+        """Deletes contexts at Browserbase, for the purge worker after a user or org delete
+        (Section 17.4). A context that Browserbase does not know counts as deleted. Raises
+        ``BrowserError`` when a delete fails, so the worker tries again later."""
+        for context_id in context_ids:
+            try:
+                response = await self._client.delete(f"/v1/contexts/{context_id}")
+            except httpx.HTTPError as error:
+                raise BrowserError(f"Browserbase did not answer: {type(error).__name__}") from None
+            if not (response.is_success or response.status_code == 404):
+                raise BrowserError(f"Browserbase did not delete a context ({response.status_code})")
 
     async def _delete_context(self, context_id: str) -> None:
         try:

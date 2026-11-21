@@ -473,3 +473,25 @@ async def test_close_stops_the_request_checks() -> None:
     cdp = connector.browsers[0].cdp
     assert [method for method, _ in cdp.sent] == ["Fetch.enable"]
     await target.aclose()
+
+
+async def test_delete_contexts_counts_an_unknown_context_as_deleted() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        status = {"/v1/contexts/gone": 404, "/v1/contexts/broken": 500}.get(request.url.path, 204)
+        return httpx.Response(status)
+
+    target = BrowserbaseTarget(
+        api_key=SecretStr(KEY),
+        project_id=PROJECT,
+        contexts=MemoryContextStore(),
+        connector=FakeConnector(),
+        transport=httpx.MockTransport(handler),
+    )
+    await target.delete_contexts(["ctx-1", "gone"])
+    assert seen == ["/v1/contexts/ctx-1", "/v1/contexts/gone"]
+    with pytest.raises(BrowserError, match="500"):
+        await target.delete_contexts(["broken"])
+    await target.aclose()

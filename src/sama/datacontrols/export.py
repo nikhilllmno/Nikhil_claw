@@ -91,6 +91,7 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "channel_identities": "user_id = :user",
     "context_files": "created_by_user_id = :user",
     "memories": "user_id = :user",
+    "browser_contexts": "user_id = :user",
     "memory_revisions": (
         "author_user_id = :user OR memory_id IN"
         " (SELECT id FROM memories WHERE org_id = :org AND user_id = :user)"

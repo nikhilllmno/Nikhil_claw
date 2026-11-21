@@ -104,6 +104,7 @@ async def test_an_org_delete_removes_every_row_of_the_org_and_no_row_of_the_othe
         ).all()
     refs = {(row.kind, json.dumps(row.refs, sort_keys=True)) for row in purges}
     assert ("sandboxes", '{"all": true}') in refs
+    assert ("browser_contexts", '{"context_ids": ["ctx-bob"]}') in refs
     trace = fresh.ids["run:b1-shared"].hex
     assert ("traces", json.dumps({"trace_ids": [trace]})) in refs
     async with engine.connect() as connection:
@@ -207,11 +208,19 @@ async def test_a_user_delete_removes_the_private_data_and_keeps_the_shared_data(
                 )
             )
         ).scalar_one()
+        contexts = (
+            await connection.execute(
+                select(DataPurge.refs).where(
+                    DataPurge.org_id == org_a, DataPurge.kind == "browser_contexts"
+                )
+            )
+        ).scalar_one()
     assert sessions == {fresh.ids["a1-shared"], fresh.ids["a2-shared"]}
     assert users == {fresh.ids["carol"], fresh.ids["dave"]}
     assert members == 0
     assert audit["sessions"] == 1
     assert purge == {"session_ids": [str(fresh.ids["a1-alice"])]}
+    assert contexts == {"context_ids": ["ctx-alice"]}  # the Browserbase context goes too
     assert await org_counts(engine, fresh.ids["org-b"]) == before_b
     # Alice has no user row in the org now, so RLS shows her nothing of it.
     async with as_user(engine, fresh.auth["alice"]) as connection:
