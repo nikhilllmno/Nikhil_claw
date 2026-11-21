@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.coding.agents import CodingAgent, label
 from sama.coding.commands import COMMANDS as CODING_COMMANDS
-from sama.coding.commands import NOT_DIRECT, parse_command, set_direct
+from sama.coding.commands import NOT_DIRECT, SwitchNotAllowedError, parse_command, set_direct
 from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBinding
@@ -663,7 +663,12 @@ class SlackGateway:
         bound = await self._session(place, target, grants, create=agent is not None)
         if bound is None:
             return NOT_DIRECT
-        return await set_direct(self._engine, target.org_id, bound.session_id, agent)
+        try:
+            return await set_direct(
+                self._engine, target.org_id, bound.session_id, agent, user_id=target.user_id
+            )
+        except SwitchNotAllowedError as error:
+            return str(error)
 
     async def _steer(self, place: _Place, target: Target, grants: Grants, note: str) -> str | None:
         """Adds ``note`` to the open run of the conversation. ``None`` when no run is open."""

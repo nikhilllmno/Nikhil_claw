@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sama.coding.agents import CodingAgent
 from sama.coding.commands import COMMANDS as CODING_COMMANDS
 from sama.coding.commands import HELP_LINES as CODING_HELP_LINES
-from sama.coding.commands import NOT_DIRECT, set_direct
+from sama.coding.commands import NOT_DIRECT, SwitchNotAllowedError, set_direct
 from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
@@ -596,7 +596,12 @@ class TelegramGateway:
         if bound is None:
             answer = NOT_DIRECT
         else:
-            answer = await set_direct(self._engine, target.org_id, bound.session_id, agent)
+            try:
+                answer = await set_direct(
+                    self._engine, target.org_id, bound.session_id, agent, user_id=target.user_id
+                )
+            except SwitchNotAllowedError as error:
+                answer = str(error)
         await self._say(chat_id, answer, reply_to=message_id)
 
     async def _steer(

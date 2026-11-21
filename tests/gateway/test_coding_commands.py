@@ -9,8 +9,8 @@ from typing import Any
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.coding.commands import DIRECT_OFF, DIRECT_ON, NOT_DIRECT
-from sama.db.models import Message, Run, RunEvent, Session, SessionBinding
+from sama.coding.commands import DIRECT_OFF, DIRECT_ON, NOT_ALLOWED, NOT_DIRECT
+from sama.db.models import Membership, Message, Run, RunEvent, Session, SessionBinding
 from sama.gateway.sessions import FollowSettings, Reply, coding_progress, follow_run
 from sama.gateway.slack import HELP as SLACK_HELP
 from sama.gateway.telegram import HELP, OWN_COMMANDS
@@ -182,6 +182,21 @@ async def test_slack_text_with_a_command_goes_to_a_coding_agent(
     thread = "1690000000.999999"
     await gateway.handle_event(slack_tests.dm("/claude"))
     assert channels.slack_api.texts(slack_tests.DM)[-1] == CLAUDE_ON
+    # A shared thread: a member may not switch it (the rule of the settings console).
+    await gateway.handle_event(slack_tests.mention("/codex", thread_ts=thread))
+    assert channels.slack_api.texts(slack_tests.CHANNEL)[-1] == NOT_ALLOWED
+    assert await active() == ["claude_code"]
+    # A workspace admin may.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(
+                Membership.org_id == tenant.org,
+                Membership.user_id == tenant.ids["mia"],
+                Membership.workspace_id == tenant.ids["ws"],
+            )
+            .values(role="admin")
+        )
     await gateway.handle_event(slack_tests.mention("/codex", thread_ts=thread))
     assert channels.slack_api.texts(slack_tests.CHANNEL)[-1] == CODEX_ON
     assert await active() == ["claude_code", "codex"]

@@ -32,7 +32,7 @@ from typing import Any, ClassVar, Final, Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.coding.commands import parse_command, set_direct
+from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
 from sama.db.models import Approval, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.handoff import moved_away
@@ -302,7 +302,16 @@ class DirectGateway[C: Conversation](abc.ABC):
         if coding is not None and coding.switch:
             # The direct mode of the session (Section 15.4).
             bound = await self._ensure(chat, target, grants)
-            answer = await set_direct(self._engine, target.org_id, bound.session_id, coding.agent)
+            try:
+                answer = await set_direct(
+                    self._engine,
+                    target.org_id,
+                    bound.session_id,
+                    coding.agent,
+                    user_id=target.user_id,
+                )
+            except SwitchNotAllowedError as error:
+                answer = str(error)
             await self._say(chat, answer)
             return
         if coding is not None and coding.agent is not None:

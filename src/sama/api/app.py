@@ -104,7 +104,7 @@ from sama.api.tasks import (
 from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
 from sama.coding.agents import CodingAgent
-from sama.coding.commands import parse_command, set_direct
+from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
@@ -1394,7 +1394,12 @@ class SamaApi:
             principal: Me, session_id: uuid.UUID, body: CodingAgentBody
         ) -> CodingAgentOut:
             access = await self._access(principal, session_id)
-            text = await set_direct(self._engine, access.org_id, session_id, body.agent)
+            try:
+                text = await set_direct(
+                    self._engine, access.org_id, session_id, body.agent, user_id=access.user_id
+                )
+            except SwitchNotAllowedError as error:
+                raise HTTPException(status_code=403, detail=str(error)) from None
             return CodingAgentOut(text=text)
 
         @app.post("/sessions/{session_id}/rollback")

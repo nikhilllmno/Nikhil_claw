@@ -7,11 +7,11 @@ import uuid
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.coding.commands import DIRECT_OFF, DIRECT_ON, NOT_DIRECT
-from sama.db.models import Message, Run, Session
+from sama.coding.commands import DIRECT_OFF, DIRECT_ON, NOT_ALLOWED, NOT_DIRECT
+from sama.db.models import Membership, Message, Run, Session
 from tests.api.conftest import bearer
 from tests.orchestrator.conftest import Tenant
 
@@ -97,3 +97,39 @@ async def test_the_route_checks_the_body_and_the_access(
     stranger = await client.post(route, headers=bearer(uuid.uuid4()), json={"agent": "codex"})
     assert stranger.status_code in (403, 404)
     assert await mode(engine, session) is None
+
+
+async def test_a_member_cannot_switch_a_shared_session_but_can_send_a_task(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The rule of the settings console (M7.10): a switch changes the session for each person in
+    it, so in a shared session only the owner or an admin may switch."""
+    shared = tenant.ids["s1"]
+    refused = await client.post(
+        f"/sessions/{shared}/coding-agent", headers=mia(tenant), json={"agent": "codex"}
+    )
+    assert refused.status_code == 403
+    assert refused.json()["detail"] == NOT_ALLOWED
+    assert await mode(engine, shared) is None
+    # A task is one message: each member who may send messages may send it.
+    task = await client.post(
+        f"/sessions/{shared}/messages", headers=mia(tenant), json={"text": "/codex fix it"}
+    )
+    assert task.status_code == 202
+    assert await sent(engine, task.json()["run_id"]) == ("codex", "fix it")
+    # A workspace admin may switch.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(
+                Membership.org_id == tenant.org,
+                Membership.user_id == tenant.ids["mia"],
+                Membership.workspace_id == tenant.ids["ws"],
+            )
+            .values(role="admin")
+        )
+    allowed = await client.post(
+        f"/sessions/{shared}/coding-agent", headers=mia(tenant), json={"agent": "codex"}
+    )
+    assert allowed.status_code == 200
+    assert await mode(engine, shared) == "codex"
