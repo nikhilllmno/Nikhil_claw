@@ -1,0 +1,128 @@
+"""The six browser tools on the sama MCP tool server (docs/architecture.md, Section 14.1)."""
+
+from __future__ import annotations
+
+import base64
+import secrets
+from collections.abc import Iterator
+from dataclasses import dataclass
+
+import pytest
+from mcp_types import ImageContent, TextContent
+
+from sama.browser.service import BrowserService
+from sama.tenancy import RunTokenSigner
+from sama.tools import MemoryTodoStore, ToolServer
+from sama.tools.browser import BROWSER_TOOLS
+from tests.browser.fakes import PNG_1PX, DenyHosts, FakeTarget
+from tests.conformance.scripted_model import serve
+from tests.support import make_scope
+from tests.tools.test_server import connect, text_of
+
+
+@dataclass
+class World:
+    url: str
+    signer: RunTokenSigner
+    target: FakeTarget
+    service: BrowserService
+
+    def token(self, run_id: str = "run-1") -> str:
+        return self.signer.issue(make_scope(run_id), ttl_s=600)
+
+
+@pytest.fixture
+def world() -> Iterator[World]:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    target = FakeTarget()
+    service = BrowserService(target, DenyHosts(frozenset({"10.0.0.1"})))
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), browser=service)
+    with serve(server.app()) as base:
+        yield World(base + "/mcp", signer, target, service)
+
+
+async def test_the_server_lists_the_browser_tools(world: World) -> None:
+    async with connect(world.url, world.token()) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    assert set(tools) >= BROWSER_TOOLS
+    act = tools["browser_act"]
+    assert act.annotations is not None
+    assert act.annotations.destructive_hint
+    assert set(act.input_schema["properties"]["action"]["enum"]) >= {"click", "type", "dialog"}
+    assert tools["browser_snapshot"].annotations is not None
+    assert tools["browser_snapshot"].annotations.read_only_hint
+
+
+async def test_a_server_without_a_browser_has_no_browser_tools() -> None:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    server = ToolServer(signer=signer, todos=MemoryTodoStore())
+    with serve(server.app()) as base:
+        async with connect(base + "/mcp", signer.issue(make_scope(), ttl_s=600)) as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+    assert not names & BROWSER_TOOLS
+
+
+async def test_the_tools_work_on_one_session_of_the_run(world: World) -> None:
+    async with connect(world.url, world.token()) as client:
+        opened = await client.call_tool("browser_open", {"url": "example.com"})
+        snapshot = await client.call_tool("browser_snapshot", {})
+        act = await client.call_tool("browser_act", {"action": "click", "ref": "e1"})
+        extract = await client.call_tool("browser_extract", {"kind": "text"})
+        tabs = await client.call_tool("browser_tabs", {"action": "list"})
+    for result in (opened, snapshot, act, extract, tabs):
+        assert not result.is_error, text_of(result)
+    assert 'url="https://example.com"' in text_of(opened)
+    assert '- button "Go" [ref=e1]' in text_of(snapshot)
+    assert "Hello from the page" in text_of(extract)
+    assert text_of(tabs).startswith("1 tab(s).")
+    (session,) = world.target.sessions
+    assert session.calls == [
+        "navigate https://example.com",
+        "snapshot",
+        "snapshot",
+        "act click e1",
+        "snapshot",
+        "extract text",
+        "tabs list None None",
+    ]
+    assert world.target.starts == [("org-1", "user-1", "run-1")]
+
+
+async def test_the_screenshot_is_an_image(world: World) -> None:
+    async with connect(world.url, world.token()) as client:
+        result = await client.call_tool("browser_screenshot", {"full_page": True})
+    assert not result.is_error
+    caption, image = result.content
+    assert isinstance(caption, TextContent)
+    assert caption.text.startswith("Tab 0 of 1. A screenshot of")
+    assert isinstance(image, ImageContent)
+    assert image.mime_type == "image/png"
+    assert base64.b64decode(image.data) == PNG_1PX
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "message"),
+    [
+        ("browser_open", {"url": "http://10.0.0.1/admin"}, "the URL policy blocked"),
+        ("browser_open", {"url": "file:///etc/passwd"}, "only http and https"),
+        ("browser_act", {"action": "click"}, "click needs ref"),
+        ("browser_tabs", {"action": "select"}, "select needs index"),
+        ("browser_extract", {"kind": "fields"}, "kind fields needs fields"),
+    ],
+)
+async def test_a_browser_error_is_a_tool_error_for_the_agent(
+    world: World, tool: str, arguments: dict[str, object], message: str
+) -> None:
+    async with connect(world.url, world.token()) as client:
+        result = await client.call_tool(tool, arguments)
+    assert result.is_error
+    assert message in text_of(result)
+
+
+async def test_the_schema_refuses_a_bad_ref(world: World) -> None:
+    async with connect(world.url, world.token()) as client:
+        result = await client.call_tool(
+            "browser_act", {"action": "click", "ref": "e1; document.cookie"}
+        )
+    assert result.is_error
+    assert world.target.sessions == []

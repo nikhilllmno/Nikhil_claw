@@ -131,6 +131,11 @@ class ControlPlaneSettings:
     anthropic_key: SecretStr | None = None
     openai_key: SecretStr | None = None
     brave_key: SecretStr | None = None
+    browserbase_key: SecretStr | None = None
+    """The Browserbase API key of the cloud browser (``BROWSERBASE_API_KEY``, Section 14.1).
+    With it and ``browserbase_project_id``, the tool server has the browser tools."""
+    browserbase_project_id: str | None = None
+    """The Browserbase project (``BROWSERBASE_PROJECT_ID``)."""
     composio_key: SecretStr | None = None
     """The Composio API key of the process (``COMPOSIO_API_KEY``). An org can set its own key
     in the vault (``composio_api_key``)."""
@@ -174,6 +179,7 @@ class ControlPlaneSettings:
             self.anthropic_key,
             self.openai_key,
             self.brave_key,
+            self.browserbase_key,
             self.composio_key,
             self.composio_webhook_secret,
             self.slack_webhook_url,
@@ -273,6 +279,8 @@ class ControlPlaneSettings:
             anthropic_key=_secret(env, "ANTHROPIC_API_KEY"),
             openai_key=_secret(env, "OPENAI_API_KEY"),
             brave_key=_secret(env, "BRAVE_API_KEY"),
+            browserbase_key=_secret(env, "BROWSERBASE_API_KEY"),
+            browserbase_project_id=env.get("BROWSERBASE_PROJECT_ID", "").strip() or None,
             composio_key=_secret(env, "COMPOSIO_API_KEY"),
             composio_webhook_secret=_secret(env, "SAMA_COMPOSIO_WEBHOOK_SECRET"),
             langfuse=langfuse,

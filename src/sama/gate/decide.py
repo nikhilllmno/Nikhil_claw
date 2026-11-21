@@ -47,6 +47,16 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "delegation": frozenset({"delegate_task", "delegate_status"}),
     "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
     "code_exec": frozenset({"execute_code"}),
+    "browser": frozenset(
+        {
+            "browser_open",
+            "browser_snapshot",
+            "browser_act",
+            "browser_screenshot",
+            "browser_extract",
+            "browser_tabs",
+        }
+    ),
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet. ``integrations`` has no fixed tools: the connector tools are deferred tools
@@ -109,6 +119,11 @@ DEFAULT_ALLOW: Final = frozenset(
         "cronjob_manage",
         "workflow_manage",
         "workflow_run",
+        "browser_open",
+        "browser_snapshot",
+        "browser_screenshot",
+        "browser_extract",
+        "browser_tabs",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
@@ -122,12 +137,24 @@ workspace and audience, and each child run or task run passes the gate again for
 that it calls (Sections 12.4 and 13.2). ``cronjob_manage`` is here because a job that the
 agent creates or widens waits for the approval of its owner before it fires (Section 12.1).
 ``workflow_manage`` and ``workflow_run`` are here for the same reason: a workflow version that
-writes waits for the approval of its owner before it runs (Section 12.3)."""
+writes waits for the approval of its owner before it runs (Section 12.3). The browser tools
+that open and read pages are here, as ``web_extract`` is; ``browser_act`` is not, because a
+click or a form can change data with the logins of the user (Section 14.1)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"
 CHILD_BLOCKED_TOOLSETS: Final = frozenset(
-    {"delegation", "tasks", "memory", "clarify", "cron", "workflows", "connections", "integrations"}
+    {
+        "delegation",
+        "tasks",
+        "memory",
+        "clarify",
+        "cron",
+        "workflows",
+        "connections",
+        "integrations",
+        "browser",
+    }
 )
 """The toolsets that a delegated child never has (Section 13.2). ``delegation`` keeps the depth
 at 1, and ``tasks`` stops a child that makes a task card that delegates again. ``memory``
@@ -135,7 +162,8 @@ keeps the shared notes free of child writes. ``clarify`` waits for a person, and
 none. ``cron`` and ``workflows`` stop a child that outlives its parent. ``connections`` and
 ``integrations`` are out for the reason of sub-agents (Section 13.1): a connection acts with the
 authority of the user, and only a run that the user watches asks the user to connect
-(Section 10.3)."""
+(Section 10.3). ``browser`` is out for the same reason: the browser has the logins of the user
+(Section 14.1)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify", "repo_push_approval"})
 """Tools that wait for a human. Unattended runs cannot use them."""

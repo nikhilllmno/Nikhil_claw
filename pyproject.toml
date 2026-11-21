@@ -27,6 +27,12 @@ requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# The cloud browser tools (docs/architecture.md, Section 14.1). The control plane connects to a
+# Browserbase session over CDP, so it needs the Playwright client and no browser binaries. The
+# sandbox image does not install this group.
+browser = [
+    "playwright==1.65.2",
+]
 databases = [
     "aiomysql>=0.3.2",
     "asyncssh>=2.24.1",
@@ -61,7 +67,7 @@ sandbox-e2b = [
 ]
 
 [tool.uv]
-default-groups = ["databases", "dev", "runtime-claude", "runtime-openai", "sandbox-e2b"]
+default-groups = ["browser", "databases", "dev", "runtime-claude", "runtime-openai", "sandbox-e2b"]
 
 [tool.ruff]
 line-length = 100

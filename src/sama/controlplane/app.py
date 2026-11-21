@@ -33,6 +33,10 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.browser.browserbase import BrowserbaseTarget
+from sama.browser.contexts import PostgresContextStore
+from sama.browser.guard import UrlGuard
+from sama.browser.service import BrowserService
 from sama.connectors.database import DatabaseGateway
 from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
@@ -251,6 +255,9 @@ def build(
     # One outbound client for ``web_extract`` and ``@url`` references: the same address rules
     # apply to both (Section 6.3). The tool server closes it.
     outbound = OutboundClient()
+    # The cloud browser (Section 14.1). The worker closes the browser session of a run when the
+    # run ends.
+    browser = _browser_service(settings, engine)
     worker = Worker(
         queue,
         registry,
@@ -269,6 +276,7 @@ def build(
             session_sandbox=sandboxed.session_sandbox if sandboxed else None,
         ),
         poll_s=worker_poll_s,
+        on_run_end=[browser.end_run] if browser is not None else [],
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
     # index alone (Section 7.1).
@@ -383,6 +391,7 @@ def build(
         tasks=TaskTools(engine),
         jobs=jobs,
         workflows=workflows,
+        browser=browser,
     )
     proxy = ModelProxy(
         signer=signer,
@@ -579,6 +588,18 @@ def build(
         stop=stop,
     )
     return plane
+
+
+def _browser_service(settings: ControlPlaneSettings, engine: AsyncEngine) -> BrowserService | None:
+    """The cloud browser of Section 14.1, or ``None`` without a Browserbase key and project."""
+    if settings.browserbase_key is None or not settings.browserbase_project_id:
+        return None
+    target = BrowserbaseTarget(
+        api_key=settings.browserbase_key,
+        project_id=settings.browserbase_project_id,
+        contexts=PostgresContextStore(engine),
+    )
+    return BrowserService(target, UrlGuard())
 
 
 async def _close_sandboxes(sandboxed: SandboxedRuntime) -> None:

@@ -69,6 +69,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --locked
+      # A local headless Chromium for the CDP session tests (tests/browser/test_cdp.py).
+      - run: uv run playwright install --with-deps --only-shell chromium
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy

@@ -2,12 +2,12 @@
 
 Org A has the workspaces ``a1`` and ``a2``. Org B has ``b1``.
 
-- ``alice``: org A member and member of ``a1``. Owns the private session ``a1-alice`` and the
-  job ``job:alice``.
+- ``alice``: org A member and member of ``a1``. Owns the private session ``a1-alice``, the
+  job ``job:alice``, and the browser context ``browser:alice``.
 - ``carol``: org A admin. Sees every workspace of org A and the audit log.
 - ``dave``: org A member with no workspace.
-- ``bob``: org B owner and member of ``b1``. Owns the private session ``b1-bob`` and the job
-  ``job:bob``.
+- ``bob``: org B owner and member of ``b1``. Owns the private session ``b1-bob``, the job
+  ``job:bob``, and the browser context ``browser:bob``.
 - ``stranger``: a Supabase Auth user with no sama user row.
 
 Each org has an org-wide tool policy rule. Alice and dave each have a personal rule. Each org
@@ -53,6 +53,7 @@ from sama.db.models import (
     Org,
     OrgInvite,
     PairingCode,
+    PersistentBrowserContext,
     ProfileChange,
     ReviewProposal,
     Run,
@@ -414,6 +415,16 @@ def plan(
             kind="result",
             target="telegram:1",
             text=f"secret result of {user}",
+        )
+    # One persistent browser context for each of two users (M5.1). A member reads only their own.
+    for user, org in (("alice", "org-a"), ("bob", "org-b")):
+        add(
+            PersistentBrowserContext,
+            f"browser:{user}",
+            org_id=ids[org],
+            user_id=ids[user],
+            target="cloud",
+            provider_context_id=f"ctx-{user}",
         )
     # One workflow for each owner, with a version, an instance, a step, and a receipt. A
     # workflow is private to its owner (M4.5).
