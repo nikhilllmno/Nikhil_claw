@@ -113,9 +113,11 @@ function connect(): void {
     for (const entry of waiting.values()) entry.reject(new Error("The extension restarted. Try again."));
     waiting.clear();
     // The service worker stopped (an update or a crash): connect again; it starts again.
+    // The new worker has no cursor of this chat, so load the chat again: the messages, then
+    // the events after them.
     setTimeout(() => {
       connect();
-      if (view.sessionId) void rpc({ call: "subscribe", sessionId: view.sessionId });
+      if (view.sessionId) void openChat(view.sessionId);
     }, 500);
   });
 }
@@ -130,6 +132,10 @@ function rpc<T = unknown>(request: Request): Promise<T> {
 
 const api = <T>(path: string, method: "GET" | "POST" = "GET", body?: unknown) =>
   rpc<T>({ call: "api", method, path, body });
+
+const loadMessages = (sessionId: string) =>
+  api<ChatMessage[]>(`/sessions/${sessionId}/messages?after=0&limit=500`);
+const loadApprovals = (sessionId: string) => api<Approval[]>(`/sessions/${sessionId}/approvals`);
 
 function errorText(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
@@ -223,12 +229,15 @@ async function refreshTab(): Promise<void> {
 }
 
 async function bindTab(tab: chrome.tabs.Tab | null): Promise<void> {
+  const previous = view.tab?.id;
   view.tab = tab;
+  // A new tab ends the work of the old one, also between two tabs without a chat.
+  if (previous !== tab?.id) tabEpoch += 1;
   ui.tabTitle.textContent = tab?.title || tab?.url || "No tab";
   ui.tabTitle.title = tab?.url ?? "";
   const sessionId =
     tab?.id !== undefined && view.worker?.signedIn ? await bindings.get(tab.id) : null;
-  if (sessionId === view.sessionId && view.tab?.id === tab?.id) {
+  if (sessionId === view.sessionId && previous === tab?.id) {
     renderComposer();
     return;
   }
@@ -253,8 +262,8 @@ async function openChat(sessionId: string | null): Promise<void> {
   try {
     const [detail, messages, approvals] = await Promise.all([
       api<SessionDetail>(`/sessions/${sessionId}`),
-      api<ChatMessage[]>(`/sessions/${sessionId}/messages?after=0&limit=500`),
-      api<Approval[]>(`/sessions/${sessionId}/approvals`),
+      loadMessages(sessionId),
+      loadApprovals(sessionId),
     ]);
     if (epoch !== tabEpoch) return;
     view.messages = messages;
@@ -278,13 +287,18 @@ async function openChat(sessionId: string | null): Promise<void> {
   }
 }
 
-/** The session of the tab. A tab without one gets a new private session. */
-async function ensureChat(): Promise<string> {
-  if (view.sessionId) return view.sessionId;
-  const tab = view.tab;
+/**
+ * The session of `tab`. A tab without one gets a new private session. The panel can show
+ * another tab when the session comes back: the binding of `tab` is kept, but the view changes
+ * only if it still shows `tab`.
+ */
+async function ensureChat(tab: chrome.tabs.Tab | null): Promise<string> {
   if (!view.home || tab?.id === undefined) {
     throw new Error(view.home ? "sama cannot see this tab." : "You are not in a workspace with an agent.");
   }
+  const bound = await bindings.get(tab.id);
+  if (bound) return bound;
+  const epoch = tabEpoch;
   const session = await api<SessionOut>("/sessions", "POST", {
     workspace_id: view.home.workspaceId,
     agent_profile_id: view.home.agentProfileId,
@@ -292,6 +306,7 @@ async function ensureChat(): Promise<string> {
     title: chatTitle(tab.title),
   });
   await bindings.bind(tab.id, session.id);
+  if (epoch !== tabEpoch || view.tab?.id !== tab.id) return session.id;
   tabEpoch += 1;
   view.sessionId = session.id;
   await rpc({ call: "subscribe", sessionId: session.id, after: 0 });
@@ -318,11 +333,11 @@ async function runEffects(effects: Effect[]): Promise<void> {
   const epoch = tabEpoch;
   try {
     if (effects.includes("reload_messages")) {
-      const messages = await api<ChatMessage[]>(`/sessions/${sessionId}/messages?after=0&limit=500`);
+      const messages = await loadMessages(sessionId);
       if (epoch === tabEpoch) view.messages = messages;
     }
     if (effects.includes("reload_approvals")) {
-      const approvals = await api<Approval[]>(`/sessions/${sessionId}/approvals`);
+      const approvals = await loadApprovals(sessionId);
       if (epoch === tabEpoch) view.approvals = approvals;
     }
   } catch (error) {
@@ -436,10 +451,11 @@ function sent(result: { queued: boolean }, note: string | null = null): void {
 async function sendText(): Promise<void> {
   const text = ui.text.value.trim();
   if (!text) return;
+  const tab = view.tab;
   await withBusy(async () => {
     show(ui.chatError, null);
     try {
-      const sessionId = await ensureChat();
+      const sessionId = await ensureChat(tab);
       const result = await rpc<{ queued: boolean }>({ call: "send", sessionId, text });
       ui.text.value = "";
       sent(result);
@@ -485,21 +501,32 @@ async function askAboutPage(): Promise<void> {
       if (!read) throw new Error("sama could not read this page.");
       let screenshot: string | null = null;
       if (withScreenshot) {
-        screenshot = await chrome.tabs
-          .captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 })
-          .catch(() => null);
+        // Chrome takes the visible tab of the window, not a tab by id. The user can change the
+        // tab during the permission prompt, so take the screenshot only if `tab` is still the
+        // visible tab before and after.
+        if (await isVisible(tab)) {
+          screenshot = await chrome.tabs
+            .captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 })
+            .catch(() => null);
+          if (!(await isVisible(tab))) screenshot = null;
+        }
       }
-      const sessionId = await ensureChat();
+      const sessionId = await ensureChat(tab);
       const page = pageContext(read, screenshot);
       const result = await rpc<{ queued: boolean }>({ call: "send", sessionId, text: question, page });
       ui.text.value = "";
       const lost = withScreenshot && page.screenshot === null;
-      sent(result, lost ? "Chrome did not give a screenshot. sama got the text only." : null);
+      sent(result, lost ? "sama got the text only, with no screenshot. Keep the tab in view and try again." : null);
       await runEffects(["reload_messages"]);
     } catch (error) {
       show(ui.chatError, errorText(error, "Could not send the page."));
     }
   });
+}
+
+async function isVisible(tab: chrome.tabs.Tab): Promise<boolean> {
+  const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId }).catch(() => []);
+  return active !== undefined && active.id === tab.id && active.url === tab.url;
 }
 
 async function decide(approvalId: string, action: "approve" | "deny"): Promise<void> {
@@ -563,7 +590,7 @@ ui.apiForm.addEventListener("submit", (event) => {
   }
   // The request must come first, in the click.
   void authAction(el("api-submit"), async () => {
-    const granted = await chrome.permissions.request({ origins: [`${new URL(url).origin}/*`] });
+    const granted = await chrome.permissions.request({ origins: [originPattern(url)] });
     if (!granted) throw new Error("The extension needs access to the API address.");
     await rpc({ call: "setApiUrl", url });
   });

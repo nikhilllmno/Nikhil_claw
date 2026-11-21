@@ -1220,6 +1220,9 @@ for it.
 - **Syntax.** A reference starts after a space or at the start of the text. The form is
   `@file:<path>`, `@url:<url>`, or `@session:<id>`. Sama removes a final `.`, `,`, `;`, `:`,
   `!`, `?`, a closing bracket, or a quote from the target. A repeated reference counts once.
+  Text in an `<untrusted_content>` block (for example a page from the Chrome extension,
+  Section 14.2.1) has no references: content from outside cannot make sama read a file, a
+  session, or a URL.
 - **Where.** Only a new `chat` run gets the attachment. A resumed run and a compact run do
   not. The stored message stays as the user wrote it, so the transcript and the search show
   the original text. Only the input of the run changes.
@@ -4436,15 +4439,21 @@ The code is in `extension/` (TypeScript, Manifest V3, esbuild). The server side 
 - **Service worker** (`background.ts`). It keeps the Supabase Auth tokens in
   `chrome.storage.session`, so the tokens go away when the browser closes. It opens the
   WebSocket, calls the REST API for the side panel, and adds the bearer token. On a `401`, it
-  refreshes the token one time and tries again. The side panel never sees the tokens.
+  refreshes the token one time and tries again. The side panel never sees the tokens. When
+  the sign-in service does not answer, the worker keeps the sign-in and tries again later. It
+  signs out only when Supabase refuses the refresh token, or when the API refuses a token that
+  cannot refresh. Chrome can stop the worker when no side panel is open; a panel that opens
+  starts the worker and the connection again.
 - **Side panel** (`panel/`). It talks to the service worker through a `chrome.runtime` port.
   It shows the sign-in form, the chat of the current tab, the approvals, and the composer.
   It builds the DOM with `textContent` only. The CSP of the manifest allows only the scripts
   of the extension.
-- **Tab binding**. The extension keeps a map of tab to session in `chrome.storage.session`.
+- **Tab binding**. The extension keeps the session of each tab in `chrome.storage.session`,
+  one key for each tab (`sama.tab.<tab id>`), so two writers do not overwrite each other.
   The first message in a tab makes a private session ("Chrome: <tab title>") in the first
-  workspace that has an agent profile. A closed tab removes its binding. The session stays in
-  the web app.
+  workspace that has an agent profile. A message goes to the session of the tab where the user
+  clicked, also when the user changes the tab before the message is sent. A closed tab removes
+  its binding. The session stays in the web app.
 
 **Sign-in.** Email and password through Supabase Auth, with the anonymous key from
 `GET /config`. Like the web app, the extension does not keep a password. An advanced form
@@ -4483,7 +4492,9 @@ permission of the origin of the tab (an optional permission, one time for each s
 reads `document.title`, `innerText`, and the selection with `chrome.scripting`. With "Include
 a screenshot", it takes a JPEG of the visible tab. Chrome takes a screenshot only with the
 `<all_urls>` host permission (a host permission for one site is not sufficient), so in this case
-the same request also asks for `<all_urls>`. If Chrome gives no screenshot, the side panel sends
+the same request also asks for `<all_urls>`. Chrome takes the visible tab of the window, so the
+side panel takes the screenshot only if the tab of the click is still the visible tab before and
+after the capture. If it has no screenshot, the side panel sends
 the text and shows a notice. Pages that are not `http` or `https`, and the
 Chrome Web Store, are refused. The `send` frame has `page {url, title, text, screenshot?}`.
 
@@ -4491,9 +4502,9 @@ The API (`sama.gateway.chrome.page_message`):
 
 - accepts a page only in a private session that the user owns, because the page can hold
   private data;
-- accepts only `http` and `https` URLs without user info, and cuts the text to 20,000
-  characters with a note;
-- redacts secrets in the title and the text with the redactor of the session;
+- accepts only `http` and `https` URLs without user info;
+- redacts secrets in the URL, the title, and the text, then cuts the text to 20,000
+  characters with a note (redaction first, so a cut cannot leave part of a secret);
 - puts the title, the URL, the selection, and the text in an
   `<untrusted_content source="chrome_page">` block after a header that tells the model to treat
   it as data (Section 16.5);

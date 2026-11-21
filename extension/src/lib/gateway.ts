@@ -47,6 +47,11 @@ export interface GatewayDeps {
   token: () => Promise<string | null>;
   /** A new access token after the server refused the old one, or `null`. */
   refresh: () => Promise<string | null>;
+  /**
+   * True when the sign-in can still get a new token (it has a refresh token). Then a missing
+   * token is a network failure of the sign-in service, and the gateway tries again later.
+   */
+  canRefresh: () => boolean;
   createSocket: (url: string) => SocketLike;
   onFrame: (frame: ServerFrame) => void;
   onStatus: (status: GatewayStatus, detail: string | null) => void;
@@ -78,6 +83,8 @@ export class Gateway {
   private socket: SocketLike | null = null;
   private token: string | null = null;
   private running = false;
+  /** Goes up at each stop. An async step of an older run sees it and does nothing. */
+  private generation = 0;
   private attempt = 0;
   private retryTimer: unknown = null;
   private pingTimer: unknown = null;
@@ -115,9 +122,15 @@ export class Gateway {
     this.deps.onStatus(status, detail);
   }
 
-  /** Connects if the user is signed in. Does nothing if the gateway runs already. */
+  /**
+   * Connects if the user is signed in. If the gateway runs and waits to try again, it tries
+   * now (a panel opened: Chrome can stop the worker and its timers when no panel is open).
+   */
   start(): void {
-    if (this.running) return;
+    if (this.running) {
+      if (this.socket === null && this.retryTimer !== null) void this.connect();
+      return;
+    }
     this.running = true;
     this.attempt = 0;
     void this.connect();
@@ -126,6 +139,7 @@ export class Gateway {
   /** Closes the socket and forgets the sessions (sign-out or a new API address). */
   stop(status: GatewayStatus = "signed_out"): void {
     this.running = false;
+    this.generation += 1;
     this.wanted.clear();
     this.closeSocket(1000, "stopped");
     this.setStatus(status);
@@ -139,9 +153,14 @@ export class Gateway {
 
   private async connect(): Promise<void> {
     this.clearTimer("retry");
+    const generation = this.generation;
     const token = await this.deps.token();
-    if (!this.running) return;
+    if (!this.running || generation !== this.generation) return;
     if (token === null) {
+      if (this.deps.canRefresh()) {
+        this.retry();
+        return;
+      }
       this.running = false;
       this.setStatus("signed_out");
       return;
@@ -254,16 +273,21 @@ export class Gateway {
     }
   }
 
-  private async closed(code: number, reason: string): Promise<void> {
+  /** Forgets the socket, stops its timers, and fails the sends that wait for an answer. */
+  private dropSocket(message: string): void {
     this.socket = null;
     this.ready = false;
     this.clearTimer("ping");
     this.clearTimer("reauth");
-    for (const [id, pending] of this.pending) {
+    for (const pending of this.pending.values()) {
       this.timers.clearTimeout(pending.timer);
-      pending.reject(new GatewayError("disconnected", "The connection to sama closed. Try again."));
-      this.pending.delete(id);
+      pending.reject(new GatewayError("disconnected", message));
     }
+    this.pending.clear();
+  }
+
+  private async closed(code: number, reason: string): Promise<void> {
+    this.dropSocket("The connection to sama closed. Try again.");
     if (!this.running) return;
     if (code === CLOSE.forbidden) {
       this.running = false;
@@ -271,9 +295,15 @@ export class Gateway {
       return;
     }
     if (code === CLOSE.unauthorized) {
+      const generation = this.generation;
       const token = (await this.deps.refresh()) ?? (await this.deps.token());
-      if (!this.running) return;
+      if (!this.running || generation !== this.generation) return;
       if (token === null || token === this.token) {
+        // No new token. With a refresh token, the sign-in service did not answer: try later.
+        if (this.deps.canRefresh()) {
+          this.retry();
+          return;
+        }
         this.running = false;
         this.setStatus("signed_out", "Your sign-in ended. Sign in again.");
         return;
@@ -293,10 +323,7 @@ export class Gateway {
 
   private closeSocket(code: number, reason: string): void {
     const socket = this.socket;
-    this.socket = null;
-    this.ready = false;
-    this.clearTimer("ping");
-    this.clearTimer("reauth");
+    this.dropSocket("The connection to sama closed.");
     this.clearTimer("retry");
     if (socket !== null) {
       socket.onclose = null;
@@ -307,11 +334,6 @@ export class Gateway {
         // Already closed.
       }
     }
-    for (const pending of this.pending.values()) {
-      this.timers.clearTimeout(pending.timer);
-      pending.reject(new GatewayError("disconnected", "The connection to sama closed."));
-    }
-    this.pending.clear();
   }
 
   private clearTimer(name: "retry" | "ping" | "reauth"): void {
@@ -327,12 +349,9 @@ export class Gateway {
     }
   }
 
+  /** JSON leaves out an `after` that is `undefined`. */
   private writeSubscribe(sessionId: string, after: number | undefined): void {
-    this.write(
-      after === undefined
-        ? { type: "subscribe", session_id: sessionId }
-        : { type: "subscribe", session_id: sessionId, after },
-    );
+    this.write({ type: "subscribe", session_id: sessionId, after });
   }
 
   /** Follows the events of a session. With `after`, the events after that event id first. */
@@ -360,10 +379,7 @@ export class Gateway {
         reject(new GatewayError("timeout", "sama did not answer in time. Try again."));
       }, SEND_TIMEOUT_MS);
       this.pending.set(id, { resolve, reject, timer });
-      const frame: ClientFrame = page
-        ? { type: "send", id, session_id: sessionId, text, page }
-        : { type: "send", id, session_id: sessionId, text };
-      if (!this.write(frame)) {
+      if (!this.write({ type: "send", id, session_id: sessionId, text, page })) {
         this.settle(id, (pending) =>
           pending.reject(new GatewayError("disconnected", "sama is not connected. Wait a moment.")),
         );

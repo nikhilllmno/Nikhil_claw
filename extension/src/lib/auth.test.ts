@@ -86,6 +86,21 @@ describe("Auth", () => {
     expect(auth.current).not.toBeNull();
   });
 
+  it("lets a sign-out win over an older password sign-in", async () => {
+    let answer: (response: Response) => void = () => undefined;
+    const auth = new Auth({
+      store: memoryStore(),
+      config: async () => CONFIG,
+      fetcher: () => new Promise<Response>((resolve) => (answer = resolve)),
+    });
+    const late = auth.signInWithPassword("a@b.c", "x");
+    await Promise.resolve();
+    await auth.signOut();
+    answer(json(200, { access_token: "a1", refresh_token: "r1", expires_in: 3600 }));
+    await expect(late).rejects.toThrow("newer sign-in");
+    expect(auth.current).toBeNull();
+  });
+
   it("says when the sign-in service does not answer", async () => {
     const { auth } = setup([new TypeError("Failed to fetch")]);
     await expect(auth.signInWithPassword("a@b.c", "x")).rejects.toThrow("could not reach the sign-in service");

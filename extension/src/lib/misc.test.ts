@@ -79,4 +79,14 @@ describe("TabBindings", () => {
     await bindings.clear();
     expect(await bindings.get(2)).toBeNull();
   });
+
+  it("keeps concurrent bindings of two tabs and other keys on clear", async () => {
+    const store = memoryStore();
+    const bindings = new TabBindings(store);
+    await store.set("sama.auth", "kept");
+    await Promise.all([bindings.bind(1, "s1"), bindings.bind(2, "s2")]);
+    expect([await bindings.get(1), await bindings.get(2)]).toEqual(["s1", "s2"]);
+    await bindings.clear();
+    expect(await store.get("sama.auth")).toBe("kept");
+  });
 });

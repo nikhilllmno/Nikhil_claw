@@ -1,8 +1,6 @@
 // The frames of the sama Chrome channel (`/channels/chrome/ws`, src/sama/api/chrome.py).
 // Keep this file the same as the server: docs/architecture.md, Section 14.2.
 
-export const PROTOCOL = 1;
-
 /** The page of a tab, for "Ask about this page" (src/sama/gateway/chrome.py, PageContext). */
 export interface PageContext {
   url: string;

@@ -76,7 +76,11 @@ const flush = async () => {
   for (let i = 0; i < 5; i++) await Promise.resolve();
 };
 
-function setup(tokens: (string | null)[] = ["t1"], refreshes: (string | null)[] = []) {
+function setup(
+  tokens: (string | null)[] = ["t1"],
+  refreshes: (string | null)[] = [],
+  options: { canRefresh?: boolean; refresh?: () => Promise<string | null> } = {},
+) {
   const timers = new FakeTimers();
   const sockets: FakeSocket[] = [];
   const frames: ServerFrame[] = [];
@@ -85,7 +89,8 @@ function setup(tokens: (string | null)[] = ["t1"], refreshes: (string | null)[] 
   const gateway = new Gateway({
     url: () => "wss://api.test/channels/chrome/ws",
     token: async () => (tokens.length > 1 ? tokens.shift()! : (tokens[0] ?? null)),
-    refresh: async () => refreshes.shift() ?? null,
+    refresh: options.refresh ?? (async () => refreshes.shift() ?? null),
+    canRefresh: () => options.canRefresh ?? false,
     createSocket: (url) => {
       const socket = new FakeSocket(url);
       sockets.push(socket);
@@ -222,6 +227,45 @@ describe("Gateway", () => {
     await flush();
     expect(two.gateway.status).toBe("signed_out");
     expect(two.statuses.at(-1)?.[1]).toContain("Sign in again");
+  });
+
+  it("tries again later when the sign-in service does not answer", async () => {
+    const { gateway, last, ready, timers, sockets } = setup(["t1"], [null], { canRefresh: true });
+    gateway.start();
+    await ready();
+    last().drop(4401, "the access token expired");
+    await flush();
+    expect(gateway.status).toBe("reconnecting");
+    await timers.advance(BACKOFF_MS[0]);
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("ignores the refresh of a run that stopped", async () => {
+    let finish: (token: string | null) => void = () => undefined;
+    const refresh = () => new Promise<string | null>((resolve) => (finish = resolve));
+    const { gateway, last, ready, sockets } = setup(["t1"], [], { refresh });
+    gateway.start();
+    await ready();
+    last().drop(4401, "the access token expired");
+    await flush();
+    gateway.restart();
+    await ready();
+    finish(null);
+    await flush();
+    expect(gateway.status).toBe("open");
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("tries at once when a panel opens during the wait", async () => {
+    const { gateway, last, ready, sockets } = setup();
+    gateway.start();
+    await ready();
+    last().drop(1006, "");
+    await flush();
+    expect(sockets).toHaveLength(1);
+    gateway.start();
+    await flush();
+    expect(sockets).toHaveLength(2);
   });
 
   it("does not reconnect when the API refuses the extension", async () => {

@@ -1126,13 +1126,9 @@ class SamaApi:
             after: Annotated[int | None, Query(ge=0)] = None,
             last_event_id: Annotated[str | None, Header()] = None,
         ) -> StreamingResponse:
-            cursor = _cursor(after, last_event_id)
-            async with as_user(self._engine, principal.auth_user_id) as connection:
-                await session_access(connection, principal, session_id)
-                if cursor is None:
-                    cursor = await self._last_event_id(connection, session_id)
+            cursor = await self.first_cursor(principal, session_id, _cursor(after, last_event_id))
             lifetime = self._stream_lifetime(principal)
-            release = self._open_stream(principal.auth_user_id)
+            release = self.open_stream(principal.auth_user_id)
             return _EventStream(
                 self._stream(principal, session_id, cursor, lifetime),
                 release=release,
@@ -3158,8 +3154,9 @@ class SamaApi:
 
     # -- the event stream -------------------------------------------------------------------
 
-    def _open_stream(self, user: uuid.UUID) -> Callable[[], None]:
-        """Takes one stream slot of the user, or raises ``429``. Returns the release."""
+    def open_stream(self, user: uuid.UUID) -> Callable[[], None]:
+        """Takes one stream slot of the user, or raises ``429``. Returns the release. The
+        extension channel takes one slot for each session that it follows."""
         settings = self._settings
         if (
             self._streams.total() >= settings.max_streams
@@ -3189,14 +3186,6 @@ class SamaApi:
         if principal.expires_at is not None:
             lifetime = min(lifetime, principal.expires_at - time.time())
         return lifetime
-
-    def open_stream(self, user: uuid.UUID) -> Callable[[], None]:
-        """Takes one stream slot of the user, or raises ``429``. The extension channel takes
-        one slot for each session that it follows."""
-        return self._open_stream(user)
-
-    def stream_lifetime(self, principal: Principal) -> float:
-        return self._stream_lifetime(principal)
 
     async def first_cursor(
         self, principal: Principal, session_id: uuid.UUID, after: int | None

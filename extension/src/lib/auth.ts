@@ -25,6 +25,7 @@ export interface AsyncStore {
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown): Promise<void>;
   remove(key: string): Promise<void>;
+  keys(): Promise<string[]>;
 }
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -68,11 +69,6 @@ export class Auth {
 
   get current(): Tokens | null {
     return this.tokens;
-  }
-
-  /** Changes at each sign-in and sign-out, not at a refresh. */
-  get generation(): number {
-    return this.epoch;
   }
 
   async load(): Promise<Tokens | null> {
@@ -123,9 +119,11 @@ export class Auth {
   }
 
   async signInWithPassword(email: string, password: string): Promise<void> {
-    const data = await this.call("token?grant_type=password", { email, password });
-    this.epoch += 1;
+    // Take the epoch first: a later sign-in or sign-out wins over this one when it ends first.
+    const epoch = ++this.epoch;
     this.inflight = null;
+    const data = await this.call("token?grant_type=password", { email, password });
+    if (epoch !== this.epoch) throw new AuthError("A newer sign-in or sign-out replaced this one.");
     await this.save(data, email.trim());
   }
 

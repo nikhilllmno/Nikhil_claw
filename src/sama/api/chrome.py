@@ -310,8 +310,8 @@ class _Connection:
                 self.stop(1009, "the frame is too large")
                 return
             if not self._allow_frame():
-                await self._error(None, "rate_limited", "too many frames. Wait and try again.")
-                continue
+                self.stop(CLOSE_TOO_MANY, "too many frames")
+                return
             frame, frame_id, problem = _parse(text)
             if frame is None:
                 await self._error(frame_id, "bad_frame", problem or "the frame is not valid")

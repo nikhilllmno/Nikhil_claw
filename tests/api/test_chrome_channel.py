@@ -183,7 +183,7 @@ async def test_a_bad_frame_gets_an_error_without_its_input(
         assert (await socket.closed()).code == 1003
 
 
-async def test_too_many_frames_are_refused(
+async def test_too_many_frames_close_the_connection(
     chrome_app: FastAPI, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(channel, "MAX_FRAMES_PER_WINDOW", 2)
@@ -191,9 +191,9 @@ async def test_too_many_frames_are_refused(
         await signed_in(socket, tenant.ids["mia_auth"])
         for _ in range(3):
             await socket.send({"type": "ping"})
-        frames = [await socket.receive() for _ in range(3)]
-        assert [f["type"] for f in frames] == ["pong", "pong", "error"]
-        assert frames[2]["code"] == "rate_limited"
+        frames = [await socket.receive() for _ in range(2)]
+        assert [f["type"] for f in frames] == ["pong", "pong"]
+        assert (await socket.closed()).code == channel.CLOSE_TOO_MANY
 
 
 async def test_a_large_frame_closes_the_connection(

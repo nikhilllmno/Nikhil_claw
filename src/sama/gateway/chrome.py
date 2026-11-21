@@ -125,11 +125,12 @@ def page_message(question: str, page: PageContext) -> PageMessage:
     if len(question) > MAX_ASK_CHARS:
         raise PageError(f"a question about a page can have at most {MAX_ASK_CHARS} characters")
     url = redact(page_url(page.url))
-    body = page.text.strip()
+    # Redact before the cut: a cut through a secret leaves a part that the redactor cannot find.
+    body = redact(page.text.strip())
     if len(body) > MAX_PAGE_TEXT_CHARS:
         body = body[:MAX_PAGE_TEXT_CHARS] + CUT_NOTE
-    title = " ".join(page.title.split())
-    content = redact(f"Title: {title}\n\n{body}" if title else body)
+    title = redact(" ".join(page.title.split()))
+    content = f"Title: {title}\n\n{body}" if title else body
     attachments = () if page.screenshot is None else (screenshot_image(page.screenshot),)
     parts = [question.strip()]
     parts += [marker(image) for image in attachments]
@@ -150,33 +151,23 @@ class TooManyConnectionsError(Exception):
     pass
 
 
-@dataclass(frozen=True, slots=True)
-class _Entry:
-    id: uuid.UUID
-    link: ChromeLink
-
-
 class ChromeHub:
     """The open extension connections of this process, by Supabase Auth user."""
 
     def __init__(self, *, max_per_user: int = MAX_CONNECTIONS_PER_USER) -> None:
         self._max_per_user = max_per_user
-        self._links: dict[uuid.UUID, list[_Entry]] = {}
+        self._links: dict[uuid.UUID, list[ChromeLink]] = {}
 
     def register(self, auth_user_id: uuid.UUID, link: ChromeLink) -> Callable[[], None]:
         """Adds a connection. Returns the function that removes it. Raises
         ``TooManyConnectionsError`` when the user has the maximum number of connections."""
-        entries = self._links.setdefault(auth_user_id, [])
-        if len(entries) >= self._max_per_user:
-            if not entries:
-                del self._links[auth_user_id]
+        links = self._links.get(auth_user_id, [])
+        if len(links) >= self._max_per_user:
             raise TooManyConnectionsError
-        entry = _Entry(uuid.uuid4(), link)
-        entries.append(entry)
+        self._links[auth_user_id] = [*links, link]
 
         def unregister() -> None:
-            current = self._links.get(auth_user_id, [])
-            remaining = [e for e in current if e.id != entry.id]
+            remaining = [other for other in self._links.get(auth_user_id, []) if other is not link]
             if remaining:
                 self._links[auth_user_id] = remaining
             else:
@@ -186,7 +177,7 @@ class ChromeHub:
 
     def links(self, auth_user_id: uuid.UUID) -> list[ChromeLink]:
         """The open connections of the user, the newest last."""
-        return [entry.link for entry in self._links.get(auth_user_id, [])]
+        return list(self._links.get(auth_user_id, []))
 
     def count(self) -> int:
-        return sum(len(entries) for entries in self._links.values())
+        return sum(len(links) for links in self._links.values())

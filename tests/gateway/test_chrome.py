@@ -161,6 +161,17 @@ def test_page_message_redacts_secrets_in_the_url_title_and_text() -> None:
     assert custom not in message.text
 
 
+def test_page_message_redacts_a_secret_before_the_cut() -> None:
+    custom = "my-very-private-value-123"
+    default_redactor().add(custom)
+    try:
+        text = "a" * (MAX_PAGE_TEXT_CHARS - len(custom) + 1) + custom
+        message = page_message("q", _page(text=text))
+    finally:
+        default_redactor().forget(custom)
+    assert custom[:-1] not in message.text
+
+
 def test_page_message_adds_the_screenshot_with_a_marker() -> None:
     message = page_message("q", _page(screenshot=_data_url("image/png", PNG)))
     (image,) = message.attachments

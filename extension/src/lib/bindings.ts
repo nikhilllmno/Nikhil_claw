@@ -4,38 +4,35 @@
 
 import type { AsyncStore } from "./auth";
 
-export const BINDINGS_KEY = "sama.tabs";
+/** The prefix of the storage key of each tab: `sama.tab.<tab id>`. */
+export const BINDING_PREFIX = "sama.tab.";
 
-export type Bindings = Record<string, string>;
+const keyOf = (tabId: number) => `${BINDING_PREFIX}${tabId}`;
 
+/**
+ * Each tab has its own storage key, so two writers (two panels, or a panel and the worker) do
+ * not overwrite the bindings of other tabs.
+ */
 export class TabBindings {
   constructor(private readonly store: AsyncStore) {}
 
-  private async all(): Promise<Bindings> {
-    const value = await this.store.get(BINDINGS_KEY);
-    return value !== null && typeof value === "object" ? { ...(value as Bindings) } : {};
-  }
-
   async get(tabId: number): Promise<string | null> {
-    return (await this.all())[String(tabId)] ?? null;
+    const value = await this.store.get(keyOf(tabId));
+    return typeof value === "string" ? value : null;
   }
 
   async bind(tabId: number, sessionId: string): Promise<void> {
-    const all = await this.all();
-    all[String(tabId)] = sessionId;
-    await this.store.set(BINDINGS_KEY, all);
+    await this.store.set(keyOf(tabId), sessionId);
   }
 
   async unbind(tabId: number): Promise<void> {
-    const all = await this.all();
-    if (!(String(tabId) in all)) return;
-    delete all[String(tabId)];
-    await this.store.set(BINDINGS_KEY, all);
+    await this.store.remove(keyOf(tabId));
   }
 
   /** Removes every binding (sign-out: the next user must not see the chats). */
   async clear(): Promise<void> {
-    await this.store.remove(BINDINGS_KEY);
+    const keys = (await this.store.keys()).filter((key) => key.startsWith(BINDING_PREFIX));
+    await Promise.all(keys.map((key) => this.store.remove(key)));
   }
 }
 
@@ -45,6 +42,7 @@ export function chromeStore(area: chrome.storage.StorageArea): AsyncStore {
     get: async (key) => (await area.get(key))[key],
     set: (key, value) => area.set({ [key]: value }),
     remove: (key) => area.remove(key),
+    keys: async () => Object.keys(await area.get(null)),
   };
 }
 
@@ -60,5 +58,6 @@ export function memoryStore(): AsyncStore & { data: Map<string, unknown> } {
     remove: async (key) => {
       data.delete(key);
     },
+    keys: async () => [...data.keys()],
   };
 }

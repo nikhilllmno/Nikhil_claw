@@ -14,6 +14,7 @@ import {
   type Request,
   type WorkerToPanel,
 } from "./lib/messages";
+import { originPattern } from "./lib/page";
 import { socketUrl } from "./lib/protocol";
 
 const session = chromeStore(chrome.storage.session);
@@ -58,6 +59,7 @@ const gateway = new Gateway({
   url: () => socketUrl(apiUrl),
   token: () => auth.getToken(),
   refresh: () => auth.refresh(),
+  canRefresh: () => auth.current?.refresh_token != null,
   createSocket: (url) => new WebSocket(url),
   onFrame: (frame) => broadcast({ kind: "frame", frame }),
   onStatus: (next, text) => {
@@ -79,14 +81,21 @@ function panelState(): PanelState {
   };
 }
 
-function broadcast(message: WorkerToPanel): void {
-  for (const port of ports.keys()) {
-    try {
-      port.postMessage(message);
-    } catch {
-      // The panel closed.
-    }
+function post(port: chrome.runtime.Port, message: WorkerToPanel): void {
+  try {
+    port.postMessage(message);
+  } catch {
+    // The panel closed.
   }
+}
+
+function broadcast(message: WorkerToPanel): void {
+  for (const port of ports.keys()) post(port, message);
+}
+
+/** Stops following a session that no open panel follows. */
+function unsubscribeIfUnused(sessionId: string): void {
+  if (![...ports.values()].some((ids) => ids.has(sessionId))) gateway.unsubscribe(sessionId);
 }
 
 function broadcastState(): void {
@@ -154,7 +163,7 @@ async function handle(port: chrome.runtime.Port, request: Request): Promise<unkn
       return panelState();
     case "setApiUrl": {
       const next = normalizeApiUrl(request.url);
-      const granted = await chrome.permissions.contains({ origins: [`${new URL(next).origin}/*`] });
+      const granted = await chrome.permissions.contains({ origins: [originPattern(next)] });
       if (!granted) throw new Error("Give the extension access to this address first.");
       gateway.stop();
       await auth.signOut();
@@ -173,20 +182,10 @@ async function handle(port: chrome.runtime.Port, request: Request): Promise<unkn
       return null;
     case "unsubscribe":
       ports.get(port)?.delete(request.sessionId);
-      if (![...ports.values()].some((ids) => ids.has(request.sessionId))) {
-        gateway.unsubscribe(request.sessionId);
-      }
+      unsubscribeIfUnused(request.sessionId);
       return null;
     case "send":
       return gateway.send(request.sessionId, request.text, request.page);
-  }
-}
-
-function reply(port: chrome.runtime.Port, message: WorkerToPanel): void {
-  try {
-    port.postMessage(message);
-  } catch {
-    // The panel closed before the answer.
   }
 }
 
@@ -199,9 +198,9 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener((message: PanelToWorker) => {
     const { id, ...request } = message;
     handle(port, request as Request).then(
-      (value) => reply(port, { kind: "reply", id, ok: true, value: value ?? null }),
+      (value) => post(port, { kind: "reply", id, ok: true, value: value ?? null }),
       (error: unknown) =>
-        reply(port, {
+        post(port, {
           kind: "reply",
           id,
           ok: false,
@@ -214,13 +213,11 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => {
     const ids = ports.get(port) ?? new Set<string>();
     ports.delete(port);
-    for (const sessionId of ids) {
-      if (![...ports.values()].some((other) => other.has(sessionId))) gateway.unsubscribe(sessionId);
-    }
+    for (const sessionId of ids) unsubscribeIfUnused(sessionId);
   });
   void ready.then(() => {
     if (auth.current !== null) gateway.start();
-    reply(port, { kind: "state", state: panelState() });
+    post(port, { kind: "state", state: panelState() });
   });
 });
 
