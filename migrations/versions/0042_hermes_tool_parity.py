@@ -2,7 +2,7 @@
 
 - ``agent_profiles.delegation_model``: the model of the child runs of ``delegate_task``. ``NULL``
   means the model of the profile, as before.
-- The default profile gets the toolset ``moa`` (an exact match of the default list of 0036).
+- The default profile gets the toolset ``moa`` (an exact match of the default list of 0041).
 - ``agent_profiles.memory_provider``: ``builtin`` (the default) or ``mem0``. With ``mem0``, sama
   also sends the turns of private chat sessions to Mem0 and the agent has ``memory_recall``.
 - ``model_calls`` accepts the provider ``gemini`` and the endpoint ``generate_content``
@@ -14,8 +14,8 @@
   ``SKILL.md`` declares them. A member who sees the workspace reads the row. Only the control
   plane writes the table.
 
-Revision ID: 0041
-Revises: 0040
+Revision ID: 0042
+Revises: 0041
 Create Date: 2026-11-21
 """
 
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0041"
-down_revision: str | None = "0040"
+revision: str = "0042"
+down_revision: str | None = "0041"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -59,17 +59,17 @@ NEW_VAULT_NAMES = (
 )
 
 
-# The default list after the browser migration (0036) and the same list with ``moa``. An exact
+# The default list after the coding agents migration (0041) and the same list with ``moa``. An exact
 # match keeps the profiles that a person changed.
 OLD_TOOLSETS = (
     '["core", "todo", "web", "clarify", "github", "memory", "skills", "sessions", "media",'
     ' "tool_search", "subagents", "connections", "integrations", "delegation", "tasks", "cron",'
-    ' "code_exec", "workflows", "browser"]'
+    ' "code_exec", "workflows", "browser", "coding_agents"]'
 )
 NEW_TOOLSETS = (
     '["core", "todo", "web", "clarify", "github", "memory", "skills", "sessions", "media",'
     ' "tool_search", "subagents", "connections", "integrations", "delegation", "tasks", "cron",'
-    ' "code_exec", "workflows", "browser", "moa"]'
+    ' "code_exec", "workflows", "browser", "coding_agents", "moa"]'
 )
 
 

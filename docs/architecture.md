@@ -1674,7 +1674,7 @@ The memory row, the revision, and the audit row are one transaction (`after` hoo
 
 Code: `src/sama/memory/provider.py`. The built-in memory of Section 8.1 is always on. A profile
 can also use an external provider. The column `agent_profiles.memory_provider` (migration
-`0041`) is `builtin` (the default) or `mem0`. An org admin sets it in the web app (agent
+`0042`) is `builtin` (the default) or `mem0`. An org admin sets it in the web app (agent
 settings) or approves a `change_propose` of the target `profile`.
 
 - **Interface.** `MemoryProvider` has `recall`, `remember`, `forget`, and `available`. The one
@@ -1697,7 +1697,7 @@ settings) or approves a `change_propose` of the target `profile`.
   works only in a private session. For a profile with `builtin` it answers that external memory
   is off. The facts are untrusted content.
 - **Delete.** A user delete and an org delete write a `data_purges` row of the kind `mem0`
-  with the user ids (migration `0041`). The purge worker deletes the memories of each user at
+  with the user ids (migration `0042`). The purge worker deletes the memories of each user at
   Mem0. Without a key, there is nothing that sama can delete, and the row is done. An org with
   its own Mem0 key loses the key with the org (the vault rows cascade), so the cleanup before
   an org delete deletes the memories of all its users first. When Mem0 fails, or the key of
@@ -2363,7 +2363,7 @@ config:
   `number`, or `boolean`; else the type of `default`, else `string`), `default`, and
   `required`. A skill has at most 20 settings. The lint refuses a `config` block that breaks a
   rule.
-- **Values.** The table `skill_settings` (migration `0041`) has one row for each org,
+- **Values.** The table `skill_settings` (migration `0042`) has one row for each org,
   workspace, and skill name, with `settings` (a JSON object). A member who sees the workspace
   reads the row (RLS `can_see_workspace`). Only the control plane writes. A value must have the
   type of its spec, and a text has at most 500 characters. A value that the redactor would
@@ -2487,7 +2487,7 @@ key (`check_fn`): with the vault on, an org can add its own key, so the tool sho
 (the vault first, then the key of the process) and the `MediaMeter` of Section 11.8: the
 budget checks of the model proxy before the call, one `model_calls` row for each call with the
 real usage or an estimate, and the shielded task that a cancel cannot stop. `model_calls`
-accepts the provider `gemini` and the endpoint `generate_content` (migration `0041`). The
+accepts the provider `gemini` and the endpoint `generate_content` (migration `0042`). The
 prices are in the `gemini` section of `prices.toml`. Gemini charges audio input at twice the
 rate of other input, so the count gives each audio token 2 input tokens. The model proxy has no
 Gemini route: a run cannot call Gemini as its own model.
@@ -2509,8 +2509,8 @@ Each post is redacted whole and then cut to 600 characters.
 
 **Gate.** `x_search`, `video_analyze`, and `moa` are in the default allow list, like
 `web_search` and `vision_analyze`: they read, and the budget limits their cost. The toolset
-`moa` is new. New profiles get it, and migration `0041` adds it to a profile that still has the
-default toolsets of `0036`. The default group set has no `moa`, and a delegated child never has
+`moa` is new. New profiles get it, and migration `0042` adds it to a profile that still has the
+default toolsets of `0041`. The default group set has no `moa`, and a delegated child never has
 it (`CHILD_BLOCKED_TOOLSETS`), because one call spends the money of four model calls.
 
 **Assumptions (M7.5).**
@@ -5184,7 +5184,7 @@ makes a child session and a queued child run in one transaction:
 | Blocked toolsets | `delegation`, `tasks`, `memory`, `clarify`, `cron`, `connections`, `integrations`, and `moa` since M7.5 (`CHILD_BLOCKED_TOOLSETS`). The gate and the prompt assembler take them away for a `delegation` session. |
 | Budget | The lower of the profile budget and the defaults: 30 turns, 1.00 USD, and 1,800 seconds. A task can ask for at most 100 turns and 10 USD, and it never gets more than the profile allows. |
 | Result | The answer of a child is cut to 4,000 characters and is marked as untrusted data. |
-| Model | `agent_profiles.delegation_model` (M7.5, migration `0041`), for example a cheaper model. Without it, the model of the profile. The model must be a model of the runtime of the profile: a runtime change clears a model that the new runtime does not know. The child run pins it (`runs.model`). |
+| Model | `agent_profiles.delegation_model` (M7.5, migration `0042`), for example a cheaper model. Without it, the model of the profile. The model must be a model of the runtime of the profile: a runtime change clears a model that the new runtime does not know. The child run pins it (`runs.model`). |
 
 **Wait**: with `wait=true` (the default), the call polls every 2 seconds until each child ends
 or `timeout_s` (at most 600 seconds) passes. Then it returns the status, the cost, and the
@@ -7444,7 +7444,7 @@ migrated schema.
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
 | `browser_logins` | The saved logins of the browser: `org_id`, `user_id` (null for an org login), `name` (unique for each scope, case does not matter), `site`, `created_by_user_id`. The vault entry `browser_login:<id>` has the secret (migration `0038`, Section 14.1). A member reads the org logins and their own logins. An org admin reads all. Only the control plane writes. |
 | `browser_url_policies` | The URL policy of the browser of each org: `org_id` (the key), `allow_hosts`, `block_hosts` (at most 200 each), `updated_by_user_id` (migration `0038`, Section 16.4). An org admin reads the row. Only the control plane writes. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, `browser_contexts` since migration `0036`, or `mem0` since migration `0041`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, `browser_contexts` since migration `0036`, or `mem0` since migration `0042`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
