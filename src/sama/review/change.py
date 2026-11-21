@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.profile_changes import TOOL_MAX_CHARS, check_rules, profile_rules
-from sama.profiles import KIND_FIELDS, ProfileError, planned_values, profile_value
+from sama.profiles import KIND_FIELDS, ProfileError, planned_values, split_change
 from sama.review.proposals import NewProposal, ProposalKind, ProposalScope, ProposalSink
 from sama.review.soul import SUMMARY_MAX_CHARS, SoulError, SoulProposer, load_run
 from sama.runtime.contract import RuntimeKind
@@ -40,9 +40,8 @@ from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import redact
 
 ChangeTarget = Literal["soul", "profile", "toolsets", "policy"]
-CHANGE_KINDS: Final = ("profile", "toolsets", "policy")
-"""The kinds of proposals that ``sama.profile_changes.write_change`` applies."""
 CHANGE_LABELS: Final = {"profile": "settings", "toolsets": "toolsets", "policy": "policy rules"}
+"""The kinds of proposals that ``sama.profile_changes.write_change`` applies, with their labels."""
 
 
 class RuleChange(BaseModel):
@@ -142,7 +141,10 @@ class ChangeProposer:
             if request.target == "policy":
                 before, after = await self._policy(claims, run, request.rules or ())
             else:
-                before, after = _profile_change(_locked(run), request.target, given)
+                profile = _locked(run)
+                before, after = split_change(
+                    profile, planned_values(profile, given), KIND_FIELDS[request.target]
+                )
         except (ProfileError, SubagentError) as error:
             raise SoulError(str(error)) from None
         if not after:
@@ -192,16 +194,3 @@ class ChangeProposer:
         if not changed:
             return {}, {}
         return {"rules": {tool: current.get(tool) for tool in changed}}, {"rules": changed}
-
-
-def _profile_change(
-    profile: LockedProfile, target: str, given: dict[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The ``before`` and ``after`` values of a profile or toolsets change, checked against the
-    profile now. A field without a change is left out."""
-    values = planned_values(profile, given)
-    changed = [field for field in KIND_FIELDS[target] if field in values]
-    return (
-        {field: profile_value(profile, field) for field in changed},
-        {field: values[field] for field in changed},
-    )

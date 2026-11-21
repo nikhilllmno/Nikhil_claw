@@ -37,6 +37,7 @@ from sama.profiles import (
     record_change,
 )
 from sama.subagents import LockedProfile, lock_profile
+from sama.vault.redact import default_redactor
 
 POLICY_ACTIONS: Final = ("allow", "ask", "deny")
 MAX_RULES: Final = 20
@@ -107,15 +108,14 @@ async def current_values(
     profile_id: uuid.UUID,
     profile: LockedProfile,
     fields: Mapping[str, Any],
-    *,
-    lock: bool = False,
 ) -> dict[str, Any]:
-    """The values of the profile now for the keys of ``fields`` (a ``before`` or ``after``)."""
+    """The values of the profile now for the keys of ``fields`` (a ``before`` or ``after``). The
+    policy rules are locked until the end of the transaction."""
     out: dict[str, Any] = {}
     for field, value in fields.items():
         if field == "rules":
             tools = list(value or {})
-            found = await profile_rules(connection, org_id, profile_id, tools, lock=lock)
+            found = await profile_rules(connection, org_id, profile_id, tools, lock=True)
             out["rules"] = {tool: found.get(tool) for tool in tools}
         else:
             out[field] = profile_value(profile, field)
@@ -154,7 +154,7 @@ async def write_change(
     if admin_only:
         await lock_admin(connection, org_id, actor_user_id)
     rules = check_rules(after["rules"]) if "rules" in after else None
-    live = await current_values(connection, org_id, profile_id, profile, before, lock=True)
+    live = await current_values(connection, org_id, profile_id, profile, before)
     if not _same(live, dict(before)):
         raise StaleChangeError(
             "the profile changed after this change was made. Make a new change from the values"
@@ -264,6 +264,10 @@ async def revert_change(
         raise LookupError("the change does not exist")
     if row.reverted_by_change_id is not None:
         raise RevertError("the change is already reverted")
+    if row.redacted:
+        raise RevertError(
+            "the change had a secret, so sama did not keep its values. Edit the profile instead"
+        )
     new_id = await write_change(
         connection,
         org_id=org_id,
@@ -289,7 +293,10 @@ async def list_changes(
     connection: AsyncConnection, org_id: uuid.UUID, profile_id: uuid.UUID
 ) -> list[dict[str, Any]]:
     """The newest changes of the profile, for the history view. On a connection of a user, the
-    row level security of ``profile_changes`` limits the rows."""
+    row level security of ``profile_changes`` limits the rows. The values are redacted again
+    before the diff is made, because a diff line (``-`` or ``+`` in front of each line) can
+    hide a secret of many lines from the redactor."""
+    redactor = default_redactor()
     rows = await connection.execute(
         select(ProfileChange, User.display_name.label("actor_name"))
         .outerjoin(
@@ -299,28 +306,32 @@ async def list_changes(
         .order_by(ProfileChange.created_at.desc(), ProfileChange.id.desc())
         .limit(HISTORY_LIMIT)
     )
-    return [
-        {
-            "id": str(row.id),
-            "kind": row.kind,
-            "source": row.source,
-            "summary": row.summary,
-            "before": row.before,
-            "after": row.after,
-            "diff": change_diff(row.kind, row.before, row.after, cut=False),
-            "actor_user_id": None if row.actor_user_id is None else str(row.actor_user_id),
-            "actor_name": row.actor_name,
-            "proposal_id": None if row.proposal_id is None else str(row.proposal_id),
-            "reverts_change_id": (
-                None if row.reverts_change_id is None else str(row.reverts_change_id)
-            ),
-            "reverted_by_change_id": (
-                None if row.reverted_by_change_id is None else str(row.reverted_by_change_id)
-            ),
-            "created_at": row.created_at.isoformat(),
-        }
-        for row in rows
-    ]
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        before, after = redactor.json(dict(row.before)), redactor.json(dict(row.after))
+        out.append(
+            {
+                "id": str(row.id),
+                "kind": row.kind,
+                "source": row.source,
+                "summary": row.summary,
+                "before": before,
+                "after": after,
+                "diff": change_diff(row.kind, before, after, cut=False),
+                "redacted": row.redacted,
+                "actor_user_id": None if row.actor_user_id is None else str(row.actor_user_id),
+                "actor_name": row.actor_name,
+                "proposal_id": None if row.proposal_id is None else str(row.proposal_id),
+                "reverts_change_id": (
+                    None if row.reverts_change_id is None else str(row.reverts_change_id)
+                ),
+                "reverted_by_change_id": (
+                    None if row.reverted_by_change_id is None else str(row.reverted_by_change_id)
+                ),
+                "created_at": row.created_at.isoformat(),
+            }
+        )
+    return out
 
 
 def _short(value: Any) -> str:

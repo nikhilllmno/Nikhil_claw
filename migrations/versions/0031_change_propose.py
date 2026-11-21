@@ -58,6 +58,7 @@ def upgrade() -> None:
         sa.Column("reverted_by_change_id", sa.UUID(), nullable=True),
         sa.Column("actor_user_id", sa.UUID(), nullable=True),
         sa.Column("summary", sa.Text(), nullable=True),
+        sa.Column("redacted", sa.Boolean(), server_default=sa.false(), nullable=False),
         sa.Column(
             "before",
             postgresql.JSONB(astext_type=sa.Text()),

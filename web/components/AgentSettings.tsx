@@ -71,7 +71,6 @@ export function AgentSettings({ profileId }: { profileId: string }) {
       <ProfileHistory
         orgId={org.id}
         profile={profile}
-        version={profile.updated_at}
         onReverted={(reverted) => {
           setProfile(reverted);
           setRevision((n) => n + 1);

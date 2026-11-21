@@ -410,3 +410,138 @@ async def test_the_session_snapshot_has_the_toolsets_and_the_rules(
     async with engine.connect() as connection:
         count = len((await connection.scalars(select(ProfileChange.id))).all())
     assert count == 0
+
+
+# -- review fixes: secrets in the history and the role of the approver -----------------------
+
+
+async def demote(engine: AsyncEngine, tenant: Tenant, user: str) -> None:
+    from sama.db.models import Membership
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(
+                Membership.org_id == tenant.org,
+                Membership.user_id == tenant.ids[user],
+                Membership.workspace_id.is_(None),
+            )
+            .values(role="member")
+        )
+
+
+async def test_a_removed_secret_does_not_stay_in_the_history(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    from sama.vault.redact import REDACTED, default_redactor
+
+    secret = "soul-secret-" + "klmnopqrst" * 4
+    chat = await start_chat(engine, tenant)
+    await set_profile(engine, tenant, soul=f"You are a test agent. Key {secret}.")
+    default_redactor().add(secret)
+    try:
+        await proposer(chat).propose(
+            chat.claims, ChangeRequest(target="soul", summary="no key", content="You are calm.")
+        )
+        (pending,) = await chat.rows(ReviewProposal)
+        assert secret not in pending.payload["before_soul"]
+        await approve(chat)
+        async with engine.connect() as connection:
+            (row,) = (await connection.execute(select(ProfileChange))).all()
+        assert secret not in str(row.before)
+        assert REDACTED in row.before["soul"]
+        assert row.after == {"soul": "You are calm."}
+        assert row.redacted is True
+        (change,) = await history(engine, tenant)
+        assert change["redacted"] is True
+        with pytest.raises(RevertError, match="had a secret"):
+            await revert(engine, tenant, change["id"])
+        assert await chat.soul() == "You are calm."
+    finally:
+        default_redactor().forget(secret)
+
+
+async def test_the_history_diff_hides_a_secret_of_many_lines(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    from sama.vault.redact import default_redactor
+
+    secret = "first-line-" + "abcdefghij" * 2 + "\nsecond-line-" + "uvwxyzabcd" * 2
+    # A row from before the redaction at write: the list redacts the values before the diff.
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(ProfileChange).values(
+                org_id=tenant.org,
+                agent_profile_id=tenant.ids["profile"],
+                kind="soul",
+                source="edit",
+                before={"soul": f"Old.\n{secret}\nEnd."},
+                after={"soul": "New."},
+            )
+        )
+    default_redactor().add(secret)
+    try:
+        (change,) = await history(engine, tenant)
+    finally:
+        default_redactor().forget(secret)
+    for part in secret.split("\n"):
+        assert part not in change["diff"]
+        assert part not in str(change["before"])
+    assert "-Old." in change["diff"]
+    assert "+New." in change["diff"]
+
+
+async def test_an_approver_who_lost_the_role_does_not_apply_the_change(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    chat = await start_chat(engine, tenant)
+    await proposer(chat).propose(
+        chat.claims, ChangeRequest(target="profile", summary="rename", name="Helper")
+    )
+    assert await chat.decide("owner") == "approved"
+    await demote(engine, tenant, "owner")
+    await chat.applier.apply_decided()
+    (proposal,) = await chat.rows(ReviewProposal)
+    assert proposal.status == "failed"
+    assert "does not have the role now" in (proposal.error or "")
+    assert (await profile(engine, tenant)).name != "Helper"
+    assert await history(engine, tenant) == []
+
+
+async def test_a_demotion_while_the_apply_waits_for_the_lock_stops_it(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    import asyncio
+
+    from sqlalchemy import text
+
+    from sama.subagents import lock_profile
+
+    chat = await start_chat(engine, tenant)
+    await proposer(chat).propose(
+        chat.claims, ChangeRequest(target="profile", summary="rename", name="Helper")
+    )
+    assert await chat.decide("owner") == "approved"
+    async with engine.connect() as holder:
+        transaction = await holder.begin()
+        await lock_profile(holder, tenant.org, tenant.ids["profile"])
+        task = asyncio.create_task(chat.applier.apply_decided())
+        async with asyncio.timeout(10):
+            while True:
+                async with engine.connect() as connection:
+                    waiting = await connection.scalar(
+                        text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE wait_event_type = 'Lock' AND datname = current_database()"
+                        )
+                    )
+                if waiting:
+                    break
+                await asyncio.sleep(0.05)
+        await demote(engine, tenant, "owner")
+        await transaction.commit()
+    await asyncio.wait_for(task, 10)
+    (proposal,) = await chat.rows(ReviewProposal)
+    assert proposal.status == "failed"
+    assert "does not have the role now" in (proposal.error or "")
+    assert (await profile(engine, tenant)).name != "Helper"

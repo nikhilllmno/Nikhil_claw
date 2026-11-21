@@ -28,7 +28,7 @@ from sama.profiles import SOUL_MAX_CHARS, record_change
 from sama.review.proposals import NewProposal, ProposalScope, ProposalSink
 from sama.tenancy.authority import run_user
 from sama.tenancy.run_token import RunTokenClaims
-from sama.vault.redact import redact
+from sama.vault.redact import default_redactor, redact
 
 SUMMARY_MAX_CHARS: Final = 200
 
@@ -86,7 +86,8 @@ class SoulProposer:
                     "profile_id": str(run.agent_profile_id),
                     "profile_name": run.name,
                     "soul": soul,
-                    "before_soul": seen,
+                    # For the diff on the card only. The digest checks the soul.
+                    "before_soul": default_redactor().text(seen),
                     "summary": summary,
                     "base_digest": soul_digest(seen),
                 },

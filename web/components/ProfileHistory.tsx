@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { type AgentProfile, type ProfileChange, errorText } from "@/lib/api";
-import { canRevert, changeTitle } from "@/lib/profileHistory";
+import { changeTitle } from "@/lib/profileHistory";
 import { useApi } from "./AuthProvider";
 import { useLoad } from "./useLoad";
 import cards from "./Cards.module.css";
@@ -10,24 +10,23 @@ import styles from "./AgentSettings.module.css";
 
 /**
  * The change history of an agent profile, newest first (M6.1). An org owner or admin can revert
- * a change. `version` reloads the history when the profile changes.
+ * a change.
  */
 export function ProfileHistory({
   orgId,
   profile,
-  version,
   onReverted,
 }: {
   orgId: string;
   profile: AgentProfile;
-  version: string;
   onReverted: (profile: AgentProfile) => void;
 }) {
   const api = useApi();
   const load = useMemo(
-    // `version` is in the list so that a saved edit or a revert loads the history again.
-    () => (version ? () => api.listAgentProfileChanges(orgId, profile.id) : null),
-    [api, orgId, profile.id, version],
+    // `updated_at` is in the list so that a saved edit or a revert loads the history again.
+    () => () => api.listAgentProfileChanges(orgId, profile.id),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, orgId, profile.id, profile.updated_at],
   );
   const { data: changes, error, reload } = useLoad(load, "Could not load the history.");
   const [confirming, setConfirming] = useState<string | null>(null);
@@ -42,6 +41,7 @@ export function ProfileHistory({
       setConfirming(null);
       onReverted(result.profile);
     } catch (e) {
+      setConfirming(null);
       setRevertError(errorText(e, "The change was not reverted."));
     } finally {
       setBusy(null);
@@ -89,7 +89,11 @@ export function ProfileHistory({
               {change.diff ? <pre className={cards.code}>{change.diff}</pre> : null}
               {change.reverted_by_change_id !== null ? (
                 <p className="hint">Reverted.</p>
-              ) : canRevert(change, profile.editable) ? (
+              ) : change.redacted ? (
+                <p className="hint">
+                  This change had a secret, so it cannot be reverted. Edit the profile instead.
+                </p>
+              ) : profile.editable ? (
                 <div className={cards.actions}>
                   {confirming === change.id ? (
                     <>

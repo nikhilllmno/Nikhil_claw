@@ -1593,7 +1593,11 @@ class ProfileChange(Base):
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     summary: Mapped[str | None] = mapped_column(Text)
     before: Mapped[dict[str, Any]] = _json()
+    """The values before the change, redacted: the table never has a known secret."""
     after: Mapped[dict[str, Any]] = _json()
+    redacted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True when the redaction changed ``before`` or ``after``. Such a change cannot be
+    reverted, because sama does not keep the old values."""
     created_at: Mapped[datetime] = _created_at()
 
 

@@ -372,6 +372,8 @@ export interface ProfileChange {
   proposal_id: string | null;
   reverts_change_id: string | null;
   reverted_by_change_id: string | null;
+  /** True when sama redacted a secret in the values. Such a change cannot be reverted. */
+  redacted: boolean;
   created_at: string;
 }
 

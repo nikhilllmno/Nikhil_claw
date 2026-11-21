@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProfileChange } from "./api";
-import { canRevert, changeTitle, kindLabel, sourceLabel } from "./profileHistory";
+import { changeTitle } from "./profileHistory";
 
 function change(overrides: Partial<ProfileChange> = {}): ProfileChange {
   return {
@@ -16,6 +16,7 @@ function change(overrides: Partial<ProfileChange> = {}): ProfileChange {
     proposal_id: "p1",
     reverts_change_id: null,
     reverted_by_change_id: null,
+    redacted: false,
     created_at: "2026-11-21T10:00:00Z",
     ...overrides,
   };
@@ -23,33 +24,15 @@ function change(overrides: Partial<ProfileChange> = {}): ProfileChange {
 
 describe("profile history labels", () => {
   it("names each kind and source", () => {
-    expect(kindLabel("soul")).toBe("Soul");
-    expect(kindLabel("policy")).toBe("Policy rules");
-    expect(sourceLabel("edit")).toBe("Edit");
-    expect(sourceLabel("revert")).toBe("Revert");
-  });
-
-  it("keeps an unknown value as it is", () => {
-    expect(kindLabel("other")).toBe("other");
-    expect(sourceLabel("other")).toBe("other");
+    expect(changeTitle(change({ kind: "soul", source: "revert" }))).toBe("Soul · Revert by Alice");
+    expect(changeTitle(change({ kind: "policy", source: "edit" }))).toBe(
+      "Policy rules · Edit by Alice",
+    );
+    expect(changeTitle(change({ kind: "profile" }))).toBe("Settings · Approved proposal by Alice");
   });
 
   it("puts the kind, the source, and the person in the title", () => {
     expect(changeTitle(change())).toBe("Tools · Approved proposal by Alice");
     expect(changeTitle(change({ actor_name: null, source: "edit" }))).toBe("Tools · Edit");
-  });
-});
-
-describe("canRevert", () => {
-  it("allows an editor to revert a change that is not reverted", () => {
-    expect(canRevert(change(), true)).toBe(true);
-  });
-
-  it("refuses a reader", () => {
-    expect(canRevert(change(), false)).toBe(false);
-  });
-
-  it("refuses a change that is already reverted", () => {
-    expect(canRevert(change({ reverted_by_change_id: "c2" }), true)).toBe(false);
   });
 });

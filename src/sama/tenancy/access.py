@@ -72,3 +72,15 @@ async def load_grants(connection: AsyncConnection, org_id: uuid.UUID, user_id: u
         )
     )
     return Grants(user_id, tuple((row.workspace_id, row.role) for row in rows))
+
+
+async def lock_grants(connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID) -> Grants:
+    """``load_grants`` with a share lock on the membership rows until the end of the
+    transaction. A write that checks a role after it locked its target calls it, so that a
+    demotion or a removal that waits cannot slip in before the write."""
+    rows = await connection.execute(
+        select(Membership.workspace_id, Membership.role)
+        .where(Membership.org_id == org_id, Membership.user_id == user_id)
+        .with_for_update(read=True)
+    )
+    return Grants(user_id, tuple((row.workspace_id, row.role) for row in rows))

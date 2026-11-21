@@ -47,7 +47,7 @@ from sama.subagents import (
     validate_subagents,
 )
 from sama.tenancy.access import ADMIN_ROLES
-from sama.vault.redact import redact
+from sama.vault.redact import default_redactor, redact
 
 EDITABLE_RUNTIMES: Final = (RuntimeKind.CLAUDE_AGENT_SDK, RuntimeKind.OPENAI_AGENTS_SDK)
 """The runtimes that an editor can choose. ``fake`` is for tests only."""
@@ -216,6 +216,17 @@ def profile_value(profile: LockedProfile, field: str) -> Any:
     return list(value) if isinstance(value, list) else value
 
 
+def split_change(
+    profile: LockedProfile, values: Mapping[str, Any], fields: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The ``before`` and ``after`` values of the ``fields`` that ``values`` changes."""
+    changed = [field for field in fields if field in values]
+    return (
+        {field: profile_value(profile, field) for field in changed},
+        {field: values[field] for field in changed},
+    )
+
+
 async def lock_admin(
     connection: AsyncConnection, org_id: uuid.UUID, actor_user_id: uuid.UUID
 ) -> None:
@@ -309,8 +320,8 @@ async def update_profile(
             )
         )
         for kind, fields in KIND_FIELDS.items():
-            changed = [field for field in fields if field in values]
-            if not changed:
+            before, after = split_change(profile, values, fields)
+            if not after:
                 continue
             await record_change(
                 connection,
@@ -319,8 +330,8 @@ async def update_profile(
                 profile_id=profile_id,
                 kind=kind,
                 source="edit",
-                before={field: profile_value(profile, field) for field in changed},
-                after={field: values[field] for field in changed},
+                before=before,
+                after=after,
                 actor_user_id=actor_user_id,
             )
 
@@ -340,7 +351,13 @@ async def record_change(
     reverts_change_id: uuid.UUID | None = None,
     summary: str | None = None,
 ) -> uuid.UUID:
-    """Writes one row of the history of a profile on ``connection``. Returns its id."""
+    """Writes one row of the history of a profile on ``connection``. Returns its id.
+
+    The row has the redacted values: a member can read the history (RLS), so a known secret,
+    for example one that an admin removes from the soul, does not stay in it."""
+    redactor = default_redactor()
+    safe_before, safe_after = redactor.json(dict(before)), redactor.json(dict(after))
+    redacted = safe_before != dict(before) or safe_after != dict(after)
     return (
         await connection.execute(
             insert(ProfileChange)
@@ -350,12 +367,13 @@ async def record_change(
                 agent_profile_id=profile_id,
                 kind=kind,
                 source=source,
-                before=dict(before),
-                after=dict(after),
+                before=safe_before,
+                after=safe_after,
+                redacted=redacted,
                 actor_user_id=actor_user_id,
                 proposal_id=proposal_id,
                 reverts_change_id=reverts_change_id,
-                summary=summary,
+                summary=None if summary is None else redactor.text(summary),
             )
             .returning(ProfileChange.id)
         )

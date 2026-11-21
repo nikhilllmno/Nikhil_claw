@@ -1946,7 +1946,10 @@ already has the values. A change of the setup is always a proposal, with the rol
 proposal. The proposal keeps the values that the agent saw (`before`) and the new values
 (`after`), only for the fields that change. When a person approves it, the applier locks the
 profile and writes the change only if the profile still has the `before` values. Else the
-proposal is `failed` with "the profile changed after this change was made". A change that is not
+proposal is `failed` with "the profile changed after this change was made". After the lock, the
+applier also checks the role of the approver again, with a share lock on the membership rows. If
+the approver lost the role, the proposal is `failed` with "the person who approved it does not
+have the role now". A change that is not
 valid now (for example, a sub-agent that uses a removed toolset) also fails.
 
 The card shows a diff in place of the arguments, in the web app, Telegram, and Slack
@@ -1961,6 +1964,13 @@ Each approved change, each edit of an admin (Section 11.4), and each revert writ
 `profile_changes` is the same as for `agent_profiles`: an org owner or admin sees every row of
 the org, and a member sees the rows of the org profiles and of the profiles of the workspaces
 of the member.
+
+A member can read `profile_changes` directly (RLS), so the row has redacted values: sama replaces
+each known secret in `before`, `after`, and `summary` before the write, and sets `redacted` to
+true when the redaction changed a value. An example is a secret that an admin removes from a
+SOUL. A redacted change cannot be reverted (`409`), because sama does not keep the old values.
+The history redacts the values again before it makes the diff, because the `-` and `+` in front
+of each line can hide a secret of many lines from the redactor.
 
 **Approvals over chat.** A Slack card and a Telegram card have three buttons for a tool call:
 Approve, Deny, and "Always allow for me". A proposal card has Approve and Deny only, because a
@@ -3300,17 +3310,17 @@ kind that it changes.
 - `GET /orgs/{org_id}/agent-profiles/{profile_id}/changes` returns the newest 50 changes of the
   profile to each member who can see the profile (`404` for another user). Each change has
   `id`, `kind`, `source`, `summary`, `before`, `after`, `diff`, `actor_user_id`, `actor_name`,
-  `proposal_id`, `reverts_change_id`, `reverted_by_change_id`, and `created_at`. The answer is
-  redacted with the secrets of the org.
+  `proposal_id`, `reverts_change_id`, `reverted_by_change_id`, `redacted`, and `created_at`.
+  The answer is redacted with the secrets of the org.
 - `POST /orgs/{org_id}/agent-profiles/{profile_id}/changes/{change_id}/revert` writes the
   `before` values of the change again, as a new change with the source `revert`. Only an org
   owner or admin can do it (`403`). It needs the redactor of the org, as an edit does (`503`).
-  It gives `404` for an unknown change, `409` when the change is already reverted or when the
-  profile does not have the `after` values of the change now, and `422` when the old values are
+  It gives `404` for an unknown change, `409` when the change is already reverted, when the
+  change is redacted, or when the profile does not have the `after` values of the change now, and `422` when the old values are
   not valid now. The answer has the `id` of the new change and the profile.
 - The settings page of the web app has a History section below the form. It shows each change
   with its diff, who made it, and when. An org owner or admin has a Revert button with a
-  confirm step. The web app has no editor for policy rules, so a policy change shows only in
+  confirm step. A redacted change shows a note in place of the button. The web app has no editor for policy rules, so a policy change shows only in
   the history.
 - `python -m sama.admin subagents set` and the reset of the review model on a runtime switch do
   not write a history row.
