@@ -63,13 +63,17 @@ _MYSQL_DENIED: Final = re.compile(
 """MySQL and MariaDB: functions that read server files, hold session locks on a pooled
 connection, run user programs, or wait on replication."""
 _TSQL_DENIED: Final = re.compile(
-    r"^(?:openrowset|opendatasource|openquery|openxml|xp_.*|sp_.*|bulk)$", re.IGNORECASE
+    r"^(?:openrowset|opendatasource|openquery|openxml|xp_.*|sp_.*|bulk|fn_xe_.*|fn_trace_.*"
+    r"|fn_get_audit_file|fn_dblog|fn_dump_dblog|fn_get_sql)$",
+    re.IGNORECASE,
 )
-"""SQL Server: functions that read files or other servers, and the system procedures."""
+"""SQL Server: functions that read files, logs, or other servers, and the system
+procedures."""
 _CLICKHOUSE_DENIED: Final = re.compile(
-    r"^(?:file|url|urlcluster|s3|s3cluster|remote|remotesecure|cluster|clusterallreplicas"
-    r"|mysql|postgresql|mongodb|redis|sqlite|hdfs|hdfscluster|jdbc|odbc|executable|input"
-    r"|azureblobstorage|azureblobstoragecluster|gcs|hudi|deltalake|iceberg.*|hive|dictionary"
+    r"^(?:file.*|url.*|s3.*|remote.*|cluster.*"
+    r"|mysql.*|postgresql.*|mongodb.*|redis.*|sqlite.*|hdfs.*|jdbc|odbc|executable.*|input"
+    r"|azure.*|gcs.*|hudi.*|deltalake.*|iceberg.*|hive.*|paimon.*|arrowflight.*|ytsaurus.*"
+    r"|dictionary"
     r"|filesystem|fuzzjson|generaterandom|merge|view|loop|format|null|zeros.*|numbers_mt"
     r"|getsetting|getmacro|getserverport|currentprofiles|currentroles|enabledroles"
     r"|enabledprofiles|defaultprofiles|defaultroles|dictget.*|dicthas|dictisin|dictgetchildren"
@@ -84,11 +88,16 @@ _BIGQUERY_DENIED: Final = re.compile(r"^(?:external_query)$", re.IGNORECASE)
 """BigQuery: a query on another database through a connection."""
 _SNOWFLAKE_DENIED: Final = re.compile(
     r"^(?:system\$.*|get_presigned_url|build_scoped_file_url|build_stage_file_url"
-    r"|get_stage_location|get_relative_path|get_absolute_path|infer_schema)$",
+    r"|get_stage_location|get_relative_path|get_absolute_path|infer_schema|to_query|identifier"
+    r"|result_scan|get_ddl)$",
     re.IGNORECASE,
 )
-"""Snowflake: the system functions (they can cancel queries or change the account), and the
-functions that read stages (files)."""
+"""Snowflake: the system functions (they can cancel queries or change the account), the
+functions that read stages (files), and the functions that make SQL or a name from a text
+(``TO_QUERY``, ``IDENTIFIER``): the check cannot see the tables and columns of that text."""
+_SEQUENCE_FUNCTIONS: Final = re.compile(r"^(?:nextval|setval|getnextval)$", re.IGNORECASE)
+"""Functions that take the next value of a sequence or set it. A sequence change is not
+rolled back (SQL Server, MariaDB, Snowflake), so ``query`` refuses them."""
 _STATISTICS: Final = re.compile(r"^(?:pg_stats|pg_statistic|pg_stats_ext.*)$", re.IGNORECASE)
 """Views of column statistics. Their sample values can show hidden or other data."""
 _DDL_COMMANDS: Final = frozenset(
@@ -150,6 +159,10 @@ class Dialect:
     system_schemas: frozenset[str]
     """Schemas (lower case) that the check refuses when the tables are restricted. The
     ``schema`` tool shows the allowed tables."""
+    table_functions: frozenset[str] | None = None
+    """The functions (lower case) that a FROM item can be. ``None`` (PostgreSQL): every
+    function that is not denied. The other engines fail closed: a table function can read
+    files, URLs, or other servers, and the policy does not see its tables."""
 
     def fold_name(self, name: str) -> str:
         if self.fold == "lower":
@@ -163,16 +176,34 @@ POSTGRES: Final = Dialect(
     "postgres", "lower", _DENIED_FUNCTIONS, frozenset({"pg_catalog", "information_schema"})
 )
 _MYSQL_SYSTEM: Final = frozenset({"information_schema", "mysql", "performance_schema", "sys"})
-MYSQL: Final = Dialect("mysql", "keep", _MYSQL_DENIED, _MYSQL_SYSTEM)
-TSQL: Final = Dialect("tsql", "keep", _TSQL_DENIED, frozenset({"sys", "information_schema"}))
+MYSQL: Final = Dialect("mysql", "keep", _MYSQL_DENIED, _MYSQL_SYSTEM, frozenset({"json_table"}))
+TSQL: Final = Dialect(
+    "tsql",
+    "keep",
+    _TSQL_DENIED,
+    frozenset({"sys", "information_schema"}),
+    frozenset({"openjson", "string_split", "generate_series"}),
+)
 BIGQUERY: Final = Dialect(
-    "bigquery", "keep", _BIGQUERY_DENIED, frozenset({"information_schema", "region-us"})
+    "bigquery",
+    "keep",
+    _BIGQUERY_DENIED,
+    frozenset({"information_schema", "region-us"}),
+    frozenset(),
 )
 SNOWFLAKE: Final = Dialect(
-    "snowflake", "upper", _SNOWFLAKE_DENIED, frozenset({"information_schema", "account_usage"})
+    "snowflake",
+    "upper",
+    _SNOWFLAKE_DENIED,
+    frozenset({"information_schema", "account_usage"}),
+    frozenset({"flatten", "split_to_table", "generator"}),
 )
 CLICKHOUSE: Final = Dialect(
-    "clickhouse", "keep", _CLICKHOUSE_DENIED, frozenset({"system", "information_schema"})
+    "clickhouse",
+    "keep",
+    _CLICKHOUSE_DENIED,
+    frozenset({"system", "information_schema"}),
+    frozenset({"numbers", "generate_series", "generateseries"}),
 )
 
 _DIALECT: ContextVar[Dialect] = ContextVar("sama_sql_dialect", default=POSTGRES)
@@ -215,9 +246,14 @@ class Policy:
                 return False
             return not self.tables or bool({(None, table), (schema, table)} & self.tables)
         if self.fixed_path is not None:
-            if not self.restricted or (None, table) in self.tables:
+            if not self.restricted:
                 return True
-            return bool(self.fixed_path) and self.table_allowed(self.fixed_path[0], table)
+            if self.fixed_path:
+                # The engine reads the name in its fixed schema: check that schema too.
+                return self.table_allowed(self.fixed_path[0], table)
+            # The gateway does not know the schema (SQL Server): a name alone is safe only
+            # when every schema is allowed and the name is allowed in each schema.
+            return not self.schemas and (None, table) in self.tables
         if not self.tables or (None, table) in self.tables:
             # The search path is the allowed schemas, or all schemas are allowed.
             return True
@@ -287,8 +323,25 @@ def _check(sql: str, mode: Mode, policy: Policy) -> Checked:
     return _check_execute(text, statement, policy)
 
 
+def _no_comments(text: str) -> None:
+    """The engines other than PostgreSQL do not get SQL comments. A server can read a comment
+    in a way that sqlglot does not: MySQL and MariaDB run the text of ``/*! ... */`` and
+    ``/*M! ... */``, MySQL reads ``/*+ ... */`` as hints that can set variables, and SQL
+    Server nests comments. So the check refuses all comments."""
+    dialect = _DIALECT.get()
+    if dialect is POSTGRES:
+        return
+    try:
+        tokens = sqlglot.Dialect.get_or_raise(dialect.name).tokenize(text)
+    except SqlglotError as error:
+        raise SqlRejectedError(f"the SQL does not parse: {_short(error)}") from None
+    if any(token.comments for token in tokens):
+        raise SqlRejectedError("SQL comments are not allowed on this engine. Remove them")
+
+
 def _one(text: str) -> exp.Expr:
     """The single statement of the text. More than one statement, or none, is refused."""
+    _no_comments(text)
     logger = logging.getLogger("sqlglot")
     level = logger.level
     logger.setLevel(logging.ERROR)  # sqlglot warns when it falls back to a Command.
@@ -325,7 +378,21 @@ def _check_read(statement: exp.Expr, policy: Policy) -> frozenset[str]:
         if isinstance(node, exp.Select) and node.args.get("format") is not None:
             # ClickHouse FORMAT: the gateway reads the rows in its own format.
             raise SqlRejectedError("a FORMAT clause is not allowed. The gateway sets the format")
+        if _DIALECT.get() is not POSTGRES and _takes_sequence_value(node):
+            raise SqlRejectedError(
+                "query cannot take a sequence value (NEXT VALUE FOR, NEXTVAL): the change is "
+                "not rolled back. Use execute"
+            )
     return _check_common(statement, policy)
+
+
+def _takes_sequence_value(node: exp.Expr) -> bool:
+    """``NEXT VALUE FOR s``, ``nextval(s)``, ``setval(...)``, or ``s.nextval``."""
+    if type(node).__name__ == "NextValueFor":
+        return True
+    if isinstance(node, exp.Func) and _SEQUENCE_FUNCTIONS.match(_function_name(node)):
+        return True
+    return isinstance(node, exp.Column) and node.name.lower() == "nextval"
 
 
 def _check_execute(text: str, statement: exp.Expr, policy: Policy) -> Checked:
@@ -388,6 +455,17 @@ def _check_common(statement: exp.Expr, policy: Policy) -> frozenset[str]:
         name = _function_name(node)
         if name and dialect.denied.match(name):
             raise SqlRejectedError(f"the function {name} is not allowed")
+    for item in statement.walk():
+        if type(item).__name__ == "DynamicIdentifier":
+            # Snowflake IDENTIFIER('...'): a name from a text, which the check cannot see.
+            raise SqlRejectedError("IDENTIFIER(...) is not allowed. Write the name")
+        source = _relation_function(item)
+        if source is not None and dialect.table_functions is not None:
+            name = _function_name(source).lower()
+            if name not in dialect.table_functions:
+                raise SqlRejectedError(
+                    f"the table function {name} is not allowed on this engine. Read a table"
+                )
     for table in statement.find_all(exp.Table):
         alias = _alias_name(table)
         if not isinstance(table.this, exp.Identifier):
@@ -426,7 +504,9 @@ def _check_common(statement: exp.Expr, policy: Policy) -> frozenset[str]:
         if policy.restricted and schema is not None and schema.lower() in dialect.system_schemas:
             raise SqlRejectedError(f"{schema}.{name} is not an allowed table. Use the schema tool")
         if not policy.table_allowed(schema, name):
-            if schema is None and any(t == name for s, t in policy.tables if s is not None):
+            if schema is None and (
+                policy.fixed_path == () or any(t == name for s, t in policy.tables if s is not None)
+            ):
                 raise SqlRejectedError(
                     f"give the schema of {name} (for example schema.{name}); the name alone "
                     "can be a table that is not allowed"
@@ -440,6 +520,23 @@ def _check_common(statement: exp.Expr, policy: Policy) -> frozenset[str]:
     if drop:
         _check_hidden(statement, policy, aliases, derived, drop)
     return drop
+
+
+def _relation_function(node: exp.Expr) -> exp.Func | None:
+    """The function of a FROM or JOIN item (``FROM f(...)``, ``TABLE(f(...))``,
+    ``LATERAL f(...)``, ``CROSS APPLY s.f(...)``), or ``None``. An item that is not a table,
+    a subquery, or a function gives a name that no list has (fail closed)."""
+    rows = type(node).__name__ == "TableFromRows"
+    if not (isinstance(node, (exp.Table, exp.Lateral)) or rows):
+        return None
+    inner = node.this
+    if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Func):
+        inner = inner.expression  # A function with a schema: sys.dm_exec_sql_text(...).
+    if isinstance(inner, exp.Func):
+        return inner
+    if isinstance(node, exp.Table) or isinstance(inner, (exp.Subquery, exp.Query)):
+        return None
+    return exp.Anonymous(this="unknown")
 
 
 def _name(identifier: exp.Identifier) -> str:
@@ -488,6 +585,18 @@ def _check_hidden(
 ) -> None:
     """``names``: the hidden column names that apply to the tables of the statement."""
     relations = {r.lower() for r in set(aliases) | derived}
+    for node in statement.find_all(exp.Select):
+        if node.args.get("kind"):
+            # BigQuery SELECT AS STRUCT / AS VALUE: the row is one value, so the gateway
+            # cannot drop a hidden column from it by its name.
+            raise SqlRejectedError(
+                "SELECT AS STRUCT and SELECT AS VALUE are not allowed when columns are hidden"
+            )
+    if _DIALECT.get() is SNOWFLAKE and any(statement.find_all(exp.Parameter)):
+        # Snowflake $1, $2: a column by its position, which can be a hidden column.
+        raise SqlRejectedError(
+            "$1, $2 (a column by position) are not allowed when columns are hidden"
+        )
     for column in statement.find_all(exp.Column):
         if isinstance(column.this, exp.Star):
             _check_star(column, statement)
@@ -516,9 +625,9 @@ def _check_hidden(
             raise SqlRejectedError(
                 "column names after an alias are not allowed when columns are hidden"
             )
-    for node in statement.walk():
+    for item in statement.walk():
         # SQL Server FOR JSON and FOR XML put all columns in one value.
-        if type(node).__name__ == "ForClause":
+        if type(item).__name__ == "ForClause":
             raise SqlRejectedError("FOR JSON and FOR XML are not allowed when columns are hidden")
     for dot in statement.find_all(exp.Dot):
         # (row).column reads a field of a whole row: ``(u).email``.

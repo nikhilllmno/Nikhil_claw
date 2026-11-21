@@ -6,17 +6,28 @@ the SSH tunnel pool (Section 10.6)."""
 
 from __future__ import annotations
 
+import asyncio
+import ssl
 from typing import Any
 
+import aiomysql
 import asyncssh
 import pytest
+from pymysql.constants import CLIENT
 
+from sama.connectors.dbcore import Target
+from sama.connectors.dbsettings import DbSettings
+from sama.connectors.engines import EngineContext
 from sama.connectors.engines.clickhouse import _error, bind
+from sama.connectors.engines.mysql import _Connection as MySqlConnection
+from sama.connectors.engines.mysql import open_session as mysql_session
 from sama.connectors.http_api import DriverError
 from sama.connectors.mongoquery import drop_hidden, read_of
 from sama.connectors.sql import (
+    BIGQUERY,
     CLICKHOUSE,
     MYSQL,
+    SNOWFLAKE,
     TSQL,
     SqlRejectedError,
     check,
@@ -28,15 +39,21 @@ MYSQL_POLICY = policy_of(fixed_path=("shop",))
 CLICKHOUSE_POLICY = policy_of(fixed_path=("shop",))
 TSQL_POLICY = policy_of(fixed_path=(), catalog="shop")
 HIDDEN_TSQL = policy_of(fixed_path=(), catalog="shop", hidden_columns=["ssn"])
+BIGQUERY_POLICY = policy_of(fixed_path=("sales",), catalog="proj")
+SNOWFLAKE_POLICY = policy_of(fixed_path=("PUBLIC",), catalog="SHOP")
+ALL = [
+    (MYSQL, MYSQL_POLICY),
+    (TSQL, TSQL_POLICY),
+    (CLICKHOUSE, CLICKHOUSE_POLICY),
+    (BIGQUERY, BIGQUERY_POLICY),
+    (SNOWFLAKE, SNOWFLAKE_POLICY),
+]
 
 
 # -- SQL dialects ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("dialect", "policy"),
-    [(MYSQL, MYSQL_POLICY), (TSQL, TSQL_POLICY), (CLICKHOUSE, CLICKHOUSE_POLICY)],
-)
+@pytest.mark.parametrize(("dialect", "policy"), ALL)
 @pytest.mark.parametrize(
     "sql",
     ["insert into users values (1)", "delete from users", "explain select 1", "drop table users"],
@@ -46,10 +63,127 @@ def test_query_mode_runs_only_select_in_every_dialect(dialect: Any, policy: Any,
         check(sql, "query", policy, dialect)
 
 
-def test_query_mode_takes_a_select_in_every_dialect() -> None:
-    assert check("select 1", "query", MYSQL_POLICY, MYSQL).kind == "select"
-    assert check("select 1", "query", TSQL_POLICY, TSQL).kind == "select"
-    assert check("select 1", "query", CLICKHOUSE_POLICY, CLICKHOUSE).kind == "select"
+@pytest.mark.parametrize(("dialect", "policy"), ALL)
+def test_query_mode_takes_a_select_in_every_dialect(dialect: Any, policy: Any) -> None:
+    assert check("select 1", "query", policy, dialect).kind == "select"
+
+
+@pytest.mark.parametrize(("dialect", "policy"), ALL)
+@pytest.mark.parametrize(
+    "sql",
+    ["select 1 /* c */", "select 1 -- c", "select 1 /*! , ssn */ from users"],
+)
+def test_comments_are_refused_in_every_dialect(dialect: Any, policy: Any, sql: str) -> None:
+    """A server can read a comment as SQL (MySQL ``/*! */``, MariaDB ``/*M! */``, hints)."""
+    with pytest.raises(SqlRejectedError, match="comments"):
+        check(sql, "query", policy, dialect)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select 1 /*! , ssn as leaked */ from users",
+        "select 1 /*M! , ssn */ from users",
+        "select 1 /*+ SET_VAR(max_execution_time=0) */ from users",
+        "select 1 # c\n from users",
+        "select 1 /*! ; commit */",
+    ],
+)
+def test_mysql_executable_comments_and_hints_are_refused(sql: str) -> None:
+    hidden = policy_of(fixed_path=("shop",), hidden_columns=["ssn"])
+    with pytest.raises(SqlRejectedError, match="comments"):
+        check(sql, "query", hidden, MYSQL)
+    # A comment-like text inside a string is a value, not a comment.
+    check("select '/*! x */' from users", "query", hidden, MYSQL)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (SNOWFLAKE, "select EMAIL from IDENTIFIER('PRIVATE.USERS')"),
+        (SNOWFLAKE, "select IDENTIFIER('SSN') from USERS"),
+        (SNOWFLAKE, "select * from TABLE(TO_QUERY('select SSN from PRIVATE.USERS'))"),
+        (SNOWFLAKE, "select * from TABLE(RESULT_SCAN(LAST_QUERY_ID()))"),
+        (CLICKHOUSE, "select * from deltaLakeS3('https://example.com/x')"),
+        (CLICKHOUSE, "select * from deltaLakeCluster('c', 'https://example.com/x')"),
+        (CLICKHOUSE, "select * from someNewTableFunction(1)"),
+        (TSQL, "select * from sys.fn_xe_file_target_read_file('a', null, null, null)"),
+        (TSQL, "select * from dbo.t cross apply sys.dm_exec_sql_text(t.h) q"),
+        (MYSQL, "select * from some_table_function(1) f"),
+    ],
+)
+def test_dynamic_names_and_unlisted_table_functions_are_refused(dialect: Any, sql: str) -> None:
+    """A table function or a name from a text can read what the policy does not see."""
+    policy = dict(ALL)[dialect]
+    with pytest.raises(SqlRejectedError):
+        check(sql, "query", policy, dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (SNOWFLAKE, "select f.value from T, lateral flatten(input => T.X) f"),
+        (SNOWFLAKE, "select * from TABLE(GENERATOR(ROWCOUNT => 3))"),
+        (CLICKHOUSE, "select * from numbers(3)"),
+        (TSQL, "select * from openjson('[1]')"),
+        (MYSQL, "select * from json_table('[1]', '$[*]' columns (a int path '$')) j"),
+        (BIGQUERY, "select * from unnest([1, 2])"),
+    ],
+)
+def test_listed_table_functions_are_allowed(dialect: Any, sql: str) -> None:
+    check(sql, "query", dict(ALL)[dialect], dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (TSQL, "select next value for dbo.order_seq"),
+        (SNOWFLAKE, "select ORDER_SEQ.NEXTVAL"),
+        (SNOWFLAKE, "select GETNEXTVAL(ORDER_SEQ)"),
+        (MYSQL, "select nextval(order_seq)"),
+        (MYSQL, "select setval(order_seq, 1)"),
+    ],
+)
+def test_query_mode_refuses_sequence_changes(dialect: Any, sql: str) -> None:
+    """A sequence value is not rolled back, so it is a write."""
+    with pytest.raises(SqlRejectedError):
+        check(sql, "query", dict(ALL)[dialect], dialect)
+
+
+def test_bigquery_select_as_struct_is_refused_when_columns_are_hidden() -> None:
+    hidden = policy_of(fixed_path=("sales",), catalog="proj", hidden_columns=["email"])
+    check("select as struct * from users", "query", BIGQUERY_POLICY, BIGQUERY)
+    for sql in ("select as struct * from users", "select as value u from users u"):
+        with pytest.raises(SqlRejectedError):
+            check(sql, "query", hidden, BIGQUERY)
+
+
+def test_snowflake_column_positions_are_refused_when_columns_are_hidden() -> None:
+    hidden = policy_of(fixed_path=("PUBLIC",), catalog="SHOP", hidden_columns=["email"])
+    check("select $2 from USERS", "query", SNOWFLAKE_POLICY, SNOWFLAKE)
+    with pytest.raises(SqlRejectedError, match="position"):
+        check("select $2 from USERS", "query", hidden, SNOWFLAKE)
+
+
+@pytest.mark.parametrize(("dialect", "default"), [(MYSQL, "shop"), (CLICKHOUSE, "shop")])
+def test_a_table_name_alone_is_checked_in_the_default_schema(dialect: Any, default: str) -> None:
+    """``tables=orders`` with ``schemas=dbo``: a name alone is in the default schema, which
+    must be an allowed schema."""
+    outside = policy_of(schemas=["other"], tables=["orders"], fixed_path=(default,))
+    with pytest.raises(SqlRejectedError):
+        check("select * from orders", "query", outside, dialect)
+    inside = policy_of(schemas=[default], tables=["orders"], fixed_path=(default,))
+    check("select * from orders", "query", inside, dialect)
+
+
+def test_sql_server_needs_the_schema_with_a_schema_list() -> None:
+    policy = policy_of(schemas=["dbo"], tables=["orders"], fixed_path=(), catalog="shop")
+    with pytest.raises(SqlRejectedError, match="give the schema"):
+        check("select * from orders", "query", policy, TSQL)
+    check("select * from dbo.orders", "query", policy, TSQL)
+    # Only a table list (every schema): the name alone is allowed in each schema.
+    any_schema = policy_of(tables=["orders"], fixed_path=(), catalog="shop")
+    check("select * from orders", "query", any_schema, TSQL)
 
 
 @pytest.mark.parametrize(
@@ -248,3 +382,87 @@ async def test_a_changed_form_opens_a_new_tunnel() -> None:
     await tunnels.discard("a")
     assert opener.opened[1][0].closed
     assert tunnels.open_count() == 0
+
+
+# -- MySQL TLS ------------------------------------------------------------------------------
+
+
+async def test_mysql_does_not_send_the_login_without_tls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """aiomysql sends the login in plain text when the server does not offer TLS. The
+    gateway connection stops first, and it does not ask for multi-statements."""
+    tls = ssl.create_default_context()
+    connection = MySqlConnection(host="db.example.com", user="u", password="p", ssl=tls)
+    connection.server_capabilities = 0
+    with pytest.raises(DriverError, match="does not offer TLS"):
+        await connection._request_authentication()
+    sent: list[int] = []
+
+    async def fake_auth(self: Any) -> None:
+        sent.append(self.client_flag)
+
+    monkeypatch.setattr(aiomysql.Connection, "_request_authentication", fake_auth)
+    plain = MySqlConnection(host="db.example.com", user="u", password="p")
+    plain.server_capabilities = 0
+    assert plain.client_flag & CLIENT.MULTI_STATEMENTS
+    await plain._request_authentication()
+    assert sent == [plain.client_flag]
+    assert not plain.client_flag & CLIENT.MULTI_STATEMENTS
+
+
+def _handshake(capabilities: int) -> bytes:
+    """A MySQL server greeting (protocol 10) with the given capability flags."""
+    body = (
+        b"\x0a8.0.0-fake\x00"
+        + (1).to_bytes(4, "little")
+        + b"abcdefgh\x00"
+        + (capabilities & 0xFFFF).to_bytes(2, "little")
+        + b"\x2d"
+        + b"\x02\x00"
+        + (capabilities >> 16).to_bytes(2, "little")
+        + b"\x15"
+        + b"\x00" * 10
+        + b"ijklmnopqrst\x00"
+        + b"mysql_native_password\x00"
+    )
+    return len(body).to_bytes(3, "little") + b"\x00" + body
+
+
+async def test_a_mysql_server_without_tls_gets_no_login() -> None:
+    """The gateway stops at the greeting of a server that does not offer TLS: the server
+    gets no bytes, so the password does not go out in plain text."""
+    received: list[bytes] = []
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        no_tls = CLIENT.PROTOCOL_41 | CLIENT.SECURE_CONNECTION | CLIENT.PLUGIN_AUTH
+        writer.write(_handshake(no_tls))
+        await writer.drain()
+        try:
+            received.append(await asyncio.wait_for(reader.read(4096), 2))
+        except TimeoutError:
+            received.append(b"")
+        writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    settings = DbSettings(
+        host="db.example.com",
+        port=port,
+        database="shop",
+        user="u",
+        password="secret-password",
+        sslmode="require",
+        writes=False,
+        policy=MYSQL_POLICY,
+        engine="mysql",
+    )
+    async with server:
+        with pytest.raises(DriverError, match="does not offer TLS"):
+            async with mysql_session(
+                settings, Target("127.0.0.1", port), EngineContext(timeout_s=5), write=False
+            ):
+                pass
+        for _ in range(100):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+    assert received == [b""]

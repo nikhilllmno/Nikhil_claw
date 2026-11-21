@@ -9,6 +9,10 @@ context of the gateway (the real host name for SNI and the certificate).
 - A write runs in a transaction that is committed. MySQL commits DDL at once: a DDL
   statement cannot be rolled back.
 - A lock wait stops after 5 seconds (``innodb_lock_wait_timeout``).
+- TLS fails closed: when the form needs TLS and the server does not offer it, the gateway
+  stops before it sends the login. The client does not ask for multi-statements.
+- The session has a fixed ``sql_mode`` without ``ANSI_QUOTES`` and ``NO_BACKSLASH_ESCAPES``,
+  so the server reads strings and names as the SQL check reads them.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from typing import Any, Final
 
 import aiomysql
 import pymysql
+from pymysql.constants import CLIENT
 
 from sama.connectors.dbcore import (
     ColumnInfo,
@@ -46,6 +51,26 @@ _KEY_CODES: Final = {
 }
 """Errors whose text has the key value. The gateway shows a fixed text (as the PostgreSQL
 detail, the value can be a row value)."""
+SQL_MODE: Final = "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+"""The ``sql_mode`` of each session. ``ANSI_QUOTES`` (a double-quoted text is a name) and
+``NO_BACKSLASH_ESCAPES`` change how the server splits the SQL text, so they are off: the
+server then reads the text as the SQL check (sqlglot, MySQL dialect) reads it."""
+
+
+class _Connection(aiomysql.Connection):  # type: ignore[misc]
+    """An aiomysql connection that does not fall back to plain text. aiomysql starts TLS only
+    when the server offers it, and else sends the login without TLS."""
+
+    async def _request_authentication(self) -> None:
+        if self._ssl_context and not self.server_capabilities & CLIENT.SSL:
+            raise DriverError(
+                "the database server does not offer TLS, and this connection needs TLS "
+                "(sslmode). The gateway did not send the login"
+            )
+        # One statement for each call: the SQL check passes exactly one statement.
+        self.client_flag &= ~CLIENT.MULTI_STATEMENTS
+        await super()._request_authentication()
+
 
 _COLUMNS_SQL: Final = """
 SELECT c.TABLE_SCHEMA, c.TABLE_NAME, t.TABLE_TYPE, t.TABLE_COMMENT, c.COLUMN_NAME,
@@ -153,22 +178,28 @@ def _error(error: pymysql.MySQLError, settings: DbSettings) -> DriverError:
 async def open_session(
     settings: DbSettings, target: Target, context: EngineContext, *, write: bool
 ) -> AsyncIterator[MySqlSession]:
+    tls = context.tls(settings)
+    connection = _Connection(
+        host=target.host,
+        port=target.port,
+        user=settings.user,
+        password=settings.password,
+        db=settings.database,
+        ssl=tls,
+        connect_timeout=10,
+        autocommit=False,
+        charset="utf8mb4",
+        local_infile=False,
+        program_name="sama",
+        sql_mode=f"'{SQL_MODE}'",
+    )
     try:
-        connection = await aiomysql.connect(
-            host=target.host,
-            port=target.port,
-            user=settings.user,
-            password=settings.password,
-            db=settings.database,
-            ssl=context.tls(settings),
-            connect_timeout=10,
-            autocommit=False,
-            charset="utf8mb4",
-            local_infile=False,
-            program_name="sama",
-        )
+        await connection._connect()
     except pymysql.MySQLError as error:
         raise _error(error, settings) from None
+    if tls is not None and connection._writer.get_extra_info("ssl_object") is None:
+        connection.close()
+        raise DriverError("the connection to the database is not encrypted (TLS)")
     try:
         async with connection.cursor() as cursor:
             limit_s = int(context.timeout_s)

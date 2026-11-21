@@ -2650,28 +2650,54 @@ at the driver, so a prompt cannot remove them.
   - ClickHouse: the table functions that read files, URLs, or other servers (`file`, `url`,
     `s3`, `remote`, `mysql`, ...), `dictGet`, `joinGet`, `COLUMNS`, and the functions that
     show settings or roles. A `FORMAT` clause is refused: the gateway sets the format.
-  - BigQuery: `EXTERNAL_QUERY`. Snowflake: the `SYSTEM$` functions and the stage functions.
+  - BigQuery: `EXTERNAL_QUERY`. Snowflake: the `SYSTEM$` functions, the stage functions,
+    `TO_QUERY`, `IDENTIFIER`, `RESULT_SCAN`, and `GET_DDL`.
+
+  The engines that are not PostgreSQL also have these rules:
+  - **No comments.** A statement with a comment is refused. MySQL and MariaDB run the text of
+    `/*! ... */` and `/*M! ... */` as SQL, and an optimizer hint (`/*+ ... */`) can change
+    the time limit. So the check cannot trust a comment. A comment-like text in a string is a
+    value and is allowed.
+  - **Table functions.** A function in `FROM`, `JOIN`, `LATERAL`, or `CROSS APPLY` must be
+    on the list of the engine. Other table functions can read files, URLs, logs, or other
+    servers. The lists: MySQL and MariaDB `JSON_TABLE`; SQL Server `OPENJSON`,
+    `STRING_SPLIT`, and `GENERATE_SERIES`; Snowflake `FLATTEN`, `SPLIT_TO_TABLE`, and
+    `GENERATOR`; ClickHouse `numbers` and `generate_series`; BigQuery none (`UNNEST` is not
+    a function here, so it is allowed).
+  - **Names from text.** Snowflake `IDENTIFIER('...')` is refused, because the check cannot
+    see the name.
+  - **Sequences.** `query` and `export` refuse `NEXT VALUE FOR`, `NEXTVAL`, `SETVAL`, and
+    `GETNEXTVAL`. A rollback does not undo a sequence value, so use `execute`.
 - **Names.** A schema is a database for MySQL, MariaDB, and ClickHouse, and a dataset for
   BigQuery. A name without a schema is in the database of the form (MySQL, ClickHouse), the
   default dataset (BigQuery), or the schema of the form (Snowflake). Snowflake makes names
   without quotes upper case. SQL Server has no fixed default schema for the gateway, so a
-  restricted SQL Server connection needs the schema in each name (`dbo.orders`). A name with a
+  restricted SQL Server connection with a schema list needs the schema in each name
+  (`dbo.orders`). A name without a schema is checked in the default schema: with
+  `schemas=other` and `tables=orders`, `select * from orders` on MySQL (database `shop`) is
+  refused, because `shop.orders` is not allowed. A name with a
   database part must use the database of the form (SQL Server, Snowflake) or the project
   (BigQuery).
 - **Hidden columns.** The rules of PostgreSQL apply. Each engine also refuses the forms that
-  read a whole row: `FOR JSON` and `FOR XML` (SQL Server), a `*` in a value subquery, and
-  `tuple(t.*)` (ClickHouse).
+  read a whole row: `FOR JSON` and `FOR XML` (SQL Server), a `*` in a value subquery,
+  `tuple(t.*)` (ClickHouse), `SELECT AS STRUCT` and `SELECT AS VALUE` (BigQuery), and a
+  column position such as `$2` (Snowflake).
 - **Read only and time limits.**
   - MySQL and MariaDB: a read runs in `START TRANSACTION READ ONLY` and is rolled back. The
     time limit is `max_execution_time` (MySQL) or `max_statement_time` (MariaDB). A lock wait
-    stops after 5 seconds.
+    stops after 5 seconds. The gateway sets a fixed `sql_mode` without `ANSI_QUOTES` and
+    `NO_BACKSLASH_ESCAPES`, so the server reads quotes and strings as the check does. The
+    driver does not ask for multi-statements. With TLS, the gateway does not send the login
+    when the server does not offer TLS, and it closes a connection that is not encrypted.
   - SQL Server has no read-only transaction. A read runs in a transaction that is always
     rolled back, and the SQL check refuses writes. `SET LOCK_TIMEOUT` is 5 seconds. A
     statement stops when the socket has no answer for the time limit.
   - ClickHouse has no transactions. A read has `readonly=1`, so the server refuses each write
     and each change of a setting (also a `SETTINGS` clause). The time limit is
     `max_execution_time`. A write is done at once.
-  - BigQuery: the time limit is `timeoutMs`, and the gateway cancels a job that runs longer.
+  - BigQuery: the time limit is `timeoutMs`, and each job also has `jobTimeoutMs`, so
+    BigQuery stops a job that runs longer. The gateway cancels the job when the time limit
+    ends, when a poll fails, and when the call is cancelled.
     Each job has `maximumBytesBilled` (the form value, default 1 GB, at least 10 MB): BigQuery
     refuses a query that would bill more, and the query costs nothing.
   - Snowflake: each statement has `MULTI_STATEMENT_COUNT` 1. The gateway polls a long
@@ -2694,11 +2720,15 @@ at the driver, so a prompt cannot remove them.
 - **Connections.** The new engines open one connection (or one HTTPS session) for each call
   and close it after the call. They keep no pool. The limit of 4 calls at a time for each
   org applies to all engines.
-- **Tests.** Each engine has the M3.11 tests: `query` is read only, DDL is denied by default,
-  `execute` changes rows with parameters, a query stops after the time limit, the model gets
-  at most 1,000 rows and 50 KB and the rest spills to a file, hidden columns never appear,
-  only the allowed tables and schemas show, `export` writes a CSV file, and the form test
-  uses the gateway.
+- **Tests.** MySQL, MariaDB, SQL Server, ClickHouse, and MongoDB have the M3.11 tests
+  against real servers: `query` is read only, DDL is denied by default, `execute` changes rows
+  with parameters, a query stops after the time limit, the model gets at most 1,000 rows and
+  50 KB and the rest spills to a file, hidden columns never appear, only the allowed tables
+  and schemas show, `export` writes a CSV file, and the form test uses the gateway.
+  BigQuery and Snowflake are tested only against fakes (see below): the requests, the limits,
+  the time limit and the cancel, the pages, the errors, the schema, and the SQL check of
+  their dialects. The M3.11 tests through the whole gateway (spill, `export`, hidden columns
+  in the result) do not run for them. That gateway code is the same for all SQL engines.
   - `tests/db/test_database_engines.py` (MySQL, MariaDB, SQL Server, ClickHouse),
     `tests/db/test_database_mongo.py`, and `tests/db/test_database_tunnel.py` run against
     real servers in docker. `scripts/test-databases.sh` starts the servers and runs the
@@ -2707,8 +2737,9 @@ at the driver, so a prompt cannot remove them.
   - BigQuery and Snowflake have no docker image. `tests/connectors/test_engine_bigquery.py`
     and `test_engine_snowflake.py` test them against fakes of the REST APIs (`httpx`
     transports). No test calls the real services.
-  - `tests/connectors/test_engines.py` tests the dialect checks, the MongoDB read check, the
-    ClickHouse parameters, and the tunnel pool without a server.
+  - `tests/connectors/test_engines.py` tests the dialect checks of all five SQL dialects,
+    the MongoDB read check, the ClickHouse parameters, the MySQL TLS check (with a fake
+    server greeting), and the tunnel pool without a server.
 
 ### 10.5 Connector hosts for stdio MCP servers
 

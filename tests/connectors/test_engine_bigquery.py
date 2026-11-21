@@ -3,6 +3,7 @@ time limit, errors, and the schema tools (no Google account)."""
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 from collections.abc import AsyncIterator, Callable
@@ -355,6 +356,58 @@ async def test_a_job_over_the_time_limit_is_cancelled(monkeypatch: pytest.Monkey
             await opened.rows("SELECT 1", [], collector())
     assert len(fake.calls(CANCEL)) == 1
     assert fake.queries(CANCEL)[0] == {"location": "EU"}
+
+
+async def test_each_job_has_a_job_time_limit() -> None:
+    fake = Fake({QUERIES: lambda body, req: {"jobComplete": True, "schema": SCHEMA}})
+    async with session(fake, timeout_s=7) as opened:
+        await opened.rows("SELECT 1", [], collector())
+    assert fake.calls(QUERIES)[0]["jobTimeoutMs"] == "7000"
+
+
+async def test_a_poll_that_fails_cancels_the_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A network error while the gateway polls: the job does not run on."""
+    monkeypatch.setattr(bigquery, "POLL_S", 0.01)
+
+    def down(body: dict[str, Any], req: httpx.Request) -> Any:
+        raise httpx.ConnectError("down")
+
+    fake = Fake(
+        {
+            QUERIES: lambda body, req: {"jobComplete": False, "jobReference": JOB},
+            RESULTS: down,
+            CANCEL: lambda body, req: {"job": {}},
+        }
+    )
+    async with session(fake) as opened:
+        with pytest.raises(DriverUnavailableError):
+            await opened.rows("SELECT 1", [], collector())
+    assert len(fake.calls(CANCEL)) == 1
+
+
+async def test_a_cancelled_call_cancels_the_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway cancels the call (its outer time limit): the job is cancelled too."""
+    monkeypatch.setattr(bigquery, "POLL_S", 0.01)
+    polled = asyncio.Event()
+
+    def pending(body: dict[str, Any], req: httpx.Request) -> Any:
+        polled.set()
+        return {"jobComplete": False, "jobReference": JOB}
+
+    fake = Fake(
+        {
+            QUERIES: lambda body, req: {"jobComplete": False, "jobReference": JOB},
+            RESULTS: pending,
+            CANCEL: lambda body, req: {"job": {}},
+        }
+    )
+    async with session(fake, timeout_s=60) as opened:
+        task = asyncio.create_task(opened.rows("SELECT 1", [], collector()))
+        await asyncio.wait_for(polled.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert len(fake.calls(CANCEL)) == 1
 
 
 async def test_the_bytes_billed_limit_error_comes_through() -> None:

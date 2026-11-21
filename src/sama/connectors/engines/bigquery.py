@@ -49,6 +49,10 @@ POLL_S: Final = 0.2
 """The wait between two polls of a job that is not complete."""
 MAX_POLL_MS: Final = 10_000
 """The most time that one poll waits at the server."""
+CALL_MARGIN_S: Final = 5.0
+"""The time that one poll can take after the time limit of its ``timeoutMs`` wait."""
+CANCEL_S: Final = 5.0
+"""The longest time for the cancel of a job."""
 MAX_LIST_ROWS: Final = 100_000
 UNAVAILABLE_CODES: Final = frozenset({408, 429})
 """Client codes that mean "try again later". Every 5xx code also means that."""
@@ -210,6 +214,11 @@ class BigQuerySession:
         with contextlib.suppress(DriverError):
             await self._call("POST", f"/jobs/{quote(job_id, safe='')}/cancel", params=params)
 
+    async def _stop(self, job: Mapping[str, Any]) -> None:
+        """Cancels an unfinished job in a bounded time, also when the call is cancelled."""
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(self._cancel(job)), CANCEL_S)
+
     async def _query(self, sql: str, params: Sequence[Any], sink: _Sink) -> str:
         """Runs one statement and gives its rows to ``sink``. Returns the status."""
         check_params(sql, "bigquery", params)
@@ -219,6 +228,8 @@ class BigQuerySession:
             "useLegacySql": False,
             "dryRun": False,
             "timeoutMs": max(1, int(self._timeout_s * 1000)),
+            # The job itself stops at the time limit, also when the gateway cannot cancel it.
+            "jobTimeoutMs": str(max(1000, int(self._timeout_s * 1000))),
             "maxResults": PAGE_ROWS,
         }
         if self._max_bytes:
@@ -235,15 +246,22 @@ class BigQuerySession:
         job = job if isinstance(job, dict) else {}
         if not job.get("location") and self._location:
             job = {**job, "location": self._location}
-        while not data.get("jobComplete", True):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                await self._cancel(job)
-                raise self._wrong_time()
-            await asyncio.sleep(min(POLL_S, remaining))
-            remaining = max(deadline - time.monotonic(), 0.001)
-            wait = max(1, int(min(remaining * 1000, MAX_POLL_MS)))
-            data = await self._results(job, {"timeoutMs": str(wait)})
+        try:
+            while not data.get("jobComplete", True):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._wrong_time()
+                await asyncio.sleep(min(POLL_S, remaining))
+                remaining = max(deadline - time.monotonic(), 0.001)
+                wait = max(1, int(min(remaining * 1000, MAX_POLL_MS)))
+                data = await asyncio.wait_for(
+                    self._results(job, {"timeoutMs": str(wait)}), remaining + CALL_MARGIN_S
+                )
+        except BaseException:
+            # The time limit, a network error, or a cancel of the call: the job does not
+            # run on without the gateway.
+            await self._stop(job)
+            raise
         status = ""
         fields: list[Mapping[str, Any]] | None = None
         while True:
