@@ -39,7 +39,21 @@ export function SubagentsSection() {
           <SubagentList orgId={choice.org.id} profile={profile} readOnly={readOnly} onSaved={onSaved} />
         )}
       </AgentProfileEditor>
-      {choice.workspaceId ? <SubagentLibrary orgId={choice.org.id} workspaceId={choice.workspaceId} /> : null}
+      {choice.workspaceId ? (
+        <section className={`card ${styles.card}`} aria-labelledby="sub-library">
+          <h2 id="sub-library" className={styles.heading}>
+            Sub-agent library
+          </h2>
+          <p className="hint">
+            Personal, workspace, and org sub-agents that you write one time and use in many agents. An agent uses one when its settings name it.
+          </p>
+          <SubagentLibrary
+            orgId={choice.org.id}
+            workspaceId={choice.workspaceId}
+            newLabel="New library sub-agent"
+          />
+        </section>
+      ) : null}
     </>
   );
 }
@@ -143,10 +157,13 @@ function SubagentList({
               setView({ kind: "form", uid: null });
             }}
           >
-            New sub-agent
+            New sub-agent for {profile.name}
           </button>
         )}
       </div>
+      <p className="hint">
+        Only {profile.name} uses these. It can give work to each of them in a run.
+      </p>
       {!runtime.subagents ? (
         <p className="alert" role="note">
           The {runtimeLabel(profile.runtime)} runtime has no sub-agents. Choose another runtime in the section Harness

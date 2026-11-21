@@ -8268,7 +8268,8 @@ The console reuses their screens. Each write goes to the API, and the API writes
 Each section has a list, a detail view, a create form, and a delete with a confirm. A section
 shows its fields as read-only when the role of the user cannot change them, and says who can.
 The Tools section shows the custom tools of the workspace (M7.3, `CustomToolsPanel`, Section
-10.8), and the Sub-agents section shows the sub-agent library (M7.4). The Harness section sets the
+10.8), and the Sub-agents section shows the sub-agent library (M7.4) in its own card, with the
+button "New library sub-agent" apart from "New sub-agent for <agent>". The Harness section sets the
 busy mode of M7.1 (`steer`, the default, `parallel`, or `queue`) and the most parallel runs of
 one session. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
 without a change of the web app.
