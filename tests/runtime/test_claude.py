@@ -684,7 +684,7 @@ async def test_the_model_gets_the_original_request_with_the_joined_messages() ->
     gate = ScriptedGate(GateDecision("allow", "ok", steer=block))
     await collect(ClaudeRuntime(gate=gate, client_factory=factory).run(request()))
     context = factory.clients[0].hook_outputs[0]["hookSpecificOutput"]["additionalContext"]
-    assert "Keep doing the original request" in context
+    assert "None of them cancels or replaces the original request" in context
     assert all(word in context for word in ("FIRSTx", "STEERx", "SECONDx"))
 
 

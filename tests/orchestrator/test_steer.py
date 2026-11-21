@@ -278,7 +278,8 @@ async def test_joined_messages_add_to_the_original_request(
         )
     taken = await queue.take_steers(org_id=tenant.org, run_id=run_id)
     assert taken.startswith("<added_messages>\n")
-    assert "They do not replace it. Keep doing the original request" in taken
+    assert "None of them cancels or replaces the original request" in taken
+    assert "do both of them" in taken
     assert f"The original request:\n{first}" in taken
     assert "1. Also put the word STEERx" in taken
     assert "2. Reply with the word SECONDx." in taken
