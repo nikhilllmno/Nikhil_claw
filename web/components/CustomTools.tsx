@@ -1,9 +1,10 @@
 "use client";
 
 // The custom tools page (docs/architecture.md, Section 10.8). A member adds an HTTP request tool
-// or a script tool, tests it, and reads its versions. A user tool applies at once. A workspace or
-// org tool of a member who is not an admin waits until an admin approves it. The credential of an
-// HTTP tool goes only into the form: the API never sends it back, and the agent never sees it.
+// or a script tool for themselves, tests it, and reads its versions. Only an admin adds and changes
+// workspace and org tools; other members read and use them. Each write applies at once. The
+// credential of an HTTP tool goes only into the form: the API never sends it back, and the agent
+// never sees it.
 //
 // `CustomToolsPanel` holds the whole feature for one workspace, so the settings console (M7.10)
 // can show it in a section of its own.
@@ -26,9 +27,9 @@ import {
   draftOf,
   emptyDraft,
   MAX_DESCRIPTION_CHARS,
-  needsApproval,
   POLICY_LABELS,
   SCOPE_LABELS,
+  scopeChoices,
   testArguments,
   toolState,
 } from "@/lib/customTools";
@@ -43,11 +44,10 @@ import styles from "./Page.module.css";
 const METHODS: HttpMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 
 export function CustomToolsPage() {
-  const { me, meError, reloadMe, workspaces, workspaceId, orgOfWorkspace } = useData();
+  const { me, meError, reloadMe, workspaces, workspaceId } = useData();
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the tools" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
-  const org = orgOfWorkspace(workspaceId);
   return (
     <div className={styles.page}>
       <PageHeader
@@ -62,7 +62,7 @@ export function CustomToolsPage() {
       {workspace === null ? (
         <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
       ) : (
-        <CustomToolsPanel key={workspace.id} workspaceId={workspace.id} orgAdmin={org?.admin ?? false} />
+        <CustomToolsPanel key={workspace.id} workspaceId={workspace.id} />
       )}
     </div>
   );
@@ -70,10 +70,13 @@ export function CustomToolsPage() {
 
 type Open = { kind: "new" } | { kind: "edit"; tool: CustomTool; version: CustomToolVersion } | null;
 
-export function CustomToolsPanel({ workspaceId, orgAdmin }: { workspaceId: string; orgAdmin: boolean }) {
+export function CustomToolsPanel({ workspaceId }: { workspaceId: string }) {
   const api = useApi();
   const load = useCallback(() => api.customTools(workspaceId), [api, workspaceId]);
   const tools = useLoad(load, "Could not load the tools.");
+  // The scopes in which the user can add a tool. Until they load, the form offers "Only me".
+  const loadScopes = useCallback(() => api.customToolScopes(workspaceId), [api, workspaceId]);
+  const scopes = useLoad(loadScopes, "Could not load the scopes.");
   const [open, setOpen] = useState<Open>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -87,7 +90,7 @@ export function CustomToolsPanel({ workspaceId, orgAdmin }: { workspaceId: strin
     return (
       <ToolEditor
         workspaceId={workspaceId}
-        orgAdmin={orgAdmin}
+        scopes={scopeChoices(scopes.data?.scopes ?? null)}
         open={open}
         onDone={done}
         onCancel={() => setOpen(null)}
@@ -120,7 +123,7 @@ export function CustomToolsPanel({ workspaceId, orgAdmin }: { workspaceId: strin
           {tools.data.map((tool) => (
             <ToolCard
               // A new key after each change gives the card fresh state (busy flags, versions).
-              key={`${tool.id}:${tool.current_version}:${tool.latest?.version}:${tool.pending}:${tool.has_credential}`}
+              key={`${tool.id}:${tool.current_version}:${tool.latest?.version}:${tool.has_credential}`}
               tool={tool}
               onChanged={(text) => done(text)}
               onEdit={(version) => setOpen({ kind: "edit", tool, version })}
@@ -178,9 +181,9 @@ function ToolCard({
         </p>
       ) : null}
       <div className={styles.actions}>
-        {shown ? (
+        {shown && tool.can_manage ? (
           <button type="button" className="btn btn-small" onClick={() => onEdit(shown)}>
-            {needsApproval(tool.scope, tool.can_manage) ? "Propose a change" : "Edit"}
+            Edit
           </button>
         ) : null}
         {tool.can_manage ? (
@@ -345,7 +348,7 @@ function CredentialForm({ tool, onSaved }: { tool: CustomTool; onSaved: (notice:
 
 function History({ tool, onChanged }: { tool: CustomTool; onChanged: (notice: string) => void }) {
   const api = useApi();
-  const [shown, setShown] = useState(tool.pending > 0);
+  const [shown, setShown] = useState(false);
   const load = useCallback(() => api.customToolVersions(tool.id), [api, tool.id]);
   const versions = useLoad(shown ? load : null, "Could not load the versions.");
   const [busy, setBusy] = useState<string | null>(null);
@@ -394,52 +397,13 @@ function History({ tool, onChanged }: { tool: CustomTool; onChanged: (notice: st
                 <div className={styles.name}>
                   <span>Version {v.version}</span>
                   {v.version === tool.current_version ? <span className="badge badge-accent">Running</span> : null}
-                  {v.review !== "approved" ? (
-                    <span className={v.review === "pending" ? "badge badge-warning" : "badge badge-danger"}>
-                      {v.review === "pending" ? "Waiting for an admin" : "Rejected"}
-                    </span>
-                  ) : null}
                   <span className={styles.meta}>
                     {v.change} · {POLICY_LABELS[v.policy]} · {relativeTime(v.created_at, now)}
                     {v.summary ? ` · ${v.summary}` : ""}
                   </span>
                 </div>
                 <div className={styles.actions}>
-                  {tool.can_manage && v.review === "pending" ? (
-                    <>
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-small"
-                        disabled={busy !== null}
-                        onClick={() =>
-                          void act(
-                            `approve-${v.version}`,
-                            () => api.reviewCustomTool(tool.id, v.version, "approve"),
-                            `Version ${v.version} of ${tool.name} runs now.`,
-                            "The version was not approved.",
-                          )
-                        }
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-small"
-                        disabled={busy !== null}
-                        onClick={() =>
-                          void act(
-                            `reject-${v.version}`,
-                            () => api.reviewCustomTool(tool.id, v.version, "reject"),
-                            `Version ${v.version} of ${tool.name} is rejected.`,
-                            "The version was not rejected.",
-                          )
-                        }
-                      >
-                        Reject
-                      </button>
-                    </>
-                  ) : null}
-                  {v.review === "approved" && v.version !== tool.current_version ? (
+                  {tool.can_manage && v.version !== tool.current_version ? (
                     <button
                       type="button"
                       className="btn btn-quiet btn-small"
@@ -448,9 +412,7 @@ function History({ tool, onChanged }: { tool: CustomTool; onChanged: (notice: st
                         void act(
                           `revert-${v.version}`,
                           () => api.revertCustomTool(tool.id, v.version),
-                          needsApproval(tool.scope, tool.can_manage)
-                            ? `The revert to version ${v.version} waits for an admin.`
-                            : `${tool.name} runs version ${v.version} again.`,
+                          `${tool.name} runs version ${v.version} again.`,
                           "The revert did not work.",
                         )
                       }
@@ -471,13 +433,14 @@ function History({ tool, onChanged }: { tool: CustomTool; onChanged: (notice: st
 
 function ToolEditor({
   workspaceId,
-  orgAdmin,
+  scopes,
   open,
   onDone,
   onCancel,
 }: {
   workspaceId: string;
-  orgAdmin: boolean;
+  /** The scopes in which the user can add a tool. */
+  scopes: CustomToolScope[];
   open: Exclude<Open, null>;
   onDone: (notice: string) => void;
   onCancel: () => void;
@@ -490,15 +453,6 @@ function ToolEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const set = <K extends keyof Draft>(field: K, value: Draft[K]) => setDraft((all) => ({ ...all, [field]: value }));
-  // The user and the org admin manage their own scopes. A workspace admin is not known on the
-  // page, so a workspace tool may still apply at once: the answer of the server tells.
-  const canSetCredential = editing ? editing.can_manage : draft.scope === "user" || (draft.scope === "org" && orgAdmin);
-  const waits = editing
-    ? needsApproval(editing.scope, editing.can_manage)
-    : draft.scope === "org"
-      ? !orgAdmin
-      : draft.scope === "workspace";
-
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     setError(null);
@@ -515,19 +469,16 @@ function ToolEditor({
           summary: draft.summary.trim(),
         });
         const credential = credentialOf(draft);
-        if (credential && saved.can_manage) await api.setCustomToolCredential(editing.id, credential);
-        onDone(
-          saved.latest && saved.latest.review === "pending"
-            ? `The change of ${saved.name} waits for an admin.`
-            : `${saved.name} runs version ${saved.current_version} now.`,
-        );
+        if (credential) await api.setCustomToolCredential(editing.id, credential);
+        onDone(`${saved.name} runs version ${saved.current_version} now.`);
       } catch (e) {
         setError(errorText(e, "The tool was not saved."));
         setBusy(false);
       }
       return;
     }
-    const body = createBody(draft, canSetCredential);
+    // Only a person who manages the scope reaches this form, so the credential goes with it.
+    const body = createBody(draft, true);
     if (typeof body === "string") {
       setError(body);
       return;
@@ -535,11 +486,7 @@ function ToolEditor({
     setBusy(true);
     try {
       const saved = await api.createCustomTool(workspaceId, body);
-      onDone(
-        saved.current_version === null
-          ? `The tool ${saved.name} waits for an admin to approve it.`
-          : `The tool ${saved.tool_name} is ready. Test it below, then ask the agent to use it.`,
-      );
+      onDone(`The tool ${saved.tool_name} is ready. Test it below, then ask the agent to use it.`);
     } catch (e) {
       setError(errorText(e, "The tool was not saved."));
       setBusy(false);
@@ -576,12 +523,15 @@ function ToolEditor({
               value={draft.scope}
               onChange={(e) => set("scope", e.target.value as CustomToolScope)}
             >
-              {(Object.keys(SCOPE_LABELS) as CustomToolScope[]).map((scope) => (
+              {scopes.map((scope) => (
                 <option key={scope} value={scope}>
                   {SCOPE_LABELS[scope]}
                 </option>
               ))}
             </select>
+            {scopes.length === 1 ? (
+              <span className="hint">An admin adds the tools for the workspace and for the org.</span>
+            ) : null}
           </label>
           <label className="field">
             <span className="label">Kind</span>
@@ -596,11 +546,6 @@ function ToolEditor({
           </label>
         </>
       )}
-      {waits ? (
-        <p className="alert alert-warning">
-          A shared tool needs an admin. Your version waits until an admin approves it.
-        </p>
-      ) : null}
       <label className="field">
         <span className="label">Description</span>
         <textarea
@@ -636,11 +581,7 @@ function ToolEditor({
         />
         <span className="hint">Use each property as a placeholder: {"{{name}}"}.</span>
       </label>
-      {draft.kind === "http" ? (
-        <HttpFields draft={draft} set={set} canSetCredential={canSetCredential} />
-      ) : (
-        <ScriptFields draft={draft} set={set} />
-      )}
+      {draft.kind === "http" ? <HttpFields draft={draft} set={set} /> : <ScriptFields draft={draft} set={set} />}
       <label className="field">
         <span className="label">What changed (optional)</span>
         <input
@@ -657,7 +598,7 @@ function ToolEditor({
       ) : null}
       <div className={styles.actions}>
         <button type="submit" className="btn btn-primary btn-small" disabled={busy}>
-          {busy ? "Saving" : waits ? "Send for approval" : "Save"}
+          {busy ? "Saving" : "Save"}
         </button>
         <button type="button" className="btn btn-quiet btn-small" disabled={busy} onClick={onCancel}>
           Cancel
@@ -669,7 +610,7 @@ function ToolEditor({
 
 type Setter = <K extends keyof Draft>(field: K, value: Draft[K]) => void;
 
-function HttpFields({ draft, set, canSetCredential }: { draft: Draft; set: Setter; canSetCredential: boolean }) {
+function HttpFields({ draft, set }: { draft: Draft; set: Setter }) {
   return (
     <fieldset className={`${styles.fieldset} ${styles.form}`}>
       <legend className={styles.subheading}>HTTP request</legend>
@@ -748,7 +689,7 @@ function HttpFields({ draft, set, canSetCredential }: { draft: Draft; set: Sette
           </label>
         </div>
       ) : null}
-      {draft.authType !== "none" && canSetCredential ? (
+      {draft.authType !== "none" ? (
         draft.authType === "basic" ? (
           <div className={styles.toolbar}>
             <label className={`field ${styles.grow}`}>
@@ -786,8 +727,6 @@ function HttpFields({ draft, set, canSetCredential }: { draft: Draft; set: Sette
             </span>
           </label>
         )
-      ) : draft.authType !== "none" ? (
-        <p className={styles.meta}>An admin sets the credential of a shared tool after approval.</p>
       ) : null}
       <div className={styles.toolbar}>
         <label className={`field ${styles.grow}`}>

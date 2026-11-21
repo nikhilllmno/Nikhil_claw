@@ -6,8 +6,8 @@ import {
   definitionOf,
   draftOf,
   emptyDraft,
-  needsApproval,
   parseHeaders,
+  scopeChoices,
   testArguments,
   toolState,
 } from "./customTools";
@@ -122,22 +122,14 @@ describe("custom tools", () => {
     expect(testArguments("{")).toMatch(/JSON/);
   });
 
-  it("describes the state of a tool", () => {
-    const tool = {
-      current_version: null,
-      pending: 1,
-      current: null,
-    } as unknown as CustomTool;
-    expect(toolState(tool)).toBe("Waiting for an admin");
-    const live = {
-      current_version: 3,
-      pending: 2,
-      current: { policy: "ask" },
-    } as unknown as CustomTool;
-    expect(toolState(live)).toBe("Version 3 · Ask me before each call · 2 change(s) wait for an admin");
-    expect(needsApproval("user", false)).toBe(false);
-    expect(needsApproval("workspace", false)).toBe(true);
-    expect(needsApproval("org", true)).toBe(false);
+  it("describes the state of a tool and the scopes to offer", () => {
+    const none = { current_version: null, current: null } as unknown as CustomTool;
+    expect(toolState(none)).toBe("No version runs");
+    const live = { current_version: 3, current: { policy: "ask" } } as unknown as CustomTool;
+    expect(toolState(live)).toBe("Version 3 · Ask me before each call");
+    expect(scopeChoices(null)).toEqual(["user"]);
+    expect(scopeChoices(["user"])).toEqual(["user"]);
+    expect(scopeChoices(["org", "user", "workspace"])).toEqual(["user", "workspace", "org"]);
   });
 });
 
@@ -159,7 +151,7 @@ describe("ApiClient custom tools", () => {
     await client.customTools("w1");
     await client.customToolVersions("t1");
     await client.revertCustomTool("t1", 2);
-    await client.reviewCustomTool("t1", 3, "approve");
+    await client.customToolScopes("w1");
     await client.setCustomToolCredential("t1", { value: "k" });
     await client.testCustomTool("t1", { a: 1 });
     await expect(client.deleteCustomTool("t1")).resolves.toBeNull();
@@ -168,7 +160,7 @@ describe("ApiClient custom tools", () => {
       ["GET", "https://api.test/workspaces/w1/custom-tools", undefined],
       ["GET", "https://api.test/custom-tools/t1/versions", undefined],
       ["POST", "https://api.test/custom-tools/t1/revert", '{"version":2}'],
-      ["POST", "https://api.test/custom-tools/t1/versions/3/approve", undefined],
+      ["GET", "https://api.test/workspaces/w1/custom-tools/scopes", undefined],
       ["PUT", "https://api.test/custom-tools/t1/credential", '{"value":"k"}'],
       ["POST", "https://api.test/custom-tools/t1/test", '{"arguments":{"a":1},"version":null}'],
       ["DELETE", "https://api.test/custom-tools/t1", undefined],

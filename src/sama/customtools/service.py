@@ -1,15 +1,15 @@
-"""Custom tools: the store, the review of shared versions, the test call, and the tools of a
-run (docs/architecture.md, Section 10.8; roadmap M7.3).
+"""Custom tools: the store, the versions, the test call, and the tools of a run
+(docs/architecture.md, Section 10.8; roadmap M7.3).
 
 Scopes work like the scopes of the skills (Section 9.2):
 
 - A ``user`` tool belongs to one user. A write of its user applies at once. A run sees it only
   in a private session of that user.
 - A ``workspace`` tool is for the members of one workspace. An ``org`` tool is for every member
-  of the org. A write of an admin (a workspace admin, an org admin, or the org owner for a
-  workspace tool; an org admin or the org owner for an org tool) applies at once. A write of
-  another member who sees the tool is a ``pending`` version: it does not run until an admin
-  approves it.
+  of the org. Only an admin writes them (a workspace admin, an org admin, or the org owner for a
+  workspace tool; an org admin or the org owner for an org tool), and a write applies at once.
+  Another member reads and uses them, and gets ``403`` for a write. This is the rule of the
+  sub-agent library (Section 13.3).
 
 Each write is a new version, and a revert copies an old version into a new one. The tool runs
 its ``current_version``. The credential of an HTTP tool is in the vault (``custom_tool:<id>``),
@@ -74,8 +74,6 @@ from sama.vault.store import Vault, custom_tool_secret
 log: Final = logging.getLogger("sama.customtools")
 
 MAX_TOOLS_PER_RUN: Final = 200
-MAX_PENDING: Final = 20
-"""Open proposals of one tool at most, so a member cannot fill the table."""
 Scope = Literal["org", "workspace", "user"]
 
 
@@ -142,7 +140,6 @@ class ToolView:
     updated_at: datetime
     current: Version | None = None
     latest: Version | None = None
-    pending: int = 0
     has_credential: bool = False
     can_manage: bool = False
 
@@ -157,7 +154,6 @@ class ToolView:
             "current_version": self.current_version,
             "current": None if self.current is None else self.current.public(),
             "latest": None if self.latest is None else self.latest.public(),
-            "pending": self.pending,
             "has_credential": self.has_credential,
             "can_manage": self.can_manage,
             "created_at": self.created_at.isoformat(),
@@ -293,6 +289,20 @@ class CustomToolService:
             visible = [r for r in rows if can_see(r.scope, grants, r.workspace_id, r.user_id)]
             return [await self._view(connection, row, grants) for row in visible]
 
+    def writable_scopes(self, grants: Grants, workspace_id: uuid.UUID) -> list[Scope]:
+        """The scopes in which this user can add a tool from the page of the workspace."""
+        scopes: list[Scope] = ["user", "workspace", "org"]
+        return [
+            scope
+            for scope in scopes
+            if can_manage(
+                scope,
+                grants,
+                workspace_id if scope == "workspace" else None,
+                grants.user_id if scope == "user" else None,
+            )
+        ]
+
     async def get(self, org_id: uuid.UUID, tool_id: uuid.UUID, grants: Grants) -> ToolView:
         async with self._engine.connect() as connection:
             row = await self._visible_row(connection, org_id, tool_id, grants)
@@ -348,17 +358,6 @@ class CustomToolService:
                 )
             ).one()
             current = Version.of(found)
-        pending = (
-            await connection.execute(
-                select(func.count())
-                .select_from(CustomToolVersion)
-                .where(
-                    CustomToolVersion.org_id == row.org_id,
-                    CustomToolVersion.tool_id == row.id,
-                    CustomToolVersion.review == "pending",
-                )
-            )
-        ).scalar_one()
         has_credential = (
             await connection.execute(
                 select(VaultSecret.id).where(
@@ -379,7 +378,6 @@ class CustomToolService:
             updated_at=row.updated_at,
             current=current,
             latest=None if versions is None else Version.of(versions),
-            pending=int(pending),
             has_credential=has_credential,
             can_manage=can_manage(row.scope, grants, row.workspace_id, row.user_id),
         )
@@ -409,11 +407,8 @@ class CustomToolService:
             scope, grants, tool_workspace, tool_user
         ):
             raise CustomToolError("the workspace does not exist", status_code=404)
-        manage = can_manage(scope, grants, tool_workspace, tool_user)
-        if credential is not None and not manage:
-            raise CustomToolError(
-                "only an admin can set the credential of a shared tool", status_code=403
-            )
+        if not can_manage(scope, grants, tool_workspace, tool_user):
+            raise CustomToolError(_SHARED_ADMIN_ONLY, status_code=403)
         if definition.http is not None:
             await self._check_url(definition)
         try:
@@ -427,14 +422,14 @@ class CustomToolService:
                             workspace_id=tool_workspace,
                             user_id=tool_user,
                             name=name,
-                            current_version=1 if manage else None,
+                            current_version=1,
                             created_by_user_id=grants.user_id,
                         )
                         .returning(CustomTool.id)
                     )
                 ).scalar_one()
                 await self._add_version(
-                    connection, org_id, tool_id, 1, definition, "create", summary, grants, manage
+                    connection, org_id, tool_id, 1, definition, "create", summary, grants
                 )
                 if credential is not None:
                     await self._put_credential(
@@ -445,7 +440,7 @@ class CustomToolService:
                     org_id,
                     tool_workspace,
                     grants.user_id,
-                    "custom_tool.created" if manage else "custom_tool.proposed",
+                    "custom_tool.created",
                     tool_id,
                     {"name": name, "scope": scope, "version": 1, "kind": definition.kind},
                 )
@@ -463,7 +458,7 @@ class CustomToolService:
         definition: Definition,
         summary: str = "",
     ) -> ToolView:
-        """A new version. It applies at once for an admin, else it waits for a review."""
+        """A new version. It applies at once."""
         _check(definition, summary)
         if definition.http is not None:
             await self._check_url(definition)
@@ -505,41 +500,24 @@ class CustomToolService:
     ) -> None:
         async with self._engine.begin() as connection:
             row = await self._visible_row(connection, org_id, tool_id, grants, lock=True)
-            manage = can_manage(row.scope, grants, row.workspace_id, row.user_id)
-            if not manage:
-                pending = (
-                    await connection.execute(
-                        select(func.count())
-                        .select_from(CustomToolVersion)
-                        .where(
-                            CustomToolVersion.org_id == org_id,
-                            CustomToolVersion.tool_id == tool_id,
-                            CustomToolVersion.review == "pending",
-                        )
-                    )
-                ).scalar_one()
-                if pending >= MAX_PENDING:
-                    raise CustomToolError(
-                        f"the tool has {MAX_PENDING} open proposals. An admin must review them",
-                        status_code=409,
-                    )
+            if not can_manage(row.scope, grants, row.workspace_id, row.user_id):
+                raise CustomToolError(_ADMIN_ONLY, status_code=403)
             number = await _next_version(connection, org_id, tool_id)
             await self._add_version(
-                connection, org_id, tool_id, number, definition, change, summary, grants, manage
+                connection, org_id, tool_id, number, definition, change, summary, grants
             )
-            if manage:
-                await connection.execute(
-                    update(CustomTool)
-                    .where(CustomTool.org_id == org_id, CustomTool.id == tool_id)
-                    .values(current_version=number, updated_at=func.now())
-                )
+            await connection.execute(
+                update(CustomTool)
+                .where(CustomTool.org_id == org_id, CustomTool.id == tool_id)
+                .values(current_version=number, updated_at=func.now())
+            )
             action = f"custom_tool.{'reverted' if change == 'revert' else 'edited'}"
             await _audit(
                 connection,
                 org_id,
                 row.workspace_id,
                 grants.user_id,
-                action if manage else "custom_tool.proposed",
+                action,
                 tool_id,
                 {"name": row.name, "version": number, "change": change},
             )
@@ -554,7 +532,6 @@ class CustomToolService:
         change: str,
         summary: str,
         grants: Grants,
-        approved: bool,
     ) -> None:
         await connection.execute(
             insert(CustomToolVersion).values(
@@ -568,70 +545,13 @@ class CustomToolService:
                 config=definition.config(),
                 change=change,
                 summary=summary,
-                review="approved" if approved else "pending",
+                # Every version is written by a person who manages the tool, so it is approved.
+                review="approved",
                 author_user_id=grants.user_id,
-                reviewed_by_user_id=grants.user_id if approved else None,
-                reviewed_at=func.now() if approved else None,
+                reviewed_by_user_id=grants.user_id,
+                reviewed_at=func.now(),
             )
         )
-
-    async def review(
-        self,
-        org_id: uuid.UUID,
-        tool_id: uuid.UUID,
-        grants: Grants,
-        version_no: int,
-        *,
-        approve: bool,
-    ) -> ToolView:
-        """An admin approves a pending version (it runs from now on) or rejects it."""
-        async with self._engine.begin() as connection:
-            row = await self._visible_row(connection, org_id, tool_id, grants, lock=True)
-            if not can_manage(row.scope, grants, row.workspace_id, row.user_id):
-                raise CustomToolError(_ADMIN_ONLY, status_code=403)
-            version = (
-                await connection.execute(
-                    select(CustomToolVersion)
-                    .where(
-                        CustomToolVersion.org_id == org_id,
-                        CustomToolVersion.tool_id == tool_id,
-                        CustomToolVersion.version_no == version_no,
-                    )
-                    .with_for_update()
-                )
-            ).one_or_none()
-            if version is None:
-                raise CustomToolError(f"the tool has no version {version_no}", status_code=404)
-            if version.review != "pending":
-                raise CustomToolError(f"version {version_no} is {version.review}", status_code=409)
-            if approve:
-                # The checks of today apply: a version can wait while the rules change.
-                _check(Version.of(version).definition, "")
-            await connection.execute(
-                update(CustomToolVersion)
-                .where(CustomToolVersion.id == version.id)
-                .values(
-                    review="approved" if approve else "rejected",
-                    reviewed_by_user_id=grants.user_id,
-                    reviewed_at=func.now(),
-                )
-            )
-            if approve:
-                await connection.execute(
-                    update(CustomTool)
-                    .where(CustomTool.org_id == org_id, CustomTool.id == tool_id)
-                    .values(current_version=version_no, updated_at=func.now())
-                )
-            await _audit(
-                connection,
-                org_id,
-                row.workspace_id,
-                grants.user_id,
-                "custom_tool.approved" if approve else "custom_tool.rejected",
-                tool_id,
-                {"name": row.name, "version": version_no},
-            )
-        return await self.get(org_id, tool_id, grants)
 
     async def set_credential(
         self, org_id: uuid.UUID, tool_id: uuid.UUID, grants: Grants, values: Mapping[str, str]
@@ -1000,6 +920,9 @@ class CustomToolService:
 
 
 _ADMIN_ONLY: Final = "only the owner of the tool or an admin can do this"
+_SHARED_ADMIN_ONLY: Final = (
+    "only an admin can add a workspace or org tool. Add the tool for yourself (scope user)"
+)
 
 
 def _check(definition: Definition, summary: str) -> None:

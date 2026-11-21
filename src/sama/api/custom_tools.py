@@ -118,6 +118,14 @@ def router(
         org_id, grants = await workspace_grants(me, workspace_id)
         return [view.public() for view in await tools.listing(org_id, grants, workspace_id)]
 
+    @routes.get("/workspaces/{workspace_id}/custom-tools/scopes")
+    async def writable_scopes(me: Me, workspace_id: uuid.UUID) -> dict[str, list[str]]:
+        """The scopes in which the user can add a tool: ``user`` for every member, and the
+        shared scopes for an admin of them (Section 10.8)."""
+        tools = service()
+        _org_id, grants = await workspace_grants(me, workspace_id)
+        return {"scopes": list(tools.writable_scopes(grants, workspace_id))}
+
     @routes.post("/workspaces/{workspace_id}/custom-tools", status_code=201)
     async def create_tool(me: Me, workspace_id: uuid.UUID, body: ToolIn) -> dict[str, Any]:
         tools = service()
@@ -160,17 +168,6 @@ def router(
         tools = service()
         org_id, grants = await tool_grants(me, tool_id)
         return (await _call(tools.revert(org_id, tool_id, grants, body.version))).public()
-
-    @routes.post("/custom-tools/{tool_id}/versions/{version}/{decision}")
-    async def review_version(
-        me: Me, tool_id: uuid.UUID, version: int, decision: Literal["approve", "reject"]
-    ) -> dict[str, Any]:
-        tools = service()
-        org_id, grants = await tool_grants(me, tool_id)
-        view = await _call(
-            tools.review(org_id, tool_id, grants, version, approve=decision == "approve")
-        )
-        return view.public()
 
     @routes.put("/custom-tools/{tool_id}/credential")
     async def set_credential(me: Me, tool_id: uuid.UUID, body: CredentialIn) -> dict[str, Any]:

@@ -72,9 +72,9 @@ export function ToolsSection() {
         </div>
         <p className={styles.text}>
           HTTP requests and Python or Node scripts that the agents find with tool search. A member adds tools for
-          themselves at once. A workspace or org tool waits until an admin approves it.
+          themselves. An admin adds the tools for the workspace and for the org.
         </p>
-        <CustomToolsPanel key={choice.workspaceId} workspaceId={choice.workspaceId} orgAdmin={org.admin} />
+        <CustomToolsPanel key={choice.workspaceId} workspaceId={choice.workspaceId} />
       </section>
     </>
   );
