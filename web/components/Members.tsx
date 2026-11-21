@@ -26,6 +26,7 @@ import {
   replaceMember,
   roleChoices,
   toggleWorkspace,
+  withoutMember,
 } from "@/lib/orgs";
 import { relativeTime, timeLeft } from "@/lib/time";
 import { useApi } from "./AuthProvider";
@@ -106,9 +107,11 @@ function OrgMembers({ org }: { org: Org }) {
                 org={org}
                 member={m}
                 all={members.data ?? []}
-                onChange={members.reload}
                 onUpdated={(updated) =>
                   members.setData((list) => (list ? replaceMember(list, updated) : list))
+                }
+                onRemoved={(userId) =>
+                  members.setData((list) => (list ? withoutMember(list, userId) : list))
                 }
               />
             ))}
@@ -159,14 +162,14 @@ function MemberRow({
   org,
   member,
   all,
-  onChange,
   onUpdated,
+  onRemoved,
 }: {
   org: Org;
   member: OrgMember;
   all: OrgMember[];
-  onChange: () => void;
   onUpdated: (member: OrgMember) => void;
+  onRemoved: (userId: string) => void;
 }) {
   const api = useApi();
   const router = useRouter();
@@ -198,13 +201,12 @@ function MemberRow({
       "Could not change the role.",
       (updated) => {
         onUpdated(updated);
-        onChange();
         if (self) reloadMe();
       },
     );
 
-  // The row shows the member that the PATCH returns at once, so the next change starts from it
-  // and not from the old list (docs/architecture.md, Section 17.2).
+  // Each change applies its own answer to the list (the PATCH returns the member). The page does
+  // not load the full list again after a change, so an older list cannot overwrite a newer change.
   const toggleSpace = (id: string, on: boolean) => {
     void run(
       () =>
@@ -229,7 +231,7 @@ function MemberRow({
           reloadMe();
           router.push("/");
         } else {
-          onChange();
+          onRemoved(member.user_id);
         }
       },
     );

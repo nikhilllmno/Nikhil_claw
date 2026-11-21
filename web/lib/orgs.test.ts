@@ -15,6 +15,7 @@ import {
   roleChoices,
   tokenFromFragment,
   toggleWorkspace,
+  withoutMember,
 } from "./orgs";
 import type { KeyValueStore } from "./pkce";
 
@@ -137,6 +138,24 @@ describe("review fixes", () => {
     const changed = { ...a, workspace_ids: ["w1"] };
     expect(replaceMember([a, b], changed)).toEqual([changed, b]);
     expect(replaceMember([b], changed)).toEqual([b]);
+  });
+
+  it("applies a role change and then a workspace change in order", () => {
+    // Each answer applies to the current list. No later full list replaces it.
+    const a = member("a", "admin");
+    const b = member("b", "member");
+    let list = [a, b];
+    list = replaceMember(list, { ...a, role: "member" });
+    const withA = toggleWorkspace(list[0]?.workspace_ids ?? [], "wA", true);
+    list = replaceMember(list, { ...a, role: "member", workspace_ids: withA });
+    expect(toggleWorkspace(list[0]?.workspace_ids ?? [], "wB", true)).toEqual(["wA", "wB"]);
+  });
+
+  it("removes one member", () => {
+    const a = member("a", "member");
+    const b = member("b", "admin");
+    expect(withoutMember([a, b], "a")).toEqual([b]);
+    expect(withoutMember([a, b], "x")).toEqual([a, b]);
   });
 
   it("toggles one workspace", () => {

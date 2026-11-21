@@ -67,6 +67,11 @@ export function replaceMember(members: readonly OrgMember[], updated: OrgMember)
   return members.map((m) => (m.user_id === updated.user_id ? updated : m));
 }
 
+/** The list without the member with this id. */
+export function withoutMember(members: readonly OrgMember[], userId: string): OrgMember[] {
+  return members.filter((m) => m.user_id !== userId);
+}
+
 /** The workspace ids after one checkbox change. The order stays, and an id occurs once. */
 export function toggleWorkspace(ids: readonly string[], id: string, on: boolean): string[] {
   const rest = ids.filter((w) => w !== id);
