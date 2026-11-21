@@ -406,6 +406,11 @@ class BrowserService:
                     f"the {session.target} browser cannot act at a point (x, y) yet; use a ref "
                     "from browser_snapshot"
                 )
+            if act.clicks != 1 and not has_vision(session):
+                # ``clicks`` came with vision mode: a session without it can ignore it.
+                raise BrowserError(
+                    f"the {session.target} browser cannot do clicks={act.clicks} yet"
+                )
             state = await session.act(act)
             shot = await session.snapshot() if snapshot else None
         except BrowserError as error:

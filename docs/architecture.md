@@ -4726,7 +4726,8 @@ point of it, as with computer use.
 - **Targets.** A session that can act at a point has the class attribute `vision = True`
   (`sama.browser.target.has_vision`). `PlaywrightSession` has it, so the `cloud` target has
   vision mode. A session without it gets the error "the <target> browser cannot act at a point
-  (x, y) yet; use a ref from browser_snapshot". The target protocol does not change, so a
+  (x, y) yet; use a ref from browser_snapshot". It also refuses `clicks` other than 1, so a
+  target cannot ignore a double click. The target protocol does not change, so a
   target can add vision mode later. For `my_chrome`, see Section 14.2.2.
 - **Tests.** `tests/browser/canvas_app.py` is a canvas app with six steps (click three circles in
   order, double-click, hover, drag, type, and scroll the wheel). Its accessibility tree is empty.

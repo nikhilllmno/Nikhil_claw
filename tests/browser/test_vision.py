@@ -163,6 +163,43 @@ async def test_points_work_on_a_page_with_a_dom(session: PlaywrightSession, canv
     assert state.title == "clicked rooms"
 
 
+BUTTONS_PAGE = (
+    "data:text/html,<title>buttons none</title><body style='margin:0;height:600px' "
+    "onmousemove=\"document.title='buttons '+event.buttons\"></body>"
+)
+
+
+async def test_a_drag_that_fails_while_it_moves_releases_the_button(
+    session: PlaywrightSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from playwright.async_api import Error, Mouse
+
+    await session.navigate(BUTTONS_PAGE)
+    move = Mouse.move
+    ups: list[bool] = []
+    up = Mouse.up
+
+    async def failing_move(self: Mouse, x: float, y: float, *, steps: int | None = None) -> None:
+        if steps:  # the move of the drag, after the button is down
+            await move(self, x / 2, y / 2)
+            raise Error("the page went away")
+        await move(self, x, y)
+
+    async def counted_up(self: Mouse, **kwargs: object) -> None:
+        ups.append(True)
+        await up(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Mouse, "move", failing_move)
+    monkeypatch.setattr(Mouse, "up", counted_up)
+    with pytest.raises(BrowserError, match="the drag failed"):
+        await session.act(Act(action="drag", x=10, y=10, to_x=200, to_y=200))
+    assert ups == [True]
+    monkeypatch.undo()
+    # The next move has no button down.
+    state = await session.act(Act(action="hover", x=300, y=300))
+    assert state.title == "buttons 0"
+
+
 def test_the_cdp_session_has_vision_mode() -> None:
     assert has_vision(PlaywrightSession)
     assert not has_vision(object())
@@ -213,6 +250,8 @@ async def test_the_service_refuses_a_point_on_a_session_without_vision() -> None
     try:
         with pytest.raises(BrowserError, match="cannot act at a point"):
             await service.act(make_claims("run-v"), Act(action="click", x=1, y=1))
+        with pytest.raises(BrowserError, match="cannot do clicks=2"):
+            await service.act(make_claims("run-v"), Act(action="click", ref="e1", clicks=2))
         assert target.sessions[0].calls == []
         target.sessions[0].vision = True
         await service.act(make_claims("run-v"), Act(action="click", x=1, y=1))
