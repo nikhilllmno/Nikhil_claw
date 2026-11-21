@@ -179,6 +179,12 @@ export const HELP_TOPICS: HelpTopic[] = [
         ],
       },
       {
+        heading: "Custom tools",
+        paragraphs: [
+          "On the Tools page you add your own tool: an HTTP request to an API, or a Python or Node script that runs in the sandbox of the session. Give it a description, the arguments as a JSON schema, and a policy: run without asking, ask before each call, or off. Test it on the page. Each change is a version that you can revert. A tool for you alone works at once. A tool for the workspace or the org waits until an admin approves it.",
+        ],
+      },
+      {
         heading: "Browser logins",
         paragraphs: [
           "On the Settings page, the Browser card keeps saved logins for the sites that the browser of the agents opens. The agent never sees the user name or the password. An admin adds logins for the whole org and chooses the sites that the browser can open.",
@@ -207,6 +213,7 @@ export const HELP_TOPICS: HelpTopic[] = [
     ],
     links: [
       { href: "/connections", label: "Connections" },
+      { href: "/tools", label: "Tools" },
       { href: "/memory", label: "Memory" },
       { href: "/skills", label: "Skills" },
       { href: "/subagents", label: "Sub-agents" },

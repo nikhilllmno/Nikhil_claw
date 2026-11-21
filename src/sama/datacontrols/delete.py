@@ -54,6 +54,7 @@ from sama.db.models import (
     Base,
     BrowserLogin,
     Connection,
+    CustomTool,
     DataPurge,
     LibraryAgent,
     Membership,
@@ -69,7 +70,12 @@ from sama.db.models import (
     WorkflowInstance,
 )
 from sama.observability.langfuse import MAX_DELETE_IDS
-from sama.vault.store import browser_login_secret, connection_secret, trigger_secret
+from sama.vault.store import (
+    browser_login_secret,
+    connection_secret,
+    custom_tool_secret,
+    trigger_secret,
+)
 
 CHILD_LINEAGES: Final = ("compaction", "delegation")
 """A child session of these lineages is part of its parent and goes with it."""
@@ -416,9 +422,9 @@ async def delete_user(
     """Deletes a user row of an org and the data of the user, in the open transaction.
 
     Deleted: the private sessions and private task cards of the user, the memberships, the
-    personal memory, skills, connections, rules, chat links, jobs, triggers, workflows, and
-    saved browser logins (the keys cascade), and the vault secrets of the personal
-    connections, the triggers, and the personal browser logins.
+    personal memory, skills, connections, rules, chat links, jobs, triggers, workflows, saved
+    browser logins, and user custom tools (the keys cascade), and the vault secrets of the
+    personal connections, the triggers, the personal browser logins, and the user custom tools.
     Kept: the shared content. Its user columns get a null. Raises ``LastOwnerError`` for the
     last owner. Returns ``Removed.running`` when a run blocks the delete."""
     await lock_timeout(connection)
@@ -496,6 +502,16 @@ async def delete_user(
                 await connection.execute(
                     select(BrowserLogin.id).where(
                         BrowserLogin.org_id == org_id, BrowserLogin.user_id == user_id
+                    )
+                )
+            ).scalars()
+        ]
+        + [
+            str(custom_tool_secret(row_id))
+            for row_id in (
+                await connection.execute(
+                    select(CustomTool.id).where(
+                        CustomTool.org_id == org_id, CustomTool.user_id == user_id
                     )
                 )
             ).scalars()

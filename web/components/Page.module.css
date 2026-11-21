@@ -116,6 +116,13 @@
   gap: var(--space-2);
 }
 
+.fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
 .form {
   display: flex;
   flex-direction: column;

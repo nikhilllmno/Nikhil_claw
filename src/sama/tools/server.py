@@ -136,6 +136,7 @@ from sama.tools.deferred import (
     DEFAULT_SEARCH_LIMIT,
     MAX_SEARCH_LIMIT,
     DeferredCatalog,
+    DeferredTool,
     DeferredToolError,
     format_describe,
     format_search,
@@ -183,6 +184,7 @@ if TYPE_CHECKING:
     from sama.browser.task import BrowserTaskRunner
     from sama.coding.tool import CodingTools
     from sama.connectors.service import ConnectionService
+    from sama.customtools.service import CustomToolService
     from sama.skills.importer import SkillImporter
 
 log = logging.getLogger("sama.tools")
@@ -406,6 +408,9 @@ class ToolServer:
       are hidden.
     - ``browser_tasks``: the browser sub-agent (``browser_task``, M5.6). It needs ``browser``.
       Without it, the tool is hidden.
+    - ``custom_tools``: the custom tools of users, workspaces, and orgs (Section 10.8). With
+      it, the server has ``tool_search``, ``tool_describe``, and ``tool_call``, and the
+      search shows the custom tools that the run may use. Without it, they are not shown.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -445,8 +450,10 @@ class ToolServer:
         browser: BrowserService | None = None,
         browser_tasks: BrowserTaskRunner | None = None,
         coding: CodingTools | None = None,
+        custom_tools: CustomToolService | None = None,
     ) -> None:
         self.signer = signer
+        self.custom_tools = custom_tools
         self.coding = coding
         self.browser = browser
         self.browser_tasks = browser_tasks if browser is not None else None
@@ -899,7 +906,9 @@ class ToolServer:
                 arguments = {"text": text, "voice": voice}
                 return await self._call(ctx, TEXT_TO_SPEECH, arguments, body)
 
-        if self.deferred is not None and (len(self.deferred) > 0 or self.connections is not None):
+        if self.deferred is not None and (
+            len(self.deferred) > 0 or self.connections is not None or self.custom_tools is not None
+        ):
             # With connections, a run can get the tools of a remote MCP server at any time.
             self._deferred_tools(server, self.deferred)
 
@@ -1186,10 +1195,13 @@ class ToolServer:
     async def _run_catalog(
         self, claims: RunTokenClaims, catalog: DeferredCatalog
     ) -> DeferredCatalog:
-        """The catalog and the tools of the remote MCP servers that the run may use now."""
-        if self.connections is None:
-            return catalog
-        extra = await self.connections.mcp_tools(claims)
+        """The catalog, the tools of the remote MCP servers, and the custom tools that the run
+        may use now."""
+        extra: list[DeferredTool] = []
+        if self.connections is not None:
+            extra += await self.connections.mcp_tools(claims)
+        if self.custom_tools is not None:
+            extra += await self.custom_tools.tools_for(claims)
         return catalog.extended(extra) if extra else catalog
 
     async def _visible(self, claims: RunTokenClaims, catalog: DeferredCatalog) -> frozenset[str]:

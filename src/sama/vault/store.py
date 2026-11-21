@@ -80,7 +80,18 @@ BrowserLoginSecretName = NewType("BrowserLoginSecretName", str)
 """The vault entry of one saved login of the browser: ``browser_login:<login id>``. The value is
 a JSON object with ``username`` and ``password`` (Section 14.1)."""
 
-VaultName = SecretName | ConnectionSecretName | TriggerSecretName | BrowserLoginSecretName
+CustomToolSecretName = NewType("CustomToolSecretName", str)
+"""The vault entry of the credential of one custom HTTP tool: ``custom_tool:<tool id>``. The value
+is a JSON object with ``origin`` (the only origin that gets the credential) and the auth fields
+(Section 10.8)."""
+
+VaultName = (
+    SecretName
+    | ConnectionSecretName
+    | TriggerSecretName
+    | BrowserLoginSecretName
+    | CustomToolSecretName
+)
 """The name of a vault entry."""
 
 
@@ -100,16 +111,32 @@ def browser_login_secret(login_id: uuid.UUID) -> BrowserLoginSecretName:
     return BrowserLoginSecretName(f"browser_login:{login_id}")
 
 
+def custom_tool_secret(tool_id: uuid.UUID) -> CustomToolSecretName:
+    """The vault name of the credential of a custom HTTP tool (Section 10.8)."""
+    return CustomToolSecretName(f"custom_tool:{tool_id}")
+
+
+PUBLIC_FIELDS: Final = frozenset({"origin"})
+"""Fields of a JSON entry that are not secret: the origin of a custom tool credential. The
+redactor does not get them, so an address is not hidden in every text."""
+
+
 def secret_parts(name: str, value: str) -> list[str]:
     """The values that the redactor gets for one entry. A connection entry is a JSON object of
     the secret form fields, and a browser login entry is a JSON object with the user name and
     the password: the redactor gets each field too, so a field is redacted alone."""
     parts = [value]
-    if name.startswith(("connection:", "browser_login:")):
+    if name.startswith(("connection:", "browser_login:", "custom_tool:")):
         with contextlib.suppress(ValueError):
             fields = json.loads(value)
             if isinstance(fields, dict):
-                parts += [v for v in fields.values() if isinstance(v, str) and v.strip()]
+                parts += [
+                    v
+                    for k, v in fields.items()
+                    if isinstance(v, str)
+                    and v.strip()
+                    and not (name.startswith("custom_tool:") and k in PUBLIC_FIELDS)
+                ]
     return parts
 
 

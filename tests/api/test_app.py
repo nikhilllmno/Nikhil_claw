@@ -94,6 +94,7 @@ async def test_the_page_and_the_config_are_public(client: httpx.AsyncClient) -> 
         "connections": False,
         "signup": "invite_only",
         "billing": False,
+        "custom_tools": False,
     }
 
 

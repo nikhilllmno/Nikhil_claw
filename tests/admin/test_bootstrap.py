@@ -75,6 +75,7 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
             "workflows",
             "browser",
             "coding_agents",
+            "custom_tools",
         ],
         list(DEFAULT_GROUP_TOOLSETS),
     )

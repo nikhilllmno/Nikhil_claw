@@ -27,6 +27,7 @@ const WORKSPACE_LINKS: NavLink[] = [
   { href: "/skills", title: "Skills", meta: "The guides that the agents follow" },
   { href: "/subagents", title: "Sub-agents", meta: "Reusable helpers for your agents" },
   { href: "/connections", title: "Connections", meta: "The tools that the agents can use" },
+  { href: "/tools", title: "Tools", meta: "Your own HTTP and script tools for the agents" },
 ];
 
 /** The links of the org and the account. */

@@ -151,6 +151,15 @@ TRIGGER_SECRET_PATTERN: Final = "^trigger:[0-9a-f-]{36}$"  # noqa: S105 (a name 
 BROWSER_LOGIN_SECRET_PATTERN: Final = "^browser_login:[0-9a-f-]{36}$"  # noqa: S105 (a pattern)
 """The vault name of the user name and the password of one saved browser login (Section 14.1):
 ``browser_login:<id>``."""
+CUSTOM_TOOL_SECRET_PATTERN: Final = "^custom_tool:[0-9a-f-]{36}$"  # noqa: S105 (a pattern)
+"""The vault name of the credential of one custom HTTP tool (Section 10.8): ``custom_tool:<id>``."""
+CUSTOM_TOOL_SCOPES: Final = ("org", "workspace", "user")
+CUSTOM_TOOL_KINDS: Final = ("http", "script")
+CUSTOM_TOOL_POLICIES: Final = ("allow", "ask", "deny")
+CUSTOM_TOOL_CHANGES: Final = ("create", "edit", "revert")
+CUSTOM_TOOL_REVIEWS: Final = ("approved", "pending", "rejected")
+"""A version of a shared custom tool that a member without the role writes is ``pending`` until
+an admin approves or rejects it (Section 10.8)."""
 TRIGGER_KINDS: Final = ("webhook", "composio")
 TRIGGER_STATUSES: Final = ("active", "disabled")
 TRIGGER_OUTCOMES: Final = (
@@ -1498,7 +1507,8 @@ class VaultSecret(Base):
         UniqueConstraint("org_id", "name"),
         CheckConstraint(
             f"{_one_of('name', VAULT_NAMES)} OR name ~ '{CONNECTION_SECRET_PATTERN}'"
-            f" OR name ~ '{TRIGGER_SECRET_PATTERN}' OR name ~ '{BROWSER_LOGIN_SECRET_PATTERN}'",
+            f" OR name ~ '{TRIGGER_SECRET_PATTERN}' OR name ~ '{BROWSER_LOGIN_SECRET_PATTERN}'"
+            f" OR name ~ '{CUSTOM_TOOL_SECRET_PATTERN}'",
             name="name",
         ),
     )
@@ -3185,4 +3195,90 @@ class LibraryAgentVersion(Base):
     source: Mapped[str] = mapped_column(Text, nullable=False)
     reverts_version: Mapped[int | None] = mapped_column(Integer)
     author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class CustomTool(Base):
+    """A custom tool of the org, of a workspace, or of a user (docs/architecture.md, Section
+    10.8, M7.3). The row holds the name and the version that runs. The definition is in
+    ``custom_tool_versions``. ``current_version`` is null until a version is approved: a new
+    shared tool that a member proposes has no live version. The credential of an HTTP tool is
+    in the vault (``custom_tool:<id>``), never in a row. Members read the tools of their org,
+    of the workspaces that they see, and their own user tools. Only the control plane writes
+    the table."""
+
+    __tablename__ = "custom_tools"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint(
+            "org_id", "scope", "workspace_id", "user_id", "name", postgresql_nulls_not_distinct=True
+        ),
+        CheckConstraint(_one_of("scope", CUSTOM_TOOL_SCOPES), name="scope"),
+        CheckConstraint(
+            "(scope = 'org' AND workspace_id IS NULL AND user_id IS NULL)"
+            " OR (scope = 'workspace' AND workspace_id IS NOT NULL AND user_id IS NULL)"
+            " OR (scope = 'user' AND workspace_id IS NULL AND user_id IS NOT NULL)",
+            name="scope_columns",
+        ),
+        CheckConstraint("name ~ '^[a-z][a-z0-9_]{1,39}$'", name="name_format"),
+        CheckConstraint("current_version IS NULL OR current_version >= 1", name="current_version"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    current_version: Mapped[int | None] = mapped_column(Integer)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class CustomToolVersion(Base):
+    """One version of a custom tool. A version never changes, but its review does (Section
+    10.8). ``config`` holds the HTTP request or the script, never a secret.
+    ``author_user_id`` and ``reviewed_by_user_id`` are not foreign keys: the history outlives a
+    deleted user."""
+
+    __tablename__ = "custom_tool_versions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "tool_id"], ["custom_tools.org_id", "custom_tools.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("org_id", "tool_id", "version_no"),
+        CheckConstraint("version_no >= 1", name="version_no"),
+        CheckConstraint(_one_of("kind", CUSTOM_TOOL_KINDS), name="kind"),
+        CheckConstraint(_one_of("policy", CUSTOM_TOOL_POLICIES), name="policy"),
+        CheckConstraint(_one_of("change", CUSTOM_TOOL_CHANGES), name="change"),
+        CheckConstraint(_one_of("review", CUSTOM_TOOL_REVIEWS), name="review"),
+        CheckConstraint("char_length(description) BETWEEN 1 AND 1000", name="description_length"),
+        CheckConstraint("char_length(summary) <= 500", name="summary_length"),
+        CheckConstraint("jsonb_typeof(input_schema) = 'object'", name="input_schema_object"),
+        CheckConstraint("jsonb_typeof(config) = 'object'", name="config_object"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    tool_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    input_schema: Mapped[dict[str, Any]] = _json()
+    policy: Mapped[str] = mapped_column(Text, nullable=False)
+    config: Mapped[dict[str, Any]] = _json()
+    change: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    review: Mapped[str] = mapped_column(Text, nullable=False)
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()

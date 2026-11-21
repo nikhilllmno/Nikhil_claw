@@ -44,6 +44,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "self": frozenset({"change_propose", "sama_pr"}),
     "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
     "integrations": frozenset(),
+    "custom_tools": frozenset(),
     "delegation": frozenset({"delegate_task", "delegate_status"}),
     "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
     "code_exec": frozenset({"execute_code"}),
@@ -63,7 +64,8 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
 }
 """The tools of each toolset that sama has today (Section 10.2). A toolset that is not here
 has no tools yet. ``integrations`` has no fixed tools: the connector tools are deferred tools
-that the catalog of the tool server adds (Section 10.3)."""
+that the catalog of the tool server adds (Section 10.3). ``custom_tools`` has no fixed tools
+either: the custom tools of each run are deferred tools (Section 10.8)."""
 
 ToolAccess = Literal["read", "write", "destructive"]
 """What a deferred tool does, for its default policy (Section 10.3): ``read`` gets ``allow``,
@@ -650,8 +652,16 @@ def policy_verdict(
 
 
 def _most_specific(rules: Iterable[PolicyRule]) -> PolicyRule | None:
+    """The rule of the highest level, an exact name before a prefix. Between two rules of the
+    same level and the same kind of name, the stricter rule wins, so the order of the rules
+    never loosens a verdict (for example a stored rule and the policy of a custom tool,
+    Section 10.8)."""
     rank = {RuleLevel.ORG: 0, RuleLevel.PROFILE: 1, RuleLevel.USER: 2}
-    return max(rules, key=lambda rule: (rank[rule.level], rule.exact), default=None)
+    return max(
+        rules,
+        key=lambda rule: (rank[rule.level], rule.exact, _STRICTNESS[rule.action]),
+        default=None,
+    )
 
 
 def _in_context(

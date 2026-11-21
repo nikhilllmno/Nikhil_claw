@@ -26,7 +26,7 @@ from sama.tools.code import (
     MAX_STDOUT_BYTES,
     STUB,
     CodeResult,
-    _result,
+    parse_output,
     render,
 )
 from tests.conformance.scripted_model import serve
@@ -221,8 +221,8 @@ def test_render_cuts_a_long_output_and_says_so() -> None:
 
 def test_a_missing_mark_is_an_error() -> None:
     with pytest.raises(CodeError, match="did not run"):
-        _result("", "bash: python3: not found\n", 60)
-    assert _result("ok", "noise\nSAMA-EXIT 0 2\n", 60).exit_code == 0
+        parse_output("", "bash: python3: not found\n", 60)
+    assert parse_output("ok", "noise\nSAMA-EXIT 0 2\n", 60).exit_code == 0
 
 
 def test_the_stub_is_plain_python_and_has_the_block_list() -> None:

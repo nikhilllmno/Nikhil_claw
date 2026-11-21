@@ -22,7 +22,7 @@ import dataclasses
 import json
 import logging
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, cast
@@ -168,6 +168,22 @@ class RunToolSource(Protocol):
     ) -> tuple[Mapping[str, frozenset[str]], Mapping[str, ToolAccess]]: ...
 
 
+class RunRuleSource(Protocol):
+    """Policy rules that depend on the run, for example the policy of each custom tool that
+    the run may use (Section 10.8). The gate reads them at each check, in its transaction."""
+
+    async def run_rules(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        user_id: uuid.UUID | None,
+        shared: bool,
+        toolsets: frozenset[str],
+    ) -> Sequence[PolicyRule]: ...
+
+
 Escalation = Callable[[str, str, str, Mapping[str, Any]], str | None]
 """``(org_id, run_id, tool name, arguments)`` gives a reason when the call needs a person even
 with an ``allow`` rule, or ``None``. It runs in the event loop, so it must be quick."""
@@ -184,19 +200,22 @@ class GateService:
         approval_ttl: timedelta = APPROVAL_TTL,
         clock: Callable[[], datetime] = _utcnow,
         extra_toolsets: ToolsetSource | None = None,
-        run_tools: RunToolSource | None = None,
+        run_tools: RunToolSource | Sequence[RunToolSource] | None = None,
+        run_rules: RunRuleSource | Sequence[RunRuleSource] | None = None,
         escalation: Escalation | None = None,
     ) -> None:
         """``extra_toolsets`` adds toolsets to the fixed table, for example the deferred tools
         of the tool server (Section 10.3). It is read at each check. ``run_tools`` adds the
-        tools that depend on the run. ``escalation`` gives a reason when a call needs a person
-        even with an ``allow`` rule (``decide``, ``escalate``); the control plane sets it to
-        the sensitive actions of the browser (Section 14.2.2)."""
+        tools that depend on the run, and ``run_rules`` adds the policy rules that depend on
+        the run (the custom tools, Section 10.8). ``escalation`` gives a reason when a call
+        needs a person even with an ``allow`` rule (``decide``, ``escalate``); the control
+        plane sets it to the sensitive actions of the browser (Section 14.2.2)."""
         if approval_ttl <= timedelta(0):
             raise ValueError("approval_ttl must be more than 0")
         self._engine = engine
         self._extra_toolsets = extra_toolsets
-        self._run_tools = run_tools
+        self._run_tools: tuple[RunToolSource, ...] = _sources(run_tools)
+        self._run_rules: tuple[RunRuleSource, ...] = _sources(run_rules)
         self.escalation = escalation
         self._ttl = approval_ttl
         self._clock = clock
@@ -552,20 +571,24 @@ class GateService:
             preapproved = workflow.preapproved
         extra = dict(self._extra_toolsets.toolsets()) if self._extra_toolsets is not None else {}
         access = dict(self._extra_toolsets.access()) if self._extra_toolsets is not None else {}
-        if self._run_tools is not None:
-            more, more_access = await self._run_tools.run_tools(
-                connection,
-                org_id=org_id,
-                workspace_id=ref.workspace_id,
-                user_id=user_id,
-                shared=row.audience != "private",
-                toolsets=toolsets,
-            )
+        who: dict[str, Any] = {
+            "org_id": org_id,
+            "workspace_id": ref.workspace_id,
+            "user_id": user_id,
+            "shared": row.audience != "private",
+            "toolsets": toolsets,
+        }
+        fixed_access = access
+        for source in self._run_tools:
+            more, more_access = await source.run_tools(connection, **who)
             for name, tools in more.items():
                 extra[name] = extra.get(name, frozenset()) | tools
-            # A fixed tool keeps its own access.
             access = {**more_access, **access}
+        # A fixed tool keeps its own access.
+        access = {**access, **fixed_access}
         rules = await self._rules(connection, org_id, row.agent_profile_id, user_id)
+        for rule_source in self._run_rules:
+            rules = (*rules, *await rule_source.run_rules(connection, **who))
         context = GateContext(
             toolsets=toolsets,
             rules=rules,
@@ -995,3 +1018,11 @@ __all__ = [
     "ApprovalExpiredError",
     "GateService",
 ]
+
+
+def _sources[T](value: T | Sequence[T] | None) -> tuple[T, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, Sequence):
+        return tuple(value)
+    return (value,)

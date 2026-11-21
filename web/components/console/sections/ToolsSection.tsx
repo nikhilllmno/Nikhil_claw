@@ -36,7 +36,8 @@ import { ErrorState, LoadingState, ToneBadge } from "../../ui";
 import { useLoad } from "../../useLoad";
 import admin from "../../Admin.module.css";
 import styles from "../../Page.module.css";
-import { AgentProfileEditor, ComingCard, SectionHeader, useAgentChoice } from "../parts";
+import { CustomToolsPanel } from "../../CustomTools";
+import { AgentProfileEditor, SectionHeader, useAgentChoice } from "../parts";
 import own from "./Tools.module.css";
 
 const ACTION_TONE = { allow: "accent", ask: "warning", deny: "danger" } as const;
@@ -65,10 +66,16 @@ export function ToolsSection() {
         )}
       </AgentProfileEditor>
       <OrgRules orgId={org.id} manage={mayManage} />
-      <ComingCard title="Custom tools">
-        Members will add tools in their own scope. Admins will add tools for the workspace and for the org. This comes
-        with custom tools.
-      </ComingCard>
+      <section className={`card ${styles.card}`} aria-label="Custom tools">
+        <div className={styles.cardHead}>
+          <h2 className={styles.subheading}>Custom tools</h2>
+        </div>
+        <p className={styles.text}>
+          HTTP requests and Python or Node scripts that the agents find with tool search. A member adds tools for
+          themselves at once. A workspace or org tool waits until an admin approves it.
+        </p>
+        <CustomToolsPanel key={choice.workspaceId} workspaceId={choice.workspaceId} orgAdmin={org.admin} />
+      </section>
     </>
   );
 }

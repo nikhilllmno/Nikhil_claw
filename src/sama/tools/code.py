@@ -202,7 +202,7 @@ class CodeRunner:
             await sandbox.write_file(f"{folder}/sama_tools.py", STUB.encode())
             await sandbox.write_file(f"{folder}/main.py", code.encode())
             result = await sandbox.exec(
-                ["bash", "-c", _script(folder, timeout_s)],
+                ["bash", "-c", program_script(folder, timeout_s)],
                 env={
                     TOOLS_URL_ENV: self._mcp_url,
                     TOKEN_ENV: token,
@@ -214,19 +214,27 @@ class CodeRunner:
             )
         except SandboxError as error:
             raise CodeError(f"the sandbox failed: {error}") from None
-        return _result(result.stdout, result.stderr, timeout_s)
+        return parse_output(result.stdout, result.stderr, timeout_s)
 
 
-def _script(folder: str, timeout_s: int) -> str:
-    """The shell script that runs the program. It prints the head of the standard output. The
+def program_script(
+    folder: str,
+    timeout_s: int,
+    *,
+    command: str | None = None,
+    stdin: str = "/dev/null",
+) -> str:
+    """The shell script that runs a program. It prints the head of the standard output. The
     standard error has a line ``SAMA-EXIT <exit code> <stdout bytes>``, then the tail of the
-    standard error of the program. The folder is removed at the end."""
+    standard error of the program. ``folder`` is removed at the end. ``command`` is a shell
+    command (default ``python3 <folder>/main.py``), and ``stdin`` is the path of its standard
+    input. Custom script tools use it too (Section 10.8)."""
     q = shlex.quote(folder)
+    run = command if command is not None else f"python3 {q}/main.py"
     return "\n".join(
         [
             f"ulimit -f {MAX_FILE_KB}",
-            f"timeout -k 5 {timeout_s} python3 {q}/main.py"
-            f" > {q}/out.txt 2> {q}/err.txt < /dev/null",
+            f"timeout -k 5 {timeout_s} {run} > {q}/out.txt 2> {q}/err.txt < {shlex.quote(stdin)}",
             "code=$?",
             f'size=$(wc -c < {q}/out.txt | tr -d " ")',
             f"head -c {MAX_STDOUT_BYTES} {q}/out.txt",
@@ -238,7 +246,9 @@ def _script(folder: str, timeout_s: int) -> str:
     )
 
 
-def _result(stdout: str, stderr: str, timeout_s: int) -> CodeResult:
+def parse_output(stdout: str, stderr: str, timeout_s: int) -> CodeResult:
+    """The result of ``program_script`` from the output of the sandbox call. Raises
+    ``CodeError`` when the script did not run."""
     _, mark, after = stderr.partition(_MARK + " ")
     first, _, rest = after.partition("\n")
     try:

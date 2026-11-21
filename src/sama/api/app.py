@@ -66,6 +66,7 @@ from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.billing import router as billing_router
 from sama.api.browser import BrowserSettings, LoginChange, LoginIn, UrlPolicyIn
 from sama.api.chrome import ChromeChannel
+from sama.api.custom_tools import router as custom_tools_router
 from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
 from sama.api.history import (
     DEFAULT_RUNS,
@@ -123,6 +124,7 @@ from sama.context import (
     children,
     list_compactions,
 )
+from sama.customtools.service import CustomToolService
 from sama.datacontrols.delete import DataError
 from sama.datacontrols.export import ExportFile
 from sama.datacontrols.retention import RetentionError
@@ -136,6 +138,7 @@ from sama.db.models import (
     Approval,
     AuditEntry,
     ChannelIdentity,
+    CustomTool,
     Integration,
     Message,
     Org,
@@ -1172,8 +1175,10 @@ class SamaApi:
         chrome: ChromeHub | None = None,
         billing: BillingService | None = None,
         browser: BrowserSettings | None = None,
+        custom_tools: CustomToolService | None = None,
     ) -> None:
-        """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
+        """Without ``custom_tools``, the custom tool routes answer ``409``. Without
+        ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
         ``409``, and without ``checkpoints`` the checkpoint routes answer ``409``. Without
         ``connections`` the connection routes answer ``409``. Without
@@ -1190,6 +1195,7 @@ class SamaApi:
         self._browser = browser
         self._api_keys = ApiKeyStore(engine)
         self._library = LibraryRoutes(SubagentLibrary(engine), self._can_manage_agents)
+        self._custom_tools = custom_tools
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._github = github
@@ -1317,11 +1323,17 @@ class SamaApi:
                 "connections": self._connections is not None,
                 "signup": self._org_service.policy.mode,
                 "billing": self._billing.enabled,
+                "custom_tools": self._custom_tools is not None,
             }
 
         app.include_router(org_router(self._org_service, _principal))
         app.include_router(billing_router(self._billing, _principal))
         app.include_router(api_keys_router(self._api_keys, _principal, self._org_admin))
+        app.include_router(
+            custom_tools_router(
+                self._require_custom_tools, _principal, self._workspace_grants, self._tool_grants
+            )
+        )
 
         @app.get("/me")
         async def me(principal: Me) -> dict[str, Any]:
@@ -3494,6 +3506,32 @@ class SamaApi:
                 detail="only the owner, a workspace admin, or the org owner can change it",
             )
         return org_id, view, grants
+
+    def _require_custom_tools(self) -> CustomToolService:
+        if self._custom_tools is None:
+            raise HTTPException(status_code=409, detail="custom tools are off in this process")
+        return self._custom_tools
+
+    async def _tool_grants(
+        self, principal: Principal, tool_id: uuid.UUID
+    ) -> tuple[uuid.UUID, Grants]:
+        """The org of a custom tool and the grants of the user. The row is read as the user, so
+        row level security hides the tools of other orgs, of workspaces that the user does not
+        see, and the user tools of other users. Raises ``404`` for a tool that the user cannot
+        see (Section 10.8)."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            org_id = (
+                await connection.execute(select(CustomTool.org_id).where(CustomTool.id == tool_id))
+            ).scalar_one_or_none()
+            user_id = None if org_id is None else await _user_id(connection, principal, org_id)
+            grants = (
+                None
+                if org_id is None or user_id is None
+                else await load_grants(connection, org_id, user_id)
+            )
+        if org_id is None or grants is None or not grants.org_member:
+            raise _not_found("the tool does not exist")
+        return org_id, grants
 
     def _require_browser(self) -> BrowserSettings:
         if self._browser is None:
