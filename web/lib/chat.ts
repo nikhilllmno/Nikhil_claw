@@ -5,6 +5,7 @@ import {
   type CheckpointItem,
   OPEN_RUN_STATUSES,
   type RunEventPayload,
+  type OpenRun,
   type RunsEvent,
   type SteerNote,
   type StreamRun,
@@ -308,6 +309,19 @@ export function noteLabel(note: Pick<SteerNote, "status">): string | null {
       // A requeued note is a message of the session now: the message shows it.
       return null;
   }
+}
+
+/**
+ * The server rows of the open runs by run id, for the numbers of `/stop NUMBER` (M7.1). Empty
+ * unless the server list has exactly the open runs of the view: a stale list could show a number
+ * that the server now gives to another run.
+ */
+export function runNumbers(openIds: readonly string[], serverRuns: readonly OpenRun[] | null): Map<string, OpenRun> {
+  const fresh =
+    serverRuns !== null &&
+    serverRuns.length === openIds.length &&
+    serverRuns.every((run) => openIds.includes(run.run_id));
+  return new Map((fresh ? serverRuns : []).map((run) => [run.run_id, run]));
 }
 
 /** True while a note waits for its run: the chat looks again until the run reads it. */

@@ -1373,8 +1373,23 @@ class RunQueue:
         )
         # The newest message that the session state has seen (M7.1). The side runs that
         # answered after it are the catch-up of a main run.
+        # A chat run that starts takes the runtime of the session now (see ``runtime`` below).
+        # The watermark must come from the same runtime as the state in ``RETURNING``, and the
+        # ``SET`` clause still sees the old ``Run.runtime``.
+        runtime = case(
+            (
+                starts,
+                func.coalesce(
+                    case((Run.compact, null()), else_=Run.coding_agent),
+                    case((Run.compact, null()), else_=Session.coding_agent),
+                    Session.run_config["runtime"].astext,
+                    AgentProfile.runtime,
+                ),
+            ),
+            else_=Run.runtime,
+        )
         state_seq = (
-            _session_state_query(prior, Run.org_id, Run.session_id, Run.runtime, "context_seq")
+            _session_state_query(prior, Run.org_id, Run.session_id, runtime, "context_seq")
             .scalar_subquery()
             .correlate(Run)
         )
@@ -1409,18 +1424,7 @@ class RunQueue:
                     # A ``/claude`` or ``/codex`` run keeps its coding agent, and the direct mode
                     # of the session sends its other chat runs to the coding agent. A compact
                     # run compacts the context of the session runtime (Section 15.4).
-                    runtime=case(
-                        (
-                            and_(Run.kind == "chat", ~resumes),
-                            func.coalesce(
-                                case((Run.compact, null()), else_=Run.coding_agent),
-                                case((Run.compact, null()), else_=Session.coding_agent),
-                                Session.run_config["runtime"].astext,
-                                AgentProfile.runtime,
-                            ),
-                        ),
-                        else_=Run.runtime,
-                    ),
+                    runtime=runtime,
                 )
                 .returning(
                     Run.org_id,

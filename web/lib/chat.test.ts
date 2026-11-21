@@ -11,6 +11,7 @@ import {
   openRunIds,
   parseCommand,
   parseCompact,
+  runNumbers,
   sessionTitle,
 } from "./chat";
 
@@ -358,5 +359,17 @@ describe("checkpointListText", () => {
 
   it("says when there are no checkpoints", () => {
     expect(checkpointListText([])).toBe(NO_CHECKPOINTS);
+  });
+});
+
+describe("runNumbers", () => {
+  const row = (id: string, number: number) => ({ number, run_id: id, status: "running", side: number > 1, text: id });
+  it("uses the server numbers only when the list matches the open runs", () => {
+    const server = [row("a", 1), row("b", 2), row("c", 3)];
+    expect(runNumbers(["c", "a", "b"], server).get("b")?.number).toBe(2);
+    // Run a ended and the new list did not load: no number is shown.
+    expect(runNumbers(["b", "c"], server).size).toBe(0);
+    expect(runNumbers(["b", "c"], null).size).toBe(0);
+    expect(runNumbers(["b", "c"], [row("b", 1), row("c", 2)]).get("c")?.number).toBe(2);
   });
 });

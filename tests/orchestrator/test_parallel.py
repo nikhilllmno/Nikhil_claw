@@ -380,3 +380,39 @@ async def test_a_compaction_does_not_consume_the_catch_up(
     following = await claim(queue)
     assert following.runtime_state == b"compacted"
     assert "quick answer" in following.input
+
+
+async def test_the_watermark_comes_from_the_runtime_of_the_resumed_state(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """A run that waited while the profile switched runtime takes the state and the watermark
+    of the new runtime, so a side answer that the state has is not given again."""
+    queue = RunQueue(engine)
+    await set_mode(engine, tenant, "parallel")
+    await send(queue, tenant, "slow")
+    slow = await claim(queue)
+    await send(queue, tenant, "quick")
+    quick = await claim(queue)
+    await finish(queue, quick, "quick answer", None)
+    await finish(queue, slow, "slow answer", b"fake-1")
+    await send(queue, tenant, "take the catch-up")
+    main = await claim(queue)
+    assert "quick answer" in main.input
+    await finish(queue, main, "ok", b"fake-2")
+    # The state of the newest run moves to the other runtime, as after a switch, and a run waits.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == main.run_id).values(runtime="claude_agent_sdk")
+        )
+    waiting = await send(queue, tenant, "after the switch")
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(runtime="claude_agent_sdk")
+        )
+    following = await claim(queue)
+    assert following.run_id == waiting
+    assert following.runtime == "claude_agent_sdk"
+    assert following.runtime_state == b"fake-2"
+    assert "quick answer" not in following.input

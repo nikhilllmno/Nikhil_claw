@@ -30,6 +30,7 @@ import {
   openRunIds,
   parseCommand,
   QUEUED_NOTICE,
+  runNumbers,
   ROLLBACK_USAGE,
   sessionTitle,
   STEER_USAGE,
@@ -210,24 +211,28 @@ export function Chat({ sessionId }: { sessionId: string }) {
 
   // The numbers of the open runs come from the server, so `/stop NUMBER` and the list agree.
   const [serverRuns, setServerRuns] = useState<OpenRun[] | null>(null);
-  const openKey = openRuns.join(",");
+  const [runsTry, setRunsTry] = useState(0);
+  const openKey = [...openRuns].sort().join(",");
   useEffect(() => {
     if (openRuns.length < 2) return;
     let live = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     api
       .listOpenRuns(sessionId)
       .then((runs) => {
         if (live) setServerRuns(runs);
       })
       .catch(() => {
-        // The list falls back to the order of the requests.
+        // Try again: the numbers stay hidden until a list matches the open runs.
+        if (live) retry = setTimeout(() => setRunsTry((n) => n + 1), NOTE_POLL_MS);
       });
     return () => {
       live = false;
+      if (retry !== undefined) clearTimeout(retry);
     };
     // `openKey` stands for the open runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, sessionId, openKey]);
+  }, [api, sessionId, openKey, runsTry]);
 
   // The queued, steered, and joined notices are about the open runs: hide them when no run is open.
   const runNotices = [QUEUED_NOTICE, STEERED_NOTICE, JOINED_NOTICE];
@@ -458,7 +463,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
     for (const m of messages ?? []) {
       if (m.role === "user" && m.run_id && !requests.has(m.run_id)) requests.set(m.run_id, m);
     }
-    const order = new Map((serverRuns ?? []).map((run) => [run.run_id, run]));
+    const order = runNumbers(openRuns, serverRuns);
     return openRuns
       .map((id) => ({
         id,
