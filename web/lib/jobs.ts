@@ -22,6 +22,29 @@ const MODEL = /^[A-Za-z0-9._:/-]{1,100}$/;
 
 // -- labels -------------------------------------------------------------------------------------
 
+/** True for the weekly curator job that sama adds to each workspace (Section 9.7). It has no
+ * prompt and no script, so the form cannot edit it. Pause, resume, run, and remove work. */
+export function isCurator(job: Pick<Job, "mode">): boolean {
+  return job.mode === "curator";
+}
+
+export function modeLabel(mode: string): string {
+  if (mode === "script") return "Script";
+  if (mode === "curator") return "Curator";
+  return "Agent";
+}
+
+export function creatorLabel(kind: string): string {
+  if (kind === "agent") return "an agent";
+  if (kind === "system") return "sama";
+  return "a person";
+}
+
+export const CURATOR_TEXT =
+  "Each week, the curator marks the skills that agents wrote and nobody used for 30 days as stale, " +
+  "and archives them after 90 days. It never deletes anything. It sends a report about the skills " +
+  "and the memory of the workspace.";
+
 export type Tone = "accent" | "warning" | "danger" | "neutral";
 
 export function statusLabel(status: string): string {

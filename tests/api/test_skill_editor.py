@@ -8,11 +8,11 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
-from sama.db.models import AuditEntry, Membership, SkillVersion, User
+from sama.db.models import AuditEntry, Membership, Skill, SkillVersion, User
 from sama.skills import SkillLibrary
 from tests.api.conftest import ISSUER, SECRET, bearer
 from tests.api.test_app import mia
@@ -289,3 +289,140 @@ async def test_the_editor_needs_a_library(tenant: Tenant, api: SamaApi) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://sama.test") as plain:
         response = await plain.get(base(tenant), headers=mia(tenant))
     assert response.status_code == 409
+
+
+async def test_a_member_pins_unpins_and_restores_an_own_skill(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The curator controls of the skills page (Section 9.7)."""
+    created = await client.post(
+        base(tenant),
+        headers=mia(tenant),
+        json={
+            "action": "create",
+            "name": "my-notes",
+            "scope": "user",
+            "content": md("my-notes", "My notes"),
+        },
+    )
+    assert created.status_code == 200, created.text
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Skill)
+            .where(Skill.org_id == tenant.org, Skill.name == "my-notes")
+            .values(status="stale", stale_since=func.now())
+        )
+    [stale] = [
+        s
+        for s in (await client.get(base(tenant), headers=mia(tenant))).json()["skills"]
+        if s["name"] == "my-notes"
+    ]
+    assert (stale["name"], stale["status"], stale["pinned"]) == ("my-notes", "stale", False)
+
+    pinned = await client.post(
+        f"{base(tenant)}/my-notes/pin", params={"scope": "user"}, headers=mia(tenant)
+    )
+    assert pinned.status_code == 200, pinned.text
+    assert pinned.json()["status"] == "active"
+    assert pinned.json()["pinned"] is True
+    detail = await client.get(f"{base(tenant)}/my-notes", headers=mia(tenant))
+    assert (detail.json()["status"], detail.json()["pinned"]) == ("active", True)
+    unpinned = await client.post(
+        f"{base(tenant)}/my-notes/unpin", params={"scope": "user"}, headers=mia(tenant)
+    )
+    assert unpinned.json()["pinned"] is False
+    not_archived = await client.post(
+        f"{base(tenant)}/my-notes/restore", params={"scope": "user"}, headers=mia(tenant)
+    )
+    assert not_archived.status_code == 409
+
+    archived = await client.post(
+        base(tenant),
+        headers=mia(tenant),
+        json={"action": "archive", "name": "my-notes", "scope": "user"},
+    )
+    assert archived.status_code == 200, archived.text
+    archive_url = f"/workspaces/{tenant.ids['ws']}/archived-skills"
+    [listed] = (await client.get(archive_url, headers=mia(tenant))).json()
+    assert (listed["name"], listed["scope"], listed["version"], listed["can_restore"]) == (
+        "my-notes",
+        "user",
+        2,
+        True,
+    )
+    refused = await client.post(
+        f"{base(tenant)}/my-notes/pin", params={"scope": "user"}, headers=mia(tenant)
+    )
+    assert refused.status_code == 409
+
+    restored = await client.post(
+        f"{base(tenant)}/my-notes/restore", params={"scope": "user"}, headers=mia(tenant)
+    )
+    assert restored.status_code == 200, restored.text
+    assert (restored.json()["status"], restored.json()["version"]) == ("active", 3)
+    assert (await client.get(archive_url, headers=mia(tenant))).json() == []
+    async with engine.connect() as connection:
+        version = (
+            await connection.execute(
+                select(SkillVersion).where(
+                    SkillVersion.org_id == tenant.org,
+                    SkillVersion.name == "my-notes",
+                    SkillVersion.version_no == 3,
+                )
+            )
+        ).one()
+        actions = sorted(
+            row.action
+            for row in await connection.execute(
+                select(AuditEntry.action).where(
+                    AuditEntry.org_id == tenant.org,
+                    AuditEntry.action.in_(("skill.pin", "skill.unpin", "skill.restore")),
+                )
+            )
+        )
+    assert (version.change, version.author_kind) == ("restore", "user")
+    assert "My notes" in version.skill_md
+    assert actions == ["skill.pin", "skill.restore", "skill.unpin"]
+    reread = await client.get(f"{base(tenant)}/my-notes", headers=mia(tenant))
+    assert reread.status_code == 200
+
+
+async def test_the_curator_controls_follow_the_write_roles(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = await add_member(engine, tenant, org_role="member", workspace_role="admin")
+    created = await client.post(
+        base(tenant),
+        headers=admin,
+        json={
+            "action": "create",
+            "name": "team-notes",
+            "scope": "workspace",
+            "content": md("team-notes", "Team notes"),
+        },
+    )
+    assert created.status_code == 200, created.text
+    member = await client.post(
+        f"{base(tenant)}/team-notes/pin", params={"scope": "workspace"}, headers=mia(tenant)
+    )
+    assert member.status_code == 403
+    missing = await client.post(
+        f"{base(tenant)}/nope/pin", params={"scope": "workspace"}, headers=admin
+    )
+    assert missing.status_code == 404
+    no_scope = await client.post(f"{base(tenant)}/team-notes/pin", headers=admin)
+    assert no_scope.status_code == 422
+    wrong = await client.post(
+        f"{base(tenant)}/team-notes/delete", params={"scope": "workspace"}, headers=admin
+    )
+    assert wrong.status_code == 422
+    ok = await client.post(
+        f"{base(tenant)}/team-notes/pin", params={"scope": "workspace"}, headers=admin
+    )
+    assert ok.status_code == 200, ok.text
+    [skill] = [
+        s
+        for s in (await client.get(base(tenant), headers=mia(tenant))).json()["skills"]
+        if s["name"] == "team-notes"
+    ]
+    assert skill["pinned"] is True

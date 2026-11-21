@@ -14,7 +14,7 @@ they edit the same rows with the same rules:
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
@@ -53,6 +53,39 @@ from sama.tenancy.access import load_grants
 from sama.vault.redact import redact
 
 MAX_JOBS_PER_USER: Final = 50
+CURATOR_FIXED: Final = (
+    "mode",
+    "prompt",
+    "script",
+    "skills",
+    "model",
+    "preapproved_tools",
+    "attach_to_session",
+)
+"""The fields that a curator job does not use, so a person cannot change them."""
+
+
+def _stored(spec: JobSpec, name: str) -> Any:
+    """The value of a field of ``spec`` as a ``JobInput`` gives it."""
+    value = getattr(spec, name)
+    return list(value) if isinstance(value, tuple) else value
+
+
+def _check_curator(given: JobInput, old: JobSpec) -> None:
+    """A curator job runs the curator, not a prompt or a script (Section 9.7). A person
+    changes its name, schedule, profile, and targets only."""
+    fixed = [
+        name
+        for name in CURATOR_FIXED
+        if name in given.model_fields_set and getattr(given, name) != _stored(old, name)
+    ]
+    if fixed:
+        raise JobError(
+            f"a curator job has a fixed {', '.join(fixed)}. You can change its name, "
+            "schedule, and delivery targets."
+        )
+
+
 RECENT_FIRES: Final = 10
 
 ActorKind = Literal["user", "agent"]
@@ -311,6 +344,8 @@ class JobService:
                         Job.org_id == actor.org_id,
                         Job.owner_user_id == actor.user_id,
                         Job.status != "removed",
+                        # The curator jobs are from sama, so they do not count (Section 9.7).
+                        Job.mode != "curator",
                     )
                 )
             ).scalar_one()
@@ -606,6 +641,18 @@ class JobService:
             schedule = preview(old.schedule, given.tz)["schedule"]
         if schedule is None:
             raise JobError("a job needs a schedule")
+        deliver = parse_target(pick("deliver", "origin") or "origin")
+        failure = pick("failure_deliver", None)
+        failure = parse_target(failure, field="failure_deliver") if failure else None
+        if old is not None and old.mode == "curator":
+            _check_curator(given, old)
+            return replace(
+                old,
+                agent_profile_id=profile_id,
+                schedule=schedule,
+                deliver=deliver,
+                failure_deliver=failure,
+            )
         mode = pick("mode", "agent") or "agent"
         prompt = (pick("prompt", "") or "").strip()
         script = pick("script", None)
@@ -621,9 +668,6 @@ class JobService:
                     f"the {label} contains a secret. Keep secrets in the vault, and use a "
                     "connection or a vault reference."
                 )
-        deliver = parse_target(pick("deliver", "origin") or "origin")
-        failure = pick("failure_deliver", None)
-        failure = parse_target(failure, field="failure_deliver") if failure else None
         if "preapproved_tools" in sent:
             tools = tuple(parse_preapproval(item) for item in given.preapproved_tools or [])
         else:

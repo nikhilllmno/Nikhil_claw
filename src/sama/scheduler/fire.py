@@ -17,7 +17,8 @@ from sqlalchemy import func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from sama.db.models import AuditEntry, Delivery, Job, JobFire, Session, User
+from sama.curator.curate import curate
+from sama.db.models import AuditEntry, Delivery, Job, JobFire, Message, Session, User
 from sama.orchestrator.queue import RunQueue
 from sama.scheduler.spec import cleared
 from sama.tenancy.access import load_grants
@@ -70,7 +71,8 @@ async def start_fire(
     manual: bool,
 ) -> uuid.UUID | None:
     """Writes the fire of ``job`` (a locked ``jobs`` row) for ``scheduled_for``. Returns the
-    fire id, or ``None`` when that fire exists (another scheduler wrote it).
+    fire id, or ``None`` when that fire exists (another scheduler wrote it). A ``curator`` fire
+    runs and finishes here.
 
     Raises ``FireBlockedError`` when the job needs an approval that it does not have, or when
     the owner cannot use the workspace now."""
@@ -100,6 +102,20 @@ async def start_fire(
             check_rate=False,
         )
         values["started_at"] = func.now()
+    report = None
+    if job.mode == "curator":
+        # The curator runs here, in this transaction: it has no model call and no sandbox
+        # (Section 9.7). The report is a message of the fire session and the result.
+        report = redact(await curate(connection, job))
+        await connection.execute(
+            insert(Message).values(
+                org_id=job.org_id,
+                session_id=session_id,
+                role="assistant",
+                content={"text": report},
+            )
+        )
+        values["started_at"] = func.now()
     await connection.execute(update(JobFire).where(JobFire.id == fire_id).values(**values))
     await connection.execute(
         insert(AuditEntry).values(
@@ -113,6 +129,8 @@ async def start_fire(
             details={"fire_id": str(fire_id), "version": job.version, "manual": manual},
         )
     )
+    if report is not None:
+        await finish_fire(connection, row, ok=True, output=report, error=None)
     return fire_id
 
 

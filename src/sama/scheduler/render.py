@@ -31,8 +31,8 @@ def render_job(view: JobView, *, full: bool = False) -> str:
         f"Deliver: {view.deliver}"
         + (f"; on failure: {view.failure_deliver}" if view.failure_deliver else ""),
     ]
-    if view.mode == "script":
-        lines.append("Mode: script")
+    if view.mode != "agent":
+        lines.append(f"Mode: {view.mode}")
     if view.model:
         lines.append(f"Model: {view.model}")
     if view.preapproved_tools:

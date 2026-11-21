@@ -6,6 +6,7 @@ import {
   availableActions,
   browserTimeZone,
   buildInput,
+  creatorLabel,
   deliveryStatusLabel,
   deliveryStatusTone,
   failureNotice,
@@ -13,6 +14,8 @@ import {
   fireStatusTone,
   formatTarget,
   formatWhen,
+  isCurator,
+  modeLabel,
   newDraft,
   parsePreapprovedTools,
   parseSkills,
@@ -479,5 +482,18 @@ describe("buildInput for an update", () => {
       mode: "script",
       script: "echo",
     });
+  });
+});
+
+describe("curator jobs", () => {
+  it("knows the curator job and its labels", () => {
+    expect(isCurator(job({ mode: "curator" }))).toBe(true);
+    expect(isCurator(job())).toBe(false);
+    expect(modeLabel("curator")).toBe("Curator");
+    expect(modeLabel("script")).toBe("Script");
+    expect(modeLabel("agent")).toBe("Agent");
+    expect(creatorLabel("system")).toBe("sama");
+    expect(creatorLabel("agent")).toBe("an agent");
+    expect(creatorLabel("user")).toBe("a person");
   });
 });

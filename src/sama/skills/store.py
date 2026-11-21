@@ -20,7 +20,7 @@ from sama.db.models import AuditEntry, Skill, SkillVersion
 from sama.review.proposals import NewProposal, ProposalOrigin, ProposalSink
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, WritePlan, index, plan_write
-from sama.skills.sql import load_actor, load_docs, scope_filter
+from sama.skills.sql import count_usage, load_actor, load_docs, scope_filter
 from sama.tenancy.run_token import RunTokenClaims
 
 
@@ -71,6 +71,20 @@ def _matches(skill: SkillDoc, query: str | None) -> bool:
     return needle in " ".join((skill.name, skill.description, *skill.tags)).lower()
 
 
+PATCHES = frozenset({"patch", "edit", "write_file", "remove_file"})
+"""The changes that count as a patch of a skill (Section 9.7)."""
+
+
+def _usage(change: str) -> dict[str, object]:
+    """The usage columns of a write. An archive is not a use of the skill."""
+    if change == "archive":
+        return {}
+    values: dict[str, object] = {"last_used_at": func.now()}
+    if change in PATCHES:
+        values["patch_count"] = Skill.patch_count + 1
+    return values
+
+
 def _find(docs: list[SkillDoc], actor: Actor, name: str) -> SkillDoc:
     for doc in index(docs, actor):
         if doc.name == name:
@@ -98,11 +112,14 @@ class PostgresSkillStore:
         return [doc for doc in index(docs, actor) if _matches(doc, query)]
 
     async def view(self, claims: RunTokenClaims, name: str) -> SkillDoc:
-        async with self._engine.connect() as connection:
+        async with self._engine.begin() as connection:
             actor = await _actor(connection, claims)
             docs = await load_docs(connection, actor, names=[name], full=True)
-        builtin = self._builtin.get(name)
-        return _find([*docs, *([builtin] if builtin else [])], actor, name)
+            builtin = self._builtin.get(name)
+            doc = _find([*docs, *([builtin] if builtin else [])], actor, name)
+            if doc.skill_id is not None:
+                await count_usage(connection, actor.org_id, doc.skill_id, "view")
+        return doc
 
     async def manage(self, claims: RunTokenClaims, request: ManageRequest) -> Written:
         try:
@@ -281,6 +298,7 @@ class PostgresSkillStore:
                         user_id=actor.user_id if plan.scope == "user" else None,
                         name=request.name,
                         current_version=1,
+                        last_used_at=func.now(),
                     )
                     .returning(Skill.id)
                 )
@@ -294,7 +312,9 @@ class PostgresSkillStore:
                 .values(
                     current_version=version,
                     status="archived" if plan.change == "archive" else "active",
+                    stale_since=None,
                     updated_at=func.now(),
+                    **_usage(plan.change),
                 )
             )
         await connection.execute(

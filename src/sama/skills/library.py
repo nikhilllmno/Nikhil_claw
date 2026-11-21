@@ -40,6 +40,10 @@ class SkillMeta:
     requires_toolsets: tuple[str, ...] = ()
     skill_id: uuid.UUID | None = None
     archived: bool = False
+    stale: bool = False
+    """True when the curator marked the skill stale (Section 9.7). It still works."""
+    pinned: bool = False
+    """True when a person pinned the skill, so the curator keeps it active."""
 
 
 @dataclass(frozen=True, slots=True)

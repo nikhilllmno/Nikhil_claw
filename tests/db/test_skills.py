@@ -8,13 +8,13 @@ import uuid
 from collections.abc import AsyncIterator
 
 import pytest
-from sqlalchemy import delete, insert, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db import as_user
 from sama.db.models import AgentProfile, AuditEntry, Membership, Run, Skill, SkillVersion
-from sama.skills import ManageRequest, PostgresSkillStore, SkillError
-from sama.skills.library import SkillDoc
+from sama.skills import ManageRequest, PostgresSkillStore, SkillError, SkillLibrary
+from sama.skills.library import Actor, SkillDoc
 from sama.tenancy import RunTokenClaims
 from tests.db.world import World
 from tests.skills.helpers import md
@@ -346,3 +346,69 @@ async def test_metadata_with_a_secret_is_refused_and_nothing_is_stored(
     assert [(row.version_no, row.summary) for row in rows] == [(1, None)]
     assert all(KEY not in str(row.files) for row in rows)
     assert skill == "active"
+
+
+async def _usage(engine: AsyncEngine, name: str) -> tuple[int, int, int, str, bool]:
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                select(
+                    Skill.view_count,
+                    Skill.use_count,
+                    Skill.patch_count,
+                    Skill.status,
+                    Skill.last_used_at.is_not(None),
+                ).where(Skill.name == name)
+            )
+        ).one()
+    return (row[0], row[1], row[2], row[3], row[4])
+
+
+async def _make_stale(engine: AsyncEngine, name: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Skill)
+            .where(Skill.name == name)
+            .values(status="stale", stale_since=func.now(), last_used_at=None)
+        )
+
+
+async def test_views_uses_and_patches_are_counted_and_make_a_stale_skill_active(
+    engine: AsyncEngine, world: World
+) -> None:
+    """The usage counters of the curator (Section 9.7)."""
+    store = PostgresSkillStore(engine, BUILTIN)
+    mine = claims(world, "a1-alice")
+    await store.manage(mine, create("notes"))
+    assert await _usage(engine, "notes") == (0, 0, 0, "active", True)
+
+    await _make_stale(engine, "notes")
+    await store.view(mine, "notes")
+    assert await _usage(engine, "notes") == (1, 0, 0, "active", True)
+
+    library = SkillLibrary(engine, BUILTIN)
+    actor = Actor(
+        org_id=world.ids["org-a"],
+        workspace_id=world.ids["a1"],
+        user_id=world.ids["alice"],
+        private=True,
+        toolsets=frozenset({"core", "skills"}),
+    )
+    await _make_stale(engine, "notes")
+    assert await library.expand(actor, "/notes the plan") is not None
+    assert await library.expand(actor, "/base the plan") is not None
+    assert await _usage(engine, "notes") == (1, 1, 0, "active", True)
+
+    await _make_stale(engine, "notes")
+    await store.manage(
+        mine, ManageRequest(action="patch", name="notes", old_string="Do it.", new_string="Go.")
+    )
+    assert await _usage(engine, "notes") == (1, 1, 1, "active", True)
+    async with engine.connect() as connection:
+        stale_since = (
+            await connection.execute(select(Skill.stale_since).where(Skill.name == "notes"))
+        ).scalar_one()
+    assert stale_since is None
+
+    await store.manage(mine, ManageRequest(action="archive", name="notes"))
+    assert await _usage(engine, "notes") == (1, 1, 1, "archived", True)

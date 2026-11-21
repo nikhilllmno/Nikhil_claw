@@ -50,3 +50,16 @@ export function filterSkills(skills: readonly SkillSummary[], text: string): Ski
     return words.every((w) => hay.includes(w));
   });
 }
+
+/** The curator badge of a skill (Section 9.7): pinned, else stale, else none. */
+export function curatorBadge(
+  skill: Pick<SkillSummary, "status" | "pinned">,
+): { label: string; tone: "accent" | "warning" } | null {
+  if (skill.pinned) return { label: "Pinned", tone: "accent" };
+  if (skill.status === "stale") return { label: "Stale", tone: "warning" };
+  return null;
+}
+
+export const STALE_TEXT =
+  "No agent used this skill for 30 days, so the curator marked it as stale. It still works. " +
+  "If nobody uses it for 90 days, the curator archives it. Use it or pin it to keep it.";

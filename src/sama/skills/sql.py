@@ -6,7 +6,8 @@ from __future__ import annotations
 import uuid
 from collections.abc import Collection, Iterable
 
-from sqlalchemy import ColumnElement, and_, or_, select
+from sqlalchemy import ColumnElement, and_, func, insert, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import AgentProfile, Membership, Run, Session, Skill, SkillVersion
@@ -38,6 +39,7 @@ async def load_docs(
         Skill.scope,
         Skill.name,
         Skill.status,
+        Skill.pinned,
         SkillVersion.version_no,
         SkillVersion.description,
         SkillVersion.tags,
@@ -71,11 +73,36 @@ async def load_docs(
                 requires_toolsets=tuple(row["requires_toolsets"]),
                 skill_id=row["id"],
                 archived=row["status"] == "archived",
+                stale=row["status"] == "stale",
+                pinned=row["pinned"],
                 skill_md=row["skill_md"] if full else "",
                 files=dict(row["files"]) if full else {},
             )
         )
     return docs
+
+
+USAGE = {"view": Skill.view_count, "use": Skill.use_count}
+
+
+async def count_usage(
+    connection: AsyncConnection, org_id: uuid.UUID, skill_id: uuid.UUID, kind: str
+) -> None:
+    """Counts a view or a use of a stored skill (Section 9.7). A stale skill is active again.
+    An archived skill does not change."""
+    column = USAGE[kind]
+    await connection.execute(
+        update(Skill)
+        .where(Skill.org_id == org_id, Skill.id == skill_id, Skill.status != "archived")
+        .values(
+            {
+                column: column + 1,
+                Skill.last_used_at: func.now(),
+                Skill.status: "active",
+                Skill.stale_since: None,
+            }
+        )
+    )
 
 
 async def profile_limits(
@@ -173,3 +200,59 @@ async def load_actor(
         review=kind == "review",
         attended=kind == "chat" and not unattended and lineage != "delegation",
     )
+
+
+async def copy_version(
+    connection: AsyncConnection,
+    org_id: uuid.UUID,
+    skill_id: uuid.UUID,
+    from_version: int,
+    *,
+    change: str,
+    summary: str,
+    author_kind: str,
+    author_user_id: uuid.UUID | None = None,
+) -> int:
+    """Writes version ``from_version + 1`` with the text and files of ``from_version`` and
+    returns its number. An archive and a restore change no text, so they copy the version.
+    The caller updates ``skills.current_version``."""
+    version = from_version + 1
+    await connection.execute(
+        insert(SkillVersion).from_select(
+            [
+                "org_id",
+                "skill_id",
+                "version_no",
+                "name",
+                "description",
+                "skill_md",
+                "files",
+                "tags",
+                "requires_toolsets",
+                "change",
+                "summary",
+                "author_kind",
+                "author_user_id",
+            ],
+            select(
+                SkillVersion.org_id,
+                SkillVersion.skill_id,
+                literal(version),
+                SkillVersion.name,
+                SkillVersion.description,
+                SkillVersion.skill_md,
+                SkillVersion.files,
+                SkillVersion.tags,
+                SkillVersion.requires_toolsets,
+                literal(change),
+                literal(summary),
+                literal(author_kind),
+                literal(author_user_id, type_=PG_UUID(as_uuid=True)),
+            ).where(
+                SkillVersion.org_id == org_id,
+                SkillVersion.skill_id == skill_id,
+                SkillVersion.version_no == from_version,
+            ),
+        )
+    )
+    return version
