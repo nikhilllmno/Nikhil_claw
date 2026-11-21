@@ -126,6 +126,91 @@ export interface ApiKeyCreated extends ApiKey {
   key: string;
 }
 
+/** The scope of a custom tool (Section 10.8). */
+export type CustomToolScope = "user" | "workspace" | "org";
+export type CustomToolKind = "http" | "script";
+export type CustomToolPolicy = "allow" | "ask" | "deny";
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD";
+
+export interface CustomToolHttp {
+  method: HttpMethod;
+  /** `https://host/path?x={{arg}}`. A placeholder can be in the path and the query only. */
+  url: string;
+  headers: Record<string, string>;
+  /** A JSON value with placeholders, or null for no body. */
+  body: unknown;
+  auth: { type: "none" | "bearer" | "api_key" | "basic"; header?: string | null; query?: string | null };
+  response: { path?: string | null; fields: string[]; max_chars: number };
+}
+
+export interface CustomToolScript {
+  language: "python" | "node";
+  code: string;
+  timeout_s: number;
+}
+
+/** One definition: what the API takes for a new version. */
+export interface CustomToolDefinition {
+  kind: CustomToolKind;
+  description: string;
+  input_schema: Record<string, unknown>;
+  policy: CustomToolPolicy;
+  http?: CustomToolHttp | null;
+  script?: CustomToolScript | null;
+}
+
+export interface CustomToolVersion extends CustomToolDefinition {
+  version: number;
+  change: "create" | "edit" | "revert";
+  summary: string;
+  review: "approved" | "pending" | "rejected";
+  author_user_id: string | null;
+  reviewed_by_user_id: string | null;
+  reviewed_at: string | null;
+  created_at: string;
+}
+
+/** A custom tool. It has no credential: the API never sends one back. */
+export interface CustomTool {
+  id: string;
+  scope: CustomToolScope;
+  workspace_id: string | null;
+  user_id: string | null;
+  name: string;
+  /** The name that the agent uses: `custom_<name>`. */
+  tool_name: string;
+  /** The version that runs. Null until an admin approves a version. */
+  current_version: number | null;
+  current: CustomToolVersion | null;
+  latest: CustomToolVersion | null;
+  pending: number;
+  has_credential: boolean;
+  can_manage: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomToolCredential {
+  value?: string;
+  username?: string;
+  password?: string;
+}
+
+export interface CustomToolCreate extends CustomToolDefinition {
+  name: string;
+  scope: CustomToolScope;
+  summary?: string;
+  credential?: CustomToolCredential | null;
+}
+
+export interface CustomToolTestResult {
+  ok: boolean;
+  result: string | null;
+  error: string | null;
+  ms: number;
+  version: number;
+}
+
 /** A saved login of the browser vault. It has no user name and no password. */
 export interface BrowserLogin {
   id: string;
@@ -2117,6 +2202,41 @@ export class ApiClient {
       `/orgs/${encodeURIComponent(orgId)}/browser/logins/${encodeURIComponent(loginId)}`,
       { method: "DELETE" },
     );
+  customTools = (workspaceId: string) =>
+    this.json<CustomTool[]>(`/workspaces/${encodeURIComponent(workspaceId)}/custom-tools`);
+  /** Adds a tool. The credential goes only to this call and to the vault. */
+  createCustomTool = (workspaceId: string, body: CustomToolCreate) =>
+    this.json<CustomTool>(`/workspaces/${encodeURIComponent(workspaceId)}/custom-tools`, {
+      method: "POST",
+      body,
+    });
+  /** A new version. For a member who cannot manage a shared tool, it waits for an admin. */
+  editCustomTool = (toolId: string, body: CustomToolDefinition & { summary?: string }) =>
+    this.json<CustomTool>(`/custom-tools/${encodeURIComponent(toolId)}`, { method: "PUT", body });
+  customToolVersions = (toolId: string) =>
+    this.json<CustomToolVersion[]>(`/custom-tools/${encodeURIComponent(toolId)}/versions`);
+  revertCustomTool = (toolId: string, version: number) =>
+    this.json<CustomTool>(`/custom-tools/${encodeURIComponent(toolId)}/revert`, {
+      method: "POST",
+      body: { version },
+    });
+  reviewCustomTool = (toolId: string, version: number, decision: "approve" | "reject") =>
+    this.json<CustomTool>(
+      `/custom-tools/${encodeURIComponent(toolId)}/versions/${version}/${decision}`,
+      { method: "POST" },
+    );
+  setCustomToolCredential = (toolId: string, credential: CustomToolCredential) =>
+    this.json<CustomTool>(`/custom-tools/${encodeURIComponent(toolId)}/credential`, {
+      method: "PUT",
+      body: credential,
+    });
+  testCustomTool = (toolId: string, args: Record<string, unknown>, version?: number) =>
+    this.json<CustomToolTestResult>(`/custom-tools/${encodeURIComponent(toolId)}/test`, {
+      method: "POST",
+      body: { arguments: args, version: version ?? null },
+    });
+  deleteCustomTool = (toolId: string) =>
+    this.json<null>(`/custom-tools/${encodeURIComponent(toolId)}`, { method: "DELETE" });
   browserUrlPolicy = (orgId: string) =>
     this.json<BrowserUrlPolicy>(`/orgs/${encodeURIComponent(orgId)}/browser/url-policy`);
   setBrowserUrlPolicy = (orgId: string, allowHosts: string[], blockHosts: string[]) =>

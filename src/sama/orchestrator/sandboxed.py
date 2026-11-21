@@ -31,6 +31,7 @@ import contextlib
 import copy
 import logging
 import time
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Protocol
@@ -102,6 +103,8 @@ CANCEL_DEADLINE_S: Final = 9.0
 EXIT_WAIT_S: Final = 5.0
 """After the terminal event, the orchestrator waits this long for the runner to exit."""
 PROVIDER_CALL_S: Final = 10.0
+SCRATCH_IDLE_S: Final = 5 * 60
+"""A scratch sandbox (``scratch_sandbox``) pauses after this time if nobody kills it."""
 """The longest wait for a provider call that has no other limit, for example a stdin write."""
 _MEMORY: Final = 10_000
 
@@ -407,6 +410,13 @@ class SandboxedRuntime:
         if runtime is not self._kind:
             return f"config is for runtime {runtime}, not {self._kind}"
         return None
+
+    async def scratch_sandbox(self, org_id: str) -> Sandbox:
+        """A new sandbox from the session template that belongs to no session, for one short
+        job such as the test of a custom script tool (Section 10.8). The caller kills it. It
+        pauses after ``SCRATCH_IDLE_S`` if the caller does not."""
+        spec = self._spec(org_id, f"scratch-{uuid.uuid4().hex}", idle_timeout_s=SCRATCH_IDLE_S)
+        return await self._provider.create(spec)
 
     def _spec(
         self, org_id: str, session_id: str, idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S

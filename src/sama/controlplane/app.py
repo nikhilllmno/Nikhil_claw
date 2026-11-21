@@ -57,6 +57,7 @@ from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
 from sama.context.session_items import PostgresSessionItems
 from sama.controlplane.settings import ControlPlaneSettings
+from sama.customtools import CustomToolService
 from sama.datacontrols.purge import PurgeWorker, SandboxBackend
 from sama.datacontrols.service import DataControls, ServiceCleanup
 from sama.datacontrols.sweep import RetentionSweep
@@ -227,8 +228,17 @@ def build(
         database=database,
     )
     connections.register_tools(deferred)
-    # The gate also reads the tools of the remote MCP servers that each run may use.
-    gate = GateService(engine, extra_toolsets=deferred, run_tools=connections)
+    # The custom tools of users, workspaces, and orgs (Section 10.8). The sandboxes are set
+    # below, when the process has a sandbox provider.
+    custom_tools = CustomToolService(engine, vault)
+    # The gate also reads the tools of the remote MCP servers and the custom tools that each
+    # run may use, and the policy of each custom tool.
+    gate = GateService(
+        engine,
+        extra_toolsets=deferred,
+        run_tools=(connections, custom_tools),
+        run_rules=custom_tools,
+    )
     broker = ClarifyBroker()
     library = SkillLibrary(engine, BuiltinSkills().all())
     # A background review proposes the changes of shared memory and shared skills. A person
@@ -266,6 +276,9 @@ def build(
         runtimes = (sandboxed, sandboxed.for_kind(RuntimeKind.OPENAI_AGENTS_SDK))
         database.spill = SandboxSpill(sandboxed.session_sandbox)
         database.exports = SandboxSpill(sandboxed.session_sandbox, folder=EXPORT_DIR)
+        # A script tool runs in the session sandbox. Its test runs in a scratch sandbox.
+        custom_tools.session_sandbox = sandboxed.session_sandbox
+        custom_tools.test_sandbox = sandboxed.scratch_sandbox
     for runtime in runtimes:
         registry.register(runtime)
 
@@ -459,6 +472,7 @@ def build(
         browser=browser,
         browser_tasks=browser_tasks,
         coding=coding,
+        custom_tools=custom_tools,
     )
     handoffs = Handoffs(engine, web_url=settings.web_base)
     # /undo and /rollback restore the files of the session sandbox (Section 15.3).
@@ -611,6 +625,7 @@ def build(
         ),
         data=data,
         billing=billing,
+        custom_tools=custom_tools,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -645,6 +660,7 @@ def build(
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
             await stack.enter_async_context(agents_app.router.lifespan_context(agents_app))
             stack.push_async_callback(connections.aclose)
+            stack.push_async_callback(custom_tools.aclose)
             if model_keys is not None:
                 stack.push_async_callback(model_keys.aclose)
             if hub is not None:

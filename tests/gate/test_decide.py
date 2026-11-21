@@ -408,6 +408,13 @@ def test_a_user_rule_beats_an_admin_allow() -> None:
     assert policy_verdict(rules, "Bash").action == "ask"
 
 
+@pytest.mark.parametrize("level", [RuleLevel.USER, RuleLevel.PROFILE])
+def test_of_two_equal_rules_the_stricter_wins_in_any_order(level: RuleLevel) -> None:
+    allow, ask = rule("x_tool", "allow", level), rule("x_tool", "ask", level)
+    assert policy_verdict((allow, ask), "x_tool").action == "ask"
+    assert policy_verdict((ask, allow), "x_tool").action == "ask"
+
+
 def test_the_profile_rule_beats_the_org_rule() -> None:
     rules = (rule("Bash", "allow", RuleLevel.PROFILE), rule("Bash", "ask", RuleLevel.ORG))
     assert policy_verdict(rules, "Bash").action == "allow"

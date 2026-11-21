@@ -42,6 +42,7 @@ KNOWN_TOOLSETS: Final = frozenset(
         "media",
         "connections",
         "integrations",
+        "custom_tools",
         "github",
         "self",
         "tool_search",

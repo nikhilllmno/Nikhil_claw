@@ -2342,7 +2342,8 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `self` | `change_propose` (SOUL, profile, toolsets, policy), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul`; since M6.1, also `profile`, `toolsets`, and `policy` (Section 9.4.2). `sama_pr` is done in M6.2 (Section 15.2.1). | Sama MCP |
-| `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run). | Sama MCP |
+| `custom_tools` | The custom HTTP and script tools of the user, the workspace, and the org (`custom_<name>`, since M7.3, Section 10.8), behind `tool_search`. | Sama MCP (HTTP on the control plane, scripts in the session sandbox) |
+| `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run), or when the custom tool service is on (since M7.3). | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
 `coding` (core, web, skills, memory, sessions, github, delegation), `safe` (web, media,
@@ -2355,14 +2356,14 @@ default profile of the first org has `tool_search` since migration `0018` (M2.6)
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
 (M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
-(M4.5), `browser` since migration `0036` (M5.1), and `coding_agents` since migration `0044`
-(M7.2). The default group set has no
+(M4.5), `browser` since migration `0036` (M5.1), `coding_agents` since migration `0044`
+(M7.2), and `custom_tools` since migration `0045` (M7.3). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
-Migrations `0022`, `0023`, `0026`, `0027`, `0029`, and `0031` change only the lists that are
-equal to the old defaults.
-Sub-agents (Section 13.1) do not get `connections` or `integrations`. A child run of
-`delegate_task` (Section 13.2) does not get `browser`.
+Migrations `0022`, `0023`, `0026`, `0027`, `0029`, `0031`, `0036`, `0041`, and `0045` change
+only the lists that are equal to the old defaults.
+Sub-agents (Section 13.1) do not get `connections`, `integrations`, or `custom_tools`. A child
+run of `delegate_task` (Section 13.2) does not get `browser`.
 
 ### 10.2.1 Code execution (M4.8)
 
@@ -3248,6 +3249,161 @@ delete removes all keys (Section 17.4).
 of its own: the budget of the profile and the quotas of the org apply. Images and caller tools
 are not supported in `/v1/chat/completions`. The MCP server has no OAuth sign-in: a client
 sends the key in a header.
+
+### 10.8 Custom tools (M7.3)
+
+A user, a workspace, or an org adds its own tool without code in the sama repo: an **HTTP
+request tool** or a **script tool**. Code: `src/sama/customtools/` (`spec.py`, `http.py`,
+`script.py`, `service.py`), the routes in `src/sama/api/custom_tools.py`, and the Tools page of
+the web app (`/tools`, `web/components/CustomTools.tsx`).
+
+**Definition.** Each version of a tool has:
+
+- a `kind`: `http` or `script`;
+- a `description` (at most 1,000 characters) that the agent reads to choose the tool;
+- an `input_schema`: a JSON schema of the arguments with `"type": "object"` (at most 50
+  properties and 20,000 bytes);
+- a `policy`: `allow` (run without an approval), `ask` (an approval for each call), or `deny`
+  (the tool is off);
+- the request (`http`) or the script (`script`).
+
+**HTTP request tool.** `method` (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`), a URL
+template, headers, an optional JSON body template, the auth, and the response mapping.
+
+- A placeholder is `{{name}}`, and `name` must be a property of the input schema. The scheme
+  and the host of the URL are fixed: a placeholder can be only in the path and the query. A
+  path value is quoted into one path segment (`/` becomes `%2F`), and `.` and `..` are refused,
+  so the agent cannot leave the path or the host. A query parameter whose value is one
+  placeholder of an argument that the call does not give is left out. A list gives one pair
+  for each item.
+- A header value is text with placeholders. It cannot have a line break. A tool cannot set
+  `Host`, `Content-Length`, `Connection`, `Authorization`, `Cookie`, or the header of its own
+  API key: a credential goes into the auth.
+- The body is a JSON value. A string that is only one placeholder becomes the argument as a
+  JSON value. A string with a placeholder in other text gets the argument as text. A `GET` or
+  `HEAD` request has no body.
+- Auth: `none`, `bearer`, `api_key` (a header or a query parameter, with its name), or `basic`.
+  The credential is in the vault entry `custom_tool:<tool id>`, as a JSON object with `origin`
+  and the fields (`value`, or `username` and `password`). The credential is **bound to the
+  origin** (`https://host[:port]`) of the version that was current when it was saved. A
+  version with another origin gets no credential: the call fails until a person sets the
+  credential again. So a changed URL never sends a saved key to a new host. The redactor gets
+  the fields, not the origin.
+- Response mapping: `path` (a dot path such as `data.items` or `items.0`), `fields` (keep only
+  these keys of an object, or of each object of a list), and `max_chars` (default 20,000, at
+  most 100,000).
+- The answer is redacted before the mapping cuts it, so a cut cannot leave a part of a secret.
+  The redactor also learns the encoded `basic` value and the URL-encoded forms of an API key
+  in the query, so an API that echoes the header or the URL does not show the credential.
+- Every request goes through `OutboundClient` (Section 16.4): `https` only, public addresses
+  only, no redirects, 2 MB, and 30 seconds. sama checks the origin with DNS when a person saves
+  a version. A `2xx` answer comes back as text. Another status is an error with the status and
+  the start of the answer.
+
+**Script tool.** `language` (`python` or `node`), `code` (at most 50,000 characters), and
+`timeout_s` (default 30, at most 120). The script runs in the **session sandbox** of the run,
+like `execute_code` (Section 10.2.1), in its own folder of `.sama/tools/` that is removed at the
+end. The arguments go to its standard input as one JSON object. Its standard output must be
+one JSON value (at most 200 KB, and 50,000 characters go to the model). The script gets no run
+token and no secret in its environment, and sama refuses a script whose code has a secret (the
+redactor check). The script is not a new trust boundary: it runs as the same user as the agent
+shell in the session sandbox (Section 16.2), so it has the same rights as a `Bash` call of the
+agent. The gate on the tool server stays the boundary for every sama tool call.
+The sandbox image has Node.js 22 since M7.2 (Section 15.4). A failure gives the exit code and the
+end of the standard error.
+
+**Scopes and approval.** Scopes work like the scopes of the skills (Section 9.2).
+
+| Scope | Who sees it | A write applies at once for | A write of another member |
+|---|---|---|---|
+| `user` | Its user only | Its user | Not possible |
+| `workspace` | The members who see the workspace | A workspace admin, an org admin, or the org owner | A `pending` version |
+| `org` | Every member of the org | An org admin or the org owner | A `pending` version |
+
+- Each write (create, edit, revert) is a new version (`custom_tool_versions`). A version never
+  changes, except its review: `approved`, `pending`, or `rejected`. The tool runs its
+  `current_version`. A new shared tool that a member proposes has no current version, so it
+  does not run.
+- A person who manages the tool approves or rejects a pending version
+  (`POST /custom-tools/{id}/versions/{n}/approve` or `/reject`). The checks run again at the
+  approval. A tool has at most 20 open proposals.
+- A revert copies an old version into a new version (`change = revert`).
+- Only a person who manages the tool sets its credential, tests it, and deletes it. A member who
+  proposes a version cannot set the credential, so a proposal cannot send a saved key to a new
+  host.
+- Each write is in the audit log: `custom_tool.created`, `edited`, `reverted`, `proposed`,
+  `approved`, `rejected`, `credential_set`, `tested`, and `deleted`.
+
+**Checks of each write.** The description, the input schema (with the descriptions of the
+arguments), the headers, the body, the URL, and the summary get the prompt injection scan of
+Section 6.1 and the secret check of the redactor. The code of a script gets the secret check.
+A finding refuses the write (HTTP 422). The
+name has 2 to 40 characters (`[a-z][a-z0-9_]*`).
+
+**The agent.** The tools are deferred tools (Section 6.3) of the new toolset `custom_tools`.
+The agent name is `custom_<name>`. Both runtimes find them with `tool_search`, read the schema
+with `tool_describe`, and run them with `tool_call`. The tool server asks the service for the
+tools of the run at each search, so a new tool or a new version is usable at once, also in a
+running session, and the frozen prompt prefix does not change (D9).
+
+- A run sees the `org` tools, the `workspace` tools of its workspace, and, in a private session,
+  the `user` tools of its run user. A shared session has no `user` tools. The narrowest scope
+  wins for one name: `user`, then `workspace`, then `org`. At most 200 tools for each run; the
+  query keeps one row for each name (the narrowest) before the limit.
+- The gate reads the tools and their policies in its transaction (`run_tools` and the new
+  `run_rules` of `GateService`). A policy is a rule of the same name. `ask` and `deny` are org
+  rules, so a user rule (for example an "always allow" of an approval card) cannot loosen them.
+  `allow` is a user rule for a `user` tool and an org rule for a shared tool. A `deny` rule of
+  any level still wins, an admin `ask` rule still wins, and a user can make an `allow` tool
+  stricter for themselves. Between two rules of the same level and the same kind of name, the
+  stricter rule wins (a change of `_most_specific` for every rule, so the order of the rules
+  never loosens a verdict). A `deny` tool is not in `tool_search`. A deferred call passes the gate as a
+  direct call does (Section 16.1), so an `ask` tool needs an approval card with the real
+  arguments, and an unattended run follows Section 12.1.
+- The service checks the arguments against the top level of the schema: the required names,
+  no unknown names, the type, and `enum`.
+- The result is untrusted content with the source `custom_tool:<agent name>` (Section 16.5).
+- `custom_tools` is in the default toolsets of a new profile. Migration `0045` adds it to a
+  profile that still has the default list of `0041` (M7.2). The default group set does not have it.
+  Sub-agents do not get it (they have no `tool_search`).
+
+**Test button.** `POST /custom-tools/{id}/test` with `arguments` and an optional `version`
+runs a version as the agent would and returns `ok`, the result or the error, and the time. The
+answer goes to the browser and not through the tool server, so the service redacts it. An
+HTTP test runs on the control plane. A script test runs in a new **scratch sandbox** from the
+session template (`SandboxedRuntime.scratch_sandbox`), which the service kills at the end. A
+scratch sandbox that is not killed pauses after 5 minutes.
+
+**Routes.** `GET` and `POST /workspaces/{id}/custom-tools`, `GET`, `PUT`, and
+`DELETE /custom-tools/{id}`, `GET /custom-tools/{id}/versions`,
+`POST /custom-tools/{id}/revert`, `POST /custom-tools/{id}/versions/{n}/{approve|reject}`,
+`PUT /custom-tools/{id}/credential`, and `POST /custom-tools/{id}/test`. No answer has a
+credential. A validation error does not repeat the input.
+
+**Tables.** Migration `0045` adds `custom_tools` (one row for each tool and scope, unique name
+for each scope owner) and `custom_tool_versions`, both with `org_id` and RLS: a member reads the
+`org` tools, the `workspace` tools of the workspaces that they see, and their own `user` tools.
+An org admin does not read the `user` tools of other users. A version has the visibility of its
+tool. Only the control plane writes. The vault accepts the names `custom_tool:<id>`. The data
+controls (Section 17.4) export the tools of a user and the versions that they wrote or reviewed.
+A user delete removes the `user` tools of the user and their credentials.
+
+**Web app.** The Tools page lists the tools of the workspace with the scope, the kind, the
+running version, and the policy. It adds and edits a tool (a form for the request or the
+script), tests it, sets the credential, shows the versions with the whole definition of each
+version, tests one version (also a pending version, before an admin approves it), approves or
+rejects a pending version, reverts, and deletes. `CustomToolsPanel` holds the whole feature for one workspace, so
+the settings console (M7.10) can use it.
+
+**Assumptions.**
+
+| # | Assumption |
+|---|---|
+| T1 | The org URL lists of the browser (Section 14.1) do not apply to custom HTTP tools. The private address rules and the other outbound rules apply. |
+| T2 | A credential belongs to the tool, not to a version. A revert does not restore an old credential. The origin binding stops a key from going to a new host. |
+| T3 | Only a person who manages a tool tests it, because a test sends the saved credential and bypasses the policy. |
+| T4 | The argument check covers the top level of the schema only. The script or the API checks nested values. |
+| T5 | The agent cannot create or change custom tools. A person does it in the web app or with the API. |
 
 ---
 
@@ -6819,6 +6975,8 @@ policy for all of them:
   request follow no redirect, for the same reason. `OutboundClient.check(url)` checks the base
   URL and the token URL when an admin adds the API. The document at `openapi_url` can follow at
   most 3 redirects, each checked, because it has no credential.
+- **Custom HTTP tools (M7.3).** A call of a `custom_<name>` HTTP tool follows no redirect, and
+  sama checks the origin when a person saves a version (Section 10.8).
 - **Connector hosts (M4.11).** A stdio MCP server does not use the outbound client. It runs in
   its own E2B sandbox, and the E2B egress allowlist of the host limits it (Section 10.5).
 - **Browser (M5.1).** The browser runs in Browserbase, not in sama, but it acts for the org, so
@@ -7002,7 +7160,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `session_search(query, limit)` | Searches past sessions that the run may see, by words and meaning, and returns up to 10 sessions with title, audience, times, and snippets (Section 7.1). An empty query lists the latest sessions. | A database. Without a service the tool is hidden. Meaning search needs an OpenAI key. Without one, the tool uses full text only. |
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
-| `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start, or the connection service (M3.5: the tools of remote MCP servers come for each run). Otherwise the three tools are hidden. |
+| `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start, or the connection service (M3.5: the tools of remote MCP servers come for each run), or the custom tool service (M7.3, Section 10.8). Otherwise the three tools are hidden. |
 | `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
@@ -7743,8 +7901,9 @@ The console reuses their screens. Each write goes to the API, and the API writes
 
 Each section has a list, a detail view, a create form, and a delete with a confirm. A section
 shows its fields as read-only when the role of the user cannot change them, and says who can.
-A part that another M7 item adds (the busy mode of M7.1, custom tools of M7.3, the sub-agent
-library of M7.4) shows a card "Not available yet" until the API gives it. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
+A part that another M7 item adds (the busy mode of M7.1, the sub-agent library of M7.4) shows
+a card "Not available yet" until the API gives it. Since M7.3, the Tools section shows the custom
+tools of the workspace (`CustomToolsPanel`, Section 10.8). The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
 without a change of the web app.
 
 **Role permissions.** Migration `0040` adds the table `org_role_permissions` (`org_id`, `role`,
