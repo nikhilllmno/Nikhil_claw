@@ -33,6 +33,10 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.coding.agents import CodingAgent
+from sama.coding.commands import COMMANDS as CODING_COMMANDS
+from sama.coding.commands import HELP_LINES as CODING_HELP_LINES
+from sama.coding.commands import NOT_DIRECT, set_direct
 from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
@@ -121,7 +125,9 @@ HELP: Final = (
     "/skills - list the skills. /<skill> <request> uses a skill\n"
     "/connect <name> - get a link to connect a tool such as gmail or github\n"
     "/cron - list and make scheduled jobs. /cron help shows more\n"
-    "/learn <urls or topic> - make a draft skill from sources"
+    "/learn <urls or topic> - make a draft skill from sources\n"
+    + "\n".join(CODING_HELP_LINES)
+    + "\n/sama - send the messages of this session to sama again"
 )
 
 OWN_COMMANDS: Final = frozenset(
@@ -143,6 +149,9 @@ OWN_COMMANDS: Final = frozenset(
         "/handoff",
         "/undo",
         "/rollback",
+        "/claude",
+        "/codex",
+        "/sama",
     }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
@@ -458,6 +467,14 @@ class TelegramGateway:
                 return
             # No run is open: the note is a normal message.
             command, text = None, rest
+        coding: CodingAgent | None = None
+        if command in CODING_COMMANDS and rest:
+            # One message for a coding agent (Section 15.4): a normal message, no skill.
+            coding, command, text = CODING_COMMANDS[command], None, rest
+        elif command in CODING_COMMANDS or command == "/sama":
+            agent = CODING_COMMANDS.get(command)
+            await self._direct(chat_id, message_id, agent, target, grants)
+            return
         skill_command = (
             command is not None and command not in OWN_COMMANDS and self._skills is not None
         )
@@ -479,7 +496,7 @@ class TelegramGateway:
             log.warning("too many runs to follow; chat=%s must try again", chat_id)
             await self._say(chat_id, BUSY, reply_to=message_id)
             return
-        if text.startswith("/") and self._skills is not None:
+        if text.startswith("/") and self._skills is not None and coding is None:
             expanded = await self._expand(chat_id, target, grants, text)
             if expanded is not None:
                 text = expanded
@@ -503,6 +520,7 @@ class TelegramGateway:
                 text=text,
                 user_id=target.user_id,
                 attachments=images,
+                coding_agent=None if coding is None else coding.value,
             )
         except QueueError as error:
             self._followers.discard(place)
@@ -514,6 +532,23 @@ class TelegramGateway:
         self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
         if await self._queue.waits(org_id=target.org_id, run_id=run_id):
             await self._say(chat_id, queued_text("/steer", "/stop"), reply_to=message_id)
+
+    async def _direct(
+        self,
+        chat_id: int,
+        message_id: int,
+        agent: CodingAgent | None,
+        target: Target,
+        grants: Grants,
+    ) -> None:
+        """``/claude``, ``/codex``, and ``/sama`` alone: starts or ends the direct mode of the
+        chat session (Section 15.4)."""
+        bound = await self._session(chat_id, target, grants, create=agent is not None)
+        if bound is None:
+            answer = NOT_DIRECT
+        else:
+            answer = await set_direct(self._engine, target.org_id, bound.session_id, agent)
+        await self._say(chat_id, answer, reply_to=message_id)
 
     async def _steer(
         self, chat_id: int, message_id: int, note: str, target: Target, grants: Grants

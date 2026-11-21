@@ -939,3 +939,21 @@ def test_an_escalation_also_applies_to_a_wrapped_call() -> None:
     wrapped = {"name": "browser_act", "arguments": CLICK}
     verdict = decide(allowed, "tool_call", wrapped, escalate=SENSITIVE)
     assert (verdict.action, verdict.reason) == ("ask", SENSITIVE)
+
+
+# -- coding agents (M7.2) -----------------------------------------------------------------------
+
+
+def test_coding_agent_run_asks_by_default() -> None:
+    assert "coding_agents" in DEFAULT_TOOLSETS
+    assert "coding_agents" not in DEFAULT_GROUP_TOOLSETS
+    assert TOOLSETS["coding_agents"] == frozenset({"coding_agent_run"})
+    arguments = {"agent": "claude_code", "prompt": "fix", "repo": "", "open_pr": False}
+    verdict = decide(context(toolsets=frozenset({"coding_agents"})), "coding_agent_run", arguments)
+    assert verdict.action == "ask"
+    without = decide(context(), "mcp__sama__coding_agent_run", arguments)
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+    allowed = context(
+        toolsets=frozenset({"coding_agents"}), rules=(rule("coding_agent_run", "allow"),)
+    )
+    assert decide(allowed, "coding_agent_run", arguments).action == "allow"

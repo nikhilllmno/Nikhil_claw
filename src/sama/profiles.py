@@ -55,8 +55,15 @@ from sama.subagents import (
 from sama.tenancy.access import ADMIN_ROLES
 from sama.vault.redact import default_redactor, redact
 
-EDITABLE_RUNTIMES: Final = (RuntimeKind.CLAUDE_AGENT_SDK, RuntimeKind.OPENAI_AGENTS_SDK)
-"""The runtimes that an editor can choose. ``fake`` is for tests only."""
+EDITABLE_RUNTIMES: Final = (
+    RuntimeKind.CLAUDE_AGENT_SDK,
+    RuntimeKind.OPENAI_AGENTS_SDK,
+    RuntimeKind.CLAUDE_CODE,
+    RuntimeKind.CODEX,
+)
+"""The runtimes that an editor can choose. ``fake`` is for tests only. ``claude_code`` and
+``codex`` send each message of a session of the profile to the coding agent CLI (Section
+15.4)."""
 NAME_MAX_CHARS: Final = 80
 SOUL_MAX_CHARS: Final = 20_000
 PROFILE_FIELDS: Final = (

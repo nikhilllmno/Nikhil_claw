@@ -44,6 +44,9 @@ from sama.browser.policy import PolicyCache, PolicyStore
 from sama.browser.service import BrowserService
 from sama.browser.target import CLOUD, BrowserTarget
 from sama.browser.task import BrowserTaskRunner, ProxyModelClient
+from sama.coding.runtime import CodingAgentRuntime
+from sama.coding.service import CodingService
+from sama.coding.tool import CodingTools
 from sama.connectors.database import DatabaseGateway
 from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
@@ -360,6 +363,25 @@ def build(
         if sandboxed
         else None
     )
+    # Claude Code and Codex in the session sandbox (Section 15.4): the runtimes claude_code and
+    # codex, and the tool coding_agent_run. The CLIs reach models only through the model proxy
+    # and git only through the git proxy.
+    coding: CodingTools | None = None
+    if sandboxed is not None:
+        coding_service = CodingService(
+            model_url=settings.model_url, cloner=cloner, github=github_tools
+        )
+        claude_code = CodingAgentRuntime(
+            kind=RuntimeKind.CLAUDE_CODE,
+            sandboxes=sandboxed,
+            signer=signer,
+            service=coding_service,
+            gate=gate,
+        )
+        registry.register(claude_code)
+        registry.register(claude_code.for_kind(RuntimeKind.CODEX))
+        # The progress lines go to the run events of the run through the worker (Section 15.4).
+        coding = CodingTools(coding_service, sandboxed.session_sandbox, progress=worker)
     # ``sama_pr`` changes the code of sama through the GitHub App (Section 15.2).
     sama_pr = (
         SamaPr(
@@ -431,6 +453,7 @@ def build(
         workflows=workflows,
         browser=browser,
         browser_tasks=browser_tasks,
+        coding=coding,
     )
     handoffs = Handoffs(engine, web_url=settings.web_base)
     # /undo and /rollback restore the files of the session sandbox (Section 15.3).

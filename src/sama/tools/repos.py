@@ -188,6 +188,17 @@ class RepoCloner:
             raise RepoError(f"the sandbox failed: {error}") from None
         return Cloned(target.url, path, commit, proxied, branch, instructions)
 
+    def proxy_url(self, target: RepoRef) -> str | None:
+        """The clone URL of ``target`` through the sama git proxy, or ``None`` without a proxy.
+        A clone whose ``origin`` has this URL can push (M7.2 reuses such a clone)."""
+        if self._proxy is None:
+            return None
+        return f"{self._proxy}/{target.owner}/{target.name}.git"
+
+    async def proxied(self, claims: RunTokenClaims, target: RepoRef) -> bool:
+        """True if ``target`` clones through the git proxy: the repo is on the allowlist."""
+        return await self._proxied(claims, target)
+
     async def _proxied(self, claims: RunTokenClaims, target: RepoRef) -> bool:
         if self._proxy is None or self._access is None:
             return False

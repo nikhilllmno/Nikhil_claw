@@ -36,6 +36,9 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.coding.agents import CodingAgent, label
+from sama.coding.commands import COMMANDS as CODING_COMMANDS
+from sama.coding.commands import NOT_DIRECT, parse_command, set_direct
 from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBinding
@@ -139,6 +142,11 @@ HELP: Final = (
     "/sama <skill> <request> - use a skill (direct messages). In a channel, mention the app"
     " and write /<skill> <request>\n"
     "/sama learn <urls or topic> - make a draft skill from sources (direct messages)\n"
+    "/sama claude TASK - send a coding task to Claude Code. /sama claude alone sends each"
+    " message of this conversation to Claude Code until /sama sama (direct messages)\n"
+    "/sama codex TASK - send a coding task to Codex. /sama codex alone sends each message of"
+    " this conversation to Codex until /sama sama (direct messages). In a channel, mention the"
+    " app and write /claude TASK or /codex TASK\n"
     "/sama help - show this help"
 )
 
@@ -506,6 +514,8 @@ class SlackGateway:
         target: Target,
         text: str,
         refs: list[_ImageRef] | None = None,
+        *,
+        coding_agent: CodingAgent | None = None,
     ) -> None:
         async with self._engine.connect() as connection:
             grants = await load_grants(connection, target.org_id, target.user_id)
@@ -513,6 +523,13 @@ class SlackGateway:
             await self._say(place, "You do not have access to this workspace now.")
             return
         refs = refs or []
+        command = parse_command(text) if not refs and coding_agent is None else None
+        if command is not None:
+            if command.switch:
+                await self._say(place, await self._direct(place, target, grants, command.agent))
+                return
+            # One message for a coding agent (Section 15.4): no skill.
+            coding_agent, text = command.agent, command.task
         steer = _STEER.fullmatch(text) if not refs else None
         if steer is not None:
             note = (steer.group(1) or "").strip()
@@ -540,7 +557,7 @@ class SlackGateway:
             if limit.problem is not None:
                 await self._whisper(place, BUDGET_WHISPER)
                 return
-        if text.startswith("/"):
+        if text.startswith("/") and coding_agent is None:
             text = await self._expand(place, target, grants, text) or text
         images = await self._download_images(place, refs)
         if images is None:
@@ -559,6 +576,7 @@ class SlackGateway:
                 text=text,
                 user_id=target.user_id,
                 attachments=images,
+                coding_agent=None if coding_agent is None else coding_agent.value,
             )
         except QueueError as error:
             self._followers.discard(holder)
@@ -571,6 +589,15 @@ class SlackGateway:
         if await self._queue.waits(org_id=target.org_id, run_id=run_id):
             how = "/sama steer" if place.thread_ts is None else "a mention with /steer"
             await self._say(place, queued_text(how, "/sama stop"))
+
+    async def _direct(
+        self, place: _Place, target: Target, grants: Grants, agent: CodingAgent | None
+    ) -> str:
+        """Starts or ends the direct mode of the session of the conversation (Section 15.4)."""
+        bound = await self._session(place, target, grants, create=agent is not None)
+        if bound is None:
+            return NOT_DIRECT
+        return await set_direct(self._engine, target.org_id, bound.session_id, agent)
 
     async def _steer(self, place: _Place, target: Target, grants: Grants, note: str) -> str | None:
         """Adds ``note`` to the open run of the conversation. ``None`` when no run is open."""
@@ -757,6 +784,9 @@ class SlackGateway:
                 "cron",
                 "steer",
                 "handoff",
+                "claude",
+                "codex",
+                "sama",
                 *PIN_COMMANDS,
                 *CHECKPOINT_COMMANDS,
             ):
@@ -779,6 +809,8 @@ class SlackGateway:
                 return await self._steer_command(sender, channel, identity, rest)
             if name == "handoff":
                 return await self._handoff(sender, channel, identity, rest)
+            if name in ("claude", "codex", "sama"):
+                return await self._coding_command(sender, channel, identity, name, rest)
             if name in CHECKPOINT_COMMANDS:
                 return await self._checkpoint(sender, channel, identity, name, rest)
             return await self._stop(sender, channel, identity)
@@ -805,6 +837,26 @@ class SlackGateway:
                 return answer
             await self._start(place, target, note)
         return "No run is open. sama takes the note as a new message."
+
+    async def _coding_command(
+        self, sender: str, channel: str, identity: Any, name: str, task: str
+    ) -> str:
+        """``/sama claude [task]``, ``/sama codex [task]``, and ``/sama sama`` in a direct
+        message (Section 15.4). A Slack command has no thread, so a channel uses a mention."""
+        if not channel.startswith("D"):
+            return "Mention the sama app in this channel and write /claude TASK or /codex TASK."
+        agent = CODING_COMMANDS.get(f"/{name}")
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        async with self._locks.hold((place.channel, place.thread_ts)):
+            if agent is None or not task:
+                return await self._direct(place, target, grants, agent)
+            await self._start(place, target, task, coding_agent=agent)
+        return f"sama sent the task to {label(agent)}."
 
     async def _handoff(self, sender: str, channel: str, identity: Any, to: str) -> str:
         """``/sama handoff`` in a direct message (Section 11.1)."""

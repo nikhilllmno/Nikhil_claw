@@ -32,6 +32,7 @@ from typing import Any, ClassVar, Final, Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.coding.commands import parse_command, set_direct
 from sama.db.models import Approval, ChannelIdentity
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.handoff import moved_away
@@ -75,7 +76,9 @@ LOCKED: Final = "Too many wrong codes. Try again later."
 CODE_CHARS: Final = 6
 """The approval reply code: the first characters of the approval id (Section 11.9)."""
 
-OWN_COMMANDS: Final = frozenset({"/new", "/stop", "/steer", "/help", "/pair", "/start", "/skills"})
+OWN_COMMANDS: Final = frozenset(
+    {"/new", "/stop", "/steer", "/help", "/pair", "/start", "/skills", "/claude", "/codex", "/sama"}
+)
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
 
 _COMMAND: Final = re.compile(r"/([A-Za-z0-9_]{1,32})(?:\s+(.*))?", re.S)
@@ -281,6 +284,22 @@ class DirectGateway[C: Conversation](abc.ABC):
             if await self._steer(chat, rest, target, grants):
                 return
             command, text = None, rest
+        coding = parse_command(text) if command in ("/claude", "/codex", "/sama") else None
+        if coding is not None and coding.switch:
+            # The direct mode of the session (Section 15.4).
+            bound = await self._ensure(chat, target, grants)
+            answer = await set_direct(self._engine, target.org_id, bound.session_id, coding.agent)
+            await self._say(chat, answer)
+            return
+        if coding is not None and coding.agent is not None:
+            # ``/claude <task>``: one message to the coding agent, with no skill expansion.
+            if len(self._followers) >= self._settings.max_followers:
+                await self._say(chat, BUSY)
+                return
+            await self._enqueue(
+                chat, target, grants, coding.task, [], coding_agent=coding.agent.value
+            )
+            return
         skill_command = (
             command is not None and command not in OWN_COMMANDS and self._skills is not None
         )
@@ -321,6 +340,8 @@ class DirectGateway[C: Conversation](abc.ABC):
         grants: Grants,
         text: str,
         images: list[NewAttachment],
+        *,
+        coding_agent: str | None = None,
     ) -> None:
         place = object()
         self._followers.add(place)
@@ -332,6 +353,7 @@ class DirectGateway[C: Conversation](abc.ABC):
                 text=text,
                 user_id=target.user_id,
                 attachments=images,
+                coding_agent=coding_agent,
             )
         except QueueError as error:
             self._followers.discard(place)

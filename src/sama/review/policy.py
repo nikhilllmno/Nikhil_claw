@@ -25,6 +25,9 @@ REVIEW_TOOLSETS: Final = frozenset({"memory", "skills"})
 DEFAULT_MODELS: Final = {
     "claude_agent_sdk": "claude-haiku-4-5",
     "openai_agents_sdk": "gpt-6-luna",
+    # A review of a coding agent session runs on the sama runtime of the same provider.
+    "claude_code": "claude-haiku-4-5",
+    "codex": "gpt-6-luna",
     "fake": "fake-review",
 }
 """The cheap model of each runtime. ``agent_profiles.review_model`` overrides it."""

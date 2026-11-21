@@ -60,6 +60,8 @@ HELP: Final = (
     "/stop - stop the current run of this thread\n"
     "/steer <text> - add a note to the current run of this thread\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
+    "/claude <task> or /codex <task> - send a coding task to Claude Code or Codex. /claude or\n"
+    "/codex alone sends each message to it until /sama\n"
     "/pair <code> - link this address with a code from the sama web page"
 )
 

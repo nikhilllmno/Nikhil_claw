@@ -51,7 +51,10 @@ NAMING_CONVENTION: Final = {
 ROLES: Final = ("owner", "admin", "member")
 INVITE_ROLES: Final = ("admin", "member")
 """An invite never makes an owner. An owner gives the role ``owner`` to a member later."""
-RUNTIMES: Final = ("claude_agent_sdk", "openai_agents_sdk", "fake")
+RUNTIMES: Final = ("claude_agent_sdk", "openai_agents_sdk", "claude_code", "codex", "fake")
+CODING_AGENTS: Final = ("claude_code", "codex")
+"""The coding agent runtimes (Section 15.4). A session in the direct mode and a run of
+``/claude`` or ``/codex`` name one in ``coding_agent``."""
 AUDIENCES: Final = ("private", "shared")
 SESSION_STATUSES: Final = ("active", "archived")
 LINEAGES: Final = ("compaction", "branch", "retry", "delegation")
@@ -579,6 +582,10 @@ class Session(Base):
             "parent_run_id IS NULL OR lineage IS NOT DISTINCT FROM 'delegation'",
             name="parent_run_is_delegation",
         ),
+        CheckConstraint(
+            f"coding_agent IS NULL OR {_one_of('coding_agent', CODING_AGENTS)}",
+            name="coding_agent",
+        ),
         Index(None, "org_id", "workspace_id"),
         Index(None, "owner_user_id"),
         Index(None, "org_id", "worker_bot_id", postgresql_where=text("worker_bot_id IS NOT NULL")),
@@ -621,6 +628,9 @@ class Session(Base):
     """The tool calls that ended since the last background review (Section 9.4)."""
     review_cursor_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     """The ``messages.seq`` up to which the last queued review reads the transcript."""
+    coding_agent: Mapped[str | None] = mapped_column(Text)
+    """The direct mode (Section 15.4): each chat run of the session goes to this coding agent
+    (``claude_code`` or ``codex``) until ``/sama``. Null: the runtime of the session."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -661,6 +671,10 @@ class Run(Base):
         # A compact run is a chat run of a person (Section 6.3).
         CheckConstraint("NOT compact OR kind = 'chat'", name="compact_is_chat"),
         CheckConstraint("compact OR compact_focus IS NULL", name="compact_focus"),
+        CheckConstraint(
+            f"coding_agent IS NULL OR {_one_of('coding_agent', CODING_AGENTS)}",
+            name="coding_agent",
+        ),
         CheckConstraint(
             "toolsets IS NULL OR jsonb_typeof(toolsets) = 'array'", name="toolsets_array"
         ),
@@ -749,6 +763,9 @@ class Run(Base):
     """When the control plane sent the trace of the ended run to Langfuse (Section 18.2)."""
     model: Mapped[str | None] = mapped_column(Text)
     """The model pin of a job run (Section 12.1). Null: the model of the profile."""
+    coding_agent: Mapped[str | None] = mapped_column(Text)
+    """The coding agent of a ``/claude`` or ``/codex`` run with a task (Section 15.4). The run
+    uses this runtime and not the runtime of the session."""
 
 
 class Message(Base):

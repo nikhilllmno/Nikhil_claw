@@ -371,3 +371,34 @@ async def test_a_long_card_without_buttons_keeps_its_reply_code(
     first = next(text for text in provider.texts() if "Reply yes" in text)
     assert first.startswith("Reply yes ")
     assert all(len(text) <= 120 for text in provider.texts())
+
+
+async def test_the_coding_commands_route_to_the_coding_agent(
+    gateway: WhatsAppGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    provider: FakeWhatsApp,
+) -> None:
+    """``/claude`` and ``/codex`` (Section 15.4) work in a direct channel too."""
+    from sama.db.models import Message, Run
+
+    await pair(gateway, engine, tenant)
+    await gateway.handle(inbound("/codex"))
+    assert "Codex" in provider.texts()[-1]
+    session = await bound(engine)
+    async with engine.connect() as connection:
+        mode = await connection.scalar(select(Session.coding_agent).where(Session.id == session.id))
+    assert mode == "codex"
+    await gateway.handle(inbound("/sama"))
+    assert provider.texts()[-1] == "sama answers the messages of this session again."
+    await gateway.handle(inbound("/claude octo/demo fix the typo"))
+    async with engine.connect() as connection:
+        run = (
+            await connection.execute(
+                select(Run.coding_agent, Message.content)
+                .join(Message, Message.run_id == Run.id)
+                .where(Run.session_id == session.id)
+            )
+        ).one()
+    assert run.coding_agent == "claude_code"
+    assert run.content["text"] == "octo/demo fix the typo"

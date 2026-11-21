@@ -22,6 +22,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.coding.agents import CodingAgent, label
 from sama.context import Pin, PinError, PinStore
 from sama.db.models import (
     ENDED_RUN_STATUSES,
@@ -177,6 +178,12 @@ class Reply:
         loop = asyncio.get_running_loop()
         if final or self._last is None or loop.time() - self._last >= self._interval_s:
             await self._show(self._text)
+
+    async def add_line(self, text: str) -> None:
+        """Adds one line of progress on its own line, between the lines of the text."""
+        if self._text and not self._text.endswith("\n"):
+            text = "\n" + text
+        await self.add(text + "\n")
 
     def restart(self) -> None:
         """The next text goes in a new message, for example after an approval card."""
@@ -573,6 +580,17 @@ async def bind(
     )
 
 
+def coding_progress(payload: dict[str, Any]) -> str | None:
+    """The line of a ``subagent_event`` of a coding agent (Section 15.4), such as
+    ``> Claude Code: edited main.py``. The events of native sub-agents show no line."""
+    try:
+        agent = CodingAgent(str(payload.get("subagent")))
+    except ValueError:
+        return None
+    text = " ".join(str(payload.get("text", "")).split())
+    return f"> {label(agent)}: {text}" if text else None
+
+
 async def follow_run(
     engine: AsyncEngine,
     org_id: uuid.UUID,
@@ -595,6 +613,10 @@ async def follow_run(
             seq = event.seq
             if event.type == "text_delta":
                 await reply.add(str(event.payload.get("text", "")))
+            elif event.type == "subagent_event":
+                line = coding_progress(event.payload)
+                if line is not None:
+                    await reply.add_line(line)
         new = [row for row in read.pending if row.id not in carded]
         if new:
             await reply.flush(final=True)

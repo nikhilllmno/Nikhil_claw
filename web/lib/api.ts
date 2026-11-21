@@ -277,6 +277,12 @@ export interface Restored {
   text: string;
 }
 
+/** The answer of `POST /sessions/{id}/coding-agent`. */
+export interface CodingAgentAnswer {
+  /** The answer for the user. */
+  text: string;
+}
+
 export interface Approval {
   id: string;
   run_id: string;
@@ -1750,6 +1756,9 @@ export class ApiClient {
     this.json<Steered>(`/sessions/${id}/steer`, { method: "POST", body: { text } });
   handoff = (id: string, to: string) =>
     this.json<Handoff>(`/sessions/${id}/handoff`, { method: "POST", body: { to } });
+  /** Starts (`claude_code` or `codex`) or ends (`null`) the direct mode of a session (M7.2). */
+  codingAgent = (id: string, agent: "claude_code" | "codex" | null) =>
+    this.json<CodingAgentAnswer>(`/sessions/${id}/coding-agent`, { method: "POST", body: { agent } });
   listCheckpoints = (id: string) => this.json<CheckpointItem[]>(`/sessions/${id}/checkpoints`);
   undo = (id: string) => this.json<Restored>(`/sessions/${id}/undo`, { method: "POST" });
   rollback = (id: string, number: number) =>

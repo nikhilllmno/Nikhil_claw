@@ -672,7 +672,7 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
 - **Agent.** Each run builds one `SandboxAgent` with the sama prefix as `instructions`, the
   `Shell` and `Compaction` capabilities, and one `MCPServerStreamableHttp` for each MCP
   server of the config, with the run token in an `Authorization` header. Each MCP call can
-  take 1,200 seconds (`MCP_CALL_TIMEOUT_S`). The SDK default is 5 seconds, which fails every
+  take 3,600 seconds (`MCP_CALL_TIMEOUT_S`; 1,200 seconds before M7.2). The SDK default is 5 seconds, which fails every
   sama tool that takes longer (for example a new browser session or `clarify`). The SDK sandbox
   client is `UnixLocalSandboxClient` in the work folder, with no snapshot. The model is
   `OpenAIResponsesModel` over an `AsyncOpenAI` client with the proxy URL and the run token.
@@ -764,6 +764,13 @@ Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
   new session or a delegated child run.
 - Use the OpenAI Agents SDK when a task needs an OpenAI model, OpenAI hosted tools, or
   OpenAI-native patterns such as handoffs.
+- Since M7.2, the runtimes `claude_code` and `codex` send each message of a session to the
+  Claude Code CLI or the Codex CLI in the session sandbox (Section 15.4). They are not adapters
+  of an SDK in the runner: the control plane drives the CLI. A profile can choose them, and a
+  session can switch to them for a time (the direct mode, `/claude` or `/codex`, until `/sama`).
+  One message can go to a coding agent with `/claude <task>` or `/codex <task>`. These are the
+  only exceptions to "one runtime for the life of a session": the frozen config of the session
+  keeps its runtime, and the coding agent keeps its own CLI session in the sandbox.
 
 ### 5.5 Conformance suite
 
@@ -1728,7 +1735,8 @@ store, and the sync. The rules:
   `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and the
   gate does not allow it.
 
-**Builtin library (M7.7).** `skills/` has 68 builtin skills. Sama wrote all of them. They
+**Builtin library (M7.7).** `skills/` has 70 builtin skills: 68 from M7.7, and `claude-code` and
+`openai-codex` from M7.2 (Section 15.4). Sama wrote all of them. They
 cover the categories of the Hermes bundled skills (docs/feature-map.md, Section 3), except
 `apple`, because those skills need a Mac. No Hermes text is in them. The rules:
 
@@ -2214,6 +2222,7 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `code_exec` | `execute_code` (Python that calls sama tools through a stub, M4.8, Section 10.2.1) | Sandbox, tools through MCP |
 | `subagents` | `Task` and `Agent`, the native tool of Claude that starts a sub-agent (since M2.7, Section 13.1). It is separate from `delegation`. | Runtime, in the sandbox |
 | `delegation` | `delegate_task`, `delegate_status` (since M4.6, Section 13.2) | Sama MCP |
+| `coding_agents` | `coding_agent_run` (Claude Code or Codex in the session sandbox, since M7.2, Section 15.4). Default `ask`. Migration `0041` adds it to a profile that has the default toolsets of migration `0036`. Not in the default group set. | Sama MCP, CLI in the sandbox |
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
@@ -2236,7 +2245,8 @@ default profile of the first org has `tool_search` since migration `0018` (M2.6)
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
 (M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
-(M4.5), and `browser` since migration `0036` (M5.1). The default group set has no
+(M4.5), `browser` since migration `0036` (M5.1), and `coding_agents` since migration `0041`
+(M7.2). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
 Migrations `0022`, `0023`, `0026`, `0027`, `0029`, and `0031` change only the lists that are
@@ -5737,6 +5747,183 @@ session has no sandbox yet, or when its sandbox is from an old template.
 **Limits.** The agent can change or delete `.sama/checkpoints` with `Bash`. Checkpoints are a
 help for the user, not a security control.
 
+### 15.4 Coding agents: Claude Code and Codex (M7.2)
+
+Sama can give coding work to two coding agent CLIs: **Claude Code** (`@anthropic-ai/claude-code`)
+and **Codex** (`@openai/codex`). This is the sama form of the Hermes skills that send work to
+Claude Code or Codex. Sama does not copy Hermes code. The CLIs run headless in the E2B sandbox of
+the session. They have no provider key and no GitHub token:
+
+- Models: Claude Code gets `ANTHROPIC_BASE_URL=<model proxy>/anthropic` and the run token as
+  `ANTHROPIC_API_KEY`. Codex gets a custom model provider `sama` with
+  `base_url=<model proxy>/openai/v1`, `wire_api="responses"`, and `env_key="SAMA_RUN_TOKEN"`.
+  The proxy uses the key of the org from the vault, else the key of sama (Section 16.6, M6.7).
+  There is no login of a person with a subscription of Anthropic or OpenAI.
+- Git: a repository on the allowlist clones through the sama git proxy, and the credential
+  helper of the clone reads `$SAMA_RUN_TOKEN` (Section 15.1). The CLI gets the run token in its
+  environment for this. A push goes only to a `sama/*` branch, and the proxy checks it.
+
+**Three ways in.**
+
+| Way | What it does |
+|---|---|
+| Tool `coding_agent_run(agent, prompt, repo, open_pr, session, timeout_s)` | The agent of a run gives one task to `claude_code` or `codex`. The CLI runs in the sandbox of the session of the run, so the agent can read the result and run the tests in the same folder. Toolset `coding_agents`. |
+| `/claude <task>`, `/codex <task>` | The channel queues one message for the coding agent (`runs.coding_agent`). The run uses the runtime of the agent and not the runtime of the session. |
+| Direct mode | `/claude` or `/codex` with no task sets `sessions.coding_agent`. Each later chat message of the session goes to that CLI until `/sama`. An agent profile with the runtime `claude_code` or `codex` is in the direct mode for all its sessions. |
+
+The commands work in Telegram (`/claude`, `/codex`, `/sama`), in Slack (`/sama claude
+[task]`, `/sama codex [task]`, `/sama sama` in a direct message, or a mention with `/claude
+<task>`), in WhatsApp and email (M7.8: `/claude`, `/codex`, `/sama` as the whole text), and in
+the web composer (a bare `/claude`, `/codex`, or `/sama` calls
+`POST /sessions/{id}/coding-agent`; `/claude <task>` goes through `POST /sessions/{id}/messages`).
+
+**A request.** A message to a coding agent is `[<repo>] <task> [--pr]`. The first word is the
+repository when it is `github.com/<owner>/<name>` (with or without `https://`) or a short
+`<owner>/<name>` without a dot. So `src/app.py` is not a repository. `--pr` as the first or the
+last word asks for a pull request. `CodingService.run` (`src/sama/coding/service.py`) then:
+
+1. prepares the folder: `<work>/<name>` for a repository, the same folder as `repo_clone`. A
+   folder that has a clone of the same repository (its `origin`) is used again, so a follow-up
+   request sees the earlier changes. A folder with another repository of the same name is
+   refused. Else `RepoCloner` clones it. Without a repository, the folder is the folder of the last request
+   of the session, else the work folder;
+2. starts the CLI with the task on stdin, and reads one JSON event per line;
+3. stops the CLI at the end of the turn, on a cancel, or at the time limit (default 20 minutes,
+   at most 50 minutes, because E2B keeps a sandbox at most 1 hour per connect);
+4. reads the diff since the commit at the start: the commits of the CLI and the changes that
+   are not committed, with new files (`git add --intent-to-add`). The result has at most 60,000
+   bytes of the redacted diff;
+5. with `--pr` or `open_pr`, commits the changes to `sama/claude-<id>` or `sama/codex-<id>`,
+   pushes through the git proxy, and opens a pull request to the branch of the start with the
+   GitHub App (`GitHubTools.create_pull`). The git config `sama.target` of the clone keeps
+   the branch of the start. A later request with `--pr` in the same folder pushes its commits
+   to the same `sama/*` branch, so the open pull request gets them. The title and the body are
+   redacted (the secrets that the redactor knows and the run token) before they go to GitHub. A
+   repository that is not on the allowlist gets no push and no pull request. A person reviews
+   and merges.
+
+**The CLI commands.** `sama.coding.agents.cli_command` builds them. The versions are pinned in
+`sandbox/Dockerfile` (Claude Code 2.1.330, Codex 0.171.0, Node.js 22).
+
+| | Claude Code | Codex |
+|---|---|---|
+| Command | `claude -p --output-format stream-json --verbose --model <m> --dangerously-skip-permissions --settings {"skipWebFetchPreflight": true} [--resume <id>]` | `codex exec [resume <flags> <id>] --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --model <m> -c model_provider="sama" -c model_providers.sama={...} ... -` |
+| Model | The model of the session if it is an Anthropic model with a price, else `claude-sonnet-4-6`. Every model alias of the CLI (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`) is set, so the CLI never sends a model without a price. The small model is `claude-haiku-4-5`. | The model of the session if it is an OpenAI model with a price, else `gpt-6.1-terra`. |
+| No other hosts | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (without it the CLI calls `api.anthropic.com` and a log host directly), `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, and `skipWebFetchPreflight`. | `analytics.enabled=false`, `feedback.enabled=false`, `features.plugins=false` (else Codex clones a plugin catalog from GitHub), the `otel` exporters `none`, and no update check. The built-in `openai` provider of Codex is never used: it ignores `OPENAI_BASE_URL` and goes to `api.openai.com`. |
+| Retries | `CLAUDE_CODE_MAX_RETRIES=3`, so a refused run token does not retry for 3 minutes. | `request_max_retries=1`, `stream_max_retries=1`. |
+| Own sandbox | Off. The sandbox user is not root, so the CLI takes the flag. | Off. The bubblewrap sandbox of Codex does not work in the E2B VM (`bwrap: loopback`), and with it every command fails. |
+| Resume | `--resume <session id>`. The transcript is in `~/.claude`. | `codex exec resume <thread id>`. The thread is in `~/.codex`. |
+| Cost in the events | From the price table and the `usage` of the result (the `total_cost_usd` of the CLI counts the whole session after a resume). | From the price table and `turn.completed.usage`, less the count at the end of the last request (the count is for the whole thread). |
+
+The model proxy needed no change. A live probe (2026-11-21, 75 calls) showed that Claude Code
+calls only `POST /anthropic/v1/messages?beta=true` (streaming, with its `anthropic-beta`
+header) and Codex calls only `POST /openai/v1/responses` (streaming, `store: false`). Codex
+sends a compaction as a normal `/responses` call. Neither CLI calls `count_tokens` or
+`GET /models`. `SandboxSettings.carry_dirs` has `.claude` and `.codex`, so a new template keeps
+the CLI sessions (Section 16.2).
+
+**The runtimes `claude_code` and `codex`.** `CodingAgentRuntime` (`src/sama/coding/runtime.py`)
+implements `AgentRuntime` on the control plane. It gets the session sandbox and the run token
+from `SandboxedRuntime` (`acquire`, `issue_token`, `release`), and it drives the CLI itself: the
+sandbox runner does not start it.
+
+- **Events.** The text of the agent is `TextDelta`. Each tool of the CLI is `ToolCallStarted`
+  (with a one-line `summary`) and `ToolCallFinished`. The diff and the pull request come as the
+  last `TextDelta`, and the whole result is `RunCompleted.output`.
+- **State.** The runtime state is JSON: the CLI session of each folder, the last folder, the
+  Codex usage of each thread, and the request that waits for an approval. The run queue keys
+  the state by runtime, so the state of `claude_code` never goes to `claude_agent_sdk`. When a
+  saved CLI session is gone (a new sandbox), the runtime starts a new CLI session once.
+- **Config.** The prompt assembler gives a coding run the frozen config of the session with
+  the runtime of the agent and a model of its provider. The frozen config of the session keeps
+  the runtime of the profile, also when the first run of the session goes to a coding agent, so
+  `/sama` goes back to it. The CLI does not get the sama prompt or the sama MCP server.
+- **Capabilities.** `streaming` and `resumable_sessions`. The CLIs compact their own context,
+  so `native_compaction` is true and `manual_compaction` is false: `/compact` in the direct
+  mode compacts the context of the sama runtime of the session. No native sub-agents, no
+  `mcp_client`, and no mid-run `/steer`. A background review of the session runs on the sama
+  runtime of the same provider (`claude_agent_sdk` or `openai_agents_sdk`).
+- **Profiles.** The web app and `PATCH /orgs/{org_id}/agent-profiles/{profile_id}` accept the
+  runtimes `claude_code` and `codex`. A `codex` profile needs an OpenAI model with a price.
+
+**Approvals, budgets, and cancel.**
+
+- The tool gate judges each request as one call of `coding_agent_run` with the agent, the
+  repository, the task (first 4,000 characters), and `open_pr`. The tool is not in
+  `DEFAULT_ALLOW`, so the default is `ask`: in a run of the runtimes, the run ends with
+  `ApprovalRequired`, and the resume after an approval starts the CLI. "Always allow" writes a
+  user rule, as for other tools. An unattended run gets `deny`. A `deny` rule wins. The run needs
+  the toolset `coding_agents`; migration `0041` adds it to a profile with the default toolsets of
+  migration `0036`, and it is in the default list of `bootstrap`. It is not in the default group
+  set.
+- The approval covers the whole request, also the pull request when `open_pr` is set. The gate
+  does not see the tools that the CLI calls in the sandbox. The sandbox (egress allowlist, no
+  secrets) and the git proxy (only `sama/*` branches, approval for protected paths) are the
+  boundary inside the request.
+- Every model call of the CLI goes through the model proxy with the run token, so the budget of
+  the run (`max_tokens`, `max_cost_usd`), the quota of the org, and the quota of the user apply,
+  and `model_calls` records each call. A refused call (`402`) ends the turn; the runtime maps it
+  to `RunFailed(budget_exceeded)`.
+- The wall time of the run limits the CLI (the CLI stops 60 seconds before it, for the diff and
+  the pull request). `/stop` cancels the run, and the cancel kills the CLI process at once. A
+  cancel during the gate check stops the run before the CLI starts.
+  A cancel of a run that called `coding_agent_run` ends the tool call, and the tool kills the
+  CLI too.
+
+**Progress in the channel.** In the runtimes, the progress is the run events. The tool runs on
+the tool server, and the channel shows only the events of the run, so `coding_agent_run` adds
+its progress to the stream of the run with `Worker.emit`, the seam of `browser_task` (M5.6,
+Section 14.1). It sends a `SubagentEvent` (`subagent` is `claude_code` or `codex`) for each text
+and each tool of the CLI, at most 200 per call. Telegram and Slack show these events as
+`> Claude Code: <text>` lines, and the web page shows them in the live run text. The control
+plane runs the tool server and the worker in one process (Section 19.1); a run of another
+process gets no progress lines, only the result.
+
+**Redaction.** The parsers redact each text of the CLI before they cut it to a preview or a
+progress line, because a cut secret no longer matches the redactor. Sama reads at most
+240,000 bytes of the diff, redacts all of it, and then cuts it to 60,000 bytes on a line end.
+After a cut, a key block that has no end line is removed. The pull request body scrubs each
+field whole before its cut. The tool server and the worker redact again (Sections 16.3 and
+16.7).
+
+**The result of the tool** has the answer of the CLI, the diff, the pull request, and the CLI
+session id. The agent gives `session=<id>` to continue the same CLI session. The answer and the
+diff come from the repository and the CLI, so they are in an `<untrusted_content>` block.
+
+**Skills.** The builtin skills `claude-code` and `openai-codex` tell the agent when to give a
+task to a coding agent, how to write the task, how to follow up, how to review the diff, and when
+to open a pull request. They need the toolset `coding_agents`, so they are hidden without it.
+The names `claude`, `codex`, and `sama` are reserved for the commands.
+
+**Other changes.** The OpenAI runtime waits up to 1 hour for one MCP call (`MCP_CALL_TIMEOUT_S`,
+1,200 seconds before), because `coding_agent_run` can take 50 minutes.
+
+**Code.**
+
+| Part | Where |
+|---|---|
+| Agents, CLI commands, limits | `src/sama/coding/agents.py` |
+| Event parsers (`ClaudeStream`, `CodexStream`) | `src/sama/coding/events.py` |
+| Folder, diff, pull request | `src/sama/coding/workspace.py` |
+| One request | `src/sama/coding/service.py` |
+| Runtimes `claude_code`, `codex` | `src/sama/coding/runtime.py` |
+| Tool body and progress | `src/sama/coding/tool.py`, `src/sama/coding/progress.py` |
+| Commands | `src/sama/coding/commands.py`, `src/sama/gateway/telegram.py`, `src/sama/gateway/slack.py`, `src/sama/api/app.py`, `web/` |
+| Columns | migration `0041`: `sessions.coding_agent`, `runs.coding_agent`, and the runtimes `claude_code` and `codex` in the checks of `agent_profiles` and `runs` |
+
+#### 15.4.1 Assumptions
+
+| # | Assumption |
+|---|---|
+| A1 | The CLIs sign in only with the run token through the model proxy (the key of the org or of sama). Sama does not build a login with a subscription of a person. |
+| A2 | The gate judges one call per request, not each tool of the CLI. Claude Code has `--permission-prompt-tool`, which could send each tool to the gate later; Codex has no such hook in `exec`. |
+| A3 | The CLI does not get the sama tools (no sama MCP server in the CLI). |
+| A4 | The progress of the tool needs the run in the same process as the tool server (Section 19.1). |
+| A5 | A message is a repository only in the forms of the parser above. A repository name with a dot needs the `github.com/` form. |
+| A6 | The conformance suite (Section 5.5) does not run the coding runtimes: its scripted tool calls and sama tool checks need `mcp_client`, the sama prompt, and a gate per tool call, which these runtimes do not have. The unit tests cover the contract rules that apply: one terminal event, approval resume once, reject, cancel within 10 seconds, the time limit, the usage of the run, and the state across runs (`tests/coding/`). |
+| A7 | The pull request is not a draft. The ruleset of the repository stops a merge without a review (Section 19.5). |
+| A8 | The CLI writes its transcript in the home folder of the sandbox. The sama archive of compactions (Section 6.3) does not see it. The run events and the messages of the session have the text that the user saw. |
+
 ---
 
 ## 16. Safety: approvals, sandbox, secrets
@@ -5991,7 +6178,8 @@ gives no deferred tool: the search fails closed (Section 6.3).
   1. creates a new sandbox from its own template;
   2. moves `SandboxSettings.carry_dirs` from the home folder of the old sandbox to the new
      one, as one archive of at most 64 MB. The default is `.claude`, the folder of the Claude
-     CLI, which holds the transcripts that a run resumes;
+     CLI, which holds the transcripts that a run resumes, and `.codex`, the threads of Codex
+     (since M7.2, Section 15.4);
   3. kills the old sandbox, also when the move fails.
 
   Other files of the old sandbox, for example in the work folder, do not stay. Skills sync
@@ -6035,7 +6223,7 @@ gives no deferred tool: the search fails closed (Section 6.3).
 | E2B | `src/sama/sandbox/e2b.py` | `lifecycle.on_timeout = "pause"`. Metadata `sama.org_id`, `sama.session_id`, and `sama.template`. `resume` connects and checks the metadata. It gives a sandbox of another template to the caller in `SandboxOutdatedError`. |
 | Docker | `src/sama/sandbox/docker.py` | For local development and CI. One container per session. `pause` stops the container and `resume` starts it. A process runs under `setsid` in its own process group, and `kill` kills that group in the container, then the `docker exec` client on the host. The group kill also runs when the client has already ended. |
 | Local | `src/sama/sandbox/local.py` | A folder on the host, for tests only. No isolation, only a clean environment. |
-| Image | `sandbox/Dockerfile` | Python 3.12, git, ripgrep, the runner, and the Claude runtime (the SDK bundles the Claude CLI). Docker uses it, and `python -m sama.sandbox.template` builds the E2B template from it. |
+| Image | `sandbox/Dockerfile` | Python 3.12, git, ripgrep, the runner, and the Claude runtime (the SDK bundles the Claude CLI). Since M7.2 also Node.js 22 and the coding agent CLIs at pinned versions: Claude Code and Codex (Section 15.4). Docker uses it, and `python -m sama.sandbox.template` builds the E2B template from it. |
 | Run token | `src/sama/tenancy/run_token.py` | HS256 JWT, issuer `sama`, audience `sama-run`. Claims: run, org, workspace, session, and user (private runs only). Lifetime at most 2 hours. |
 | Runner | `src/sama/runtime/runner.py` | `python -m sama.runtime.runner` in the sandbox. One process per run or resume. |
 | Warm runner | `src/sama/warm.py` | `python -m sama.warm` in the sandbox: the same protocol, with the imports already done in a warm server. The control plane uses it (`WARM_RUNNER_ARGV`). |
@@ -6316,7 +6504,11 @@ forwards the call, and records the usage and the cost of each call. The code is 
 
 Other routes get `404`. `SAMA_MODEL_URL` in the sandbox is the root URL of the proxy. The
 runner gives the Claude CLI `ANTHROPIC_BASE_URL=<root>/anthropic` and the run token as
-`ANTHROPIC_API_KEY`. The OpenAI adapter (M3.6) uses `<root>/openai/v1` as `base_url`.
+`ANTHROPIC_API_KEY`. The OpenAI adapter (M3.6) uses `<root>/openai/v1` as `base_url`. The
+coding agent CLIs (M7.2, Section 15.4) use the same two routes: Claude Code calls
+`/anthropic/v1/messages?beta=true` (the proxy does not forward the query), and Codex calls
+`/openai/v1/responses` through a custom model provider. A live probe found no gap in the proxy
+for them.
 
 **One call.**
 

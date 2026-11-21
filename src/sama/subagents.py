@@ -147,7 +147,8 @@ def parse_subagents(raw: Any) -> tuple[SubagentSpec, ...]:
 
 def model_provider(runtime: RuntimeKind) -> Provider:
     """The provider of the models of a runtime. The fake runtime uses the Anthropic table."""
-    return Provider.OPENAI if runtime is RuntimeKind.OPENAI_AGENTS_SDK else Provider.ANTHROPIC
+    openai = (RuntimeKind.OPENAI_AGENTS_SDK, RuntimeKind.CODEX)
+    return Provider.OPENAI if runtime in openai else Provider.ANTHROPIC
 
 
 def known_models(runtime: RuntimeKind) -> list[str]:

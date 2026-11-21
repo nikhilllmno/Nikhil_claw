@@ -92,12 +92,19 @@ so a frozen ``RunConfig`` keeps the same fingerprint for the life of a session.
 class RuntimeKind(StrEnum):
     CLAUDE_AGENT_SDK = "claude_agent_sdk"  # default
     OPENAI_AGENTS_SDK = "openai_agents_sdk"
+    CLAUDE_CODE = "claude_code"  # the Claude Code CLI, headless (M7.2, Section 15.4)
+    CODEX = "codex"  # the OpenAI Codex CLI, headless (M7.2, Section 15.4)
     FAKE = "fake"  # scripted, for tests
 
 
 ReasoningEffort = Literal["low", "medium", "high"]
 REASONING_EFFORTS: Final[tuple[str, ...]] = ("low", "medium", "high")
 """The reasoning efforts that an agent profile can set (M7.10). Each adapter maps them."""
+
+
+CODING_RUNTIMES: Final = frozenset({RuntimeKind.CLAUDE_CODE, RuntimeKind.CODEX})
+"""The runtimes that run a coding agent CLI in the session sandbox (Section 15.4). The control
+plane drives the CLI. The sandbox runner does not start them."""
 
 
 class Capabilities(_Frozen):

@@ -147,6 +147,20 @@ export function applyStreamEvent(
       }
       return { state: { ...state, tools: { ...state.tools, [event.run_id]: tools } }, effects };
     }
+    case "subagent_event": {
+      // The progress of a coding agent (M7.2). Native sub-agents show nothing here.
+      const line = codingProgressLine(payload);
+      const known = state.runs[event.run_id];
+      if (line === null || (known !== undefined && !OPEN_RUN_STATUSES.has(known.status))) {
+        return { state, effects };
+      }
+      const before = state.text[event.run_id] ?? "";
+      const gap = before === "" || before.endsWith("\n\n") ? "" : before.endsWith("\n") ? "\n" : "\n\n";
+      return {
+        state: { ...state, text: { ...state.text, [event.run_id]: `${before}${gap}${line}\n\n` } },
+        effects,
+      };
+    }
     case "approval_required":
       effects.push("reload_approvals");
       return { state, effects };
@@ -177,11 +191,24 @@ export function sessionTitle(session: { id: string; title: string | null }): str
 export const HANDOFF_CHANNELS = ["telegram", "slack", "web"] as const;
 export type HandoffChannel = (typeof HANDOFF_CHANNELS)[number];
 
+/** The coding agents that a session can send its messages to (M7.2). */
+export const CODING_AGENTS = { claude_code: "Claude Code", codex: "Codex" } as const;
+export type CodingAgent = keyof typeof CODING_AGENTS;
+
+/** The progress line of a coding agent event, or `null` for any other sub-agent event. */
+export function codingProgressLine(payload: Record<string, unknown>): string | null {
+  const agent = payload.subagent;
+  if (typeof agent !== "string" || !Object.hasOwn(CODING_AGENTS, agent)) return null;
+  const text = typeof payload.text === "string" ? payload.text.split(/\s+/).filter(Boolean).join(" ") : "";
+  return text ? `> ${CODING_AGENTS[agent as CodingAgent]}: ${text}` : null;
+}
+
 /** A busy control or a context command of the composer (M3.9). */
 export type ChatCommand =
   | { kind: "compact"; focus: string }
   | { kind: "steer"; note: string }
   | { kind: "handoff"; to: HandoffChannel | null }
+  | { kind: "coding"; agent: CodingAgent | null }
   | { kind: "undo" }
   | { kind: "rollback"; number: number | null; valid: boolean }
   | { kind: "stop" };
@@ -203,6 +230,12 @@ export function parseCommand(text: string): ChatCommand | null {
       kind: "handoff",
       to: (HANDOFF_CHANNELS as readonly string[]).includes(to) ? (to as HandoffChannel) : null,
     };
+  }
+  // `/claude TASK` is a normal message: the API reads the command. Alone, it sets the direct mode.
+  const coding = /^\/(claude|codex|sama)$/i.exec(trimmed);
+  if (coding) {
+    const name = (coding[1] ?? "").toLowerCase();
+    return { kind: "coding", agent: name === "sama" ? null : name === "claude" ? "claude_code" : "codex" };
   }
   if (/^\/undo$/i.test(trimmed)) return { kind: "undo" };
   const rollback = /^\/rollback(?:\s+(\S*))?\s*$/i.exec(trimmed);

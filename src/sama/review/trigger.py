@@ -29,6 +29,7 @@ from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from sama.coding.agents import base_runtime
 from sama.db.models import AgentProfile, Message, ModelCall, Org, Run, RunEvent, Session
 from sama.review.policy import (
     MAX_COST_USD,
@@ -187,7 +188,9 @@ async def _queue_review(
                 session_id=run.session_id,
                 agent_profile_id=run.agent_profile_id,
                 triggered_by_user_id=None,
-                runtime=run.runtime,
+                # A review never runs in a coding agent CLI: it uses the sama runtime of the
+                # same provider (Section 15.4).
+                runtime=base_runtime(run.runtime).value,
                 budget=review_budget(profile_budget),
                 unattended=True,
                 kind="review",

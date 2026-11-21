@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyStreamEvent,
   checkpointListText,
+  codingProgressLine,
   initialLive,
   isPaused,
   NO_CHECKPOINTS,
@@ -52,6 +53,45 @@ describe("applyStreamEvent", () => {
     });
     expect(done.effects).toEqual(["reload_messages"]);
     expect(done.state.text).toEqual({});
+  });
+
+  it("shows the progress of a coding agent as lines of the live text", () => {
+    const event = (seq: number, type: string, payload: Record<string, unknown>) => ({
+      run_id: "r1",
+      seq,
+      type,
+      payload,
+    });
+    let state = applyStreamEvent(initialLive, "run_event", event(1, "text_delta", { text: "Start" })).state;
+    state = applyStreamEvent(
+      state,
+      "run_event",
+      event(2, "subagent_event", { subagent: "claude_code", text: "edited  main.py\nand tests" }),
+    ).state;
+    state = applyStreamEvent(
+      state,
+      "run_event",
+      event(3, "subagent_event", { subagent: "codex", text: "ran pytest" }),
+    ).state;
+    expect(state.text.r1).toBe("Start\n\n> Claude Code: edited main.py and tests\n\n> Codex: ran pytest\n\n");
+  });
+
+  it("ignores native sub-agent events and the events of an ended run", () => {
+    const native = applyStreamEvent(initialLive, "run_event", {
+      run_id: "r1",
+      seq: 1,
+      type: "subagent_event",
+      payload: { subagent: "reviewer", text: "reading" },
+    });
+    expect(native.state).toBe(initialLive);
+    const ended = applyStreamEvent(initialLive, "runs", { runs: [run("r1", "completed")] }).state;
+    const late = applyStreamEvent(ended, "run_event", {
+      run_id: "r1",
+      seq: 2,
+      type: "subagent_event",
+      payload: { subagent: "codex", text: "ran pytest" },
+    });
+    expect(late.state.text).toEqual({});
   });
 
   it("clears the live text of a run at its terminal event", () => {
@@ -244,6 +284,22 @@ describe("parseCommand", () => {
     expect(parseCommand("/handoff")).toEqual({ kind: "handoff", to: null });
     expect(parseCommand("/handoff mars")).toEqual({ kind: "handoff", to: null });
     expect(parseCommand("/handoff slack now")).toBeNull();
+  });
+
+  it("reads the coding agent commands", () => {
+    expect(parseCommand("/claude")).toEqual({ kind: "coding", agent: "claude_code" });
+    expect(parseCommand(" /Codex ")).toEqual({ kind: "coding", agent: "codex" });
+    expect(parseCommand("/sama")).toEqual({ kind: "coding", agent: null });
+    // A task is a normal message: the API reads the command.
+    expect(parseCommand("/claude fix the tests")).toBeNull();
+    expect(parseCommand("/codex fix the tests")).toBeNull();
+  });
+
+  it("gives the progress line of a coding agent only", () => {
+    expect(codingProgressLine({ subagent: "codex", text: "ran pytest" })).toBe("> Codex: ran pytest");
+    expect(codingProgressLine({ subagent: "codex", text: "  " })).toBeNull();
+    expect(codingProgressLine({ subagent: "toString", text: "x" })).toBeNull();
+    expect(codingProgressLine({ text: "x" })).toBeNull();
   });
 
   it("reads the checkpoint commands", () => {

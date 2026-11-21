@@ -101,6 +101,8 @@ from sama.api.tasks import (
     TaskStatus,
 )
 from sama.billing import BillingService
+from sama.coding.agents import CodingAgent
+from sama.coding.commands import parse_command, set_direct
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
@@ -329,6 +331,17 @@ class HandoffOut(BaseModel):
 class Rollback(_Body):
     number: int = Field(ge=1, le=MAX_HISTORY)
     """The number of a checkpoint in ``GET /sessions/{id}/checkpoints``. 1 is the newest."""
+
+
+class CodingAgentBody(_Body):
+    agent: CodingAgent | None
+    """The coding agent that gets each message of the session (the direct mode, Section 15.4).
+    ``null`` ends the direct mode."""
+
+
+class CodingAgentOut(BaseModel):
+    text: str
+    """The answer for the user."""
 
 
 class CheckpointOut(BaseModel):
@@ -1343,6 +1356,14 @@ class SamaApi:
         @app.post("/sessions/{session_id}/undo")
         async def undo(principal: Me, session_id: uuid.UUID) -> RestoreOut:
             return await self._restore(principal, session_id, None)
+
+        @app.post("/sessions/{session_id}/coding-agent")
+        async def coding_agent(
+            principal: Me, session_id: uuid.UUID, body: CodingAgentBody
+        ) -> CodingAgentOut:
+            access = await self._access(principal, session_id)
+            text = await set_direct(self._engine, access.org_id, session_id, body.agent)
+            return CodingAgentOut(text=text)
 
         @app.post("/sessions/{session_id}/rollback")
         async def rollback(principal: Me, session_id: uuid.UUID, body: Rollback) -> RestoreOut:
@@ -3801,8 +3822,14 @@ class SamaApi:
             except HTTPException as error:
                 raise SendError(error.status_code, str(error.detail)) from None
         attachments: tuple[NewAttachment, ...] = ()
+        coding_agent: CodingAgent | None = None
         if page is None:
-            text = await self._expand_skill(access, text)
+            command = parse_command(text)
+            if command is not None and command.agent is not None and command.task:
+                # One message for a coding agent (Section 15.4): no skill.
+                coding_agent, text = command.agent, command.task
+            else:
+                text = await self._expand_skill(access, text)
         else:
             session = access.session
             if session.audience != "private" or session.owner_user_id != access.user_id:
@@ -3819,6 +3846,7 @@ class SamaApi:
                 text=text,
                 user_id=access.user_id,
                 attachments=attachments,
+                coding_agent=None if coding_agent is None else coding_agent.value,
             )
         except RateLimitedError as error:
             raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None
