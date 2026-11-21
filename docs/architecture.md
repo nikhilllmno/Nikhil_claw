@@ -420,7 +420,11 @@ parallel" button of the web chat start a parallel run, like a background agent o
   them in a `<parallel_answers>` block, in the order of completion, at most the newest 10 turns
   (`catch_up_block`). The claim reads the newest side reply in its one `UPDATE ... RETURNING`, so
   a run with no catch-up uses no extra statement. The next main run resumes a state that has
-  the catch-up, so no turn is lost and no turn comes two times.
+  the catch-up, so no turn is lost and no turn comes two times. `runs.state_seq` keeps the
+  watermark of the state that a run resumed. A failed or cancelled run saves the conversation
+  from before it (Section 5.3), so `fail` sets its `context_seq` back to `state_seq`. A
+  `/compact` run reads no catch-up, so its `context_seq` is `state_seq` too. Thus a failure or a
+  compaction never hides a side answer from the next main run.
 - **Order.** Each reply is stored when its run completes, so the replies join the transcript and
   the channel thread in the order of completion. Each channel follows each run, so each answer
   comes in the same thread when its run ends.

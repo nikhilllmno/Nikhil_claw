@@ -802,7 +802,12 @@ class Run(Base):
     run starts a new runtime session, and the next run of the session does not resume its
     runtime state."""
     context_seq: Mapped[int | None] = mapped_column(BigInteger)
-    """The newest ``messages.seq`` of the session when the chat run started (M7.1)."""
+    """The newest ``messages.seq`` that the runtime state of this run has seen (M7.1): the
+    newest message at the claim of a chat run. A ``/compact`` run and a failed run keep
+    ``state_seq``, because their state has no catch-up of side answers."""
+    state_seq: Mapped[int | None] = mapped_column(BigInteger)
+    """The ``context_seq`` of the run whose runtime state this run resumed (M7.1). Null: the
+    run started with no state."""
 
 
 class Message(Base):

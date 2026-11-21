@@ -1371,6 +1371,13 @@ class RunQueue:
             .correlate(Run)
             .scalar_subquery()
         )
+        # The newest message that the session state has seen (M7.1). The side runs that
+        # answered after it are the catch-up of a main run.
+        state_seq = (
+            _session_state_query(prior, Run.org_id, Run.session_id, Run.runtime, "context_seq")
+            .scalar_subquery()
+            .correlate(Run)
+        )
         row = (
             await connection.execute(
                 update(Run)
@@ -1389,7 +1396,14 @@ class RunQueue:
                     dispatched_at=None,
                     started_at=func.coalesce(Run.started_at, func.now()),
                     side=side,
-                    context_seq=case((starts, func.coalesce(newest_seq, 0)), else_=Run.context_seq),
+                    state_seq=case((starts, state_seq), else_=Run.state_seq),
+                    # A ``/compact`` run reads no catch-up, so its state keeps the watermark of
+                    # the state that it compacts: the next main run still gets the side answers.
+                    context_seq=case(
+                        (and_(starts, Run.compact), state_seq),
+                        (starts, func.coalesce(newest_seq, 0)),
+                        else_=Run.context_seq,
+                    ),
                     # A chat run that starts takes the runtime of the session now, as the
                     # model: the profile can switch runtime while the run waits (Section 11.4).
                     # A ``/claude`` or ``/codex`` run keeps its coding agent, and the direct mode
@@ -1459,19 +1473,7 @@ class RunQueue:
                         ),
                         else_=None,
                     ).label("session_state"),
-                    # The newest message that the session state has seen (M7.1). The side runs
-                    # that answered after it are the catch-up of a main run.
-                    case(
-                        (
-                            starts,
-                            _session_state_query(
-                                prior, Run.org_id, Run.session_id, Run.runtime, "context_seq"
-                            )
-                            .scalar_subquery()
-                            .correlate(Run),
-                        ),
-                        else_=None,
-                    ).label("state_seq"),
+                    Run.state_seq,
                     case(
                         (
                             starts,
@@ -1820,6 +1822,9 @@ class RunQueue:
                 failure_code=code.value,
                 failure_message=redact(message),
                 runtime_state=_encode_state(runtime_state),
+                # The state of a failure is the conversation from before the run, so it keeps the
+                # watermark of that conversation (M7.1): the catch-up of the run is not in it.
+                context_seq=Run.state_seq,
             )
 
     async def pause(

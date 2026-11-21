@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.db.models import AgentProfile, Message, Run
 from sama.gateway.sessions import busy_text, stop_reply
 from sama.orchestrator.queue import ClaimedRun, RunQueue
-from sama.runtime.contract import Usage
+from sama.runtime.contract import FailureCode, Usage
 from tests.orchestrator.conftest import Tenant
 
 OWNER = "worker-a"
@@ -328,3 +328,55 @@ async def test_claims_at_the_same_time_keep_the_limit(engine: AsyncEngine, tenan
             )
         ).all()
     assert sorted(r.side for r in running) == [False, True]
+
+
+async def test_a_failed_main_run_does_not_lose_the_catch_up(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await set_mode(engine, tenant, "parallel")
+    await send(queue, tenant, "slow")
+    slow = await claim(queue)
+    await send(queue, tenant, "quick")
+    quick = await claim(queue)
+    await finish(queue, quick, "quick answer", None)
+    await finish(queue, slow, "slow answer", b"main-1")
+    await send(queue, tenant, "next")
+    failing = await claim(queue)
+    assert "quick answer" in failing.input
+    # The failure state is the conversation before the run, without the catch-up.
+    assert await queue.fail(
+        failing,
+        OWNER,
+        code=FailureCode.MODEL_ERROR,
+        message="boom",
+        usage=Usage(),
+        runtime_state=b"main-1-kept",
+    )
+    await send(queue, tenant, "again")
+    retry = await claim(queue)
+    assert retry.runtime_state == b"main-1-kept"
+    assert "quick answer" in retry.input
+
+
+async def test_a_compaction_does_not_consume_the_catch_up(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await set_mode(engine, tenant, "parallel")
+    await send(queue, tenant, "slow")
+    slow = await claim(queue)
+    await send(queue, tenant, "quick")
+    quick = await claim(queue)
+    await finish(queue, quick, "quick answer", None)
+    await finish(queue, slow, "slow answer", b"main-1")
+    await queue.enqueue_compact(
+        org_id=tenant.org, session_id=tenant.ids["s1"], user_id=tenant.ids["mia"]
+    )
+    compact = await claim(queue)
+    assert compact.compact
+    await finish(queue, compact, "", b"compacted")
+    await send(queue, tenant, "after the compaction")
+    following = await claim(queue)
+    assert following.runtime_state == b"compacted"
+    assert "quick answer" in following.input

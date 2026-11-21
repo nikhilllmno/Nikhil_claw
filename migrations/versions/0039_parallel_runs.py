@@ -8,7 +8,8 @@
   the profile was in the mode ``parallel`` at the enqueue, or the person asked for it (``/bg``).
 - ``runs.side`` is true for a run that started while another chat run of its session was open.
   A side run starts a new runtime session and does not give its runtime state to the session.
-- ``runs.context_seq`` is the newest ``messages.seq`` that a chat run saw when it started.
+- ``runs.context_seq`` is the newest ``messages.seq`` that the runtime state of a run has seen,
+  and ``runs.state_seq`` is that value of the state that the run resumed.
 
 The unique index ``ix_runs_one_active_per_session`` becomes ``ix_runs_one_main_per_session``:
 a session has at most one open run that is not a side run. No table is added, so no RLS policy
@@ -57,6 +58,7 @@ def upgrade() -> None:
         "runs", sa.Column("side", sa.Boolean(), server_default=sa.false(), nullable=False)
     )
     op.add_column("runs", sa.Column("context_seq", sa.BigInteger(), nullable=True))
+    op.add_column("runs", sa.Column("state_seq", sa.BigInteger(), nullable=True))
     op.create_check_constraint(
         op.f("ck_runs_side_is_chat"), "runs", "NOT side OR (kind = 'chat' AND NOT compact)"
     )
@@ -77,14 +79,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Before the downgrade, end the side runs that are open: the old index allows one open run
-    # per session.
+    # Before the downgrade, end the side runs that are not ended (the old index allows one open
+    # run per session), and drop the runtime state of every side run: the old state query has
+    # no side flag, so a side state could become the conversation of the session.
     op.execute(
         "UPDATE runs SET status = 'failed', failure_code = 'internal',"
         " failure_message = 'the downgrade ended the parallel run', lease_owner = NULL,"
-        " lease_expires_at = NULL, pending_approval_id = NULL, finished_at = now()"
-        " WHERE side AND status IN ('running', 'paused')"
+        " lease_expires_at = NULL, pending_approval_id = NULL, resume_decision = NULL,"
+        " resume_reason = NULL, finished_at = now()"
+        " WHERE side AND status IN ('queued', 'running', 'paused')"
     )
+    op.execute("UPDATE runs SET runtime_state = NULL WHERE side")
     op.drop_index("ix_runs_active_per_session", table_name="runs")
     op.drop_index("ix_runs_one_main_per_session", table_name="runs")
     op.create_index(
@@ -95,6 +100,7 @@ def downgrade() -> None:
         postgresql_where=sa.text("status IN ('running', 'paused')"),
     )
     op.drop_constraint(op.f("ck_runs_side_is_chat"), "runs", type_="check")
+    op.drop_column("runs", "state_seq")
     op.drop_column("runs", "context_seq")
     op.drop_column("runs", "side")
     op.drop_column("runs", "allow_parallel")
