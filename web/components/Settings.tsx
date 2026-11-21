@@ -17,6 +17,7 @@ import {
   type Org,
   type PairingCode,
 } from "@/lib/api";
+import { CHANNEL_TITLES, pairingHint } from "@/lib/channels";
 import { ROLE_LABELS, roleBadge } from "@/lib/orgs";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
@@ -30,7 +31,8 @@ import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./Page.module.css";
 
-const CHANNEL_TITLES: Record<ChatChannel, string> = { telegram: "Telegram", slack: "Slack" };
+/** The channels where a user links an account with a code from this page. */
+const PAIRING_CHANNELS: ChatChannel[] = ["telegram", "whatsapp", "email"];
 
 export function Settings() {
   const { me, meError, reloadMe, workspaceId, profilesFor, orgOfWorkspace } = useData();
@@ -192,11 +194,9 @@ function LinkedAccounts({
   const api = useApi();
   const { profilesFor } = useData();
   const load = useCallback(async () => {
-    const [telegram, slack] = await Promise.all([api.listIdentities("telegram"), api.listIdentities("slack")]);
-    return [
-      ...telegram.map((i) => ({ ...i, channel: "telegram" as const })),
-      ...slack.map((i) => ({ ...i, channel: "slack" as const })),
-    ];
+    const channels: ChatChannel[] = ["telegram", "slack", "whatsapp", "email"];
+    const lists = await Promise.all(channels.map((c) => api.listIdentities(c)));
+    return channels.flatMap((channel, index) => (lists[index] ?? []).map((i) => ({ ...i, channel })));
   }, [api]);
   const identities = useLoad(load, "Could not load the linked chat accounts.");
   const [busy, setBusy] = useState<string | null>(null);
@@ -211,7 +211,11 @@ function LinkedAccounts({
   const target = workspaceId !== null && agent !== null ? { workspaceId, profileId: agent.id } : null;
   const pairingHere = pairing !== null && samePair(pairing, target);
   const result = target === null ? null : (pairResults[pairKey(target)] ?? null);
-  const telegramOn = org?.integrations.some((i) => i.kind === "telegram" && i.status === "active") ?? false;
+  const active = PAIRING_CHANNELS.filter(
+    (c) => org?.integrations.some((i) => i.kind === c && i.status === "active") ?? false,
+  );
+  const [chosen, setChosen] = useState<ChatChannel | null>(null);
+  const channel = chosen !== null && active.includes(chosen) ? chosen : (active[0] ?? null);
   const [now] = useState(() => Date.now());
 
   const where = (identity: ChannelIdentity) => {
@@ -236,7 +240,7 @@ function LinkedAccounts({
   };
 
   const pair = async () => {
-    if (target === null) return;
+    if (target === null || channel === null) return;
     const started = { ...target };
     setPairing(started);
     const key = pairKey(started);
@@ -247,7 +251,7 @@ function LinkedAccounts({
       return next;
     });
     try {
-      const code = await api.createPairingCode("telegram", started.workspaceId, started.profileId);
+      const code = await api.createPairingCode(channel, started.workspaceId, started.profileId);
       keep({ code, error: null });
     } catch (e) {
       keep({ code: null, error: errorText(e, "No code was made.") });
@@ -290,9 +294,21 @@ function LinkedAccounts({
           ))}
         </ul>
       )}
-      {telegramOn && agent !== null ? (
+      {channel !== null && agent !== null ? (
         <div className={styles.section}>
-          <h3 className={styles.subheading}>Link a Telegram account</h3>
+          <h3 className={styles.subheading}>Link a {CHANNEL_TITLES[channel]} account</h3>
+          {active.length > 1 ? (
+            <label className="field">
+              <span className="label">Channel</span>
+              <select className="input" value={channel} onChange={(e) => setChosen(e.target.value as ChatChannel)}>
+                {active.map((c) => (
+                  <option key={c} value={c}>
+                    {CHANNEL_TITLES[c]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           {profiles.length > 1 ? (
             <label className="field">
               <span className="label">Agent</span>
@@ -321,14 +337,14 @@ function LinkedAccounts({
                 {result.code.link ? (
                   <>
                     <a href={result.code.link} target="_blank" rel="noopener noreferrer">
-                      Open the bot in Telegram
+                      {pairingHint(channel).open}
                     </a>{" "}
                     or send{" "}
                   </>
                 ) : (
                   "Send "
                 )}
-                <code className="mono">{result.code.command}</code> to the bot. The code stops working{" "}
+                <code className="mono">{result.code.command}</code> to {pairingHint(channel).to}. The code stops working{" "}
                 {new Date(result.code.expires_at).toLocaleTimeString()}.
               </p>
             </div>

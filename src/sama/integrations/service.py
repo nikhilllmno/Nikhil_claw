@@ -37,7 +37,7 @@ import secrets
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Final
 from urllib.parse import quote
@@ -48,8 +48,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AuditEntry, ChannelGroup, ChannelIdentity, Integration, PairingCode
+from sama.gateway.mail_inbound import BadKey, public_key
+from sama.gateway.sendgrid_client import API_KEY as SENDGRID_KEY
+from sama.gateway.sendgrid_client import SEND_SCOPE, SendGridClient, SendGridError
 from sama.gateway.slack_client import BOT_TOKEN, SIGNING_SECRET, SlackClient, SlackError
 from sama.gateway.telegram_client import TelegramClient, TelegramError
+from sama.gateway.whatsapp_providers import (
+    PROVIDER_TITLES,
+    GupshupProvider,
+    WhatsAppCredentials,
+    WhatsAppError,
+    WhatsAppProvider,
+    build_provider,
+)
 from sama.vault.crypto import VaultError
 from sama.vault.store import SecretName, Vault
 
@@ -60,6 +71,10 @@ MAX_ERROR_CHARS: Final = 500
 
 TelegramClientFactory = Callable[[SecretStr], TelegramClient]
 SlackClientFactory = Callable[[SecretStr], SlackClient]
+WhatsAppFactory = Callable[[WhatsAppCredentials], WhatsAppProvider]
+SendGridFactory = Callable[[SecretStr], SendGridClient]
+EMAIL_ADDRESS: Final = re.compile(r"[a-z0-9._-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)+")
+"""An inbound address: no ``+`` in the local part, because sama adds ``+t<token>``."""
 
 SLACK_SCOPES: Final = (
     "app_mentions:read",
@@ -199,6 +214,8 @@ class Integrations:
         public_url: str | None,
         telegram_client: TelegramClientFactory = TelegramClient,
         slack_client: SlackClientFactory = SlackClient,
+        whatsapp_provider: WhatsAppFactory = build_provider,
+        sendgrid_client: SendGridFactory = SendGridClient,
         on_change: Callable[[uuid.UUID], None] | None = None,
     ) -> None:
         """``on_change`` gets the id of each integration that changed or went, so that a
@@ -208,6 +225,8 @@ class Integrations:
         self._public_url = (public_url or "").rstrip("/") or None
         self._telegram_client = telegram_client
         self._slack_client = slack_client
+        self._whatsapp_provider = whatsapp_provider
+        self._sendgrid_client = sendgrid_client
         self._on_change = on_change
 
     @property
@@ -533,6 +552,275 @@ class Integrations:
         )
         return IntegrationView(**row._asdict())
 
+    # -- WhatsApp and email (Section 11.9) --------------------------------------------------
+
+    async def connect_whatsapp(
+        self, org_id: uuid.UUID, user_id: uuid.UUID, credentials: WhatsAppCredentials
+    ) -> ChannelSetup:
+        """Connects the WhatsApp number of the org through its provider, or replaces it.
+        Raises ``IntegrationError``. For Gupshup, sama also adds the webhook subscription; a
+        failed subscription gives the status ``failed``."""
+        vault, public_url = self._require()
+        problem = credentials.problem()
+        if problem is not None:
+            raise IntegrationError(problem)
+        title = PROVIDER_TITLES[credentials.provider]
+        if credentials.provider == "gupshup":
+            # The secret header of the subscription: Gupshup does not sign its callbacks.
+            credentials = replace(credentials, app_secret=SecretStr(secrets.token_urlsafe(32)))
+        provider = self._whatsapp_provider(credentials)
+        try:
+            try:
+                await provider.check()
+            except WhatsAppError as error:
+                log.warning("a WhatsApp check failed org=%s: %s", org_id, error)
+                raise IntegrationError(
+                    f"{title} did not accept the credentials. Check them and try again."
+                ) from None
+            token = secrets.token_urlsafe(24)
+            settings: dict[str, Any] = {"provider": credentials.provider}
+            for name in ("phone_number_id", "account_sid", "app_id", "app_name"):
+                value = getattr(credentials, name)
+                if value:
+                    settings[name] = value
+            async with _locked(
+                self._engine,
+                _org_key(org_id, "whatsapp"),
+                _external_key("whatsapp", credentials.number),
+            ):
+                old = await self._old_gupshup(vault, org_id)
+                async with self._engine.begin() as connection:
+                    view = await self._store_channel(
+                        connection,
+                        org_id,
+                        user_id,
+                        kind="whatsapp",
+                        external_id=credentials.number,
+                        settings=settings,
+                        digest=secret_hash(token),
+                        details={"kind": "whatsapp", "provider": credentials.provider},
+                    )
+                    values = {
+                        SecretName.WHATSAPP_API_TOKEN: credentials.api_token.get_secret_value(),
+                        SecretName.WHATSAPP_LINK_SECRET: secrets.token_urlsafe(32),
+                    }
+                    if credentials.app_secret is not None:
+                        values[SecretName.WHATSAPP_APP_SECRET] = (
+                            credentials.app_secret.get_secret_value()
+                        )
+                    else:
+                        await vault.delete(
+                            org_id,
+                            SecretName.WHATSAPP_APP_SECRET,
+                            actor_user_id=user_id,
+                            connection=connection,
+                        )
+                    for name, value in values.items():
+                        await vault.put(
+                            org_id, name, value, actor_user_id=user_id, connection=connection
+                        )
+                self._changed(view.id)
+                url = f"{public_url}/whatsapp/{view.id}/webhook/{token}"
+                if isinstance(provider, GupshupProvider):
+                    view = await self._subscribe(org_id, view, provider, url, old)
+        finally:
+            await provider.aclose()
+        return ChannelSetup(
+            view,
+            webhook_url=url,
+            verify_token=token if credentials.provider == "meta" else None,
+            steps=whatsapp_steps(credentials.provider, url, token),
+        )
+
+    async def _old_gupshup(self, vault: Vault, org_id: uuid.UUID) -> tuple[Any, SecretStr] | None:
+        """The settings and the key of the Gupshup number that the org has now, so that a
+        new connect can remove the old subscription."""
+        async with self._engine.connect() as connection:
+            settings = await connection.scalar(
+                select(Integration.settings).where(
+                    Integration.org_id == org_id, Integration.kind == "whatsapp"
+                )
+            )
+        if not settings or settings.get("provider") != "gupshup":
+            return None
+        try:
+            key = await vault.get(org_id, SecretName.WHATSAPP_API_TOKEN, fresh=True)
+        except VaultError:
+            return None
+        return None if key is None else (settings, key)
+
+    async def _subscribe(
+        self,
+        org_id: uuid.UUID,
+        view: IntegrationView,
+        provider: GupshupProvider,
+        url: str,
+        old: tuple[Any, SecretStr] | None,
+    ) -> IntegrationView:
+        if old is not None:
+            await self._unsubscribe(org_id, old[0], old[1])
+        error: str | None = None
+        subscription = ""
+        try:
+            assert provider.header_secret is not None  # noqa: S101 (connect_whatsapp sets it)
+            subscription = await provider.subscribe(url, provider.header_secret)
+        except WhatsAppError as failure:
+            error = str(failure)[:MAX_ERROR_CHARS]
+            log.warning("a Gupshup subscription failed org=%s: %s", org_id, error)
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    update(Integration)
+                    .where(Integration.org_id == org_id, Integration.id == view.id)
+                    .values(
+                        status="failed" if error else "active",
+                        last_error=error,
+                        settings=Integration.settings.op("||")(
+                            func.jsonb_build_object("subscription_id", subscription)
+                        ),
+                        updated_at=func.now(),
+                    )
+                    .returning(*_VIEW)
+                )
+            ).one()
+        self._changed(view.id)
+        return IntegrationView(**row._asdict())
+
+    async def connect_email(
+        self,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID,
+        *,
+        address: str,
+        api_key: SecretStr,
+        parse_public_key: str,
+        sender_name: str = "sama",
+    ) -> ChannelSetup:
+        """Connects the inbound address of the org with SendGrid, or replaces it. Raises
+        ``IntegrationError``."""
+        vault, public_url = self._require()
+        address = address.strip().lower()
+        key = api_key.get_secret_value().strip()
+        if EMAIL_ADDRESS.fullmatch(address) is None:
+            raise IntegrationError(
+                "the address must be a plain address without +, for example sama@mail.example.com."
+            )
+        if SENDGRID_KEY.fullmatch(key) is None:
+            raise IntegrationError("this is not a SendGrid API key. It starts with SG.")
+        try:
+            public_key(parse_public_key)
+        except BadKey as error:
+            raise IntegrationError(
+                f"{error}. Copy the public key of the security policy of the parse webhook."
+            ) from None
+        client = self._sendgrid_client(SecretStr(key))
+        try:
+            scopes = await client.scopes()
+        except SendGridError as error:
+            log.warning("a SendGrid check failed org=%s: %s", org_id, error)
+            raise IntegrationError("SendGrid did not accept the API key.") from None
+        finally:
+            await client.aclose()
+        if SEND_SCOPE not in scopes:
+            raise IntegrationError("the SendGrid API key needs the Mail Send permission.")
+        settings = {"public_key": parse_public_key.strip(), "sender_name": sender_name}
+        async with (
+            _locked(self._engine, _org_key(org_id, "email"), _external_key("email", address)),
+            self._engine.begin() as connection,
+        ):
+            view = await self._store_channel(
+                connection,
+                org_id,
+                user_id,
+                kind="email",
+                external_id=address,
+                settings=settings,
+                digest=secret_hash(key),
+                details={"kind": "email", "address": address},
+            )
+            for name, value in (
+                (SecretName.SENDGRID_API_KEY, key),
+                (SecretName.EMAIL_LINK_SECRET, secrets.token_urlsafe(32)),
+            ):
+                await vault.put(org_id, name, value, actor_user_id=user_id, connection=connection)
+        self._changed(view.id)
+        url = f"{public_url}/email/{view.id}/inbound"
+        return ChannelSetup(view, webhook_url=url, steps=email_steps(address, url))
+
+    async def _store_channel(
+        self,
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID,
+        *,
+        kind: str,
+        external_id: str,
+        settings: dict[str, Any],
+        digest: str,
+        details: dict[str, Any],
+    ) -> IntegrationView:
+        """Writes the ``active`` row of a WhatsApp number or an email address. A new number
+        or address deletes the old row with its links."""
+        elsewhere = await connection.scalar(
+            select(Integration.id).where(
+                Integration.kind == kind,
+                Integration.external_id == external_id,
+                Integration.org_id != org_id,
+            )
+        )
+        if elsewhere is not None:
+            raise IntegrationError(
+                f"this {_NOUNS[kind]} is connected to another org.", status_code=409
+            )
+        current = (
+            await connection.execute(
+                select(Integration.id, Integration.external_id)
+                .where(Integration.org_id == org_id, Integration.kind == kind)
+                .with_for_update()
+            )
+        ).one_or_none()
+        if current is not None and current.external_id != external_id:
+            # Another number or address: the links of the old one do not work with it.
+            await connection.execute(
+                delete(Integration).where(
+                    Integration.org_id == org_id, Integration.id == current.id
+                )
+            )
+            self._changed(current.id)
+            current = None
+        values = {
+            "status": "active",
+            "external_id": external_id,
+            "name": external_id,
+            "settings": settings,
+            "secret_hash": digest,
+            "last_error": None,
+        }
+        try:
+            if current is None:
+                row = (
+                    await connection.execute(
+                        insert(Integration)
+                        .values(org_id=org_id, kind=kind, created_by_user_id=user_id, **values)
+                        .returning(*_VIEW)
+                    )
+                ).one()
+            else:
+                row = (
+                    await connection.execute(
+                        update(Integration)
+                        .where(Integration.org_id == org_id, Integration.id == current.id)
+                        .values(**values, updated_at=func.now())
+                        .returning(*_VIEW)
+                    )
+                ).one()
+        except IntegrityError:
+            raise IntegrationError(
+                "another connect is in progress. Try again.", status_code=409
+            ) from None
+        await _audit(connection, org_id, user_id, "integration.connected", row.id, details)
+        return IntegrationView(**row._asdict())
+
     # -- all kinds --------------------------------------------------------------------------
 
     async def disconnect(self, org_id: uuid.UUID, kind: str, user_id: uuid.UUID) -> bool:
@@ -551,8 +839,7 @@ class Integrations:
             if row.external_id is not None:
                 # A connect of the same bot or workspace in another org cannot start before
                 # the webhook is gone or the token is revoked.
-                key = _bot_key if kind == "telegram" else _team_key
-                await _lock(lock, key(row.external_id))
+                await _lock(lock, _external_key(kind, row.external_id))
             return await self._disconnect(vault, org_id, kind, user_id)
 
     async def _disconnect(
@@ -564,7 +851,7 @@ class Integrations:
                 await connection.execute(
                     delete(Integration)
                     .where(Integration.org_id == org_id, Integration.kind == kind)
-                    .returning(Integration.id, Integration.name)
+                    .returning(Integration.id, Integration.name, Integration.settings)
                 )
             ).one_or_none()
             if row is None:
@@ -580,10 +867,14 @@ class Integrations:
                 {"kind": kind, "name": row.name},
             )
         self._changed(row.id)
-        if token is not None:
-            await (self._forget_telegram if kind == "telegram" else self._forget_slack)(
-                org_id, token
-            )
+        if token is None:
+            return True
+        if kind == "telegram":
+            await self._forget_telegram(org_id, token)
+        elif kind == "slack":
+            await self._forget_slack(org_id, token)
+        elif kind == "whatsapp" and (row.settings or {}).get("provider") == "gupshup":
+            await self._unsubscribe(org_id, row.settings, token)
         return True
 
     async def _forget_telegram(self, org_id: uuid.UUID, token: SecretStr) -> None:
@@ -605,6 +896,29 @@ class Integrations:
         finally:
             await client.aclose()
 
+    async def _unsubscribe(self, org_id: uuid.UUID, settings: Any, api_key: SecretStr) -> None:
+        """Removes the Gupshup subscription of sama (best effort)."""
+        subscription = str((settings or {}).get("subscription_id") or "")
+        app_id = str((settings or {}).get("app_id") or "")
+        if not subscription or not app_id:
+            return
+        provider = self._whatsapp_provider(
+            WhatsAppCredentials(
+                provider="gupshup",
+                number="+10000000",
+                api_token=api_key,
+                app_id=app_id,
+                app_name=str(settings.get("app_name") or ""),
+            )
+        )
+        try:
+            if isinstance(provider, GupshupProvider):
+                await provider.unsubscribe(subscription)
+        except WhatsAppError as error:
+            log.warning("a Gupshup subscription delete failed org=%s: %s", org_id, error)
+        finally:
+            await provider.aclose()
+
     def _require(self) -> tuple[Vault, str]:
         if self._vault is None:
             raise IntegrationError(
@@ -625,19 +939,90 @@ class Integrations:
 _SECRETS: Final = {
     "telegram": (SecretName.TELEGRAM_BOT_TOKEN,),
     "slack": (SecretName.SLACK_BOT_TOKEN, SecretName.SLACK_SIGNING_SECRET),
+    "whatsapp": (
+        SecretName.WHATSAPP_API_TOKEN,
+        SecretName.WHATSAPP_APP_SECRET,
+        SecretName.WHATSAPP_LINK_SECRET,
+    ),
+    "email": (SecretName.SENDGRID_API_KEY, SecretName.EMAIL_LINK_SECRET),
 }
+_NOUNS: Final = {"whatsapp": "WhatsApp number", "email": "email address"}
 
 
 def _org_key(org_id: uuid.UUID, kind: str) -> str:
     return f"sama.integration:org:{org_id}:{kind}"
 
 
+def _external_key(kind: str, external_id: str) -> str:
+    """The lock of one bot, Slack workspace, WhatsApp number, or email address."""
+    return f"sama.integration:{kind}:{external_id}"
+
+
 def _bot_key(bot_id: str) -> str:
-    return f"sama.integration:telegram:{bot_id}"
+    return _external_key("telegram", bot_id)
 
 
 def _team_key(team_id: str) -> str:
-    return f"sama.integration:slack:{team_id}"
+    return _external_key("slack", team_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelSetup:
+    """The result of a WhatsApp or email connect: the URL that the admin gives to the
+    provider, and the steps that are left for a person."""
+
+    integration: IntegrationView
+    webhook_url: str
+    verify_token: str | None = None
+    """The verify token of the Meta webhook. sama shows it once and keeps only its digest."""
+    steps: list[str] = field(default_factory=list)
+
+    def public(self) -> dict[str, Any]:
+        return {
+            **self.integration.public(),
+            "webhook_url": self.webhook_url,
+            "verify_token": self.verify_token,
+            "steps": self.steps,
+        }
+
+
+def whatsapp_steps(provider: str, url: str, token: str) -> list[str]:
+    """The steps that a person does at the provider after the connect (Section 11.9)."""
+    if provider == "meta":
+        return [
+            "In the Meta app, open WhatsApp > Configuration > Webhook and click Edit.",
+            f"Set the callback URL to {url} and the verify token to {token}. Click Verify and"
+            " save.",
+            "Subscribe the webhook field messages.",
+            "A business-initiated message needs an approved template. Replies within 24 hours of"
+            " a user message do not.",
+        ]
+    if provider == "twilio":
+        return [
+            "In the Twilio console, open Messaging > Senders > WhatsApp senders (or the WhatsApp"
+            " sandbox) and select the number.",
+            f"Set 'When a message comes in' to {url} with the method POST, and save.",
+            "For the sandbox, each tester first sends the join word of the sandbox to its number.",
+        ]
+    return [
+        "sama added the webhook subscription of the Gupshup app. Check it under the app >"
+        " Webhooks in the Gupshup dashboard.",
+        "Each tester of a Gupshup app that is not live first opts in to the number.",
+    ]
+
+
+def email_steps(address: str, url: str) -> list[str]:
+    domain = address.partition("@")[2]
+    return [
+        f"Add an MX record for {domain} that points to mx.sendgrid.net (priority 10). Use a"
+        " subdomain that receives no other mail.",
+        f"In SendGrid, authenticate the domain {domain} (Settings > Sender Authentication), so"
+        f" that mail from {address} passes DKIM.",
+        f"In SendGrid, add an Inbound Parse host for {domain} with the URL {url}. Do not tick"
+        " 'Post the raw, full MIME message' unless you want it; sama reads both forms.",
+        "Make a security policy with signature verification for the parse webhook and attach it."
+        " Paste its public key here when you connect.",
+    ]
 
 
 # Longer than the Telegram calls in a lock (timeouts and 429 waits), and an upper limit for a

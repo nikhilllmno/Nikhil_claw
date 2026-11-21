@@ -103,7 +103,7 @@ profile in the web app. ``revert``: an admin reverted an earlier change (Section
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
 APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
-CHANNELS: Final = ("web", "slack", "telegram", "extension")
+CHANNELS: Final = ("web", "slack", "telegram", "extension", "whatsapp", "email")
 ACTOR_KINDS: Final = ("user", "agent", "system")
 PROVIDERS: Final = ("anthropic", "openai")
 KEY_SOURCES: Final = ("org", "sama")
@@ -127,6 +127,11 @@ VAULT_NAMES: Final = (
     "slack_signing_secret",
     "composio_api_key",
     "composio_webhook_secret",
+    "whatsapp_api_token",
+    "whatsapp_app_secret",
+    "whatsapp_link_secret",
+    "sendgrid_api_key",
+    "email_link_secret",
 )
 CONNECTION_SECRET_PATTERN: Final = "^connection:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
 """The vault name of the secret fields of one connection (Section 10.3): ``connection:<id>``."""
@@ -145,8 +150,8 @@ TRIGGER_TARGETS: Final = ("run", "workflow")
 """What an event starts (Section 12.2). Workflows (M4.5) add ``workflow``."""
 SAFE_TOOLSETS: Final = ("web", "media", "clarify")
 """The ``safe`` preset (Section 10.2): the default toolsets of an event-triggered run."""
-INTEGRATION_KINDS: Final = ("telegram", "slack")
-"""The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
+INTEGRATION_KINDS: Final = ("telegram", "slack", "whatsapp", "email")
+"""The chat apps that an org can connect (docs/architecture.md, Sections 11.6 and 11.9)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
 BROWSER_TARGETS: Final = ("cloud", "my_chrome")
 """The browser targets (Section 14.1): Browserbase now, the Chrome extension in M5.5."""

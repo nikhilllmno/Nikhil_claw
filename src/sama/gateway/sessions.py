@@ -195,6 +195,24 @@ class Reply:
         self.sent_any = True
 
 
+class FinalReply(Reply):
+    """A reply for a channel that cannot edit a message (WhatsApp and email, Section 11.9).
+
+    The text goes out only at a final flush: before an approval card and at the end of the run.
+    The outbox splits a long text by the limits of its channel.
+    """
+
+    async def add(self, text: str) -> None:
+        self._text += text
+
+    async def flush(self, *, final: bool) -> None:
+        if not final or not self._text.strip():
+            return
+        text, self._text = self._text, ""
+        await self._outbox.send_message(text, reply_to=self._reply_to)
+        self.sent_any = True
+
+
 async def find_session(
     engine: AsyncEngine, channel: str, key: str, target: Target, grants: Grants
 ) -> Bound | None:

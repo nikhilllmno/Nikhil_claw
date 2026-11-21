@@ -140,6 +140,7 @@ from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.gateway.chrome import ChromeHub, PageContext, PageError, page_message
 from sama.gateway.handoff import HandoffError, Handoffs
 from sama.gateway.pairing import PairingError, create_code
+from sama.gateway.whatsapp_providers import WhatsAppCredentials
 from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
@@ -372,6 +373,37 @@ class TelegramConnect(_Body):
     """The token of the bot from @BotFather."""
 
 
+class WhatsAppConnect(_Body):
+    """The WhatsApp number of the org and the credentials of its provider (Section 11.9)."""
+
+    provider: Literal["meta", "twilio", "gupshup"]
+    number: str = Field(min_length=8, max_length=16)
+    """The business number in E.164 form, for example ``+15551234567``."""
+    api_token: SecretStr = Field(min_length=1, max_length=600)
+    """The access token (Meta), the auth token (Twilio), or the API key (Gupshup)."""
+    app_secret: SecretStr | None = Field(default=None, max_length=200)
+    """The app secret of the Meta app. Meta only."""
+    phone_number_id: str | None = Field(default=None, max_length=40)
+    """Meta only."""
+    account_sid: str | None = Field(default=None, max_length=40)
+    """Twilio only."""
+    app_id: str | None = Field(default=None, max_length=60)
+    """Gupshup only."""
+    app_name: str | None = Field(default=None, max_length=100)
+    """Gupshup only."""
+
+
+class EmailConnect(_Body):
+    """The inbound address of the org and its SendGrid account (Section 11.9)."""
+
+    address: str = Field(min_length=3, max_length=254)
+    api_key: SecretStr = Field(min_length=1, max_length=200)
+    """A SendGrid API key with the Mail Send permission."""
+    public_key: str = Field(min_length=20, max_length=2000)
+    """The public key of the security policy of the Inbound Parse webhook."""
+    sender_name: str = Field(default="sama", min_length=1, max_length=60)
+
+
 class ModelKeyIn(_Body):
     api_key: SecretStr = Field(min_length=1, max_length=MAX_KEY_CHARS)
     """The API key of the provider. It goes to the vault; no answer has it."""
@@ -491,7 +523,15 @@ class SlackConnect(_Body):
     """The signing secret of the Slack app, from Basic Information."""
 
 
-Channel = Literal["telegram", "slack"]
+Channel = Literal["telegram", "slack", "whatsapp", "email"]
+_APP_NAMES: Final = {
+    "telegram": "Telegram bot",
+    "slack": "Slack app",
+    "whatsapp": "WhatsApp number",
+    "email": "email address",
+}
+_DIRECT_CHANNELS: Final = frozenset({"whatsapp", "email"})
+"""Channels without groups: only ``user`` pairing codes (Section 11.9)."""
 
 MAX_MEMORY_ENTRIES: Final = 100
 
@@ -1386,6 +1426,51 @@ class SamaApi:
             except IntegrationError as error:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             return view.public()
+
+        @app.post("/orgs/{org_id}/integrations/whatsapp", status_code=201)
+        async def connect_whatsapp(
+            principal: Me, org_id: uuid.UUID, body: WhatsAppConnect
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            credentials = WhatsAppCredentials(
+                provider=body.provider,
+                number=body.number.strip(),
+                api_token=SecretStr(body.api_token.get_secret_value().strip()),
+                app_secret=(
+                    SecretStr(body.app_secret.get_secret_value().strip())
+                    if body.app_secret is not None
+                    else None
+                ),
+                phone_number_id=body.phone_number_id,
+                account_sid=body.account_sid,
+                app_id=body.app_id,
+                app_name=body.app_name,
+            )
+            try:
+                setup = await self._require_integrations().connect_whatsapp(
+                    org_id, grants.user_id, credentials
+                )
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return setup.public()
+
+        @app.post("/orgs/{org_id}/integrations/email", status_code=201)
+        async def connect_email(
+            principal: Me, org_id: uuid.UUID, body: EmailConnect
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                setup = await self._require_integrations().connect_email(
+                    org_id,
+                    grants.user_id,
+                    address=body.address,
+                    api_key=body.api_key,
+                    parse_public_key=body.public_key,
+                    sender_name=body.sender_name,
+                )
+            except IntegrationError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return setup.public()
 
         @app.get("/orgs/{org_id}/model-keys")
         async def model_keys(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -2662,6 +2747,10 @@ class SamaApi:
     async def _pairing_code(
         self, principal: Principal, channel: Channel, body: NewPairingCode
     ) -> dict[str, Any]:
+        if channel in _DIRECT_CHANNELS and body.kind != "user":
+            raise HTTPException(
+                status_code=400, detail=f"{channel} has no groups: make a user code."
+            )
         org_id, user_id = await self._workspace_access(
             principal, body.workspace_id, body.agent_profile_id
         )
@@ -2681,7 +2770,7 @@ class SamaApi:
                 )
             ).one_or_none()
         if bot is None:
-            app_name = "Telegram bot" if channel == "telegram" else "Slack app"
+            app_name = _APP_NAMES[channel]
             raise HTTPException(
                 status_code=409,
                 detail=f"the org has no {app_name}. An org admin connects one under Integrations.",
@@ -2700,7 +2789,15 @@ class SamaApi:
                 )
         except PairingError as error:
             raise HTTPException(status_code=429, detail=str(error)) from None
-        if channel == "slack":
+        link: str | None
+        if channel == "whatsapp":
+            # The link opens a chat with the number and fills in the code.
+            link = f"https://wa.me/{str(bot.external_id).lstrip('+')}?text={code}"
+            command = code
+        elif channel == "email":
+            link = f"mailto:{bot.external_id}?subject={code}"
+            command = code
+        elif channel == "slack":
             # The link opens the direct messages with the app. The code goes in by hand.
             app_id = (bot.settings or {}).get("app_id")
             link = (

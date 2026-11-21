@@ -107,6 +107,15 @@ CHANNEL_HINTS: Final = {
         "Channel: Slack. Slack shows plain text: do not use Markdown tables or headings."
         " Keep answers short. A long answer arrives as several messages."
     ),
+    "whatsapp": (
+        "Channel: WhatsApp. WhatsApp shows plain text: do not use Markdown tables, headings,"
+        " or links in brackets. Keep answers short. The answer arrives when the run ends."
+    ),
+    "email": (
+        "Channel: email. Write a plain text email reply: no Markdown tables or headings, and"
+        " no greeting or signature of your own. The answer goes out as one email when the run"
+        " ends."
+    ),
 }
 """Hints for sessions that a chat channel made (Section 11). A web session gets no hint."""
 

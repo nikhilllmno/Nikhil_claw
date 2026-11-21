@@ -63,9 +63,11 @@ from sama.gateway.handoff import Handoffs
 from sama.github.client import GitHubClient
 from sama.github.proxy import GitHubUpstream, GitProxy
 from sama.github.service import GitHubService
+from sama.integrations.email_hub import EmailHub
 from sama.integrations.hub import TelegramHub
 from sama.integrations.service import Integrations
 from sama.integrations.slack_hub import SlackHub
+from sama.integrations.whatsapp_hub import WhatsAppHub
 from sama.media.generate import GeneratedMediaStore, ImageService, SpeechService
 from sama.media.meter import MediaMeter
 from sama.media.store import AttachmentStore
@@ -466,6 +468,32 @@ def build(
         if vault is not None
         else None
     )
+    # WhatsApp and email (Section 11.9) need the public address for their links.
+    whatsapp = (
+        WhatsAppHub(
+            engine,
+            vault,
+            public_url=settings.public_url,
+            keys=keys,
+            gate=gate,
+            skills=library,
+            reviews=reviews,
+        )
+        if vault is not None and settings.public_url
+        else None
+    )
+    email = (
+        EmailHub(
+            engine,
+            vault,
+            public_url=settings.public_url,
+            gate=gate,
+            skills=library,
+            reviews=reviews,
+        )
+        if vault is not None and settings.public_url
+        else None
+    )
     scheduler = _scheduler(settings, engine, vault, sandboxed)
     if hub is not None:
         handoffs.register("telegram", hub.door)
@@ -473,7 +501,7 @@ def build(
         handoffs.register("slack", slack.door)
 
     def forget(integration_id: uuid.UUID) -> None:
-        for cache in (hub, slack):
+        for cache in (hub, slack, whatsapp, email):
             if cache is not None:
                 cache.forget(integration_id)
 
@@ -563,6 +591,10 @@ def build(
         api_app.include_router(hub.router())
     if slack is not None:
         api_app.include_router(slack.router())
+    if whatsapp is not None:
+        api_app.include_router(whatsapp.router())
+    if email is not None:
+        api_app.include_router(email.router())
 
     stop = asyncio.Event()
 
@@ -586,6 +618,10 @@ def build(
                 stack.push_async_callback(upstream.aclose)
             if slack is not None:
                 stack.push_async_callback(slack.aclose)
+            if whatsapp is not None:
+                stack.push_async_callback(whatsapp.aclose)
+            if email is not None:
+                stack.push_async_callback(email.aclose)
             loops = _monitor(settings, engine, stack, sandboxes=e2b)
             loops.append(RetentionSweep(engine))
             loops.append(TaskDispatcher(engine, queue))
