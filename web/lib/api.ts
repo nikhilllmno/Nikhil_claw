@@ -339,7 +339,11 @@ export type RunStatus =
   | (string & {});
 
 /** The statuses of a run that has not ended. */
-export const OPEN_RUN_STATUSES: ReadonlySet<string> = new Set(["queued", "running", "paused"]);
+export const OPEN_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "queued",
+  "running",
+  "paused",
+]);
 
 export interface RunOut {
   id: string;
@@ -392,7 +396,6 @@ export interface SteerNote {
   delivered_at: string | null;
   requeued_run_id: string | null;
 }
-
 
 /** One row of `GET /sessions/{id}/open-runs` (M7.1), oldest first. */
 export interface OpenRun {
@@ -828,7 +831,8 @@ export interface StartedConnection {
 
 // -- scheduled jobs (src/sama/scheduler) --------------------------------------------------------
 
-export type JobStatus = "active" | "paused" | "pending_approval" | "removed" | (string & {});
+export type JobStatus =
+  "active" | "paused" | "pending_approval" | "removed" | (string & {});
 
 /** A stored schedule. `cron` has `expr` and `tz`, `interval` has `every_s`, `once` has `at`. */
 export interface JobSchedule {
@@ -839,8 +843,10 @@ export interface JobSchedule {
   at?: string;
 }
 
-export type FireStatus = "running" | "completed" | "failed" | "skipped" | (string & {});
-export type DeliveryStatus = "pending" | "sending" | "sent" | "failed" | "unknown" | (string & {});
+export type FireStatus =
+  "running" | "completed" | "failed" | "skipped" | (string & {});
+export type DeliveryStatus =
+  "pending" | "sending" | "sent" | "failed" | "unknown" | (string & {});
 
 export interface JobDelivery {
   kind: string;
@@ -1032,7 +1038,8 @@ export type MemoryWritten = Omit<MemoryNotes, "can_edit">;
 
 export type SkillScope = "builtin" | "org" | "workspace" | "user";
 export type WritableSkillScope = Exclude<SkillScope, "builtin">;
-export type SkillAction = "create" | "edit" | "write_file" | "remove_file" | "archive";
+export type SkillAction =
+  "create" | "edit" | "write_file" | "remove_file" | "archive";
 
 export type SkillSettingValue = string | number | boolean;
 
@@ -1414,7 +1421,10 @@ export interface PairingCode {
 }
 
 /** The file name in a `Content-Disposition: attachment; filename="…"` header, else `fallback`. */
-export function attachmentName(header: string | null, fallback: string): string {
+export function attachmentName(
+  header: string | null,
+  fallback: string,
+): string {
   const match = header ? /filename="?([^";]+)"?/i.exec(header) : null;
   const name = match?.[1]?.trim();
   return name && !/[\\/]/.test(name) ? name : fallback;
@@ -1645,8 +1655,10 @@ export interface TriggerDelivery {
   workflow_instance_id: string | null;
 }
 
-export type WorkflowStatus = "active" | "paused" | "pending_approval" | "removed";
-export type InstanceStatus = "running" | "waiting" | "completed" | "failed" | "cancelled";
+export type WorkflowStatus =
+  "active" | "paused" | "pending_approval" | "removed";
+export type InstanceStatus =
+  "running" | "waiting" | "completed" | "failed" | "cancelled";
 
 export interface Workflow {
   id: string;
@@ -1756,7 +1768,9 @@ export function errorMessage(status: number, body: unknown): string {
       const parts = detail.map((item: unknown) => {
         if (item !== null && typeof item === "object" && "msg" in item) {
           const { msg, loc } = item as { msg: unknown; loc?: unknown };
-          const where = Array.isArray(loc) ? loc.filter((p) => p !== "body").join(".") : "";
+          const where = Array.isArray(loc)
+            ? loc.filter((p) => p !== "body").join(".")
+            : "";
           return where ? `${where}: ${String(msg)}` : String(msg);
         }
         return "";
@@ -1797,7 +1811,10 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
-export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+export type FetchLike = (
+  input: string,
+  init?: RequestInit,
+) => Promise<Response>;
 
 /** The most that `GET /sessions/{id}/messages` returns in one page. */
 const MESSAGE_PAGE = 500;
@@ -1823,12 +1840,16 @@ export class ApiClient {
     const current = () => this.assertCurrent(generation);
     current();
     const send = async (token: string): Promise<Response> => {
-      const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
-      if (options.body !== undefined) headers["Content-Type"] = "application/json";
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+      };
+      if (options.body !== undefined)
+        headers["Content-Type"] = "application/json";
       return this.fetcher(`${this.baseUrl}${path}`, {
         method: options.method ?? "GET",
         headers,
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        body:
+          options.body === undefined ? undefined : JSON.stringify(options.body),
         signal: options.signal,
       });
     };
@@ -1866,7 +1887,8 @@ export class ApiClient {
     const data: unknown =
       response.status === 204 ? null : await response.json().catch(() => null);
     this.assertCurrent(generation);
-    if (!response.ok) throw new ApiError(response.status, errorMessage(response.status, data));
+    if (!response.ok)
+      throw new ApiError(response.status, errorMessage(response.status, data));
     return data as T;
   }
 
@@ -1882,21 +1904,30 @@ export class ApiClient {
     this.json<BillingOverview>(`/orgs/${encodeURIComponent(orgId)}/billing`);
   /** Starts Stripe Checkout for a paid plan. Open the returned URL. */
   startCheckout = (orgId: string, plan: string) =>
-    this.json<StripeRedirect>(`/orgs/${encodeURIComponent(orgId)}/billing/checkout`, {
-      method: "POST",
-      body: { plan },
-    });
+    this.json<StripeRedirect>(
+      `/orgs/${encodeURIComponent(orgId)}/billing/checkout`,
+      {
+        method: "POST",
+        body: { plan },
+      },
+    );
   /** Moves a paid subscription to another paid plan. Stripe prorates the price. */
   changePlan = (orgId: string, plan: string) =>
-    this.json<BillingOverview>(`/orgs/${encodeURIComponent(orgId)}/billing/plan`, {
-      method: "PUT",
-      body: { plan },
-    });
+    this.json<BillingOverview>(
+      `/orgs/${encodeURIComponent(orgId)}/billing/plan`,
+      {
+        method: "PUT",
+        body: { plan },
+      },
+    );
   /** Opens the Stripe customer portal: payment method, invoices, and cancel. */
   openBillingPortal = (orgId: string) =>
-    this.json<StripeRedirect>(`/orgs/${encodeURIComponent(orgId)}/billing/portal`, {
-      method: "POST",
-    });
+    this.json<StripeRedirect>(
+      `/orgs/${encodeURIComponent(orgId)}/billing/portal`,
+      {
+        method: "POST",
+      },
+    );
   listMembers = (orgId: string) =>
     this.json<OrgMember[]>(`/orgs/${encodeURIComponent(orgId)}/members`);
   /** Changes the role or the workspaces (the whole set) of a member. */
@@ -1911,9 +1942,12 @@ export class ApiClient {
     );
   /** Removes a member. With the user's own id: leaves the org. */
   removeMember = (orgId: string, userId: string) =>
-    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, {
-      method: "DELETE",
-    });
+    this.json<null>(
+      `/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`,
+      {
+        method: "DELETE",
+      },
+    );
   listInvites = (orgId: string) =>
     this.json<OrgInvite[]>(`/orgs/${encodeURIComponent(orgId)}/invites`);
   createInvite = (
@@ -1936,7 +1970,9 @@ export class ApiClient {
       body: displayName ? { ...answer, display_name: displayName } : answer,
     });
   listSessions = (limit = 50, status: "active" | "archived" = "active") =>
-    this.json<SessionOut[]>(`/sessions${query({ limit, status: status === "active" ? null : status })}`);
+    this.json<SessionOut[]>(
+      `/sessions${query({ limit, status: status === "active" ? null : status })}`,
+    );
   createSession = (body: NewSession) =>
     this.json<SessionOut>("/sessions", { method: "POST", body });
   getSession = (id: string) => this.json<SessionDetail>(`/sessions/${id}`);
@@ -1963,49 +1999,89 @@ export class ApiClient {
       body: parallel ? { text, parallel } : { text },
     });
   listSteers = (id: string) => this.json<SteerNote[]>(`/sessions/${id}/steers`);
-  listOpenRuns = (id: string) => this.json<OpenRun[]>(`/sessions/${id}/open-runs`);
+  listOpenRuns = (id: string) =>
+    this.json<OpenRun[]>(`/sessions/${id}/open-runs`);
   /** A note for the open run. Without an open run the API sends the text as a message. */
   steer = (id: string, text: string) =>
-    this.json<Steered>(`/sessions/${id}/steer`, { method: "POST", body: { text } });
+    this.json<Steered>(`/sessions/${id}/steer`, {
+      method: "POST",
+      body: { text },
+    });
   handoff = (id: string, to: string) =>
-    this.json<Handoff>(`/sessions/${id}/handoff`, { method: "POST", body: { to } });
+    this.json<Handoff>(`/sessions/${id}/handoff`, {
+      method: "POST",
+      body: { to },
+    });
   /** Starts (`claude_code` or `codex`) or ends (`null`) the direct mode of a session (M7.2). */
   codingAgent = (id: string, agent: "claude_code" | "codex" | null) =>
-    this.json<CodingAgentAnswer>(`/sessions/${id}/coding-agent`, { method: "POST", body: { agent } });
-  listCheckpoints = (id: string) => this.json<CheckpointItem[]>(`/sessions/${id}/checkpoints`);
-  undo = (id: string) => this.json<Restored>(`/sessions/${id}/undo`, { method: "POST" });
+    this.json<CodingAgentAnswer>(`/sessions/${id}/coding-agent`, {
+      method: "POST",
+      body: { agent },
+    });
+  listCheckpoints = (id: string) =>
+    this.json<CheckpointItem[]>(`/sessions/${id}/checkpoints`);
+  undo = (id: string) =>
+    this.json<Restored>(`/sessions/${id}/undo`, { method: "POST" });
   rollback = (id: string, number: number) =>
-    this.json<Restored>(`/sessions/${id}/rollback`, { method: "POST", body: { number } });
+    this.json<Restored>(`/sessions/${id}/rollback`, {
+      method: "POST",
+      body: { number },
+    });
   compact = (id: string, focus: string) =>
-    this.json<{ run_id: string }>(`/sessions/${id}/compact`, { method: "POST", body: { focus } });
-  cancelRun = (runId: string) => this.json<{ status: string }>(`/runs/${runId}/cancel`, { method: "POST" });
-  listApprovals = (id: string) => this.json<Approval[]>(`/sessions/${id}/approvals`);
+    this.json<{ run_id: string }>(`/sessions/${id}/compact`, {
+      method: "POST",
+      body: { focus },
+    });
+  cancelRun = (runId: string) =>
+    this.json<{ status: string }>(`/runs/${runId}/cancel`, { method: "POST" });
+  listApprovals = (id: string) =>
+    this.json<Approval[]>(`/sessions/${id}/approvals`);
   approve = (approvalId: string, alwaysAllow: boolean) =>
-    this.json<{ status: string; resumed: boolean }>(`/approvals/${approvalId}/approve`, {
-      method: "POST",
-      body: { always_allow: alwaysAllow },
-    });
+    this.json<{ status: string; resumed: boolean }>(
+      `/approvals/${approvalId}/approve`,
+      {
+        method: "POST",
+        body: { always_allow: alwaysAllow },
+      },
+    );
   deny = (approvalId: string) =>
-    this.json<{ status: string; resumed: boolean }>(`/approvals/${approvalId}/deny`, {
-      method: "POST",
-      body: {},
-    });
-  listQuestions = (id: string) => this.json<ClarifyRequest[]>(`/sessions/${id}/questions`);
+    this.json<{ status: string; resumed: boolean }>(
+      `/approvals/${approvalId}/deny`,
+      {
+        method: "POST",
+        body: {},
+      },
+    );
+  listQuestions = (id: string) =>
+    this.json<ClarifyRequest[]>(`/sessions/${id}/questions`);
   answerQuestion = (id: string, requestId: string, answers: string[]) =>
-    this.json<null>(`/sessions/${id}/questions/${encodeURIComponent(requestId)}/answer`, {
-      method: "POST",
-      body: { answers },
-    });
+    this.json<null>(
+      `/sessions/${id}/questions/${encodeURIComponent(requestId)}/answer`,
+      {
+        method: "POST",
+        body: { answers },
+      },
+    );
   getAgentProfile = (orgId: string, profileId: string) =>
     this.json<AgentProfile>(`/orgs/${orgId}/agent-profiles/${profileId}`);
-  updateAgentProfile = (orgId: string, profileId: string, patch: AgentProfilePatch) =>
+  updateAgentProfile = (
+    orgId: string,
+    profileId: string,
+    patch: AgentProfilePatch,
+  ) =>
     this.json<AgentProfile>(`/orgs/${orgId}/agent-profiles/${profileId}`, {
       method: "PATCH",
       body: patch,
     });
   listAgentProfileChanges = (orgId: string, profileId: string) =>
-    this.json<ProfileChange[]>(`/orgs/${orgId}/agent-profiles/${profileId}/changes`);
-  revertAgentProfileChange = (orgId: string, profileId: string, changeId: string) =>
+    this.json<ProfileChange[]>(
+      `/orgs/${orgId}/agent-profiles/${profileId}/changes`,
+    );
+  revertAgentProfileChange = (
+    orgId: string,
+    profileId: string,
+    changeId: string,
+  ) =>
     this.json<{ id: string; profile: AgentProfile }>(
       `/orgs/${orgId}/agent-profiles/${profileId}/changes/${changeId}/revert`,
       { method: "POST", body: {} },
@@ -2013,7 +2089,11 @@ export class ApiClient {
   listConnectors = () => this.json<Connector[]>("/connectors");
   listConnections = (workspaceId: string) =>
     this.json<Connection[]>(`/workspaces/${workspaceId}/connections`);
-  startConnection = (workspaceId: string, connector: string, scope: ConnectionScope) =>
+  startConnection = (
+    workspaceId: string,
+    connector: string,
+    scope: ConnectionScope,
+  ) =>
     this.json<StartedConnection>(`/workspaces/${workspaceId}/connections`, {
       method: "POST",
       body: { connector, scope },
@@ -2022,54 +2102,75 @@ export class ApiClient {
     this.json<Connection>(`/connections/${id}/check`, { method: "POST" });
   /** Sends the form. The secret values go only to this call, never to the chat. */
   submitConnectionForm = (id: string, values: Record<string, string>) =>
-    this.json<Connection>(`/connections/${id}/form`, { method: "PUT", body: { values } });
+    this.json<Connection>(`/connections/${id}/form`, {
+      method: "PUT",
+      body: { values },
+    });
   disableConnection = (id: string) =>
     this.json<Connection>(`/connections/${id}/disable`, { method: "POST" });
-  deleteConnection = (id: string) => this.json<null>(`/connections/${id}`, { method: "DELETE" });
+  deleteConnection = (id: string) =>
+    this.json<null>(`/connections/${id}`, { method: "DELETE" });
   listTasks = (workspaceId: string) =>
     this.json<TaskList>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks`);
   getTask = (workspaceId: string, taskId: string) =>
-    this.json<TaskDetail>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}`);
+    this.json<TaskDetail>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}`,
+    );
   createTask = (workspaceId: string, body: NewTaskBody) =>
     this.json<TaskOut>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks`, {
       method: "POST",
       body,
     });
   updateTask = (workspaceId: string, taskId: string, patch: TaskPatch) =>
-    this.json<TaskOut>(`/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}`, {
-      method: "PATCH",
-      body: patch,
-    });
+    this.json<TaskOut>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}`,
+      {
+        method: "PATCH",
+        body: patch,
+      },
+    );
   addTaskComment = (workspaceId: string, taskId: string, body: string) =>
     this.json<TaskComment>(
       `/workspaces/${encodeURIComponent(workspaceId)}/tasks/${taskId}/comments`,
       { method: "POST", body: { body } },
     );
-  previewSchedule = (schedule: string | JobSchedule, tz?: string, signal?: AbortSignal) =>
+  previewSchedule = (
+    schedule: string | JobSchedule,
+    tz?: string,
+    signal?: AbortSignal,
+  ) =>
     this.json<SchedulePreview>("/jobs/preview", {
       method: "POST",
       body: tz ? { schedule, tz } : { schedule },
       signal,
     });
   listJobs = (orgId: string) => this.json<Job[]>(`/orgs/${orgId}/jobs`);
-  getJob = (orgId: string, jobId: string) => this.json<Job>(`/orgs/${orgId}/jobs/${jobId}`);
+  getJob = (orgId: string, jobId: string) =>
+    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}`);
   createJob = (orgId: string, body: JobInput) =>
     this.json<Job>(`/orgs/${orgId}/jobs`, { method: "POST", body });
   updateJob = (orgId: string, jobId: string, body: JobInput) =>
     this.json<Job>(`/orgs/${orgId}/jobs/${jobId}`, { method: "PATCH", body });
   /** Approves one version of a job. The API refuses a version that is not the current one. */
   approveJob = (orgId: string, jobId: string, version: number) =>
-    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/approve`, { method: "POST", body: { version } });
+    this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/approve`, {
+      method: "POST",
+      body: { version },
+    });
   pauseJob = (orgId: string, jobId: string) =>
     this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/pause`, { method: "POST" });
   resumeJob = (orgId: string, jobId: string) =>
     this.json<Job>(`/orgs/${orgId}/jobs/${jobId}/resume`, { method: "POST" });
   /** Starts a fire now, outside the schedule. */
   runJob = (orgId: string, jobId: string) =>
-    this.json<{ fire_id: string }>(`/orgs/${orgId}/jobs/${jobId}/run`, { method: "POST" });
+    this.json<{ fire_id: string }>(`/orgs/${orgId}/jobs/${jobId}/run`, {
+      method: "POST",
+    });
   /** Cancels the runs of the job that are open. */
   cancelJob = (orgId: string, jobId: string) =>
-    this.json<{ cancelled: number }>(`/orgs/${orgId}/jobs/${jobId}/cancel`, { method: "POST" });
+    this.json<{ cancelled: number }>(`/orgs/${orgId}/jobs/${jobId}/cancel`, {
+      method: "POST",
+    });
   deleteJob = (orgId: string, jobId: string) =>
     this.json<null>(`/orgs/${orgId}/jobs/${jobId}`, { method: "DELETE" });
   // -- M3.12 ------------------------------------------------------------------------------------
@@ -2084,10 +2185,12 @@ export class ApiClient {
     limit = 20,
   ) =>
     this.json<MemoryRevision[]>(
-      `/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}/revisions${query({
-        agent_profile_id: agentProfileId,
-        limit,
-      })}`,
+      `/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}/revisions${query(
+        {
+          agent_profile_id: agentProfileId,
+          limit,
+        },
+      )}`,
     );
   editMemory = (
     workspaceId: string,
@@ -2096,10 +2199,13 @@ export class ApiClient {
     agentProfileId: string | null,
     reason: string | null,
   ) =>
-    this.json<MemoryWritten>(`/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}`, {
-      method: "PUT",
-      body: { entries, agent_profile_id: agentProfileId, reason },
-    });
+    this.json<MemoryWritten>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/memory/${target}`,
+      {
+        method: "PUT",
+        body: { entries, agent_profile_id: agentProfileId, reason },
+      },
+    );
   revertMemory = (
     workspaceId: string,
     target: MemoryTarget,
@@ -2112,36 +2218,58 @@ export class ApiClient {
       { method: "POST", body: { agent_profile_id: agentProfileId, reason } },
     );
   listSkills = (workspaceId: string) =>
-    this.json<SkillCatalog>(`/workspaces/${encodeURIComponent(workspaceId)}/skills`);
-  getSkill = (workspaceId: string, name: string, scope: SkillScope | null = null) =>
+    this.json<SkillCatalog>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/skills`,
+    );
+  getSkill = (
+    workspaceId: string,
+    name: string,
+    scope: SkillScope | null = null,
+  ) =>
     this.json<SkillDetail>(
       `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}${query({ scope })}`,
     );
   writeSkill = (workspaceId: string, body: SkillWriteBody) =>
-    this.json<SkillWritten>(`/workspaces/${encodeURIComponent(workspaceId)}/skills`, {
-      method: "POST",
-      body,
-    });
+    this.json<SkillWritten>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/skills`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   getSkillSettings = (workspaceId: string, name: string) =>
     this.json<SkillSettings>(
       `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/settings`,
     );
   /** Replaces all stored values. `null` or a missing key: use the default. */
-  putSkillSettings = (workspaceId: string, name: string, values: Record<string, SkillSettingValue | null>) =>
+  putSkillSettings = (
+    workspaceId: string,
+    name: string,
+    values: Record<string, SkillSettingValue | null>,
+  ) =>
     this.json<SkillSettings>(
       `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/settings`,
       { method: "PUT", body: { values } },
     );
   listArchivedSkills = (workspaceId: string) =>
-    this.json<ArchivedSkill[]>(`/workspaces/${encodeURIComponent(workspaceId)}/archived-skills`);
+    this.json<ArchivedSkill[]>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/archived-skills`,
+    );
   /** Pins, unpins, or restores a stored skill (Section 9.7). */
-  setSkillState = (workspaceId: string, name: string, scope: WritableSkillScope, action: SkillStateAction) =>
+  setSkillState = (
+    workspaceId: string,
+    name: string,
+    scope: WritableSkillScope,
+    action: SkillStateAction,
+  ) =>
     this.json<SkillState>(
       `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/${action}${query({ scope })}`,
       { method: "POST" },
     );
   listSkillVersions = (skillId: string) =>
-    this.json<SkillVersion[]>(`/skills/${encodeURIComponent(skillId)}/versions`);
+    this.json<SkillVersion[]>(
+      `/skills/${encodeURIComponent(skillId)}/versions`,
+    );
   getSkillVersion = (skillId: string, version: number) =>
     this.json<SkillVersionDetail>(`/skills/${encodeURIComponent(skillId)}/versions/${version}`);
   listSubagents = (orgId: string, workspaceId: string | null) =>
@@ -2178,13 +2306,29 @@ export class ApiClient {
       { method: "POST", body },
     );
   searchSessions = (orgId: string, q: string, workspaceId: string | null, limit = 10) =>
+    this.json<SkillVersionDetail>(
+      `/skills/${encodeURIComponent(skillId)}/versions/${version}`,
+    );
+  searchSessions = (
+    orgId: string,
+    q: string,
+    workspaceId: string | null,
+    limit = 10,
+  ) =>
     this.json<SearchHit[]>(
       `/orgs/${encodeURIComponent(orgId)}/session-search${query({ q, workspace_id: workspaceId, limit })}`,
     );
   /** The export file of a session. The body is a file, not JSON. */
-  exportSession = async (id: string, format: ExportFormat): Promise<ExportFile> => {
+  exportSession = async (
+    id: string,
+    format: ExportFormat,
+  ): Promise<ExportFile> => {
     const generation = this.tokens.generation;
-    const response = await this.raw(`/sessions/${id}/export${query({ format })}`, {}, generation);
+    const response = await this.raw(
+      `/sessions/${id}/export${query({ format })}`,
+      {},
+      generation,
+    );
     if (!response.ok) {
       const data: unknown = await response.json().catch(() => null);
       this.assertCurrent(generation);
@@ -2193,56 +2337,94 @@ export class ApiClient {
     const blob = await response.blob();
     this.assertCurrent(generation);
     const fallback = `session-${id.slice(0, 8)}.${format === "json" ? "json" : "md"}`;
-    return { name: attachmentName(response.headers.get("Content-Disposition"), fallback), blob };
+    return {
+      name: attachmentName(
+        response.headers.get("Content-Disposition"),
+        fallback,
+      ),
+      blob,
+    };
   };
   listRuns = (sessionId: string, limit = 50) =>
     this.json<RunSummary[]>(`/sessions/${sessionId}/runs${query({ limit })}`);
-  getRunTrace = (runId: string) => this.json<RunTrace>(`/runs/${encodeURIComponent(runId)}/trace`);
+  getRunTrace = (runId: string) =>
+    this.json<RunTrace>(`/runs/${encodeURIComponent(runId)}/trace`);
   /** Sends the bot token. It goes only to this call, never to the chat. */
   connectTelegram = (orgId: string, botToken: string) =>
-    this.json<IntegrationSummary>(`/orgs/${encodeURIComponent(orgId)}/integrations/telegram`, {
-      method: "POST",
-      body: { bot_token: botToken },
-    });
+    this.json<IntegrationSummary>(
+      `/orgs/${encodeURIComponent(orgId)}/integrations/telegram`,
+      {
+        method: "POST",
+        body: { bot_token: botToken },
+      },
+    );
   /** Sends the credentials of the provider. They go only to this call, never to the chat. */
   connectWhatsApp = (orgId: string, body: WhatsAppConnect) =>
-    this.json<ChannelSetup>(`/orgs/${encodeURIComponent(orgId)}/integrations/whatsapp`, {
-      method: "POST",
-      body,
-    });
+    this.json<ChannelSetup>(
+      `/orgs/${encodeURIComponent(orgId)}/integrations/whatsapp`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   /** Sends the SendGrid key. It goes only to this call, never to the chat. */
   connectEmail = (orgId: string, body: EmailConnect) =>
-    this.json<ChannelSetup>(`/orgs/${encodeURIComponent(orgId)}/integrations/email`, {
-      method: "POST",
-      body,
-    });
+    this.json<ChannelSetup>(
+      `/orgs/${encodeURIComponent(orgId)}/integrations/email`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   disconnectIntegration = (orgId: string, kind: ChatChannel) =>
-    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/integrations/${kind}`, { method: "DELETE" });
-  modelKeys = (orgId: string) =>
-    this.json<ModelKeyStatus[]>(`/orgs/${encodeURIComponent(orgId)}/model-keys`);
-  setModelKey = (orgId: string, provider: ModelProvider, apiKey: string) =>
-    this.json<ModelKeyStatus>(`/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`, {
-      method: "PUT",
-      body: { api_key: apiKey },
-    });
-  removeModelKey = (orgId: string, provider: ModelProvider) =>
-    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`, { method: "DELETE" });
-  apiKeys = (orgId: string) => this.json<ApiKey[]>(`/orgs/${encodeURIComponent(orgId)}/api-keys`);
-  /** The answer has the key. It shows one time only. */
-  createApiKey = (orgId: string, body: ApiKeyCreate) =>
-    this.json<ApiKeyCreated>(`/orgs/${encodeURIComponent(orgId)}/api-keys`, { method: "POST", body });
-  revokeApiKey = (orgId: string, keyId: string) =>
-    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/api-keys/${encodeURIComponent(keyId)}`, {
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/integrations/${kind}`, {
       method: "DELETE",
     });
-  browserLogins = (orgId: string) =>
-    this.json<BrowserLogin[]>(`/orgs/${encodeURIComponent(orgId)}/browser/logins`);
-  /** Sends the user name and the password. They go only to this call, never to the chat. */
-  addBrowserLogin = (orgId: string, body: BrowserLoginAdd) =>
-    this.json<BrowserLogin>(`/orgs/${encodeURIComponent(orgId)}/browser/logins`, {
+  modelKeys = (orgId: string) =>
+    this.json<ModelKeyStatus[]>(
+      `/orgs/${encodeURIComponent(orgId)}/model-keys`,
+    );
+  setModelKey = (orgId: string, provider: ModelProvider, apiKey: string) =>
+    this.json<ModelKeyStatus>(
+      `/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`,
+      {
+        method: "PUT",
+        body: { api_key: apiKey },
+      },
+    );
+  removeModelKey = (orgId: string, provider: ModelProvider) =>
+    this.json<null>(
+      `/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`,
+      { method: "DELETE" },
+    );
+  apiKeys = (orgId: string) =>
+    this.json<ApiKey[]>(`/orgs/${encodeURIComponent(orgId)}/api-keys`);
+  /** The answer has the key. It shows one time only. */
+  createApiKey = (orgId: string, body: ApiKeyCreate) =>
+    this.json<ApiKeyCreated>(`/orgs/${encodeURIComponent(orgId)}/api-keys`, {
       method: "POST",
       body,
     });
+  revokeApiKey = (orgId: string, keyId: string) =>
+    this.json<null>(
+      `/orgs/${encodeURIComponent(orgId)}/api-keys/${encodeURIComponent(keyId)}`,
+      {
+        method: "DELETE",
+      },
+    );
+  browserLogins = (orgId: string) =>
+    this.json<BrowserLogin[]>(
+      `/orgs/${encodeURIComponent(orgId)}/browser/logins`,
+    );
+  /** Sends the user name and the password. They go only to this call, never to the chat. */
+  addBrowserLogin = (orgId: string, body: BrowserLoginAdd) =>
+    this.json<BrowserLogin>(
+      `/orgs/${encodeURIComponent(orgId)}/browser/logins`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   removeBrowserLogin = (orgId: string, loginId: string) =>
     this.json<null>(
       `/orgs/${encodeURIComponent(orgId)}/browser/logins/${encodeURIComponent(loginId)}`,
@@ -2284,18 +2466,30 @@ export class ApiClient {
   deleteCustomTool = (toolId: string) =>
     this.json<null>(`/custom-tools/${encodeURIComponent(toolId)}`, { method: "DELETE" });
   browserUrlPolicy = (orgId: string) =>
-    this.json<BrowserUrlPolicy>(`/orgs/${encodeURIComponent(orgId)}/browser/url-policy`);
-  setBrowserUrlPolicy = (orgId: string, allowHosts: string[], blockHosts: string[]) =>
-    this.json<BrowserUrlPolicy>(`/orgs/${encodeURIComponent(orgId)}/browser/url-policy`, {
-      method: "PUT",
-      body: { allow_hosts: allowHosts, block_hosts: blockHosts },
-    });
+    this.json<BrowserUrlPolicy>(
+      `/orgs/${encodeURIComponent(orgId)}/browser/url-policy`,
+    );
+  setBrowserUrlPolicy = (
+    orgId: string,
+    allowHosts: string[],
+    blockHosts: string[],
+  ) =>
+    this.json<BrowserUrlPolicy>(
+      `/orgs/${encodeURIComponent(orgId)}/browser/url-policy`,
+      {
+        method: "PUT",
+        body: { allow_hosts: allowHosts, block_hosts: blockHosts },
+      },
+    );
   listIdentities = (channel: ChatChannel) =>
     this.json<ChannelIdentity[]>(`/channels/${channel}/identities`);
   unlinkIdentity = (channel: ChatChannel, identityId: string) =>
-    this.json<null>(`/channels/${channel}/identities/${encodeURIComponent(identityId)}`, {
-      method: "DELETE",
-    });
+    this.json<null>(
+      `/channels/${channel}/identities/${encodeURIComponent(identityId)}`,
+      {
+        method: "DELETE",
+      },
+    );
   createPairingCode = (
     channel: ChatChannel,
     workspaceId: string,
@@ -2304,7 +2498,11 @@ export class ApiClient {
   ) =>
     this.json<PairingCode>(`/channels/${channel}/pairing-codes`, {
       method: "POST",
-      body: { workspace_id: workspaceId, agent_profile_id: agentProfileId, kind },
+      body: {
+        workspace_id: workspaceId,
+        agent_profile_id: agentProfileId,
+        kind,
+      },
     });
   /** Adds a remote MCP server by URL. Only a workspace admin can do this. */
   addMcpServer = (workspaceId: string, body: McpServerAdd) =>
@@ -2314,10 +2512,13 @@ export class ApiClient {
     });
   /** Adds a stdio MCP server in a connector host. A custom command needs the org owner. */
   addStdioServer = (workspaceId: string, body: StdioServerAdd) =>
-    this.json<StartedConnection>(`/workspaces/${workspaceId}/connections/stdio`, {
-      method: "POST",
-      body,
-    });
+    this.json<StartedConnection>(
+      `/workspaces/${workspaceId}/connections/stdio`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   /** Adds an HTTP API from an OpenAPI document or a list of endpoints. */
   addApi = (workspaceId: string, body: ApiAdd) =>
     this.json<StartedConnection>(`/workspaces/${workspaceId}/connections/api`, {
@@ -2326,26 +2527,41 @@ export class ApiClient {
     });
   /** Makes the pending Slack app of the org and gives its manifest (Section 11.6). */
   setupSlack = (orgId: string) =>
-    this.json<SlackSetup>(`/orgs/${encodeURIComponent(orgId)}/integrations/slack/setup`, {
-      method: "POST",
-    });
+    this.json<SlackSetup>(
+      `/orgs/${encodeURIComponent(orgId)}/integrations/slack/setup`,
+      {
+        method: "POST",
+      },
+    );
   /** Sends the bot token and the signing secret. They go only to this call. */
   connectSlack = (orgId: string, botToken: string, signingSecret: string) =>
-    this.json<IntegrationSummary>(`/orgs/${encodeURIComponent(orgId)}/integrations/slack`, {
-      method: "POST",
-      body: { bot_token: botToken, signing_secret: signingSecret },
-    });
+    this.json<IntegrationSummary>(
+      `/orgs/${encodeURIComponent(orgId)}/integrations/slack`,
+      {
+        method: "POST",
+        body: { bot_token: botToken, signing_secret: signingSecret },
+      },
+    );
   // -- M6.9 -------------------------------------------------------------------------------------
   createAgentProfile = (orgId: string, body: NewAgentProfile) =>
-    this.json<AgentProfile>(`/orgs/${encodeURIComponent(orgId)}/agent-profiles`, {
-      method: "POST",
-      body,
-    });
+    this.json<AgentProfile>(
+      `/orgs/${encodeURIComponent(orgId)}/agent-profiles`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   orgUsage = (orgId: string, days: number) =>
-    this.json<OrgUsage>(`/orgs/${encodeURIComponent(orgId)}/usage${query({ days })}`);
+    this.json<OrgUsage>(
+      `/orgs/${encodeURIComponent(orgId)}/usage${query({ days })}`,
+    );
   orgAudit = (
     orgId: string,
-    options: { limit?: number; before?: number | null; action?: string | null } = {},
+    options: {
+      limit?: number;
+      before?: number | null;
+      action?: string | null;
+    } = {},
   ) =>
     this.json<AuditPage>(
       `/orgs/${encodeURIComponent(orgId)}/audit${query({
@@ -2355,17 +2571,25 @@ export class ApiClient {
       })}`,
     );
   curatorReports = (orgId: string, limit = 10) =>
-    this.json<CuratorReports>(`/orgs/${encodeURIComponent(orgId)}/curator-reports${query({ limit })}`);
+    this.json<CuratorReports>(
+      `/orgs/${encodeURIComponent(orgId)}/curator-reports${query({ limit })}`,
+    );
   dataSettings = (orgId: string) =>
     this.json<DataSettings>(`/orgs/${encodeURIComponent(orgId)}/data-settings`);
   setRetention = (orgId: string, retentionDays: number | null) =>
-    this.json<DataSettings>(`/orgs/${encodeURIComponent(orgId)}/data-settings`, {
-      method: "PUT",
-      body: { retention_days: retentionDays },
-    });
+    this.json<DataSettings>(
+      `/orgs/${encodeURIComponent(orgId)}/data-settings`,
+      {
+        method: "PUT",
+        body: { retention_days: retentionDays },
+      },
+    );
   /** The ZIP of all the data of the org (an org owner). */
   exportOrg = (orgId: string) =>
-    this.download(`/orgs/${encodeURIComponent(orgId)}/export`, `sama-org-${orgId.slice(0, 8)}.zip`);
+    this.download(
+      `/orgs/${encodeURIComponent(orgId)}/export`,
+      `sama-org-${orgId.slice(0, 8)}.zip`,
+    );
   /** The ZIP of the data of one user in the org (the user, or an org owner). */
   exportUser = (orgId: string, userId: string) =>
     this.download(
@@ -2373,15 +2597,24 @@ export class ApiClient {
       `sama-user-${userId.slice(0, 8)}.zip`,
     );
   deleteUser = (orgId: string, userId: string) =>
-    this.json<Removed>(`/orgs/${encodeURIComponent(orgId)}/users/${encodeURIComponent(userId)}`, {
-      method: "DELETE",
-    });
+    this.json<Removed>(
+      `/orgs/${encodeURIComponent(orgId)}/users/${encodeURIComponent(userId)}`,
+      {
+        method: "DELETE",
+      },
+    );
   /** Deletes the org. `confirm` must be the slug of the org. */
   deleteOrg = (orgId: string, confirm: string) =>
-    this.json<Removed>(`/orgs/${encodeURIComponent(orgId)}${query({ confirm })}`, { method: "DELETE" });
+    this.json<Removed>(
+      `/orgs/${encodeURIComponent(orgId)}${query({ confirm })}`,
+      { method: "DELETE" },
+    );
 
   /** A file answer. A status that is not 2xx throws an `ApiError` with the JSON detail. */
-  private download = async (path: string, fallback: string): Promise<ExportFile> => {
+  private download = async (
+    path: string,
+    fallback: string,
+  ): Promise<ExportFile> => {
     const generation = this.tokens.generation;
     const response = await this.raw(path, {}, generation);
     if (!response.ok) {
@@ -2391,7 +2624,13 @@ export class ApiClient {
     }
     const blob = await response.blob();
     this.assertCurrent(generation);
-    return { name: attachmentName(response.headers.get("Content-Disposition"), fallback), blob };
+    return {
+      name: attachmentName(
+        response.headers.get("Content-Disposition"),
+        fallback,
+      ),
+      blob,
+    };
   };
   /** Ends an OAuth sign-in: the server sent the user back with `state` and `code` (or `error`). */
   finishOAuth = (state: string, code: string | null, error: string | null) =>
@@ -2401,20 +2640,36 @@ export class ApiClient {
     });
   /** The include and exclude filters of the tools of a remote MCP server. */
   setConnectionTools = (id: string, include: string[], exclude: string[]) =>
-    this.json<Connection>(`/connections/${id}/tools`, { method: "PUT", body: { include, exclude } });
+    this.json<Connection>(`/connections/${id}/tools`, {
+      method: "PUT",
+      body: { include, exclude },
+    });
   // -- M7.10 settings console -------------------------------------------------------------------
   rolePermissions = (orgId: string) =>
-    this.json<RolePermissions>(`/orgs/${encodeURIComponent(orgId)}/role-permissions`);
-  setRolePermissions = (orgId: string, role: EditableRole, permissions: Partial<Record<PermissionKey, boolean>>) =>
-    this.json<RolePermissions>(`/orgs/${encodeURIComponent(orgId)}/role-permissions/${role}`, {
-      method: "PUT",
-      body: { permissions },
-    });
+    this.json<RolePermissions>(
+      `/orgs/${encodeURIComponent(orgId)}/role-permissions`,
+    );
+  setRolePermissions = (
+    orgId: string,
+    role: EditableRole,
+    permissions: Partial<Record<PermissionKey, boolean>>,
+  ) =>
+    this.json<RolePermissions>(
+      `/orgs/${encodeURIComponent(orgId)}/role-permissions/${role}`,
+      {
+        method: "PUT",
+        body: { permissions },
+      },
+    );
   toolPolicy = (orgId: string, profileId: string) =>
     this.json<ToolPolicy>(
       `/orgs/${encodeURIComponent(orgId)}/agent-profiles/${encodeURIComponent(profileId)}/tool-policy`,
     );
-  setToolPolicy = (orgId: string, profileId: string, rules: ToolPolicyChange[]) =>
+  setToolPolicy = (
+    orgId: string,
+    profileId: string,
+    rules: ToolPolicyChange[],
+  ) =>
     this.json<ToolPolicy>(
       `/orgs/${encodeURIComponent(orgId)}/agent-profiles/${encodeURIComponent(profileId)}/tool-policy`,
       { method: "PUT", body: { rules } },
@@ -2427,16 +2682,21 @@ export class ApiClient {
       body: { rules },
     });
   listTriggers = (workspaceId: string) =>
-    this.json<Trigger[]>(`/workspaces/${encodeURIComponent(workspaceId)}/triggers`);
+    this.json<Trigger[]>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers`,
+    );
   getTrigger = (workspaceId: string, triggerId: string) =>
     this.json<Trigger>(
       `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}`,
     );
   createTrigger = (workspaceId: string, body: NewTrigger) =>
-    this.json<TriggerWithSecret>(`/workspaces/${encodeURIComponent(workspaceId)}/triggers`, {
-      method: "POST",
-      body,
-    });
+    this.json<TriggerWithSecret>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers`,
+      {
+        method: "POST",
+        body,
+      },
+    );
   updateTrigger = (workspaceId: string, triggerId: string, body: TriggerEdit) =>
     this.json<Trigger>(
       `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}`,
@@ -2467,7 +2727,10 @@ export class ApiClient {
       { method: "POST", body },
     );
   validateWorkflow = (yaml: string) =>
-    this.json<WorkflowValidation>("/workflows/validate", { method: "POST", body: { yaml } });
+    this.json<WorkflowValidation>("/workflows/validate", {
+      method: "POST",
+      body: { yaml },
+    });
   listWorkflows = (orgId: string) =>
     this.json<Workflow[]>(`/orgs/${encodeURIComponent(orgId)}/workflows`);
   getWorkflow = (orgId: string, workflowId: string) =>
@@ -2496,7 +2759,11 @@ export class ApiClient {
       `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}/approve`,
       { method: "POST", body: { version } },
     );
-  startWorkflow = (orgId: string, workflowId: string, inputs: Record<string, unknown> = {}) =>
+  startWorkflow = (
+    orgId: string,
+    workflowId: string,
+    inputs: Record<string, unknown> = {},
+  ) =>
     this.json<WorkflowInstanceDetail>(
       `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}/start`,
       { method: "POST", body: { inputs } },
@@ -2512,10 +2779,17 @@ export class ApiClient {
       { method: "POST" },
     );
   deleteWorkflow = (orgId: string, workflowId: string) =>
-    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}`, {
-      method: "DELETE",
-    });
-  listWorkflowInstances = (orgId: string, workflowId: string | null = null, limit = 20) =>
+    this.json<null>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}`,
+      {
+        method: "DELETE",
+      },
+    );
+  listWorkflowInstances = (
+    orgId: string,
+    workflowId: string | null = null,
+    limit = 20,
+  ) =>
     this.json<WorkflowInstance[]>(
       `/orgs/${encodeURIComponent(orgId)}/workflow-instances${query({ workflow_id: workflowId, limit })}`,
     );
@@ -2529,18 +2803,25 @@ export class ApiClient {
       { method: "POST" },
     );
   updateSession = (sessionId: string, body: SessionPatch) =>
-    this.json<SessionOut>(`/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body });
+    this.json<SessionOut>(`/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "PATCH",
+      body,
+    });
   checkIntegration = (orgId: string, kind: ChatChannel) =>
     this.json<IntegrationCheck>(
       `/orgs/${encodeURIComponent(orgId)}/integrations/${encodeURIComponent(kind)}/check`,
       { method: "POST" },
     );
   enableConnection = (id: string) =>
-    this.json<Connection>(`/connections/${encodeURIComponent(id)}/enable`, { method: "POST" });
+    this.json<Connection>(`/connections/${encodeURIComponent(id)}/enable`, {
+      method: "POST",
+    });
 }
 
 /** A query string (`?a=1&b=2`) of the values that are not `null`, else "". */
-export function query(values: Record<string, string | number | null | undefined>): string {
+export function query(
+  values: Record<string, string | number | null | undefined>,
+): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(values)) {
     if (value !== null && value !== undefined) params.set(key, String(value));
@@ -2555,6 +2836,10 @@ export async function fetchConfig(
   fetcher: FetchLike = (input, init) => fetch(input, init),
 ): Promise<PublicConfig> {
   const response = await fetcher(`${baseUrl}/config`);
-  if (!response.ok) throw new ApiError(response.status, `The API did not answer (${response.status}).`);
+  if (!response.ok)
+    throw new ApiError(
+      response.status,
+      `The API did not answer (${response.status}).`,
+    );
   return (await response.json()) as PublicConfig;
 }

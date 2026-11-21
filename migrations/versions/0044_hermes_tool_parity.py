@@ -14,8 +14,8 @@
   ``SKILL.md`` declares them. A member who sees the workspace reads the row. Only the control
   plane writes the table.
 
-Revision ID: 0042
-Revises: 0041
+Revision ID: 0044
+Revises: 0043
 Create Date: 2026-11-21
 """
 
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0042"
-down_revision: str | None = "0041"
+revision: str = "0044"
+down_revision: str | None = "0043"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
