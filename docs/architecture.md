@@ -4755,8 +4755,8 @@ point of it, as with computer use.
 `browser_task(goal, start_url, max_steps, max_cost_usd, timeout_s)` hands a whole browser goal
 to a sub-agent. One call runs many browser steps and returns a short result and the list of the
 actions. The code is in `sama.browser.task` (the loop), `sama.browser.budget` (the limits), and
-`sama.tools.browser_task` (the tool). The tool server has the tool when it has the browser tools
-(the Browserbase key and project).
+`sama.tools.browser_task` (the tool). The tool server has the tool when the browser service has
+the `cloud` target (the Browserbase key and project).
 
 **Why not `browser-use`.** The roadmap item named the `browser-use` library. Sama does not use
 it, because it cannot run safely in this design:
@@ -4775,8 +4775,10 @@ version: the same tools, the same session, and the same rules as the six browser
 
 1. The model of the sub-agent gets a fixed system prompt, the goal, and seven tools: `open`,
    `act`, `snapshot`, `screenshot`, `extract` (`text`, `links`, `tables`), `tabs`, and `done`.
-   The first six call `BrowserService` on the browser session of the run, so they use the same
-   tabs, cookies, and logins as `browser_open`. With `start_url`, the loop opens the URL before
+   The first six call `BrowserService` with the `cloud` target on the browser session of the
+   run, so they use the same tabs, cookies, and logins as `browser_open` with `target=cloud`.
+   The sub-agent never uses `my_chrome` (Section 14.2.2): the user is not there to click for a
+   sensitive action. Without the `cloud` target (no Browserbase key), the tool is hidden. With `start_url`, the loop opens the URL before
    the first model call.
 2. Each model call is one step. A step can run at most 5 tool calls. The last step must call
    `done` (`tool_choice`), so the task always ends with the best result that the sub-agent has.

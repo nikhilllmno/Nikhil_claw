@@ -19,7 +19,7 @@ import pytest
 from sama.browser import task as task_module
 from sama.browser.budget import MAX_STEPS, TaskBudget, parse_budget
 from sama.browser.service import BrowserService
-from sama.browser.target import BrowserError
+from sama.browser.target import MY_CHROME, BrowserError, TargetName
 from sama.browser.task import (
     DONE,
     OLD_RESULT_CHARS,
@@ -185,6 +185,7 @@ async def test_the_sub_agent_uses_the_browser_and_returns_an_untrusted_result(
         "seconds": 1.0,
         "accept": True,
         "snapshot": True,
+        "target": "cloud",
     }
 
 
@@ -546,3 +547,14 @@ async def test_the_proxy_client_maps_errors_to_fixed_texts() -> None:
             await client.create("t", {"model": MODEL})
     finally:
         await client.aclose()
+
+
+def test_the_runner_needs_the_cloud_target() -> None:
+    class ChromeOnly(FakeTarget):
+        @property
+        def name(self) -> TargetName:
+            return MY_CHROME
+
+    service = BrowserService(ChromeOnly(), DenyHosts(frozenset()))
+    with pytest.raises(ValueError, match="needs the cloud target"):
+        BrowserTaskRunner(service, ScriptedModel([]), PriceTable.load(), model=MODEL)

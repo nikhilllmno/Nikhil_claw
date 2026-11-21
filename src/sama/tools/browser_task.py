@@ -38,7 +38,8 @@ BROWSER_TASK: Final = "browser_task"
 
 DESCRIPTION: Final = (
     "Hand a whole browser goal to a browser sub-agent. It works on the cloud target of "
-    "this run (the same tabs, cookies, and logins as browser_open) for many steps, and "
+    "this run (the same tabs, cookies, and logins as browser_open with target cloud) for "
+    "many steps, and "
     "returns a short result and the list of its actions. Use it for a multi-step task such "
     "as 'find the opening hours on example.com' or 'fill the contact form with these "
     "values'. Write a goal that names the site, the data to get, and the actions that are "
