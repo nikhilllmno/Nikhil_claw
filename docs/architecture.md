@@ -5752,7 +5752,7 @@ migrated schema.
 
 | Table | Key columns |
 |---|---|
-| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0034`, Section 17.4) |
+| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0035`, Section 17.4) |
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
@@ -5783,7 +5783,7 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0034`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -6016,8 +6016,8 @@ log of the org, so the control plane logs it instead.
 - The user export has the rows of the user only: the private sessions with their rows, the
   user rows (memberships, personal memory, rules, chat links, jobs, triggers, workflows, and
   connections), the rows that the user made or decided (task cards, approvals, audit rows),
-  and the messages, steers, and pins that the user wrote in shared sessions, and the invites
-  that the user sent, accepted, or got. Agent profiles,
+  and the messages, steers, and pins that the user wrote in shared sessions, the invites
+  that the user sent, accepted, or got, and the profile changes that the user made (M6.1). Agent profiles,
   vault secrets, and embeddings are not in a user export.
 - The export never has a secret: not the vault columns (`wrapped_key`, `ciphertext`), not
   `integrations.secret_hash`, not `pairing_codes.code_hash`, and not `org_invites.token_hash`.

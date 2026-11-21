@@ -1,4 +1,4 @@
-"""Migration 0034: data controls (docs/architecture.md, Section 17.4)."""
+"""Migration 0035: data controls (docs/architecture.md, Section 17.4)."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def test_the_upgrade_adds_the_purges_and_the_setting_and_the_downgrade_removes_t
         asyncio.run(seed(url))
         assert _state(url) == (True, True, ["data_purges_select"])
         config = alembic_config(url)
-        command.downgrade(config, "0033")
+        command.downgrade(config, "0034")
         assert _state(url) == (False, False, [])
         command.upgrade(config, "head")
         assert _state(url) == (True, True, ["data_purges_select"])

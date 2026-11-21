@@ -74,6 +74,7 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     ),
     "audit_log": "actor_user_id = :user",
     "agent_profiles": None,
+    "profile_changes": "actor_user_id = :user",
     "vault_secrets": None,
     "data_purges": None,
     "message_embeddings": None,

@@ -32,6 +32,7 @@ from sama.db.models import (
     DataPurge,
     Membership,
     OrgInvite,
+    ProfileChange,
     Run,
     Session,
     User,
@@ -264,6 +265,28 @@ async def test_a_user_delete_removes_the_invites_of_the_user_and_keeps_sent_ones
         ).all()
     # The accepted invite must name its user, so it goes. The sent invite stays without alice.
     assert [(row.id, row.invited_by_user_id) for row in rows] == [(sent, None)]
+
+
+async def test_a_user_delete_keeps_the_profile_changes_of_the_user_without_the_user(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    org_a, alice = fresh.ids["org-a"], fresh.ids["alice"]
+    change = fresh.ids["change:profile-a"]
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(ProfileChange).where(ProfileChange.id == change).values(actor_user_id=alice)
+        )
+
+    await DataControls(engine).delete_user(org_a, alice, actor_user_id=fresh.ids["carol"])
+
+    async with engine.connect() as connection:
+        actor = (
+            await connection.execute(
+                select(ProfileChange.actor_user_id).where(ProfileChange.id == change)
+            )
+        ).one()
+    # The history of a shared profile stays (M6.1). Only the link to the user goes.
+    assert actor.actor_user_id is None
 
 
 async def test_the_last_owner_cannot_be_deleted(engine: AsyncEngine, fresh: World) -> None:

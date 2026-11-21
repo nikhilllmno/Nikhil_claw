@@ -9,8 +9,8 @@ Langfuse traces of the deleted runs. The purge worker does the cleanup and retri
 table has no foreign key to ``orgs``, so its rows stay after an org delete. Only org owners
 and admins read the rows. Only the control plane writes the table.
 
-Revision ID: 0034
-Revises: 0033
+Revision ID: 0035
+Revises: 0034
 Create Date: 2026-11-21
 """
 
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0034"
-down_revision: str | None = "0033"
+revision: str = "0035"
+down_revision: str | None = "0034"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
