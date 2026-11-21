@@ -86,9 +86,14 @@ async def _git(
     env: dict[str, str] | None = None,
     timeout_s: float = GIT_TIMEOUT_S,
 ) -> tuple[int, str, str]:
+    # ``git -C`` from the work folder: E2B refuses a command whose ``cwd`` does not exist, and
+    # the folder of a repository that is not cloned yet does not exist.
     try:
         result = await sandbox.exec(
-            ["git", *args], cwd=path, env={**_GIT_ENV, **(env or {})}, timeout_s=timeout_s
+            ["git", "-C", path, *args],
+            cwd=sandbox.workdir,
+            env={**_GIT_ENV, **(env or {})},
+            timeout_s=timeout_s,
         )
     except SandboxError as error:
         raise WorkspaceError(f"the sandbox failed: {error}") from None
@@ -133,6 +138,9 @@ async def prepare(
         path = folder if folder and folder.startswith(workdir + "/") else workdir
     proxied = False
     commit, branch = await _state(sandbox, path) if path != workdir else (None, None)
+    if target is None and commit is None and path != workdir and not await _is_dir(sandbox, path):
+        # The folder of the last request is gone (for example a new sandbox).
+        path = workdir
     if target is not None and commit is None:
         if cloner is None:
             raise WorkspaceError("this server has no sandbox clone, so it cannot clone a repo")
@@ -166,6 +174,16 @@ async def prepare(
             code, out, _ = await _git(sandbox, path, "config", "--get", TARGET_CONFIG)
             base_branch = out.strip() if code == 0 and out.strip() else None
     return Workspace(path, target, commit, branch, proxied, base_branch)
+
+
+async def _is_dir(sandbox: Sandbox, path: str) -> bool:
+    try:
+        result = await sandbox.exec(
+            ["test", "-d", path], cwd=sandbox.workdir, timeout_s=GIT_TIMEOUT_S
+        )
+    except SandboxError as error:
+        raise WorkspaceError(f"the sandbox failed: {error}") from None
+    return result.exit_code == 0
 
 
 def _repo_of(url: str) -> RepoRef | None:
