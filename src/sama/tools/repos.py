@@ -106,6 +106,16 @@ def parse_repo(text: str) -> RepoRef:
     return RepoRef(owner, name)
 
 
+def valid_folder(name: str) -> bool:
+    """A folder name of ``repo_clone``: one segment, not ``.`` or ``..``."""
+    return _valid_folder(name)
+
+
+def valid_ref(ref: str) -> bool:
+    """A branch or tag name that ``repo_clone`` accepts."""
+    return _valid_ref(ref)
+
+
 def _valid_folder(name: str) -> bool:
     return bool(_NAME.fullmatch(name)) and name not in {".", ".."}
 
@@ -161,8 +171,11 @@ class RepoCloner:
         ref: str | None = None,
         folder: str | None = None,
         token: str | None = None,
+        sandbox: Sandbox | None = None,
     ) -> Cloned:
-        """``token`` is the run token of the call. A clone through the proxy needs it."""
+        """``token`` is the run token of the call. A clone through the proxy needs it.
+        ``sandbox`` is the session sandbox when the caller has it already (coding mode,
+        Section 15.5)."""
         target = parse_repo(repo)
         if ref is not None and not _valid_ref(ref):
             raise RepoError(f"{ref!r} is not a valid branch or tag name")
@@ -172,7 +185,8 @@ class RepoCloner:
                 "the folder must be one name of letters, digits, '.', '_', or '-', "
                 "and not '.' or '..'"
             )
-        sandbox = await self._session_sandbox(claims.org_id, claims.session_id)
+        if sandbox is None:
+            sandbox = await self._session_sandbox(claims.org_id, claims.session_id)
         if sandbox is None:
             raise RepoError("the session has no sandbox yet")
         path = f"{sandbox.workdir.rstrip('/')}/{folder}"

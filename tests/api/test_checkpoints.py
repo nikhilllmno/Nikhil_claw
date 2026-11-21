@@ -120,3 +120,34 @@ async def test_the_routes_check_the_body_the_access_and_an_open_run(
     await RunQueue(engine).enqueue(org_id=tenant.org, session_id=session, text="hi", user_id=None)
     busy = await client.post(f"{base}/undo", headers=mia(tenant))
     assert (busy.status_code, busy.json()["detail"]) == (409, BUSY)
+
+
+async def test_a_rollback_with_a_commit_checks_the_checkpoint(
+    checkpoint_client: httpx.AsyncClient, tenant: Tenant, work: Path
+) -> None:
+    """Coding mode (Section 15.5): a restore names the checkpoint by its commit, so a list
+    that changed in the meantime does not restore another checkpoint."""
+    client = checkpoint_client
+    base = f"/sessions/{tenant.ids['mine']}"
+    checkpoints = Checkpoints(str(work))
+    (work / "a.txt").write_text("one")
+    checkpoints.snapshot("r1", "Write")
+    (work / "a.txt").write_text("two")
+    (item,) = (await client.get(f"{base}/checkpoints", headers=mia(tenant))).json()
+    assert len(item["commit"]) == 40
+    checkpoints.snapshot("r2", "Edit")
+    stale = await client.post(
+        f"{base}/rollback", headers=mia(tenant), json={"number": 1, "commit": item["commit"]}
+    )
+    assert stale.status_code == 409
+    assert "changed" in stale.json()["detail"]
+    assert (work / "a.txt").read_text() == "two"
+    fresh = await client.post(
+        f"{base}/rollback", headers=mia(tenant), json={"number": 2, "commit": item["commit"]}
+    )
+    assert fresh.status_code == 200
+    assert (work / "a.txt").read_text() == "one"
+    bad = await client.post(
+        f"{base}/rollback", headers=mia(tenant), json={"number": 1, "commit": "x"}
+    )
+    assert bad.status_code == 422

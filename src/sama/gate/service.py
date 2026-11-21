@@ -23,7 +23,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, cast
 
@@ -307,6 +307,16 @@ class GateService:
                 # allow") uses up its ticket here, so a later call with the same arguments
                 # cannot use the old approval (Section 14.2.2).
                 await self._take_ticket(connection, run.ref, name, arguments_digest(effective))
+            if verdict.step is GateStep.PLAN:
+                # Plan mode does not stop a call that a person approved (Section 15.5): with
+                # a ticket of this exact call, the verdict without plan mode applies.
+                unplanned = decide(
+                    replace(run.context, plan_mode=False), tool_name, arguments, escalate=escalate
+                )
+                if unplanned.action != "deny" and await self._take_ticket(
+                    connection, run.ref, name, arguments_digest(effective)
+                ):
+                    verdict = Verdict("allow", GateStep.RECORDED, "the call has an approved ticket")
             if verdict.action == "ask":
                 digest = arguments_digest(effective)
                 if await self._take_ticket(connection, run.ref, name, digest):
@@ -517,6 +527,7 @@ class GateService:
                     Session.owner_user_id,
                     Session.lineage,
                     Session.profile_snapshot,
+                    Session.plan_mode,
                 )
                 .join(
                     AgentProfile,
@@ -600,6 +611,8 @@ class GateService:
             preapproved=preapproved,
             catalog=merged_catalog(extra),
             access=access,
+            # A review run reads the transcript only; plan mode is for the chat runs.
+            plan_mode=bool(row.plan_mode) and row.kind != "review",
         )
         call = None
         if call_id:

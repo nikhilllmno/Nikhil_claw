@@ -37,6 +37,8 @@ from sama.coding.agents import CodingAgent
 from sama.coding.commands import COMMANDS as CODING_COMMANDS
 from sama.coding.commands import HELP_LINES as CODING_HELP_LINES
 from sama.coding.commands import NOT_DIRECT, SwitchNotAllowedError, set_direct
+from sama.coding_mode.commands import plan_action, plan_reply
+from sama.coding_mode.service import CodingService
 from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import AgentProfile, ChannelGroup, ChannelIdentity
@@ -124,6 +126,8 @@ HELP: Final = (
     "/compact [focus] - make the context of this session shorter\n"
     "/undo - restore the session files to before the last run that changed them\n"
     "/rollback - list the checkpoints of the session files. /rollback <number> restores one\n"
+    "/plan <task> - make a plan first, then work after you approve it. /plan shows the plan,"
+    " /plan approve, /plan edit <plan>, /plan reject <feedback>, /plan off\n"
     "/pin <text> - keep a text in the context. /pins lists the pins. /unpin <number> removes one\n"
     "/pair <code> - link this account, or link a group with a group code\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
@@ -157,6 +161,7 @@ OWN_COMMANDS: Final = frozenset(
         "/claude",
         "/codex",
         "/sama",
+        "/plan",
     }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
@@ -327,6 +332,7 @@ class TelegramGateway:
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
         checkpoints: CheckpointService | None = None,
+        coding_mode: CodingService | None = None,
     ) -> None:
         """``lockout`` and ``followers`` can be shared by the gateways of all bots, so that
         the limits hold for the whole process."""
@@ -342,6 +348,7 @@ class TelegramGateway:
         self._connections = connections
         self._handoffs = handoffs
         self._checkpoints = checkpoints
+        self._coding_mode = coding_mode
         self._pins = pins or PinStore(engine)
         self._transcriber = transcriber
         self._lockout = lockout or Lockout()
@@ -940,6 +947,8 @@ class TelegramGateway:
         elif command in ("/undo", "/rollback"):
             answer = await self._checkpoint(chat_id, command[1:], rest, target, grants)
             await self._say(chat_id, answer, reply_to=message_id)
+        elif command == "/plan":
+            await self._plan(chat_id, message_id, rest, target, grants)
         else:
             await self._say(chat_id, HELP, reply_to=message_id)
 
@@ -976,6 +985,41 @@ class TelegramGateway:
             raise
         await self._say(chat_id, COMPACTING, reply_to=message_id)
         self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
+
+    async def _plan(
+        self, chat_id: int, message_id: int, rest: str, target: Target, grants: Grants
+    ) -> None:
+        """``/plan``: plan mode of coding mode in a direct chat (Section 15.5). A command that
+        sends a message to the agent follows its run, as a message does."""
+        if target.audience != "private":
+            await self._say(
+                chat_id, "Plan mode works in a direct chat with sama.", reply_to=message_id
+            )
+            return
+        if len(self._followers) >= self._settings.max_followers:
+            log.warning("too many runs to follow; chat=%s must try again", chat_id)
+            await self._say(chat_id, BUSY, reply_to=message_id)
+            return
+        place = object()
+        self._followers.add(place)
+        try:
+            task = plan_action(rest)[0] == "task"
+            current = await self._session(chat_id, target, grants, create=task)
+            reply = await plan_reply(
+                self._coding_mode,
+                org_id=target.org_id,
+                user_id=target.user_id,
+                session_id=None if current is None else current.session_id,
+                rest=rest,
+            )
+        except BaseException:
+            self._followers.discard(place)
+            raise
+        await self._say(chat_id, reply.text, reply_to=message_id)
+        if reply.run_id is None:
+            self._followers.discard(place)
+            return
+        self._spawn(self._follow_run(chat_id, target, reply.run_id, message_id, place))
 
     async def _model(
         self, chat_id: int, message_id: int, name: str, target: Target, grants: Grants

@@ -96,7 +96,8 @@ export function Composer({
       <p className={styles.hint}>
         Enter to send, Shift+Enter for a new line. While the agent works, a message joins the current run at its
         next step. Type /bg TASK or press Run in parallel to start a second run, /stop NUMBER to stop one run, /compact
-        to shorten the context, or /handoff telegram|slack to move the session.
+        to shorten the context, /handoff telegram|slack to move the session, or /plan TASK to plan before the agent
+        changes files.
         {nearLimit ? ` ${value.length.toLocaleString()} of ${MAX_MESSAGE_CHARS.toLocaleString()} characters.` : ""}
       </p>
     </form>

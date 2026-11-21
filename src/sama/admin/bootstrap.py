@@ -25,6 +25,7 @@ DEFAULT_TOOLSETS: Final = (
     "web",
     "clarify",
     "github",
+    "plan",
     "memory",
     "skills",
     "sessions",

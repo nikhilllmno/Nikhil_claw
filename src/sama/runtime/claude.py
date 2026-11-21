@@ -87,6 +87,7 @@ from sama.runtime.contract import (
     Usage,
     bound_subagent_text,
     is_terminal,
+    output_preview,
 )
 from sama.runtime.gating import AllowAllGate as AllowAllGate
 from sama.runtime.gating import BoundedSet
@@ -578,7 +579,7 @@ def _preview(content: Any) -> str:
             str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content
         ]
         text = "\n".join(p for p in parts if p)
-    return text[:_PREVIEW_CHARS]
+    return output_preview(text, _PREVIEW_CHARS)
 
 
 def _error_text(result: ResultMessage) -> str:

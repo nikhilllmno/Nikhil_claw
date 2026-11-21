@@ -33,6 +33,7 @@ from sama.runtime import (
 )
 from sama.runtime.contract import CompactRequest
 from sama.runtime.fake import FakeRuntime, FakeScript
+from sama.runtime.runner import RunnerJob
 from sama.sandbox import ExecResult, SandboxError, SandboxProcess, SandboxSpec
 from sama.sandbox.local import LocalProvider, LocalSandbox
 from sama.sandbox.process import SubprocessProcess
@@ -936,3 +937,53 @@ async def test_a_job_script_runs_in_the_session_sandbox(runtime: SandboxedRuntim
     sandbox = await runtime.session_sandbox(scope.org_id, scope.session_id)
     assert sandbox is not None
     assert again.stdout.strip() == sandbox.workdir
+
+
+class _Preparer:
+    """A coding step (Section 15.5) that records its calls and gives a fixed note."""
+
+    def __init__(self, note: str) -> None:
+        self.note = note
+        self.calls: list[tuple[str, str]] = []
+
+    async def prepare(self, sandbox: Any, scope: RunScope, token: str) -> str:
+        self.calls.append((scope.run_id, token))
+        return self.note
+
+
+async def test_the_coding_step_adds_its_note_to_the_input(
+    runtime: SandboxedRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs: list[Any] = []
+    write = sandboxed_module._write_job
+
+    async def spy(process: SandboxProcess, job: Any) -> None:
+        jobs.append(job)
+        await write(process, job)
+
+    monkeypatch.setattr(sandboxed_module, "_write_job", spy)
+    preparer = _Preparer("[sama coding mode] note")
+    runtime.set_preparer(preparer)
+    runtime.fake_scripts.append(_reply("ok"))
+    events = await collect(runtime.run(_request(make_scope("run-1"))))
+    assert isinstance(events[-1], RunCompleted)
+    assert jobs[-1].run.input == "hi\n\n[sama coding mode] note"
+    ((run_id, token),) = preparer.calls
+    assert run_id == "run-1"
+    assert RunTokenSigner(KEY).verify(token).run_id == "run-1"
+
+    # An empty note keeps the input, and a /compact run has no coding step.
+    preparer.note = ""
+    runtime.fake_scripts.append(_reply("ok"))
+    await collect(runtime.run(_request(make_scope("run-2"))))
+    assert jobs[-1].run.input == "hi"
+    compact = RunRequest(
+        scope=make_scope("run-3"),
+        input="",
+        config=CONFIG,
+        runtime_state=b"state",
+        compact=CompactRequest(focus=""),
+    )
+    job = RunnerJob(op="run", run=compact)
+    assert await runtime._prepare(job, cast(Any, None), compact.scope, "token") is job
+    assert len(preparer.calls) == 2

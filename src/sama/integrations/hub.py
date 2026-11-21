@@ -28,6 +28,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.coding_mode.service import CodingService
 from sama.connectors.service import ConnectionService
 from sama.db.models import Integration
 from sama.gate.service import GateService
@@ -138,6 +139,7 @@ class TelegramHub(GatewayCache[_Bot]):
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
         checkpoints: CheckpointService | None = None,
+        coding_mode: CodingService | None = None,
     ) -> None:
         """``keys`` gives the OpenAI key of an org for voice notes: the vault entry of the
         org, then the default key of the process. Without a key voice notes are off."""
@@ -156,6 +158,7 @@ class TelegramHub(GatewayCache[_Bot]):
         self._jobs = jobs
         self._handoffs = handoffs
         self._checkpoints = checkpoints
+        self._coding_mode = coding_mode
         self._lockout = Lockout()
         self._followers: set[object] = set()
 
@@ -278,6 +281,7 @@ class TelegramHub(GatewayCache[_Bot]):
             jobs=self._jobs,
             handoffs=self._handoffs,
             checkpoints=self._checkpoints,
+            coding_mode=self._coding_mode,
             transcriber=transcriber,
             lockout=self._lockout,
             followers=self._followers,

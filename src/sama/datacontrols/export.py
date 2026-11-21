@@ -114,6 +114,8 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "session_bindings": _PRIVATE + " OR created_by_user_id = :user",
     "session_handoffs": _PRIVATE + " OR user_id = :user",
     "session_todos": _PRIVATE,
+    "session_repos": _PRIVATE + " OR created_by_user_id = :user",
+    "session_plans": _PRIVATE + " OR decided_by_user_id = :user",
     "session_compactions": _PRIVATE,
     "tasks": ("owner_user_id = :user OR created_by_user_id = :user OR assignee_user_id = :user"),
     "task_comments": (

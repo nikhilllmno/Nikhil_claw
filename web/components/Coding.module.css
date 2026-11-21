@@ -1,0 +1,220 @@
+/* The Code page of a session (M7.9). The shared page frame is Page.module.css. */
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  border-bottom: var(--border-width) solid var(--border);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--touch-target);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-bottom: var(--border-width-accent) solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.tab:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.tabSelected {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.help {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.fields > :global(.field) {
+  flex: 1 1 var(--field-basis);
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--touch-target);
+  font-size: var(--text-sm);
+}
+
+.plan {
+  padding: var(--space-3) var(--space-4);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  max-height: var(--viewer-max-height);
+  overflow: auto;
+}
+
+.feedback {
+  padding: var(--space-2) var(--space-3);
+  border-left: var(--border-width-accent) solid var(--danger);
+  background: var(--danger-soft);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* -- Diff --------------------------------------------------------------------------------- */
+
+.file {
+  padding: 0;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.fileHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fileHead:hover {
+  background: var(--surface-hover);
+}
+
+.filePath {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.counts {
+  display: inline-flex;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.added {
+  color: var(--accent-text);
+}
+
+.removed {
+  color: var(--danger);
+}
+
+.scrollX {
+  overflow-x: auto;
+  border-top: var(--border-width) solid var(--border);
+}
+
+.diff {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.diff td {
+  padding: 0 var(--space-2);
+  vertical-align: top;
+}
+
+.num {
+  width: var(--diff-gutter);
+  min-width: var(--diff-gutter);
+  color: var(--text-subtle);
+  text-align: right;
+  user-select: none;
+}
+
+.code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.rowAdd {
+  background: var(--accent-soft);
+}
+
+.rowDel {
+  background: var(--danger-soft);
+}
+
+.rowHunk {
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+}
+
+.rowNote {
+  color: var(--text-subtle);
+  font-style: normal;
+}
+
+/* -- Commands ----------------------------------------------------------------------------- */
+
+.command {
+  margin: 0;
+  max-height: var(--scroll-list-max);
+  overflow: auto;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* -- Confirm ------------------------------------------------------------------------------ */
+
+.confirm {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}

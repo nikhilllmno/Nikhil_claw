@@ -18,9 +18,11 @@ import {
   toneBadge,
   toolTone,
 } from "@/lib/history";
+import { groupSubagents, runHasEnded, traceSubagentEvents } from "@/lib/subagentProgress";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
 import { PageHeader } from "./PageHeader";
+import { SubagentGroup } from "./SubagentGroup";
 import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./Page.module.css";
@@ -117,18 +119,20 @@ function RunCard({
           {open ? "Hide the trace" : "Show the trace"}
         </button>
       </div>
-      {open ? <Trace runId={run.id} /> : null}
+      {open ? <Trace runId={run.id} runEnded={runHasEnded(run.status)} /> : null}
     </section>
   );
 }
 
-function Trace({ runId }: { runId: string }) {
+function Trace({ runId, runEnded }: { runId: string; runEnded: boolean }) {
   const api = useApi();
   const load = useCallback(() => api.getRunTrace(runId), [api, runId]);
   const trace = useLoad(load, "Could not load the trace.");
   if (trace.error) return <ErrorState title="The trace did not load" message={trace.error} onRetry={trace.reload} />;
   if (trace.data === null) return <LoadingState label="Loading the trace" />;
   const { steps, tool_calls: tools, model_calls: models, truncated } = trace.data;
+  const subagents = groupSubagents(traceSubagentEvents(steps), runEnded);
+  const toolNames = new Map(tools.map((call) => [call.call_id, call.tool_name]));
 
   return (
     <>
@@ -164,6 +168,21 @@ function Trace({ runId }: { runId: string }) {
           </ol>
         )}
       </div>
+      {subagents.length > 0 ? (
+        <div className={styles.section}>
+          <h3 className={styles.subheading}>Sub-agents</h3>
+          <ul className={styles.list}>
+            {subagents.map((group) => (
+              <li key={group.key}>
+                {group.callId !== null && toolNames.has(group.callId) ? (
+                  <p className={styles.meta}>Started by {toolNames.get(group.callId)}</p>
+                ) : null}
+                <SubagentGroup group={group} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       <div className={styles.section}>
         <h3 className={styles.subheading}>Tool calls</h3>
         {tools.length === 0 ? (

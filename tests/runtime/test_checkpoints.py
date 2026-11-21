@@ -486,3 +486,149 @@ def test_the_command_reports_a_busy_runner(
         os.close(fd)
     assert result["ok"] is False
     assert result["busy"] is True
+
+
+# -- diff (coding mode, Section 15.5) ------------------------------------------------------------
+
+
+def test_the_diff_of_the_session_and_of_one_step(tmp_path: Path) -> None:
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "app.py", "a\nb\n")
+    _write(tmp_path, "gone.txt", "x\n")
+    checkpoints.snapshot("r1", "Write")
+    _write(tmp_path, "app.py", "a\nc\nd\n")
+    (tmp_path / "gone.txt").unlink()
+    (tmp_path / "logo.bin").write_bytes(b"\0\1\2")
+    checkpoints.snapshot("r2", "Edit")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "app.py").rename(tmp_path / "pkg" / "app.py")
+
+    everything = checkpoints.diff(None)
+    assert (everything.base.number, everything.head) == (2, None)
+    found = {f.path: f for f in everything.files}
+    # The first app.py and the new one have too little in common to be a rename.
+    assert set(found) == {"app.py", "pkg/app.py", "gone.txt", "logo.bin"}
+    assert found["app.py"].status == "deleted"
+    assert (found["pkg/app.py"].status, found["pkg/app.py"].additions) == ("added", 3)
+    assert found["pkg/app.py"].patch.startswith("diff --git a/pkg/app.py b/pkg/app.py")
+    assert "+d" in found["pkg/app.py"].patch
+    assert (found["gone.txt"].status, found["gone.txt"].deletions) == ("deleted", 1)
+    assert found["logo.bin"].binary
+    assert found["logo.bin"].additions is None
+
+    step = checkpoints.diff(2, 1)
+    assert {f.path: f.status for f in step.files} == {
+        "app.py": "modified",
+        "gone.txt": "deleted",
+        "logo.bin": "added",
+    }
+    latest = checkpoints.diff(1)
+    ((renamed),) = latest.files
+    assert (renamed.path, renamed.old_path, renamed.status) == ("pkg/app.py", "app.py", "renamed")
+    # A diff leaves the history as it was.
+    assert len(checkpoints.listing(10)) == 2
+
+
+def test_the_diff_cuts_a_long_patch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "MAX_FILE_PATCH_CHARS", 200)
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "a.txt", "")
+    checkpoints.snapshot("r1", "Write")
+    _write(tmp_path, "a.txt", "line\n" * 500)
+    (changed,) = checkpoints.diff(None).files
+    assert changed.truncated
+    assert len(changed.patch) == 200
+    assert changed.additions == 500
+
+
+def test_the_diff_needs_checkpoints(tmp_path: Path) -> None:
+    with pytest.raises(CheckpointError, match="no checkpoints"):
+        Checkpoints(str(tmp_path)).diff(None)
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "a.txt", "1")
+    checkpoints.snapshot("r1", "Write")
+    with pytest.raises(CheckpointError, match="no checkpoint 4"):
+        checkpoints.diff(4)
+
+
+def test_the_diff_command_prints_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "a.txt", "1\n")
+    checkpoints.snapshot("r1", "Write")
+    _write(tmp_path, "a.txt", "2\n")
+    assert main(["--workdir", str(tmp_path), "diff", "--base", "oldest"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert [f["path"] for f in result["diff"]["files"]] == ["a.txt"]
+    assert main(["--workdir", str(tmp_path), "diff", "--base", "x"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_the_snapshot_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _write(tmp_path, "a.txt", "1\n")
+    assert main(["--workdir", str(tmp_path), "snapshot", "--run", "r1", "--tool", "codex"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["ok"] is True
+    assert first["commit"]
+    assert main(["--workdir", str(tmp_path), "snapshot", "--run", "r1", "--tool", "codex"]) == 0
+    assert json.loads(capsys.readouterr().out)["commit"] is None
+    (item,) = Checkpoints(str(tmp_path)).listing(5)
+    assert (item.run_id, item.tool) == ("r1", "codex")
+
+
+def test_the_diff_stops_at_the_total_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "MAX_PATCH_CHARS", 300)
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "keep.txt", "")
+    checkpoints.snapshot("r1", "Write")
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _write(tmp_path, name, "line\n" * 100)
+    found = checkpoints.diff(None)
+    assert found.truncated
+    assert sum(len(f.patch) for f in found.files) <= 300
+    assert [f.path for f in found.files] == ["a.txt", "b.txt", "c.txt"]
+    assert found.files[-1].patch == ""
+    assert found.files[-1].truncated
+    assert all(f.additions == 100 for f in found.files)
+
+
+def test_a_type_change_keeps_each_patch_with_its_file(tmp_path: Path) -> None:
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "a.txt", "one\n")
+    _write(tmp_path, "b.txt", "x\n")
+    checkpoints.snapshot("r1", "Write")
+    (tmp_path / "a.txt").unlink()
+    (tmp_path / "a.txt").symlink_to("b.txt")
+    _write(tmp_path, "b.txt", "y\n")
+    files = {f.path: f for f in checkpoints.diff(None).files}
+    assert files["a.txt"].status == "type_changed"
+    assert "-one" in files["a.txt"].patch
+    assert "+b.txt" in files["a.txt"].patch
+    assert files["b.txt"].patch.startswith("diff --git a/b.txt b/b.txt")
+    assert "+y" in files["b.txt"].patch
+
+
+def test_a_slow_git_diff_is_an_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoints = Checkpoints(str(tmp_path))
+    _write(tmp_path, "a.txt", "1\n")
+    checkpoints.snapshot("r1", "Write")
+    _write(tmp_path, "a.txt", "2\n")
+    slow = tmp_path.parent / "slow-git"
+    slow.write_text("#!/bin/sh\nsleep 5\n")
+    slow.chmod(0o755)
+    real = module.GIT
+    monkeypatch.setattr(module, "GIT_TIMEOUT_S", 0.2)
+    original = module.Checkpoints._patches
+
+    def patched(self: Checkpoints, old: str, new: str, files: int) -> list[tuple[str, bool]]:
+        monkeypatch.setattr(module, "GIT", str(slow))
+        try:
+            return original(self, old, new, files)
+        finally:
+            monkeypatch.setattr(module, "GIT", real)
+
+    monkeypatch.setattr(module.Checkpoints, "_patches", patched)
+    with pytest.raises(CheckpointError, match="too long"):
+        checkpoints.diff(None)

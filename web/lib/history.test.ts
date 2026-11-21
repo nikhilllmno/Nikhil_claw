@@ -58,6 +58,8 @@ describe("history helpers", () => {
     expect(stepSummary(step("run_failed", { code: "timeout", message: "too slow" }))).toBe(
       "timeout: too slow",
     );
+    expect(stepTitle(step("subagent_event", {}))).toBe("Sub-agent step");
+    expect(stepSummary(step("subagent_event", { subagent: "web", text: "Open page" }))).toBe("web: Open page");
     expect(stepSummary(step("usage", { n: 1 }))).toBe("");
   });
 

@@ -39,6 +39,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sama.coding.agents import CodingAgent, label
 from sama.coding.commands import COMMANDS as CODING_COMMANDS
 from sama.coding.commands import NOT_DIRECT, SwitchNotAllowedError, parse_command, set_direct
+from sama.coding_mode.commands import PLAN_COMMAND, plan_action, plan_reply
+from sama.coding_mode.service import CodingService
 from sama.connectors.service import ConnectionService
 from sama.context import PinStore
 from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBinding
@@ -139,6 +141,9 @@ HELP: Final = (
     "/sama undo - restore the session files to before the last run that changed them. /sama"
     " rollback lists the checkpoints of the files; /sama rollback NUMBER restores one (direct"
     " messages)\n"
+    "/sama plan TASK - make a plan first, then work after you approve it. /sama plan shows the"
+    " plan; /sama plan approve, /sama plan edit PLAN, /sama plan reject FEEDBACK, /sama plan"
+    " off (direct messages)\n"
     "/sama pin TEXT - keep a text in the context. /sama pins lists the pins. /sama unpin NUMBER"
     " removes one (direct messages)\n"
     "/sama cron - list and make scheduled jobs. /sama cron help shows more (direct messages)\n"
@@ -387,6 +392,7 @@ class SlackGateway:
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
         checkpoints: CheckpointService | None = None,
+        coding_mode: CodingService | None = None,
     ) -> None:
         """``lockout``, ``followers``, and ``seen`` can be shared by all gateways of the process,
         so that the limits and the repeat check hold for the whole process."""
@@ -403,6 +409,7 @@ class SlackGateway:
         self._jobs = jobs
         self._handoffs = handoffs
         self._checkpoints = checkpoints
+        self._coding_mode = coding_mode
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -860,6 +867,7 @@ class SlackGateway:
                 "sama",
                 *PIN_COMMANDS,
                 *CHECKPOINT_COMMANDS,
+                PLAN_COMMAND,
             ):
                 if name not in ("help", "pair"):
                     return await self._skill(sender, channel, identity, name, rest)
@@ -884,6 +892,8 @@ class SlackGateway:
                 return await self._coding_command(sender, channel, identity, name, rest)
             if name in CHECKPOINT_COMMANDS:
                 return await self._checkpoint(sender, channel, identity, name, rest)
+            if name == PLAN_COMMAND:
+                return await self._plan(sender, channel, identity, rest)
             return await self._stop(sender, channel, identity, rest)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
@@ -1037,6 +1047,42 @@ class SlackGateway:
             raise
         self._spawn(self._follow(place, target, run_id, holder))
         return COMPACTING
+
+    async def _plan(self, sender: str, channel: str, identity: Any, rest: str) -> str:
+        """``/sama plan`` in a direct message: plan mode of coding mode (Section 15.5). A
+        command that sends a message to the agent follows its run, as a message does."""
+        if not channel.startswith("D"):
+            return "Plan mode works in a direct message with the sama app."
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        if len(self._followers) >= self._settings.max_followers:
+            log.warning("too many runs to follow; channel=%s must try again", channel)
+            return BUSY
+        holder = object()
+        self._followers.add(holder)
+        try:
+            task = plan_action(rest)[0] == "task"
+            current = await self._session(place, target, grants, create=task)
+            reply = await plan_reply(
+                self._coding_mode,
+                org_id=target.org_id,
+                user_id=target.user_id,
+                session_id=None if current is None else current.session_id,
+                rest=rest,
+                prefix="/sama ",
+            )
+        except BaseException:
+            self._followers.discard(holder)
+            raise
+        if reply.run_id is None:
+            self._followers.discard(holder)
+        else:
+            self._spawn(self._follow(place, target, reply.run_id, holder))
+        return reply.text
 
     async def _pin(self, sender: str, channel: str, identity: Any, name: str, rest: str) -> str:
         """``/sama pin``, ``pins``, and ``unpin`` in a direct message."""

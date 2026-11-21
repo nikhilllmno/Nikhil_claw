@@ -10,6 +10,7 @@ import {
   type ChatMessage,
   type ClarifyRequest,
   type ExportFormat,
+  type PlanOut,
   OPEN_RUN_STATUSES,
   type OpenRun,
   type SessionDetail,
@@ -38,8 +39,17 @@ import {
   STOP_USAGE,
 } from "@/lib/chat";
 import { isQuotaError } from "@/lib/billing";
+import {
+  NO_PROPOSED_PLAN,
+  PLAN_REJECTED_NOTICE,
+  planCommandError,
+  planModeNotice,
+  planStatusText,
+  proposedPlan,
+} from "@/lib/coding";
 import { saveFile } from "@/lib/history";
 import { runEventStream } from "@/lib/stream";
+import { runHasEnded } from "@/lib/subagentProgress";
 import { ApprovalCard } from "./ApprovalCard";
 import { useApi } from "./AuthProvider";
 import { Composer } from "./Composer";
@@ -80,6 +90,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   // The answer of a busy control: queued, steered, or moved (M3.9).
   const [notice, setNotice] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
+  // The newest plan of the session, for the plan card (M7.9). `null`: none, or not loaded.
+  const [plan, setPlan] = useState<PlanOut | null>(null);
   const [tick, setTick] = useState(0);
   const localId = useRef(0);
   // Keep the view at the end while new text arrives, unless the user scrolled up.
@@ -123,18 +135,27 @@ export function Chat({ sessionId }: { sessionId: string }) {
     }
   }, [api, sessionId]);
 
+  const loadPlan = useCallback(async () => {
+    try {
+      setPlan((await api.getCoding(sessionId)).plan);
+    } catch {
+      // The plan card is a help. The Code page shows the error.
+    }
+  }, [api, sessionId]);
+
   const run = useCallback(
     (effects: Effect[]) => {
       for (const effect of new Set(effects)) {
         if (effect === "reload_messages") {
           void loadMessages();
           void loadNotes();
+          void loadPlan();
           reloadSessions();
         } else if (effect === "reload_approvals") void loadApprovals();
         else void loadQuestions();
       }
     },
-    [loadMessages, loadNotes, loadApprovals, loadQuestions, reloadSessions],
+    [loadMessages, loadNotes, loadPlan, loadApprovals, loadQuestions, reloadSessions],
   );
 
   // Load the session, then follow its event stream.
@@ -162,6 +183,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setLiveState({ ...initialLive, runs });
       void loadMessages();
       void loadNotes();
+      void loadPlan();
       void loadApprovals();
       void loadQuestions();
       let connectedBefore = false;
@@ -248,6 +270,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
     setSendError(null);
     setQuotaError(false);
     setNotice(null);
+    const planProblem = command?.kind === "plan" ? planCommandError(command.plan) : null;
+    if (planProblem !== null) {
+      setSendError(planProblem);
+      return;
+    }
     if (command?.kind === "stop") {
       if (!command.valid) {
         setSendError(STOP_USAGE);
@@ -302,10 +329,52 @@ export function Chat({ sessionId }: { sessionId: string }) {
         setNotice(text);
         return;
       }
+      if (command?.kind === "plan" && ["status", "mode"].includes(command.plan.kind)) {
+        // Plan mode and the newest plan (M7.9).
+        let notice: string;
+        if (command.plan.kind === "mode") {
+          await api.setPlanMode(sessionId, command.plan.on);
+          notice = planModeNotice(command.plan.on);
+        } else {
+          notice = planStatusText(await api.getCoding(sessionId));
+        }
+        clearDraft();
+        setNotice(notice);
+        void loadPlan();
+        return;
+      }
       let runId: string;
       let queued = false;
       let userText: string | null = text;
-      if (command?.kind === "compact") {
+      if (command?.kind === "plan") {
+        const step = command.plan;
+        if (step.kind === "start") {
+          ({ run_id: runId, queued } = await api.startPlan(sessionId, step.task));
+          userText = step.task;
+        } else {
+          // Approve, edit, or reject the newest plan that waits for a decision.
+          const waiting = proposedPlan((await api.getCoding(sessionId)).plan);
+          if (waiting === null) {
+            clearDraft();
+            setPlan(null);
+            setNotice(NO_PROPOSED_PLAN);
+            return;
+          }
+          userText = null;
+          if (step.kind === "reject") {
+            const answer = await api.rejectPlan(sessionId, waiting.id, step.feedback || undefined);
+            clearDraft();
+            if (answer.run_id === null) {
+              setNotice(PLAN_REJECTED_NOTICE);
+              return;
+            }
+            ({ run_id: runId, queued } = { run_id: answer.run_id, queued: answer.queued });
+          } else {
+            const body = step.kind === "edit" ? step.text : undefined;
+            ({ run_id: runId, queued } = await api.approvePlan(sessionId, waiting.id, body));
+          }
+        }
+      } else if (command?.kind === "compact") {
         ({ run_id: runId } = await api.compact(sessionId, command.focus));
         userText = null;
       } else if (command?.kind === "steer") {
@@ -378,10 +447,14 @@ export function Chat({ sessionId }: { sessionId: string }) {
       void loadMessages();
       reloadSessions();
     } catch (e) {
-      // The text stays in the composer: nothing was sent.
-      setSendError(errorText(e, "The message was not sent."));
+      const message = errorText(e, "The message was not sent.");
+      // The text stays in the composer: nothing was sent. When the queue refuses the run of
+      // a plan decision, the API undoes the decision, so the plan stays open.
+      setSendError(message);
       setQuotaError(isQuotaError(e));
     } finally {
+      // A plan command can change the plan: show its state of now.
+      if (command?.kind === "plan") void loadPlan();
       setSending(false);
     }
   };
@@ -441,21 +514,36 @@ export function Chat({ sessionId }: { sessionId: string }) {
         next += 1;
       }
     };
+    const progress = (runId: string) => {
+      const calls = live.tools[runId] ?? [];
+      const subagents = live.subagents[runId] ?? [];
+      if (calls.length === 0 && subagents.length === 0) return null;
+      return (
+        <ToolGroup
+          key={`tools-${runId}`}
+          calls={calls}
+          subagents={subagents}
+          runEnded={runHasEnded(live.runs[runId]?.status)}
+        />
+      );
+    };
     for (const m of messages ?? []) {
       notesBefore(m.created_at);
       if (m.role === "assistant" && m.run_id && !shown.has(m.run_id)) {
         shown.add(m.run_id);
-        const calls = live.tools[m.run_id];
-        if (calls) items.push(<ToolGroup key={`tools-${m.run_id}`} calls={calls} />);
+        const group = progress(m.run_id);
+        if (group) items.push(group);
       }
       items.push(<MessageView key={m.id} message={m} />);
     }
     notesBefore(null);
-    for (const [runId, calls] of Object.entries(live.tools)) {
-      if (!shown.has(runId)) items.push(<ToolGroup key={`tools-${runId}`} calls={calls} />);
+    for (const runId of new Set([...Object.keys(live.tools), ...Object.keys(live.subagents)])) {
+      if (shown.has(runId)) continue;
+      const group = progress(runId);
+      if (group) items.push(group);
     }
     return items;
-  }, [messages, notes, live.tools]);
+  }, [messages, notes, live.tools, live.subagents, live.runs]);
 
   // The open runs, oldest request first, numbered as `/stop NUMBER` counts them (M7.1).
   const runRows = useMemo(() => {
@@ -626,6 +714,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
             }}
           />
         ))}
+        {proposedPlan(plan) !== null ? (
+          <p className={`alert alert-warning ${styles.banner}`} role="status">
+            The agent proposed plan {plan?.version}. Open the <Link href={`/s/${sessionId}/code`}>Code page</Link>{" "}
+            to approve, edit, or reject it. Or send /plan approve.
+          </p>
+        ) : null}
         {sendError ? (
           <p className={`alert alert-error ${styles.banner}`} role="alert">
             {sendError}
@@ -737,6 +831,9 @@ function SessionTools({ sessionId }: { sessionId: string }) {
 
   return (
     <div className={styles.tools}>
+      <Link href={`/s/${sessionId}/code`} className="btn btn-quiet btn-small">
+        Code
+      </Link>
       <Link href={`/s/${sessionId}/runs`} className="btn btn-quiet btn-small">
         Runs
       </Link>
