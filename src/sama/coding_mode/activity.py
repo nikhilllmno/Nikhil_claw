@@ -98,7 +98,8 @@ def result_summary(output: str) -> str | None:
 
 def _command_of(tool: str, arguments: Mapping[str, Any]) -> str:
     if tool == "Bash":
-        value = arguments.get("command") or arguments.get("cmd")
+        # ``summary``: the one-line command of a Claude Code or Codex run (Section 15.4).
+        value = arguments.get("command") or arguments.get("cmd") or arguments.get("summary")
         if isinstance(value, list):
             return " ".join(str(item) for item in value)
         return str(value or "")

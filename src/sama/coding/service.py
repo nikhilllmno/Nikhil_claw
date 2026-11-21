@@ -139,7 +139,10 @@ class CodingService:
         model: str,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         on_event: EventSink | None = None,
+        on_ready: Callable[[], Awaitable[None]] | None = None,
     ) -> CodingOutcome:
+        """``on_ready`` runs after the folder is ready (also after a clone) and before the CLI
+        starts. Coding mode takes its checkpoint there (Section 15.5)."""
         prompt = request.prompt.strip()
         if not prompt:
             raise CodingError("give the task for the coding agent")
@@ -160,6 +163,8 @@ class CodingService:
         except WorkspaceError as error:
             raise CodingError(str(error)) from None
         outcome.workspace = space
+        if on_ready is not None:
+            await on_ready()
         command = cli_command(
             request.agent,
             prompt=prompt,

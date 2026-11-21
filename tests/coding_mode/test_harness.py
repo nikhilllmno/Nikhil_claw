@@ -44,6 +44,8 @@ async def test_before_clones_notes_and_takes_a_checkpoint(
     prep = await hooks.before(object(), scope, token, "codex", False)  # type: ignore[arg-type]
     assert "https://github.com/team/app" in prep.note
     assert (prep.plan_mode, prep.plan_args) == (False, ())
+    assert snapshots.calls == []
+    await hooks.checkpoint(scope, "codex")
     assert snapshots.calls == [(scope.run_id, "codex")]
 
 
@@ -61,6 +63,7 @@ async def test_plan_mode_gives_the_cli_flags_and_stores_the_plan(
     codex = await hooks.before(object(), scope, token, "codex", True)  # type: ignore[arg-type]
     assert codex.plan_args == ()
     assert "whole answer" in codex.note
+    await hooks.checkpoint(scope, "codex")  # a failed checkpoint only logs
     line = await hooks.plan(scope, "1. a\n2. b")
     assert line.startswith("Plan version 1 is saved.")
     state = await coding.state(org_id=org, session_id=session)
@@ -82,3 +85,18 @@ async def test_a_plan_that_cannot_be_stored_gives_a_line(
 def test_codex_has_no_cli_plan_flags() -> None:
     assert plan_mode_for("codex").cli_args == ()
     assert plan_mode_for("claude_code").native_plan_tool == "ExitPlanMode"
+
+
+async def test_the_plan_note_follows_the_judged_plan_mode(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    """Plan mode went off during the approval: the run that the gate judged as a plan run
+    still gets the plan rules."""
+    hooks = _hooks(coding)
+    scope, token = await _run(coding, tenant)
+    assert not await hooks.planning(scope)
+    prep = await hooks.before(object(), scope, token, "codex", True)  # type: ignore[arg-type]
+    assert prep.plan_mode
+    assert "whole answer" in prep.note
+    off = await hooks.before(object(), scope, token, "codex", False)  # type: ignore[arg-type]
+    assert "Plan mode" not in off.note

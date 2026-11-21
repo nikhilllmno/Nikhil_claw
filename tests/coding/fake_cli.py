@@ -83,6 +83,18 @@ def claude(argv: list[str]) -> int:
                 },
             }
         )
+        if mode == "plan_error":
+            _say(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": "API Error: 402 budget_exceeded",
+                    "session_id": session,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            )
+            return 1
         _say(
             {
                 "type": "result",

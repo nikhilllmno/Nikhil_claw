@@ -6755,24 +6755,29 @@ in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding
   block, with `open_pr` false. No MCP tool has this name, so only the runtime asks for it. The
   tool `coding_agent_run` of a sama agent stays blocked in plan mode, because it starts the CLI
   with all permissions.
-- After it has the sandbox and before the CLI starts, the hooks clone the pending repositories
-  and give the note (`CodingPreparer`, the same step as for the SDK runtimes; the note goes
-  after the task), and take one checkpoint of the work folder (`CheckpointService.snapshot`,
-  tool `claude_code` or `codex`). The tools of the CLI do not pass the gate of the runner, so
-  they take no checkpoints. With this checkpoint, the diff of the Code page and `/undo` cover
-  the changes of the CLI.
+- After it has the sandbox, the hooks clone the pending repositories and give the note
+  (`CodingPreparer`, the same step as for the SDK runtimes; the note goes after the task). The
+  plan mode rules of the note come from the plan mode that the gate judged, so a change of plan
+  mode during an approval cannot start a plan run without them.
+- When the folder of the request is ready (also after a clone of the repository of the task)
+  and before the CLI starts, the hooks take one checkpoint of the work folder
+  (`CheckpointService.snapshot`, tool `claude_code` or `codex`). The tools of the CLI do not
+  pass the gate of the runner, so they take no checkpoints. With this checkpoint, the diff of
+  the Code page and `/undo` cover the changes of the CLI.
 - In plan mode, Claude Code starts with `--permission-mode plan` in place of
   `--dangerously-skip-permissions`, and the note asks it to end with `ExitPlanMode`. The parser
   gives the input `plan` of that tool as `CliPlan`. Codex keeps its flags: its own read-only
   sandbox (bubblewrap) does not work in the E2B VM, and with it every command fails. So Codex
   gets only the plan-first note, and its answer is the plan.
-- At the end of a plan mode run, the plan (`CliPlan`, else the answer of the CLI) becomes a
-  proposed plan (`CodingService.propose`), and the answer of the run says how to decide it. An
+- At the end of a plan mode run, the plan (`CliPlan`, else the answer of a CLI that ended
+  without an error) becomes a proposed plan (`CodingService.propose`, at most 30 seconds), and
+  the answer of the run says how to decide it. A failure of the CLI, for example a refused
+  budget, stays a failure of the run. After a cancel, no plan is stored. An
   approval sends the plan as a message; in the direct mode that message goes to the same CLI,
   which then works with all permissions.
-- The commands and the test runs of the CLI come from its `tool_call_*` run events. Their
-  arguments have a one-line `summary` and not the full command, so the Code page shows that
-  summary.
+- The commands and the test runs of the CLI come from its `tool_call_*` run events. For
+  `Bash`, the arguments have a one-line `summary` (at most 160 characters) and not the full
+  command; the commands list reads it, so a long command is cut.
 - The chat shows the progress of `coding_agent_run` (`subagent_event`) as a sub-agent group
   with the name "Claude Code" or "Codex", as for other sub-agents.
 

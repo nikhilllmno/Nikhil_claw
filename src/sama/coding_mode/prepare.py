@@ -79,7 +79,12 @@ class CodingPreparer:
         self._signer = signer
 
     async def prepare(
-        self, sandbox: Sandbox, scope: RunScope, token: str, harness: str | None = None
+        self,
+        sandbox: Sandbox,
+        scope: RunScope,
+        token: str,
+        harness: str | None = None,
+        plan: bool | None = None,
     ) -> str:
         """Clones the pending repositories and returns the note for the run input ("" for
         none). It never raises. Each clone has its own time limit, and a failed clone only
@@ -90,7 +95,8 @@ class CodingPreparer:
             runtime = await self._coding.chat_run(org_id=org_id, run_id=uuid.UUID(scope.run_id))
             if runtime is None:
                 return ""  # a background review or a /compact run has no coding step
-            plan = await self._coding.plan_mode(org_id=org_id, session_id=session_id)
+            if plan is None:
+                plan = await self._coding.plan_mode(org_id=org_id, session_id=session_id)
             pending = await self._coding.pending_repos(org_id=org_id, session_id=session_id)
         except Exception as error:
             log.warning("the coding step failed run=%s: %r", scope.run_id, error)

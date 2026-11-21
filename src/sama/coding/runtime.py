@@ -214,6 +214,10 @@ class _State:
         return json.dumps(data, sort_keys=True).encode()
 
 
+PLAN_SAVE_TIMEOUT_S: Final = 30.0
+"""The longest time to store the plan of a plan mode run."""
+
+
 @dataclass(frozen=True, slots=True)
 class CodingModePrep:
     """What coding mode (Section 15.5) gives a run before the CLI starts."""
@@ -235,6 +239,10 @@ class CodingModeHooks(Protocol):
     async def before(
         self, sandbox: Sandbox, scope: RunScope, token: str, agent: str, plan: bool
     ) -> CodingModePrep: ...
+
+    async def checkpoint(self, scope: RunScope, agent: str) -> None:
+        """Takes a checkpoint of the work folder before the CLI starts."""
+        ...
 
     async def plan(self, scope: RunScope, text: str) -> str:
         """Stores the plan of the run and returns a line for the user, or ""."""
@@ -432,6 +440,12 @@ class CodingAgentRuntime:
                         sandbox, scope, token, self._agent.value, planning
                     )
                 prompt = f"{parsed.prompt}\n\n{prep.note}" if prep.note else parsed.prompt
+                hooks = self._hooks
+
+                async def ready() -> None:
+                    if hooks is not None:
+                        await hooks.checkpoint(scope, self._agent.value)
+
                 folder = state.folder
                 space_key = None
                 if parsed.repo:
@@ -456,6 +470,7 @@ class CodingAgentRuntime:
                     model=model,
                     timeout_s=timeout_s,
                     on_event=events.put,
+                    on_ready=ready,
                 )
                 if resume and outcome.is_error and not outcome.worked:
                     # The saved CLI session is gone (a new sandbox): start a new one.
@@ -549,16 +564,24 @@ class CodingAgentRuntime:
                 yield TextDelta(text="\n\n" + tail, usage=usage)
             if self._hooks is not None and planning and not outcome.timed_out:
                 # Plan mode (Section 15.5): the plan of Claude Code (``ExitPlanMode``), else the
-                # answer of the CLI, is the plan that a person decides.
+                # answer of a CLI that ended well, is the plan that a person decides. A failure
+                # of the CLI stays a failure. No plan is stored after a cancel.
                 plan = plan_text[-1] if plan_text else ("" if outcome.is_error else outcome.text)
-                if plan.strip():
-                    line = await self._hooks.plan(scope, plan)
+                if plan.strip() and run_id not in self._cancelled:
+                    try:
+                        line = await asyncio.wait_for(
+                            self._hooks.plan(scope, plan), timeout=PLAN_SAVE_TIMEOUT_S
+                        )
+                    except TimeoutError:
+                        line = "sama could not save the plan in time. Send /plan to check."
+                    if run_id in self._cancelled:
+                        yield RunFailed(
+                            code=FailureCode.CANCELLED, message="cancelled", usage=usage
+                        )
+                        return
                     if line:
                         yield TextDelta(text="\n\n" + line, usage=usage)
                         text = f"{text}\n\n{line}"
-                    if plan_text:
-                        # Claude Code ends its turn at ``ExitPlanMode``; that is not an error.
-                        outcome.is_error = False
             if outcome.timed_out:
                 yield RunFailed(
                     code=FailureCode.TIMEOUT,

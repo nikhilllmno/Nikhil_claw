@@ -76,7 +76,12 @@ def plan_mode_for(harness: str) -> HarnessPlanMode:
 
 class _Preparer(Protocol):
     async def prepare(
-        self, sandbox: Sandbox, scope: RunScope, token: str, harness: str | None = None
+        self,
+        sandbox: Sandbox,
+        scope: RunScope,
+        token: str,
+        harness: str | None = None,
+        plan: bool | None = None,
     ) -> str: ...
 
 
@@ -116,20 +121,27 @@ class HarnessHooks:
     async def before(
         self, sandbox: Sandbox, scope: RunScope, token: str, agent: str, plan: bool
     ) -> CodingModePrep:
-        """``plan`` is the plan mode that the gate judged for this run."""
-        note = await self._preparer.prepare(sandbox, scope, token, harness=agent)
-        if self._snapshots is not None:
-            try:
-                await self._snapshots.snapshot(
-                    org_id=uuid.UUID(scope.org_id),
-                    session_id=uuid.UUID(scope.session_id),
-                    run_id=scope.run_id,
-                    tool=agent,
-                )
-            except Exception as error:
-                log.warning("no checkpoint before the CLI run=%s: %r", scope.run_id, error)
+        """``plan`` is the plan mode that the gate judged for this run. The plan mode note and
+        the CLI flags come from it, not from a new read, so a change of plan mode during an
+        approval cannot start a planned run without its rules."""
+        note = await self._preparer.prepare(sandbox, scope, token, harness=agent, plan=plan)
         args = plan_mode_for(agent).cli_args if plan else ()
         return CodingModePrep(note=note, plan_mode=plan, plan_args=args)
+
+    async def checkpoint(self, scope: RunScope, agent: str) -> None:
+        """One checkpoint of the work folder after the folder is ready and before the CLI
+        starts. The tools of the CLI take no checkpoints."""
+        if self._snapshots is None:
+            return
+        try:
+            await self._snapshots.snapshot(
+                org_id=uuid.UUID(scope.org_id),
+                session_id=uuid.UUID(scope.session_id),
+                run_id=scope.run_id,
+                tool=agent,
+            )
+        except Exception as error:
+            log.warning("no checkpoint before the CLI run=%s: %r", scope.run_id, error)
 
     async def plan(self, scope: RunScope, text: str) -> str:
         try:

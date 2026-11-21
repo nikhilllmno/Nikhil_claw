@@ -89,7 +89,7 @@ async def test_the_commands_and_pull_requests_come_from_the_run_events(
                 {"call_id": "c2", "is_error": True, "output_preview": "== 1 failed in 0.1s =="},
             ),
             (started, {"call_id": "c3", "name": "Read", "arguments": {"file_path": "a"}}),
-            (started, {"call_id": "c4", "name": "Bash", "arguments": {"command": "npm test"}}),
+            (started, {"call_id": "c4", "name": "Bash", "arguments": {"summary": "npm test"}}),
             (
                 started,
                 {
