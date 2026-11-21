@@ -43,7 +43,7 @@ OLD_PURGE_KINDS = "kind IN ('sandboxes', 'traces', 'browser_contexts')"
 NEW_PURGE_KINDS = "kind IN ('sandboxes', 'traces', 'browser_contexts', 'mem0')"
 _PATTERNS = (
     " OR name ~ '^connection:[0-9a-f-]{36}$' OR name ~ '^trigger:[0-9a-f-]{36}$'"
-    " OR name ~ '^browser_login:[0-9a-f-]{36}$'"
+    " OR name ~ '^browser_login:[0-9a-f-]{36}$' OR name ~ '^custom_tool:[0-9a-f-]{36}$'"
 )
 OLD_VAULT_NAMES = (
     "name IN ('anthropic_api_key', 'openai_api_key', 'brave_api_key', 'telegram_bot_token',"
