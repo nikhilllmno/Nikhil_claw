@@ -105,6 +105,8 @@ async def test_an_org_delete_removes_every_row_of_the_org_and_no_row_of_the_othe
     refs = {(row.kind, json.dumps(row.refs, sort_keys=True)) for row in purges}
     assert ("sandboxes", '{"all": true}') in refs
     assert ("browser_contexts", '{"context_ids": ["ctx-bob"]}') in refs
+    # The Mem0 memories of each user of the org go too (M7.5).
+    assert ("mem0", json.dumps({"user_ids": [str(fresh.ids["bob"])]})) in refs
     trace = fresh.ids["run:b1-shared"].hex
     assert ("traces", json.dumps({"trace_ids": [trace]})) in refs
     async with engine.connect() as connection:
@@ -215,6 +217,12 @@ async def test_a_user_delete_removes_the_private_data_and_keeps_the_shared_data(
                 )
             )
         ).scalar_one()
+        memories = (
+            await connection.execute(
+                select(DataPurge.refs).where(DataPurge.org_id == org_a, DataPurge.kind == "mem0")
+            )
+        ).scalar_one()
+    assert memories == {"user_ids": [str(alice)]}  # the Mem0 memories go too (M7.5)
     assert sessions == {fresh.ids["a1-shared"], fresh.ids["a2-shared"]}
     assert users == {fresh.ids["carol"], fresh.ids["dave"]}
     assert members == 0

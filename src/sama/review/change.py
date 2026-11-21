@@ -72,15 +72,30 @@ class ChangeRequest:
     subagents: Sequence[Any] | None = None
     toolsets: Sequence[str] | None = None
     group_toolsets: Sequence[str] | None = None
+    delegation_model: str | None = None
+    """The model of the children of ``delegate_task``. The empty text: the model of the
+    profile."""
+    memory_provider: str | None = None
     rules: Sequence[tuple[str, str]] | None = None
     """``(tool, action)`` pairs. The action ``none`` removes the rule."""
 
     def fields(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
-        for field in ("name", "runtime", "model", "subagents", "toolsets", "group_toolsets"):
+        for field in (
+            "name",
+            "runtime",
+            "model",
+            "subagents",
+            "toolsets",
+            "group_toolsets",
+            "delegation_model",
+            "memory_provider",
+        ):
             value = getattr(self, field)
             if value is not None:
                 out[field] = value if isinstance(value, str) else list(value)
+        if out.get("delegation_model") == "":
+            out["delegation_model"] = None
         if self.rules is not None:
             out["rules"] = [list(pair) for pair in self.rules]
         return out
@@ -101,6 +116,8 @@ def _locked(run: Any) -> LockedProfile:
         group_toolsets=(
             [str(t) for t in run.group_toolsets] if isinstance(run.group_toolsets, list) else []
         ),
+        delegation_model=run.delegation_model,
+        memory_provider=run.memory_provider,
     )
 
 

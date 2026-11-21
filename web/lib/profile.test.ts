@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentProfile } from "./api";
-import { diffDraft, newSubagent, runtimeOption, toDraft, validateDraft, withRuntime } from "./profile";
+import { diffDraft, memoryProviderLabel, newSubagent, runtimeOption, toDraft, validateDraft, withRuntime } from "./profile";
 
 const profile: AgentProfile = {
   id: "p",
@@ -23,6 +23,8 @@ const profile: AgentProfile = {
     },
   ],
   library_subagents: [],
+  delegation_model: null,
+  memory_provider: "builtin",
   updated_at: "2026-11-20T00:00:00Z",
   editable: true,
   options: {
@@ -33,6 +35,7 @@ const profile: AgentProfile = {
       { name: "claude_agent_sdk", models: ["claude-opus-5-5", "claude-sonnet-5-5"], subagents: true },
       { name: "openai_agents_sdk", models: ["gpt-6.2-astra", "gpt-6.2-sol"], subagents: false },
     ],
+    memory_providers: ["builtin", "mem0"],
     limits: {
       name_max_chars: 80,
       soul_max_chars: 20000,
@@ -91,6 +94,43 @@ describe("library sub-agents", () => {
     expect(validateDraft(full, profile.options.limits)).toMatch(/at most 10/);
     full.librarySubagents = full.librarySubagents.slice(0, 9);
     expect(validateDraft(full, profile.options.limits)).toBeNull();
+  });
+});
+
+describe("delegation model and memory provider", () => {
+  it("starts from the saved values", () => {
+    expect(toDraft(profile)).toMatchObject({ delegationModel: "", memoryProvider: "builtin" });
+    const saved = { ...profile, delegation_model: "claude-opus-5-5", memory_provider: "mem0" as const };
+    expect(toDraft(saved)).toMatchObject({ delegationModel: "claude-opus-5-5", memoryProvider: "mem0" });
+    expect(diffDraft(saved, toDraft(saved))).toEqual({});
+  });
+
+  it("sends only the changed field", () => {
+    const draft = toDraft(profile);
+    draft.delegationModel = "claude-opus-5-5";
+    expect(diffDraft(profile, draft)).toEqual({ delegation_model: "claude-opus-5-5" });
+    draft.memoryProvider = "mem0";
+    expect(diffDraft(profile, draft)).toEqual({ delegation_model: "claude-opus-5-5", memory_provider: "mem0" });
+  });
+
+  it("sends an empty string to go back to the model of the agent", () => {
+    const saved = { ...profile, delegation_model: "claude-opus-5-5" };
+    const draft = { ...toDraft(saved), delegationModel: "" };
+    expect(diffDraft(saved, draft)).toEqual({ delegation_model: "" });
+  });
+
+  it("drops a delegation model that the new runtime does not have", () => {
+    const saved = { ...profile, delegation_model: "claude-opus-5-5" };
+    const draft = withRuntime(toDraft(saved), saved, "openai_agents_sdk");
+    expect(draft.delegationModel).toBe("");
+    expect(diffDraft(saved, draft)).toMatchObject({ delegation_model: "" });
+    expect(withRuntime(draft, saved, "claude_agent_sdk").delegationModel).toBe("claude-opus-5-5");
+  });
+
+  it("names the providers for people", () => {
+    expect(memoryProviderLabel("builtin")).toBe("Built-in only");
+    expect(memoryProviderLabel("mem0")).toBe("Built-in and Mem0");
+    expect(memoryProviderLabel("other")).toBe("other");
   });
 });
 

@@ -31,6 +31,7 @@ from sama.admin.bootstrap import DEFAULT_MODEL, default_profile
 from sama.db.models import (
     BUSY_MODES,
     MAX_PARALLEL_RUNS_CAP,
+    MEMORY_PROVIDERS,
     AgentProfile,
     AuditEntry,
     Membership,
@@ -89,6 +90,8 @@ PROFILE_FIELDS: Final = (
     "reasoning_effort",
     "busy_mode",
     "max_parallel_runs",
+    "delegation_model",
+    "memory_provider",
 )
 """The fields of a profile that an edit, a proposal, or a revert can change."""
 ADMIN_ONLY_FIELDS: Final = ("budget", "reasoning_effort")
@@ -106,6 +109,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "reasoning_effort",
         "busy_mode",
         "max_parallel_runs",
+        "delegation_model",
+        "memory_provider",
     ),
     "toolsets": ("toolsets", "group_toolsets"),
     "policy": ("rules",),
@@ -160,6 +165,11 @@ class ProfileChanges:
     """The most open chat runs of one session, 1 to ``MAX_PARALLEL_RUNS_CAP``."""
     library_subagents: Sequence[str] | None = None
     """The ids of library agents (Section 13.3). ``check_library`` checks them."""
+    delegation_model: str | None = None
+    """The model of the children of ``delegate_task`` (Section 13.2). The empty text means the
+    model of the profile."""
+    memory_provider: str | None = None
+    """``builtin`` or ``mem0`` (Section 8.2)."""
 
 
 def profile_options(runtime: RuntimeKind, plan: str | None = None) -> dict[str, Any]:
@@ -178,6 +188,7 @@ def profile_options(runtime: RuntimeKind, plan: str | None = None) -> dict[str, 
             "max_cost_usd": None if caps.get("max_cost_usd") is None else str(caps["max_cost_usd"]),
             "max_wall_time_s": caps.get("max_wall_time_s"),
         },
+        "memory_providers": list(MEMORY_PROVIDERS),
         "runtimes": [
             {
                 "name": kind.value,
@@ -357,12 +368,32 @@ def planned_values(profile: LockedProfile, after: Mapping[str, Any]) -> dict[str
             values["model"] = model
         if profile.review_model is not None and not model_is_known(runtime, profile.review_model):
             values["review_model"] = None
+        if (
+            profile.delegation_model is not None
+            and "delegation_model" not in after
+            and not model_is_known(runtime, profile.delegation_model)
+        ):
+            # The children use the model of the profile until an admin picks a new one.
+            values["delegation_model"] = None
     elif new_model is not None and new_model != profile.model:
         # The stored model can be a model that the table no longer lists. Only a new value must
         # be in the list.
         if new_model not in known_models(runtime):
             raise ProfileError("the model is not known for the runtime of the profile")
         values["model"] = new_model
+    if "delegation_model" in after:
+        child = after["delegation_model"]
+        child = None if child is None or str(child).strip() == "" else str(child).strip()
+        if child is not None and child not in known_models(runtime):
+            raise ProfileError("the delegation model is not known for the runtime of the profile")
+        if child != profile.delegation_model:
+            values["delegation_model"] = child
+    if "memory_provider" in after:
+        provider = str(after["memory_provider"])
+        if provider not in MEMORY_PROVIDERS:
+            raise ProfileError(f"the memory provider is one of {', '.join(MEMORY_PROVIDERS)}")
+        if provider != profile.memory_provider:
+            values["memory_provider"] = provider
     for field in ("toolsets", "group_toolsets"):
         if field in after:
             toolsets = _check_toolsets([str(name) for name in after[field] or []])
@@ -535,6 +566,10 @@ async def update_profile(
         after["max_parallel_runs"] = changes.max_parallel_runs
     if changes.library_subagents is not None:
         after["library_subagents"] = list(changes.library_subagents)
+    if changes.delegation_model is not None:
+        after["delegation_model"] = changes.delegation_model.strip() or None
+    if changes.memory_provider is not None:
+        after["memory_provider"] = changes.memory_provider
     if "soul" in after:
         # Checked before the lock, so a bad soul does not wait for the lock.
         if len(after["soul"]) > SOUL_MAX_CHARS:

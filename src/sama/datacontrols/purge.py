@@ -9,7 +9,8 @@ tries again with a backoff until it works:
 - ``traces``: asks Langfuse to delete the traces of the deleted runs. The delete writes these
   rows with a later ``next_attempt_at`` (``TRACE_DELAY``);
 - ``browser_contexts``: deletes the Browserbase contexts (cookies and logins) of the deleted
-  users (M5.1).
+  users (M5.1);
+- ``mem0``: deletes the Mem0 memories of the deleted users (M7.5, Section 8.2).
 
 A process without E2B, Langfuse, or Browserbase leaves those rows for a process that has them.
 """
@@ -72,6 +73,12 @@ class BrowserContextDeleter(Protocol):
     async def delete_contexts(self, context_ids: Sequence[str]) -> None: ...
 
 
+class MemoryDeleter(Protocol):
+    """``Mem0Provider`` in production. A user without memories counts as deleted."""
+
+    async def forget(self, org_id: str, user_ids: Sequence[str]) -> None: ...
+
+
 class PurgeWorker:
     def __init__(
         self,
@@ -80,11 +87,13 @@ class PurgeWorker:
         sandboxes: SandboxBackend | None = None,
         traces: TraceDeleter | None = None,
         browser_contexts: BrowserContextDeleter | None = None,
+        memories: MemoryDeleter | None = None,
     ) -> None:
         self._engine = engine
         self._sandboxes = sandboxes
         self._traces = traces
         self._browser_contexts = browser_contexts
+        self._memories = memories
 
     @property
     def kinds(self) -> tuple[str, ...]:
@@ -95,6 +104,7 @@ class PurgeWorker:
                 ("sandboxes", self._sandboxes),
                 ("traces", self._traces),
                 ("browser_contexts", self._browser_contexts),
+                ("mem0", self._memories),
             )
             if backend is not None
         )
@@ -168,6 +178,12 @@ class PurgeWorker:
             if self._traces is None:
                 return False
             await self._traces.delete_traces([str(trace) for trace in refs.get("trace_ids", [])])
+            return True
+        if kind == "mem0":
+            if self._memories is None:
+                return False
+            users = [str(user) for user in refs.get("user_ids", [])]
+            await self._memories.forget(str(org_id), users)
             return True
         if kind == "browser_contexts":
             if self._browser_contexts is None:

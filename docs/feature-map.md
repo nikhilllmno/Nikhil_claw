@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft v0.3, 2026-11-18 |
+| Status | Draft v0.4, 2026-11-21 |
 | Source | Hermes Agent, commit `0e8e4216` (MIT, Copyright (c) 2025 Nous Research) |
 | Design | [`architecture.md`](architecture.md) (sections are linked as §N) |
 | Plan | [`roadmap.md`](roadmap.md) (milestones M1 to M6) |
@@ -39,7 +39,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Fallback model and credential pools | `agent/credential_pool*.py` | The model proxy retries on a second key or model of the same provider. | Adapt | M3 |
 | Prompt caching | `agent/prompt_caching*.py` | SDK caching plus the frozen prefix. Proxy records cache tokens. | SDK | M1 |
 | Reasoning effort settings | config `agent.reasoning_effort` | Profile setting `reasoning_effort` (`low`, `medium`, `high`, or the model default), set in the Harness section of the settings console. The adapters give it to the SDK (`effort` for Claude, `reasoning.effort` for OpenAI) (§17.7). | SDK | M7 (M7.10 done) |
-| Mixture of Agents (`hermes moa`) | `agent/moa_loop.py` | Not planned. Sub-agents cover most uses. | Defer | — |
+| Mixture of Agents (`hermes moa`) | `agent/moa_loop.py` | Sama tool `moa` in the toolset `moa`: three models of Anthropic, OpenAI, and Gemini answer at the same time, and an aggregator model writes one answer. A cost cap per call, metered like the model proxy. Children do not get it (§10.2.2). | Adapt | M7 (M7.5 done) |
 | Codex app-server runtime | `agent/transports/codex_app_server.py` | Since M7.2: the runtimes `codex` and `claude_code` run the Codex CLI (`codex exec --json`) and the Claude Code CLI (`claude -p`, stream-json) headless in the session sandbox, through the model proxy and the git proxy. They implement the same `AgentRuntime` contract. A profile chooses them, or a session switches with `/codex` and `/claude` until `/sama` (§15.4). Sama uses `codex exec`, not the app server. | Adapt | M7 (M7.2 done) |
 | Hand work to Claude Code or Codex (skills) | `skills/autonomous-ai-agents/` | The tool `coding_agent_run(agent, prompt, repo, open_pr, session)`, the commands `/claude <task>` and `/codex <task>`, and the builtin skills `claude-code` and `openai-codex` (our own text). The result has the summary, the diff, and an optional pull request. Approvals (`ask` by default), budgets, and time limits apply (§15.4). | Adapt | M7 (M7.2 done) |
 
@@ -51,9 +51,10 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `read_file`, `write_file`, `patch`, `search_files` | `tools/file_tools.py` | Native file tools (Claude `Read`, `Write`, `Edit`, `Grep`; OpenAI sandbox shell in M3.6, the filesystem capability and `apply_patch` later). | SDK | M1 |
 | Terminal backends (local, Docker, SSH, Modal, Daytona, ...) | `tools/environments/` | One `SandboxProvider`: E2B in the cloud, Docker for development and CI (D5). | Adapt | M1 |
 | `web_search`, `web_extract` | `tools/web_tools.py` | Sama tools, search provider key on the control plane (§10.2). | Adapt | M1 |
-| `x_search` | `tools/x_search_tool.py` | Through an integration if needed. | Defer | — |
+| `x_search` | `tools/x_search_tool.py` | Sama tool in the `web` toolset: the recent search of the X API v2 with the X token of the org or of sama, at most 20 posts, untrusted content (§10.2.2). | Adapt | M7 (M7.5 done) |
 | `vision_analyze` | `tools/vision_tools.py` | Sama `media` tool. Images from Telegram and Slack are stored, and a vision model answers questions about them (§11.7). | Adapt | M2 (done) |
-| `video_analyze`, `video_generate` | `tools/vision_tools.py`, `tools/video_generation_tool.py` | Not planned. | Defer | — |
+| `video_analyze` | `tools/vision_tools.py` | Sama `media` tool with Gemini: a YouTube link, an `https` video file, or a file of the sandbox (at most 14 MB). Frames and audio in one call, metered (§10.2.2). | Adapt | M7 (M7.5 done) |
+| `video_generate` | `tools/video_generation_tool.py` | Not yet: a video takes minutes to make, costs much more than an image, and needs a new kind of generated file and channel delivery (§10.2.2, A4). | Defer | — |
 | `image_generate` | `tools/image_generation_tool.py` | Sama `media` tool with the OpenAI image model. Telegram sends a photo, Slack uploads a file, and the API lists the file (§11.8). | Adapt | M4 (M4.9 done) |
 | `text_to_speech` | `tools/tts_tool.py` | Sama `media` tool. Telegram sends a voice note, and Slack uploads the audio file (§11.8). | Adapt | M4 (M4.9 done) |
 | Speech to text for voice memos | `tools/transcription_tools.py` | Gateway transcribes inbound voice with the OpenAI transcription model before the run (§11). | Adapt | M1 |
@@ -61,9 +62,9 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `clarify` | `tools/clarify_tool.py` | Sama tool, rendered as buttons per channel. Denied in unattended runs. | Adapt | M1 |
 | `execute_code` (RPC to tools) | `tools/code_execution_tool.py` | Sama `code_exec`: Python in the sandbox with a stub that calls sama tools over MCP. Only stdout returns to the model (§10.2). | Adapt | M4 (M4.8 done) |
 | User-defined tools (no code) | none (Hermes adds tools in Python through `tools/registry.py` and plugins) | Custom tools from the web app or the API: an HTTP request tool (URL and body templates, auth from the vault bound to one origin, response mapping) or a Python or Node script in the session sandbox, with a JSON schema, a description, and a policy. Versions with revert, a test button, and scopes like skills. Both runtimes reach them through `tool_search` as `custom_<name>` (§10.8). | New | M7 (M7.3 done) |
-| `computer_use` (desktop control) | `tools/computer_use_tool.py` | Browser vision mode (§14) covers web apps. Full desktop control is not planned. | Defer | — |
+| `computer_use` (desktop control) | `tools/computer_use_tool.py` | Browser vision mode (§14) covers web apps. Full desktop control is desktop-only and is not planned. | Defer | — |
 | `manage_connections` | `tools/connectors/tool.py` | `connections_list`, `connection_request` (a link to the Connections page), `connection_test`. Add, change, and remove happen in the web app. `/connect` gives a link, so secrets never enter chat (§10.3). | Adapt | M3 (M3.4 done) |
-| Discord and Feishu tools | `tools/discord_tool.py`, `tools/feishu_*.py` | Through Composio toolkits when needed. | Defer | — |
+| Discord and Feishu tools | `tools/discord_tool.py`, `tools/feishu_*.py` | An org adds a Discord or Feishu (Lark) MCP server as a connection (`mcp_remote` or `mcp_hosted`, §10.3). Its tools come behind `tool_search`. No sama code. A Discord channel is M7.8. | Adapt | M3, M4 (connections done) |
 | Desktop-only tools (`desktop_ui`, `project`, `catalog`) | `tools/project_tools.py` and others | No desktop app. | Skip | — |
 | No agent-callable `send_message` | `toolsets.py` | Same rule: replies go to the trigger's channel (§10.1). | Adapt | M1 |
 | Toolset bundles (`coding`, `safe`, platform bundles) | `toolsets.py` | Presets `assistant`, `coding`, `safe`, `cron` (§10.2). | Adapt | M1 |
@@ -81,7 +82,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Bundled skills (44) and optional skills (141) | `skills/`, `optional-skills/` | 70 builtin skills that sama wrote (68 from M7.7, and `claude-code` and `openai-codex` from M7.2). They cover each category of the Hermes bundled skills except `apple` (Mac only): `autonomous-ai-agents` (`agents`), `creative`, `devops`, `email`, `media`, `note-taking` (`notes`), `productivity`, `research`, `social-media` (`social`), `software-development` (`software`), and `web`. Each skill has a category tag, `requires_toolsets`, and its own test (§9.2). No Hermes skill text is copied. | Adapt | M2 (done), M7 (M7.7 done) |
 | Skills Hub install with quarantine and scan | `tools/skills_hub*.py`, `skills_guard.py` | `skill_import` from a public GitHub URL with an import scan, the skill lint and injection scan, and an approval (§9.6). `agentskills.io` is later. | Adapt | M4 (M4.10 done) |
 | Conditional activation (`requires_toolsets`, platforms) | frontmatter | Same frontmatter keys. Skills whose tools are missing are hidden. | Adapt | M2 (done) |
-| Per-skill config | `skills.config` | Skill settings per workspace, filled in the web app. The M3.12 skill editor changes only `SKILL.md` and the files. The settings form comes later. | Adapt | Later |
+| Per-skill config | `skills.config` | The `config` block of `SKILL.md` declares the settings. A workspace admin fills them in the skill editor of the web app, and `skill_view` shows them as data. No secrets (§9.8). | Adapt | M7 (M7.5 done) |
 | Skill bundles | `agent/skill_bundles.py` | Agent profiles list skills. | Adapt | M2 (done) |
 
 ## 4. Memory
@@ -92,7 +93,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `memory` tool: add, patch, remove | `tools/memory_tool.py` | Same actions. Over-limit writes fail and return the current entries. | Adapt | M2 (M2.1 done) |
 | Frozen memory snapshot in the prompt | `agent/memory_manager.py` | Snapshot in the frozen prefix. New writes apply from the next session. | Adapt | M2 (M2.1 done) |
 | Memory nudges | `agent/background_review.py` | Background review every 10 user turns (§9.4.1). | Adapt | M2 (M2.4 done) |
-| External memory providers (Mem0, Honcho, ...) | `plugins/memory/` | Optional Mem0 provider behind a `MemoryProvider` interface. | Defer | — |
+| External memory providers (Mem0, Honcho, ...) | `plugins/memory/` | Optional Mem0 provider behind a `MemoryProvider` interface, per profile. The built-in memory stays the default. Private turns sync to Mem0, `memory_recall` searches them, and a delete purges them (§8.2). Honcho and others can use the same interface. | Adapt | M7 (M7.5 done) |
 | Memory history | none (files only) | `memory_revisions` table with author, run, and reason. Revert in the API (M2.1) and in the memory editor of the web app (M3.12). | New | M2, M3 (M2.1 and M3.12 done) |
 
 ## 5. Sessions
@@ -176,7 +177,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 |---|---|---|---|---|
 | `delegate_task` (single and batch) | `tools/delegate_tool.py` | Child session and run in its own sandbox. Summary returns to the parent (§13.2). | Adapt | M4 (done, M4.6) |
 | Limits: depth 1, 10 children, blocked tools | `tools/delegate_tool_config.py` | Same defaults. Child runs also have a cost budget, and lose `tasks`, `memory`, `clarify`, `cron`, `connections`, and `integrations` (§13.2). | Adapt | M4 (done, M4.6) |
-| Cheaper model for children | `delegation.model` | Child model per profile. M4.6 children use the model of the parent profile. | Adapt | Later |
+| Cheaper model for children | `delegation.model` | `agent_profiles.delegation_model`: the model of the children of `delegate_task`, set in the agent settings of the web app. Without it, the model of the profile (§13.2). | Adapt | M7 (M7.5 done) |
 | Native in-run sub-agents | none (Hermes has its own loop) | Claude `agents` (M2.7 done). OpenAI agents as tools (M7.4 done). Handoffs are not used (§13). | SDK | M2 and M7 (done) |
 | Sub-agent library | none (Hermes delegates with ad hoc prompts) | Personal, workspace, and org library agents with a prompt, toolsets, a model, and limits. A profile uses them, `delegate_task(agent=...)` starts one, and the web app edits them with versions and a test run (§13.3). | Sama | M7 (done, M7.4) |
 | Background delegation and steering | `tools/async_delegation*.py` | `delegate_status`, cancel, and steer for children. Steer is a message after the current child run (§13.2). | Adapt | M4 (done, M4.6) |

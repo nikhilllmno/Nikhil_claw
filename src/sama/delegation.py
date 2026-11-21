@@ -32,7 +32,7 @@ from sama.orchestrator.queue import QueueError, RunQueue
 from sama.runtime.contract import RuntimeKind
 from sama.subagent_library import Agent as LibraryAgent
 from sama.subagent_library import find_by_name, usable_agents
-from sama.subagents import supports_subagents
+from sama.subagents import model_is_known, supports_subagents
 from sama.tenancy.authority import run_user
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import redact
@@ -122,6 +122,20 @@ def child_budget(task: ChildTask, agent: LibraryAgent | None = None) -> dict[str
         "max_cost_usd": str(cost),
         "max_wall_time_s": CHILD_MAX_WALL_TIME_S,
     }
+
+
+def child_model(runtime: str, model: str | None) -> str | None:
+    """The model of a child run: ``agent_profiles.delegation_model`` when the runtime of the
+    profile knows it, else ``None`` (the model of the profile, Section 13.2)."""
+    if not model:
+        return None
+    try:
+        kind = RuntimeKind(runtime)
+    except ValueError:
+        return None
+    if kind is RuntimeKind.FAKE or model_is_known(kind, model):
+        return model
+    return None
 
 
 def child_prompt(task: ChildTask) -> str:
@@ -313,8 +327,17 @@ class DelegationService:
                     Run.kind,
                     Run.status.label("run_status"),
                     Run.toolsets.label("run_toolsets"),
+                    AgentProfile.runtime,
+                    AgentProfile.delegation_model,
                 )
                 .join(Run, and_(Run.org_id == Session.org_id, Run.session_id == Session.id))
+                .join(
+                    AgentProfile,
+                    and_(
+                        AgentProfile.org_id == Session.org_id,
+                        AgentProfile.id == Session.agent_profile_id,
+                    ),
+                )
                 .where(
                     Session.org_id == ids.org_id,
                     Session.id == ids.session_id,
@@ -370,6 +393,13 @@ class DelegationService:
             # ``enqueue_in`` gives each run of a library agent session the toolsets, the limits,
             # and the model of the agent (Section 13.3).
             budget=child_budget(task, agent),
+            # The cheaper model of the children of the profile (M7.5). A library agent with its
+            # own model keeps it.
+            model=(
+                None
+                if agent is not None and agent.model
+                else child_model(parent.runtime, parent.delegation_model)
+            ),
             # The child keeps the toolset limit of the parent run (a trigger run, Section 12.2).
             toolsets=narrow_toolsets(parent.run_toolsets),
         )

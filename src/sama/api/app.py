@@ -85,6 +85,8 @@ from sama.api.skill_editor import (
     SkillCatalog,
     SkillDetail,
     SkillEditor,
+    SkillSettingsOut,
+    SkillSettingsWrite,
     SkillState,
     SkillVersionDetail,
     SkillWrite,
@@ -667,6 +669,10 @@ class TriggerEdit(_Edit):
     status: Literal["active", "disabled"] | None = None
 
 
+ModelKeyProvider = Literal["anthropic", "openai"]
+"""The providers of the org model keys (Section 17.3). Gemini is not a runtime provider."""
+
+
 class ProfileEdit(_Edit):
     """The fields to change. Every field is optional, and a body has at least one."""
 
@@ -692,6 +698,11 @@ class ProfileEdit(_Edit):
         Annotated[list[Annotated[str, Field(max_length=36)]], Field(max_length=8)] | None
     ) = None
     """The ids of library agents (Section 13.3), in order."""
+
+    delegation_model: Annotated[str, Field(max_length=100)] | None = None
+    """The model of the children of ``delegate_task``. The empty text: the model of the
+    profile (Section 13.2)."""
+    memory_provider: Literal["builtin", "mem0"] | None = None
 
     nullable: ClassVar[frozenset[str]] = frozenset({"reasoning_effort"})
     busy_mode: Literal["steer", "parallel", "queue"] | None = None
@@ -1721,12 +1732,12 @@ class SamaApi:
 
         @app.put("/orgs/{org_id}/model-keys/{provider}")
         async def set_model_key(
-            principal: Me, org_id: uuid.UUID, provider: Provider, body: ModelKeyIn
+            principal: Me, org_id: uuid.UUID, provider: ModelKeyProvider, body: ModelKeyIn
         ) -> dict[str, Any]:
             grants = await self._chat_admin(principal, org_id)
             try:
                 status = await self._require_model_keys().set(
-                    org_id, provider, body.api_key, grants.user_id
+                    org_id, Provider(provider), body.api_key, grants.user_id
                 )
             except ModelKeyError as error:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
@@ -1734,11 +1745,11 @@ class SamaApi:
 
         @app.delete("/orgs/{org_id}/model-keys/{provider}", status_code=204)
         async def remove_model_key(
-            principal: Me, org_id: uuid.UUID, provider: Provider
+            principal: Me, org_id: uuid.UUID, provider: ModelKeyProvider
         ) -> Response:
             grants = await self._chat_admin(principal, org_id)
             try:
-                await self._require_model_keys().remove(org_id, provider, grants.user_id)
+                await self._require_model_keys().remove(org_id, Provider(provider), grants.user_id)
             except ModelKeyError as error:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             return Response(status_code=204)
@@ -2430,6 +2441,18 @@ class SamaApi:
             await self._permit(principal, org_id, "skills.write", grants)
             return await self._editor().write(principal, workspace_id, body)
 
+        @app.get("/workspaces/{workspace_id}/skills/{name}/settings")
+        async def skill_settings(
+            principal: Me, workspace_id: uuid.UUID, name: str
+        ) -> SkillSettingsOut:
+            return await self._editor().settings(principal, workspace_id, name)
+
+        @app.put("/workspaces/{workspace_id}/skills/{name}/settings")
+        async def put_skill_settings(
+            principal: Me, workspace_id: uuid.UUID, name: str, body: SkillSettingsWrite
+        ) -> SkillSettingsOut:
+            return await self._editor().put_settings(principal, workspace_id, name, body)
+
         @app.get("/workspaces/{workspace_id}/archived-skills")
         async def archived_skills(principal: Me, workspace_id: uuid.UUID) -> list[ArchivedSkill]:
             return await self._editor().archived(principal, workspace_id)
@@ -2583,6 +2606,8 @@ class SamaApi:
                         AgentProfile.busy_mode,
                         AgentProfile.max_parallel_runs,
                         AgentProfile.library_subagents,
+                        AgentProfile.delegation_model,
+                        AgentProfile.memory_provider,
                         AgentProfile.updated_at,
                         select(Org.plan)
                         .where(Org.id == AgentProfile.org_id)
@@ -2617,6 +2642,8 @@ class SamaApi:
             "busy_mode": row.busy_mode,
             "max_parallel_runs": row.max_parallel_runs,
             "library_subagents": [str(value) for value in row.library_subagents or []],
+            "delegation_model": row.delegation_model,
+            "memory_provider": row.memory_provider,
             "updated_at": row.updated_at.isoformat(),
             "editable": await self._can_manage_agents(org_id, grants),
             "options": profile_options(runtime, row.plan),

@@ -68,6 +68,12 @@ class SecretName(StrEnum):
     """The SendGrid API key of the email integration (Section 11.9)."""
     EMAIL_LINK_SECRET = "email_link_secret"  # noqa: S105
     """The key that signs the approval links in emails (Section 11.9)."""
+    GEMINI_API_KEY = "gemini_api_key"
+    """The Gemini key of ``video_analyze`` and of ``moa`` (Section 10.2.2, M7.5)."""
+    X_BEARER_TOKEN = "x_bearer_token"  # noqa: S105
+    """The bearer token of the X API for ``x_search`` (Section 10.2.2, M7.5)."""
+    MEM0_API_KEY = "mem0_api_key"
+    """The Mem0 key of the ``mem0`` memory provider (Section 8.2, M7.5)."""
 
 
 ConnectionSecretName = NewType("ConnectionSecretName", str)

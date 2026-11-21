@@ -23,6 +23,9 @@ _DATED_ID: Final = re.compile(r"^(?P<base>.+?)-(?:\d{8}|\d{4}-\d{2}-\d{2})$")
 class Provider(StrEnum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+    GEMINI = "gemini"
+    """Only the tools of the control plane call Gemini (``video_analyze`` and ``moa``,
+    Section 10.2.2). The model proxy has no Gemini route."""
 
 
 class _Frozen(BaseModel):
@@ -84,12 +87,15 @@ class ProviderPrices(_Frozen):
 class PriceTable(_Frozen):
     anthropic: ProviderPrices
     openai: ProviderPrices
+    gemini: ProviderPrices = Field(default_factory=lambda: ProviderPrices(models={}))
 
     @classmethod
     def load(cls, path: Path = PRICES_FILE) -> Self:
         return cls.model_validate(tomllib.loads(path.read_text(encoding="utf-8")))
 
     def _prices(self, provider: Provider) -> ProviderPrices:
+        if provider is Provider.GEMINI:
+            return self.gemini
         return self.anthropic if provider is Provider.ANTHROPIC else self.openai
 
     def lookup(self, provider: Provider, model: str) -> ModelPrice | None:

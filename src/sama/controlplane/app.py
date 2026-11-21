@@ -58,7 +58,7 @@ from sama.context import ContextArchive
 from sama.context.session_items import PostgresSessionItems
 from sama.controlplane.settings import ControlPlaneSettings
 from sama.customtools import CustomToolService
-from sama.datacontrols.purge import PurgeWorker, SandboxBackend
+from sama.datacontrols.purge import MemoryDeleter, PurgeWorker, SandboxBackend
 from sama.datacontrols.service import DataControls, ServiceCleanup
 from sama.datacontrols.sweep import RetentionSweep
 from sama.db.engine import create_engine
@@ -78,8 +78,11 @@ from sama.integrations.whatsapp_hub import WhatsAppHub
 from sama.media.generate import GeneratedMediaStore, ImageService, SpeechService
 from sama.media.meter import MediaMeter
 from sama.media.store import AttachmentStore
+from sama.media.video import VideoService
 from sama.media.vision import VisionService
 from sama.memory import MemoryService, PostgresMemoryStore
+from sama.memory.provider import Mem0Provider, MemoryRecall, MemorySync
+from sama.moa import MIN_REFERENCES, MOA_KEYS, MixtureService
 from sama.modelkeys import ModelKeys
 from sama.modelproxy.app import ModelProxy, ProxySettings
 from sama.modelproxy.ledger import UsageLedger
@@ -108,6 +111,7 @@ from sama.server import OpenAICompat, SamaMcpServer, ServerCore
 from sama.server.mcp import MCP_PATH as SERVER_MCP_PATH
 from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, SkillLibrary
 from sama.skills.importer import SkillImporter
+from sama.skills.settings import SkillSettingsStore
 from sama.tasks.dispatcher import TaskDispatcher
 from sama.tasks.runs import TaskTools
 from sama.tenancy.regions import set_home_regions
@@ -123,6 +127,7 @@ from sama.tools.sama_pr import SamaPr
 from sama.tools.server import MCP_PATH, ToolServer
 from sama.tools.todo import PostgresTodoStore
 from sama.tools.web import BraveSearch
+from sama.tools.x import XSearch
 from sama.triggers.service import TriggerService
 from sama.vault.redact import default_redactor
 from sama.vault.store import OrgKeys, SecretName, Vault
@@ -201,8 +206,14 @@ def build(
             SecretName.OPENAI_API_KEY: settings.openai_key,
             SecretName.BRAVE_API_KEY: settings.brave_key,
             SecretName.COMPOSIO_API_KEY: settings.composio_key,
+            SecretName.GEMINI_API_KEY: settings.gemini_key,
+            SecretName.X_BEARER_TOKEN: settings.x_bearer_token,
+            SecretName.MEM0_API_KEY: settings.mem0_key,
         },
     )
+    # The external memory of Section 8.2 (M7.5). Without a Mem0 key for any org, it is off.
+    mem0 = Mem0Provider(keys) if keys.available(SecretName.MEM0_API_KEY) else None
+    memory_sync = MemorySync(engine, mem0) if mem0 is not None else None
     signer = RunTokenSigner(settings.run_token_key.get_secret_value().encode())
     # The deferred tools are in one catalog. The gate reads their toolsets from it, and the tool
     # server runs them (Section 10.3). The connector tools of the catalog in
@@ -310,7 +321,7 @@ def build(
             session_sandbox=sandboxed.session_sandbox if sandboxed else None,
         ),
         poll_s=worker_poll_s,
-        on_run_end=[browser.end_run],
+        on_run_end=[browser.end_run, *([memory_sync] if memory_sync is not None else [])],
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
     # index alone (Section 7.1).
@@ -473,6 +484,30 @@ def build(
         browser_tasks=browser_tasks,
         coding=coding,
         custom_tools=custom_tools,
+        # The Hermes tool parity tools of Section 10.2.2 (M7.5). Each is hidden without its key.
+        video=(
+            VideoService(
+                keys=keys,
+                meter=meter,
+                session_sandbox=sandboxed.session_sandbox if sandboxed else None,
+                redactor=default_redactor(),
+            )
+            if keys.available(SecretName.GEMINI_API_KEY)
+            else None
+        ),
+        x=XSearch(keys) if keys.available(SecretName.X_BEARER_TOKEN) else None,
+        moa=(
+            MixtureService(
+                keys=keys,
+                meter=meter,
+                max_cost_usd=settings.moa_max_cost_usd,
+                redactor=default_redactor(),
+            )
+            if sum(keys.available(name) for name in MOA_KEYS) >= MIN_REFERENCES
+            else None
+        ),
+        recall=MemoryRecall(engine, mem0) if mem0 is not None else None,
+        skill_settings=SkillSettingsStore(engine),
     )
     handoffs = Handoffs(engine, web_url=settings.web_base)
     # /undo and /rollback restore the files of the session sandbox (Section 15.3).
@@ -674,7 +709,11 @@ def build(
                 stack.push_async_callback(whatsapp.aclose)
             if email is not None:
                 stack.push_async_callback(email.aclose)
-            loops = _monitor(settings, engine, stack, sandboxes=e2b)
+            if mem0 is not None:
+                stack.push_async_callback(mem0.aclose)
+            if memory_sync is not None:
+                stack.push_async_callback(memory_sync.wait)
+            loops = _monitor(settings, engine, stack, sandboxes=e2b, memories=mem0)
             loops.append(RetentionSweep(engine))
             loops.append(TaskDispatcher(engine, queue))
             if embedder is not None:
@@ -819,6 +858,7 @@ def _monitor(
     stack: contextlib.AsyncExitStack,
     *,
     sandboxes: SandboxBackend | None = None,
+    memories: MemoryDeleter | None = None,
 ) -> list[_Loop]:
     """The trace export and the error rate alerts of Section 18, when they are set, and the
     purge worker of Section 17.4. The purge worker deletes the Langfuse traces, kills the
@@ -854,8 +894,14 @@ def _monitor(
             contexts=PostgresContextStore(engine),
         )
         stack.push_async_callback(browser.aclose)
-    if langfuse is not None or sandboxes is not None or browser is not None:
+    if langfuse is not None or sandboxes is not None or browser is not None or memories:
         loops.append(
-            PurgeWorker(engine, sandboxes=sandboxes, traces=langfuse, browser_contexts=browser)
+            PurgeWorker(
+                engine,
+                sandboxes=sandboxes,
+                traces=langfuse,
+                browser_contexts=browser,
+                memories=memories,
+            )
         )
     return loops

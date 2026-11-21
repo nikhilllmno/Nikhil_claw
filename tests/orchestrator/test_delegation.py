@@ -11,13 +11,14 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Message, Run, Session
+from sama.db.models import AgentProfile, Message, Run, Session
 from sama.delegation import (
     MAX_CHILDREN,
     ChildTask,
     DelegationError,
     DelegationService,
     child_budget,
+    child_model,
     render_started,
     render_statuses,
 )
@@ -308,3 +309,42 @@ async def test_a_child_of_a_run_without_a_limit_has_no_limit(
     [child] = await service(engine, queue).start(me, [ChildTask(goal="x")])
     [run] = await rows(engine, select(Run.toolsets).where(Run.id == child.run_id))
     assert run.toolsets is None
+
+
+def test_the_child_model_needs_a_model_that_the_runtime_knows() -> None:
+    """M7.5: ``agent_profiles.delegation_model`` (Section 13.2)."""
+    assert child_model("claude_agent_sdk", None) is None
+    assert child_model("claude_agent_sdk", "") is None
+    assert child_model("claude_agent_sdk", "claude-haiku-5-5") == "claude-haiku-5-5"
+    assert child_model("claude_agent_sdk", "gpt-6-luna") is None
+    assert child_model("openai_agents_sdk", "gpt-6-luna") == "gpt-6-luna"
+    assert child_model("fake", "fake-cheap") == "fake-cheap"
+    assert child_model("unknown", "x") is None
+
+
+async def test_a_child_uses_the_delegation_model_of_the_profile(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentProfile)
+            .where(AgentProfile.id == tenant.ids["profile"])
+            .values(delegation_model="fake-cheap")
+        )
+    me, _ = await parent_run(queue, tenant, "mine")
+    [child] = await service(engine, queue).start(me, [ChildTask(goal="sum the numbers")])
+    [row] = await rows(engine, select(Run.model).where(Run.id == child.run_id))
+    assert row.model == "fake-cheap"
+    claimed = await claim_child(queue, child.run_id)
+    assert claimed.model == "fake-cheap"
+
+
+async def test_without_a_delegation_model_the_child_uses_the_profile_model(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    me, _ = await parent_run(queue, tenant, "mine")
+    [child] = await service(engine, queue).start(me, [ChildTask(goal="sum the numbers")])
+    [row] = await rows(engine, select(Run.model).where(Run.id == child.run_id))
+    assert row.model is None

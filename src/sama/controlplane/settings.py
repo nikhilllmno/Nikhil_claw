@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Final
 from urllib.parse import urlsplit
 
@@ -17,6 +18,8 @@ from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
 from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
 from sama.media.vision import DEFAULT_VISION_MODEL
+from sama.moa import DEFAULT_MAX_COST_USD as DEFAULT_MOA_MAX_COST_USD
+from sama.moa import MAX_COST_CAP_USD as MOA_COST_CAP_USD
 from sama.modelproxy.prices import PriceTable, Provider
 from sama.orgs.service import SignupPolicy
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
@@ -41,6 +44,20 @@ class SettingsError(ValueError):
 def _secret(env: Mapping[str, str], name: str) -> SecretStr | None:
     value = env.get(name, "").strip()
     return SecretStr(value) if value else None
+
+
+def _moa_cap(env: Mapping[str, str]) -> Decimal:
+    """``SAMA_MOA_MAX_COST_USD``: a number above 0 and at most ``MOA_COST_CAP_USD``."""
+    value = env.get("SAMA_MOA_MAX_COST_USD", "").strip()
+    if not value:
+        return DEFAULT_MOA_MAX_COST_USD
+    try:
+        cap = Decimal(value)
+    except InvalidOperation:
+        raise SettingsError("SAMA_MOA_MAX_COST_USD must be a number") from None
+    if not cap.is_finite() or cap <= 0 or cap > MOA_COST_CAP_USD:
+        raise SettingsError(f"SAMA_MOA_MAX_COST_USD must be above 0 and at most {MOA_COST_CAP_USD}")
+    return cap
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -140,6 +157,16 @@ class ControlPlaneSettings:
     anthropic_key: SecretStr | None = None
     openai_key: SecretStr | None = None
     brave_key: SecretStr | None = None
+    gemini_key: SecretStr | None = None
+    """The Gemini key of the process (``GEMINI_API_KEY``) for ``video_analyze`` and ``moa``
+    (Section 10.2.2). An org can set its own key in the vault (``gemini_api_key``)."""
+    x_bearer_token: SecretStr | None = None
+    """The X API bearer token of the process (``X_BEARER_TOKEN``) for ``x_search``."""
+    mem0_key: SecretStr | None = None
+    """The Mem0 key of the process (``MEM0_API_KEY``) for the ``mem0`` memory provider
+    (Section 8.2)."""
+    moa_max_cost_usd: Decimal = DEFAULT_MOA_MAX_COST_USD
+    """The cost cap of one ``moa`` call (``SAMA_MOA_MAX_COST_USD``, Section 10.2.2)."""
     browserbase_key: SecretStr | None = None
     """The Browserbase API key of the cloud browser (``BROWSERBASE_API_KEY``, Section 14.1).
     With it and ``browserbase_project_id``, the tool server has the browser tools."""
@@ -213,6 +240,9 @@ class ControlPlaneSettings:
             self.anthropic_key,
             self.openai_key,
             self.brave_key,
+            self.gemini_key,
+            self.x_bearer_token,
+            self.mem0_key,
             self.browserbase_key,
             self.composio_key,
             self.composio_webhook_secret,
@@ -315,6 +345,10 @@ class ControlPlaneSettings:
             anthropic_key=_secret(env, "ANTHROPIC_API_KEY"),
             openai_key=_secret(env, "OPENAI_API_KEY"),
             brave_key=_secret(env, "BRAVE_API_KEY"),
+            gemini_key=_secret(env, "GEMINI_API_KEY"),
+            x_bearer_token=_secret(env, "X_BEARER_TOKEN"),
+            mem0_key=_secret(env, "MEM0_API_KEY"),
+            moa_max_cost_usd=_moa_cap(env),
             browserbase_key=_secret(env, "BROWSERBASE_API_KEY"),
             browserbase_project_id=env.get("BROWSERBASE_PROJECT_ID", "").strip() or None,
             browserbase_record=env.get("SAMA_BROWSERBASE_RECORD", "").strip() == "1",

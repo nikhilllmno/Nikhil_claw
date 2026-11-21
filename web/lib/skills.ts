@@ -1,7 +1,7 @@
 // Helpers of the skill editor (docs/architecture.md, Section 9). The API lints every write
 // again; these checks only give the user a fast answer.
 
-import type { SkillScope, SkillSummary } from "./api";
+import type { SkillScope, SkillSettingSpec, SkillSettings, SkillSettingValue, SkillSummary } from "./api";
 
 export const SCOPE_LABELS: Record<SkillScope, string> = {
   builtin: "Built-in",
@@ -63,3 +63,71 @@ export function curatorBadge(
 export const STALE_TEXT =
   "No agent used this skill for 30 days, so the curator marked it as stale. It still works. " +
   "If nobody uses it for 90 days, the curator archives it. Use it or pin it to keep it.";
+
+/** The edited settings of a skill: the text of a string or number field, the state of a checkbox. */
+export type SettingsForm = Record<string, string | boolean>;
+
+/** The form for the stored values of `settings`. A checkbox starts with the value in use. */
+export function settingsForm(settings: Pick<SkillSettings, "specs" | "values" | "effective">): SettingsForm {
+  const form: SettingsForm = {};
+  for (const spec of settings.specs) {
+    const stored = settings.values[spec.key];
+    if (spec.type === "boolean") {
+      const used = stored ?? settings.effective[spec.key] ?? spec.default;
+      form[spec.key] = used === true;
+    } else {
+      form[spec.key] = stored === undefined ? "" : String(stored);
+    }
+  }
+  return form;
+}
+
+/** The problem of the text of one field, or `null`. */
+export function settingProblem(spec: Pick<SkillSettingSpec, "type" | "required" | "default">, text: string): string | null {
+  const empty = text.trim() === "";
+  if (empty) {
+    return spec.required && spec.default === null ? "Give a value." : null;
+  }
+  if (spec.type === "number" && !Number.isFinite(Number(text))) return "Give a number.";
+  return null;
+}
+
+/**
+ * The `PUT` body for the form. An empty text field is `null`, so the default applies. A
+ * checkbox that shows the default, and has no stored value, is `null` too. `errors` has the
+ * problem of each field that the browser can see. With an error, send nothing.
+ */
+export function settingsBody(
+  specs: readonly SkillSettingSpec[],
+  form: SettingsForm,
+  stored: Readonly<Record<string, SkillSettingValue>> = {},
+): { values: Record<string, SkillSettingValue | null>; errors: Record<string, string> } {
+  const values: Record<string, SkillSettingValue | null> = {};
+  const errors: Record<string, string> = {};
+  for (const spec of specs) {
+    const raw = form[spec.key];
+    if (spec.type === "boolean") {
+      const checked = raw === true;
+      values[spec.key] = spec.key in stored || checked !== (spec.default === true) ? checked : null;
+      continue;
+    }
+    const text = typeof raw === "string" ? raw : "";
+    const problem = settingProblem(spec, text);
+    if (problem !== null) errors[spec.key] = problem;
+    if (text.trim() === "") values[spec.key] = null;
+    else values[spec.key] = spec.type === "number" ? Number(text) : text;
+  }
+  return { values, errors };
+}
+
+/** True if the form has other values than the stored ones. */
+export function settingsChanged(
+  specs: readonly SkillSettingSpec[],
+  form: SettingsForm,
+  saved: SettingsForm,
+): boolean {
+  return specs.some((spec) => form[spec.key] !== saved[spec.key]);
+}
+
+export const SETTINGS_NOTE =
+  "These values are data for the skill, not secrets. Do not put secrets here. Use a connection for a credential.";

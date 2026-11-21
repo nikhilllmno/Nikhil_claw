@@ -464,3 +464,51 @@ async def test_change_propose_sends_the_change_to_the_proposer() -> None:
     assert toolsets == ChangeRequest(target="toolsets", summary="web", toolsets=["files", "web"])
     assert toolsets.fields() == {"toolsets": ["files", "web"]}
     assert rules.fields() == {"rules": [["web_*", "ask"]]}
+
+
+async def test_the_hermes_parity_tools_show_with_their_services() -> None:
+    """M7.5 (Section 10.2.2): each tool shows only when its service exists."""
+    import httpx as _httpx
+
+    from sama.media.meter import MediaMeter
+    from sama.media.video import VideoService
+    from sama.memory.provider import Mem0Provider, MemoryRecall
+    from sama.moa import MixtureService
+    from sama.modelproxy.prices import PriceTable
+    from sama.modelproxy.store import MemoryUsageStore
+    from sama.tools.x import XSearch
+    from sama.vault.store import OrgKeys
+
+    keys = OrgKeys(None, {})
+    meter = MediaMeter(usage=MemoryUsageStore(), prices=PriceTable.load())
+    signer = RunTokenSigner(secrets.token_bytes(32))
+
+    def refuse(request: _httpx.Request) -> _httpx.Response:
+        raise AssertionError("no provider call without a key")
+
+    http = _httpx.AsyncClient(transport=_httpx.MockTransport(refuse))
+    server = ToolServer(
+        signer=signer,
+        todos=MemoryTodoStore(),
+        video=VideoService(keys=keys, meter=meter, http=http),
+        x=XSearch(keys, http=http),
+        moa=MixtureService(keys=keys, meter=meter, http=http),
+        recall=MemoryRecall(None, Mem0Provider(keys, http=http)),  # type: ignore[arg-type]
+    )
+    names = {tool.name for tool in await server.mcp().list_tools()}
+    assert {"video_analyze", "x_search", "moa", "memory_recall"} <= names
+    with serve(server.app()) as base:
+        token = signer.issue(make_scope(), ttl_s=600)
+        async with connect(base + "/mcp", token) as client:
+            x = await client.call_tool("x_search", {"query": "sama"})
+            moa = await client.call_tool("moa", {"question": "why?"})
+            video = await client.call_tool("video_analyze", {"source": "https://youtu.be/abc"})
+    assert "no X API token" in x.content[0].text  # type: ignore[union-attr]
+    assert "at least two" in moa.content[0].text  # type: ignore[union-attr]
+    assert "no Gemini key" in video.content[0].text  # type: ignore[union-attr]
+    await server.aclose()
+    plain = {
+        tool.name
+        for tool in await ToolServer(signer=signer, todos=MemoryTodoStore()).mcp().list_tools()
+    }
+    assert not {"video_analyze", "x_search", "moa", "memory_recall"} & plain

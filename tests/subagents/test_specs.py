@@ -204,7 +204,7 @@ def test_the_tools_are_the_tools_of_the_toolsets_that_the_run_has() -> None:
         toolsets=run_toolsets("web", "todo", "subagents"),
         runtime=CLAUDE,
     )
-    assert definition.tools == ("TodoWrite", "todo", "web_extract", "web_search")
+    assert definition.tools == ("TodoWrite", "todo", "web_extract", "web_search", "x_search")
     assert definition.model is None
 
 
@@ -214,7 +214,7 @@ def test_a_subagent_never_has_more_than_the_run() -> None:
         toolsets=run_toolsets("web", "subagents"),
         runtime=CLAUDE,
     )
-    assert definition.tools == ("web_extract", "web_search")
+    assert definition.tools == ("web_extract", "web_search", "x_search")
 
 
 def test_a_subagent_never_has_the_subagent_or_the_clarify_tools() -> None:
@@ -223,7 +223,7 @@ def test_a_subagent_never_has_the_subagent_or_the_clarify_tools() -> None:
         toolsets=run_toolsets("web", "subagents", "clarify"),
         runtime=CLAUDE,
     )
-    assert definition.tools == ("web_extract", "web_search")
+    assert definition.tools == ("web_extract", "web_search", "x_search")
 
 
 def test_a_subagent_never_has_the_tools_of_tool_search_for_a_deferred_tool() -> None:
@@ -235,7 +235,7 @@ def test_a_subagent_never_has_the_tools_of_tool_search_for_a_deferred_tool() -> 
         toolsets=toolsets,
         runtime=CLAUDE,
     )
-    assert definition.tools == ("web_extract", "web_search")
+    assert definition.tools == ("web_extract", "web_search", "x_search")
     for name in ("tool_search", "tool_describe", "tool_call"):
         assert name not in definition.tools
 

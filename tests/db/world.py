@@ -68,6 +68,7 @@ from sama.db.models import (
     SessionCompaction,
     SessionHandoff,
     SessionTodo,
+    SkillSettings,
     StoredContextFile,
     Task,
     TaskComment,
@@ -459,6 +460,17 @@ def plan(
             user_id=ids[user],
             target="cloud",
             provider_context_id=f"ctx-{user}",
+        )
+    # The settings of one skill in each workspace (M7.5). A member who sees the workspace reads
+    # them.
+    for workspace, org in (("a1", "org-a"), ("a2", "org-a"), ("b1", "org-b")):
+        add(
+            SkillSettings,
+            f"skill-settings:{workspace}",
+            org_id=ids[org],
+            workspace_id=ids[workspace],
+            skill_name="weather",
+            settings={"city": f"city of {workspace}"},
         )
     # One workflow for each owner, with a version, an instance, a step, and a receipt. A
     # workflow is private to its owner (M4.5).

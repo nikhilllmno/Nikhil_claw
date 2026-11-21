@@ -191,7 +191,7 @@ async def test_a_shared_run_with_the_toolset_in_the_group_set_is_limited_to_it(
         engine, tenant.org, tenant.ids["profile"], parse_subagents([raw(toolsets=["web", "core"])])
     )
     [definition] = (await assemble(engine, tenant, "s1")).subagents
-    assert definition.tools == ("web_extract", "web_search")
+    assert definition.tools == ("web_extract", "web_search", "x_search")
 
 
 async def test_a_runtime_without_subagents_gets_none(engine: AsyncEngine, tenant: Tenant) -> None:

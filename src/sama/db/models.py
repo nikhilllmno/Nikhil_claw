@@ -112,7 +112,7 @@ TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
 APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
 CHANNELS: Final = ("web", "slack", "telegram", "extension", "whatsapp", "email")
 ACTOR_KINDS: Final = ("user", "agent", "system")
-PROVIDERS: Final = ("anthropic", "openai")
+PROVIDERS: Final = ("anthropic", "openai", "gemini")
 KEY_SOURCES: Final = ("org", "sama")
 """The key of a model call: the key of the org or the key of sama (Section 16.6, M6.7)."""
 REGION_PATTERN: Final = "^[a-z]{2}-[a-z]+-[0-9]$"
@@ -124,6 +124,7 @@ MODEL_ENDPOINTS: Final = (
     "chat_completions",
     "images",
     "speech",
+    "generate_content",
 )
 VAULT_NAMES: Final = (
     "anthropic_api_key",
@@ -139,6 +140,9 @@ VAULT_NAMES: Final = (
     "whatsapp_link_secret",
     "sendgrid_api_key",
     "email_link_secret",
+    "gemini_api_key",
+    "x_bearer_token",
+    "mem0_api_key",
 )
 CONNECTION_SECRET_PATTERN: Final = "^connection:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
 """The vault name of the secret fields of one connection (Section 10.3): ``connection:<id>``."""
@@ -295,7 +299,9 @@ class Base(DeclarativeBase):
 
 MAX_RETENTION_DAYS: Final = 3650
 """The upper limit of ``orgs.retention_days`` (docs/architecture.md, Section 17.4)."""
-PURGE_KINDS: Final = ("sandboxes", "traces", "browser_contexts")
+PURGE_KINDS: Final = ("sandboxes", "traces", "browser_contexts", "mem0")
+MEMORY_PROVIDERS: Final = ("builtin", "mem0")
+"""The memory providers of a profile (Section 8.2). ``builtin`` is the default."""
 
 
 class Org(Base):
@@ -533,6 +539,7 @@ class AgentProfile(Base):
         CheckConstraint(
             "jsonb_typeof(library_subagents) = 'array'", name="library_subagents_is_array"
         ),
+        CheckConstraint(_one_of("memory_provider", MEMORY_PROVIDERS), name="memory_provider"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -578,6 +585,11 @@ class AgentProfile(Base):
     the same time), or ``queue`` (it waits)."""
     max_parallel_runs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
     """The most open chat runs (running or paused) of one session of the profile (M7.1)."""
+    delegation_model: Mapped[str | None] = mapped_column(Text)
+    """The model of the child runs of ``delegate_task`` (Section 13.2). ``None``: the model of
+    the profile."""
+    memory_provider: Mapped[str] = mapped_column(Text, nullable=False, server_default="builtin")
+    """``builtin`` or ``mem0`` (Section 8.2). The built-in memory works in both cases."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -3282,3 +3294,32 @@ class CustomToolVersion(Base):
     reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()
+
+
+class SkillSettings(Base):
+    """The settings of one skill for one workspace (docs/architecture.md, Section 9.8, M7.5).
+    The ``config`` block of ``SKILL.md`` declares the keys. ``settings`` maps a key to its
+    value. A member who sees the workspace reads the row. Only the control plane writes the
+    table."""
+
+    __tablename__ = "skill_settings"
+    __table_args__ = (
+        UniqueConstraint("org_id", "workspace_id", "skill_name"),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "updated_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint("jsonb_typeof(settings) = 'object'", name="settings_is_object"),
+        CheckConstraint("char_length(skill_name) BETWEEN 1 AND 64", name="skill_name_length"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    skill_name: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict[str, Any]] = _json()
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

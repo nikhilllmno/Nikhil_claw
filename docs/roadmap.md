@@ -512,6 +512,28 @@ own sub-agents, skills, tools, and MCP servers. Admins edit all settings in one 
 
 ---
 
+## M7 — Parity and power use
+
+Goal: sama has every Hermes skill and tool that fits a cloud service, works like Claude Code
+and Codex for coding, handles a new request while a run is busy, and lets each user add their
+own sub-agents, skills, tools, and MCP servers. Admins edit all settings in one console.
+
+| # | Item | Acceptance criteria |
+|---|---|---|
+| M7.1 | Parallel requests | A new message while a run is busy can start a second run at the same time in the same session, with the transcript up to that point. Both replies arrive in the same thread, in order of completion. The busy mode per profile is `queue`, `parallel`, or `steer`; the default is `parallel`, with a limit of concurrent runs per session. `/stop` stops one run or all runs. Works on both runtimes and in web, Telegram, and Slack. |
+| M7.2 | Coding agent connectors | `claude_code` and `codex` connectors run the Claude Code CLI or the Codex CLI headless in an E2B sandbox, with the model proxy and the git proxy (no keys in the sandbox). A tool `coding_agent_run(agent, repo, prompt)` and the commands `/claude` and `/codex` send a request to them. Progress streams to the channel. The result has a summary, the diff, and an optional pull request. Approval rules and budgets apply. |
+| M7.3 | Custom tools | A user, workspace, or org adds a tool from the web app or the API: an HTTP request tool or a script tool (Python or Node in the sandbox) with a JSON schema, a description, a policy (`allow`, `ask`, `deny`), and a test button. Versioned, with history. Both runtimes see the tools through `tool_search`. |
+| M7.4 | Sub-agent library | Personal, workspace, and org sub-agents with a name, a prompt, toolsets, a model, and limits. A profile uses agents from the library. `delegate_task(agent=...)` starts a library agent. Works on both runtimes (OpenAI agents as tools). Editable in the web app. |
+| M7.5 | Hermes tool parity | `x_search`, `video_analyze`, mixture of agents (`moa`), a cheaper model for children, per-skill settings, and a Mem0 memory provider. The feature map has no Hermes tool left as Defer unless it is desktop-only. Done (architecture §8.2, §9.8, §10.2.2, and §13.2): `x_search` (X API v2 recent search), `video_analyze` (Gemini, YouTube links, `https` files, and sandbox files up to 14 MB), `moa` (three providers and an aggregator, with a cost cap), `delegation_model` per profile, skill settings per workspace with a form in the skill editor, and the `mem0` memory provider (`memory_recall`, a run-end sync, and delete through the purge worker). The X API account of staging has no credits, so a person must add credits before `x_search` returns posts. `video_generate` stays deferred (architecture §10.2.2, A4). |
+| M7.6 | Sama as a server | Sama as an MCP server for other agents, and an OpenAI-compatible chat endpoint, with org API keys and the same policy and budgets. |
+| M7.7 | Builtin skill library | Sama-written builtin skills that cover the categories of the Hermes bundled skills (no copied text). Each skill passes the lint and the injection scan and has a test. |
+| M7.8 | More channels | Email (inbound and outbound) and WhatsApp channels with the same adapter shape as Telegram and Slack: pairing, sessions, approvals, and media. Discord if a bot token exists. |
+| M7.9 | Coding mode | A session can attach a repo. Plan mode: the agent proposes a plan, a person approves it, then the agent works. The web app shows the file changes of the sandbox as diffs, the test runs, and the checkpoints, and opens a pull request. |
+| M7.10 | Settings console | One editable console in the web app with these sections: Setup, Slack, Roles, Tools, Webhooks, Triggers, Sessions, Schedules, Workflows, MCP servers, Sub-agents, Skills, and Harness (runtime, model, reasoning, busy mode, budgets). Each section reads and writes the API, with audit entries. |
+| M7.11 | End-to-end tests | A Playwright suite runs the main flows of M1 to M7 against staging every night and on demand. A full manual pass on staging has a test report. |
+
+---
+
 ## Later (not planned)
 
 - Microsoft Teams and other channels after M7.8.

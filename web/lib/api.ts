@@ -512,6 +512,8 @@ export interface RuntimeOption {
   subagents: boolean;
 }
 
+export type MemoryProvider = "builtin" | "mem0";
+
 export interface AgentProfileOptions {
   toolsets: ToolsetOption[];
   /** The models of the saved runtime. */
@@ -519,6 +521,8 @@ export interface AgentProfileOptions {
   /** True if the saved runtime has sub-agents. */
   subagents: boolean;
   runtimes: RuntimeOption[];
+  /** The long-term memory providers, for example `builtin` and `mem0`. */
+  memory_providers: string[];
   limits: AgentProfileLimits;
   /** The reasoning efforts that a profile can choose (M7.10). */
   reasoning_efforts: ReasoningEffort[];
@@ -559,6 +563,9 @@ export interface AgentProfile {
   max_parallel_runs?: number;
   /** The ids of the library sub-agents (M7.4), in order. */
   library_subagents: string[];
+  /** The model of the `delegate_task` child runs. `null`: the model of the profile. */
+  delegation_model: string | null;
+  memory_provider: MemoryProvider;
   updated_at: string;
   /** True if the user is an org owner or admin. */
   editable: boolean;
@@ -582,6 +589,9 @@ export interface AgentProfilePatch {
   busy_mode?: BusyMode;
   max_parallel_runs?: number;
   library_subagents?: string[];
+  /** An empty string: use the model of the profile. */
+  delegation_model?: string;
+  memory_provider?: MemoryProvider;
 }
 
 export type ProfileChangeKind = "soul" | "profile" | "toolsets" | "policy";
@@ -1022,6 +1032,31 @@ export type MemoryWritten = Omit<MemoryNotes, "can_edit">;
 export type SkillScope = "builtin" | "org" | "workspace" | "user";
 export type WritableSkillScope = Exclude<SkillScope, "builtin">;
 export type SkillAction = "create" | "edit" | "write_file" | "remove_file" | "archive";
+
+export type SkillSettingValue = string | number | boolean;
+
+/** One setting of a skill, from the `config` block of its SKILL.md. */
+export interface SkillSettingSpec {
+  key: string;
+  type: "string" | "number" | "boolean";
+  description: string;
+  default: SkillSettingValue | null;
+  required: boolean;
+}
+
+/** `GET` and `PUT /workspaces/{workspace_id}/skills/{name}/settings`. */
+export interface SkillSettings {
+  name: string;
+  scope: string;
+  specs: SkillSettingSpec[];
+  /** The stored values. */
+  values: Record<string, SkillSettingValue>;
+  /** The values in use: the stored value, else the default. */
+  effective: Record<string, SkillSettingValue | null>;
+  can_edit: boolean;
+  /** Why the config block cannot be read. Then `specs` is empty. */
+  problem: string | null;
+}
 
 export interface SkillSummary {
   /** `null` for a built-in skill. */
@@ -2086,6 +2121,16 @@ export class ApiClient {
       method: "POST",
       body,
     });
+  getSkillSettings = (workspaceId: string, name: string) =>
+    this.json<SkillSettings>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/settings`,
+    );
+  /** Replaces all stored values. `null` or a missing key: use the default. */
+  putSkillSettings = (workspaceId: string, name: string, values: Record<string, SkillSettingValue | null>) =>
+    this.json<SkillSettings>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/settings`,
+      { method: "PUT", body: { values } },
+    );
   listArchivedSkills = (workspaceId: string) =>
     this.json<ArchivedSkill[]>(`/workspaces/${encodeURIComponent(workspaceId)}/archived-skills`);
   /** Pins, unpins, or restores a stored skill (Section 9.7). */
