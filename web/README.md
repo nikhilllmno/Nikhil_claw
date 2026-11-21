@@ -64,7 +64,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/memory` | Memory editor: agent notes, your profile, and workspace notes, with the revision history and revert. |
 | `/skills` | Skill editor: list, new skill, `SKILL.md`, files, versions, and archive. Built-in skills are read-only. |
 | `/members` | The members of an org and their roles. An owner or admin changes roles and workspaces, removes members, makes invite links, and revokes invites. |
-| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot and the Slack app), linked chat accounts with link codes, the agents (an admin creates a new agent), and "Your data" (download or delete your data in an org). |
+| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot and the Slack app), the browser card of each org (saved logins and the URL policy), linked chat accounts with link codes, the agents (an admin creates a new agent), and "Your data" (download or delete your data in an org). |
 | `/onboarding` | The setup guide after sign-up: connect a chat app, pick or create an agent, send a first message. |
 | `/admin` | The admin area (an org owner or admin): overview, `/admin/usage`, `/admin/audit`, `/admin/changes` (agent changes), `/admin/curator`, `/admin/keys` (org keys and region), and `/admin/data` (retention, org export, org delete). |
 | `/help`, `/help/[topic]` | Help pages for customers. They need no sign-in. |

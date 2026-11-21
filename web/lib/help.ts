@@ -179,6 +179,12 @@ export const HELP_TOPICS: HelpTopic[] = [
         ],
       },
       {
+        heading: "Browser logins",
+        paragraphs: [
+          "On the Settings page, the Browser card keeps saved logins for the sites that the browser of the agents opens. The agent never sees the user name or the password. An admin adds logins for the whole org and chooses the sites that the browser can open.",
+        ],
+      },
+      {
         heading: "Memory",
         paragraphs: [
           "The agents keep short notes: notes about the workspace, notes about you, and notes of each agent. You can read, change, and revert the notes on the Memory page.",

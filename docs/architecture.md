@@ -6809,7 +6809,9 @@ link to that deployment (Section 17.3).
   types the slug of the org). `GET /me` gives the `slug` of each org for this check.
 
 **Settings.** The settings page keeps the account, the chat apps (with the Slack form), the
-linked chat accounts, and the agents (an admin creates a new agent there). It adds "Your data"
+browser card of each org (saved logins and the URL policy, Section 14.1), the linked chat
+accounts, and the agents (an admin creates a new agent there). The browser card stays on the
+settings page and not in the admin area, because each member adds personal saved logins. It adds "Your data"
 for each org: the download of the user export and the delete of the own data
 (`DELETE /orgs/{org_id}/users/{user_id}` with the id of the user, Section 17.4).
 
