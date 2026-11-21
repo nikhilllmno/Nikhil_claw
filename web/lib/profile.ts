@@ -170,7 +170,7 @@ export function runtimeOption(options: AgentProfileOptions, saved: string, runti
  * The draft after the user chooses `runtime`. A model of another runtime cannot stay, so the
  * draft takes the saved model (back on the saved runtime) or the first model of the runtime.
  */
-export function withRuntime<D extends { runtime: string; model: string }>(
+export function withRuntime<D extends { runtime: string; model: string; delegationModel?: string }>(
   draft: D,
   profile: AgentProfile,
   runtime: string,
@@ -179,6 +179,7 @@ export function withRuntime<D extends { runtime: string; model: string }>(
   let model = draft.model;
   if (runtime === profile.runtime) model = profile.model;
   else if (!models.includes(model)) model = models[0] ?? "";
+  if (draft.delegationModel === undefined) return { ...draft, runtime, model };
   // A model for delegated tasks of another runtime cannot stay either.
   let delegationModel = draft.delegationModel;
   if (runtime === profile.runtime) delegationModel = profile.delegation_model ?? "";

@@ -522,7 +522,8 @@ export interface AgentProfileOptions {
   subagents: boolean;
   runtimes: RuntimeOption[];
   /** The long-term memory providers, for example `builtin` and `mem0`. */
-  memory_providers: string[];
+  /** Since M7.5. */
+  memory_providers?: string[];
   limits: AgentProfileLimits;
   /** The reasoning efforts that a profile can choose (M7.10). */
   reasoning_efforts: ReasoningEffort[];

@@ -247,7 +247,7 @@ function SettingsForm({
             disabled={readOnly}
             onChange={(e) => edit({ memoryProvider: e.target.value as Draft["memoryProvider"] })}
           >
-            {withCurrent(options.memory_providers, draft.memoryProvider).map((p) => (
+            {withCurrent(options.memory_providers ?? ["builtin", "mem0"], draft.memoryProvider).map((p) => (
               <option key={p} value={p}>
                 {memoryProviderLabel(p)}
               </option>

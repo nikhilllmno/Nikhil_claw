@@ -30,6 +30,8 @@ function profile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     group_toolsets: [],
     subagents: [],
     library_subagents: [],
+    delegation_model: null,
+    memory_provider: "builtin",
     updated_at: "2026-11-20T00:00:00+00:00",
     editable: true,
     options: {

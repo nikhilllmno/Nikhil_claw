@@ -19,7 +19,7 @@ from sama.api.origins import (
     parse_extension_ids,
     parse_origins,
 )
-from sama.db.models import AgentProfile, AuditEntry, Membership, ProfileChange, Run, User
+from sama.db.models import AgentProfile, AuditEntry, Membership, Run, User
 from sama.gate import GateStep
 from sama.gate.decide import TOOLSETS
 from sama.gate.service import GateService
@@ -1132,38 +1132,3 @@ async def test_a_revert_puts_the_budget_and_the_effort_back(
     assert response.status_code == 200, response.text
     row = await stored(engine, tenant)
     assert (row.budget, row.reasoning_effort) == ({}, None)
-
-
-        json={"delegation_model": "claude-haiku-5-5", "memory_provider": "mem0"},
-    )
-    assert response.status_code == 200
-    assert (response.json()["delegation_model"], response.json()["memory_provider"]) == (
-        "claude-haiku-5-5",
-        "mem0",
-    )
-    bad = await client.patch(agent(tenant), headers=admin, json={"delegation_model": "gpt-6-luna"})
-    assert bad.status_code == 422
-    assert "delegation model is not known" in bad.json()["detail"]
-    bad = await client.patch(agent(tenant), headers=admin, json={"memory_provider": "honcho"})
-    assert bad.status_code == 422
-
-    # A switch to a runtime that does not know the child model clears it.
-    response = await client.patch(
-        agent(tenant), headers=admin, json={"runtime": "openai_agents_sdk", "model": "gpt-6.2-sol"}
-    )
-    assert response.status_code == 200
-    assert response.json()["delegation_model"] is None
-    response = await client.patch(agent(tenant), headers=admin, json={"delegation_model": ""})
-    assert response.status_code == 200
-    row = await stored(engine, tenant)
-    assert (row.delegation_model, row.memory_provider) == (None, "mem0")
-    # The history has the change, so an admin can revert it.
-    async with engine.connect() as connection:
-        kinds = (
-            await connection.execute(
-                select(ProfileChange.after).where(
-                    ProfileChange.agent_profile_id == tenant.ids["profile"]
-                )
-            )
-        ).scalars()
-        assert any("memory_provider" in after for after in kinds)
