@@ -853,11 +853,23 @@ def test_browser_act_asks_by_default_and_a_rule_can_allow_it() -> None:
     assert allowed.action == "allow"
 
 
+@pytest.mark.parametrize("action", ["list", "fill"])
+def test_browser_vault_asks_by_default(action: str) -> None:
+    # A fill uses a saved login of the user, so the user approves it (M5.3).
+    name = "mcp__sama__browser_vault"
+    verdict = decide(context(toolsets=frozenset({"browser"})), name, {"action": action})
+    assert verdict.action == "ask"
+    without = decide(context(), name, {"action": action})
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+
+
 def test_the_browser_toolset_is_for_private_runs_only() -> None:
     assert "browser" in DEFAULT_TOOLSETS
     assert "browser" not in DEFAULT_GROUP_TOOLSETS
     assert "browser" in CHILD_BLOCKED_TOOLSETS
-    assert TOOLSETS["browser"] == frozenset({*BROWSER_READS, "browser_tabs", "browser_act"})
+    assert TOOLSETS["browser"] == frozenset(
+        {*BROWSER_READS, "browser_tabs", "browser_act", "browser_vault"}
+    )
     child = effective_toolsets(
         DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="private", lineage="delegation"
     )

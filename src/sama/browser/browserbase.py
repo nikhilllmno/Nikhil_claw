@@ -112,10 +112,12 @@ class BrowserbaseTarget:
         connector: CdpConnector | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         context_save_s: float = CONTEXT_SAVE_S,
+        record: bool = False,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._project_id = project_id
+        self._record = record
         self._context_save_s = context_save_s
         self._clock = clock
         self._sleep = sleep
@@ -311,8 +313,12 @@ class BrowserbaseTarget:
             "timeout": self._session_timeout_s,
             "userMetadata": {"sama_org": org_id, "sama_run": run_id},
         }
+        # No recording and no logs at Browserbase by default: a recording can show a page with a
+        # login, and a log can keep a form body with a password (M5.3).
+        settings: dict[str, Any] = {"recordSession": self._record, "logSession": self._record}
         if context_id is not None:
-            payload["browserSettings"] = {"context": {"id": context_id, "persist": persist}}
+            settings["context"] = {"id": context_id, "persist": persist}
+        payload["browserSettings"] = settings
         try:
             return await self._client.post("/v1/sessions", json=payload)
         except httpx.HTTPError as error:

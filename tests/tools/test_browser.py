@@ -165,3 +165,44 @@ async def test_the_tools_take_a_target_when_the_service_has_two() -> None:
     assert [frame["op"] for frame in link.frames] == ["navigate", "snapshot", "release"]
     assert link.frames[0]["approved"] is False
     assert target.sessions == []
+
+
+async def test_browser_vault_is_listed_only_with_the_saved_logins(world: World) -> None:
+    async with connect(world.url, world.token()) as client:
+        names = {tool.name for tool in (await client.list_tools()).tools}
+    assert "browser_vault" not in names
+
+
+async def test_browser_vault_fills_through_the_server_without_the_secret() -> None:
+    from tests.browser.fakes import AllowAll, FillSession
+    from tests.browser.test_vault_service import PASSWORD, USERNAME, Logins, login
+
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    target = FakeTarget(session_class=FillSession)
+    logins = Logins(login("Example", "https://example.com", personal=False))
+    service = BrowserService(target, AllowAll(), logins=logins)
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), browser=service)
+    with serve(server.app()) as base:
+        token = signer.issue(make_scope(), ttl_s=600)
+        async with connect(base + "/mcp", token) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            listed = await client.call_tool("browser_vault", {"action": "list"})
+            await client.call_tool("browser_open", {"url": "https://example.com/login"})
+            (session,) = target.sessions
+            session.tree = f'- textbox "Pin" [ref=e2]: {PASSWORD} for {USERNAME}'
+            filled = await client.call_tool("browser_vault", {"action": "fill", "name": "Example"})
+            missing = await client.call_tool("browser_vault", {"action": "fill"})
+    assert set(tools["browser_vault"].input_schema["properties"]["action"]["enum"]) == {
+        "list",
+        "fill",
+    }
+    assert not listed.is_error
+    assert '"name": "Example"' in text_of(listed)
+    assert not filled.is_error, text_of(filled)
+    for result in (listed, filled):
+        assert PASSWORD not in text_of(result)
+        assert USERNAME not in text_of(result)
+    assert "[REDACTED] for [REDACTED]" in text_of(filled)
+    assert missing.is_error
+    assert "fill needs name" in text_of(missing)
+    await service.aclose()

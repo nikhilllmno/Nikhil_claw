@@ -14,9 +14,11 @@ the model. A target knows only its browser.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, runtime_checkable
+
+from pydantic import SecretStr
 
 TargetName = Literal["cloud", "my_chrome"]
 CLOUD: Final = "cloud"
@@ -184,6 +186,40 @@ class BrowserSession(Protocol):
 
     async def close(self) -> None:
         """Ends the browser. It does not raise."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class FillRequest:
+    """A saved login to fill into the active tab (``browser_vault``, M5.3). The secret never goes
+    back to the agent."""
+
+    username: SecretStr
+    password: SecretStr
+    site_allows: Callable[[str], bool]
+    """True for the URL of a document where sama may fill the login (the site of the login)."""
+    username_ref: str | None = None
+    password_ref: str | None = None
+    submit: bool = False
+    """Press Enter in the last filled field."""
+
+
+@dataclass(frozen=True, slots=True)
+class Filled:
+    page: PageState
+    fields: tuple[str, ...]
+    """The fields that sama filled: ``username``, ``password``, or both."""
+
+
+@runtime_checkable
+class LoginFiller(Protocol):
+    """A browser session that can fill a saved login. A target without it gives the agent an
+    error for ``browser_vault`` with ``action="fill"``."""
+
+    async def fill_login(self, request: FillRequest) -> Filled:
+        """Fills the user name and the password into the fields of the active tab. It refuses a
+        field in a document that ``site_allows`` refuses. An error message has no part of the
+        secret."""
         ...
 
 

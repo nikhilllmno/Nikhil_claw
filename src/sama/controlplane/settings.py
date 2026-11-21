@@ -137,6 +137,10 @@ class ControlPlaneSettings:
     With it and ``browserbase_project_id``, the tool server has the browser tools."""
     browserbase_project_id: str | None = None
     """The Browserbase project (``BROWSERBASE_PROJECT_ID``)."""
+    browserbase_record: bool = False
+    """``SAMA_BROWSERBASE_RECORD=1`` turns on the session recording and the session logs of
+    Browserbase, for a test. They are off by default: a recording can show a page with a
+    login, and a log can keep a form with a password (Section 14.1)."""
     composio_key: SecretStr | None = None
     """The Composio API key of the process (``COMPOSIO_API_KEY``). An org can set its own key
     in the vault (``composio_api_key``)."""
@@ -302,6 +306,7 @@ class ControlPlaneSettings:
             brave_key=_secret(env, "BRAVE_API_KEY"),
             browserbase_key=_secret(env, "BROWSERBASE_API_KEY"),
             browserbase_project_id=env.get("BROWSERBASE_PROJECT_ID", "").strip() or None,
+            browserbase_record=env.get("SAMA_BROWSERBASE_RECORD", "").strip() == "1",
             composio_key=_secret(env, "COMPOSIO_API_KEY"),
             composio_webhook_secret=_secret(env, "SAMA_COMPOSIO_WEBHOOK_SECRET"),
             langfuse=langfuse,

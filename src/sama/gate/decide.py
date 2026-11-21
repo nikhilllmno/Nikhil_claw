@@ -55,6 +55,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
             "browser_screenshot",
             "browser_extract",
             "browser_tabs",
+            "browser_vault",
         }
     ),
 }
@@ -138,8 +139,9 @@ that it calls (Sections 12.4 and 13.2). ``cronjob_manage`` is here because a job
 agent creates or widens waits for the approval of its owner before it fires (Section 12.1).
 ``workflow_manage`` and ``workflow_run`` are here for the same reason: a workflow version that
 writes waits for the approval of its owner before it runs (Section 12.3). The browser tools
-that open and read pages are here, as ``web_extract`` is; ``browser_act`` is not, because a
-click or a form can change data with the logins of the user (Section 14.1)."""
+that open and read pages are here, as ``web_extract`` is; ``browser_act`` and ``browser_vault``
+are not, because a click, a form, or a saved login can change data with the logins of the user
+(Section 14.1)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"

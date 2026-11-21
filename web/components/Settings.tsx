@@ -1,8 +1,8 @@
 "use client";
 
 // The settings page (docs/architecture.md, Sections 11.4 and 17.3). It shows the account, the
-// chat apps of each org, the model keys and the region of each org, the chat accounts that the
-// user linked, and the agents. An org admin connects or disconnects the Telegram bot and sets
+// chat apps of each org, the model keys and the region of each org, the browser settings of each
+// org (Section 14.1), the chat accounts that the user linked, and the agents. An org admin connects or disconnects the Telegram bot and sets
 // the model keys of the org here. A bot token or a model key goes only into the form of this
 // page.
 
@@ -23,6 +23,7 @@ import { keyProblem, keyUse, MAX_KEY_CHARS, PROVIDER_TITLES, regionText } from "
 import { ROLE_LABELS, roleBadge } from "@/lib/orgs";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
+import { BrowserSettings } from "./BrowserSettings";
 import { useData } from "./DataProvider";
 import { PageHeader } from "./PageHeader";
 import { ErrorState, LoadingState } from "./ui";
@@ -74,6 +75,10 @@ export function Settings() {
 
       {me.orgs.map((o) => (
         <OrgKeys key={o.id} org={o} />
+      ))}
+
+      {me.orgs.map((o) => (
+        <BrowserSettings key={o.id} org={o} />
       ))}
 
       <LinkedAccounts orgs={me.orgs} workspaceId={workspaceId} org={org} />

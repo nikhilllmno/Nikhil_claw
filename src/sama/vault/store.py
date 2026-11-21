@@ -65,7 +65,11 @@ ConnectionSecretName = NewType("ConnectionSecretName", str)
 TriggerSecretName = NewType("TriggerSecretName", str)
 """The vault entry of the signing secret of one webhook trigger: ``trigger:<trigger id>``."""
 
-VaultName = SecretName | ConnectionSecretName | TriggerSecretName
+BrowserLoginSecretName = NewType("BrowserLoginSecretName", str)
+"""The vault entry of one saved login of the browser: ``browser_login:<login id>``. The value is
+a JSON object with ``username`` and ``password`` (Section 14.1)."""
+
+VaultName = SecretName | ConnectionSecretName | TriggerSecretName | BrowserLoginSecretName
 """The name of a vault entry."""
 
 
@@ -79,11 +83,18 @@ def trigger_secret(trigger_id: uuid.UUID) -> TriggerSecretName:
     return TriggerSecretName(f"trigger:{trigger_id}")
 
 
+def browser_login_secret(login_id: uuid.UUID) -> BrowserLoginSecretName:
+    """The vault name of the user name and the password of a saved browser login
+    (Section 14.1)."""
+    return BrowserLoginSecretName(f"browser_login:{login_id}")
+
+
 def secret_parts(name: str, value: str) -> list[str]:
     """The values that the redactor gets for one entry. A connection entry is a JSON object of
-    the secret form fields: the redactor gets each field too, so a field is redacted alone."""
+    the secret form fields, and a browser login entry is a JSON object with the user name and
+    the password: the redactor gets each field too, so a field is redacted alone."""
     parts = [value]
-    if name.startswith("connection:"):
+    if name.startswith(("connection:", "browser_login:")):
         with contextlib.suppress(ValueError):
             fields = json.loads(value)
             if isinstance(fields, dict):
@@ -95,7 +106,8 @@ def _vault_name(name: str) -> VaultName:
     try:
         return SecretName(name)
     except ValueError:
-        # A ``connection:`` or ``trigger:`` name. Both are plain text at run time.
+        # A ``connection:``, ``trigger:``, or ``browser_login:`` name. All are plain text at
+        # run time.
         return ConnectionSecretName(name)
 
 

@@ -23,19 +23,34 @@ The service has one or more targets (Section 14.1): ``cloud`` (Browserbase) and 
 (the extension of the user, M5.5). A run has at most one session on each target. A tool call
 names its target, or uses the target of the last browser call of the run, or the first target
 of the service. The limits count the sessions of each target.
+
+M5.3 adds two parts:
+
+- The URL policy of each org (``sama.browser.policy``). The ``cloud`` sessions and the URL
+  checks of the ``cloud`` target use the ``OrgGuard`` of the org of the run. The ``my_chrome``
+  target keeps its own rules (Section 14.2.2).
+- The browser vault (``vault_list`` and ``vault_fill``). The session fills a saved login into the
+  page. The user name and the password never go to the agent: each result of the run has them
+  replaced with ``[REDACTED]``, also when the page shows them later.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, Final
+from urllib.parse import quote, quote_plus
 
+from sama.browser.guard import OrgGuard
+from sama.browser.logins import Login, LoginError, LoginSource, site_allows
+from sama.browser.policy import PolicySource
 from sama.browser.target import (
     ACTIONS_WITH_REF,
     MY_CHROME,
@@ -47,6 +62,8 @@ from sama.browser.target import (
     Extracted,
     ExtractKind,
     ExtractRequest,
+    FillRequest,
+    LoginFiller,
     NavigationGuard,
     PageState,
     Screenshot,
@@ -67,6 +84,18 @@ MAX_SESSIONS_PER_ORG: Final = 5
 MAX_SESSIONS: Final = 20
 SOURCE: Final = UNTRUSTED_SOURCE
 SAMA_PREFIX: Final = "mcp__sama__"
+REDACTED: Final = "[REDACTED]"
+MIN_SCRUB_CHARS: Final = 3
+"""A filled user name shorter than this is not replaced in the results: a short word is in
+too much page text. A filled password is always replaced."""
+SCREENSHOT_AFTER_FILL: Final = (
+    "screenshots are off for the rest of this run after a saved login was filled, because an "
+    "image can show the login; use browser_snapshot or browser_extract"
+)
+NO_LOGINS: Final = (
+    "There are no saved logins for you. An org admin adds the logins of the org, and each user "
+    "adds personal logins, in the web app (Settings, Browser)."
+)
 
 
 @dataclass(slots=True)
@@ -89,6 +118,8 @@ class BrowserService:
         target: BrowserTarget | Sequence[BrowserTarget],
         guard: NavigationGuard,
         *,
+        policies: PolicySource | None = None,
+        logins: LoginSource | None = None,
         idle_s: float = DEFAULT_IDLE_S,
         max_sessions_per_org: int = MAX_SESSIONS_PER_ORG,
         max_sessions: int = MAX_SESSIONS,
@@ -101,6 +132,12 @@ class BrowserService:
         self.target = targets[0]
         """The default target: the target of a run that names none."""
         self.guard = guard
+        self.policies = policies
+        self.logins = logins
+        self._guards: dict[str, NavigationGuard] = {}
+        self._secrets: dict[tuple[str, str], set[str]] = {}
+        """For each run: the forms of the filled user names and passwords that the results must
+        not show."""
         self._idle_s = idle_s
         self._max_per_org = max_sessions_per_org
         self._max = max_sessions
@@ -132,11 +169,18 @@ class BrowserService:
             self._check_limits(claims.org_id, live.target)
             live.reserved = True
             try:
+                guard = self.guard if live.target == MY_CHROME else self.guard_for(claims.org_id)
+                if isinstance(guard, OrgGuard):
+                    # The session starts with the current policy of the org, or not at all.
+                    try:
+                        await guard.load()
+                    except BlockedUrlError as error:
+                        raise BrowserError(str(error)) from None
                 live.session = await self.targets[live.target].start(
                     org_id=claims.org_id,
                     user_id=claims.user_id,
                     run_id=claims.run_id,
-                    guard=self.guard,
+                    guard=guard,
                     session_id=claims.session_id,
                 )
             except BaseException:
@@ -169,9 +213,29 @@ class BrowserService:
                 "when a run ends"
             )
 
+    def guard_for(self, org_id: str) -> NavigationGuard:
+        """The URL guard of the org for the ``cloud`` target: the host lists of the org and the
+        address rules. Without a policy source, the address rules alone."""
+        if self.policies is None:
+            return self.guard
+        guard = self._guards.get(org_id)
+        if guard is None:
+            guard = self._guards[org_id] = OrgGuard(self.guard, org_id, self.policies)
+        return guard
+
+    def forget_policy(self, org_id: str) -> None:
+        """Drops the kept URL policy of the org, after an admin changed it."""
+        forget = getattr(self.policies, "forget", None)
+        if forget is not None:
+            forget(org_id)
+        guard = self._guards.get(org_id)
+        if isinstance(guard, OrgGuard):
+            guard.invalidate()
+
     def end_run(self, org_id: str, run_id: str) -> None:
         """The run-end hook of the worker. It closes the sessions of the run in the
         background."""
+        self._secrets.pop((org_id, run_id), None)
         self._current.pop((org_id, run_id), None)
         for key in [key for key in self._live if key[0] == org_id and key[1] == run_id]:
             live = self._live.pop(key)
@@ -260,7 +324,7 @@ class BrowserService:
 
     # -- the tools ---------------------------------------------------------------------------
 
-    async def _checked(self, url: str, target: TargetName) -> str:
+    async def _checked(self, claims: RunTokenClaims, url: str, target: TargetName) -> str:
         url = url.strip()
         scheme = url.split(":", 1)[0].lower() if ":" in url else ""
         if not scheme or "//" not in url:
@@ -273,7 +337,7 @@ class BrowserService:
             # each site apply (the session and the extension check them, Section 14.2.2).
             return url
         try:
-            await self.guard.check(url)
+            await self.guard_for(claims.org_id).check(url)
         except BlockedUrlError as error:
             raise BrowserError(f"the URL policy blocked {url}: {error}") from None
         return url
@@ -287,7 +351,7 @@ class BrowserService:
         target: TargetName | None = None,
     ) -> str:
         name = self.target_of(claims, target)
-        url = await self._checked(url, name)
+        url = await self._checked(claims, url, name)
         live, session = await self._locked_session(claims, name)
         try:
             try:
@@ -295,17 +359,22 @@ class BrowserService:
             except BlockedUrlError as error:
                 raise BrowserError(str(error)) from None
             shot = await session.snapshot() if snapshot else None
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
         finally:
             self._release(live)
-        return render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
+        text = render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
+        return self._clean(claims, text)
 
     async def snapshot(self, claims: RunTokenClaims, *, target: TargetName | None = None) -> str:
         live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             shot = await session.snapshot()
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
         finally:
             self._release(live)
-        return render_snapshot(shot)
+        return self._clean(claims, render_snapshot(shot))
 
     async def act(
         self,
@@ -323,9 +392,12 @@ class BrowserService:
         try:
             state = await session.act(act)
             shot = await session.snapshot() if snapshot else None
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
         finally:
             self._release(live)
-        return render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
+        text = render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
+        return self._clean(claims, text)
 
     async def screenshot(
         self,
@@ -335,12 +407,18 @@ class BrowserService:
         target: TargetName | None = None,
     ) -> tuple[str, Screenshot]:
         """The caption for the model and the image."""
+        if self._secrets.get((claims.org_id, claims.run_id)):
+            # An image cannot be scrubbed: the page can show the user name, or the password
+            # after a click on "show password". So no screenshot after a fill in this run.
+            raise BrowserError(SCREENSHOT_AFTER_FILL)
         live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             shot = await session.screenshot(full_page=full_page)
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
         finally:
             self._release(live)
-        return render_screenshot(shot), shot
+        return self._clean(claims, render_screenshot(shot)), shot
 
     async def extract(
         self,
@@ -355,9 +433,11 @@ class BrowserService:
         live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             result = await session.extract(request)
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
         finally:
             self._release(live)
-        return render_extracted(result)
+        return self._clean(claims, render_extracted(result))
 
     async def tabs(
         self,
@@ -371,16 +451,123 @@ class BrowserService:
         if action == "select" and index is None:
             raise BrowserError("select needs index: the index of a tab from the list")
         name = self.target_of(claims, target)
-        checked = await self._checked(url, name) if url else None
+        checked = await self._checked(claims, url, name) if url else None
         live, session = await self._locked_session(claims, name)
         try:
             try:
                 tabs = await session.tabs(action, index=index, url=checked)
             except BlockedUrlError as error:
                 raise BrowserError(str(error)) from None
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
         finally:
             self._release(live)
-        return render_tabs(tabs)
+        return self._clean(claims, render_tabs(tabs))
+
+    # -- the vault ---------------------------------------------------------------------------
+
+    async def _usable(self, claims: RunTokenClaims) -> tuple[LoginSource, list[Login]]:
+        if self.logins is None:
+            raise BrowserError("the browser vault is off in this process")
+        if claims.user_id is None:
+            raise BrowserError("saved logins work only in a private session of a user")
+        try:
+            return self.logins, await self.logins.usable(claims.org_id, claims.user_id)
+        except LoginError as error:
+            raise BrowserError(error.message) from None
+
+    async def vault_list(self, claims: RunTokenClaims) -> str:
+        """The names and sites of the logins that the user can use. No secret."""
+        _, logins = await self._usable(claims)
+        if not logins:
+            return NO_LOGINS
+        rows = [{"name": login.name, "site": login.site, "scope": login.scope} for login in logins]
+        return (
+            f"{len(rows)} saved login(s). Fill one with browser_vault action=fill and its name, "
+            "on a page of its site. sama fills the user name and the password; you never see "
+            "them.\n" + json.dumps(rows, ensure_ascii=False, indent=1)
+        )
+
+    async def vault_fill(
+        self,
+        claims: RunTokenClaims,
+        name: str,
+        *,
+        username_ref: str | None = None,
+        password_ref: str | None = None,
+        submit: bool = False,
+        snapshot: bool = True,
+        target: TargetName | None = None,
+    ) -> str:
+        """Fills the saved login ``name`` into the active tab. The login of the user wins over
+        an org login with the same name."""
+        source, logins = await self._usable(claims)
+        wanted = " ".join(name.split()).casefold()
+        matches = [login for login in logins if login.name.casefold() == wanted]
+        if not matches:
+            raise BrowserError(
+                "there is no saved login with this name; call browser_vault action=list"
+            )
+        login = sorted(matches, key=lambda item: item.user_id is None)[0]
+        try:
+            credentials = await source.credentials(login)
+        except LoginError as error:
+            raise BrowserError(error.message) from None
+        self._remember(claims, credentials.username.get_secret_value(), username=True)
+        self._remember(claims, credentials.password.get_secret_value(), username=False)
+        live, session = await self._locked_session(claims, self.target_of(claims, target))
+        try:
+            if not isinstance(session, LoginFiller):
+                raise BrowserError(
+                    "this browser target cannot fill saved logins; use the cloud browser"
+                )
+            filled = await session.fill_login(
+                FillRequest(
+                    username=credentials.username,
+                    password=credentials.password,
+                    site_allows=partial(site_allows, login.site),
+                    username_ref=username_ref,
+                    password_ref=password_ref,
+                    submit=submit,
+                )
+            )
+            shot = await session.snapshot() if snapshot else None
+        except BrowserError as error:
+            raise self._clean_error(claims, error) from None
+        finally:
+            self._release(live)
+        what = " and the ".join("user name" if f == "username" else f for f in filled.fields)
+        note = (
+            f"sama filled the {what} of the saved login {json.dumps(login.name)} "
+            f"({login.site}); the values are not shown"
+            + ("; it pressed Enter to submit" if submit else "")
+        )
+        state = replace(filled.page, notes=(note, *filled.page.notes))
+        text = render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
+        return self._clean(claims, text)
+
+    # -- the secrets of a run ----------------------------------------------------------------
+
+    def _remember(self, claims: RunTokenClaims, value: str, *, username: bool) -> None:
+        if not value or (username and len(value) < MIN_SCRUB_CHARS):
+            return
+        self._secrets.setdefault((claims.org_id, claims.run_id), set()).update(_forms(value))
+
+    def _clean(self, claims: RunTokenClaims, text: str) -> str:
+        """Replaces each filled user name and password of the run with ``[REDACTED]``. The
+        longest form first, so a value inside another value does not leave a part."""
+        secrets = self._secrets.get((claims.org_id, claims.run_id))
+        if not secrets:
+            return text
+        for value in sorted(secrets, key=len, reverse=True):
+            text = text.replace(value, REDACTED)
+        return text
+
+    def _clean_error(self, claims: RunTokenClaims, error: BrowserError) -> BrowserError:
+        if not self._secrets.get((claims.org_id, claims.run_id)):
+            return error
+        detail = self._clean(claims, error.detail) if error.detail else error.detail
+        return BrowserError(self._clean(claims, error.message), detail=detail)
 
     async def _locked_session(
         self, claims: RunTokenClaims, target: TargetName
@@ -401,6 +588,39 @@ class BrowserService:
 
 
 # -- rendering -------------------------------------------------------------------------------
+
+
+def _forms(value: str) -> set[str]:
+    """The forms of a value in a result: as it is, escaped in JSON (an extract), escaped in
+    HTML (a URL in an attribute), and encoded in a URL (a form that sends with GET, or a script
+    that encodes it)."""
+    forms = {
+        value,
+        json.dumps(value)[1:-1],
+        json.dumps(value, ensure_ascii=False)[1:-1],
+        html.escape(value, quote=True),
+        quote(value, safe=""),
+        quote_plus(value, safe=""),
+        _form_encoded(value),
+        _form_encoded(value).replace("+", "%20"),
+        quote(value, safe="~!*'()"),  # encodeURIComponent of JavaScript
+    }
+    return {form for form in forms if form}
+
+
+def _form_encoded(value: str) -> str:
+    """The ``application/x-www-form-urlencoded`` form of a browser (a form that sends with
+    GET): only letters, digits, and ``*-._`` stay; a space is ``+``. Python's ``quote_plus``
+    keeps ``~``, and a browser does not."""
+    out = []
+    for char in value:
+        if char.isascii() and (char.isalnum() or char in "*-._"):
+            out.append(char)
+        elif char == " ":
+            out.append("+")
+        else:
+            out.append("".join(f"%{byte:02X}" for byte in char.encode()))
+    return "".join(out)
 
 
 def _merged(state: PageState, shot: Snapshot) -> Snapshot:

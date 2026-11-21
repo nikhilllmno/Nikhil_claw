@@ -172,9 +172,12 @@ def make_target(
     connector: FakeConnector,
     contexts: Any = None,
     time: FakeTime | None = None,
+    *,
+    record: bool = False,
 ) -> BrowserbaseTarget:
     time = time or FakeTime()
     return BrowserbaseTarget(
+        record=record,
         api_key=SecretStr(KEY),
         project_id=PROJECT,
         contexts=contexts if contexts is not None else MemoryContextStore(),
@@ -200,7 +203,11 @@ async def test_a_private_run_gets_the_persistent_context_of_its_user() -> None:
         "projectId": PROJECT,
         "timeout": 900,
         "userMetadata": {"sama_org": "org-1", "sama_run": "run-1"},
-        "browserSettings": {"context": {"id": "ctx-1", "persist": True}},
+        "browserSettings": {
+            "recordSession": False,
+            "logSession": False,
+            "context": {"id": "ctx-1", "persist": True},
+        },
     }
     assert connector.urls == ["wss://connect/2"]
     assert store.rows == {("org-1", "user-1", "cloud"): "ctx-1"}
@@ -284,8 +291,21 @@ async def test_a_shared_run_gets_a_new_context_that_is_not_kept() -> None:
     target = make_target(api, connector, store)
     await target.start(org_id="org-1", user_id=None, run_id="run-1", guard=AllowAll())
     assert api.calls() == [("POST", "/v1/sessions")]
-    assert "browserSettings" not in api.requests[0][2]
+    assert "context" not in api.requests[0][2]["browserSettings"]
     assert store.rows == {}
+    await target.aclose()
+
+
+async def test_recording_and_logs_are_off_unless_asked() -> None:
+    api, connector, store = FakeApi(), FakeConnector(), MemoryContextStore()
+    target = make_target(api, connector, store)
+    await target.start(org_id="org-1", user_id=None, run_id="run-1", guard=AllowAll())
+    assert api.requests[0][2]["browserSettings"] == {"recordSession": False, "logSession": False}
+    await target.aclose()
+    api, connector = FakeApi(), FakeConnector()
+    target = make_target(api, connector, store, record=True)
+    await target.start(org_id="org-1", user_id=None, run_id="run-2", guard=AllowAll())
+    assert api.requests[0][2]["browserSettings"] == {"recordSession": True, "logSession": True}
     await target.aclose()
 
 

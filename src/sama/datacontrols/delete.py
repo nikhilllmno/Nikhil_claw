@@ -49,6 +49,7 @@ from sama.db.models import (
     ENDED_RUN_STATUSES,
     AuditEntry,
     Base,
+    BrowserLogin,
     Connection,
     DataPurge,
     Membership,
@@ -64,7 +65,7 @@ from sama.db.models import (
     WorkflowInstance,
 )
 from sama.observability.langfuse import MAX_DELETE_IDS
-from sama.vault.store import connection_secret, trigger_secret
+from sama.vault.store import browser_login_secret, connection_secret, trigger_secret
 
 CHILD_LINEAGES: Final = ("compaction", "delegation")
 """A child session of these lineages is part of its parent and goes with it."""
@@ -411,8 +412,9 @@ async def delete_user(
     """Deletes a user row of an org and the data of the user, in the open transaction.
 
     Deleted: the private sessions and private task cards of the user, the memberships, the
-    personal memory, skills, connections, rules, chat links, jobs, triggers, and workflows
-    (the keys cascade), and the vault secrets of the personal connections and the triggers.
+    personal memory, skills, connections, rules, chat links, jobs, triggers, workflows, and
+    saved browser logins (the keys cascade), and the vault secrets of the personal
+    connections, the triggers, and the personal browser logins.
     Kept: the shared content. Its user columns get a null. Raises ``LastOwnerError`` for the
     last owner. Returns ``Removed.running`` when a run blocks the delete."""
     await lock_timeout(connection)
@@ -463,23 +465,38 @@ async def delete_user(
 
     # The secrets of the rows that cascade from the user. The services remove the accounts
     # outside sama before this transaction (``Cleanup``).
-    names = [
-        str(connection_secret(row_id))
-        for row_id in (
-            await connection.execute(
-                select(Connection.id).where(
-                    Connection.org_id == org_id, Connection.owner_user_id == user_id
+    names = (
+        [
+            str(connection_secret(row_id))
+            for row_id in (
+                await connection.execute(
+                    select(Connection.id).where(
+                        Connection.org_id == org_id, Connection.owner_user_id == user_id
+                    )
                 )
-            )
-        ).scalars()
-    ] + [
-        str(trigger_secret(row_id))
-        for row_id in (
-            await connection.execute(
-                select(Trigger.id).where(Trigger.org_id == org_id, Trigger.owner_user_id == user_id)
-            )
-        ).scalars()
-    ]
+            ).scalars()
+        ]
+        + [
+            str(trigger_secret(row_id))
+            for row_id in (
+                await connection.execute(
+                    select(Trigger.id).where(
+                        Trigger.org_id == org_id, Trigger.owner_user_id == user_id
+                    )
+                )
+            ).scalars()
+        ]
+        + [
+            str(browser_login_secret(row_id))
+            for row_id in (
+                await connection.execute(
+                    select(BrowserLogin.id).where(
+                        BrowserLogin.org_id == org_id, BrowserLogin.user_id == user_id
+                    )
+                )
+            ).scalars()
+        ]
+    )
     if names:
         await connection.execute(
             delete(VaultSecret).where(VaultSecret.org_id == org_id, VaultSecret.name.in_(names))
