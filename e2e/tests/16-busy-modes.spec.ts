@@ -3,7 +3,7 @@
 
 import { poll, type RunOut } from "../lib/api.ts";
 import { marker } from "../lib/names.ts";
-import { send, startSession, waitForReply, waitIdle } from "../lib/ui.ts";
+import { composer, send, startSession, waitForReply, waitIdle } from "../lib/ui.ts";
 import { expect, test } from "../fixtures.ts";
 
 /** A prompt that keeps a run busy for some tool steps, so a second message comes while it works. */
@@ -33,8 +33,15 @@ test("a message during a run joins it (steer is the default)", async ({ ownerPag
   await waitForReply(page, first);
   await waitForReply(page, join);
   await waitIdle(page);
+  // The note ends as delivered, or as the next message when the run ended before its next step.
   const steers = await ownerApi.get<{ text: string; status: string }[]>(`/sessions/${sessionId}/steers`);
-  expect(steers.find((s) => s.text.includes(join))?.status).toMatch(/delivered|requeued/);
+  const status = steers.find((s) => s.text.includes(join))?.status;
+  expect(status).toMatch(/^(delivered|requeued)$/);
+  if (status === "delivered") {
+    await expect(note).toContainText("Delivered to the run");
+  } else {
+    await expect(page.getByRole("article", { name: "You", exact: true }).filter({ hasText: join })).toBeVisible();
+  }
 });
 
 test("/bg starts a second run at the same time", async ({ ownerPage: page, ownerApi }) => {
@@ -55,6 +62,22 @@ test("/bg starts a second run at the same time", async ({ ownerPage: page, owner
   expect(chat.length).toBeGreaterThanOrEqual(2);
   const [newer, older] = [chat[0]!, chat[1]!];
   expect(Date.parse(newer.started_at!)).toBeLessThan(Date.parse(older.finished_at!));
+});
+
+test("the Run in parallel button starts a second run", async ({ ownerPage: page }) => {
+  const first = marker("slow");
+  const quick = marker("quick");
+  await startSession(page, `e2e parallel button ${first}`);
+  await send(page, busyTask(first));
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await composer(page).fill(`Reply with the word ${quick} and nothing else.`);
+  await page.getByRole("button", { name: "Run in parallel" }).click();
+  const runs = page.getByRole("region", { name: "Runs that work at the same time" });
+  await expect(runs).toBeVisible();
+  await expect(runs.getByRole("button", { name: /^Stop run \d+$/ })).toHaveCount(2);
+  await waitForReply(page, quick);
+  await waitForReply(page, first);
+  await waitIdle(page);
 });
 
 test("/stop NUMBER stops one of two open runs", async ({ ownerPage: page, ownerApi }) => {
