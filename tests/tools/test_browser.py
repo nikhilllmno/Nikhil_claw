@@ -106,6 +106,14 @@ async def test_the_screenshot_is_an_image(world: World) -> None:
         ("browser_open", {"url": "http://10.0.0.1/admin"}, "the URL policy blocked"),
         ("browser_open", {"url": "file:///etc/passwd"}, "only http and https"),
         ("browser_act", {"action": "click"}, "click needs ref"),
+        ("browser_act", {"action": "click", "x": 5}, "a point needs both x and y"),
+        (
+            "browser_act",
+            {"action": "select", "x": 5, "y": 5, "values": ["a"]},
+            "x and y work only with",
+        ),
+        ("browser_act", {"action": "click", "ref": "e1", "x": 5, "y": 5}, "not both"),
+        ("browser_act", {"action": "click", "x": 5, "y": 5}, "cannot act at a point"),
         ("browser_tabs", {"action": "select"}, "select needs index"),
         ("browser_extract", {"kind": "fields"}, "kind fields needs fields"),
     ],
@@ -206,3 +214,35 @@ async def test_browser_vault_fills_through_the_server_without_the_secret() -> No
     assert missing.is_error
     assert "fill needs name" in text_of(missing)
     await service.aclose()
+
+
+async def test_browser_act_takes_a_point_in_vision_mode(world: World) -> None:
+    world.target.vision = True
+    async with connect(world.url, world.token()) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        click = await client.call_tool(
+            "browser_act", {"action": "click", "x": 120.5, "y": 80, "clicks": 2, "snapshot": False}
+        )
+        drag = await client.call_tool(
+            "browser_act",
+            {"action": "drag", "x": 10, "y": 20, "to_x": 300, "to_y": 40, "snapshot": False},
+        )
+    properties = tools["browser_act"].input_schema["properties"]
+    assert set(properties) >= {"x", "y", "to_x", "to_y", "clicks"}
+    assert "vision mode" in (tools["browser_act"].description or "")
+    assert "vision mode" in (tools["browser_screenshot"].description or "")
+    assert not click.is_error, text_of(click)
+    assert not drag.is_error, text_of(drag)
+    (session,) = world.target.sessions
+    assert session.calls == ["act click None at (120.5, 80)", "act drag None at (10, 20)"]
+
+
+@pytest.mark.parametrize("point", [{"x": -1, "y": 5}, {"x": 5, "y": 10_001}])
+async def test_the_schema_refuses_a_point_out_of_range(
+    world: World, point: dict[str, float]
+) -> None:
+    world.target.vision = True
+    async with connect(world.url, world.token()) as client:
+        result = await client.call_tool("browser_act", {"action": "click", **point})
+    assert result.is_error
+    assert world.target.sessions == []

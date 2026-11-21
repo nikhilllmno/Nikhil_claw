@@ -70,6 +70,8 @@ class FakeSession:
     tree: str = '- button "Go" [ref=e1]'
     error: BrowserError | None = None
     """When set, ``snapshot`` raises it."""
+    vision: bool = False
+    """The session can act at a point (vision mode, M5.2)."""
 
     @property
     def target(self) -> TargetName:
@@ -96,7 +98,8 @@ class FakeSession:
         return Snapshot(page=self._state(), tree=self.tree)
 
     async def act(self, act: Act) -> PageState:
-        self.calls.append(f"act {act.action} {act.ref}")
+        point = "" if act.point is None else f" at ({act.point[0]:g}, {act.point[1]:g})"
+        self.calls.append(f"act {act.action} {act.ref}{point}")
         return self._state()
 
     async def screenshot(self, *, full_page: bool = False) -> Screenshot:
@@ -142,6 +145,8 @@ class FakeTarget:
     """When set, ``start`` waits for it, so a test can run starts at the same time."""
     session_class: type[FakeSession] = FakeSession
     guards: list[NavigationGuard] = field(default_factory=list)
+    vision: bool = False
+    """The sessions can act at a point (vision mode, M5.2)."""
 
     @property
     def name(self) -> TargetName:
@@ -162,7 +167,7 @@ class FakeTarget:
             raise self.fail
         self.starts.append((org_id, user_id, run_id))
         self.guards.append(guard)
-        session = self.session_class(run_id)
+        session = self.session_class(run_id, vision=self.vision)
         self.sessions.append(session)
         return session
 

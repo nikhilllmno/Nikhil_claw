@@ -32,6 +32,12 @@ M5.3 adds two parts:
 - The browser vault (``vault_list`` and ``vault_fill``). The session fills a saved login into the
   page. The user name and the password never go to the agent: each result of the run has them
   replaced with ``[REDACTED]``, also when the page shows them later.
+
+Vision mode (M5.2): ``browser_act`` can name a point (``x``, ``y``) of the viewport instead of a
+ref, for pages that have no usable accessibility tree (a ``<canvas>`` app). The service checks
+the arguments of a point before the session starts, and refuses a point on a session that has
+no vision mode. The caption of a screenshot gives the size of the image, so the agent knows the
+range of the points.
 """
 
 from __future__ import annotations
@@ -48,10 +54,11 @@ from functools import partial
 from typing import Any, Final
 from urllib.parse import quote, quote_plus
 
-from sama.browser.guard import OrgGuard
+from sama.browser.guard import BLANK, OrgGuard
 from sama.browser.logins import Login, LoginError, LoginSource, site_allows
 from sama.browser.policy import PolicySource
 from sama.browser.target import (
+    ACTIONS_WITH_POINT,
     ACTIONS_WITH_REF,
     MY_CHROME,
     UNTRUSTED_SOURCE,
@@ -71,6 +78,7 @@ from sama.browser.target import (
     Tab,
     TabAction,
     TargetName,
+    has_vision,
 )
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.outbound import BlockedUrlError
@@ -95,6 +103,12 @@ SCREENSHOT_AFTER_FILL: Final = (
 NO_LOGINS: Final = (
     "There are no saved logins for you. An org admin adds the logins of the org, and each user "
     "adds personal logins, in the web app (Settings, Browser)."
+)
+VISION_HINT_REFS: Final = 2
+"""A snapshot with this many refs or fewer gets the vision hint."""
+VISION_HINT: Final = (
+    "the page has few elements with refs (for example a canvas); to act on it, take "
+    "browser_screenshot and use browser_act with x and y (vision mode)"
 )
 
 
@@ -384,12 +398,19 @@ class BrowserService:
         snapshot: bool = True,
         target: TargetName | None = None,
     ) -> str:
-        if act.action in ACTIONS_WITH_REF and not act.ref:
-            raise BrowserError(f"{act.action} needs ref: the ref of an element from the snapshot")
-        if act.action == "drag" and not act.target_ref:
-            raise BrowserError("drag needs target_ref: the element to drop on")
+        check_act(act)
         live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
+            if act.point is not None and not has_vision(session):
+                raise BrowserError(
+                    f"the {session.target} browser cannot act at a point (x, y) yet; use a ref "
+                    "from browser_snapshot"
+                )
+            if act.clicks != 1 and not has_vision(session):
+                # ``clicks`` came with vision mode: a session without it can ignore it.
+                raise BrowserError(
+                    f"the {session.target} browser cannot do clicks={act.clicks} yet"
+                )
             state = await session.act(act)
             shot = await session.snapshot() if snapshot else None
         except BrowserError as error:
@@ -623,6 +644,39 @@ def _form_encoded(value: str) -> str:
     return "".join(out)
 
 
+def check_act(act: Act) -> None:
+    """Refuses the arguments of ``browser_act`` that do not fit the action, before a session
+    starts. An action names its element with a ref or with a point (vision mode), not both."""
+    has_x, has_y = act.x is not None, act.y is not None
+    if has_x != has_y:
+        raise BrowserError("a point needs both x and y")
+    if (act.to_x is None) != (act.to_y is None):
+        raise BrowserError("a drop point needs both to_x and to_y")
+    point = act.point is not None
+    if point:
+        if act.action not in ACTIONS_WITH_POINT:
+            allowed = ", ".join(sorted(ACTIONS_WITH_POINT))
+            raise BrowserError(f"x and y work only with {allowed}; {act.action} does not use them")
+        if act.ref:
+            raise BrowserError("give ref or x and y, not both")
+    if act.to_point is not None and not (act.action == "drag" and point):
+        raise BrowserError("to_x and to_y work only with drag at a point (x and y)")
+    if act.clicks != 1 and act.action != "click":
+        raise BrowserError("clicks works only with click")
+    if act.action == "drag":
+        if point:
+            if act.target_ref:
+                raise BrowserError("a drag at a point needs to_x and to_y, not target_ref")
+            if act.to_point is None:
+                raise BrowserError("drag at a point needs to_x and to_y: the point to drop on")
+            return
+        if not act.target_ref and act.ref:
+            raise BrowserError("drag needs target_ref: the element to drop on")
+    if act.action in ACTIONS_WITH_REF and not act.ref and not point:
+        how = " or x and y (vision mode)" if act.action in ACTIONS_WITH_POINT else ""
+        raise BrowserError(f"{act.action} needs ref: the ref of an element from the snapshot{how}")
+
+
 def _merged(state: PageState, shot: Snapshot) -> Snapshot:
     """The snapshot after an action, with the notes and blocked URLs of the action first. The
     snapshot reads the news of the session again, so without this the news of the action is
@@ -666,16 +720,41 @@ def render_snapshot(shot: Snapshot) -> str:
     body = f"Title: {state.title}{_blocked(state)}\n\n{shot.tree or '(the page is empty)'}"
     return (
         f"{_header(state)} Use the [ref=...] values with browser_act; a new snapshot makes "
-        f"the old refs invalid.{_notes(state)}\n{untrusted(body, source=SOURCE, url=state.url)}"
+        f"the old refs invalid.{_notes(state)}{_vision_hint(shot)}\n"
+        f"{untrusted(body, source=SOURCE, url=state.url)}"
     )
+
+
+def _vision_hint(shot: Snapshot) -> str:
+    """A hint for a page with few refs, for example a ``<canvas>`` app: the agent can look at a
+    screenshot and act at points. A blank tab gets no hint."""
+    if shot.page.url == BLANK or shot.tree.count("[ref=") > VISION_HINT_REFS:
+        return ""
+    return f"\nNote: {VISION_HINT}"
 
 
 def render_screenshot(shot: Screenshot) -> str:
     state = shot.page
     return (
         f"{_header(state)} A screenshot of {len(shot.data)} bytes ({shot.mime_type}) follows."
-        f"{_notes(state)}\n"
+        f"{_size(shot)}{_notes(state)}\n"
         f"{untrusted(f'Title: {state.title}{_blocked(state)}', source=SOURCE, url=state.url)}"
+    )
+
+
+def _size(shot: Screenshot) -> str:
+    """The size of the image, and how a point of it maps to ``browser_act`` (vision mode)."""
+    if not (shot.width and shot.height):
+        return ""
+    size = f" The image is {shot.width}x{shot.height} pixels."
+    if shot.full_page:
+        return (
+            f"{size} It is the full page, so its points are not viewport points: for browser_act "
+            "with x and y, take a screenshot with full_page=false."
+        )
+    return (
+        f"{size} It is the viewport: browser_act takes x (0 to {shot.width - 1}) and y (0 to "
+        f"{shot.height - 1}) in these pixels, from the top left corner."
     )
 
 
