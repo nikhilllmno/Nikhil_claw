@@ -365,7 +365,7 @@ maintenance calls `sweep_steers()`: it sends the pending notes of completed runs
 came in after `complete`) as a new message, and it drops (status `dropped`) the pending notes of
 failed and cancelled runs. It handles at most 50 runs in one pass (`STEER_SWEEP_BATCH`).
 
-**Busy modes and parallel runs (M7.1, migration `0040`).** The busy mode of an agent profile
+**Busy modes and parallel runs (M7.1, migration `0043`).** The busy mode of an agent profile
 (`agent_profiles.busy_mode`) says what a new message does while a run of its session is open.
 The modes follow Claude Code:
 
@@ -431,6 +431,11 @@ parallel" button of the web chat start a parallel run, like a background agent o
 - **Stop.** `/stop` stops all open runs of the session. `/stop NUMBER` stops the run at that
   place of `open_runs` (the open chat runs, oldest first). A wrong number lists the open runs.
   The answer to a parallel run tells its number. `GET /sessions/{id}/open-runs` gives the list.
+- **Coding agents (M7.2, Section 15.4).** A coding agent CLI (`claude_code`, `codex`) cannot
+  read a note in the middle of a run, and it has no runtime session that a side run can share.
+  So in a session in the direct mode (`sessions.coding_agent`), or while a coding agent run is
+  open, the mode `steer` acts as `queue`: the message waits. No side run starts in a session in
+  the direct mode, next to an open coding agent run, or as a `/claude` or `/codex` task.
 - **Limits and quotas.** A side run counts like any run: one message for the message rates, one
   run for `max_running_runs` of the org and the plan (Section 17.5), and its model cost for the
   model quotas. A run that waits for the session limit stays `queued`.

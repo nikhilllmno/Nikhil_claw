@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import AgentProfile, Message, Run
+from sama.db.models import AgentProfile, Message, Run, Session
 from sama.gateway.sessions import busy_text, stop_reply
 from sama.orchestrator.queue import ClaimedRun, RunQueue
 from sama.runtime.contract import FailureCode, Usage
@@ -416,3 +416,59 @@ async def test_the_watermark_comes_from_the_runtime_of_the_resumed_state(
     assert following.runtime == "claude_agent_sdk"
     assert following.runtime_state == b"fake-2"
     assert "quick answer" not in following.input
+
+
+async def test_a_coding_agent_session_has_no_join_and_no_side_runs(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """Section 15.4: a coding agent CLI cannot read a note mid-run, so in the direct mode a
+    message waits, and no run starts next to a coding agent run."""
+    queue = RunQueue(engine)
+    session = tenant.ids["s1"]
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Session).where(Session.id == session).values(coding_agent="claude_code")
+        )
+    await send(queue, tenant, "fix the bug")
+    cli = await claim(queue)
+    assert cli.runtime == "claude_code"
+    assert (
+        await queue.steer(org_id=tenant.org, session_id=session, text="x", busy_mode=True) is None
+    )
+    waiting = await send(queue, tenant, "also the tests", parallel=True)
+    assert await queue.claim(OWNER) is None
+    assert await queue.waits(org_id=tenant.org, run_id=waiting)
+
+
+async def test_no_side_run_starts_next_to_a_coding_agent_task(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await queue.enqueue(
+        org_id=tenant.org,
+        session_id=tenant.ids["s1"],
+        text="octo/demo fix the typo",
+        user_id=tenant.ids["mia"],
+        coding_agent="codex",
+    )
+    task = await claim(queue)
+    assert task.runtime == "codex"
+    assert (
+        await queue.steer(org_id=tenant.org, session_id=tenant.ids["s1"], text="x", busy_mode=True)
+        is None
+    )
+    await send(queue, tenant, "meanwhile", parallel=True)
+    assert await queue.claim(OWNER) is None
+    # A /claude task never starts as a side run either.
+    await finish(queue, task, "done", None)
+    await send(queue, tenant, "main")
+    await claim(queue)
+    blocked = await queue.enqueue(
+        org_id=tenant.org,
+        session_id=tenant.ids["s1"],
+        text="octo/demo second",
+        user_id=tenant.ids["mia"],
+        coding_agent="claude_code",
+        parallel=True,
+    )
+    assert await queue.waits(org_id=tenant.org, run_id=blocked)

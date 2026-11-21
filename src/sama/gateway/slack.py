@@ -615,18 +615,8 @@ class SlackGateway:
                 text=text,
                 user_id=target.user_id,
                 attachments=images,
-        if (
-            not parallel
-            and coding_agent is None
-            and not refs
-            and steer is None
-            and not text.startswith("/")
-        ):
-            joined = await self._join(place, target, grants, text)
-            if joined is not None:
-                await self._say(place, joined)
-                return
-        if text.startswith("/") and coding_agent is None:
+                coding_agent=None if coding_agent is None else coding_agent.value,
+                parallel=parallel,
             )
         except QueueError as error:
             self._followers.discard(holder)

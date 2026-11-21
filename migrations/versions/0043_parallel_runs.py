@@ -15,8 +15,8 @@ The unique index ``ix_runs_one_active_per_session`` becomes ``ix_runs_one_main_p
 a session has at most one open run that is not a side run. No table is added, so no RLS policy
 changes.
 
-Revision ID: 0040
-Revises: 0039
+Revision ID: 0043
+Revises: 0042
 Create Date: 2026-11-21
 """
 
@@ -25,8 +25,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0040"
-down_revision: str | None = "0039"
+revision: str = "0043"
+down_revision: str | None = "0042"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

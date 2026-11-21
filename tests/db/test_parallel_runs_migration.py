@@ -1,4 +1,4 @@
-"""Migration 0040: busy modes and parallel runs (docs/architecture.md, Section 4.3, M7.1)."""
+"""Migration 0043: busy modes and parallel runs (docs/architecture.md, Section 4.3, M7.1)."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def test_the_upgrade_adds_the_columns_and_the_downgrade_removes_them() -> None:
         assert "ix_runs_one_main_per_session" in _indexes(url)
         assert "ix_runs_one_active_per_session" not in _indexes(url)
         config = alembic_config(url)
-        command.downgrade(config, "0039")
+        command.downgrade(config, "0042")
         assert not {"busy_mode", "max_parallel_runs"} & _columns(url, "agent_profiles")
         assert not {"allow_parallel", "side", "context_seq"} & _columns(url, "runs")
         assert "ix_runs_one_active_per_session" in _indexes(url)
@@ -72,7 +72,7 @@ def test_the_downgrade_ends_side_runs_and_drops_their_state() -> None:
                 )
             )
             ids.append(inserted["id"])
-        command.downgrade(alembic_config(url), "0039")
+        command.downgrade(alembic_config(url), "0042")
         rows = asyncio.run(
             _fetch(url, "SELECT id, status, runtime_state FROM runs WHERE id = ANY($1)", ids)
         )

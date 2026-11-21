@@ -94,8 +94,16 @@ ADMIN_ONLY_FIELDS: Final = ("budget", "reasoning_effort")
 must not raise its own budget."""
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "soul": ("soul",),
-    "profile": ("name", "runtime", "model", "subagents", "budget", "reasoning_effort"),
-    "profile": ("name", "runtime", "model", "subagents", "busy_mode", "max_parallel_runs"),
+    "profile": (
+        "name",
+        "runtime",
+        "model",
+        "subagents",
+        "budget",
+        "reasoning_effort",
+        "busy_mode",
+        "max_parallel_runs",
+    ),
     "toolsets": ("toolsets", "group_toolsets"),
     "policy": ("rules",),
 }

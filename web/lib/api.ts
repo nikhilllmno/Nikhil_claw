@@ -470,8 +470,6 @@ export interface AgentProfile {
   budget: ProfileBudget;
   /** `null`: the default of the model. */
   reasoning_effort: ReasoningEffort | null;
-  /** The busy mode (M7.1). Only when the API has it. */
-  busy_mode?: BusyMode;
 }
 
 /** The body of `PATCH /orgs/{org_id}/agent-profiles/{profile_id}`. Each field is optional. */

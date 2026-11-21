@@ -709,7 +709,7 @@ class Run(Base):
             "org_id",
             postgresql_where=text("status = 'running'"),
         ),
-        # One open main run per session (migration 0040, Section 4.3). Side runs (M7.1) run
+        # One open main run per session (migration 0043, Section 4.3). Side runs (M7.1) run
         # next to it, up to the limit of the profile, which the claim checks.
         Index(
             "ix_runs_one_main_per_session",

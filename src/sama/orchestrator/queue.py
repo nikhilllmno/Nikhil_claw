@@ -72,6 +72,7 @@ from sama.context.compaction import record_compacted
 from sama.context.pins import all_pin_texts, compact_focus, pin_block, pins_for_input
 from sama.db.engine import autocommit
 from sama.db.models import (
+    CODING_AGENTS,
     ENDED_RUN_STATUSES,
     MAX_STEER_CHARS,
     AgentProfile,
@@ -330,7 +331,8 @@ def _ready(runs: Any, limit: Any) -> Any:
     - A chat run starts when the session has no open chat run, or when it resumes after an
       approval (it was open before), or when it can run in parallel (M7.1): it is not a
       ``/compact`` run, ``allow_parallel`` is set, and the session has fewer open chat runs
-      than ``limit``.
+      than ``limit``. A coding agent run (Section 15.4) never runs in parallel: the run is not
+      a coding agent run, no open run is one, and the session is not in the direct mode.
     """
     active = aliased(Run)
     older = aliased(Run)
@@ -362,7 +364,22 @@ def _ready(runs: Any, limit: Any) -> Any:
                 or_(
                     ~exists().where(*opened).correlate(runs),
                     _resumes(runs),
-                    and_(runs.allow_parallel, ~runs.compact, open_chat < limit),
+                    and_(
+                        runs.allow_parallel,
+                        ~runs.compact,
+                        open_chat < limit,
+                        # A coding agent CLI (Section 15.4) never runs next to another run, and
+                        # a session in the direct mode has no side runs.
+                        runs.coding_agent.is_(None),
+                        ~exists().where(*opened, active.runtime.in_(CODING_AGENTS)).correlate(runs),
+                        ~exists()
+                        .where(
+                            Session.org_id == runs.org_id,
+                            Session.id == runs.session_id,
+                            Session.coding_agent.is_not(None),
+                        )
+                        .correlate(runs),
+                    ),
                 ),
             ),
         ),
@@ -1025,7 +1042,16 @@ class RunQueue:
                                     AgentProfile.org_id == Run.org_id,
                                     AgentProfile.id == Run.agent_profile_id,
                                     AgentProfile.busy_mode == "steer",
-                                )
+                                ),
+                                # A coding agent CLI cannot read a note in the middle of a run,
+                                # and a session in the direct mode sends each message to the
+                                # CLI (Section 15.4): there the message waits.
+                                Run.runtime.not_in(CODING_AGENTS),
+                                ~exists().where(
+                                    Session.org_id == Run.org_id,
+                                    Session.id == Run.session_id,
+                                    Session.coding_agent.is_not(None),
+                                ),
                             ]
                             if busy_mode
                             else []
