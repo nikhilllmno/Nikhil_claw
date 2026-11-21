@@ -8081,6 +8081,10 @@ for tests.
   pay.
 
 Add the flows of a new item to the suite in the pull request of the item, or in the next one.
+The staging web app deploys to Vercel by hand, so deploy it before a flow of a new page runs.
+The channel flows of M7.8 use fake credentials: they check that a connect with credentials that
+the provider refuses leaves no row, and the guards of the routes. A real WhatsApp number or
+SendGrid account is not part of the suite.
 
 ---
 
