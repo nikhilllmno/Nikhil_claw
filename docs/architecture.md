@@ -7520,7 +7520,9 @@ for tests.
   uses a new email address and org name.
 - **Results.** The workflow keeps the HTML report, the JUnit file, and the screenshots,
   videos, and traces of failed tests for 7 days. A trace can have the short-lived token of a
-  test user. The teardown deletes the user and the org, so the token gives access to nothing.
+  test user (it expires after 1 hour). After a clean teardown the user and the org are gone, so
+  the token gives access to nothing. When the teardown keeps an owner because its org did not
+  go, the token gives access to that test org until it expires or the sweep removes the org.
 - **Billing.** The billing test opens Stripe Checkout in test mode (`cs_test_`) and does not
   pay.
 

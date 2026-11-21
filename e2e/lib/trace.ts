@@ -61,5 +61,7 @@ export async function sessionToolUses(api: SamaApi, sessionId: string): Promise<
  */
 export function calledTool(use: ToolUse, match: RegExp): boolean {
   if (match.test(use.name)) return true;
-  return use.name.endsWith("tool_call") && match.test(JSON.stringify(use.arguments ?? ""));
+  if (!use.name.endsWith("tool_call")) return false;
+  const args = use.arguments as { name?: unknown } | null | undefined;
+  return typeof args?.name === "string" && match.test(args.name);
 }

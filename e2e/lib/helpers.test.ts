@@ -147,8 +147,11 @@ describe("trace", () => {
       ["mcp__sama__tool_call", false, "boom"],
     ]);
     expect(calledTool(uses[0]!, /^browser_open$/)).toBe(true);
-    expect(calledTool(uses[1]!, /mcp_ev_echo/)).toBe(true);
+    expect(calledTool(uses[1]!, /mcp_ev_echo$/)).toBe(true);
     expect(calledTool(uses[0]!, /echo/)).toBe(false);
+    // Only the name of the wrapped tool counts, not another argument.
+    const other = { name: "tool_call", arguments: { name: "web_search", q: "mcp_ev_echo" }, ok: true, output: "" };
+    expect(calledTool(other, /mcp_ev_echo/)).toBe(false);
   });
 });
 
