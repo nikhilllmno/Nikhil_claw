@@ -125,8 +125,9 @@ class CheckpointService:
 
         A new run needs a lock on the session row: ``RunQueue.enqueue`` locks the row, and the
         insert of a run takes a key share lock on it. So no run can start while the restore
-        changes the files. The lock does not take the rate lock of the org, so the other
-        sessions of the org do not wait."""
+        changes the files. The restore does not take the rate lock of the org. A message to
+        this session during the restore waits for the row with the rate lock held, so the new
+        runs of the org wait until the restore ends (about 1 second; Section 15.3)."""
         args = ["undo"] if number is None else ["restore", "--number", str(number)]
         async with self._engine.begin() as connection:
             workspace_id = await self._reserve(connection, org_id, session_id)

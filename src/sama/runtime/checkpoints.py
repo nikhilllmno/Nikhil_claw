@@ -535,35 +535,39 @@ class _Guard:
     def __init__(self, workdir: str, saved: set[str]) -> None:
         self.workdir = workdir
         self.saved = saved
-        self._lossy: dict[str, bool] = {}
+        self._state: dict[str, Literal["ok", "gone", "lossy"]] = {}
 
     def safe(self, rel: str) -> bool:
         parts = rel.split("/")
         for depth in range(1, len(parts) + 1):
             prefix = "/".join(parts[:depth])
-            lossy = self._lossy.get(prefix)
-            if lossy is None:
-                lossy = self._lossy[prefix] = self._replace_loses(prefix, depth == len(parts))
-            if lossy:
+            state = self._state.get(prefix)
+            if state is None:
+                state = self._state[prefix] = self._check(prefix, depth == len(parts))
+            if state == "lossy":
                 return False
+            if state == "gone":
+                # A saved file or link on the path goes first, so nothing is under it.
+                return True
         return True
 
-    def _replace_loses(self, rel: str, last: bool) -> bool:
-        """True if a write at (or under) ``rel`` removes something that is not saved."""
+    def _check(self, rel: str, last: bool) -> Literal["ok", "gone", "lossy"]:
+        """``lossy`` if a write at (or under) ``rel`` removes something that is not saved.
+        ``gone`` if a saved file or link is on the path of the write: the restore removes it."""
         try:
             st = os.lstat(os.path.join(self.workdir, rel))
-        except (FileNotFoundError, NotADirectoryError):
-            # Nothing is there, or a file on the path goes first (it is saved, or the check
-            # of that file stops the write).
-            return False
+        except FileNotFoundError:
+            return "ok"
         except OSError:
-            return True
+            return "lossy"
         if stat.S_ISDIR(st.st_mode):
             # A folder on the path of a file stays. A folder at the place of a file goes.
-            return last and self._holds_unsaved(rel)
+            return "lossy" if last and self._holds_unsaved(rel) else "ok"
         if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
-            return rel not in self.saved
-        return True
+            if rel not in self.saved:
+                return "lossy"
+            return "ok" if last else "gone"
+        return "lossy"
 
     def _holds_unsaved(self, rel: str) -> bool:
         for root, dirs, files in os.walk(os.path.join(self.workdir, rel), followlinks=False):

@@ -4873,9 +4873,12 @@ line. A restore:
 
 1. refuses when the session has an open run. The service locks the session row
    (`FOR UPDATE`) for the whole restore. `RunQueue.enqueue` locks the same row, and a new run
-   row takes a key share lock on it, so no run can start during a restore. The lock is only on
-   this session: other sessions of the org do not wait. The runner also holds
-   `.sama/runner.lock`, and a restore waits at most 10 seconds for it.
+   row takes a key share lock on it, so no run can start during a restore. The restore does
+   not take the rate lock of the org. But a message to the same session during a restore
+   waits for the row while it holds the rate lock, and then the new runs of the other sessions
+   of the org also wait until the restore ends. A restore takes about 1 second in E2B, and at
+   most the command timeout (120 seconds). The runner also holds `.sama/runner.lock`, and a
+   restore waits at most 10 seconds for it.
 2. takes a `rollback` checkpoint of the current files first, so that the user can go back with
    `/rollback 1`.
 3. finds the files of the target that it cannot write without data loss. To write a file,

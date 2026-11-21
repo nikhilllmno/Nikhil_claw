@@ -259,6 +259,21 @@ def test_a_restore_replaces_a_folder_that_holds_only_saved_files(work: Path) -> 
     assert (work / "data/a/b.txt").read_text() == "b"
 
 
+def test_a_restore_replaces_a_link_at_the_place_of_a_folder(work: Path) -> None:
+    checkpoints = Checkpoints(str(work))
+    _write(work, "src/main.py", "old")
+    checkpoints.snapshot("r1", "Bash")
+    # The run moves the folder and puts a link to the new place.
+    (work / "src").rename(work / "lib")
+    _write(work, "lib/main.py", "new")
+    os.symlink("lib", work / "src")
+    restored = checkpoints.undo()
+    assert not (work / "src").is_symlink()
+    assert (work / "src/main.py").read_text() == "old"
+    assert not (work / "lib").exists()
+    assert restored.kept == 0
+
+
 def test_git_attributes_do_not_change_the_bytes(work: Path) -> None:
     checkpoints = Checkpoints(str(work))
     attributes = "*.txt text eol=lf ident\n*.bin filter=missing\n"
