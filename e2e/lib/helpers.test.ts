@@ -131,3 +131,108 @@ describe("sweep", () => {
     expect(staleTestUsers(users, 3 * 3_600_000, now).map((u) => u.id)).toEqual(["1"]);
   });
 });
+
+describe("trace", () => {
+  it("pairs the start and the end of each tool call", async () => {
+    const { calledTool, toolUsesOf } = await import("./trace.ts");
+    const uses = toolUsesOf([
+      { type: "tool_call_started", payload: { call_id: "a", name: "browser_open", arguments: {} } },
+      { type: "text", payload: {} },
+      { type: "tool_call_started", payload: { call_id: "b", name: "mcp__sama__tool_call", arguments: { name: "mcp_ev_echo" } } },
+      { type: "tool_call_finished", payload: { call_id: "a", is_error: false, output_preview: "ok" } },
+      { type: "tool_call_finished", payload: { call_id: "b", is_error: true, output_preview: "boom" } },
+    ]);
+    expect(uses.map((u) => [u.name, u.ok, u.output])).toEqual([
+      ["browser_open", true, "ok"],
+      ["mcp__sama__tool_call", false, "boom"],
+    ]);
+    expect(calledTool(uses[0]!, /^browser_open$/)).toBe(true);
+    expect(calledTool(uses[1]!, /mcp_ev_echo/)).toBe(true);
+    expect(calledTool(uses[0]!, /echo/)).toBe(false);
+  });
+});
+
+describe("cleanup", () => {
+  const owner = { email: "sama-e2e+r-owner@example.com", password: "p", authUserId: "u1" };
+  const member = { email: "sama-e2e+r-member@example.com", password: "p", authUserId: "u2" };
+  const org = { id: "o1", slug: "e2e-r-main", name: "e2e-r-main", workspaceId: "w", profileId: "p", owner: "owner" };
+  const noWait = async () => undefined;
+
+  it("tries an org delete again after a conflict, then removes the users", async () => {
+    const { cleanUp } = await import("./cleanup.ts");
+    const { HttpError } = await import("./http.ts");
+    let tries = 0;
+    const deleted: string[] = [];
+    const errors = await cleanUp([{ org, owner }], [owner, member], {
+      deleteOrg: async () => {
+        tries += 1;
+        if (tries < 3) throw new HttpError("DELETE", "https://a.test/orgs/o1", 409, "runs stop");
+      },
+      deleteUser: async (user) => deleted.push(user.email),
+      sleep: noWait,
+    });
+    expect(errors).toEqual([]);
+    expect(tries).toBe(3);
+    expect(deleted).toEqual([owner.email, member.email]);
+  });
+
+  it("keeps the owner of an org that does not go, so the sweep can try again", async () => {
+    const { cleanUp, ORG_DELETE_TRIES } = await import("./cleanup.ts");
+    const { HttpError } = await import("./http.ts");
+    let tries = 0;
+    const deleted: string[] = [];
+    const errors = await cleanUp([{ org, owner }], [owner, member], {
+      deleteOrg: async () => {
+        tries += 1;
+        throw new HttpError("DELETE", "https://a.test/orgs/o1", 409, "runs stop");
+      },
+      deleteUser: async (user) => deleted.push(user.email),
+      sleep: noWait,
+    });
+    expect(tries).toBe(ORG_DELETE_TRIES);
+    expect(deleted).toEqual([member.email]);
+    expect(errors.join("\n")).toMatch(/org o1/);
+    expect(errors.join("\n")).toMatch(/kept/);
+  });
+
+  it("does not try again after an error that does not pass", async () => {
+    const { cleanUp } = await import("./cleanup.ts");
+    const { HttpError } = await import("./http.ts");
+    let tries = 0;
+    await cleanUp([{ org, owner }], [], {
+      deleteOrg: async () => {
+        tries += 1;
+        throw new HttpError("DELETE", "https://a.test/orgs/o1", 400, "bad slug");
+      },
+      deleteUser: async () => undefined,
+      sleep: noWait,
+    });
+    expect(tries).toBe(1);
+  });
+});
+
+describe("supabase origin", () => {
+  it("needs https and the expected project", async () => {
+    const { httpsOrigin } = await import("./env.ts");
+    expect(httpsOrigin("https://x.supabase.co/")).toBe("https://x.supabase.co");
+    expect(() => httpsOrigin("http://x.supabase.co")).toThrow(/https/);
+    const env = readEnv({ E2E_SUPABASE_SERVICE_ROLE_KEY: "k" });
+    expect(env.supabaseUrl).toBe("https://nzykdakgziugbuezuzpb.supabase.co");
+  });
+
+  it("refuses an API that names another Supabase project", async () => {
+    const { supabaseConfig } = await import("./supabase.ts");
+    const real = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ supabase_url: "https://evil.example", supabase_anon_key: "a" }), {
+        status: 200,
+      })) as typeof fetch;
+    try {
+      await expect(supabaseConfig("https://api.test", "https://good.supabase.co")).rejects.toThrow(
+        /not https:\/\/good.supabase.co/,
+      );
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+});

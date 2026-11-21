@@ -15,7 +15,7 @@ export default async function globalSetup(): Promise<void> {
   // For work on a test: keep the world of the last run (with E2E_KEEP_DATA=1) and use it again.
   if (process.env.E2E_REUSE_WORLD === "1" && existsSync(WORLD_FILE)) return;
   const env = readEnv();
-  const supabase = await supabaseConfig(env.apiUrl);
+  const supabase = await supabaseConfig(env.apiUrl, env.supabaseUrl);
   const admin = new SupabaseAdmin(supabase, env.supabaseServiceKey);
 
   const users: Record<string, TestUser> = {};

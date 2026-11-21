@@ -61,7 +61,12 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
   ],
   supabaseAdmin: [
     async ({ world }, use) => {
-      await use(new SupabaseAdmin(world.supabase, readEnv().supabaseServiceKey));
+      const env = readEnv();
+      // The key goes only to the expected project (lib/supabase.ts).
+      if (world.supabase.url !== env.supabaseUrl) {
+        throw new Error(`The world file is for ${world.supabase.url}, not ${env.supabaseUrl}.`);
+      }
+      await use(new SupabaseAdmin(world.supabase, env.supabaseServiceKey));
     },
     { scope: "worker" },
   ],

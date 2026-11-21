@@ -22,8 +22,11 @@ test("sign up, confirm the email, sign in, make the first org, follow the setup 
   page,
   world,
   supabaseAdmin,
-}) => {
-  const email = testEmail(world.runId, "signup");
+}, testInfo) => {
+  // A retry is a new person: the user of the failed try is confirmed already, and the
+  // teardown removes it with its org.
+  const attempt = testInfo.retry === 0 ? "" : `r${testInfo.retry}`;
+  const email = testEmail(world.runId, `signup${attempt}`);
   const password = newPassword((n) => randomBytes(n));
   let user: TestUser | null = null;
 
@@ -60,7 +63,7 @@ test("sign up, confirm the email, sign in, make the first org, follow the setup 
 
   // A new user has no org: the welcome page offers to make one.
   await expect(page.getByRole("heading", { name: "Welcome to sama" })).toBeVisible();
-  const name = orgName(world.runId, "onboarding");
+  const name = orgName(world.runId, `onboarding${attempt}`);
   await page.getByLabel("Org name").fill(name);
   const created = page.waitForResponse(
     (r) => r.request().method() === "POST" && new URL(r.url()).pathname === "/orgs",

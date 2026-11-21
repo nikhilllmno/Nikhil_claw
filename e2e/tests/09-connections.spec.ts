@@ -2,6 +2,7 @@
 // "everything" server as a hosted stdio connection, and the agent calls its echo tool.
 
 import { marker } from "../lib/names.ts";
+import { calledTool, sessionToolUses } from "../lib/trace.ts";
 import { send, startSession, waitForReplyApproving } from "../lib/ui.ts";
 import { expect, test } from "../fixtures.ts";
 
@@ -10,6 +11,7 @@ const EVERYTHING = { name: "@modelcontextprotocol/server-everything", version: "
 
 test("add the MCP everything server, use its echo tool, and remove it", async ({
   ownerPage: page,
+  ownerApi,
 }) => {
   test.setTimeout(12 * 60_000);
   const suffix = marker("m").toLowerCase();
@@ -31,13 +33,18 @@ test("add the MCP everything server, use its echo tool, and remove it", async ({
 
   try {
     const word = marker("echo");
-    await startSession(page, `e2e mcp ${word}`);
+    const sessionId = await startSession(page, `e2e mcp ${word}`);
     await send(
       page,
       `Find the echo tool of the ${title} connection and call it with the message ${word}. ` +
         `Then reply with what it returned.`,
     );
     await waitForReplyApproving(page, word);
+    // The answer alone does not prove the call: the marker is also in the prompt.
+    const echo = (await sessionToolUses(ownerApi, sessionId)).filter((u) =>
+      calledTool(u, new RegExp(`mcp_${name}_echo`)),
+    );
+    expect(echo.some((u) => u.ok && u.output.includes(word))).toBe(true);
   } finally {
     await page.goto("/connections");
     page.once("dialog", (dialog) => dialog.accept());

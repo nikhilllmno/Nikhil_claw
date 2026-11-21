@@ -45,7 +45,8 @@ export async function requestJson<T>(url: string, options: RequestOptions = {}):
     headers["content-type"] = "application/json";
     body = JSON.stringify(options.body);
   }
-  const response = await fetch(url, { method, headers, body });
+  // No redirects: a redirect could carry the authorization header to another host.
+  const response = await fetch(url, { method, headers, body, redirect: "error" });
   const text = await response.text();
   if (!response.ok && !(options.allow ?? []).includes(response.status)) {
     throw new HttpError(method, url, response.status, text);

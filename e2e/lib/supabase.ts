@@ -1,6 +1,7 @@
 // The Supabase Auth admin calls that make and remove the test users. Only the setup, the
 // teardown, and the sweep use the service key. The tests use user tokens only.
 
+import { httpsOrigin } from "./env.ts";
 import { requestJson } from "./http.ts";
 
 export interface SupabaseConfig {
@@ -26,6 +27,8 @@ export class SupabaseAdmin {
   private readonly serviceKey: string;
 
   constructor(config: SupabaseConfig, serviceKey: string) {
+    // The key goes only to an https origin, never to a path or a redirect (see requestJson).
+    if (httpsOrigin(config.url) !== config.url) throw new Error(`Not an origin: ${config.url}`);
     this.config = config;
     this.serviceKey = serviceKey;
   }
@@ -132,13 +135,21 @@ export async function signIn(
   };
 }
 
-/** The Supabase URL and anon key come from the API, as the web app reads them. */
-export async function supabaseConfig(apiUrl: string): Promise<SupabaseConfig> {
+/**
+ * The Supabase URL and anon key come from the API, as the web app reads them. The URL must be
+ * the expected project (`E2E_SUPABASE_URL`): the service key goes to it, so an API that names
+ * another server makes the run stop before any key leaves.
+ */
+export async function supabaseConfig(apiUrl: string, expectedUrl: string): Promise<SupabaseConfig> {
   const { data } = await requestJson<{ supabase_url?: string; supabase_anon_key?: string }>(
     `${apiUrl}/config`,
   );
   if (!data.supabase_url || !data.supabase_anon_key) {
     throw new Error("GET /config has no Supabase settings: sign-in is off on this API.");
   }
-  return { url: data.supabase_url.replace(/\/+$/, ""), anonKey: data.supabase_anon_key };
+  const url = httpsOrigin(data.supabase_url);
+  if (url !== httpsOrigin(expectedUrl)) {
+    throw new Error(`The API uses the Supabase project ${url}, not ${expectedUrl}. Set E2E_SUPABASE_URL.`);
+  }
+  return { url, anonKey: data.supabase_anon_key };
 }

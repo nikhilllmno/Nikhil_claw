@@ -8,15 +8,29 @@ export interface Env {
   apiUrl: string;
   /** The service_role key of the staging Supabase project. It makes and removes test users. */
   supabaseServiceKey: string;
+  /**
+   * The Supabase project that the service key belongs to. The key goes only to this origin,
+   * also when E2E_API_URL points to another API (see supabaseConfig).
+   */
+  supabaseUrl: string;
   /** A short id of this run. It is in each test email address, so a sweep finds the leftovers. */
   runId: string;
 }
 
 export const DEFAULT_WEB_URL = "https://sama-web-staging.vercel.app";
 export const DEFAULT_API_URL = "https://sama-staging.fly.dev";
+/** The staging Supabase project (architecture Section 19.3). */
+export const DEFAULT_SUPABASE_URL = "https://nzykdakgziugbuezuzpb.supabase.co";
 
 function trimSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+/** The origin of an https URL. Throws for another scheme, because a key goes there. */
+export function httpsOrigin(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:") throw new Error(`The Supabase URL must use https: ${url.origin}`);
+  return url.origin;
 }
 
 export function readEnv(source: NodeJS.ProcessEnv = process.env): Env {
@@ -30,6 +44,7 @@ export function readEnv(source: NodeJS.ProcessEnv = process.env): Env {
     webUrl: trimSlash(source.E2E_WEB_URL || DEFAULT_WEB_URL),
     apiUrl: trimSlash(source.E2E_API_URL || DEFAULT_API_URL),
     supabaseServiceKey,
+    supabaseUrl: httpsOrigin(source.E2E_SUPABASE_URL || DEFAULT_SUPABASE_URL),
     runId: source.E2E_RUN_ID || newRunId(),
   };
 }

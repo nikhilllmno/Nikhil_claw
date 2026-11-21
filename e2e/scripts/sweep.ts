@@ -9,7 +9,7 @@ import { sweep } from "../lib/sweep.ts";
 const env = readEnv();
 const hours = Number(process.env.E2E_SWEEP_MIN_AGE_HOURS || 3);
 const dryRun = process.argv.includes("--dry-run");
-const admin = new SupabaseAdmin(await supabaseConfig(env.apiUrl), env.supabaseServiceKey);
+const admin = new SupabaseAdmin(await supabaseConfig(env.apiUrl, env.supabaseUrl), env.supabaseServiceKey);
 const result = await sweep(admin, env.apiUrl, { minAgeMs: hours * 3_600_000, dryRun });
 console.warn(
   `${dryRun ? "Would remove" : "Removed"} ${result.users.length} test user(s) and ` +

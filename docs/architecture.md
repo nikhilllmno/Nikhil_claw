@@ -7479,7 +7479,9 @@ has the routes `/orgs/{org_id}/github/...`, the pages `/github/app/created` and
 
 The Playwright suite in `e2e/` (TypeScript) tests the main flows on a deployed system. It
 drives the web app in Chromium, as a person does. It uses the API for flows that have no page
-yet (triggers, workflows) and to check results. `e2e/README.md` lists the flows and the rules
+yet (triggers, workflows) and to check results. A test of a tool also reads the run trace
+(`GET /runs/{run_id}/trace`) and checks that the tool ran without an error, because a model
+can give the expected words without the tool. `e2e/README.md` lists the flows and the rules
 for tests.
 
 - **When.** The workflow `.github/workflows/e2e.yml` runs it against staging each night at
@@ -7496,20 +7498,26 @@ for tests.
     is on the free plan, so the plan caps (2 runs at the same time, 10 messages a minute)
     also apply to the suite. One worker runs the tests in order.
   - The global teardown deletes each test org with `DELETE /orgs/{org_id}` (all its rows go,
-    Section 17.4), and then the users. The sweep (`npm run sweep`) runs first in each nightly
+    Section 17.4), and then the users. It tries an org delete up to 5 times when the API
+    answers `409` (runs of the org still stop) or a server error. When an org does not go, its
+    owner stays, so the sweep can sign in as that user and try again. The sweep (`npm run sweep`) runs first in each nightly
     run. It removes each user with the `sama-e2e+` prefix that is older than 3 hours, and the
     `e2e-` orgs that the user owns. It gets a token of each user with an admin magic link
     (no email) and deletes each org with the slug from `GET /me`.
 - **Credentials.** The repository secret `E2E_SUPABASE_SERVICE_ROLE_KEY` (the `service_role`
   key of the staging Supabase project) makes and removes the test users. Only the setup, the
-  teardown, and the sweep use it. Without the secret, the workflow skips the suite with a
-  warning and does not fail. The tests use the tokens of the test users, as the web app
+  teardown, the sweep, and the sign-up test use it, and only in the Node process, never in the
+  browser. The key goes only to the expected project (`E2E_SUPABASE_URL`, default the staging
+  project): when `GET /config` of the API names another Supabase URL, the run stops before
+  the key leaves. No request follows a redirect. Without the secret, the workflow skips the
+  suite with a warning and does not fail. The tests use the tokens of the test users, as the web app
   does (`sessionStorage` key `sama.auth`). The world file of a run (`e2e/.state/world.json`,
   mode 0600, ignored by git) has the test passwords, and the teardown removes it.
 - **Sign-up.** The staging project sends email with the built-in mailer, which sends only to
   the team. So the sign-up test sends the browser's `POST /auth/v1/signup` to the admin API
   (`generate_link` with `type: signup` makes the same unconfirmed user and sends no email),
-  confirms the address with the admin API, and then signs in on the page.
+  confirms the address with the admin API, and then signs in on the page. A retry of the test
+  uses a new email address and org name.
 - **Results.** The workflow keeps the HTML report, the JUnit file, and the screenshots,
   videos, and traces of failed tests for 7 days. A trace can have the short-lived token of a
   test user. The teardown deletes the user and the org, so the token gives access to nothing.

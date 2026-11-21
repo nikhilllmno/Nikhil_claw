@@ -25,6 +25,7 @@ npx playwright show-report                 # the HTML report
 | `E2E_SUPABASE_SERVICE_ROLE_KEY` | yes | Makes and removes the test users. Never give it to a test page. |
 | `E2E_WEB_URL` | no | The web app. Default `https://sama-web-staging.vercel.app`. |
 | `E2E_API_URL` | no | The API. Default `https://sama-staging.fly.dev`. |
+| `E2E_SUPABASE_URL` | no | The Supabase project of the service key. Default the staging project. The run stops when `GET /config` of the API names another project, so the key never goes to another server. |
 | `E2E_RUN_ID` | no | The id of the run in the test emails and org names. Default: the time and 4 random characters. |
 | `E2E_WORKERS` | no | Parallel workers. Default 1, because the free plan allows 2 runs at the same time. |
 | `E2E_KEEP_DATA` | no | `1` keeps the test org and users after the run, for a look at a failure. |
@@ -39,7 +40,8 @@ npx playwright show-report                 # the HTML report
 - The world file `.state/world.json` (mode 0600, ignored by git) keeps the users and the org
   for the tests.
 - The global teardown deletes each test org with the API (all its rows go, Section 17.4) and
-  then deletes the users in Supabase.
+  then deletes the users in Supabase. It tries an org delete again after a `409` or a server
+  error. When an org does not go, its owner and the world file stay for the sweep.
 - `npm run sweep` removes what a stopped run left: each user with the `sama-e2e+` prefix that
   is older than 3 hours, and the `e2e-` orgs that the user owns. The nightly workflow runs it
   first. `npm run sweep -- --dry-run` only lists them.
@@ -76,5 +78,6 @@ except inside a file with `test.describe.configure({ mode: "serial" })`.
   `.alert-error` for the error alerts of the app.
 - Put a unique word (`marker()`) in each prompt and wait for it in the answer. Do not check the
   exact words of a model.
+- For a tool flow, also check the run trace (`lib/trace.ts`): the tool ran and had no error.
 - Do not print tokens, passwords, or keys. Errors of the HTTP helper drop the query string.
 - A test that makes data that the teardown does not know removes it in a `finally` block.
