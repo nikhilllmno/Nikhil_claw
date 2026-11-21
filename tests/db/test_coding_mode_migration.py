@@ -1,4 +1,4 @@
-"""Migration 0043: coding mode (docs/architecture.md, Section 15.5)."""
+"""Migration 0044: coding mode (docs/architecture.md, Section 15.5)."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def test_the_upgrade_adds_the_tables_with_rls_and_the_downgrade_removes_them() -
         for table in TABLES:
             assert _policies(url, table) == [f"{table}_select"]
         config = alembic_config(url)
-        command.downgrade(config, "0042")
+        command.downgrade(config, "0043")
         assert "plan_mode" not in _columns(url, "sessions")
         for table in TABLES:
             assert _columns(url, table) == set()

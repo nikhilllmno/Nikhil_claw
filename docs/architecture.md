@@ -6602,7 +6602,7 @@ the same for both runtimes and for the coding agent harnesses of M7.2 (below).
 | API | `src/sama/api/coding_mode.py` | The routes below. |
 | Web app | `web/app/(shell)/s/[sessionId]/code/page.tsx`, `web/components/CodingPanel.tsx` | The Code page of a session. |
 | Claude Code and Codex | `src/sama/coding_mode/harness.py`, `src/sama/coding/runtime.py` | `HarnessHooks`: clone, note, checkpoint, and plan mode for the runtimes of M7.2. |
-| Tables | migration `0043` | `sessions.plan_mode`, `session_repos`, `session_plans`. |
+| Tables | migration `0044` | `sessions.plan_mode`, `session_repos`, `session_plans`. |
 
 **Attach a repository.** `POST /sessions/{id}/repos` takes `repo` (as for `repo_clone`), an
 optional `ref` (a branch or a tag), and an optional `folder` (default: the repository name). The
@@ -6742,7 +6742,7 @@ commit, branch, error, the user who attached it; unique per session and folder) 
 `session_plans` (org, session, the run, version, body, proposed body, status, edited, feedback,
 the user who decided, the time; unique per session and version). Members read the rows of the
 sessions that they can see (`sama_private.can_read_session`). No policy allows writes: the
-control plane writes them. Migration `0043` also adds the toolset `plan` to each profile that has
+control plane writes them. Migration `0044` also adds the toolset `plan` to each profile that has
 the toolset `github`, and `python -m sama.admin bootstrap` gives it to new profiles.
 
 **Claude Code and Codex (M7.2).** The runtimes `claude_code` and `codex` (Section 15.4) run a
