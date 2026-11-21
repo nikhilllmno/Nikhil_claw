@@ -81,6 +81,24 @@ export function onboardingSteps(org: Pick<Org, "integrations" | "agent_profiles"
   ];
 }
 
+/** The agents that a session in the workspace can use: the org-wide ones and the workspace ones. */
+export function usableAgents<T extends { workspace_id: string | null }>(agents: T[], workspaceId: string | null): T[] {
+  return agents.filter((a) => a.workspace_id === null || a.workspace_id === workspaceId);
+}
+
+/**
+ * The chosen agent when the workspace can use it, else `null`. The screens never swap in another
+ * agent: the person chooses again.
+ */
+export function usableChoice(
+  agents: { id: string; workspace_id: string | null }[],
+  workspaceId: string | null,
+  chosen: string | null | undefined,
+): string | null {
+  if (!chosen) return null;
+  return usableAgents(agents, workspaceId).some((a) => a.id === chosen) ? chosen : null;
+}
+
 /** The first step that is not done, or `null` when all are done. */
 export function currentStep(steps: Step[]): StepId | null {
   return steps.find((s) => !s.done)?.id ?? null;

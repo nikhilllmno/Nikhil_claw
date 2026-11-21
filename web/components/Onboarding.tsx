@@ -17,6 +17,8 @@ import {
   type Progress,
   saveProgress,
   type StepId,
+  usableAgents,
+  usableChoice,
 } from "@/lib/onboarding";
 import { useApi } from "./AuthProvider";
 import { ChatApps } from "./ChatApps";
@@ -102,6 +104,7 @@ function Guide({ org }: { org: Org }) {
                     update({ done: true });
                     router.push(`/s/${sessionId}`);
                   }}
+                  onPickAgain={() => setOpened("agent")}
                 />
               ) : null}
             </div>
@@ -143,16 +146,20 @@ function StepPanel({
   progress,
   onDone,
   onFinished,
+  onPickAgain,
 }: {
   step: StepId;
   org: Org;
   progress: Progress;
   onDone: (change: Partial<Progress>) => void;
   onFinished: (sessionId: string) => void;
+  onPickAgain: () => void;
 }) {
   if (step === "channel") return <ChannelStep org={org} onDone={onDone} />;
   if (step === "agent") return <AgentStep org={org} progress={progress} onDone={onDone} />;
-  if (step === "message") return <MessageStep org={org} progress={progress} onFinished={onFinished} />;
+  if (step === "message") {
+    return <MessageStep org={org} progress={progress} onFinished={onFinished} onPickAgain={onPickAgain} />;
+  }
   return null;
 }
 
@@ -200,10 +207,14 @@ function AgentStep({
   const { reloadMe, workspaceId } = useData();
   const workspace = org.workspaces.find((w) => w.id === workspaceId)?.id ?? org.workspaces[0]?.id ?? null;
   // Only the agents that the workspace of the first message can use.
-  const profiles = org.agent_profiles.filter((p) => p.workspace_id === null || p.workspace_id === workspace);
-  const [chosen, setChosen] = useState<string>(
-    profiles.find((p) => p.id === progress.agentId)?.id ?? profiles[0]?.id ?? "",
-  );
+  const profiles = usableAgents(org.agent_profiles, workspace);
+  const [picked, setChosen] = useState<string | null>(null);
+  // Checked at each render, so a workspace change never keeps an agent that it cannot use.
+  const chosen =
+    usableChoice(profiles, workspace, picked) ??
+    usableChoice(profiles, workspace, progress.agentId) ??
+    profiles[0]?.id ??
+    "";
   const [creating, setCreating] = useState(profiles.length === 0 && org.admin);
 
   if (creating) {
@@ -275,22 +286,38 @@ function MessageStep({
   org,
   progress,
   onFinished,
+  onPickAgain,
 }: {
   org: Org;
   progress: Progress;
   onFinished: (sessionId: string) => void;
+  onPickAgain: () => void;
 }) {
   const api = useApi();
   const { workspaceId, reloadSessions } = useData();
   const workspace = org.workspaces.find((w) => w.id === workspaceId) ?? org.workspaces[0] ?? null;
-  const usable = org.agent_profiles.filter((p) => p.workspace_id === null || p.workspace_id === workspace?.id);
-  const agent = usable.find((p) => p.id === progress.agentId) ?? usable[0] ?? null;
+  const agentId = usableChoice(org.agent_profiles, workspace?.id ?? null, progress.agentId);
+  const agent = org.agent_profiles.find((p) => p.id === agentId) ?? null;
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (workspace === null || agent === null) {
-    return <p className={styles.text}>You need a workspace and an agent first. Ask an admin of {org.name}.</p>;
+  if (workspace === null) {
+    return <p className={styles.text}>You need a workspace first. Ask an admin of {org.name}.</p>;
+  }
+  if (agent === null) {
+    return (
+      <div className={styles.form}>
+        <p className={styles.text}>
+          The workspace {workspace.name} cannot use the agent that you picked. Pick an agent again.
+        </p>
+        <div className={styles.actions}>
+          <button type="button" className="btn btn-small" onClick={onPickAgain}>
+            Pick an agent
+          </button>
+        </div>
+      </div>
+    );
   }
 
   const send = async (event: React.FormEvent) => {

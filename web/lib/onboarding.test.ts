@@ -8,6 +8,8 @@ import {
   onboardingSteps,
   saveProgress,
   showSetupCard,
+  usableAgents,
+  usableChoice,
 } from "./onboarding";
 
 function memory() {
@@ -75,5 +77,26 @@ describe("steps", () => {
       expect(t.name.length).toBeLessThanOrEqual(80);
       expect(t.soul.length).toBeGreaterThan(20);
     }
+  });
+});
+
+describe("agent choice", () => {
+  const agents = [
+    { id: "all", workspace_id: null },
+    { id: "a-only", workspace_id: "A" },
+    { id: "b-only", workspace_id: "B" },
+  ];
+
+  it("lists the agents that a workspace can use", () => {
+    expect(usableAgents(agents, "A").map((a) => a.id)).toEqual(["all", "a-only"]);
+    expect(usableAgents(agents, null).map((a) => a.id)).toEqual(["all"]);
+  });
+
+  it("drops a choice that the new workspace cannot use, and never swaps in another agent", () => {
+    expect(usableChoice(agents, "A", "a-only")).toBe("a-only");
+    expect(usableChoice(agents, "B", "a-only")).toBeNull();
+    expect(usableChoice(agents, "B", "all")).toBe("all");
+    expect(usableChoice(agents, "A", undefined)).toBeNull();
+    expect(usableChoice([], "A", "all")).toBeNull();
   });
 });
