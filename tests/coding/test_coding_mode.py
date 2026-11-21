@@ -41,6 +41,7 @@ class FakeHooks:
     """The agent and the files of the work folder at each checkpoint."""
     workdir: str = ""
     slow_plan: float = 0.0
+    saving: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def planning(self, scope: RunScope) -> bool:
         return self.plan_mode
@@ -57,6 +58,7 @@ class FakeHooks:
         self.checkpoints.append((agent, files))
 
     async def plan(self, scope: RunScope, text: str) -> str:
+        self.saving.set()
         if self.slow_plan:
             await asyncio.sleep(self.slow_plan)
         self.plans.append(text)
@@ -231,3 +233,23 @@ async def test_a_slow_plan_save_has_a_time_limit(
     final = events[-1]
     assert isinstance(final, RunCompleted)
     assert "could not save the plan in time" in final.output
+
+
+async def test_a_cancel_during_the_plan_save_stores_no_plan(
+    sandboxes: SandboxedRuntime, signer: RunTokenSigner
+) -> None:
+    sandbox = await session_sandbox(sandboxes)
+    repo = Path(sandbox.workdir) / "proj"
+    make_repo(repo)
+    hooks, gate = FakeHooks(plan_mode=True, slow_plan=20), FakeGate()
+    runtime = _runtime(sandboxes, signer, hooks, gate)
+    running = asyncio.ensure_future(
+        collect(runtime.run(_request("add a route", state=_state(str(repo)))))
+    )
+    await asyncio.wait_for(hooks.saving.wait(), timeout=30)
+    await runtime.cancel("run-1")
+    events = await asyncio.wait_for(running, timeout=10)
+    final = events[-1]
+    assert isinstance(final, RunFailed)
+    assert final.code is FailureCode.CANCELLED
+    assert hooks.plans == []

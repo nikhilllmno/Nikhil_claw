@@ -100,3 +100,22 @@ async def test_the_plan_note_follows_the_judged_plan_mode(
     assert "whole answer" in prep.note
     off = await hooks.before(object(), scope, token, "codex", False)  # type: ignore[arg-type]
     assert "Plan mode" not in off.note
+
+
+class EmptyPreparer:
+    """A preparer whose reads failed: it gives no note."""
+
+    async def prepare(self, *args: Any, **kwargs: Any) -> str:
+        return ""
+
+
+async def test_the_plan_rules_stay_when_the_preparer_gives_nothing(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    hooks = HarnessHooks(EmptyPreparer(), coding)
+    scope, token = await _run(coding, tenant)
+    prep = await hooks.before(object(), scope, token, "codex", True)  # type: ignore[arg-type]
+    assert prep.note.startswith("[sama coding mode] Plan mode is on.")
+    assert "whole answer" in prep.note
+    plain = await hooks.before(object(), scope, token, "codex", False)  # type: ignore[arg-type]
+    assert plain.note == ""

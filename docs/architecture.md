@@ -6757,8 +6757,8 @@ in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding
   with all permissions.
 - After it has the sandbox, the hooks clone the pending repositories and give the note
   (`CodingPreparer`, the same step as for the SDK runtimes; the note goes after the task). The
-  plan mode rules of the note come from the plan mode that the gate judged, so a change of plan
-  mode during an approval cannot start a plan run without them.
+  hooks add the plan mode rules themselves, from the plan mode that the gate judged, so neither
+  a change of plan mode during an approval nor a failed read can start a plan run without them.
 - When the folder of the request is ready (also after a clone of the repository of the task)
   and before the CLI starts, the hooks take one checkpoint of the work folder
   (`CheckpointService.snapshot`, tool `claude_code` or `codex`). The tools of the CLI do not
@@ -6772,7 +6772,8 @@ in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding
 - At the end of a plan mode run, the plan (`CliPlan`, else the answer of a CLI that ended
   without an error) becomes a proposed plan (`CodingService.propose`, at most 30 seconds), and
   the answer of the run says how to decide it. A failure of the CLI, for example a refused
-  budget, stays a failure of the run. After a cancel, no plan is stored. An
+  budget, stays a failure of the run. A cancel stops the save, and its transaction rolls
+  back; a save that committed before the cancel stays. An
   approval sends the plan as a message; in the direct mode that message goes to the same CLI,
   which then works with all permissions.
 - The commands and the test runs of the CLI come from its `tool_call_*` run events. For

@@ -274,6 +274,9 @@ class CodingAgentRuntime:
         self._gate = gate
         self._hooks = hooks
         self._active: dict[str, asyncio.Task[CodingOutcome]] = {}
+        self._saving: dict[str, asyncio.Task[str]] = {}
+        """The plan save of a run in plan mode. A cancel stops it, so its transaction rolls
+        back."""
         self._cancelled: set[str] = set()
         self._used: set[str] = set()
 
@@ -307,6 +310,9 @@ class CodingAgentRuntime:
         task = self._active.get(run_id)
         if task is not None:
             task.cancel()
+        saving = self._saving.get(run_id)
+        if saving is not None:
+            saving.cancel()
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         scope = request.scope
@@ -568,12 +574,18 @@ class CodingAgentRuntime:
                 # of the CLI stays a failure. No plan is stored after a cancel.
                 plan = plan_text[-1] if plan_text else ("" if outcome.is_error else outcome.text)
                 if plan.strip() and run_id not in self._cancelled:
+                    saving = asyncio.ensure_future(self._hooks.plan(scope, plan))
+                    self._saving[run_id] = saving
                     try:
-                        line = await asyncio.wait_for(
-                            self._hooks.plan(scope, plan), timeout=PLAN_SAVE_TIMEOUT_S
-                        )
+                        line = await asyncio.wait_for(saving, timeout=PLAN_SAVE_TIMEOUT_S)
                     except TimeoutError:
                         line = "sama could not save the plan in time. Send /plan to check."
+                    except asyncio.CancelledError:
+                        if not (saving.cancelled() and run_id in self._cancelled):
+                            raise
+                        line = ""
+                    finally:
+                        self._saving.pop(run_id, None)
                     if run_id in self._cancelled:
                         yield RunFailed(
                             code=FailureCode.CANCELLED, message="cancelled", usage=usage

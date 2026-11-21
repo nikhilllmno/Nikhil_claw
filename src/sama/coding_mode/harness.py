@@ -124,7 +124,12 @@ class HarnessHooks:
         """``plan`` is the plan mode that the gate judged for this run. The plan mode note and
         the CLI flags come from it, not from a new read, so a change of plan mode during an
         approval cannot start a planned run without its rules."""
-        note = await self._preparer.prepare(sandbox, scope, token, harness=agent, plan=plan)
+        # The repository note comes from the preparer; the plan rules come from ``plan`` here,
+        # so a failed read in the preparer cannot drop them.
+        note = await self._preparer.prepare(sandbox, scope, token, harness=agent, plan=False)
+        if plan:
+            rules = f"[sama coding mode] {plan_mode_for(agent).prompt}"
+            note = f"{note}\n\n{rules}" if note else rules
         args = plan_mode_for(agent).cli_args if plan else ()
         return CodingModePrep(note=note, plan_mode=plan, plan_args=args)
 
