@@ -248,7 +248,9 @@ class PlaywrightSession:
 
     def _on_paused(self, event: dict[str, Any]) -> None:
         """Chrome paused a request (or a redirect hop) of a target. sama must answer each one,
-        so the check runs as a task."""
+        so the check runs as a task. A closed session takes no new checks."""
+        if self._closed:
+            return
         task = asyncio.get_running_loop().create_task(self._check_paused(event))
         self._checks.add(task)
         task.add_done_callback(self._checks.discard)
@@ -623,15 +625,23 @@ class PlaywrightSession:
         self._closed = True
         if self._pending is not None:
             self._pending.cancel()
-        for task in list(self._checks):
+        if self._cdp is not None:
+            with contextlib.suppress(Exception):
+                self._cdp.remove_listener("Fetch.requestPaused", self._on_paused)
+        checks = list(self._checks)
+        for task in checks:
             task.cancel()
         try:
+            await asyncio.gather(*checks, return_exceptions=True)
             async with asyncio.timeout(CLOSE_TIMEOUT_S):
                 await self._browser.close()
         except Exception:
             log.warning("the browser did not close cleanly", exc_info=True)
-        if self._on_close is not None:
-            try:
-                await self._on_close()
-            except Exception:
-                log.warning("the browser release failed", exc_info=True)
+        finally:
+            if self._on_close is not None:
+                # The release frees the context of the session, so it runs also when the
+                # close is cancelled.
+                try:
+                    await asyncio.shield(self._on_close())
+                except Exception:
+                    log.warning("the browser release failed", exc_info=True)

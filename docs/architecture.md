@@ -4534,7 +4534,14 @@ one writer at a time:
   reads the saved logins but does not save. Its first result has the note "another run of
   this user uses the browser profile now, so the logins and cookies of this run are not kept".
 - When the writer closes, the next writer waits until 10 seconds after that close.
-- A failed or cancelled start frees the context.
+- When Browserbase does not confirm the release of a writer, that session can live until its
+  hard timeout. Until then, a new run reads the context with `persist: false` and the same
+  note, and does not wait.
+- A failed or cancelled start ends its Browserbase session first, and then frees the context.
+  When the start is cancelled while Browserbase makes the session, a background task waits
+  for the answer and ends that session.
+- When a session closes, it stops taking paused requests, and it cancels and waits for the
+  checks that run.
 
 This coordination is for each process. Two processes can write one context, and then the last
 save wins.

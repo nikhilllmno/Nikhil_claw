@@ -68,6 +68,9 @@ class FakeCdp:
         self.sent.append((method, params))
         return {}
 
+    def remove_listener(self, event: str, callback: Callable[..., Any]) -> None:
+        return None
+
 
 @dataclass
 class FakeBrowser:
@@ -88,9 +91,12 @@ class FakeConnector:
     urls: list[str] = field(default_factory=list)
     browsers: list[FakeBrowser] = field(default_factory=list)
     closed: bool = False
+    gate: asyncio.Event | None = None
 
     async def connect(self, url: str) -> Browser:
         self.urls.append(url)
+        if self.gate is not None:
+            await self.gate.wait()
         if self.fail:
             raise RuntimeError("WebSocket error: 401")
         browser = FakeBrowser()
@@ -111,8 +117,10 @@ class FakeApi:
     session_body: Any = None
     contexts_error: bool = False
     count: int = 0
+    release_status: int = 200
+    session_gate: asyncio.Event | None = None
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    async def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["x-bb-api-key"] == KEY
         body: dict[str, Any] = json.loads(request.content) if request.content else {}
         self.requests.append((request.method, request.url.path, body))
@@ -125,6 +133,8 @@ class FakeApi:
         if request.method == "DELETE" and path.startswith("/v1/contexts/"):
             return httpx.Response(204)
         if request.method == "POST" and path == "/v1/sessions":
+            if self.session_gate is not None:
+                await self.session_gate.wait()
             context = (body.get("browserSettings") or {}).get("context") or {}
             if context.get("id") in self.lost_contexts:
                 return httpx.Response(404, json={"message": "Context not found"})
@@ -135,6 +145,8 @@ class FakeApi:
                 201, json={"id": f"sess-{self.count}", "connectUrl": f"wss://connect/{self.count}"}
             )
         if request.method == "POST" and path.startswith("/v1/sessions/"):
+            if self.release_status != 200:
+                return httpx.Response(self.release_status, json={})
             return httpx.Response(200, json={"id": path.rsplit("/", 1)[1]})
         return httpx.Response(500)
 
@@ -372,4 +384,92 @@ async def test_a_network_error_becomes_a_clear_message() -> None:
     target = make_target(api, FakeConnector())
     with pytest.raises(BrowserError, match="Browserbase did not answer: ConnectError"):
         await target.start(org_id="org-1", user_id="user-1", run_id="run-1", guard=AllowAll())
+    await target.aclose()
+
+
+async def wait_until(condition: Callable[[], bool]) -> None:
+    for _ in range(1000):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the condition did not become true")
+
+
+async def test_a_cancelled_connect_ends_the_session_before_it_frees_the_context() -> None:
+    api, time = FakeApi(), FakeTime()
+    connector = FakeConnector(gate=asyncio.Event())
+    target = make_target(api, connector, time=time)
+    start = asyncio.ensure_future(
+        target.start(org_id="org-1", user_id="user-1", run_id="run-1", guard=AllowAll())
+    )
+    await wait_until(lambda: bool(connector.urls))
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    assert api.calls()[-1] == ("POST", "/v1/sessions/sess-2")  # the release
+    connector.gate = None
+    await target.start(org_id="org-1", user_id="user-1", run_id="run-2", guard=AllowAll())
+    assert persist_of(api, -1) is True
+    assert time.slept == [10.0]  # the save time after the release
+    await target.aclose()
+
+
+async def test_a_cancelled_create_ends_the_late_session() -> None:
+    api, connector = FakeApi(session_gate=asyncio.Event()), FakeConnector()
+    target = make_target(api, connector)
+    start = asyncio.ensure_future(
+        target.start(org_id="org-1", user_id="user-1", run_id="run-1", guard=AllowAll())
+    )
+    await wait_until(lambda: ("POST", "/v1/sessions") in api.calls())
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    # The context stays claimed until Browserbase answers and the late session ends.
+    gate, api.session_gate = api.session_gate, None
+    await target.start(org_id="org-1", user_id="user-1", run_id="run-2", guard=AllowAll())
+    assert persist_of(api, -1) is False
+    assert gate is not None
+    gate.set()
+    await target.aclose()  # waits for the cleanup
+    assert ("POST", "/v1/sessions/sess-3") in api.calls()  # the late session ended
+
+
+async def test_a_failed_release_keeps_other_writers_away_until_the_hard_timeout() -> None:
+    api, connector, time = FakeApi(release_status=500), FakeConnector(), FakeTime()
+    target = make_target(api, connector, time=time)
+    first = await target.start(org_id="org-1", user_id="user-1", run_id="run-1", guard=AllowAll())
+    await first.close()
+    second = await target.start(org_id="org-1", user_id="user-1", run_id="run-2", guard=AllowAll())
+    assert persist_of(api, -1) is False
+    assert time.slept == []  # a reader does not wait for the hard timeout
+    await second.close()
+    time.now += 900 + 10 + 1
+    await target.start(org_id="org-1", user_id="user-1", run_id="run-3", guard=AllowAll())
+    assert persist_of(api, -1) is True
+    await target.aclose()
+
+
+class BlockingGuard(AllowAll):
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def check(self, url: str) -> None:
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+async def test_close_stops_the_request_checks() -> None:
+    api, connector, guard = FakeApi(), FakeConnector(), BlockingGuard()
+    target = make_target(api, connector)
+    session = await target.start(org_id="org-1", user_id=None, run_id="run-1", guard=guard)
+    assert isinstance(session, PlaywrightSession)
+    event = {"requestId": "r1", "resourceType": "Document", "request": {"url": "https://a.test/"}}
+    session._on_paused(event)
+    await guard.entered.wait()
+    await session.close()
+    assert not session._checks  # cancelled and awaited
+    session._on_paused({**event, "requestId": "r2"})  # a late event after the close
+    assert not session._checks
+    cdp = connector.browsers[0].cdp
+    assert [method for method, _ in cdp.sent] == ["Fetch.enable"]
     await target.aclose()

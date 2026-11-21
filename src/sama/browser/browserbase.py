@@ -24,6 +24,7 @@ at the same time; the last save wins.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -32,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 import httpx
 from pydantic import SecretStr
 
-from sama.browser.cdp import PlaywrightSession
+from sama.browser.cdp import CLOSE_TIMEOUT_S, PlaywrightSession
 from sama.browser.contexts import BrowserContextStore
 from sama.browser.target import CLOUD, BrowserError, BrowserSession, NavigationGuard, TargetName
 
@@ -52,8 +53,8 @@ CONTEXT_SAVE_S: Final = 10.0
 """After a writer session of a persistent context ends, the time that Browserbase can need to
 save the context. A new session of the context waits for the rest of this time."""
 NOT_KEPT_NOTE: Final = (
-    "another run of this user uses the browser profile now, so the logins and cookies of this "
-    "run are not kept"
+    "another run of this user uses the browser profile now (or an earlier session did not end "
+    "cleanly), so the logins and cookies of this run are not kept"
 )
 
 
@@ -122,6 +123,7 @@ class BrowserbaseTarget:
         """The contexts that a live session of this process writes."""
         self._saved_at: dict[str, float] = {}
         """For each context: the time when Browserbase has saved it (clock time)."""
+        self._cleanups: set[asyncio.Task[None]] = set()
         self._contexts = contexts
         self._session_timeout_s = session_timeout_s
         self._connector = connector or PlaywrightConnector()
@@ -138,6 +140,8 @@ class BrowserbaseTarget:
         return CLOUD
 
     async def aclose(self) -> None:
+        if self._cleanups:
+            await asyncio.gather(*self._cleanups, return_exceptions=True)
         await self._connector.aclose()
         await self._client.aclose()
 
@@ -149,15 +153,16 @@ class BrowserbaseTarget:
         try:
             return await self._start(context_id, claimed, org_id, user_id, run_id, guard)
         except BaseException:
-            # A failed start writes no context. (A release already freed it; no await runs
-            # between that release and this line, so no other session claimed it again.)
+            # A start that failed before Browserbase made its session writes no context. After
+            # that, the release of the session frees the context (``claimed`` is empty then).
             self._writers.difference_update(claimed)
             raise
 
     def _claim(self, context_id: str | None, claimed: list[str]) -> bool:
-        """Makes this session the writer of the context if no other session writes it. There
-        is no await between the check and the claim."""
-        if context_id is None or context_id in self._writers:
+        """Makes this session the writer of the context if no other session writes it and no
+        unconfirmed session can still write it. There is no await between the check and the
+        claim."""
+        if context_id is None or context_id in self._writers or self._quarantined(context_id):
             return False
         self._writers.add(context_id)
         claimed.append(context_id)
@@ -174,7 +179,7 @@ class BrowserbaseTarget:
     ) -> BrowserSession:
         persist = self._claim(context_id, claimed)
         await self._wait_saved(context_id)
-        response = await self._create_session(context_id, persist, org_id, run_id)
+        response = await self._create_session(context_id, persist, claimed, org_id, run_id)
         if context_id is not None and user_id is not None and response.status_code == 404:
             # Browserbase lost the context: forget it and start a new one.
             await self._contexts.forget(org_id, user_id, CLOUD, context_id)
@@ -184,36 +189,58 @@ class BrowserbaseTarget:
             context_id = await self._context_of(org_id, user_id)
             persist = self._claim(context_id, claimed)
             await self._wait_saved(context_id)
-            response = await self._create_session(context_id, persist, org_id, run_id)
+            response = await self._create_session(context_id, persist, claimed, org_id, run_id)
         body = self._ok(response, "create a browser session")
         session_id = str(body["id"])
         connect_url = str(body["connectUrl"])
         written = context_id if persist else None
+        # From here the release of this session frees the context, not the caller.
+        claimed.clear()
+        notes = (NOT_KEPT_NOTE,) if context_id is not None and not persist else ()
+        browser: Browser | None = None
         try:
             browser = await self._connector.connect(connect_url)
-        except Exception as error:
-            await self._release(session_id, written)
-            log.warning("the CDP connection failed session=%s", session_id, exc_info=True)
-            raise BrowserError("the browser did not connect; try again") from error
-        log.info("browser session started org=%s run=%s session=%s", org_id, run_id, session_id)
-        notes = (NOT_KEPT_NOTE,) if context_id is not None and not persist else ()
-        try:
-            return await PlaywrightSession.attach(
+            session = await PlaywrightSession.attach(
                 browser,
                 guard,
                 target=CLOUD,
                 on_close=self._releaser(session_id, written),
                 notes=notes,
             )
-        except Exception as error:
-            await self._release(session_id, written)
+        except BaseException as error:
+            # Also a cancelled start ends the remote session before it frees the context.
+            cleanup = asyncio.ensure_future(self._abandon(browser, session_id, written))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                if isinstance(error, Exception):
+                    raise
+            if not isinstance(error, Exception):
+                raise
+            if browser is None:
+                log.warning("the CDP connection failed session=%s", session_id, exc_info=True)
+                raise BrowserError("the browser did not connect; try again") from error
             raise BrowserError("the browser did not start; try again") from error
+        log.info("browser session started org=%s run=%s session=%s", org_id, run_id, session_id)
+        return session
+
+    async def _abandon(self, browser: Browser | None, session_id: str, written: str | None) -> None:
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(CLOSE_TIMEOUT_S):
+                    await browser.close()
+        await self._release(session_id, written)
+
+    def _quarantined(self, context_id: str) -> bool:
+        """True while a session whose release Browserbase did not confirm can still write the
+        context (until its hard timeout)."""
+        return self._saved_at.get(context_id, 0.0) - self._clock() > self._context_save_s
 
     async def _wait_saved(self, context_id: str | None) -> None:
         if context_id is None:
             return
         wait = self._saved_at.get(context_id, 0.0) - self._clock()
-        if wait > 0:
+        if 0 < wait <= self._context_save_s:  # a quarantined context makes a reader; no wait
             await self._sleep(wait)
 
     def _releaser(self, session_id: str, written: str | None) -> Callable[[], Any]:
@@ -238,6 +265,39 @@ class BrowserbaseTarget:
         return stored
 
     async def _create_session(
+        self, context_id: str | None, persist: bool, claimed: list[str], org_id: str, run_id: str
+    ) -> httpx.Response:
+        """Creates the session. When the caller is cancelled during the request, Browserbase can
+        still make the session, so a task waits for the answer, ends that session, and then
+        frees the context."""
+        request = asyncio.ensure_future(self._post_session(context_id, persist, org_id, run_id))
+        try:
+            return await asyncio.shield(request)
+        except asyncio.CancelledError:
+            written = context_id if persist else None
+            if written is not None and written in claimed:
+                claimed.remove(written)  # the task frees it
+            cleanup = asyncio.ensure_future(self._end_unowned(request, written))
+            self._cleanups.add(cleanup)
+            cleanup.add_done_callback(self._cleanups.discard)
+            raise
+
+    async def _end_unowned(
+        self, request: asyncio.Future[httpx.Response], written: str | None
+    ) -> None:
+        session_id: str | None = None
+        try:
+            response = await request
+            if response.is_success:
+                session_id = str(response.json()["id"])
+        except Exception:
+            log.warning("a cancelled browser session start failed", exc_info=True)
+        if session_id is not None:
+            await self._release(session_id, written)
+        elif written is not None:
+            self._writers.discard(written)
+
+    async def _post_session(
         self, context_id: str | None, persist: bool, org_id: str, run_id: str
     ) -> httpx.Response:
         payload: dict[str, Any] = {
@@ -254,28 +314,37 @@ class BrowserbaseTarget:
 
     async def _release(self, session_id: str, written: str | None = None) -> None:
         """Asks Browserbase to end the session. For a writer of a context, the context is
-        free again after the save time."""
+        free again after the save time. When Browserbase does not confirm the release, the
+        session can live until its hard timeout, so no other session writes the context
+        until then."""
+        released = False
         try:
-            await self._request_release(session_id)
+            released = await self._request_release(session_id)
         finally:
             if written is not None:
-                self._saved_at[written] = self._clock() + self._context_save_s
+                hold = self._context_save_s
+                if not released:
+                    hold += self._session_timeout_s
+                self._saved_at[written] = self._clock() + hold
                 self._writers.discard(written)
 
-    async def _request_release(self, session_id: str) -> None:
+    async def _request_release(self, session_id: str) -> bool:
         try:
             response = await self._client.post(
                 f"/v1/sessions/{session_id}",
                 json={"projectId": self._project_id, "status": "REQUEST_RELEASE"},
             )
-            if response.is_error:
-                log.warning(
-                    "the browser session release failed session=%s status=%d",
-                    session_id,
-                    response.status_code,
-                )
         except httpx.HTTPError:
             log.warning("the browser session release failed session=%s", session_id, exc_info=True)
+            return False
+        if response.is_error:
+            log.warning(
+                "the browser session release failed session=%s status=%d",
+                session_id,
+                response.status_code,
+            )
+            return False
+        return True
 
     async def _delete_context(self, context_id: str) -> None:
         try:
