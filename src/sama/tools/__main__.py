@@ -40,8 +40,8 @@ from sama.modelproxy.prices import PriceTable
 from sama.modelproxy.store import PostgresUsageStore
 from sama.observability.logs import configure_logging
 from sama.orchestrator.queue import RunQueue
+from sama.review.change import ChangeProposer
 from sama.review.proposals import PostgresProposalStore
-from sama.review.soul import SoulProposer
 from sama.search import OpenAIEmbedder, SessionSearch
 from sama.skills import BuiltinSkills, PostgresSkillStore, SkillStore
 from sama.tenancy.run_token import RunTokenSigner
@@ -99,7 +99,7 @@ def build_app(store_kind: str) -> Starlette:
     sessions: SessionSearch | None = None
     vision: VisionService | None = None
     proposals: PostgresProposalStore | None = None
-    souls: SoulProposer | None = None
+    changes: ChangeProposer | None = None
     steers: RunQueue | None = None
     if store_kind == "postgres":
         from sama.db.engine import create_engine
@@ -112,7 +112,7 @@ def build_app(store_kind: str) -> Starlette:
         todos = PostgresTodoStore(engine)
         memories = PostgresMemoryStore(engine)
         proposals = PostgresProposalStore(engine)
-        souls = SoulProposer(engine, proposals)
+        changes = ChangeProposer(engine, proposals)
         skills = PostgresSkillStore(engine, BuiltinSkills().all(), proposals)
         gate = GateService(engine)
         steers = RunQueue(engine)
@@ -142,7 +142,7 @@ def build_app(store_kind: str) -> Starlette:
         sessions=sessions,
         vision=vision,
         gate=gate,
-        souls=souls,
+        changes=changes,
         steers=steers,
     )
     return server.app(around=lambda: keep_redactor_current(vault))

@@ -30,6 +30,7 @@ from sama.db.models import (
     StoredContextFile,
 )
 from sama.gate.decide import effective_toolsets, run_limit
+from sama.profile_changes import session_snapshot
 from sama.prompt.scan import scan
 from sama.review.policy import SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT
 from sama.runtime.contract import (
@@ -176,12 +177,17 @@ class PromptAssembler:
                 config = RunConfig.model_validate(stored.run_config)
             else:
                 config = await self._build(connection, run, stored.created_at)
+                # The snapshot keeps the toolsets and the profile policy rules of this session,
+                # so a looser change of the profile applies from the next session (Section 11.4).
                 await connection.execute(
                     update(Session)
                     .where(*session)
                     .values(
                         run_config=config.model_dump(mode="json"),
                         config_fingerprint=config.fingerprint(),
+                        profile_snapshot=await session_snapshot(
+                            connection, run.org_id, run.agent_profile_id
+                        ),
                     )
                 )
         return _checked(config, run)

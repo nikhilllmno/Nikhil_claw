@@ -3,27 +3,29 @@
 ``update_profile`` changes the name, the soul, the runtime, the model, the toolsets, and the
 sub-agents of a profile in one transaction. It writes one audit entry with the names of the
 changed fields and the names of the sub-agents, never the text of the soul or of a prompt.
+It also writes the history of the profile (``profile_changes``), which the web app shows with a
+revert button (``sama.profile_changes``).
 
 A session keeps the soul, the runtime, the model, and the sub-agents that it froze, so those
-changes apply from the next session. The gate reads the toolsets on every tool call, so a change
-to the toolsets applies at the next tool call, also in a session that is running.
+changes apply from the next session. A session also keeps a snapshot of the toolsets, and the
+gate allows only the toolsets that the snapshot and the profile of now both have: a removed
+toolset applies at the next tool call, and a new toolset applies from the next session.
 
-This is the M3.8 interim. Since M3.2, the agent can propose a new soul with ``change_propose``
-(``sama.review.soul``), and a person approves it on an approval card. The other fields of a
-profile will go through ``change_propose`` when it gets the targets profile and toolsets (M6.1).
+The agent can propose the same changes with ``change_propose`` (M3.2 and M6.1,
+``sama.review.change``), and a person approves them on an approval card.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
 from sqlalchemy import func, insert, select, update
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AgentProfile, AuditEntry, Membership
+from sama.db.models import AgentProfile, AuditEntry, Membership, ProfileChange
 from sama.gate.decide import TOOLSETS
 from sama.runtime.contract import (
     SUBAGENT_DESCRIPTION_MAX_CHARS,
@@ -35,6 +37,7 @@ from sama.runtime.contract import (
 )
 from sama.subagents import (
     MAX_SUBAGENTS,
+    LockedProfile,
     known_models,
     lock_profile,
     model_is_known,
@@ -50,6 +53,23 @@ EDITABLE_RUNTIMES: Final = (RuntimeKind.CLAUDE_AGENT_SDK, RuntimeKind.OPENAI_AGE
 """The runtimes that an editor can choose. ``fake`` is for tests only."""
 NAME_MAX_CHARS: Final = 80
 SOUL_MAX_CHARS: Final = 20_000
+PROFILE_FIELDS: Final = (
+    "name",
+    "soul",
+    "runtime",
+    "model",
+    "subagents",
+    "toolsets",
+    "group_toolsets",
+)
+"""The fields of a profile that an edit, a proposal, or a revert can change."""
+KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
+    "soul": ("soul",),
+    "profile": ("name", "runtime", "model", "subagents"),
+    "toolsets": ("toolsets", "group_toolsets"),
+    "policy": ("rules",),
+}
+"""The fields of each kind of change. ``rules`` are the policy rules of the profile."""
 
 
 class ProfileError(ValueError):
@@ -111,6 +131,111 @@ def _check_toolsets(toolsets: Sequence[str]) -> list[str]:
     return list(toolsets)
 
 
+def planned_values(profile: LockedProfile, after: Mapping[str, Any]) -> dict[str, Any]:
+    """The column values that set the fields of ``after`` on ``profile``, checked.
+
+    ``after`` maps a field (``name``, ``soul``, ``runtime``, ``model``, ``subagents``,
+    ``toolsets``, ``group_toolsets``) to its new JSON value. A field with the value that the
+    profile has now is not a change. Raises ``ProfileError`` when a value is not valid, and
+    ``SubagentError`` when the sub-agents do not fit the profile after the change (for example,
+    a toolset that a sub-agent uses is not in the new toolsets).
+
+    A change of the runtime needs a model of the new runtime: the new model of the change, or
+    the model that the profile has now. A review model that the new runtime does not know goes
+    back to the default of the runtime. The stored sub-agents must fit the new runtime.
+    """
+    unknown = set(after) - set(PROFILE_FIELDS)
+    if unknown:
+        raise ProfileError("the field is not known: " + ", ".join(sorted(unknown)))
+    values: dict[str, Any] = {}
+    if "name" in after:
+        name = str(after["name"]).strip()
+        if not 1 <= len(name) <= NAME_MAX_CHARS:
+            raise ProfileError(f"the name has 1 to {NAME_MAX_CHARS} characters")
+        if name != profile.name:
+            values["name"] = name
+    if "soul" in after:
+        soul = str(after["soul"])
+        if len(soul) > SOUL_MAX_CHARS:
+            raise ProfileError(f"the soul has at most {SOUL_MAX_CHARS} characters")
+        if redact(soul) != soul:
+            raise ProfileError("the soul contains a secret")
+        if soul != profile.soul:
+            values["soul"] = soul
+    runtime = profile.runtime
+    if "runtime" in after:
+        try:
+            wanted = RuntimeKind(str(after["runtime"]))
+        except ValueError:
+            raise ProfileError(f"the runtime {after['runtime']} is not known") from None
+        if wanted not in EDITABLE_RUNTIMES:
+            raise ProfileError(f"the runtime {wanted.value} cannot be chosen")
+        if wanted != profile.runtime:
+            runtime = wanted
+            values["runtime"] = runtime.value
+    new_model = None if after.get("model") is None else str(after["model"])
+    if "runtime" in values:
+        model = profile.model if new_model is None else new_model
+        if model not in known_models(runtime):
+            raise ProfileError("choose a model of the new runtime")
+        if model != profile.model:
+            values["model"] = model
+        if profile.review_model is not None and not model_is_known(runtime, profile.review_model):
+            values["review_model"] = None
+    elif new_model is not None and new_model != profile.model:
+        # The stored model can be a model that the table no longer lists. Only a new value must
+        # be in the list.
+        if new_model not in known_models(runtime):
+            raise ProfileError("the model is not known for the runtime of the profile")
+        values["model"] = new_model
+    for field in ("toolsets", "group_toolsets"):
+        if field in after:
+            toolsets = _check_toolsets([str(name) for name in after[field] or []])
+            if toolsets != getattr(profile, field):
+                values[field] = toolsets
+    final_toolsets = values.get("toolsets", profile.toolsets)
+    if "subagents" in after:
+        specs = parse_subagents(list(after["subagents"] or []))
+        validate_subagents(specs, toolsets=final_toolsets, runtime=runtime)
+        value = subagents_value(specs)
+        if value != profile.subagents:
+            values["subagents"] = value
+    elif "toolsets" in values or "runtime" in values:
+        # The toolsets or the runtime can change, so the stored sub-agents must still fit.
+        validate_subagents(
+            parse_subagents(profile.subagents), toolsets=final_toolsets, runtime=runtime
+        )
+    return values
+
+
+def profile_value(profile: LockedProfile, field: str) -> Any:
+    """The JSON value of a field of the profile now."""
+    if field == "runtime":
+        return profile.runtime.value
+    value = getattr(profile, field)
+    return list(value) if isinstance(value, list) else value
+
+
+async def lock_admin(
+    connection: AsyncConnection, org_id: uuid.UUID, actor_user_id: uuid.UUID
+) -> None:
+    """Raises ``NotAdminError`` when the actor is not an org owner or admin now. Call it after
+    the lock of the profile: the share lock keeps the membership until the end of the
+    transaction, so a demotion that is waiting cannot slip in before the write."""
+    admin = await connection.execute(
+        select(Membership.id)
+        .where(
+            Membership.org_id == org_id,
+            Membership.user_id == actor_user_id,
+            Membership.workspace_id.is_(None),
+            Membership.role.in_(ADMIN_ROLES),
+        )
+        .with_for_update(read=True)
+    )
+    if admin.first() is None:
+        raise NotAdminError
+
+
 async def update_profile(
     engine: AsyncEngine,
     org_id: uuid.UUID,
@@ -119,98 +244,54 @@ async def update_profile(
     *,
     actor_user_id: uuid.UUID,
 ) -> None:
-    """Applies the changes and writes the audit entry.
+    """Applies the changes, writes the audit entry and the history (``profile_changes``).
 
     A field with the value that the profile has now is not a change. Without a change, the
     function writes nothing. Raises ``ProfileError`` when a value is not valid, and
     ``SubagentError`` when the profile does not exist or the sub-agents do not fit the profile
-    after the change (for example, a toolset that a sub-agent uses is not in the new toolsets).
-    Raises ``NotAdminError`` when the actor is not an org owner or admin at the time of the
-    write: the caller checked the role earlier, and the role can change while the write waits
-    for the lock of the profile.
-
-    A change of the runtime needs a model of the new runtime: the new model of the change, or
-    the model that the profile has now. A review model that the new runtime does not know goes
-    back to the default of the runtime. The stored sub-agents must fit the new runtime.
+    after the change. Raises ``NotAdminError`` when the actor is not an org owner or admin at
+    the time of the write: the caller checked the role earlier, and the role can change while
+    the write waits for the lock of the profile. See ``planned_values`` for the rules.
     """
     if changes.runtime is not None and changes.runtime not in EDITABLE_RUNTIMES:
         raise ProfileError(f"the runtime {changes.runtime.value} cannot be chosen")
-    soul = changes.soul
-    if soul is not None:
-        if len(soul) > SOUL_MAX_CHARS:
+    after: dict[str, Any] = {}
+    if changes.name is not None:
+        after["name"] = changes.name
+    if changes.soul is not None:
+        after["soul"] = changes.soul
+    if changes.runtime is not None:
+        after["runtime"] = changes.runtime.value
+    if changes.model is not None:
+        after["model"] = changes.model
+    if changes.toolsets is not None:
+        after["toolsets"] = list(changes.toolsets)
+    if changes.subagents is not None:
+        after["subagents"] = list(changes.subagents)
+    if "soul" in after:
+        # Checked before the lock, so a bad soul does not wait for the lock.
+        if len(after["soul"]) > SOUL_MAX_CHARS:
             raise ProfileError(f"the soul has at most {SOUL_MAX_CHARS} characters")
-        if redact(soul) != soul:
+        if redact(after["soul"]) != after["soul"]:
             raise ProfileError("the soul contains a secret")
-    toolsets = None if changes.toolsets is None else _check_toolsets(changes.toolsets)
-    specs = None if changes.subagents is None else parse_subagents(list(changes.subagents))
+    if "toolsets" in after:
+        _check_toolsets(after["toolsets"])
+    if "subagents" in after:
+        parse_subagents(after["subagents"])
 
     async with engine.begin() as connection:
         profile = await lock_profile(connection, org_id, profile_id)
-        # Checked after the lock of the profile, and the share lock keeps the membership until
-        # the end of the transaction, so a demotion that is waiting cannot slip in before the
-        # write.
-        admin = await connection.execute(
-            select(Membership.id)
-            .where(
-                Membership.org_id == org_id,
-                Membership.user_id == actor_user_id,
-                Membership.workspace_id.is_(None),
-                Membership.role.in_(ADMIN_ROLES),
-            )
-            .with_for_update(read=True)
-        )
-        if admin.first() is None:
-            raise NotAdminError
-        values: dict[str, Any] = {}
-        subagent_names: list[str] = []
-        if changes.name is not None and changes.name != profile.name:
-            values["name"] = changes.name
-        if soul is not None and soul != profile.soul:
-            values["soul"] = soul
-        runtime = profile.runtime
-        if changes.runtime is not None and changes.runtime != profile.runtime:
-            runtime = changes.runtime
-            values["runtime"] = runtime.value
-        if "runtime" in values:
-            model = profile.model if changes.model is None else changes.model
-            if model not in known_models(runtime):
-                raise ProfileError("choose a model of the new runtime")
-            if model != profile.model:
-                values["model"] = model
-            if profile.review_model is not None and not model_is_known(
-                runtime, profile.review_model
-            ):
-                values["review_model"] = None
-        elif changes.model is not None and changes.model != profile.model:
-            # The stored model can be a model that the table no longer lists. Only a new
-            # value must be in the list.
-            if changes.model not in known_models(runtime):
-                raise ProfileError("the model is not known for the runtime of the profile")
-            values["model"] = changes.model
-        if toolsets is not None and toolsets != profile.toolsets:
-            values["toolsets"] = toolsets
-        if specs is None:
-            # The toolsets or the runtime can change, so the stored sub-agents must still fit.
-            if "toolsets" in values or "runtime" in values:
-                validate_subagents(
-                    parse_subagents(profile.subagents),
-                    toolsets=values.get("toolsets", profile.toolsets),
-                    runtime=runtime,
-                )
-        else:
-            validate_subagents(
-                specs, toolsets=values.get("toolsets", profile.toolsets), runtime=runtime
-            )
-            value = subagents_value(specs)
-            if value != profile.subagents:
-                values["subagents"] = value
-                subagent_names = [spec.name for spec in specs]
+        await lock_admin(connection, org_id, actor_user_id)
+        values = planned_values(profile, after)
         if not values:
             return
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .values(**values, updated_at=func.now())
+        )
+        subagent_names = (
+            [str(spec["name"]) for spec in values["subagents"]] if "subagents" in values else []
         )
         await connection.execute(
             insert(AuditEntry).values(
@@ -227,3 +308,55 @@ async def update_profile(
                 },
             )
         )
+        for kind, fields in KIND_FIELDS.items():
+            changed = [field for field in fields if field in values]
+            if not changed:
+                continue
+            await record_change(
+                connection,
+                org_id=org_id,
+                workspace_id=profile.workspace_id,
+                profile_id=profile_id,
+                kind=kind,
+                source="edit",
+                before={field: profile_value(profile, field) for field in changed},
+                after={field: values[field] for field in changed},
+                actor_user_id=actor_user_id,
+            )
+
+
+async def record_change(
+    connection: AsyncConnection,
+    *,
+    org_id: uuid.UUID,
+    workspace_id: uuid.UUID | None,
+    profile_id: uuid.UUID,
+    kind: str,
+    source: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    actor_user_id: uuid.UUID | None,
+    proposal_id: uuid.UUID | None = None,
+    reverts_change_id: uuid.UUID | None = None,
+    summary: str | None = None,
+) -> uuid.UUID:
+    """Writes one row of the history of a profile on ``connection``. Returns its id."""
+    return (
+        await connection.execute(
+            insert(ProfileChange)
+            .values(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                agent_profile_id=profile_id,
+                kind=kind,
+                source=source,
+                before=dict(before),
+                after=dict(after),
+                actor_user_id=actor_user_id,
+                proposal_id=proposal_id,
+                reverts_change_id=reverts_change_id,
+                summary=summary,
+            )
+            .returning(ProfileChange.id)
+        )
+    ).scalar_one()

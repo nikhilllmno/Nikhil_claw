@@ -89,13 +89,17 @@ RECEIPT_STATUSES: Final = ("intent", "done", "failed", "unknown")
 FIRE_STATUSES: Final = ("running", "completed", "failed", "skipped")
 DELIVERY_KINDS: Final = ("result", "failure", "alert")
 DELIVERY_STATUSES: Final = ("pending", "sending", "sent", "failed", "unknown")
-PROPOSAL_KINDS: Final = ("memory", "skill", "soul")
+PROPOSAL_KINDS: Final = ("memory", "skill", "soul", "profile", "toolsets", "policy")
 PROPOSAL_ORIGINS: Final = ("review", "chat")
 """``review``: a background review proposed the change. ``chat``: the agent proposed it in a chat
 run, because the user of the run does not have the role for the change (Section 9.4)."""
 WORKER_BOT_STATUSES: Final = ("active", "disabled")
 PROPOSAL_SCOPES: Final = ("agent", "workspace", "org")
 PROPOSAL_STATUSES: Final = ("pending", "applied", "failed", "discarded")
+PROFILE_CHANGE_KINDS: Final = ("soul", "profile", "toolsets", "policy")
+PROFILE_CHANGE_SOURCES: Final = ("proposal", "edit", "revert")
+"""``proposal``: a person approved a ``change_propose`` proposal. ``edit``: an admin changed the
+profile in the web app. ``revert``: an admin reverted an earlier change (Section 11.4)."""
 TOOL_DECISIONS: Final = ("allow", "ask", "deny")
 TOOL_STATUSES: Final = ("started", "finished", "failed", "denied")
 APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
@@ -473,6 +477,10 @@ class Session(Base):
     """The frozen ``RunConfig`` of the session, set by the first run (Section 6.1)."""
     config_fingerprint: Mapped[str | None] = mapped_column(Text)
     """``RunConfig.fingerprint()`` of ``run_config``."""
+    profile_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """The toolsets and the profile policy rules when the session froze its config (Section
+    11.4). The gate lets the session use only what the snapshot and the profile of now both
+    allow, so a new permission applies from the next session and a removal applies at once."""
     review_user_turns: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     """The user turns that ended since the last background review (Section 9.4)."""
     review_tool_iterations: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -1546,6 +1554,47 @@ class ReviewProposal(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ProfileChange(Base):
+    """One change of an agent profile, for the history and the revert in the web app
+    (docs/architecture.md, Section 11.4). ``before`` and ``after`` hold the changed fields
+    only. Only the control plane writes the table."""
+
+    __tablename__ = "profile_changes"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "agent_profile_id"],
+            ["agent_profiles.org_id", "agent_profiles.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "actor_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("kind", PROFILE_CHANGE_KINDS), name="kind"),
+        CheckConstraint(_one_of("source", PROFILE_CHANGE_SOURCES), name="source"),
+        CheckConstraint("jsonb_typeof(before) = 'object'", name="before_is_object"),
+        CheckConstraint("jsonb_typeof(after) = 'object'", name="after_is_object"),
+        Index(None, "org_id", "agent_profile_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The workspace of the profile. ``None`` for a profile of the whole org."""
+    agent_profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The approved proposal. A plain column: the history stays when the session is deleted."""
+    reverts_change_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reverted_by_change_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    summary: Mapped[str | None] = mapped_column(Text)
+    before: Mapped[dict[str, Any]] = _json()
+    after: Mapped[dict[str, Any]] = _json()
+    created_at: Mapped[datetime] = _created_at()
 
 
 class SessionCompaction(Base):

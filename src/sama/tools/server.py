@@ -71,8 +71,10 @@ from sama.memory.core import (
     Target,
 )
 from sama.memory.service import MemoryService
-from sama.profiles import SOUL_MAX_CHARS
-from sama.review.soul import SUMMARY_MAX_CHARS, SoulError, SoulProposer
+from sama.profile_changes import MAX_RULES
+from sama.profiles import NAME_MAX_CHARS, SOUL_MAX_CHARS
+from sama.review.change import ChangeProposer, ChangeRequest, ChangeTarget, RuleChange
+from sama.review.soul import SUMMARY_MAX_CHARS, SoulError
 from sama.runtime.archive import (
     ARCHIVE_PATH,
     MAX_ARCHIVE_BODY_BYTES,
@@ -104,6 +106,7 @@ from sama.skills.library import ManageRequest
 from sama.skills.lint import MAX_FILE_CHARS, MAX_SKILL_MD_CHARS
 from sama.skills.render import render_list, render_view, render_written
 from sama.skills.store import SkillStore
+from sama.subagents import MAX_SUBAGENTS
 from sama.tasks.runs import TaskTools
 from sama.tasks.service import TaskError
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
@@ -364,8 +367,9 @@ class ToolServer:
       its tool is hidden.
     - ``code``: runs a Python program in the session sandbox (``execute_code``, Section 10.2).
       Without it, the tool is hidden.
-    - ``souls``: proposes a new soul for the profile of the run (``change_propose``, toolset
-      ``self``). Without it, the tool is hidden.
+    - ``changes``: proposes a change of the soul, the settings, the toolsets, or the policy
+      rules of the profile of the run (``change_propose``, toolset ``self``). Without it, the
+      tool is hidden.
     - ``sama_pr``: a code change to the sama repository as a pull request (``sama_pr``,
       toolset ``self``, Section 15.2). Without it, the tool is hidden.
     - ``deferred``: the catalog of deferred tools. With at least one tool in it when the app
@@ -408,7 +412,7 @@ class ToolServer:
         connections: ConnectionService | None = None,
         archive: ArchiveBackend | None = None,
         gate: GateBackend | None = None,
-        souls: SoulProposer | None = None,
+        changes: ChangeProposer | None = None,
         delegation: DelegationService | None = None,
         tasks: TaskTools | None = None,
         session_items: SessionItemsBackend | None = None,
@@ -428,7 +432,7 @@ class ToolServer:
         self.speech = speech
         self.steers = steers
         self.sama_pr = sama_pr
-        self.souls = souls
+        self.changes = changes
         self.session_items = session_items
         self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
         self.jobs = jobs
@@ -667,33 +671,61 @@ class ToolServer:
                 }
                 return await self._call(ctx, MEMORY, arguments, body)
 
-        if self.souls is not None:
-            souls = self.souls
+        if self.changes is not None:
+            changes = self.changes
 
             @server.tool(
                 name=CHANGE_PROPOSE,
                 description=(
-                    "Propose a change of your own setup. The only target is soul: the "
-                    "instructions that set your persona and the way you work for every user of "
-                    "this agent profile. Give the full new soul in content, not a diff, and a "
-                    "short summary of the change. The change is not saved: a workspace admin "
-                    "or the org owner must approve it on an approval card. After the approval, "
-                    "it applies from the next session. Propose a change only when the user asks "
-                    "for it."
+                    "Propose a change of your own setup for every user of this agent profile. "
+                    "Targets: soul (the instructions that set your persona and the way you "
+                    "work: give the full new soul in content, not a diff); profile (name, "
+                    "runtime, model, or subagents: the full new list of sub-agent specs); "
+                    "toolsets (toolsets or group_toolsets: the full new list); policy (rules: "
+                    "a list of {tool, action}, where tool is a tool name or a prefix with * "
+                    "last, and action is allow, ask, deny, or none to remove the rule). Give "
+                    "only the fields of the target and a short summary of the change. The "
+                    "change is not saved: a workspace admin or the org owner must approve it "
+                    "on an approval card that shows the diff. After the approval, it applies "
+                    "from the next session. Propose a change only when the user asks for it."
                 ),
                 annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
                 structured_output=False,
             )
             async def change_propose_tool(
                 ctx: Context,
-                target: Literal["soul"],
-                content: Annotated[str, Field(max_length=SOUL_MAX_CHARS)],
+                target: ChangeTarget,
                 summary: Annotated[str, Field(max_length=SUMMARY_MAX_CHARS)],
+                content: Annotated[str | None, Field(max_length=SOUL_MAX_CHARS)] = None,
+                name: Annotated[str | None, Field(max_length=NAME_MAX_CHARS)] = None,
+                runtime: Annotated[str | None, Field(max_length=64)] = None,
+                model: Annotated[str | None, Field(max_length=200)] = None,
+                subagents: Annotated[
+                    list[dict[str, Any]] | None, Field(max_length=MAX_SUBAGENTS)
+                ] = None,
+                toolsets: Annotated[list[str] | None, Field(max_length=64)] = None,
+                group_toolsets: Annotated[list[str] | None, Field(max_length=64)] = None,
+                rules: Annotated[list[RuleChange] | None, Field(max_length=MAX_RULES)] = None,
             ) -> str:
-                async def body(claims: RunTokenClaims) -> str:
-                    return await souls.propose(claims, content, summary)
+                request = ChangeRequest(
+                    target=target,
+                    summary=summary,
+                    content=content,
+                    name=name,
+                    runtime=runtime,
+                    model=model,
+                    subagents=subagents,
+                    toolsets=toolsets,
+                    group_toolsets=group_toolsets,
+                    rules=None if rules is None else [(r.tool, r.action) for r in rules],
+                )
 
-                arguments = {"target": target, "content": content, "summary": summary}
+                async def body(claims: RunTokenClaims) -> str:
+                    return await changes.propose(claims, request)
+
+                arguments = {"target": target, "summary": summary, **request.fields()}
+                if content is not None:
+                    arguments["content"] = content
                 return await self._call(ctx, CHANGE_PROPOSE, arguments, body)
 
         if self.sessions is not None:

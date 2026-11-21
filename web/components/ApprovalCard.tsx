@@ -26,13 +26,22 @@ export function ApprovalCard({ approval, onDecided }: { approval: Approval; onDe
   };
 
   const args = JSON.stringify(approval.arguments, null, 2);
+  // A proposal of a change of the agent shows its diff. A rule cannot approve a proposal, so it
+  // has no "Always allow".
+  const proposal = approval.proposal === true;
   return (
     <section className={`card ${styles.card}`} aria-label={`Approval for ${approval.tool_name}`}>
       <h2 className={styles.title}>
         The agent wants to use <span className="mono">{approval.tool_name}</span>
       </h2>
       {approval.reason ? <p className={styles.reason}>{approval.reason}</p> : null}
-      {args !== "{}" ? <pre className={styles.code}>{args}</pre> : null}
+      {approval.diff ? (
+        <pre className={styles.code} aria-label="The change">
+          {approval.diff}
+        </pre>
+      ) : args !== "{}" ? (
+        <pre className={styles.code}>{args}</pre>
+      ) : null}
       {error ? (
         <p className="alert alert-error" role="alert">
           {error}
@@ -47,9 +56,11 @@ export function ApprovalCard({ approval, onDecided }: { approval: Approval; onDe
         >
           {busy === "approve" ? "Approving…" : "Approve"}
         </button>
-        <button type="button" className="btn" disabled={busy !== null} onClick={() => decide("always")}>
-          {busy === "always" ? "Saving…" : "Always allow"}
-        </button>
+        {!proposal ? (
+          <button type="button" className="btn" disabled={busy !== null} onClick={() => decide("always")}>
+            {busy === "always" ? "Saving…" : "Always allow"}
+          </button>
+        ) : null}
         <button
           type="button"
           className="btn btn-danger"
@@ -59,9 +70,15 @@ export function ApprovalCard({ approval, onDecided }: { approval: Approval; onDe
           {busy === "deny" ? "Denying…" : "Deny"}
         </button>
       </div>
-      <p className="hint">
-        Always allow lets this agent use {approval.tool_name} for you without asking again.
-      </p>
+      {proposal ? (
+        approval.diff ? (
+          <p className="hint">After the approval, the change applies to new sessions.</p>
+        ) : null
+      ) : (
+        <p className="hint">
+          Always allow lets this agent use {approval.tool_name} for you without asking again.
+        </p>
+      )}
     </section>
   );
 }
