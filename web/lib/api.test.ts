@@ -587,3 +587,43 @@ describe("browser settings calls", () => {
     ]);
   });
 });
+
+describe("admin calls (M6.9)", () => {
+  it("builds the URLs of the admin views and the data controls", async () => {
+    const fetcher = vi.fn(async () => json(200, {}));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.orgUsage("o1", 7);
+    await client.orgAudit("o1", { action: "member.", before: 99 });
+    await client.orgAudit("o1");
+    await client.curatorReports("o1");
+    await client.setRetention("o1", null);
+    await client.deleteOrg("o1", "acme labs");
+    await client.createAgentProfile("o1", { name: "R" });
+    await client.connectSlack("o1", "xoxb-1", "sig");
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method, init.body])).toEqual([
+      ["https://api.test/orgs/o1/usage?days=7", "GET", undefined],
+      ["https://api.test/orgs/o1/audit?limit=50&before=99&action=member.", "GET", undefined],
+      ["https://api.test/orgs/o1/audit?limit=50", "GET", undefined],
+      ["https://api.test/orgs/o1/curator-reports?limit=10", "GET", undefined],
+      ["https://api.test/orgs/o1/data-settings", "PUT", '{"retention_days":null}'],
+      ["https://api.test/orgs/o1?confirm=acme+labs", "DELETE", undefined],
+      ["https://api.test/orgs/o1/agent-profiles", "POST", '{"name":"R"}'],
+      ["https://api.test/orgs/o1/integrations/slack", "POST", '{"bot_token":"xoxb-1","signing_secret":"sig"}'],
+    ]);
+  });
+
+  it("downloads an export with the file name of the answer, or a fallback", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response("zip", { status: 200, headers: { "Content-Disposition": 'attachment; filename="org.zip"' } }),
+      )
+      .mockResolvedValueOnce(new Response("zip", { status: 200 }))
+      .mockResolvedValueOnce(json(403, { detail: "only an org owner can do this" }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    expect((await client.exportOrg("abcdef0123")).name).toBe("org.zip");
+    expect((await client.exportUser("o1", "u1234567890")).name).toBe("sama-user-u1234567.zip");
+    await expect(client.exportOrg("o1")).rejects.toMatchObject({ status: 403, message: "only an org owner can do this" });
+  });
+});

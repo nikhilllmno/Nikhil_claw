@@ -43,6 +43,8 @@ export interface IntegrationSummary {
 export interface Org {
   id: string;
   name: string;
+  /** The short name of the org. A delete of the org asks for it. */
+  slug: string;
   user_id: string;
   display_name: string | null;
   /** True for an org owner or admin. */
@@ -1002,6 +1004,134 @@ export interface RunTrace {
 
 export type ChatChannel = "telegram" | "slack";
 
+/** The answer of `POST /orgs/{org_id}/integrations/slack/setup` (Section 11.6). */
+export interface SlackSetup {
+  integration: IntegrationSummary;
+  events_url: string;
+  interactions_url: string;
+  commands_url: string;
+  manifest: Record<string, unknown>;
+  /** Opens the Slack page that makes a new app from the manifest. */
+  manifest_link: string;
+}
+
+/** A new agent profile (M6.9). Null `workspace_id`: a profile of the whole org. */
+export interface NewAgentProfile {
+  name: string;
+  soul?: string;
+  runtime?: string;
+  model?: string;
+  workspace_id?: string | null;
+}
+
+// -- admin views (Section 17.6, M6.9) -----------------------------------------------------------
+
+export interface UsageTotals {
+  /** A decimal number as a string. */
+  cost_usd: string;
+  /** The part of `cost_usd` on the own model keys of the org. */
+  org_key_cost_usd: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  model_calls: number;
+  runs: number;
+  sessions: number;
+}
+
+export interface UsageDay {
+  /** A UTC day, `YYYY-MM-DD`. */
+  day: string;
+  cost_usd: string;
+  input_tokens: number;
+  output_tokens: number;
+  model_calls: number;
+}
+
+export interface UsageRow {
+  key: string | null;
+  label: string;
+  cost_usd: string;
+  input_tokens: number;
+  output_tokens: number;
+  model_calls: number;
+}
+
+export interface OrgUsage {
+  days: number;
+  since: string;
+  until: string;
+  totals: UsageTotals;
+  by_day: UsageDay[];
+  by_user: UsageRow[];
+  by_profile: UsageRow[];
+  by_model: UsageRow[];
+  by_key_source: UsageRow[];
+}
+
+export interface AuditEntry {
+  id: number;
+  created_at: string;
+  action: string;
+  actor_kind: string;
+  actor_user_id: string | null;
+  actor_name: string | null;
+  workspace_id: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  run_id: string | null;
+  details: Record<string, unknown>;
+}
+
+export interface AuditPage {
+  entries: AuditEntry[];
+  /** The `before` of the next (older) page. `null` on the last page. */
+  next_before: number | null;
+}
+
+export interface CuratorJob {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  status: string;
+  next_fire_at: string | null;
+  last_fire_at: string | null;
+}
+
+export interface CuratorReport {
+  id: string;
+  job_id: string;
+  workspace_id: string;
+  workspace_name: string;
+  status: string;
+  manual: boolean;
+  scheduled_for: string;
+  finished_at: string | null;
+  output: string | null;
+  error: string | null;
+  truncated: boolean;
+}
+
+export interface CuratorReports {
+  jobs: CuratorJob[];
+  reports: CuratorReport[];
+}
+
+/** `GET /orgs/{org_id}/data-settings` (Section 17.4). Null days: keep everything. */
+export interface DataSettings {
+  plan: string;
+  retention_days: number | null;
+  plan_default_days: number | null;
+  plan_max_days: number | null;
+  effective_days: number | null;
+}
+
+/** What a delete removed. */
+export interface Removed {
+  sessions: number;
+  runs: number;
+}
+
 export interface ChannelIdentity {
   id: string;
   org_id: string;
@@ -1573,6 +1703,75 @@ export class ApiClient {
       method: "POST",
       body,
     });
+  /** Makes the pending Slack app of the org and gives its manifest (Section 11.6). */
+  setupSlack = (orgId: string) =>
+    this.json<SlackSetup>(`/orgs/${encodeURIComponent(orgId)}/integrations/slack/setup`, {
+      method: "POST",
+    });
+  /** Sends the bot token and the signing secret. They go only to this call. */
+  connectSlack = (orgId: string, botToken: string, signingSecret: string) =>
+    this.json<IntegrationSummary>(`/orgs/${encodeURIComponent(orgId)}/integrations/slack`, {
+      method: "POST",
+      body: { bot_token: botToken, signing_secret: signingSecret },
+    });
+  // -- M6.9 -------------------------------------------------------------------------------------
+  createAgentProfile = (orgId: string, body: NewAgentProfile) =>
+    this.json<AgentProfile>(`/orgs/${encodeURIComponent(orgId)}/agent-profiles`, {
+      method: "POST",
+      body,
+    });
+  orgUsage = (orgId: string, days: number) =>
+    this.json<OrgUsage>(`/orgs/${encodeURIComponent(orgId)}/usage${query({ days })}`);
+  orgAudit = (
+    orgId: string,
+    options: { limit?: number; before?: number | null; action?: string | null } = {},
+  ) =>
+    this.json<AuditPage>(
+      `/orgs/${encodeURIComponent(orgId)}/audit${query({
+        limit: options.limit ?? 50,
+        before: options.before ?? null,
+        action: options.action || null,
+      })}`,
+    );
+  curatorReports = (orgId: string, limit = 10) =>
+    this.json<CuratorReports>(`/orgs/${encodeURIComponent(orgId)}/curator-reports${query({ limit })}`);
+  dataSettings = (orgId: string) =>
+    this.json<DataSettings>(`/orgs/${encodeURIComponent(orgId)}/data-settings`);
+  setRetention = (orgId: string, retentionDays: number | null) =>
+    this.json<DataSettings>(`/orgs/${encodeURIComponent(orgId)}/data-settings`, {
+      method: "PUT",
+      body: { retention_days: retentionDays },
+    });
+  /** The ZIP of all the data of the org (an org owner). */
+  exportOrg = (orgId: string) =>
+    this.download(`/orgs/${encodeURIComponent(orgId)}/export`, `sama-org-${orgId.slice(0, 8)}.zip`);
+  /** The ZIP of the data of one user in the org (the user, or an org owner). */
+  exportUser = (orgId: string, userId: string) =>
+    this.download(
+      `/orgs/${encodeURIComponent(orgId)}/users/${encodeURIComponent(userId)}/export`,
+      `sama-user-${userId.slice(0, 8)}.zip`,
+    );
+  deleteUser = (orgId: string, userId: string) =>
+    this.json<Removed>(`/orgs/${encodeURIComponent(orgId)}/users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+    });
+  /** Deletes the org. `confirm` must be the slug of the org. */
+  deleteOrg = (orgId: string, confirm: string) =>
+    this.json<Removed>(`/orgs/${encodeURIComponent(orgId)}${query({ confirm })}`, { method: "DELETE" });
+
+  /** A file answer. A status that is not 2xx throws an `ApiError` with the JSON detail. */
+  private download = async (path: string, fallback: string): Promise<ExportFile> => {
+    const generation = this.tokens.generation;
+    const response = await this.raw(path, {}, generation);
+    if (!response.ok) {
+      const data: unknown = await response.json().catch(() => null);
+      this.assertCurrent(generation);
+      throw new ApiError(response.status, errorMessage(response.status, data));
+    }
+    const blob = await response.blob();
+    this.assertCurrent(generation);
+    return { name: attachmentName(response.headers.get("Content-Disposition"), fallback), blob };
+  };
   /** Ends an OAuth sign-in: the server sent the user back with `state` and `code` (or `error`). */
   finishOAuth = (state: string, code: string | null, error: string | null) =>
     this.json<Connection>("/connections/oauth/callback", {

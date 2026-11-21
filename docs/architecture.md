@@ -3151,7 +3151,7 @@ cross-org check of Section 17.1 through the API.
 | Method and path | Purpose |
 |---|---|
 | `GET /config` | The Supabase URL and the public anon key, for the web page. `signup` is `open` or `invite_only` (Section 17.2). `billing` is true when billing is on (Section 17.5). |
-| `GET /me` | The orgs, workspaces, and agent profiles that the user can see. Each org has the `role` and the `plan` of the user. |
+| `GET /me` | The orgs, workspaces, and agent profiles that the user can see. Each org has the `slug`, and the `role` and the `plan` of the user. |
 | `POST /orgs` | Make an org with the user as the owner (`201`). `403` when sign-up is closed, the email is not confirmed, or the domain is blocked. `429` over a rate limit (Section 17.2). |
 | `GET /orgs/{org_id}/members`, `PATCH`, `DELETE /orgs/{org_id}/members/{user_id}` | The members of the org. `PATCH` changes `role` or `workspace_ids` (an admin). `DELETE` removes a member (an admin) or leaves the org (the user). `409` for the last owner (Section 17.2). |
 | `GET`, `POST /orgs/{org_id}/invites`, `DELETE /orgs/{org_id}/invites/{invite_id}` | The invites of the org, for an admin. `POST` takes `email`, `role`, and `workspace_id`, and gives the token one time (`201`). `429` over the plan caps (Section 17.2). |
@@ -3179,6 +3179,8 @@ cross-org check of Section 17.1 through the API.
 | `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_approval`, then `RunQueue.release_decided`. `always_allow` writes the user rule. `409` if the approval is decided or expired. |
 | `GET /workspaces/{id}/memory`, `GET .../memory/{target}/revisions`, `PUT .../memory/{target}`, `POST .../memory/{target}/revisions/{seq}/revert` | The memory of the workspace (Section 8.1). `target` is `agent`, `user`, or `workspace`. The `agent` target needs `agent_profile_id` (query or body). `user` is the notes of the caller. A user who cannot see the workspace gets `404`. A `workspace` write needs a workspace admin (`403`). A change that is not valid gets `422`. |
 | `GET /sessions/{id}/questions`, `POST .../questions/{request_id}/answer` | The open `clarify` questions of the session, when the process has a `ClarifyBroker` (Section 16.7). |
+| `POST /orgs/{org_id}/agent-profiles` | Make an agent profile (an org owner or admin, `201`). `409` over 20 profiles (Section 17.6, M6.9). |
+| `GET /orgs/{org_id}/usage`, `GET /orgs/{org_id}/audit`, `GET /orgs/{org_id}/curator-reports` | The admin views: usage, audit log, and curator reports (an org owner or admin, Section 17.6, M6.9). |
 | `GET /orgs/{org_id}/session-search?q=&workspace_id=&limit=` | Search the sessions of the org that the user can read (M3.12, below). At most 10 hits. `q` has at most 400 characters (`422`). An empty `q` gives the latest sessions. |
 | `GET /sessions/{id}/export?format=markdown\|json` | The transcript as a file to download (M3.12, below). |
 | `GET /sessions/{id}/runs?limit=` | The runs of the session, newest first, with the token use and the cost. Default 50, at most 200. |
@@ -3234,7 +3236,8 @@ origins, for example `https://sama-web.vercel.app,http://localhost:3000`:
 - With the setting, the API answers a preflight request from a listed origin. It allows the
   methods `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`, the headers `Authorization`,
   `Content-Type`, and `Last-Event-ID`, and caches the answer for 600 seconds. It never allows
-  credentials. The event stream and error answers have the CORS header, too, also the answer
+  credentials. It exposes `Content-Disposition`, so the web app reads the file name of an
+  export (M6.9). The event stream and error answers have the CORS header, too, also the answer
   to an unhandled error (`500`): the CORS layer is outside the layer that makes that answer.
 - Without the setting (the default), the API sends no CORS header. The page at `/` does not
   need CORS, because it has the same origin as the API.
@@ -3383,7 +3386,8 @@ pages of the web app. They use the same guards as the session routes (code and R
 The web app routes are `/search`, `/memory`, `/skills`, `/settings`, and `/s/{id}/runs`. The chat
 header has the export buttons and a link to the runs. The settings page shows the account, the
 chat apps of each org (an admin connects and disconnects the Telegram bot there), the linked chat
-accounts, and the agents. The web app has no Slack connect form.
+accounts, and the agents. Since M6.9 an admin also connects the Slack app there, and the model
+keys moved to the admin area (Section 17.6).
 
 **Not in M1.12.** `python -m sama.api` runs only the API. The control plane process (Section
 19.1) puts the API, the worker, and the tool server in one process, so that the API answers
@@ -6730,6 +6734,96 @@ changed the plan. It does not say that the payment is done before then.
   usage that sama already reported.
 - When a subscription ends, the last usage (at most 5 minutes) can be missed.
 - Existing members stay when a plan with a lower member cap starts.
+
+### 17.6 Customer web app (M6.9)
+
+The web app (`web/`) is ready for customers: a setup guide after sign-up, an admin area, a
+help center, and the same navigation, empty states, errors, and loading states on each page.
+The Billing page of M6.6 (Section 17.5) is in the navigation, the setup guide, the admin
+overview, and the help.
+
+**Navigation.** The sidebar has the sessions, then three groups: Workspace (Jobs, Search,
+Memory, Skills, Connections), Agents, and Org (Members, Admin, Billing, Settings, Help). Only
+an owner or admin of an org sees Admin and Billing. A user without an org sees only the welcome page, Settings, and
+Help. While the setup guide has open steps, an admin sees "Finish the setup" in the sidebar and
+a card on the home page.
+
+**Setup guide (`/onboarding`).** After a person creates an org, the web app opens the guide.
+It has five steps: create the org (done), choose a plan, connect a chat app, pick or create an
+agent, and send a first message.
+
+- Plan: the guide lists the plans of `GET /billing/plans` and marks the plan of the org. The
+  person keeps the plan, or an admin opens the Billing page to buy one (Section 17.5). The step
+  is done when the person keeps the plan or the org has a plan other than `free`. Without
+  billing (`billing_enabled` false), the guide says that the deployment sells no plans.
+
+- Chat app: an admin connects the Telegram bot or the Slack app of the org. The Slack form
+  calls `POST /orgs/{org_id}/integrations/slack/setup`, shows the link that makes the Slack app
+  from the manifest, and sends the bot token and the signing secret to
+  `POST /orgs/{org_id}/integrations/slack` (Section 11.6). The person can skip the step and use
+  only the web app.
+- Agent: the person picks an agent of the org, or an admin creates one from a template
+  (assistant, research, writing, support) with `POST /orgs/{org_id}/agent-profiles` (below).
+- First message: the guide makes a private session with the agent and sends the message, then
+  opens the chat.
+- The progress of each org is in `localStorage` (`sama.onboarding.<org_id>`). It only chooses
+  what the screens show. A step is done when its result exists (an active chat app, a known
+  agent) or when the person skipped it.
+
+**New agent profile.** `POST /orgs/{org_id}/agent-profiles` takes `name`, `soul` (optional),
+`runtime` and `model` (optional; the defaults of a new org), and `workspace_id` (null for the
+whole org). Only an org owner or admin can do it (`403`). The profile gets the toolsets of a
+new org and the run budget of the plan of the org (Section 17.2). The rules of an edit apply
+(Section 11.4): a name of 1 to 80 characters, a soul of at most 20,000 characters without a
+secret, a model of the runtime, and a workspace of the org (`422`). A soul needs the redactor
+of the org (`503`, as for an edit). An org has at most 20 profiles (`409`). A transaction-level
+advisory lock serializes the creates of an org, and the write checks the admin role again. The
+audit row is `profile.created` with the runtime, the model, and whether a soul is set. A create
+writes no history row: the history of Section 11.4 starts with the first change.
+
+**Admin area (`/admin`).** Only an org owner or admin sees it. The tabs are Overview, Usage,
+Audit log, Agent changes, Curator reports, Org keys and region, and Data controls. Members stays
+at `/members`, because every member reads it, and Billing stays at `/billing` (Section 17.5).
+The overview links to both. The usage tab shows the model cost of each day, person, agent, and
+model; the Billing page shows the cost against the quotas of the plan. For an org in another region the area shows the
+link to that deployment (Section 17.3).
+
+| Route | Who | Result |
+|---|---|---|
+| `GET /orgs/{org_id}/usage?days=` | An org owner or admin | The model cost and tokens of the last `days` UTC days (1 to 90, default 30): totals, each day, and the 50 largest rows by person, agent, model, and key source |
+| `GET /orgs/{org_id}/audit?limit=&before=&action=&actor_user_id=` | An org owner or admin | The audit rows of the org, newest first (`limit` 1 to 200, default 50), with the actor name. `before` is the id cursor. `action` is a prefix (at most 64 characters; `%` and `_` are not wildcards). `next_before` is null on the last page |
+| `GET /orgs/{org_id}/curator-reports?limit=` | An org owner or admin | The curator jobs of the org (Section 9.7) and the newest ended fires (`limit` 1 to 50, default 10) with their reports |
+
+- A member who is not an admin gets `403`. A person who is not a member gets `404`. An org in
+  another region gives `421` (Section 17.3).
+- The routes read as the table owner after the role check, and each query filters on
+  `org_id`, as the data controls do (Section 17.4). Thus the usage counts the private sessions
+  of all members. No answer has the text of a message.
+- The redactor runs again on the audit details and on the report text. A report is cut after
+  50,000 characters at a space, after the redaction, with `truncated: true`.
+- The usage counts both key sources (Section 17.3) and shows the part on the org keys.
+- Agent changes merges the history of each agent of the org (Section 11.4, M6.1), newest
+  first. The revert stays on the page of the agent.
+- Org keys and region is the card of Section 17.3. It moved from the settings page.
+- Data controls is the retention, the org export (an owner), and the org delete (an owner, who
+  types the slug of the org). `GET /me` gives the `slug` of each org for this check.
+
+**Settings.** The settings page keeps the account, the chat apps (with the Slack form), the
+browser card of each org (saved logins and the URL policy, Section 14.1), the linked chat
+accounts, and the agents (an admin creates a new agent there). The browser card stays on the
+settings page and not in the admin area, because each member adds personal saved logins. It adds "Your data"
+for each org: the download of the user export and the delete of the own data
+(`DELETE /orgs/{org_id}/users/{user_id}` with the id of the user, Section 17.4).
+
+**Exports from the browser.** The API sends `Access-Control-Expose-Headers:
+Content-Disposition`, so the web app reads the file name of an export (Section 11.4, CORS).
+
+**Help (`/help`).** The help pages need no sign-in. Each topic has short sections in
+ASD-STE100 Simplified Technical English and links to the pages that it explains: getting
+started, sessions and chat, agents, Telegram and Slack, connections, memory and skills, jobs
+and the task board, members and roles, the admin area, plans and billing, data and privacy, and
+troubleshooting.
+The text is in `web/lib/help.ts`. The sign-in page links to it.
 
 ---
 

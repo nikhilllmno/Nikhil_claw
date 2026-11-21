@@ -123,6 +123,7 @@ async def test_me_lists_what_the_user_can_see(client: httpx.AsyncClient, tenant:
     assert orgs[0]["user_id"] == str(tenant.ids["mia"])
     assert (orgs[0]["admin"], orgs[0]["integrations"]) == (False, [])
     assert (orgs[0]["role"], orgs[0]["plan"]) == ("member", "team")
+    assert orgs[0]["slug"] == f"q-{tenant.org.hex[:8]}"
     stranger = (await client.get("/me", headers=bearer(uuid.uuid4()))).json()
     assert stranger == {"orgs": []}
 

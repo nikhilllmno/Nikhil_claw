@@ -810,6 +810,8 @@ async def test_the_event_stream_and_an_error_answer_have_the_cors_header(
 
     assert unauthorized.status_code == 401
     assert unauthorized.headers["access-control-allow-origin"] == WEB
+    # The web app reads the file name of an export (M6.9).
+    assert unauthorized.headers["access-control-expose-headers"] == "Content-Disposition"
     assert stream.status_code == 200
     assert stream.headers["access-control-allow-origin"] == WEB
     assert stream.headers["content-type"].startswith("text/event-stream")

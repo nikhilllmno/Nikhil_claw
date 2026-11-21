@@ -162,7 +162,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Approvals over chat (buttons, `/approve`, `/deny`) | `gateway/approval_actor.py` | Approval cards per channel (§11.1): web and Telegram in M1, Slack and approver rules per role in M3. Since M3.2: "Always allow for me" on Slack and Telegram cards, chat proposals, and the timeout counts as deny (§9.4.2). | Adapt | M1, M3 (M3.2 done) |
 | Streaming edits to messages | `gateway/stream_consumer*.py` | Edit one message as text arrives, with rate limits per channel. | Adapt | M1 |
 | Slash command registry | `hermes_cli/commands.py` | One command registry for all channels (§11.1). | Adapt | M1 |
-| Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, session search, run traces, connections, and settings (M3.8, M3.12). Jobs and workflows come in M6 (§11.2, §11.4). | Adapt | M1 (minimal), M3 (M3.8 and M3.12 done), M6 |
+| Web dashboard | `web/` | Next.js web app: chat, approvals, memory, skills, session search, run traces, connections, and settings (M3.8, M3.12). Since M6.9: a setup guide, an admin area (usage, audit log, agent changes, curator reports, org keys, data controls), and help pages (§11.4, §17.6). | Adapt | M1 (minimal), M3 (M3.8 and M3.12 done), M6 (M6.9 done) |
 | Chrome extension side panel | none | MV3 extension with chat bound to the current tab, Supabase sign-in, a WebSocket to the API, and "Ask about this page" as untrusted content (§14.2.1). | New | M5 (M5.4 done) |
 
 ## 10. Sub-agents and multi-agent work
@@ -233,7 +233,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | CLI and TUI | `cli.py`, `ui-tui/` | Cloud only. A small admin CLI (`sama`) for operators may come later. | Skip | — |
 | Desktop app | `apps/desktop/` | No desktop app. The web app and the Chrome extension cover it. | Skip | — |
 | Profiles (separate homes) | `~/.hermes/profiles/` | Agent profiles and workspaces in Postgres (§17). | Adapt | M1 |
-| Setup wizard, doctor, update | `hermes setup`, `hermes doctor` | Web onboarding for customers (M6): sign-up, a first org, and invites are done (§17.2, M6.5). Health checks and alerts (§18). | Adapt | M6 |
+| Setup wizard, doctor, update | `hermes setup`, `hermes doctor` | Web onboarding for customers (M6): sign-up, a first org, and invites (§17.2, M6.5), then a setup guide that connects a chat app, picks or creates an agent, and sends a first message (§17.6, M6.9). Health checks and alerts (§18). | Adapt | M6 (M6.5 and M6.9 done) |
 | Gateway service management | `hermes gateway install` | Fly.io process groups, deploys from CI (§19). | Adapt | M1 |
 | Batch runner and trajectories | `batch_runner.py`, `trajectory_compressor.py` | Not planned. Langfuse datasets cover evals. | Defer | — |
 | Evals | `evals/` | Conformance suite in CI and a nightly live suite (§5.5). | Adapt | M1 |

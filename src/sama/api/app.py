@@ -47,6 +47,20 @@ from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Lifespan
 
 from sama import workerbots
+from sama.api.admin import (
+    DEFAULT_AUDIT_LIMIT,
+    DEFAULT_CURATOR_REPORTS,
+    DEFAULT_USAGE_DAYS,
+    MAX_AUDIT_FILTER_CHARS,
+    MAX_AUDIT_ID,
+    MAX_AUDIT_LIMIT,
+    MAX_CURATOR_REPORTS,
+    MAX_USAGE_DAYS,
+    AuditPage,
+    CuratorReports,
+    OrgUsage,
+    OrgViews,
+)
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.billing import router as billing_router
 from sama.api.browser import BrowserSettings, LoginChange, LoginIn, UrlPolicyIn
@@ -162,9 +176,12 @@ from sama.profile_changes import RevertError, StaleChangeError, list_changes, re
 from sama.profiles import (
     NAME_MAX_CHARS,
     SOUL_MAX_CHARS,
+    NewProfile,
     NotAdminError,
     ProfileChanges,
     ProfileError,
+    ProfileLimitError,
+    create_profile,
     profile_options,
     update_profile,
 )
@@ -578,6 +595,19 @@ class ProfileEdit(_Edit):
     subagents: list[Any] | None = None
 
 
+class ProfileCreate(_Body):
+    """A new agent profile (M6.9). It gets the toolsets of a new org and the run budget of the
+    plan. ``workspace_id`` null makes a profile of the whole org."""
+
+    name: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=NAME_MAX_CHARS)
+    ]
+    soul: Annotated[str, Field(max_length=SOUL_MAX_CHARS)] = ""
+    runtime: RuntimeKind | None = None
+    model: Annotated[str, Field(min_length=1, max_length=100)] | None = None
+    workspace_id: uuid.UUID | None = None
+
+
 class Answers(_Body):
     answers: list[str] = Field(min_length=1, max_length=10)
 
@@ -772,6 +802,8 @@ class _CorsApp(FastAPI):
             allow_credentials=False,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+            # The web app reads the file name of an export (M6.9).
+            expose_headers=["Content-Disposition"],
             max_age=600,
         )
 
@@ -1008,6 +1040,7 @@ class SamaApi:
         self._checkpoints = checkpoints
         self._model_keys = model_keys
         self._data = data or DataControls(engine)
+        self._views = OrgViews(engine)
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -1305,6 +1338,12 @@ class SamaApi:
         ) -> Response:
             await self._answer(principal, session_id, request_id, body.answers)
             return Response(status_code=204)
+
+        @app.post("/orgs/{org_id}/agent-profiles", status_code=201)
+        async def create_agent_profile(
+            principal: Me, org_id: uuid.UUID, body: ProfileCreate
+        ) -> dict[str, Any]:
+            return await self._create_profile(principal, org_id, body)
 
         @app.get("/orgs/{org_id}/agent-profiles/{profile_id}")
         async def get_agent_profile(
@@ -1708,6 +1747,7 @@ class SamaApi:
 
         self._workflow_routes(app)
         self._data_routes(app)
+        self._admin_routes(app)
 
         @app.get("/skills/{skill_id}/versions")
         async def skill_versions(principal: Me, skill_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -1982,7 +2022,15 @@ class SamaApi:
         regions = home_regions()
         async with as_user(self._engine, principal.auth_user_id) as connection:
             users = await connection.execute(
-                select(User.id, User.org_id, User.display_name, Org.name, Org.plan, Org.region)
+                select(
+                    User.id,
+                    User.org_id,
+                    User.display_name,
+                    Org.name,
+                    Org.slug,
+                    Org.plan,
+                    Org.region,
+                )
                 .join(Org, Org.id == User.org_id)
                 .where(User.auth_user_id == principal.auth_user_id)
                 .order_by(Org.name, Org.id)
@@ -1994,6 +2042,7 @@ class SamaApi:
                 entry: dict[str, Any] = {
                     "id": str(user.org_id),
                     "name": user.name,
+                    "slug": user.slug,
                     "user_id": str(user.id),
                     "display_name": user.display_name,
                     "admin": grants.org_admin,
@@ -2137,6 +2186,38 @@ class SamaApi:
         except SubagentError as error:
             if str(error) == "the profile does not exist":
                 raise _not_found("the agent profile does not exist") from None
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        return await self._profile(principal, org_id, profile_id)
+
+    async def _create_profile(
+        self, principal: Principal, org_id: uuid.UUID, body: ProfileCreate
+    ) -> dict[str, Any]:
+        """Makes an agent profile (M6.9). Only an org owner or admin can do it."""
+        grants = await self._org_admin(principal, org_id)
+        if body.soul:
+            # The redactor must know every vault value before the soul is checked.
+            try:
+                await know_the_secrets(self._engine, org_id)
+            except VaultUnreadableError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from None
+        try:
+            profile_id = await create_profile(
+                self._engine,
+                org_id,
+                NewProfile(
+                    name=body.name,
+                    soul=body.soul,
+                    runtime=body.runtime,
+                    model=body.model,
+                    workspace_id=body.workspace_id,
+                ),
+                actor_user_id=grants.user_id,
+            )
+        except NotAdminError:
+            raise HTTPException(status_code=403, detail=_ADMIN_ONLY) from None
+        except ProfileLimitError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        except ProfileError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
         return await self._profile(principal, org_id, profile_id)
 
@@ -2816,6 +2897,47 @@ class SamaApi:
                 data.set_retention(org_id, body.retention_days, actor_user_id=grants.user_id)
             )
             return view.as_json()
+
+    def _admin_routes(self, app: FastAPI) -> None:
+        """The admin views of the web app (Section 17.6, M6.9): usage, audit log, and curator
+        reports. Only an org owner or admin reads them."""
+        views = self._views
+
+        @app.get("/orgs/{org_id}/usage")
+        async def org_usage(
+            principal: Me,
+            org_id: uuid.UUID,
+            days: Annotated[int, Query(ge=1, le=MAX_USAGE_DAYS)] = DEFAULT_USAGE_DAYS,
+        ) -> OrgUsage:
+            await self._org_admin(principal, org_id)
+            return await views.usage(org_id, days)
+
+        @app.get("/orgs/{org_id}/audit")
+        async def org_audit(
+            principal: Me,
+            org_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=MAX_AUDIT_LIMIT)] = DEFAULT_AUDIT_LIMIT,
+            before: Annotated[int | None, Query(ge=1, le=MAX_AUDIT_ID)] = None,
+            action: Annotated[str | None, Query(max_length=MAX_AUDIT_FILTER_CHARS)] = None,
+            actor_user_id: uuid.UUID | None = None,
+        ) -> AuditPage:
+            await self._org_admin(principal, org_id)
+            return await views.audit(
+                org_id,
+                limit=limit,
+                before=before,
+                action=action.strip() if action else None,
+                actor_user_id=actor_user_id,
+            )
+
+        @app.get("/orgs/{org_id}/curator-reports")
+        async def org_curator_reports(
+            principal: Me,
+            org_id: uuid.UUID,
+            limit: Annotated[int, Query(ge=1, le=MAX_CURATOR_REPORTS)] = DEFAULT_CURATOR_REPORTS,
+        ) -> CuratorReports:
+            await self._org_admin(principal, org_id)
+            return await views.curator_reports(org_id, limit=limit)
 
     def _workflow_routes(self, app: FastAPI) -> None:
         """The workflow routes of Section 12.3. A user sees and changes only the workflows that

@@ -97,8 +97,20 @@
 }
 
 .foot {
+  flex: none;
+  max-height: 55%;
+  overflow-y: auto;
   border-top: var(--border-width) solid var(--border);
   padding-bottom: var(--space-2);
+}
+
+/* A link with one line: the navigation under the sessions. */
+.compact {
+  min-height: var(--touch-target);
+}
+
+.compact .itemTitle {
+  font-size: var(--text-sm);
 }
 
 .user {

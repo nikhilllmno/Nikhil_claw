@@ -22,11 +22,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import AgentProfile, AuditEntry, Membership, ProfileChange
+from sama.admin.bootstrap import DEFAULT_MODEL, default_profile
+from sama.db.models import AgentProfile, AuditEntry, Membership, Org, ProfileChange, Workspace
 from sama.gate.decide import TOOLSETS
+from sama.orgs.plans import plan_of
 from sama.runtime.contract import (
     SUBAGENT_DESCRIPTION_MAX_CHARS,
     SUBAGENT_MAX_TURNS,
@@ -70,6 +72,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "policy": ("rules",),
 }
 """The fields of each kind of change. ``rules`` are the policy rules of the profile."""
+MAX_PROFILES_PER_ORG: Final = 20
+"""An org has at most this many agent profiles (M6.9). The web app makes new profiles."""
+_CREATE_LOCK: Final = "sama.profiles.create"
 
 
 class ProfileError(ValueError):
@@ -78,6 +83,10 @@ class ProfileError(ValueError):
 
 class NotAdminError(Exception):
     """The actor is not an org owner or admin any more when the write runs."""
+
+
+class ProfileLimitError(Exception):
+    """The org has ``MAX_PROFILES_PER_ORG`` profiles. The text is safe to show."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,3 +387,99 @@ async def record_change(
             .returning(ProfileChange.id)
         )
     ).scalar_one()
+
+
+@dataclass(frozen=True, slots=True)
+class NewProfile:
+    """A new agent profile (M6.9). ``workspace_id`` ``None`` makes a profile of the whole org.
+    Without ``runtime`` and ``model``, the profile gets the defaults of a new org."""
+
+    name: str
+    soul: str = ""
+    runtime: RuntimeKind | None = None
+    model: str | None = None
+    workspace_id: uuid.UUID | None = None
+
+
+async def create_profile(
+    engine: AsyncEngine, org_id: uuid.UUID, new: NewProfile, *, actor_user_id: uuid.UUID
+) -> uuid.UUID:
+    """Makes an agent profile with the toolsets of a new org and the run budget of the plan of
+    the org (Section 17.2), and writes the audit entry ``profile.created``.
+
+    Raises ``ProfileError`` for a value that is not valid or a workspace of another org,
+    ``ProfileLimitError`` when the org has ``MAX_PROFILES_PER_ORG`` profiles, and
+    ``NotAdminError`` when the actor is not an org owner or admin at the time of the write. The
+    caller makes sure that the redactor knows the secrets of the org before a soul is checked.
+    """
+    name = new.name.strip()
+    if not 1 <= len(name) <= NAME_MAX_CHARS:
+        raise ProfileError(f"the name has 1 to {NAME_MAX_CHARS} characters")
+    if len(new.soul) > SOUL_MAX_CHARS:
+        raise ProfileError(f"the soul has at most {SOUL_MAX_CHARS} characters")
+    if redact(new.soul) != new.soul:
+        raise ProfileError("the soul contains a secret")
+    runtime = new.runtime or RuntimeKind.CLAUDE_AGENT_SDK
+    if runtime not in EDITABLE_RUNTIMES:
+        raise ProfileError(f"the runtime {runtime.value} cannot be chosen")
+    models = known_models(runtime)
+    if new.model is not None:
+        model = new.model
+    elif runtime is RuntimeKind.CLAUDE_AGENT_SDK and DEFAULT_MODEL in models:
+        model = DEFAULT_MODEL
+    elif models:
+        model = models[0]
+    else:
+        raise ProfileError("the runtime has no model")
+    if model not in models:
+        raise ProfileError("the model is not known for the runtime")
+
+    async with engine.begin() as connection:
+        # One create at a time in an org, so two parallel requests cannot pass the cap.
+        await connection.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key), hashtext(:org))"),
+            {"key": _CREATE_LOCK, "org": str(org_id)},
+        )
+        await lock_admin(connection, org_id, actor_user_id)
+        plan = (
+            await connection.execute(select(Org.plan).where(Org.id == org_id))
+        ).scalar_one_or_none()
+        if plan is None:
+            raise ProfileError("the org does not exist")
+        if new.workspace_id is not None:
+            found = (
+                await connection.execute(
+                    select(Workspace.id).where(
+                        Workspace.org_id == org_id, Workspace.id == new.workspace_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if found is None:
+                raise ProfileError("the workspace is not in the org")
+        count = (
+            await connection.execute(
+                select(func.count()).select_from(AgentProfile).where(AgentProfile.org_id == org_id)
+            )
+        ).scalar_one()
+        if count >= MAX_PROFILES_PER_ORG:
+            raise ProfileLimitError(f"an org has at most {MAX_PROFILES_PER_ORG} agents")
+        values = default_profile(org_id, name=name, model=model, budget=plan_of(plan).run_budget)
+        values.update(workspace_id=new.workspace_id, soul=new.soul, runtime=runtime.value)
+        profile_id: uuid.UUID = (
+            await connection.execute(
+                insert(AgentProfile).values(**values).returning(AgentProfile.id)
+            )
+        ).scalar_one()
+        await connection.execute(
+            insert(AuditEntry).values(
+                org_id=org_id,
+                workspace_id=new.workspace_id,
+                actor_kind="user",
+                actor_user_id=actor_user_id,
+                action="profile.created",
+                target_type="agent_profile",
+                target_id=str(profile_id),
+                details={"runtime": runtime.value, "model": model, "soul": bool(new.soul)},
+            )
+        )
+    return profile_id
