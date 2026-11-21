@@ -162,6 +162,12 @@ def fill(site: str, **changes: object) -> FillRequest:
     return dataclasses.replace(request, **changes)  # type: ignore[arg-type]
 
 
+async def frame_loaded(session: PlaywrightSession) -> None:
+    """Waits for the login form in the frame: the navigation waits only for the top page."""
+    page = session._context.pages[0]
+    await page.frame_locator("iframe").locator("input[type=password]").wait_for()
+
+
 def other_site(site: str) -> str:
     return site.replace("127.0.0.1", "localhost")
 
@@ -221,10 +227,12 @@ async def test_fill_refuses_the_page_of_another_site(session: PlaywrightSession,
 async def test_fill_uses_only_the_frames_of_the_site(session: PlaywrightSession, site: str) -> None:
     # The login form of another site in a frame of this site: no fill.
     await session.navigate(f"{site}/framed?src={other_site(site)}/login")
+    await frame_loaded(session)
     with pytest.raises(BrowserError, match="no login field of the site"):
         await session.fill_login(fill(site))
     # The login form of the site in a frame of another page: the fill goes to the frame.
     await session.navigate(f"{other_site(site)}/framed?src={site}/login")
+    await frame_loaded(session)
     filled = await session.fill_login(fill(site))
     assert filled.fields == ("username", "password")
     frame = session._context.pages[0].frames[1]
@@ -292,6 +300,7 @@ async def test_a_parent_page_that_takes_the_focus_does_not_get_the_password(
     session: PlaywrightSession, site: str
 ) -> None:
     await session.navigate(f"{other_site(site)}/steal?src={site}/login")
+    await frame_loaded(session)
     filled = await session.fill_login(fill(site))
     assert filled.fields == ("username", "password")
     page = session._context.pages[0]
