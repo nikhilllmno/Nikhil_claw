@@ -151,6 +151,8 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
 const RUNTIME_LABELS: Record<string, string> = {
   claude_agent_sdk: "Claude Agent SDK",
   openai_agents_sdk: "OpenAI Agents SDK",
+  claude_code: "Claude Code (CLI)",
+  codex: "Codex (CLI)",
 };
 
 /** The name of a runtime for people. */

@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { AgentProfile } from "./api";
-import { diffDraft, memoryProviderLabel, newSubagent, runtimeOption, toDraft, validateDraft, withRuntime } from "./profile";
+import {
+  diffDraft,
+  memoryProviderLabel,
+  newSubagent,
+  runtimeLabel,
+  runtimeOption,
+  toDraft,
+  validateDraft,
+  withRuntime,
+} from "./profile";
 
 const profile: AgentProfile = {
   id: "p",
@@ -189,5 +198,14 @@ describe("the runtime", () => {
       subagents: true,
     });
     expect(runtimeOption(old, "claude_agent_sdk", "other").models).toEqual([]);
+  });
+});
+
+describe("runtimeLabel", () => {
+  it("names each runtime of the API and keeps an unknown name", () => {
+    expect(runtimeLabel("claude_agent_sdk")).toBe("Claude Agent SDK");
+    expect(runtimeLabel("claude_code")).toBe("Claude Code (CLI)");
+    expect(runtimeLabel("codex")).toBe("Codex (CLI)");
+    expect(runtimeLabel("other_runtime")).toBe("other_runtime");
   });
 });
