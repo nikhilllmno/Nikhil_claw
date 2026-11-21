@@ -264,7 +264,13 @@ export function ChatApps({
               <button type="submit" className="btn btn-primary btn-small" disabled={busy !== null}>
                 {busy === "connect-slack" ? "Connecting" : "Connect"}
               </button>
-              <button type="button" className="btn btn-quiet btn-small" disabled={busy !== null} onClick={() => setSetup(null)}>
+              <button type="button" className="btn btn-quiet btn-small" disabled={busy !== null} onClick={() => {
+                  // The secrets leave the page state when the form closes.
+                  setSlackToken("");
+                  setSigningSecret("");
+                  setSetup(null);
+                }}
+              >
                 Cancel
               </button>
             </div>

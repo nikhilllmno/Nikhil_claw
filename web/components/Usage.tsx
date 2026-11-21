@@ -74,6 +74,29 @@ export function Usage() {
                   <span>{shortDay(usage.by_day[0]?.day ?? "")}</span>
                   <span>{shortDay(usage.by_day.at(-1)?.day ?? "")}</span>
                 </div>
+                <details>
+                  <summary className={`hint ${own.summary}`}>Show the cost of each day</summary>
+                  <div className={styles.scroll}>
+                    <table className={own.data}>
+                      <thead>
+                        <tr>
+                          <th scope="col">Day (UTC)</th>
+                          <th scope="col">Cost</th>
+                          <th scope="col">Calls</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...usage.by_day].reverse().map((d) => (
+                          <tr key={d.day}>
+                            <td>{shortDay(d.day)}</td>
+                            <td>{formatCost(d.cost_usd)}</td>
+                            <td>{d.model_calls}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
               </section>
               <Breakdown id="usage-people" title="People" column="Person" rows={usage.by_user} total={usage.totals.cost_usd} />
               <Breakdown id="usage-agents" title="Agents" column="Agent" rows={usage.by_profile} total={usage.totals.cost_usd} />

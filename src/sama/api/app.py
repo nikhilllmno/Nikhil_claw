@@ -52,6 +52,7 @@ from sama.api.admin import (
     DEFAULT_CURATOR_REPORTS,
     DEFAULT_USAGE_DAYS,
     MAX_AUDIT_FILTER_CHARS,
+    MAX_AUDIT_ID,
     MAX_AUDIT_LIMIT,
     MAX_CURATOR_REPORTS,
     MAX_USAGE_DAYS,
@@ -2916,7 +2917,7 @@ class SamaApi:
             principal: Me,
             org_id: uuid.UUID,
             limit: Annotated[int, Query(ge=1, le=MAX_AUDIT_LIMIT)] = DEFAULT_AUDIT_LIMIT,
-            before: Annotated[int | None, Query(ge=1)] = None,
+            before: Annotated[int | None, Query(ge=1, le=MAX_AUDIT_ID)] = None,
             action: Annotated[str | None, Query(max_length=MAX_AUDIT_FILTER_CHARS)] = None,
             actor_user_id: uuid.UUID | None = None,
         ) -> AuditPage:

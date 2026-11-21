@@ -38,6 +38,8 @@ USAGE_TOP: Final = 50
 MAX_AUDIT_LIMIT: Final = 200
 DEFAULT_AUDIT_LIMIT: Final = 50
 MAX_AUDIT_FILTER_CHARS: Final = 64
+MAX_AUDIT_ID: Final = 2**63 - 1
+"""The largest ``audit_log.id`` (``bigint``). A larger cursor is not valid (``422``)."""
 MAX_CURATOR_REPORTS: Final = 50
 DEFAULT_CURATOR_REPORTS: Final = 10
 MAX_REPORT_CHARS: Final = 50_000
@@ -165,7 +167,11 @@ class OrgViews:
 
     async def usage(self, org_id: uuid.UUID, days: int, *, now: datetime | None = None) -> OrgUsage:
         since, until = usage_window(days, now or datetime.now(UTC))
-        window = and_(ModelCall.org_id == org_id, ModelCall.created_at >= since)
+        window = and_(
+            ModelCall.org_id == org_id,
+            ModelCall.created_at >= since,
+            ModelCall.created_at <= until,
+        )
         cost = func.coalesce(func.sum(ModelCall.cost_usd), 0)
         tokens_in = func.coalesce(func.sum(ModelCall.input_tokens), 0)
         tokens_out = func.coalesce(func.sum(ModelCall.output_tokens), 0)
@@ -176,7 +182,11 @@ class OrgViews:
             tokens_out.label("output_tokens"),
             calls.label("model_calls"),
         )
-        async with self._engine.connect() as connection:
+        async with self._engine.connect() as plain:
+            # One snapshot for all the parts, so a call that commits in between does not make
+            # the totals and the breakdowns disagree.
+            connection = await plain.execution_options(isolation_level="REPEATABLE READ")
+            await connection.begin()
             totals = (
                 await connection.execute(
                     select(

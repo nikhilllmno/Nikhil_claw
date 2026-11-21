@@ -198,10 +198,13 @@ function AgentStep({
   onDone: (change: Partial<Progress>) => void;
 }) {
   const { reloadMe, workspaceId } = useData();
-  const profiles = org.agent_profiles;
-  const [chosen, setChosen] = useState<string>(progress.agentId ?? profiles[0]?.id ?? "");
-  const [creating, setCreating] = useState(profiles.length === 0 && org.admin);
   const workspace = org.workspaces.find((w) => w.id === workspaceId)?.id ?? org.workspaces[0]?.id ?? null;
+  // Only the agents that the workspace of the first message can use.
+  const profiles = org.agent_profiles.filter((p) => p.workspace_id === null || p.workspace_id === workspace);
+  const [chosen, setChosen] = useState<string>(
+    profiles.find((p) => p.id === progress.agentId)?.id ?? profiles[0]?.id ?? "",
+  );
+  const [creating, setCreating] = useState(profiles.length === 0 && org.admin);
 
   if (creating) {
     return (

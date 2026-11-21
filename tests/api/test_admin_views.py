@@ -3,6 +3,7 @@ Section 17.5, M6.9)."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -14,7 +15,16 @@ from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api.admin import MAX_REPORT_CHARS, usage_window
-from sama.db.models import AgentProfile, AuditEntry, Job, JobFire, ModelCall, Org
+from sama.db.models import (
+    AgentProfile,
+    AuditEntry,
+    Job,
+    JobFire,
+    Membership,
+    ModelCall,
+    Org,
+    User,
+)
 from sama.profiles import MAX_PROFILES_PER_ORG
 from tests.api.conftest import bearer
 from tests.api.test_app import add_user, mia
@@ -86,9 +96,12 @@ async def test_an_admin_reads_the_usage_of_the_org(
     await add_call(engine, tenant, run_shared, cost="0.20", model="claude-y", key_source="org")
     # A private session of mia: an admin sees its cost, but not its text.
     await add_call(engine, tenant, run_private, session="mine", cost="0.05", user=False)
-    # Out of the window.
+    # Out of the window: too old, and after the end of the window.
     old = datetime.now(UTC) - timedelta(days=40)
     await add_call(engine, tenant, run_shared, cost="9.00", when=old)
+    await add_call(
+        engine, tenant, run_shared, cost="7.00", when=datetime.now(UTC) + timedelta(days=2)
+    )
 
     response = await client.get(f"/orgs/{tenant.org}/usage", headers=await admin(engine, tenant))
     assert response.status_code == 200, response.text
@@ -213,6 +226,11 @@ async def test_the_audit_log_pages_and_filters(
 
     too_long = await client.get(f"/orgs/{tenant.org}/audit?action={'a' * 65}", headers=headers)
     assert too_long.status_code == 422
+    # A cursor over the bigint range is not valid, and is not a server error.
+    huge = await client.get(f"/orgs/{tenant.org}/audit?before={2**63}", headers=headers)
+    assert huge.status_code == 422
+    top = await client.get(f"/orgs/{tenant.org}/audit?before={2**63 - 1}", headers=headers)
+    assert top.status_code == 200
 
 
 # -- curator reports -------------------------------------------------------------------------
@@ -413,3 +431,40 @@ async def test_the_profile_create_uses_the_plan_budget_and_the_cap(
     full = await client.post(url, headers=headers, json={"name": "one more"})
     assert full.status_code == 409
     assert "at most" in full.json()["detail"]
+
+
+async def test_parallel_creates_cannot_pass_the_cap(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    headers = await admin(engine, tenant)
+    async with engine.begin() as connection:
+        for n in range(MAX_PROFILES_PER_ORG - 2):
+            await connection.execute(
+                insert(AgentProfile).values(
+                    org_id=tenant.org, name=f"filler {n}", model="claude-sonnet-5-5"
+                )
+            )
+    url = f"/orgs/{tenant.org}/agent-profiles"
+    answers = await asyncio.gather(
+        *(client.post(url, headers=headers, json={"name": f"race {n}"}) for n in range(3))
+    )
+    assert sorted(a.status_code for a in answers) == [201, 409, 409]
+
+
+async def test_a_demoted_admin_cannot_create_a_profile(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    auth_id = await add_user(engine, tenant, workspace_member=False, role="admin")
+    async with engine.begin() as connection:
+        user_id = (
+            await connection.execute(select(User.id).where(User.auth_user_id == auth_id))
+        ).scalar_one()
+        await connection.execute(
+            update(Membership)
+            .where(Membership.user_id == user_id, Membership.workspace_id.is_(None))
+            .values(role="member")
+        )
+    response = await client.post(
+        f"/orgs/{tenant.org}/agent-profiles", headers=bearer(auth_id), json={"name": "x"}
+    )
+    assert response.status_code == 403

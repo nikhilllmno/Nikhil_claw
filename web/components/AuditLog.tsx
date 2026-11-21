@@ -26,23 +26,26 @@ export function AuditLog() {
   );
   const first = useLoad(load, "Could not load the audit log.");
   // The older pages that the user loaded for this filter.
-  const [older, setOlder] = useState<{ filter: string; entries: AuditEntry[]; next: number | null } | null>(null);
+  // They belong to one first page: a new first page (another filter, a reload) drops them, so
+  // the cursor always continues the page on screen.
+  const [older, setOlder] = useState<{ base: object; entries: AuditEntry[]; next: number | null } | null>(null);
   const [busy, setBusy] = useState(false);
   const [moreError, setMoreError] = useState<string | null>(null);
   const [now] = useState(() => Date.now());
 
   const current = first.data !== null && first.data.filter === filter ? first.data.page : null;
-  const extra = older !== null && older.filter === filter ? older : null;
+  const extra = older !== null && first.data !== null && older.base === first.data ? older : null;
   const entries = current === null ? [] : [...current.entries, ...(extra?.entries ?? [])];
   const next = extra ? extra.next : (current?.next_before ?? null);
 
   const loadMore = async () => {
-    if (next === null) return;
+    const base = first.data;
+    if (next === null || base === null) return;
     setBusy(true);
     setMoreError(null);
     try {
       const page = await api.orgAudit(org.id, { limit: PAGE, action: filter, before: next });
-      setOlder({ filter, entries: [...(extra?.entries ?? []), ...page.entries], next: page.next_before });
+      setOlder({ base, entries: [...(extra?.entries ?? []), ...page.entries], next: page.next_before });
     } catch (e) {
       setMoreError(errorText(e, "Could not load more entries."));
     } finally {

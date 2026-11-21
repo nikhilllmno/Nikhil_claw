@@ -5,7 +5,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { createContext, useCallback, useContext, useState } from "react";
+import { createContext, Fragment, useCallback, useContext, useState } from "react";
 import type { Org } from "@/lib/api";
 import { formatCost } from "@/lib/history";
 import { useApi } from "./AuthProvider";
@@ -88,7 +88,10 @@ export function AdminFrame({ children }: { children: React.ReactNode }) {
             </ul>
           </nav>
           {org.region_here ? (
-            <OrgContext.Provider value={org}>{children}</OrgContext.Provider>
+            <OrgContext.Provider value={org}>
+              {/* A new org mounts the page again, so no data, draft, or secret of the old org stays. */}
+              <Fragment key={org.id}>{children}</Fragment>
+            </OrgContext.Provider>
           ) : (
             <div className="state">
               <h2>This org is in another region</h2>
@@ -168,7 +171,7 @@ export function Stat({ label, value }: { label: string; value: string | null }) 
   return (
     <div className={own.stat}>
       <dt>{label}</dt>
-      <dd>{value ?? <span className="skeleton" style={{ display: "block", height: "var(--space-5)" }} />}</dd>
+      <dd>{value ?? <span className={`skeleton ${own.statSkeleton}`} />}</dd>
     </div>
   );
 }

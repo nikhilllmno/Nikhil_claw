@@ -74,7 +74,7 @@ a.tile:hover {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(var(--stat-min), 1fr));
   gap: var(--space-3);
   margin: 0;
 }
@@ -87,6 +87,11 @@ a.tile:hover {
   border: var(--border-width) solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface-raised);
+}
+
+.statSkeleton {
+  display: block;
+  height: var(--space-5);
 }
 
 .stat dt {
@@ -104,15 +109,15 @@ a.tile:hover {
 .chart {
   display: flex;
   align-items: flex-end;
-  gap: 2px;
-  height: 8rem;
+  gap: var(--chart-gap);
+  height: var(--chart-height);
   padding: var(--space-2) 0 0;
   border-bottom: var(--border-width) solid var(--border);
 }
 
 .bar {
   flex: 1 1 0;
-  min-width: 2px;
+  min-width: var(--chart-gap);
   height: 100%;
   display: flex;
   align-items: flex-end;
@@ -120,7 +125,7 @@ a.tile:hover {
 
 .barFill {
   width: 100%;
-  min-height: 1px;
+  min-height: var(--border-width);
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
   background: var(--accent);
 }
@@ -176,7 +181,7 @@ a.tile:hover {
 .data th:first-child,
 .data td:first-child {
   width: 100%;
-  min-width: 8rem;
+  min-width: var(--table-name-min);
   text-align: left;
   white-space: normal;
   overflow-wrap: anywhere;

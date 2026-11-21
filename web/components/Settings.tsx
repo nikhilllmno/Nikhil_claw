@@ -62,10 +62,23 @@ export function Settings() {
                 <span className={styles.meta}>
                   {o.display_name ? `${o.display_name} · ` : ""}
                   {o.workspaces.length === 1 ? "1 workspace" : `${o.workspaces.length} workspaces`}
-                  {o.admin ? (
+                  {o.admin && o.region_here ? (
                     <>
                       {" · "}
                       <Link href="/admin">Admin</Link>
+                    </>
+                  ) : null}
+                  {!o.region_here ? (
+                    <>
+                      {` · Region ${o.region}, served by another deployment`}
+                      {o.region_url ? (
+                        <>
+                          {" · "}
+                          <a href={o.region_url} rel="noopener noreferrer">
+                            Open the org there
+                          </a>
+                        </>
+                      ) : null}
                     </>
                   ) : null}
                 </span>
