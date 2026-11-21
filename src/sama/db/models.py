@@ -244,12 +244,21 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
+MAX_RETENTION_DAYS: Final = 3650
+"""The upper limit of ``orgs.retention_days`` (docs/architecture.md, Section 17.3)."""
+PURGE_KINDS: Final = ("sandboxes", "traces")
+
+
 class Org(Base):
     __tablename__ = "orgs"
     __table_args__ = (
         Index(None, "created_by_auth_user_id", "created_at"),
         Index(None, "created_at"),
         CheckConstraint(f"region ~ '{REGION_PATTERN}'", name="region"),
+        CheckConstraint(
+            f"retention_days IS NULL OR retention_days BETWEEN 1 AND {MAX_RETENTION_DAYS}",
+            name="retention_days",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -263,6 +272,9 @@ class Org(Base):
     created_by_auth_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     """The Supabase Auth user who made the org with self-serve sign-up (Section 17.2). Null for
     an org of ``bootstrap``. The rate limits of org creation count these rows."""
+    retention_days: Mapped[int | None] = mapped_column(Integer)
+    """Sama deletes a session after this many days without activity. Null means the default
+    of the plan (Section 17.3)."""
     created_at: Mapped[datetime] = _created_at()
 
 
@@ -2661,3 +2673,29 @@ class SessionHandoff(Base):
     """The open runs that the handoff gave to the target chat. Only the follower of the newest
     handoff of a run sends its output (``sama.gateway.handoff.moved_away``)."""
     created_at: Mapped[datetime] = _created_at()
+
+
+class DataPurge(Base):
+    """One cleanup outside Postgres after a delete (docs/architecture.md, Section 17.3): the E2B
+    sandboxes of deleted sessions, or the Langfuse traces of deleted runs. The delete writes the
+    row in its own transaction, and the purge worker does the cleanup. No foreign key to
+    ``orgs``: the row stays after an org delete."""
+
+    __tablename__ = "data_purges"
+    __table_args__ = (
+        CheckConstraint(_one_of("kind", PURGE_KINDS), name="kind"),
+        Index(None, "next_attempt_at", postgresql_where=text("done_at IS NULL")),
+        Index(None, "org_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    refs: Mapped[dict[str, Any]] = _json()
+    """``sandboxes``: ``{"session_ids": [...]}`` or ``{"all": true}``. ``traces``:
+    ``{"trace_ids": [...]}``."""
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_attempt_at: Mapped[datetime] = _created_at()
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

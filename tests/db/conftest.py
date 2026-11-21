@@ -20,11 +20,12 @@ import asyncpg
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.pool import NullPool
 
 from sama.db import create_engine
-from tests.db.world import World, seed
+from tests.db.world import World, seed, unseed
 
 ROOT = Path(__file__).resolve().parents[2]
 SHIM = Path(__file__).with_name("supabase_shim.sql")
@@ -83,6 +84,24 @@ def database_url() -> Iterator[str]:
 def world(database_url: str) -> World:
     """Two orgs with users, workspaces, sessions, and child rows."""
     return asyncio.run(seed(database_url))
+
+
+@pytest.fixture
+async def fresh(database_url: str) -> AsyncIterator[World]:
+    """Two new orgs for a test that changes or deletes rows. The teardown deletes them and
+    their ``data_purges`` rows, so the session ``world`` stays the only seeded data."""
+    world = await seed(database_url)
+    yield world
+    await unseed(database_url, world)
+    engine = create_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM data_purges WHERE org_id = ANY(:orgs)"),
+                {"orgs": [world.ids["org-a"], world.ids["org-b"]]},
+            )
+    finally:
+        await engine.dispose()
 
 
 @pytest.fixture

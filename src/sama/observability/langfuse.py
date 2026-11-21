@@ -17,6 +17,11 @@ import httpx
 from pydantic import SecretStr
 
 TRACES_PATH: Final = "/api/public/otel/v1/traces"
+DELETE_PATH: Final = "/api/public/traces"
+"""The bulk delete of traces (docs/architecture.md, Section 17.3). Langfuse deletes them later,
+in the background."""
+MAX_DELETE_IDS: Final = 1000
+"""The most trace ids in one delete request."""
 SCOPE: Final = "sama.observability"
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -70,6 +75,7 @@ class LangfuseClient:
         timeout_s: float = 10.0,
     ) -> None:
         self._url = base_url.rstrip("/") + TRACES_PATH
+        self._delete_url = base_url.rstrip("/") + DELETE_PATH
         self._resource = _attributes(
             {"service.name": service}
             | ({"deployment.environment.name": environment} if environment else {})
@@ -116,6 +122,24 @@ class LangfuseClient:
             return
         status = response.status_code
         raise LangfuseError(f"Langfuse answered HTTP {status}", retry=status in RETRY_STATUSES)
+
+    async def delete_traces(self, trace_ids: Sequence[str]) -> None:
+        """Asks Langfuse to delete the traces, ``MAX_DELETE_IDS`` in one request. A second
+        request for the same ids does no harm. Raises ``LangfuseError``."""
+        ids = sorted(set(trace_ids))
+        for start in range(0, len(ids), MAX_DELETE_IDS):
+            batch = ids[start : start + MAX_DELETE_IDS]
+            try:
+                response = await self._http.request(
+                    "DELETE", self._delete_url, json={"traceIds": batch}
+                )
+            except httpx.HTTPError as error:
+                raise LangfuseError(
+                    f"Langfuse did not answer: {type(error).__name__}", retry=True
+                ) from None
+            if not response.is_success:
+                status = response.status_code
+                raise LangfuseError(f"Langfuse answered HTTP {status}", retry=True)
 
 
 def _rejected(response: httpx.Response) -> int:

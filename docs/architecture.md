@@ -1278,8 +1278,9 @@ for it.
 - **Titles and summaries**: a small model writes a title after the first turn and a summary
   when the session goes idle. Summaries feed session search and the background review.
   Summaries are not in M2.4: the review reads the transcript (Section 9.4).
-- **Retention**: per-org setting. Default: keep everything. Delete removes rows and sandbox
-  data.
+- **Retention**: per-org setting (`orgs.retention_days`) inside the limits of the plan.
+  Default: keep everything. The retention sweep deletes the old sessions with their rows,
+  sandboxes, and Langfuse traces (M6.8, Section 17.3).
 - **Runtime state**: the canonical transcript is `messages`. The runtime keeps its own state
   as a blob: the Claude adapter keeps the SDK session id in `runs.runtime_state`. The OpenAI
   adapter keeps its conversation items in `runtime_session_items`, through
@@ -3832,8 +3833,8 @@ or not available.
   redactor reads the question and the answer. It cannot read the pixels of an image.
 - A5. A Telegram album arrives as one update for each photo, so it makes one run for each
   photo. The limit of 4 images is for one message.
-- A6. Old attachments stay as long as the session does. A retention rule comes with the data
-  retention work.
+- A6. Old attachments stay as long as the session does. The retention sweep deletes them
+  with their session (M6.8, Section 17.3).
 - A7. The Anthropic key of the org pays for the call. An org with no key has no image analysis.
 - A8. The agent profile of an existing org keeps its own toolset list. Only the default list
   gets `media`. An admin adds `media` to a changed list. The group set (Section 11.3) is
@@ -5736,8 +5737,9 @@ environment as the default (Section 16.3).
   the Supabase JWT. The API also checks scope in code (two guards).
 - **Now (team)**: one org for our team, invite-only sign-up.
 - **Customers (M6)**: self-serve sign-up, org creation, invites, and roles are done (M6.5,
-  Section 17.2). Org keys and a region per org are done (M6.7, Section 17.3). Plans and usage
-  billing (Stripe), quotas, and data export and delete come later.
+  Section 17.2). Org keys and a region per org are done (M6.7, Section 17.3). Data export,
+  delete, and retention are done (M6.8, Section 17.4). Plans and usage billing (Stripe) and
+  quotas come later.
 - **Products on top**: vorflux creates one sama workspace per hotel and adds its own tables
   and tools through the extension points (D16).
 
@@ -5750,7 +5752,7 @@ migrated schema.
 
 | Table | Key columns |
 |---|---|
-| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits` |
+| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0032`, Section 17.3) |
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
@@ -5781,6 +5783,7 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0032`, Section 17.3). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -5984,6 +5987,94 @@ region is not deployed. M6.7 adds the setting, the routing seam, and the operato
 
 Until step 4 is done on the new database, the runs of the org stay queued there.
 
+### 17.3 Data controls (M6.8)
+
+An org can export its data, delete a user, delete the org, and set a retention. The code is
+in `src/sama/datacontrols/`. The API checks the permission, and `DataControls` does the
+work as the table owner.
+
+| Route | Who | Result |
+|---|---|---|
+| `GET /orgs/{org_id}/export` | An org owner | A ZIP of all the data of the org |
+| `GET /orgs/{org_id}/users/{user_id}/export` | The user, or an org owner | A ZIP of the data of the user |
+| `DELETE /orgs/{org_id}/users/{user_id}` | The user, or an org admin. Only an owner deletes an owner. | `{sessions, runs}` |
+| `DELETE /orgs/{org_id}?confirm=<slug>` | An org owner. `confirm` must be the org slug. | `{sessions, runs}` |
+| `GET /orgs/{org_id}/data-settings` | A member | The retention setting, the plan default and maximum, and the retention in use |
+| `PUT /orgs/{org_id}/data-settings` | An org owner or admin | Sets `retention_days` (null for the plan default) |
+
+Errors: `404` when the org or the user does not exist, `403` for a missing role, `409` when
+the user is the last owner or when runs are running, and `400` for a retention that the plan
+does not allow. An export, a user delete, and a retention change write an audit row
+(`data.exported`, `user.deleted`, `data.retention_changed`). An org delete removes the audit
+log of the org, so the control plane logs it instead.
+
+**Export.** The format is `sama-export/1`. The ZIP has `manifest.json`, one
+`tables/<table>.jsonl` file for each table, and the stored files in `files/<table>/<id>`.
+
+- The org export has the `orgs` row and every table with `org_id`, except `data_purges`.
+  A test checks that a new table gets an export rule.
+- The user export has the rows of the user only: the private sessions with their rows, the
+  user rows (memberships, personal memory, rules, chat links, jobs, triggers, workflows, and
+  connections), the rows that the user made or decided (task cards, approvals, audit rows),
+  and the messages, steers, and pins that the user wrote in shared sessions. Agent profiles,
+  vault secrets, and embeddings are not in a user export.
+- The export never has a secret: not the vault columns (`wrapped_key`, `ciphertext`), not
+  `integrations.secret_hash`, and not `pairing_codes.code_hash`. Derived columns
+  (`messages.search_vector`, `message_embeddings.embedding`) are also not in it. The
+  manifest names the columns that it leaves out.
+- The bytes of `attachments` and `generated_media` go to `files/`. The row gets `data_file`.
+- The export reads one snapshot (`REPEATABLE READ`), so the tables agree. The control plane
+  writes the ZIP to a temporary file and deletes the file after the download.
+- Files in a sandbox are not in the export. The sandbox is a cache (D3).
+
+**Delete.** A delete runs in one transaction with a lock timeout of 5 seconds:
+
+- A session delete also deletes the `compaction` and `delegation` children. A `branch` or
+  `retry` child stays and becomes a root session. The session rows cascade.
+- A row that stays and points to a deleted row with a key that has no cascade gets a null.
+  The code finds these keys in the models, so a new table is safe.
+- A running run blocks the delete. Sama asks the run to stop, and the API answers `409`.
+  The client tries again. A queued or paused run is deleted.
+- A user delete removes the private sessions, the private task cards, the memberships, the
+  personal memory, skills, connections, rules, chat links, jobs, triggers, workflows, and the
+  vault secrets of the personal connections and triggers. Shared content stays. Its user
+  columns get a null. The last owner of an org cannot be deleted.
+- An org delete removes the org row, and every table cascades. It sets `sama.audit_purge`, so
+  the audit log of the org goes too (Section 17.1).
+- Before the database delete, `ServiceCleanup` removes the accounts outside sama: the
+  Composio accounts and triggers, the connector hosts, the Telegram webhooks, and the Slack
+  tokens. A failure there is logged and does not stop the delete.
+- In the same transaction the delete writes `data_purges` rows: the sandboxes of the deleted
+  sessions (or all sandboxes of a deleted org) and the Langfuse traces of the deleted runs
+  that the exporter sent (at most 1,000 trace ids in one row).
+- The Supabase Auth user is not deleted. A person can be a user in more than one org.
+
+**Purge worker.** `PurgeWorker` runs in the monitor of each control plane. It claims rows
+with `FOR UPDATE SKIP LOCKED` and a lease of 5 minutes.
+
+- `sandboxes`: it finds the E2B sandboxes by the labels `sama.org_id` and `sama.session_id`,
+  checks the labels again, and kills them. A full page of 100 keeps the row open for the next
+  pass.
+- `traces`: it calls `DELETE /api/public/traces` of Langfuse with the trace ids. Langfuse
+  deletes them later.
+- A failure waits 30 seconds times 2 to the power of the attempts, at most 6 hours. The row
+  keeps the error type only. A full page waits 30 seconds. The worker forgets done rows after 30 days.
+- A kind without a backend (no E2B key or no Langfuse key) stays open.
+
+**Retention.** `orgs.retention_days` is the setting of the org. Null means the default of
+the plan. `PLAN_RETENTION` in `retention.py` is the seam for the plans of M6.6: each plan can
+set a default and a maximum. Until M6.6, every plan keeps everything, and only an org setting
+turns the sweep on.
+
+- `RetentionSweep` runs in the monitor every hour. For each org with a retention, it deletes
+  the root sessions (and their `compaction` and `delegation` children) with no activity after
+  the cutoff: no new message, no run that is open or ended after the cutoff, and no job that
+  uses the session. A `branch` or `retry` child is checked on its own.
+- It deletes at most 500 sessions of one org in one pass, in batches of 50, and it skips a
+  session that is busy. Each pass writes the audit row `data.retention`.
+- The retention does not apply to the audit log, memory, skills, or other rows that are not
+  in a session.
+
 ---
 
 ## 18. Observability and cost
@@ -6073,6 +6164,9 @@ runtimes.
   broken answer, other HTTP errors, or rejected spans) the trace is lost and an error is
   logged. If the monitor stops between the commit and the send, the trace is lost. An error
   never holds a key.
+- Delete: a data delete (Section 17.3) writes the trace ids of the deleted runs that the
+  exporter sent to `data_purges`. The purge worker sends them to
+  `DELETE /api/public/traces`, at most 1,000 ids in one request.
 
 ### 18.3 Error rate alerts (M1.14)
 
