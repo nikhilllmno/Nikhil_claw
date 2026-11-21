@@ -43,6 +43,7 @@ from sama.gate.wire import (
     GateAnswer,
     GateRequest,
 )
+from sama.integrations.guide import channel_guide
 from sama.media.generate import (
     DEFAULT_IMAGE_SIZE,
     DEFAULT_VOICE,
@@ -1355,7 +1356,9 @@ class ToolServer:
             name=CONNECTION_REQUEST,
             description=(
                 "Get a link that the user opens to connect a connector. Give the connector "
-                "name from connections_list. scope is personal (for the user only) or "
+                "name from connections_list, or a chat channel (whatsapp, whatsapp_meta, "
+                "whatsapp_twilio, whatsapp_gupshup, email, telegram, slack) for its setup "
+                "steps. scope is personal (for the user only) or "
                 "workspace (for all members; a workspace admin connects it). The default is "
                 "personal in a private session and workspace in a shared session. Give the "
                 "link to the user. Never ask for passwords, API keys, or tokens in the chat."
@@ -1369,6 +1372,10 @@ class ToolServer:
             scope: Literal["personal", "workspace"] | None = None,
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
+                # A chat channel is an integration of the org, not a connection (Section 11.9).
+                guide = channel_guide(connector, getattr(connections, "web_base", None))
+                if guide is not None:
+                    return guide
                 return await connections.request_for_agent(claims, connector, scope)
 
             arguments = {"connector": connector, "scope": scope}

@@ -1002,7 +1002,36 @@ export interface RunTrace {
   truncated: boolean;
 }
 
-export type ChatChannel = "telegram" | "slack";
+export type ChatChannel = "telegram" | "slack" | "whatsapp" | "email";
+
+/** The WhatsApp providers that an org can connect (Section 11.9). */
+export type WhatsAppProvider = "meta" | "twilio" | "gupshup";
+
+export interface WhatsAppConnect {
+  provider: WhatsAppProvider;
+  number: string;
+  api_token: string;
+  app_secret?: string;
+  phone_number_id?: string;
+  account_sid?: string;
+  app_id?: string;
+  app_name?: string;
+}
+
+export interface EmailConnect {
+  address: string;
+  api_key: string;
+  public_key: string;
+  sender_name?: string;
+}
+
+/** The answer of a WhatsApp or email connect: the URL for the provider and the steps left. */
+export interface ChannelSetup extends IntegrationSummary {
+  id: string;
+  webhook_url: string;
+  verify_token: string | null;
+  steps: string[];
+}
 
 /** The answer of `POST /orgs/{org_id}/integrations/slack/setup` (Section 11.6). */
 export interface SlackSetup {
@@ -1637,6 +1666,18 @@ export class ApiClient {
     this.json<IntegrationSummary>(`/orgs/${encodeURIComponent(orgId)}/integrations/telegram`, {
       method: "POST",
       body: { bot_token: botToken },
+    });
+  /** Sends the credentials of the provider. They go only to this call, never to the chat. */
+  connectWhatsApp = (orgId: string, body: WhatsAppConnect) =>
+    this.json<ChannelSetup>(`/orgs/${encodeURIComponent(orgId)}/integrations/whatsapp`, {
+      method: "POST",
+      body,
+    });
+  /** Sends the SendGrid key. It goes only to this call, never to the chat. */
+  connectEmail = (orgId: string, body: EmailConnect) =>
+    this.json<ChannelSetup>(`/orgs/${encodeURIComponent(orgId)}/integrations/email`, {
+      method: "POST",
+      body,
     });
   disconnectIntegration = (orgId: string, kind: ChatChannel) =>
     this.json<null>(`/orgs/${encodeURIComponent(orgId)}/integrations/${kind}`, { method: "DELETE" });

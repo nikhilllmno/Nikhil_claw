@@ -52,6 +52,12 @@ PATTERNS: Final = tuple(
         r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
         r"(?i)\bbearer\s+(?P<s>[A-Za-z0-9._~+/-]{20,}=*)",
         r"(?i)\b(?:postgres(?:ql)?|mysql|redis|mongodb(?:\+srv)?)://[^:@/\s\"']+:(?P<s>[^@/\s\"']+)@",
+        # Capability URLs of the WhatsApp and email channels (Section 11.9): the webhook token,
+        # the approval link token, and the media link signature. Access logs show paths.
+        r"/whatsapp/[0-9a-fA-F-]{36}/webhook/(?P<s>[A-Za-z0-9_-]+)",
+        r"/email/[0-9a-fA-F-]{36}/approvals/(?P<s>[A-Za-z0-9_.=-]+)",
+        r"/whatsapp/[0-9a-fA-F-]{36}/media/[0-9a-fA-F-]{36}\?[^\s\"']*?\bs=(?P<s>[A-Za-z0-9_-]+)",
+        r"hub\.verify_token=(?P<s>[^&\s\"']+)",
     )
 )
 

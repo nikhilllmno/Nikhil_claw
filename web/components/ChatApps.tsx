@@ -1,6 +1,7 @@
 "use client";
 
-// The chat apps of an org (docs/architecture.md, Sections 11.4 and 11.6): Telegram and Slack.
+// The chat apps of an org (docs/architecture.md, Sections 11.4, 11.6, and 11.9): Telegram, Slack,
+// WhatsApp, and email.
 // An org admin connects or disconnects the bot of the org here. A bot token or a signing secret
 // goes only into the form of this card, and leaves the page state as soon as the API has it.
 // The settings page and the setup guide both show this card.
@@ -9,6 +10,7 @@ import { useState } from "react";
 import { errorText, type IntegrationSummary, type Org, type SlackSetup } from "@/lib/api";
 import { integrationTone, toneBadge } from "@/lib/history";
 import { useApi } from "./AuthProvider";
+import { ChannelConnect } from "./ChannelConnect";
 import styles from "./Page.module.css";
 
 function statusBadge(status: string | undefined): string {
@@ -277,6 +279,8 @@ export function ChatApps({
           </form>
         )}
       </div>
+      <ChannelConnect org={org} kind="whatsapp" onChanged={onChanged} />
+      <ChannelConnect org={org} kind="email" onChanged={onChanged} />
       {error ? (
         <p className="alert alert-error" role="alert">
           {error}

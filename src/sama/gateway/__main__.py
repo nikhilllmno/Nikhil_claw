@@ -3,7 +3,8 @@ and 11.6).
 
 The gateway takes the updates of the Telegram bots and the requests of the Slack apps that the
 orgs connected as integrations, at ``POST /telegram/<integration id>/webhook`` and
-``POST /slack/<integration id>/{events,interactions,commands}``. ``python -m sama.controlplane``
+``POST /slack/<integration id>/{events,interactions,commands}``. With ``SAMA_PUBLIC_URL`` it also
+serves the WhatsApp and email routes (Section 11.9). ``python -m sama.controlplane``
 serves the same routes; run this process only when the API runs on its own
 (``python -m sama.api``).
 
@@ -31,8 +32,10 @@ from pydantic import SecretStr
 from sama.api.origins import parse_origins
 from sama.db.engine import create_engine
 from sama.gateway.handoff import Handoffs
+from sama.integrations.email_hub import EmailHub
 from sama.integrations.hub import TelegramHub
 from sama.integrations.slack_hub import SlackHub
+from sama.integrations.whatsapp_hub import WhatsAppHub
 from sama.observability.logs import configure_logging
 from sama.tools.server import quiet_dependency_logs
 from sama.vault.crypto import VaultKey
@@ -66,6 +69,10 @@ def build_app() -> FastAPI:
     slack = SlackHub(engine, vault, handoffs=handoffs)
     handoffs.register("telegram", hub.door)
     handoffs.register("slack", slack.door)
+    # WhatsApp and email need the public address for their links (Section 11.9).
+    public_url = os.environ.get("SAMA_PUBLIC_URL", "")
+    whatsapp = WhatsAppHub(engine, vault, public_url=public_url, keys=keys) if public_url else None
+    email = EmailHub(engine, vault, public_url=public_url) if public_url else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -73,6 +80,9 @@ def build_app() -> FastAPI:
         try:
             yield
         finally:
+            for extra in (email, whatsapp):
+                if extra is not None:
+                    await extra.aclose()
             await slack.aclose()
             await hub.aclose()
             await engine.dispose()
@@ -80,6 +90,10 @@ def build_app() -> FastAPI:
     app = FastAPI(title="sama chat gateway", lifespan=lifespan)
     app.include_router(hub.router())
     app.include_router(slack.router())
+    if whatsapp is not None:
+        app.include_router(whatsapp.router())
+    if email is not None:
+        app.include_router(email.router())
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -89,7 +103,7 @@ def build_app() -> FastAPI:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="The sama chat gateway (Telegram and Slack).")
+    parser = argparse.ArgumentParser(description="The sama chat gateway.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()

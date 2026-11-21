@@ -155,7 +155,9 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 |---|---|---|---|---|
 | Telegram adapter | `plugins/platforms/telegram/` | Bot API webhook adapter, inline keyboards, voice notes (§11.2). | Adapt | M1 |
 | Slack adapter | `plugins/platforms/slack/` | Events API and Web API with `httpx` (no Bolt), one Slack app per org as an integration, Block Kit approvals, thread = session (§11.2, §11.6). Threads are shared sessions with the audience rule (M3.3). | Adapt | M3 (M3.1, M3.3 done) |
-| 24 other platforms (Discord, WhatsApp, Signal, Email, Teams, ...) | `plugins/platforms/` | Same adapter shape. Email and WhatsApp first, on request. | Defer | — |
+| WhatsApp adapter | `plugins/platforms/whatsapp/` | One adapter over three providers that the org picks: Meta WhatsApp Cloud API, Twilio, or Gupshup. Each webhook is signed (HMAC of Meta, signature of Twilio, secret header of the Gupshup subscription) and has a secret URL token. Direct chats are private sessions. Approval buttons or reply codes, images, voice notes, and signed media links (§11.9). | Adapt | M7 (M7.8 done) |
+| Email adapter | `plugins/platforms/email/` | An inbound address per org with SendGrid Inbound Parse (ECDSA-signed) and the SendGrid mail API. DKIM or SPF must pass for the sender. A thread is a private session. Approval links with a confirm page, image attachments (§11.9). | Adapt | M7 (M7.8 done) |
+| Other platforms (Discord, Signal, Teams, ...) | `plugins/platforms/` | Same adapter shape. Discord when a bot token exists. | Defer | — |
 | API server (OpenAI-compatible) | `gateway/platforms/api_server*.py` | Sama HTTP API with streaming events (§4.1). OpenAI-compatible endpoint later. | Adapt | M1 |
 | Authorization ladder, default deny | `gateway/authz_mixin.py` | Paired identities only. Group toolset and approver rule for shared sessions. Private and shared session audiences (§11.3). | Adapt | M1 |
 | DM pairing codes with rate limits and lockout | `gateway/pairing.py` | Codes from the web app, 10-minute expiry, lockout (§11.3). | Adapt | M1 |

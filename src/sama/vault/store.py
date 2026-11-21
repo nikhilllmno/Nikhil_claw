@@ -57,6 +57,17 @@ class SecretName(StrEnum):
     COMPOSIO_WEBHOOK_SECRET = "composio_webhook_secret"  # noqa: S105
     """The signing secret of the Composio webhook subscription of the org (Section 12.2).
     Without it, the secret of the process."""
+    WHATSAPP_API_TOKEN = "whatsapp_api_token"  # noqa: S105
+    """The API credential of the WhatsApp provider of the org (Section 11.9): the access token
+    (Meta), the auth token (Twilio), or the API key (Gupshup)."""
+    WHATSAPP_APP_SECRET = "whatsapp_app_secret"  # noqa: S105
+    """The app secret of the Meta app, which signs the webhook requests (Section 11.9)."""
+    WHATSAPP_LINK_SECRET = "whatsapp_link_secret"  # noqa: S105
+    """The key that signs the media links that Twilio reads for WhatsApp (Section 11.9)."""
+    SENDGRID_API_KEY = "sendgrid_api_key"
+    """The SendGrid API key of the email integration (Section 11.9)."""
+    EMAIL_LINK_SECRET = "email_link_secret"  # noqa: S105
+    """The key that signs the approval links in emails (Section 11.9)."""
 
 
 ConnectionSecretName = NewType("ConnectionSecretName", str)

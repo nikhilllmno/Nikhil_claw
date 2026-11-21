@@ -19,7 +19,7 @@
 8. [Memory](#8-memory)
 9. [Skills and the self-improvement loop](#9-skills-and-the-self-improvement-loop)
 10. [Tools, toolsets, and integrations](#10-tools-toolsets-and-integrations)
-11. [Channels: web, Slack, Telegram, Chrome](#11-channels-web-slack-telegram-chrome)
+11. [Channels: web, Slack, Telegram, WhatsApp, email, Chrome](#11-channels-web-slack-telegram-whatsapp-email-chrome)
 12. [Scheduler, cron jobs, and workflows](#12-scheduler-cron-jobs-and-workflows)
 13. [Sub-agents and multi-agent work](#13-sub-agents-and-multi-agent-work)
 14. [Browser use and the Chrome extension](#14-browser-use-and-the-chrome-extension)
@@ -3011,7 +3011,7 @@ sama tools and skills with an org token. This is not planned for M1 to M6.
 
 ---
 
-## 11. Channels: web, Slack, Telegram, Chrome
+## 11. Channels: web, Slack, Telegram, WhatsApp, email, Chrome
 
 ### 11.1 Gateway
 
@@ -3077,7 +3077,9 @@ another channel. The rules:
 | Slack | Events API, interactivity, and the `/sama` command over HTTP. Web API calls with `httpx` (no Bolt: sama needs only six methods and checks the signature itself) | One Slack app per org. An org admin makes the app from a manifest and connects it as an integration (Section 11.6). Direct messages and mentions in linked channels. A thread in a channel is a session. Approval buttons through Block Kit. Images that users send are stored for `vision_analyze` (Section 11.7). |
 | Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Photos and image files are stored for `vision_analyze` (Section 11.7). Inline keyboards for approvals. |
 | Chrome extension | WebSocket from the extension to the API (`/channels/chrome/ws`, Section 14.2.1). Supabase Auth sign-in, like the web app | Side panel chat bound to the current tab. "Ask about this page" shares the page as untrusted content (M5.4). The `my_chrome` browser target on the same WebSocket (Section 14.2.2, M5.5). |
-| Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
+| WhatsApp (M7.8) | Webhooks of Meta WhatsApp Cloud API, Twilio, or Gupshup; the org picks one | One number per org. Direct chats only. Approval buttons or reply codes. Images and voice notes. Section 11.9. |
+| Email (M7.8) | SendGrid Inbound Parse (signed) and the SendGrid mail API | One inbound address per org. A thread is a session. Approval links. Image attachments. Section 11.9. |
+| Later | Discord, Microsoft Teams | Same adapter shape. |
 
 ### 11.3 Pairing and access
 
@@ -3554,7 +3556,7 @@ integrations on. Without them the routes answer `409`.
 
 | Column | Meaning |
 |---|---|
-| `org_id`, `kind` | `telegram` or `slack`. One integration of each kind per org (unique). |
+| `org_id`, `kind` | `telegram`, `slack`, `whatsapp`, or `email` (Section 11.9). One integration of each kind per org (unique). |
 | `status` | `pending`, `active`, or `failed`. Only an `active` integration makes pairing codes. |
 | `external_id`, `name` | The bot id and username (Telegram), or the team id and name of the Slack workspace (Slack). One bot or Slack workspace belongs to one org (unique per kind). A `pending` Slack row has no `external_id`. |
 | `secret_hash` | The SHA-256 digest of the webhook secret (Telegram) or of the signing secret (Slack), in hex. The row has no clear text secret. |
@@ -3574,7 +3576,7 @@ again with the bot of their org.
 | `POST /orgs/{org_id}/integrations/slack/setup` | An org owner or admin | Makes the `pending` Slack row (or keeps the row) and returns its request URLs, the app manifest, and a link that makes the app from the manifest. |
 | `POST /orgs/{org_id}/integrations/slack` with `bot_token`, `signing_secret` | An org owner or admin | Connects the Slack app of the row. |
 | `DELETE /orgs/{org_id}/integrations/{kind}` | An org owner or admin | Disconnects the integration. |
-| `POST /channels/{channel}/pairing-codes`, `GET /channels/{channel}/identities`, `DELETE /channels/{channel}/identities/{id}` | A user of the workspace | Pairing for `telegram` or `slack` (Section 11.3). The answer has `link` and `command`: for Slack, a link that opens the app in Slack and `/sama pair CODE`. |
+| `POST /channels/{channel}/pairing-codes`, `GET /channels/{channel}/identities`, `DELETE /channels/{channel}/identities/{id}` | A user of the workspace | Pairing for `telegram`, `slack`, `whatsapp`, or `email` (Sections 11.3 and 11.9). The answer has `link` and `command`: for Slack, a link that opens the app in Slack and `/sama pair CODE`; for WhatsApp, a `wa.me` link with the code; for email, a `mailto:` link with the code as the subject. |
 
 A user who is not a member gets `404`. A member who is not an admin gets `403`.
 
@@ -3953,6 +3955,164 @@ refuses gets a row with its status code and zero cost. It shares the
 API returns. `text_to_speech` records one input token for each character, because the API
 charges by character. The prices are in the `media` section of `prices.toml`. The proxy does
 not allow these models, so a run cannot call them through the proxy.
+
+### 11.9 WhatsApp and email (M7.8)
+
+WhatsApp and email have the same adapter shape as Telegram and Slack (Section 11.1): signed
+inbound requests, pairing, sessions, approvals, and media. They have only direct
+conversations with one person, so every session is `private` and a pairing code is a `user`
+code. A `group` code for these channels gets `400`. Both channels cannot edit a sent message,
+so the reply of a run goes out when the run ends or pauses for an approval
+(`sama.gateway.sessions.FinalReply`).
+
+Code: `sama.gateway.direct` (the shared part), `sama.gateway.whatsapp`,
+`sama.gateway.whatsapp_providers`, `sama.gateway.twilio_client`, `sama.gateway.mail`,
+`sama.gateway.mail_inbound`, `sama.gateway.sendgrid_client`, `sama.gateway.links`,
+`sama.integrations.whatsapp_hub`, `sama.integrations.email_hub`, and `sama.integrations.guide`.
+Migration `0039` adds the kinds `whatsapp` and `email` to `integrations`, the channels
+`whatsapp` and `email` to the `channel` checks of Section 11.5 and of `session_handoffs`, and
+the vault names below. It adds no table: the channels use `integrations`,
+`channel_identities`, `pairing_codes`, and `session_bindings`, which already have `org_id`,
+RLS, and export and delete rules (Section 17.4).
+
+**Integrations.** One WhatsApp number and one inbound email address per org, like the other
+kinds (Section 11.6). An org owner or admin connects them on the Settings page of the web app.
+
+| Route | Body | Does |
+|---|---|---|
+| `POST /orgs/{org_id}/integrations/whatsapp` | `provider` (`meta`, `twilio`, or `gupshup`), `number` (E.164), `api_token`, and the fields of the provider | Checks the credentials with the provider, stores the row `active` and the secrets in the vault, and answers with `webhook_url`, `verify_token` (Meta only), and `steps`. |
+| `POST /orgs/{org_id}/integrations/email` | `address`, `api_key` (SendGrid), `public_key`, `sender_name` | Checks that the key has the scope `mail.send` and that the public key is an ECDSA P-256 key, stores the row and the secrets, and answers with `webhook_url` and `steps`. |
+| `DELETE /orgs/{org_id}/integrations/{whatsapp,email}` | | Deletes the row, its links and codes, and the vault entries. For Gupshup it also deletes the webhook subscription of sama. |
+
+| Column | WhatsApp | Email |
+|---|---|---|
+| `external_id` | The account or app that the credentials prove: `meta:<phone number id>`, `twilio:<account SID>:<number>`, or `gupshup:<app id>`. Unique per kind. A number alone is not proven, so it does not block the same number in another org. | `sendgrid:<16 hex characters of the key digest>:<address>`. Unique per kind. The address alone is not proven. |
+| `name` | The number in E.164 form. | The inbound address in lower case. |
+| `settings` | `provider`, and `phone_number_id` (Meta), `account_sid` (Twilio), or `app_id`, `app_name`, and `subscription_id` (Gupshup). | `public_key` of the parse security policy and `sender_name`. |
+| `secret_hash` | The SHA-256 digest of the random token in the webhook URL. | The SHA-256 digest of the SendGrid key. The hub refuses a vault key with another digest (`503`). |
+
+| Vault name | Value |
+|---|---|
+| `whatsapp_api_token` | The access token (Meta), the auth token (Twilio), or the API key (Gupshup). |
+| `whatsapp_app_secret` | The app secret of the Meta app, or the value of the secret header of the Gupshup subscription. Twilio has none. |
+| `whatsapp_link_secret` | A random key that signs the media links (below). |
+| `sendgrid_api_key` | The SendGrid key with `mail.send`. |
+| `email_link_secret` | A random key that signs the approval links (below). |
+
+A connect holds the advisory locks of the org and kind and of the `external_id`, as in
+Section 11.6. A new `external_id` deletes the old row with its links. So a new SendGrid key, a
+new Twilio account, or a new Meta phone number id deletes the links of the old row, and the
+users pair again. A Meta connect checks
+that the phone number id of the token shows the given number. A connect again
+makes a new webhook token and new link secrets.
+
+**WhatsApp providers.** The gateway sees one interface, `WhatsAppProvider`: `verify`, `parse`,
+`check`, `send_text`, `send_buttons`, `send_media`, and `download`. Each provider calls only its
+own API host and downloads media only from its own hosts. A redirect of a download gets no
+credentials.
+
+| Provider | Inbound signature | Approval card | Text limit |
+|---|---|---|---|
+| Meta WhatsApp Cloud API | `X-Hub-Signature-256`: the HMAC-SHA256 of the raw body with the app secret. `GET` with `hub.verify_token` answers `hub.challenge`. | Reply buttons (`interactive`). | 4,096 |
+| Twilio | `X-Twilio-Signature`: the HMAC-SHA1 of the public webhook URL and the sorted form fields with the auth token. | Reply codes, because buttons need an approved content template. | 1,600 |
+| Gupshup | Gupshup does not sign its callbacks. sama adds the subscription itself (version 3, the Meta format) with the header `X-Sama-Webhook-Secret`, and checks the header. The token of the URL is the second check. A row without the header secret in the vault gets `503` (fail closed). | Quick reply buttons. | 4,096 |
+
+**WhatsApp webhook.** Every provider posts to `POST /whatsapp/<integration id>/webhook/<token>`.
+The hub compares the digest of the token with `secret_hash` in constant time (also for an
+unknown id), builds the gateway with the secrets from the vault, checks the signature of the
+provider, and gives each message to the gateway in the background. A wrong token or signature
+gets `401`. The body limit is 1 MB. Twilio gets an empty TwiML answer. A message to another
+number of the provider is dropped. A repeated message id is dropped.
+
+**WhatsApp gateway.**
+
+- An unknown number gets a pairing prompt. A code in the message, or `/pair CODE`, links it.
+  The lockout of Section 11.3 applies.
+- A chat is a `private` session with the key `<integration id>:chat:<number>`. Commands:
+  `/new`, `/stop`, `/steer TEXT`, `/skills`, `/<skill> TEXT`, `/pair CODE`, and `/help`.
+- An approval card has the buttons Approve, Deny, and "Always allow for me" (when the tool
+  allows it, Section 9.4.2). A button sends the text `yes CODE`, `no CODE`, or `always CODE`,
+  where `CODE` is the first 6 characters of the approval id. A typed reply with the same text
+  decides too. A card without buttons starts with the reply codes, so a cut at the text limit
+  keeps them. The gateway looks for the code only among the open approvals of the session of
+  the chat, and `decide` checks the user as for Telegram.
+- Images go to `vision_analyze` (Section 11.7). A voice note is transcribed with the OpenAI key
+  of the org (Section 11.5). Another file type gets a short refusal.
+- A file that a run makes (Section 11.8) goes out through
+  `GET /whatsapp/<integration id>/media/<media id>?e=<expiry>&s=<signature>`. The signature is
+  the HMAC-SHA256 of the integration, the media, and the expiry with `whatsapp_link_secret`.
+  A link works for one hour. A wrong or old link gets `404`.
+- Before each send the gateway checks the link of the number again, as Telegram does.
+
+**Email.** SendGrid Inbound Parse posts each email to the inbound address to
+`POST /email/<integration id>/inbound`. The hub checks `X-Twilio-Email-Event-Webhook-Signature`:
+the ECDSA P-256 signature (SHA-256) of the timestamp and the raw body, with the public key of
+the security policy of the parse webhook. The timestamp must be within 10 minutes of now. The
+body limit is 30 MB. The hub reads both forms of the parse webhook: the fields, and the raw
+MIME message (`send_raw`).
+
+- **Sender check.** The `From` address can be forged. The gateway accepts an email only when
+  DKIM passed for the domain of `From` (or a parent domain), or SPF passed with an envelope
+  domain that matches. Other email is dropped and logged without content.
+- **Threads.** A new email starts a new thread and a new `private` session. The binding key is
+  `<integration id>:thread:<sender>:<token>`, so one sender cannot reach the thread of another.
+  Each email of sama has `Reply-To: <local>+t<token>@<domain>` and
+  `Message-ID: <sama.<token>.<random>@<domain>>`, and keeps `In-Reply-To` and `References`.
+  A reply finds its thread from the `+t` address or from the references. The gateway cuts the
+  quoted text of a reply. The first message of a thread starts with its subject.
+- **Pairing.** The user sends the code as the subject (or the first lines) of an email. An
+  unknown sender gets the pairing prompt at most once an hour.
+- **Commands.** An email whose whole text is `/stop`, `/steer TEXT`, `/skills`, `/<skill> TEXT`,
+  `/pair CODE`, or `/help`.
+- **Output.** The reply of a run goes out as one plain text email in the thread (a reply over
+  100,000 characters goes on in a second email). A stored answer of a run without text deltas
+  goes to the outbox whole (at most 200,000 characters), so it follows the same rule. A file of
+  a run is an attachment.
+- **Approvals.** The card email has one link for each choice:
+  `<public url>/email/<integration id>/approvals/<token>`. The token holds the approval, the
+  choice, the user, and an expiry of 24 hours, with an HMAC-SHA256 of `email_link_secret`.
+  `GET` shows a page with one button and changes nothing, so a mail scanner that opens a link
+  decides nothing. `POST` decides as the user of the link, only while that user still has a
+  linked address on the integration. `decide` and the gate check the user as for the other
+  channels. A forwarded email lets its reader decide as the user; the card says so.
+
+**Capability URLs in logs.** The webhook token, the approval token, the media signature, and
+`hub.verify_token` are parts of URLs, and access logs show paths. The redactor of the logs
+(`sama.vault.redact`) replaces them with `[REDACTED]` in every log line (Section 16.3).
+
+**Setup through the agent.** `connection_request` accepts the channel names `whatsapp`,
+`whatsapp_meta`, `whatsapp_twilio`, `whatsapp_gupshup`, `email`, `telegram`, and `slack`. For
+`whatsapp` it asks the agent to find the provider first. For the other names it gives the steps
+for a person and a link to the Settings page (`/settings?connect=whatsapp&provider=twilio`), which
+opens the form of the provider. The builtin skill `channel-setup` tells the agent to give the
+steps one at a time and never to ask for a secret in the chat. The secrets go only into the
+web app.
+
+**Steps for a person.** sama cannot do these steps:
+
+- Meta: make a Meta app with WhatsApp and a system user token, then enter the webhook URL and
+  the verify token under WhatsApp > Configuration and subscribe the field `messages`. A
+  message that the business sends first needs an approved template; a reply within 24 hours
+  of a user message does not.
+- Twilio: set the webhook URL as "When a message comes in" of the WhatsApp sender or of the
+  WhatsApp sandbox. Each tester of the sandbox first sends its join word.
+- Gupshup: nothing after the connect. A tester of an app that is not live opts in first.
+- Email: an MX record of the inbound subdomain to `mx.sendgrid.net`, a domain authentication in
+  SendGrid for the sender address, an Inbound Parse host with the URL of sama, and a security
+  policy with signature verification attached to it.
+
+**Limits of M7.8.**
+
+- Discord is not in this step: no bot token exists. Microsoft Teams and other channels are
+  later.
+- `/handoff` from or to WhatsApp or email is not available, because WhatsApp needs a template
+  outside the 24-hour window, and an email thread starts only from the user. An unlink of the
+  number or the address stops the output of its sessions.
+- A job with the target `origin` in these channels keeps its result in the session (Section
+  12.1). `email:<address>` delivery works as before.
+- The repeat filter, the pairing lockout, the prompt limit, and the run followers are in memory,
+  per hub, as for Telegram.
+- Workspace-level channel integrations are not in this step: the org picks one provider.
 
 ---
 

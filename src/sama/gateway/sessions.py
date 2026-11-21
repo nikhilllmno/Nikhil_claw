@@ -195,6 +195,24 @@ class Reply:
         self.sent_any = True
 
 
+class FinalReply(Reply):
+    """A reply for a channel that cannot edit a message (WhatsApp and email, Section 11.9).
+
+    The text goes out only at a final flush: before an approval card and at the end of the run.
+    The outbox splits a long text by the limits of its channel.
+    """
+
+    async def add(self, text: str) -> None:
+        self._text += text
+
+    async def flush(self, *, final: bool) -> None:
+        if not final or not self._text.strip():
+            return
+        text, self._text = self._text, ""
+        await self._outbox.send_message(text, reply_to=self._reply_to)
+        self.sent_any = True
+
+
 async def find_session(
     engine: AsyncEngine, channel: str, key: str, target: Target, grants: Grants
 ) -> Bound | None:
@@ -599,16 +617,21 @@ async def send_ending(
     run_id: uuid.UUID,
     status: str,
     reply: Reply,
+    *,
+    max_chars: int = MAX_FINAL_CHARS,
+    split_at: int | None = SPLIT_AT,
 ) -> None:
     """The last messages of a run: the stored answer when no text showed, the failure, or the
-    stop."""
+    stop. ``max_chars`` caps the stored answer. ``split_at`` cuts it into messages; ``None``
+    gives the whole text to the outbox, which splits it by the limits of its channel."""
     if status == "completed" and not reply.sent_any:
         # A runtime that sends no text deltas: show the stored answer. A ``/compact`` run has
         # no answer, so it shows the result of the compaction.
-        text = (await final_text(engine, org_id, run_id))[:MAX_FINAL_CHARS]
+        text = (await final_text(engine, org_id, run_id))[:max_chars]
         text = text or await compaction_text(engine, org_id, run_id)
-        for start in range(0, len(text), SPLIT_AT):
-            await outbox.send_message(text[start : start + SPLIT_AT])
+        step = split_at or max(len(text), 1)
+        for start in range(0, len(text), step):
+            await outbox.send_message(text[start : start + step])
     elif status == "failed":
         await outbox.send_message(await failure_message(engine, org_id, run_id))
     elif status == "cancelled":
