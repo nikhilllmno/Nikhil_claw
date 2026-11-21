@@ -4907,12 +4907,9 @@ point of it, as with computer use.
   the point. `drag` presses the button at the point, moves to the drop point in 12 steps, and
   releases the button. `scroll` moves the mouse to the point and turns the wheel by `amount`.
   `press` needs no point: it uses the keyboard of the page.
-- **Screenshots.** A viewport screenshot (`full_page=false`) has one pixel for each CSS pixel
-  of the viewport, also when the device scale factor is above 1 (it is 2 on Browserbase). The
-  session calls CDP `Page.captureScreenshot` with a clip in CSS pixels and a `scale`. When the
-  image is not as wide as the clip, it takes the image again with the corrected scale, and keeps
-  that scale for the tab. The Playwright scale `css` is not enough: over `connect_over_cdp`
-  Playwright does not know the device scale factor of the browser. The caption gives the size of the image (sama reads it from the JPEG
+- **Screenshots.** A viewport screenshot (`full_page=false`) has the Playwright scale `css`,
+  so one pixel of the image is one CSS pixel of the viewport, also on a screen with a device
+  scale factor above 1. The caption gives the size of the image (sama reads it from the JPEG
   header) and the range of the points, for example "The image is 1280x720 pixels. It is the
   viewport: browser_act takes x (0 to 1279) and y (0 to 719)". The caption of a full-page image
   says that its points are not viewport points.
@@ -4933,6 +4930,10 @@ point of it, as with computer use.
   (x, y) yet; use a ref from browser_snapshot". It also refuses `clicks` other than 1, so a
   target cannot ignore a double click. The target protocol does not change, so a
   target can add vision mode later. For `my_chrome`, see Section 14.2.2.
+- **Viewport.** The `cloud` target asks Browserbase for a 1280x720 viewport
+  (`browserSettings.viewport`, `sama.browser.browserbase.VIEWPORT`). Without it, a session of
+  the project had a 2560x1440 viewport. Claude Code scales an image wider than 2000 pixels down,
+  so the model had to convert each point, and each screenshot cost more tokens.
 - **Tests.** `tests/browser/canvas_app.py` is a canvas app with six steps (click three circles in
   order, double-click, hover, drag, type, and scroll the wheel). Its accessibility tree is empty.
   `tests/browser/test_vision.py` does the task at points with a local Chromium.

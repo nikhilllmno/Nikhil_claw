@@ -35,7 +35,6 @@ Playwright client only, no browser binaries.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import logging
@@ -151,6 +150,7 @@ _FIELD_JS: Final = """el => {
   if (tag === 'SELECT') return Array.from(el.selectedOptions, o => o.label).join(', ');
   return (el.innerText || '').trim();
 }"""
+_HEIGHT_JS: Final = "() => document.documentElement.scrollHeight"
 HIDDEN: Final = "[hidden]"
 """What a snapshot shows in place of the value of a password field."""
 FILL_MARK: Final = "data-sama-login"
@@ -231,9 +231,6 @@ def hide_values(tree: str, values: list[str]) -> str:
 
 
 _VIEWPORT_JS: Final = "() => [window.innerWidth, window.innerHeight]"
-_CAPTURE_JS: Final = """() => [window.innerWidth, window.innerHeight,
-  window.scrollX, window.scrollY, document.documentElement.scrollHeight]"""
-"""The viewport, the scroll position, and the page height, for a screenshot in CSS pixels."""
 _SOF_MARKERS: Final = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 """The JPEG start-of-frame markers: they have the size of the image."""
 
@@ -316,8 +313,6 @@ class PlaywrightSession:
         self._cdp: CDPSession | None = None
         self._checks: set[asyncio.Task[None]] = set()
         self._closed = False
-        self._scales: dict[Page, float] = {}
-        """The ``Page.captureScreenshot`` scale of each tab that gives CSS pixels."""
 
     @classmethod
     async def attach(
@@ -370,7 +365,6 @@ class PlaywrightSession:
             self._dialog_opened.set()
 
     def _on_page_close(self, page: Page) -> None:
-        self._scales.pop(page, None)
         self._dialogs.pop(page, None)
         if self._active is page:
             pages = self._context.pages
@@ -851,7 +845,25 @@ class PlaywrightSession:
         page = await self._page()
         self._no_dialog(page)
         try:
-            data = await self._capture(page, full_page=full_page)
+            if full_page:
+                height = int(await page.evaluate(_HEIGHT_JS))
+                width, _ = await self._viewport(page)
+                data = await page.screenshot(
+                    type="jpeg",
+                    quality=SCREENSHOT_QUALITY,
+                    scale="css",
+                    full_page=True,
+                    clip={
+                        "x": 0,
+                        "y": 0,
+                        "width": width,
+                        "height": max(1, min(height, MAX_SCREENSHOT_HEIGHT)),
+                    },
+                )
+            else:
+                # The scale "css" makes one pixel of the image one CSS pixel of the viewport,
+                # so a point of the image is a point for an action (vision mode).
+                data = await page.screenshot(type="jpeg", quality=SCREENSHOT_QUALITY, scale="css")
         except PlaywrightError as error:
             raise BrowserError("the screenshot failed", detail=_short(error)) from None
         width, height = jpeg_size(data)
@@ -863,57 +875,6 @@ class PlaywrightSession:
             height=height,
             full_page=full_page,
         )
-
-    async def _capture(self, page: Page, *, full_page: bool) -> bytes:
-        """A JPEG of the viewport (or of the page) in CSS pixels: one pixel of the image is one
-        CSS pixel, so a point of the image is a point for an action (vision mode).
-
-        It calls CDP ``Page.captureScreenshot`` with a clip in CSS pixels and a ``scale``. The
-        scale ``css`` of Playwright is not enough: over ``connect_over_cdp`` (Browserbase)
-        Playwright does not know the device scale factor of the browser (2 on Browserbase), and
-        its image has device pixels. How Chrome applies the scale depends on how the factor is
-        set, so the session measures it: when the image is not as wide as the clip, it takes the
-        image again with the corrected scale, and keeps that scale for the tab."""
-        width, height, scroll_x, scroll_y, page_height = await page.evaluate(_CAPTURE_JS)
-        if full_page:
-            clip = {
-                "x": 0,
-                "y": 0,
-                "width": width,
-                "height": min(page_height, MAX_SCREENSHOT_HEIGHT),
-            }
-        else:
-            clip = {"x": scroll_x, "y": scroll_y, "width": width, "height": height}
-        clip = {key: float(value) for key, value in clip.items()}
-        clip["width"] = max(1.0, clip["width"])
-        clip["height"] = max(1.0, clip["height"])
-        scale = self._scales.get(page, 1.0)
-        data = await self._capture_at(page, clip, scale, full_page=full_page)
-        got, _ = jpeg_size(data)
-        if got and abs(got - clip["width"]) > 1:
-            scale = scale * clip["width"] / got
-            self._scales[page] = scale
-            data = await self._capture_at(page, clip, scale, full_page=full_page)
-        return data
-
-    async def _capture_at(
-        self, page: Page, clip: dict[str, float], scale: float, *, full_page: bool
-    ) -> bytes:
-        cdp = await self._context.new_cdp_session(page)
-        try:
-            result = await cdp.send(
-                "Page.captureScreenshot",
-                {
-                    "format": "jpeg",
-                    "quality": SCREENSHOT_QUALITY,
-                    "clip": {**clip, "scale": scale},
-                    "captureBeyondViewport": full_page,
-                },
-            )
-        finally:
-            with contextlib.suppress(PlaywrightError):
-                await cdp.detach()
-        return base64.b64decode(result["data"])
 
     async def extract(self, request: ExtractRequest) -> Extracted:
         page = await self._page()
