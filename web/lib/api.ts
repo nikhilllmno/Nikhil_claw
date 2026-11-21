@@ -62,6 +62,8 @@ export interface Org {
   region_here: boolean;
   /** The address of the deployment that serves the region, if it is known. */
   region_url: string | null;
+  /** The permissions of the role of the user (Section 17.7, M7.10). An old API has none. */
+  permissions?: PermissionKey[];
 }
 
 export type ModelProvider = "anthropic" | "openai";
@@ -190,6 +192,8 @@ export interface SessionOut {
   /** `compaction` for the archive of a transcript, else `null`. */
   lineage: string | null;
   parent_session_id: string | null;
+  /** True when the user can rename or archive the session (M7.10). An old API has none. */
+  can_manage?: boolean;
 }
 
 export type RunStatus =
@@ -347,6 +351,12 @@ export interface AgentProfileOptions {
   subagents: boolean;
   runtimes: RuntimeOption[];
   limits: AgentProfileLimits;
+  /** The reasoning efforts that a profile can choose (M7.10). */
+  reasoning_efforts: ReasoningEffort[];
+  /** The run budget of the plan of the org. `null`: no cap. */
+  budget_caps: BudgetCaps;
+  /** The busy modes (M7.1). The API gives them only when it has the busy mode. */
+  busy_modes?: BusyMode[];
 }
 
 /** The limits of the editor. The API sends all of them. */
@@ -376,6 +386,12 @@ export interface AgentProfile {
   /** True if the user is an org owner or admin. */
   editable: boolean;
   options: AgentProfileOptions;
+  /** The run budget of the profile (M7.10). */
+  budget: ProfileBudget;
+  /** `null`: the default of the model. */
+  reasoning_effort: ReasoningEffort | null;
+  /** The busy mode (M7.1). Only when the API has it. */
+  busy_mode?: BusyMode;
 }
 
 /** The body of `PATCH /orgs/{org_id}/agent-profiles/{profile_id}`. Each field is optional. */
@@ -386,6 +402,9 @@ export interface AgentProfilePatch {
   model?: string;
   toolsets?: string[];
   subagents?: Subagent[];
+  budget?: ProfileBudget;
+  reasoning_effort?: ReasoningEffort | null;
+  busy_mode?: BusyMode;
 }
 
 export type ProfileChangeKind = "soul" | "profile" | "toolsets" | "policy";
@@ -609,6 +628,8 @@ export interface Connection {
   has_secret: boolean;
   /** Only for a remote MCP server. */
   mcp?: ConnectionMcp | null;
+  /** True when the user can change or delete the connection (M7.10). An old API has none. */
+  can_manage?: boolean;
 }
 
 /** The answer to a new connection: the sign-in link of Composio, or `null` for a form. */
@@ -1248,6 +1269,256 @@ export interface StripeRedirect {
   url: string;
 }
 
+// -- M7.10 settings console ---------------------------------------------------------------------
+
+export type ReasoningEffort = "low" | "medium" | "high";
+/** `steer`: a new message joins the open run. `parallel`: a second run. `queue`: it waits. */
+export type BusyMode = "steer" | "parallel" | "queue";
+
+/** The run budget of a profile. `null`: no limit. `max_cost_usd` is a decimal string. */
+export interface ProfileBudget {
+  max_turns: number | null;
+  max_cost_usd: string | null;
+  max_wall_time_s: number | null;
+  max_tokens: number | null;
+}
+
+export interface BudgetCaps {
+  max_turns: number | null;
+  max_cost_usd: string | null;
+  max_wall_time_s: number | null;
+}
+
+export type PermissionKey =
+  | "jobs.create"
+  | "workflows.create"
+  | "triggers.create"
+  | "connections.add"
+  | "skills.write"
+  | "browser.logins"
+  | "sessions.shared"
+  | "members.invite"
+  | "agents.manage"
+  | "chat_apps.manage";
+
+export type EditableRole = "admin" | "member";
+
+export interface PermissionInfo {
+  key: PermissionKey;
+  label: string;
+  description: string;
+  roles: EditableRole[];
+}
+
+/** `GET /orgs/{org_id}/role-permissions`. The owner has every permission. */
+export interface RolePermissions {
+  permissions: PermissionInfo[];
+  roles: Record<EditableRole, Partial<Record<PermissionKey, boolean>>>;
+  editable: Record<EditableRole, boolean>;
+}
+
+export type PolicyAction = "allow" | "ask" | "deny";
+
+export interface ToolPolicyRule {
+  /** An exact tool name, or a prefix that ends in `*`. */
+  tool: string;
+  action: PolicyAction;
+}
+
+/** A change of a rule. `action: null` removes the rule. */
+export interface ToolPolicyChange {
+  tool: string;
+  action: PolicyAction | null;
+}
+
+export interface ToolInfo {
+  name: string;
+  toolset: string;
+  /** True when the toolset of the tool is on for the profile. */
+  enabled: boolean;
+  /** The verdict without a rule. */
+  default: PolicyAction;
+  /** True when the tool always asks a person (for example `repo_push_approval`). */
+  always_ask: boolean;
+}
+
+/** `GET /orgs/{org_id}/agent-profiles/{profile_id}/tool-policy`. */
+export interface ToolPolicy {
+  editable: boolean;
+  max_rules: number;
+  rules: ToolPolicyRule[];
+  org_rules: ToolPolicyRule[];
+  tools: ToolInfo[];
+}
+
+/** `GET /orgs/{org_id}/tool-policy`: the rules for every agent of the org. */
+export interface OrgToolPolicy {
+  editable: boolean;
+  max_rules: number;
+  rules: ToolPolicyRule[];
+}
+
+export type TriggerKind = "webhook" | "composio";
+export type TriggerStatus = "active" | "disabled";
+
+/** A trigger of a workspace (Section 12.2). */
+export interface Trigger {
+  id: string;
+  workspace_id: string;
+  owner_user_id: string;
+  agent_profile_id: string | null;
+  kind: TriggerKind;
+  name: string;
+  prompt: string | null;
+  toolsets: string[];
+  target: "run" | "workflow";
+  workflow_id: string | null;
+  status: TriggerStatus;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  /** A webhook trigger: the address that takes the signed deliveries. */
+  url?: string;
+  connection_id?: string | null;
+  composio_slug?: string | null;
+  composio_config?: Record<string, unknown> | null;
+}
+
+/** The answer of a create and of a secret rotation. The API gives the secret only here, once. */
+export interface TriggerWithSecret extends Trigger {
+  secret?: string;
+}
+
+export interface NewTrigger {
+  kind: TriggerKind;
+  name: string;
+  prompt?: string;
+  agent_profile_id?: string;
+  toolsets?: string[];
+  connection_id?: string;
+  composio_slug?: string;
+  composio_config?: Record<string, unknown>;
+  workflow_id?: string;
+}
+
+export interface TriggerEdit {
+  name?: string;
+  prompt?: string;
+  toolsets?: string[];
+  status?: TriggerStatus;
+}
+
+export type DeliveryOutcome =
+  | "accepted"
+  | "duplicate"
+  | "bad_signature"
+  | "disabled"
+  | "bad_body"
+  | "rate_limited"
+  | "rejected"
+  | "test_ok";
+
+/** One delivery to a trigger, newest first. No payload is kept. */
+export interface TriggerDelivery {
+  id: string;
+  delivery_id: string | null;
+  received_at: string;
+  outcome: DeliveryOutcome;
+  http_status: number;
+  error: string | null;
+  test: boolean;
+  session_id: string | null;
+  run_id: string | null;
+  workflow_instance_id: string | null;
+}
+
+export type WorkflowStatus = "active" | "paused" | "pending_approval" | "removed";
+export type InstanceStatus = "running" | "waiting" | "completed" | "failed" | "cancelled";
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description: string | null;
+  version: number;
+  status: WorkflowStatus;
+  next_fire_at: string | null;
+  last_fire_at: string | null;
+  workspace_id: string;
+  agent_profile_id: string;
+  created_by_kind: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkflowInstance {
+  id: string;
+  workflow_id: string;
+  workflow: string;
+  version: number;
+  status: InstanceStatus;
+  inputs: Record<string, unknown> | null;
+  output: unknown;
+  error: string | null;
+  trigger: string;
+  scheduled_for: string | null;
+  parent_instance_id: string | null;
+  depth: number;
+  created_at: string;
+  finished_at?: string | null;
+}
+
+export interface WorkflowDetail extends Workflow {
+  source?: string;
+  definition?: Record<string, unknown>;
+  hash?: string;
+  needs_approval?: boolean;
+  approved?: boolean;
+  approval_reasons?: string[];
+  triggers?: Array<Record<string, unknown> & { text?: string }>;
+  instances?: WorkflowInstance[];
+}
+
+export interface WorkflowStep {
+  step_id: string;
+  kind: string;
+  status: string;
+  input: unknown;
+  output: unknown;
+  error: string | null;
+  attempts: number;
+  session_id: string | null;
+  run_id: string | null;
+  child_instance_id: string | null;
+  wake_at: string | null;
+  event: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface WorkflowInstanceDetail extends WorkflowInstance {
+  steps: WorkflowStep[];
+}
+
+export interface WorkflowValidation {
+  definition: Record<string, unknown>;
+  hash: string;
+  needs_approval: boolean;
+  approval_reasons: string[];
+  next_fire_at: string | null;
+}
+
+export interface SessionPatch {
+  title?: string;
+  status?: "active" | "archived";
+}
+
+/** The answer of the test of a chat app. */
+export interface IntegrationCheck {
+  ok: boolean;
+  detail: string | null;
+  integration: IntegrationSummary;
+}
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -1451,7 +1722,8 @@ export class ApiClient {
       method: "POST",
       body: displayName ? { ...answer, display_name: displayName } : answer,
     });
-  listSessions = (limit = 50) => this.json<SessionOut[]>(`/sessions?limit=${limit}`);
+  listSessions = (limit = 50, status: "active" | "archived" = "active") =>
+    this.json<SessionOut[]>(`/sessions${query({ limit, status: status === "active" ? null : status })}`);
   createSession = (body: NewSession) =>
     this.json<SessionOut>("/sessions", { method: "POST", body });
   getSession = (id: string) => this.json<SessionDetail>(`/sessions/${id}`);
@@ -1822,6 +2094,141 @@ export class ApiClient {
   /** The include and exclude filters of the tools of a remote MCP server. */
   setConnectionTools = (id: string, include: string[], exclude: string[]) =>
     this.json<Connection>(`/connections/${id}/tools`, { method: "PUT", body: { include, exclude } });
+  // -- M7.10 settings console -------------------------------------------------------------------
+  rolePermissions = (orgId: string) =>
+    this.json<RolePermissions>(`/orgs/${encodeURIComponent(orgId)}/role-permissions`);
+  setRolePermissions = (orgId: string, role: EditableRole, permissions: Partial<Record<PermissionKey, boolean>>) =>
+    this.json<RolePermissions>(`/orgs/${encodeURIComponent(orgId)}/role-permissions/${role}`, {
+      method: "PUT",
+      body: { permissions },
+    });
+  toolPolicy = (orgId: string, profileId: string) =>
+    this.json<ToolPolicy>(
+      `/orgs/${encodeURIComponent(orgId)}/agent-profiles/${encodeURIComponent(profileId)}/tool-policy`,
+    );
+  setToolPolicy = (orgId: string, profileId: string, rules: ToolPolicyChange[]) =>
+    this.json<ToolPolicy>(
+      `/orgs/${encodeURIComponent(orgId)}/agent-profiles/${encodeURIComponent(profileId)}/tool-policy`,
+      { method: "PUT", body: { rules } },
+    );
+  orgToolPolicy = (orgId: string) =>
+    this.json<OrgToolPolicy>(`/orgs/${encodeURIComponent(orgId)}/tool-policy`);
+  setOrgToolPolicy = (orgId: string, rules: ToolPolicyChange[]) =>
+    this.json<OrgToolPolicy>(`/orgs/${encodeURIComponent(orgId)}/tool-policy`, {
+      method: "PUT",
+      body: { rules },
+    });
+  listTriggers = (workspaceId: string) =>
+    this.json<Trigger[]>(`/workspaces/${encodeURIComponent(workspaceId)}/triggers`);
+  getTrigger = (workspaceId: string, triggerId: string) =>
+    this.json<Trigger>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}`,
+    );
+  createTrigger = (workspaceId: string, body: NewTrigger) =>
+    this.json<TriggerWithSecret>(`/workspaces/${encodeURIComponent(workspaceId)}/triggers`, {
+      method: "POST",
+      body,
+    });
+  updateTrigger = (workspaceId: string, triggerId: string, body: TriggerEdit) =>
+    this.json<Trigger>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}`,
+      { method: "PATCH", body },
+    );
+  rotateTriggerSecret = (workspaceId: string, triggerId: string) =>
+    this.json<TriggerWithSecret>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}/secret`,
+      { method: "POST" },
+    );
+  deleteTrigger = (workspaceId: string, triggerId: string) =>
+    this.json<null>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}`,
+      { method: "DELETE" },
+    );
+  triggerDeliveries = (workspaceId: string, triggerId: string, limit = 50) =>
+    this.json<TriggerDelivery[]>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}/deliveries${query({ limit })}`,
+    );
+  /** Sends a signed test delivery. `start: false` only checks it; `true` starts the run. */
+  testTrigger = (
+    workspaceId: string,
+    triggerId: string,
+    body: { payload?: Record<string, unknown> | null; start?: boolean } = {},
+  ) =>
+    this.json<{ delivery: TriggerDelivery }>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/triggers/${encodeURIComponent(triggerId)}/test`,
+      { method: "POST", body },
+    );
+  validateWorkflow = (yaml: string) =>
+    this.json<WorkflowValidation>("/workflows/validate", { method: "POST", body: { yaml } });
+  listWorkflows = (orgId: string) =>
+    this.json<Workflow[]>(`/orgs/${encodeURIComponent(orgId)}/workflows`);
+  getWorkflow = (orgId: string, workflowId: string) =>
+    this.json<WorkflowDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}`,
+    );
+  createWorkflow = (
+    orgId: string,
+    body: { yaml: string; workspace_id?: string; agent_profile_id?: string },
+  ) =>
+    this.json<WorkflowDetail>(`/orgs/${encodeURIComponent(orgId)}/workflows`, {
+      method: "POST",
+      body,
+    });
+  updateWorkflow = (
+    orgId: string,
+    workflowId: string,
+    body: { yaml: string; workspace_id?: string; agent_profile_id?: string },
+  ) =>
+    this.json<WorkflowDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}`,
+      { method: "PUT", body },
+    );
+  approveWorkflow = (orgId: string, workflowId: string, version: number) =>
+    this.json<WorkflowDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}/approve`,
+      { method: "POST", body: { version } },
+    );
+  startWorkflow = (orgId: string, workflowId: string, inputs: Record<string, unknown> = {}) =>
+    this.json<WorkflowInstanceDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}/start`,
+      { method: "POST", body: { inputs } },
+    );
+  pauseWorkflow = (orgId: string, workflowId: string) =>
+    this.json<WorkflowDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}/pause`,
+      { method: "POST" },
+    );
+  resumeWorkflow = (orgId: string, workflowId: string) =>
+    this.json<WorkflowDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}/resume`,
+      { method: "POST" },
+    );
+  deleteWorkflow = (orgId: string, workflowId: string) =>
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/workflows/${encodeURIComponent(workflowId)}`, {
+      method: "DELETE",
+    });
+  listWorkflowInstances = (orgId: string, workflowId: string | null = null, limit = 20) =>
+    this.json<WorkflowInstance[]>(
+      `/orgs/${encodeURIComponent(orgId)}/workflow-instances${query({ workflow_id: workflowId, limit })}`,
+    );
+  getWorkflowInstance = (orgId: string, instanceId: string) =>
+    this.json<WorkflowInstanceDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflow-instances/${encodeURIComponent(instanceId)}`,
+    );
+  cancelWorkflowInstance = (orgId: string, instanceId: string) =>
+    this.json<WorkflowInstanceDetail>(
+      `/orgs/${encodeURIComponent(orgId)}/workflow-instances/${encodeURIComponent(instanceId)}/cancel`,
+      { method: "POST" },
+    );
+  updateSession = (sessionId: string, body: SessionPatch) =>
+    this.json<SessionOut>(`/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body });
+  checkIntegration = (orgId: string, kind: ChatChannel) =>
+    this.json<IntegrationCheck>(
+      `/orgs/${encodeURIComponent(orgId)}/integrations/${encodeURIComponent(kind)}/check`,
+      { method: "POST" },
+    );
+  enableConnection = (id: string) =>
+    this.json<Connection>(`/connections/${encodeURIComponent(id)}/enable`, { method: "POST" });
 }
 
 /** A query string (`?a=1&b=2`) of the values that are not `null`, else "". */

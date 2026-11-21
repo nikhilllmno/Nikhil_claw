@@ -4216,6 +4216,8 @@ Execution (M4.1 to M4.3):
 Webhooks (signed, one URL per trigger), Composio triggers, and channel events (for example "a
 message in #support that matches a pattern") can start a run or a workflow. Event payloads
 are untrusted. Event-triggered runs use the `safe` toolset unless the trigger says otherwise.
+Since M7.10 each delivery to a known trigger has a row in a delivery log, and the owner or an
+admin can send a signed test delivery (Section 17.7).
 
 **What M4.4 builds**
 
@@ -7068,7 +7070,8 @@ The Billing page of M6.6 (Section 17.5) is in the navigation, the setup guide, t
 overview, and the help.
 
 **Navigation.** The sidebar has the sessions, then three groups: Workspace (Jobs, Search,
-Memory, Skills, Connections), Agents, and Org (Members, Admin, Billing, Settings, Help). Only
+Memory, Skills, Connections), Agents, and Org (Console, Members, Admin, Billing, Settings,
+Help). The Console is the settings console of Section 17.7 (M7.10). Only
 an owner or admin of an org sees Admin and Billing. A user without an org sees only the welcome page, Settings, and
 Help. While the setup guide has open steps, an admin sees "Finish the setup" in the sidebar and
 a card on the home page.
@@ -7149,6 +7152,132 @@ started, sessions and chat, agents, Telegram and Slack, connections, memory and 
 and the task board, members and roles, the admin area, plans and billing, data and privacy, and
 troubleshooting.
 The text is in `web/lib/help.ts`. The sign-in page links to it.
+
+### 17.7 Settings console (M7.10)
+
+The web app has one settings console at `/console/<section>`, like the settings of Vorflux. A
+left navigation lists the sections in four groups. Below a width of 64rem the navigation is a row
+of tabs above the section. The console works on the org of the workspace that the sidebar shows.
+The old pages (`/jobs`, `/skills`, `/connections`, `/members`, `/settings`, `/agents/{id}`) stay.
+The console reuses their screens. Each write goes to the API, and the API writes the audit row.
+
+| Group | Section | What it does |
+|---|---|---|
+| Org | Setup | The steps of the setup guide (Section 17.6) as a list, with a link to the section that does each step |
+| Org | Slack | The chat apps of the org: Slack and Telegram (connect, disconnect, and a test), WhatsApp with the choice of its provider, and email (Section 11.9), and the linked chat accounts and pairing codes |
+| Org | Roles | The members, the invites, and an editor of the permissions of each role |
+| Agents | Harness | The runtime, the model, the reasoning effort, the busy mode, and the run budget of each agent |
+| Agents | Tools | The toolsets of each agent, the policy of each tool for the agent, and the rules for every agent of the org |
+| Agents | Sub-agents | The native sub-agents of each agent (Section 13.1): list, create, edit, and delete |
+| Agents | Skills | The skill editor of Section 9.2 |
+| Agents | MCP servers | The remote and hosted MCP servers of the workspace: add, test, disable, enable, tool filters, and delete |
+| Automation | Webhooks | The `webhook` triggers (Section 12.2): create, the secret one time, edit, disable, rotate, delete, a test send, and the delivery log |
+| Automation | Triggers | The `composio` triggers, with the same screens as the webhooks |
+| Automation | Schedules | The jobs of Section 12.1, with "Run now" |
+| Automation | Workflows | The workflows of Section 12.3: a YAML editor with a check, approve, start, pause, resume, delete, and the recent instances |
+| Activity | Sessions | Search, rename, archive, restore, export, and the retention of the org |
+
+Each section has a list, a detail view, a create form, and a delete with a confirm. A section
+shows its fields as read-only when the role of the user cannot change them, and says who can.
+A part that another M7 item adds (the busy mode of M7.1, custom tools of M7.3, the sub-agent
+library of M7.4) shows a card "Not available yet" until the API gives it. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
+without a change of the web app.
+
+**Role permissions.** Migration `0040` adds the table `org_role_permissions` (`org_id`, `role`,
+`permission`, `allowed`). The catalog is in `sama.orgs.permissions`:
+
+| Key | Roles | Route that checks it |
+|---|---|---|
+| `jobs.create` | admin, member | `POST /orgs/{org_id}/jobs` |
+| `workflows.create` | admin, member | `POST /orgs/{org_id}/workflows` |
+| `triggers.create` | admin, member | `POST /workspaces/{workspace_id}/triggers` |
+| `connections.add` | admin, member | `POST /workspaces/{workspace_id}/connections` and the MCP, stdio, and API routes |
+| `skills.write` | admin, member | `POST /workspaces/{workspace_id}/skills` |
+| `browser.logins` | admin, member | `POST /orgs/{org_id}/browser/logins` |
+| `sessions.shared` | admin, member | `POST /sessions` with `audience: shared` |
+| `members.invite` | admin | `POST /orgs/{org_id}/invites` |
+| `agents.manage` | admin | The create, edit, and revert of agent profiles, and the tool policy routes |
+| `chat_apps.manage` | admin | The routes of `/orgs/{org_id}/integrations` |
+
+- Without a row, a permission is allowed, so an org without changes works as before. The org
+  owner always has every permission. A permission only takes away: the role checks of the other
+  sections stay, and a permission never gives more than they give.
+- `GET /orgs/{org_id}/role-permissions` (every member) gives the catalog, the value of each key
+  for `admin` and `member`, and which role the user can edit. `PUT
+  /orgs/{org_id}/role-permissions/{role}` takes `{"permissions": {"<key>": bool}}` (1 to 20
+  keys). Only the owner edits the role `admin`. An owner or admin edits the role `member`. The
+  audit row is `role.permissions_changed` with the keys that changed.
+- `GET /me` gives `permissions` for each org: the allowed keys of the role of the user.
+- A refused call gives `403` with `Your role in this org cannot do this: <label>.`
+- RLS: a member of the org reads the rows. Writes go through the API only.
+
+**Tool policy per tool.** The rules are the rows of `tool_policies` (Section 16.1).
+
+- `GET /orgs/{org_id}/agent-profiles/{profile_id}/tool-policy` gives the rules of the agent, the
+  rules of the org, and each tool of `TOOLSETS` with its toolset, whether the agent has the
+  toolset, and the verdict without a rule (`allow` for `DEFAULT_ALLOW`, else `ask`; the tools of
+  `ALWAYS_ASK` have `always_ask`).
+- `PUT` on the same path takes `{"rules": [{"tool", "action"}]}` (1 to 20 rules; `action` null
+  removes the rule; a tool is a name or a prefix that ends in `*`). It writes through
+  `write_change` with the kind `policy`, so the agent history and the audit row `profile.updated`
+  have it.
+- `GET` and `PUT /orgs/{org_id}/tool-policy` read and write the rules for every agent of the org.
+  The audit row is `tool_policy.updated`.
+- An org owner or admin with `agents.manage` writes. The hardline list (Section 16.1) does not
+  change.
+
+**Harness.** The agent profile has a run budget (Section 4.3) and a new column
+`reasoning_effort` (`low`, `medium`, `high`, or null for the default of the model).
+
+- `GET /orgs/{org_id}/agent-profiles/{profile_id}` gives `budget` (`max_turns`, `max_cost_usd`,
+  `max_wall_time_s`, `max_tokens`) and `reasoning_effort`. `options` gives `reasoning_efforts`
+  and `budget_caps` (the run budget of the plan of the org, Section 17.2).
+- `PATCH` takes `budget` and `reasoning_effort`. Each budget value is above 0, `max_turns` is at
+  most 10,000, and `max_wall_time_s` is at most 86,400. When the plan has a cap for a key, the
+  value must be set and must not be above the cap (`422`). Both fields are in the `profile` kind
+  of the history. `change_propose` cannot change them, so an agent cannot raise its own budget.
+- `RunConfig.reasoning_effort` carries the effort into the run. It is not in the fingerprint when
+  it is null. The Claude adapter gives it as `effort`, and the OpenAI adapter gives it as
+  `ModelSettings(reasoning=Reasoning(effort=...))`. As the model, it applies from the next
+  session.
+
+**Trigger delivery log and test send.** Migration `0040` adds the table `trigger_deliveries`.
+
+- sama writes one row for each delivery to a known trigger, also for a refused one. The
+  `outcome` is `accepted`, `duplicate`, `bad_signature`, `disabled`, `bad_body`,
+  `rate_limited`, `rejected`, or `test_ok`, with the HTTP status, a short redacted error, and the
+  session, run, or workflow instance. sama keeps no payload. sama keeps the newest 200 rows of a
+  trigger.
+- `GET /workspaces/{workspace_id}/triggers/{trigger_id}/deliveries?limit=` (1 to 100) gives the
+  rows, newest first, to a user who sees the trigger.
+- `POST /workspaces/{workspace_id}/triggers/{trigger_id}/test` takes `{"payload": object | null,
+  "start": bool}` (at most 20,000 bytes). For a webhook, sama signs the body with the secret of
+  the trigger and sends it through the same check as a real delivery. A `composio` trigger has no
+  secret of its own, so its test skips the signature. With `start: false` the test stops after
+  the checks (`test_ok`). With `start: true` it starts the run or the workflow. The owner or an
+  admin sends a test. The audit row is `trigger.test_sent`.
+- RLS: a user who sees the workspace of the trigger reads the rows. Writes go through the API.
+
+**Sessions.** `GET /sessions?status=archived` lists the archived sessions. `PATCH
+/sessions/{session_id}` takes `title` and `status` (`active` or `archived`). The owner of a
+private session changes it. An admin of the workspace or the org changes a shared session. A
+compaction archive (Section 6.3) and a session with a compaction child keep their status, and a
+session with an open run cannot be archived (`409`). The audit rows are `session.renamed`,
+`session.archived`, and `session.restored`.
+
+**Test of a chat app.** `POST /orgs/{org_id}/integrations/{kind}/check` (an admin with
+`chat_apps.manage`) calls Telegram `getMe` or Slack `auth.test` with the stored token and gives
+`{"ok", "detail", "integration"}`. A failure sets `last_error`. A WhatsApp or email app has no
+test (`409`). The audit row is `integration.checked`. The connect and disconnect routes of
+WhatsApp and email (Section 11.9) also need `chat_apps.manage`.
+
+**Enable a connection.** `POST /connections/{connection_id}/enable` moves a `disabled`
+connection out of `disabled` and runs the check of Section 10.3, so the state comes from the
+backend (`409` for a connection that is not disabled). The audit row is `connection.enabled`.
+"Test connection" in the console is `POST /connections/{connection_id}/check`.
+
+**Data controls.** The user export of Section 17.4 has the rows of `org_role_permissions` that
+the user changed and the delivery rows of the triggers of the user.
 
 ---
 

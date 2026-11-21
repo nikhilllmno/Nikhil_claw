@@ -252,7 +252,9 @@ class ConnectionView:
             out.append(McpTool(name, remote, cast(ToolAccess, access), enabled, operation))
         return out
 
-    def public(self) -> dict[str, Any]:
+    def public(self, can_manage: bool | None = None) -> dict[str, Any]:
+        """The view for the API. ``can_manage`` is whether the caller can change the connection
+        (``ConnectionService.can_manage``). It is in the view only when the caller gives it."""
         out: dict[str, Any] = {
             "id": str(self.id),
             "workspace_id": str(self.workspace_id),
@@ -270,6 +272,8 @@ class ConnectionView:
             "has_secret": self.has_secret,
             "mcp": None,
         }
+        if can_manage is not None:
+            out["can_manage"] = can_manage
         if self.has_tool_list:
             include, exclude = self.filters
             cache = self.tool_cache or {}
@@ -302,8 +306,11 @@ class Started:
     connection: ConnectionView
     redirect_url: str | None
 
-    def public(self) -> dict[str, Any]:
-        return {"connection": self.connection.public(), "redirect_url": self.redirect_url}
+    def public(self, can_manage: bool | None = None) -> dict[str, Any]:
+        return {
+            "connection": self.connection.public(can_manage),
+            "redirect_url": self.redirect_url,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -666,6 +673,26 @@ class ConnectionService:
         async with self._engine.begin() as connection:
             await _audit(connection, org_id, actor, "connection.disabled", view.id, view.scope)
         return view
+
+    async def enable(
+        self, org_id: uuid.UUID, connection_id: uuid.UUID, *, actor: uuid.UUID
+    ) -> ConnectionView:
+        """Turns a ``disabled`` connection on again. The connection leaves ``disabled`` and the
+        backend then checks it, so the state that the caller gets is the state of the backend
+        (it can stay ``pending`` or ``failed``). Raises ``ConnectorError`` with ``409`` when the
+        connection is not ``disabled``."""
+        view = await self.get(org_id, connection_id)
+        if view is None:
+            raise ConnectorError("the connection does not exist", status_code=404)
+        if view.state != "disabled":
+            raise ConnectorError("the connection is not disabled", status_code=409)
+        # ``expect`` makes the write fail when another request changed the row in the meantime.
+        moved = await self._write(org_id, view.id, state="pending", error=None, expect=view)
+        if moved is None:
+            raise ConnectorError("the connection changed: try again", status_code=409)
+        async with self._engine.begin() as connection:
+            await _audit(connection, org_id, actor, "connection.enabled", view.id, view.scope)
+        return await self.check(org_id, view.id, actor=actor)
 
     async def delete(
         self, org_id: uuid.UUID, connection_id: uuid.UUID, *, actor: uuid.UUID

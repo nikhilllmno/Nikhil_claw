@@ -261,6 +261,7 @@ class PromptAssembler:
             mcp_servers=self._mcp_servers,
             skill_index=await self._skill_index(connection, run),
             subagents=await _subagents(connection, run),
+            reasoning_effort=run.reasoning_effort,
         )
 
     async def _skill_index(

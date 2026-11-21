@@ -24,27 +24,11 @@ type Asked = { q: string; workspace: string | null; org: string; from: string | 
 
 export function SessionSearch() {
   const { me, meError, reloadMe, workspaces, workspaceId, orgOfWorkspace } = useData();
-  const [text, setText] = useState("");
-  const [onlyHere, setOnlyHere] = useState(true);
-  const [asked, setAsked] = useState<Asked | null>(null);
   const org = orgOfWorkspace(workspaceId);
 
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
-
-  const submit = (event: React.FormEvent) => {
-    event.preventDefault();
-    const q = text.trim();
-    if (q === "" || org === null) return;
-    setAsked((previous) => ({
-      q,
-      workspace: onlyHere ? workspaceId : null,
-      org: org.id,
-      from: workspaceId,
-      run: (previous?.run ?? 0) + 1,
-    }));
-  };
 
   return (
     <div className={styles.page}>
@@ -60,38 +44,75 @@ export function SessionSearch() {
       {workspace === null || org === null ? (
         <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
       ) : (
-        <form className={styles.form} role="search" onSubmit={submit}>
-          <div className={styles.toolbar}>
-            <label className={`field ${styles.grow}`}>
-              <span className="label">Words to find</span>
-              <input
-                className="input"
-                type="search"
-                value={text}
-                maxLength={MAX_QUERY_CHARS}
-                placeholder="For example: deploy plan"
-                onChange={(e) => setText(e.target.value)}
-              />
-            </label>
-            <button type="submit" className="btn btn-primary" disabled={text.trim() === ""}>
-              Search
-            </button>
-          </div>
-          <label className={styles.name}>
-            <input type="checkbox" checked={onlyHere} onChange={(e) => setOnlyHere(e.target.checked)} />
-            <span>Only the workspace {workspace.name}</span>
-          </label>
-        </form>
+        <SessionSearchForm orgId={org.id} workspaceId={workspace.id} workspaceLabel={workspace.name} />
       )}
-      {/* The results are for one search of one workspace. A new workspace hides them. */}
-      {asked !== null && asked.from === workspaceId ? (
-        <Results key={`${asked.org}|${asked.workspace ?? ""}|${asked.q}|${asked.run}`} asked={asked} />
-      ) : null}
     </div>
   );
 }
 
-function Results({ asked }: { asked: Asked }) {
+/**
+ * The search form and its results for one workspace. The search page and the Sessions section of
+ * the console both use it. The results are for one search of one workspace: a new workspace
+ * hides them.
+ */
+export function SessionSearchForm({
+  orgId,
+  workspaceId,
+  workspaceLabel,
+}: {
+  orgId: string;
+  workspaceId: string;
+  workspaceLabel: string;
+}) {
+  const [text, setText] = useState("");
+  const [onlyHere, setOnlyHere] = useState(true);
+  const [asked, setAsked] = useState<Asked | null>(null);
+
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    const q = text.trim();
+    if (q === "") return;
+    setAsked((previous) => ({
+      q,
+      workspace: onlyHere ? workspaceId : null,
+      org: orgId,
+      from: workspaceId,
+      run: (previous?.run ?? 0) + 1,
+    }));
+  };
+
+  return (
+    <>
+      <form className={styles.form} role="search" onSubmit={submit}>
+        <div className={styles.toolbar}>
+          <label className={`field ${styles.grow}`}>
+            <span className="label">Words to find</span>
+            <input
+              className="input"
+              type="search"
+              value={text}
+              maxLength={MAX_QUERY_CHARS}
+              placeholder="For example: deploy plan"
+              onChange={(e) => setText(e.target.value)}
+            />
+          </label>
+          <button type="submit" className="btn btn-primary" disabled={text.trim() === ""}>
+            Search
+          </button>
+        </div>
+        <label className={styles.name}>
+          <input type="checkbox" checked={onlyHere} onChange={(e) => setOnlyHere(e.target.checked)} />
+          <span>Only the workspace {workspaceLabel}</span>
+        </label>
+      </form>
+      {asked !== null && asked.from === workspaceId ? (
+        <SearchResults key={`${asked.org}|${asked.workspace ?? ""}|${asked.q}|${asked.run}`} asked={asked} />
+      ) : null}
+    </>
+  );
+}
+
+function SearchResults({ asked }: { asked: Asked }) {
   const api = useApi();
   const load = useCallback(
     () => api.searchSessions(asked.org, asked.q, asked.workspace),

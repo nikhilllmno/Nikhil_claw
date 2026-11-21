@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import AuditEntry, Skill, SkillVersion
+from sama.orgs import permissions
 from sama.review.proposals import NewProposal, ProposalOrigin, ProposalSink
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, WritePlan, index, plan_write
@@ -62,6 +63,15 @@ async def _actor(connection: AsyncConnection, claims: RunTokenClaims) -> Actor:
         run_id=uuid.UUID(claims.run_id),
         token_user=claims.user_id,
     )
+
+
+async def _permit(connection: AsyncConnection, actor: Actor) -> None:
+    """The org permission ``skills.write`` of the user of the actor (M7.10). It comes after the
+    role checks of the plan: it never gives more than they give."""
+    try:
+        await permissions.require_user(connection, actor.org_id, actor.user_id, "skills.write")
+    except permissions.PermissionDeniedError as error:
+        raise SkillError(str(error)) from None
 
 
 def _matches(skill: SkillDoc, query: str | None) -> bool:
@@ -187,6 +197,7 @@ class PostgresSkillStore:
         *,
         author_kind: str = "agent",
     ) -> Written:
+        await _permit(connection, actor)
         # The lock stops a second write to this name until this one commits.
         await connection.execute(
             select(Skill.id)
@@ -242,6 +253,7 @@ class PostgresSkillStore:
             plan = await self._plan_as_owner(connection, actor, request)
         except SkillError:
             return None
+        await _permit(connection, actor)
         has_role = actor.org_owner or (plan.scope == "workspace" and actor.workspace_admin)
         if has_role or plan.scope not in ("workspace", "org"):
             return None

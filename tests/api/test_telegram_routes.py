@@ -310,3 +310,59 @@ async def test_integrations_need_the_vault(engine: AsyncEngine, tenant: Tenant) 
     with pytest.raises(IntegrationError, match="SAMA_VAULT_KEY") as error:
         await service.connect_telegram(tenant.org, tenant.ids["mia"], SecretStr(TOKEN))
     assert error.value.status_code == 409
+
+
+async def test_an_admin_checks_the_telegram_bot(
+    tg: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, telegram: FakeTelegram
+) -> None:
+    admin = bearer(await add_user(engine, tenant, workspace_member=True, role="admin"))
+    base = f"/orgs/{tenant.org}/integrations/telegram"
+    assert (await tg.post(base, headers=admin, json={"bot_token": TOKEN})).status_code == 201
+
+    ok = await tg.post(f"{base}/check", headers=admin)
+
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert (body["ok"], body["detail"]) == (True, None)
+    assert (body["integration"]["kind"], body["integration"]["status"]) == ("telegram", "active")
+    assert body["integration"]["last_error"] is None
+    assert TOKEN not in ok.text
+
+    telegram.failing.add("getMe")
+    failed = await tg.post(f"{base}/check", headers=admin)
+    assert failed.status_code == 200
+    assert failed.json()["ok"] is False
+    assert failed.json()["detail"].startswith("Telegram did not accept the token")
+    assert failed.json()["integration"]["last_error"] == failed.json()["detail"]
+    assert failed.json()["integration"]["status"] == "active"
+    assert TOKEN not in failed.text
+
+    telegram.failing.clear()
+    healed = await tg.post(f"{base}/check", headers=admin)
+    assert healed.json()["ok"] is True
+    assert healed.json()["integration"]["last_error"] is None
+    async with engine.connect() as connection:
+        entries = (
+            await connection.execute(
+                select(AuditEntry.details)
+                .where(AuditEntry.action == "integration.checked")
+                .order_by(AuditEntry.id)
+            )
+        ).all()
+    assert [e.details for e in entries] == [
+        {"kind": "telegram", "ok": True},
+        {"kind": "telegram", "ok": False},
+        {"kind": "telegram", "ok": True},
+    ]
+
+
+async def test_the_check_needs_an_admin_and_an_integration(
+    tg: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    base = f"/orgs/{tenant.org}/integrations"
+    assert (await tg.post(f"{base}/telegram/check", headers=mia(tenant))).status_code == 403
+    admin = bearer(await add_user(engine, tenant, workspace_member=True, role="admin"))
+    assert (await tg.post(f"{base}/slack/check", headers=admin)).status_code == 404
+    assert (await tg.post(f"{base}/discord/check", headers=admin)).status_code == 422
+    other = bearer("33333333-3333-3333-3333-333333333333")
+    assert (await tg.post(f"{base}/telegram/check", headers=other)).status_code == 404

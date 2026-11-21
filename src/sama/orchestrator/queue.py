@@ -95,9 +95,11 @@ from sama.review import policy as review_policy
 from sama.review.transcript import build_transcript
 from sama.review.trigger import after_completed_run
 from sama.runtime.contract import (
+    BUDGET_KEYS,
     MAX_COMPACT_FOCUS_CHARS,
     ApprovalDecision,
     FailureCode,
+    ReasoningEffort,
     RuntimeKind,
     Usage,
     clip_subagent_text,
@@ -258,9 +260,6 @@ def _check_quota(row: Any) -> None:
         )
 
 
-BUDGET_KEYS: Final = ("max_turns", "max_tokens", "max_cost_usd", "max_wall_time_s")
-
-
 def narrow_budget(
     budget: Mapping[str, Any] | None, cap: Mapping[str, Any] | None
 ) -> dict[str, Any]:
@@ -361,6 +360,8 @@ class ClaimedRun:
     lineage: str | None = None
     """The lineage of the session. ``delegation`` for a delegated child (Section 13.2): the
     gate and the prompt take away the toolsets in ``CHILD_BLOCKED_TOOLSETS``."""
+    reasoning_effort: ReasoningEffort | None = None
+    """The reasoning effort of the profile (M7.10). ``None``: the default of the model."""
 
 
 def _stored_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -509,6 +510,11 @@ class RunQueue:
                     ),
                 )
                 .where(Session.org_id == org_id, Session.id == session_id)
+                # A share lock on the session row, after the rate lock: an archive of the
+                # session (``PATCH /sessions/{id}``) takes the row for update, so it waits for
+                # this enqueue or this enqueue sees the new status (M7.10). The run insert
+                # takes the same share lock.
+                .with_for_update(read=True, of=Session)
             )
         ).one_or_none()
         if session is None:
@@ -1143,6 +1149,7 @@ class RunQueue:
                     func.coalesce(Run.model, AgentProfile.model).label("model"),
                     AgentProfile.soul,
                     AgentProfile.review_model,
+                    AgentProfile.reasoning_effort,
                     select(Message.content)
                     .where(
                         Message.org_id == Run.org_id,
@@ -1203,6 +1210,7 @@ class RunQueue:
             next_seq=int(next_seq),
             compact=bool(row.compact),
             lineage=row.lineage,
+            reasoning_effort=row.reasoning_effort,
         )
 
     @staticmethod

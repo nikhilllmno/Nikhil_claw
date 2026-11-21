@@ -40,6 +40,11 @@ class Grants:
     def org_owner(self) -> bool:
         return any(workspace is None and role == "owner" for workspace, role in self.rows)
 
+    @property
+    def org_role(self) -> str | None:
+        """The role of the user in the org (``owner``, ``admin``, or ``member``)."""
+        return next((role for workspace, role in self.rows if workspace is None), None)
+
     def sees_workspace(self, workspace_id: uuid.UUID) -> bool:
         """The rule of ``sama_private.can_see_workspace``."""
         return self.org_admin or (

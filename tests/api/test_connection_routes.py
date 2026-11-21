@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import JwtVerifier, SamaApi
 from sama.connectors.api import ApiDriver
-from sama.db.models import Connection, Membership
+from sama.db.models import AuditEntry, Connection, Membership
 from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import Vault
 from tests.api.conftest import ISSUER, SECRET, bearer
@@ -332,3 +332,101 @@ async def test_a_stdio_server_needs_e2b_and_a_valid_body(
     refused = await api_web.post(url, headers=mia(tenant), json=body)
     assert refused.status_code == 409
     assert "E2B" in refused.text
+
+
+async def test_a_disabled_connection_is_enabled_and_checked_again(
+    web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, fake: FakeComposio
+) -> None:
+    started = await web.post(path(tenant), headers=mia(tenant), json={"connector": "gmail"})
+    connection_id = started.json()["connection"]["id"]
+    fake.status = "ACTIVE"
+    await web.post(f"/connections/{connection_id}/check", headers=mia(tenant))
+    url = f"/connections/{connection_id}"
+    assert (await web.post(f"{url}/enable", headers=mia(tenant))).status_code == 409, "not disabled"
+    assert (await web.post(f"{url}/disable", headers=mia(tenant))).json()["state"] == "disabled"
+
+    enabled = await web.post(f"{url}/enable", headers=mia(tenant))
+
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["id"] == connection_id
+    assert enabled.json()["state"] == "connected", "the state is the answer of the backend"
+    async with engine.connect() as db:
+        actions = (
+            await db.execute(
+                select(AuditEntry.action)
+                .where(AuditEntry.target_id == connection_id)
+                .order_by(AuditEntry.id)
+            )
+        ).scalars()
+        assert [a for a in actions if a != "connection.started"] == [
+            "connection.connected",
+            "connection.disabled",
+            "connection.enabled",
+            "connection.connected",
+        ]
+
+
+async def test_an_enabled_connection_that_the_backend_refuses_does_not_connect(
+    web: httpx.AsyncClient, fake: FakeComposio, tenant: Tenant
+) -> None:
+    started = await web.post(path(tenant), headers=mia(tenant), json={"connector": "gmail"})
+    connection_id = started.json()["connection"]["id"]
+    await web.post(f"/connections/{connection_id}/disable", headers=mia(tenant))
+    fake.status = "EXPIRED"
+
+    enabled = await web.post(f"/connections/{connection_id}/enable", headers=mia(tenant))
+
+    assert enabled.status_code == 200
+    assert enabled.json()["state"] != "disabled"
+    assert enabled.json()["state"] != "connected"
+
+
+async def test_only_a_manager_enables_a_connection(
+    web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    started = await web.post(path(tenant), headers=mia(tenant), json={"connector": "gmail"})
+    connection_id = started.json()["connection"]["id"]
+    await web.post(f"/connections/{connection_id}/disable", headers=mia(tenant))
+    other = bearer(await add_user(engine, tenant, workspace_member=True))
+    assert (
+        await web.post(f"/connections/{connection_id}/enable", headers=other)
+    ).status_code == 404
+
+
+async def test_each_connection_answer_says_if_the_caller_can_manage_it(
+    web: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant, fake: FakeComposio
+) -> None:
+    await make_admin(engine, tenant)
+    mine = (await web.post(path(tenant), headers=mia(tenant), json={"connector": "gmail"})).json()
+    assert mine["connection"]["can_manage"] is True
+    shared = (
+        await web.post(
+            path(tenant),
+            headers=mia(tenant),
+            json={"connector": "notion", "scope": "workspace"},
+        )
+    ).json()
+    assert shared["connection"]["can_manage"] is True
+    member = bearer(await add_user(engine, tenant, workspace_member=True))
+
+    as_member = {
+        c["id"]: c["can_manage"] for c in (await web.get(path(tenant), headers=member)).json()
+    }
+    assert as_member == {shared["connection"]["id"]: False}
+    as_admin = {
+        c["id"]: c["can_manage"] for c in (await web.get(path(tenant), headers=mia(tenant))).json()
+    }
+    assert as_admin == {mine["connection"]["id"]: True, shared["connection"]["id"]: True}
+    # The detail answers of the actions have it too, and it follows the manage rule.
+    fake.status = "ACTIVE"
+    checked = await web.post(f"/connections/{mine['connection']['id']}/check", headers=mia(tenant))
+    assert checked.json()["can_manage"] is True
+    seen = await web.post(f"/connections/{shared['connection']['id']}/check", headers=member)
+    assert seen.status_code == 200
+    assert seen.json()["can_manage"] is False
+    disabled = await web.post(
+        f"/connections/{mine['connection']['id']}/disable", headers=mia(tenant)
+    )
+    assert disabled.json()["can_manage"] is True
+    enabled = await web.post(f"/connections/{mine['connection']['id']}/enable", headers=mia(tenant))
+    assert enabled.json()["can_manage"] is True

@@ -76,7 +76,7 @@ export function toSubagent(draft: DraftSubagent): Subagent {
   };
 }
 
-const sameList = (a: readonly string[], b: readonly string[]) =>
+export const sameList = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
 
 /** The fields of `draft` that differ from the saved profile. An empty object: no change. */
@@ -119,12 +119,21 @@ export function runtimeOption(options: AgentProfileOptions, saved: string, runti
  * The draft after the user chooses `runtime`. A model of another runtime cannot stay, so the
  * draft takes the saved model (back on the saved runtime) or the first model of the runtime.
  */
-export function withRuntime(draft: Draft, profile: AgentProfile, runtime: string): Draft {
+export function withRuntime<D extends { runtime: string; model: string }>(
+  draft: D,
+  profile: AgentProfile,
+  runtime: string,
+): D {
   const { models } = runtimeOption(profile.options, profile.runtime, runtime);
   let model = draft.model;
   if (runtime === profile.runtime) model = profile.model;
   else if (!models.includes(model)) model = models[0] ?? "";
   return { ...draft, runtime, model };
+}
+
+/** `list` with `value` in it, so that a select shows a value that the options do not have. */
+export function withCurrent(list: string[], value: string): string[] {
+  return value === "" || list.includes(value) ? list : [value, ...list];
 }
 
 /** The first problem that the browser can see before it sends the form, or `null`. */

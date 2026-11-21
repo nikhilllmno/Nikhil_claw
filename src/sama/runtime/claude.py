@@ -1103,6 +1103,7 @@ class ClaudeRuntime:
             resume=translator.session_id,
             max_turns=_remaining_turns(budget, translator),
             max_budget_usd=_remaining_cost(budget, translator),
+            effort=config.reasoning_effort,
             include_partial_messages=True,
             hooks=self._hooks(scope, config, phase, translator),
             can_use_tool=_can_use_tool(translator),

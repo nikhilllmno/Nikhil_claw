@@ -15,6 +15,20 @@ const PAGES: [string, string][] = [
   ["/settings", "Settings"],
   ["/admin", "Admin"],
   ["/onboarding", "Set up"],
+  // The settings console (M7.10): each section has its title as the heading.
+  ["/console/setup", "Setup"],
+  ["/console/slack", "Slack"],
+  ["/console/roles", "Roles"],
+  ["/console/harness", "Harness"],
+  ["/console/tools", "Tools"],
+  ["/console/subagents", "Sub-agents"],
+  ["/console/skills", "Skills"],
+  ["/console/mcp", "MCP servers"],
+  ["/console/webhooks", "Webhooks"],
+  ["/console/triggers", "Triggers"],
+  ["/console/schedules", "Schedules"],
+  ["/console/workflows", "Workflows"],
+  ["/console/sessions", "Sessions"],
 ];
 
 test("the API and the web app are up", async ({ request, world }) => {

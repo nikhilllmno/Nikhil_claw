@@ -71,7 +71,11 @@ export function Members() {
   );
 }
 
-function OrgMembers({ org }: { org: Org }) {
+/**
+ * The members, the invite form, and the open invites of an org. `canInvite` is false when the
+ * role of the user cannot invite people (M7.10): the invite form stays out.
+ */
+export function OrgMembers({ org, canInvite = true }: { org: Org; canInvite?: boolean }) {
   const api = useApi();
   const loadMembers = useCallback(() => api.listMembers(org.id), [api, org.id]);
   const members = useLoad(loadMembers, "Could not load the members.");
@@ -121,12 +125,16 @@ function OrgMembers({ org }: { org: Org }) {
 
       {admin ? (
         <>
-          <InviteForm
-            org={org}
-            onCreated={() => {
-              invites.reload();
-            }}
-          />
+          {canInvite ? (
+            <InviteForm
+              org={org}
+              onCreated={() => {
+                invites.reload();
+              }}
+            />
+          ) : (
+            <p className={styles.meta}>Your role cannot invite people. An org owner can change this.</p>
+          )}
           <section className={`card ${styles.card}`} aria-labelledby="members-invites">
             <h2 id="members-invites" className={styles.heading}>
               Open invites

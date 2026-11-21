@@ -14,6 +14,7 @@
   --text-lg: 1.0625rem;
   --text-xl: 1.375rem;
   --text-2xl: 1.875rem;
+  --tracking-caps: 0.04em;
   --leading-tight: 1.25;
   --leading-normal: 1.55;
   --leading-loose: 1.7;
@@ -45,6 +46,8 @@
   --topbar-height: 3.25rem;
   --content-max: 46rem;
   --settings-max: 52rem;
+  --console-max: 76rem;
+  --console-nav-width: 13rem;
   --touch-target: 2.5rem;
   --field-basis: 14rem;
   --editor-min-height: 16rem;

@@ -38,11 +38,24 @@ import styles from "./Page.module.css";
 
 type Open = { kind: "skill"; name: string; scope: SkillScope } | { kind: "new" } | null;
 
-export function SkillEditor() {
+/**
+ * The skill editor. `embedded`: the settings console (M7.10) shows it inside a section, so the
+ * page frame and the header stay out. `canWrite` is false when the role of the user has no
+ * permission to write skills: every write control stays out, whatever the rows say.
+ */
+export function SkillEditor({ embedded = false, canWrite = true }: { embedded?: boolean; canWrite?: boolean } = {}) {
   const { me, meError, reloadMe, workspaces, workspaceId } = useData();
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading the skills" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
+
+  if (embedded) {
+    return workspace === null ? (
+      <p className="alert">You are not in a workspace yet. Ask an admin of your org to add you.</p>
+    ) : (
+      <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} canWrite={canWrite} />
+    );
+  }
 
   return (
     <div className={styles.page}>
@@ -60,13 +73,13 @@ export function SkillEditor() {
       ) : (
         // The key gives each workspace its own catalog, so one workspace never shows the skills
         // of another one while the new list loads.
-        <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} />
+        <WorkspaceSkills key={workspace.id} workspaceId={workspace.id} canWrite />
       )}
     </div>
   );
 }
 
-function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
+function WorkspaceSkills({ workspaceId, canWrite }: { workspaceId: string; canWrite: boolean }) {
   const api = useApi();
   const [open, setOpen] = useState<Open>(null);
   // The row that the list gives the focus to when it shows again: "new" or `scope:name`.
@@ -110,6 +123,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
         <SkillView
           key={`${open.scope}:${open.name}`}
           workspaceId={workspaceId}
+          canWrite={canWrite}
           name={open.name}
           scope={open.scope}
           onBack={() => back(null)}
@@ -127,6 +141,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
         <SkillsHome
           workspaceId={workspaceId}
           catalog={catalog.data}
+          canWrite={canWrite}
           filter={filter}
           onFilter={setFilter}
           focusKey={focusKey}
@@ -153,6 +168,7 @@ function WorkspaceSkills({ workspaceId }: { workspaceId: string }) {
 function SkillsHome({
   workspaceId,
   catalog,
+  canWrite,
   filter,
   onFilter,
   focusKey,
@@ -162,6 +178,7 @@ function SkillsHome({
 }: {
   workspaceId: string;
   catalog: SkillCatalog;
+  canWrite: boolean;
   filter: string;
   onFilter: (text: string) => void;
   focusKey: string | null;
@@ -213,12 +230,15 @@ function SkillsHome({
             onChange={(e) => onFilter(e.target.value)}
           />
         </label>
-        {catalog.writable_scopes.length > 0 ? (
+        {catalog.writable_scopes.length > 0 && canWrite ? (
           <button ref={newButton} type="button" className="btn btn-primary" onClick={onNew}>
             New skill
           </button>
         ) : null}
       </div>
+      {!canWrite ? (
+        <p className={styles.meta}>Your role cannot write skills. An org admin can change this.</p>
+      ) : null}
       <SkillList
         skills={filterSkills(catalog.skills, filter)}
         total={catalog.skills.length}
@@ -227,6 +247,7 @@ function SkillsHome({
       />
       <ArchivedSkills
         workspaceId={workspaceId}
+        canWrite={canWrite}
         onRestored={(skill) => {
           restoring.current = { key: `${skill.scope}:${skill.name}`, from: catalog };
           onRestored(skill.name);
@@ -238,9 +259,11 @@ function SkillsHome({
 
 function ArchivedSkills({
   workspaceId,
+  canWrite,
   onRestored,
 }: {
   workspaceId: string;
+  canWrite: boolean;
   onRestored: (skill: ArchivedSkill) => void;
 }) {
   const api = useApi();
@@ -292,7 +315,7 @@ function ArchivedSkills({
               </div>
             </div>
             <p className={styles.text}>{s.description}</p>
-            {s.can_restore ? (
+            {s.can_restore && canWrite ? (
               <div className={styles.actions}>
                 <button
                   type="button"
@@ -473,6 +496,7 @@ function NewSkill({
 
 function SkillView({
   workspaceId,
+  canWrite,
   name,
   scope,
   onBack,
@@ -481,6 +505,7 @@ function SkillView({
   onSaved,
 }: {
   workspaceId: string;
+  canWrite: boolean;
   name: string;
   scope: SkillScope;
   onBack: () => void;
@@ -511,7 +536,7 @@ function SkillView({
   }
   if (detail.data === null) return <LoadingState label="Loading the skill" />;
   const skill = detail.data;
-  const writable = skill.can_edit;
+  const writable = skill.can_edit && canWrite;
   const text = content ?? skill.skill_md;
 
   // A save or a file change makes a new version. The files and the versions load again.
@@ -661,7 +686,9 @@ function SkillView({
             <p className={styles.meta}>
               {skill.scope === "builtin"
                 ? "A built-in skill is read-only. To change it, make a skill with the same name."
-                : "You cannot change this skill. An admin of its scope can."}
+                : !canWrite
+                  ? "Your role cannot write skills. An org admin can change this."
+                  : "You cannot change this skill. An admin of its scope can."}
             </p>
           </>
         )}

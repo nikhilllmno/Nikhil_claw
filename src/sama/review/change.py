@@ -30,7 +30,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.profile_changes import TOOL_MAX_CHARS, check_rules, profile_rules
-from sama.profiles import KIND_FIELDS, ProfileError, planned_values, split_change
+from sama.profiles import (
+    ADMIN_ONLY_FIELDS,
+    KIND_FIELDS,
+    ProfileError,
+    planned_values,
+    split_change,
+)
 from sama.review.proposals import NewProposal, ProposalKind, ProposalScope, ProposalSink
 from sama.review.soul import SUMMARY_MAX_CHARS, SoulError, SoulProposer, load_run
 from sama.runtime.contract import RuntimeKind
@@ -119,7 +125,8 @@ class ChangeProposer:
             raise SoulError(
                 f"content is only for the target soul. Give the fields of {request.target}"
             )
-        allowed = KIND_FIELDS[request.target]
+        # A person changes the budget and the reasoning effort in the web app. The agent cannot.
+        allowed = tuple(f for f in KIND_FIELDS[request.target] if f not in ADMIN_ONLY_FIELDS)
         extra = sorted(set(given) - set(allowed))
         if extra:
             raise SoulError(

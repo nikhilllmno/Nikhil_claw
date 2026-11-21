@@ -36,6 +36,7 @@ from sama.db.models import (
     Workspace,
 )
 from sama.orchestrator.queue import RunQueue
+from sama.orgs import permissions
 from sama.scheduler import schedule as schedules
 from sama.scheduler.jobs import Actor
 from sama.tenancy.access import load_grants
@@ -132,6 +133,12 @@ class WorkflowService:
         await self._guard(actor)
         definition = self._parse(source)
         async with self._engine.begin() as connection:
+            try:
+                await permissions.require_user(
+                    connection, actor.org_id, actor.user_id, "workflows.create"
+                )
+            except permissions.PermissionDeniedError as error:
+                raise WorkflowError(str(error)) from None
             count = (
                 await connection.execute(
                     select(func.count()).where(

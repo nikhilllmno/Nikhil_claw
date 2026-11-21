@@ -30,6 +30,7 @@ const WORKSPACE_LINKS: NavLink[] = [
 
 /** The links of the org and the account. */
 const ORG_LINKS: NavLink[] = [
+  { href: "/console", title: "Console", meta: "All the settings of the org, the agents, and the automation" },
   { href: "/members", title: "Members", meta: "The people of your org and their roles" },
   { href: "/admin", title: "Admin", meta: "Usage, audit log, keys, and data", admin: true },
   { href: "/billing", title: "Billing", meta: "The plan, usage, and quotas", admin: true },
@@ -236,7 +237,7 @@ export function Sidebar({
         ) : null}
         <NavGroup
           label={noOrg ? "Account" : "Org"}
-          links={noOrg ? ORG_LINKS.filter((l) => l.href !== "/members") : ORG_LINKS}
+          links={noOrg ? ORG_LINKS.filter((l) => l.href !== "/members" && l.href !== "/console") : ORG_LINKS}
           pathname={pathname}
           admin={isOrgAdmin}
         />

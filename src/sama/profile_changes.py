@@ -80,21 +80,29 @@ def check_rules(rules: Mapping[str, Any]) -> dict[str, str | None]:
     return out
 
 
+def _level(org_id: uuid.UUID, profile_id: uuid.UUID | None) -> list[Any]:
+    """The columns that select the rules of a profile, or the org rules (no profile). A rule of
+    a user is never one of them."""
+    return [
+        ToolPolicy.org_id == org_id,
+        ToolPolicy.agent_profile_id.is_(None)
+        if profile_id is None
+        else ToolPolicy.agent_profile_id == profile_id,
+        ToolPolicy.user_id.is_(None),
+    ]
+
+
 async def profile_rules(
     connection: AsyncConnection,
     org_id: uuid.UUID,
-    profile_id: uuid.UUID,
+    profile_id: uuid.UUID | None,
     tools: Iterable[str] | None = None,
     *,
     lock: bool = False,
 ) -> dict[str, str]:
-    """The policy rules of the profile (not of a user) as ``{tool: action}``. With ``tools``,
-    only the rules of those tools."""
-    query = select(ToolPolicy.tool, ToolPolicy.action).where(
-        ToolPolicy.org_id == org_id,
-        ToolPolicy.agent_profile_id == profile_id,
-        ToolPolicy.user_id.is_(None),
-    )
+    """The policy rules of the profile (not of a user) as ``{tool: action}``. Without a
+    profile, the org rules. With ``tools``, only the rules of those tools."""
+    query = select(ToolPolicy.tool, ToolPolicy.action).where(*_level(org_id, profile_id))
     if tools is not None:
         query = query.where(ToolPolicy.tool.in_(list(tools)))
     if lock:
@@ -168,7 +176,7 @@ async def write_change(
             .values(**values, updated_at=func.now())
         )
     for tool, action in (rules or {}).items():
-        await _set_rule(connection, org_id, profile_id, tool, action, actor_user_id)
+        await set_rule(connection, org_id, profile_id, tool, action, actor_user_id)
     change_id = await record_change(
         connection,
         org_id=org_id,
@@ -205,22 +213,18 @@ async def write_change(
     return change_id
 
 
-async def _set_rule(
+async def set_rule(
     connection: AsyncConnection,
     org_id: uuid.UUID,
-    profile_id: uuid.UUID,
+    profile_id: uuid.UUID | None,
     tool: str,
     action: str | None,
     actor_user_id: uuid.UUID,
 ) -> None:
+    """Sets one rule of the profile, or of the org without a profile. ``None`` removes it."""
     if action is None:
         await connection.execute(
-            delete(ToolPolicy).where(
-                ToolPolicy.org_id == org_id,
-                ToolPolicy.agent_profile_id == profile_id,
-                ToolPolicy.user_id.is_(None),
-                ToolPolicy.tool == tool,
-            )
+            delete(ToolPolicy).where(*_level(org_id, profile_id), ToolPolicy.tool == tool)
         )
         return
     statement = pg_insert(ToolPolicy).values(
