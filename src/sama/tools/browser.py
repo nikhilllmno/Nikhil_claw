@@ -8,6 +8,10 @@ only the targets of the service. The agent reads the page as an accessibility tr
 (``[ref=e12]``) and acts on an element by its ref. Each output goes through the gate, the
 redactor, and the output cap of the tool server, as for the other tools.
 
+Vision mode (M5.2): ``browser_act`` can act at a point (``x``, ``y``) of the viewport instead of
+a ref, for a page without a usable accessibility tree (a ``<canvas>`` app). The agent reads the
+page with ``browser_screenshot``, whose caption gives the size of the image.
+
 ``browser_vault`` (M5.3) lists the saved logins of the user and fills one into the page. The
 agent names the login. sama fills the user name and the password, and the result never shows
 them. The server has the tool only when the process has the vault.
@@ -27,6 +31,7 @@ from pydantic import Field
 
 from sama.browser.target import (
     CLOUD,
+    MAX_COORDINATE,
     MY_CHROME,
     Act,
     ActionKind,
@@ -70,6 +75,7 @@ MAX_FIELDS: Final = 50
 
 _Ref = Annotated[str, Field(min_length=1, max_length=40, pattern=r"^(ref=)?[A-Za-z0-9_-]+$")]
 _Url = Annotated[str, Field(min_length=1, max_length=MAX_URL_CHARS)]
+_Coordinate = Annotated[float, Field(ge=0, le=MAX_COORDINATE)]
 
 OPEN_DESCRIPTION: Final = (
     "Open a URL in the browser of this run. The result is the accessibility tree of the page "
@@ -97,16 +103,23 @@ SNAPSHOT_DESCRIPTION: Final = (
     "open, the result shows the dialog."
 )
 ACT_DESCRIPTION: Final = (
-    "Do one action in the active tab. Actions: click (ref), type (ref, text, submit), select "
-    "(ref, values), hover (ref), drag (ref, target_ref), scroll (direction and amount, or ref "
-    "to scroll it into view), press (text: a key such as Enter or Control+A; ref optional), "
-    "wait (seconds, at most 10), back, forward, reload, and dialog (accept, prompt_text: answer "
-    "an open dialog). The refs come from the latest snapshot. The result is a new snapshot "
-    "(snapshot=true)."
+    "Do one action in the active tab. Actions: click (ref, clicks: 2 for a double click), type "
+    "(ref, text, submit), select (ref, values), hover (ref), drag (ref, target_ref), scroll "
+    "(direction and amount, or ref to scroll it into view), press (text: a key such as Enter "
+    "or Control+A; ref optional), wait (seconds, at most 10), back, forward, reload, and "
+    "dialog (accept, prompt_text: answer an open dialog). The refs come from the latest "
+    "snapshot. Vision mode, for a page without usable refs (for example a canvas): click, "
+    "type, hover, and scroll take x and y instead of ref, and drag takes x, y, to_x, and to_y. "
+    "A point is in the pixels of the latest browser_screenshot with full_page=false, from the "
+    "top left corner. type at a point clicks there and then types with the keyboard. The "
+    "result is a new snapshot (snapshot=true); in vision mode, set snapshot=false and take a "
+    "new screenshot."
 )
 SCREENSHOT_DESCRIPTION: Final = (
     "Take a JPEG screenshot of the active tab (full_page: the whole page, up to 6000 pixels "
-    "high). Use it to look at the layout or at content that the snapshot does not show."
+    "high). Use it to look at the layout or at content that the snapshot does not show. A "
+    "screenshot with full_page=false is the viewport: browser_act takes x and y in its pixels "
+    "(vision mode)."
 )
 EXTRACT_DESCRIPTION: Final = (
     "Read data from the active tab with no model call. Kinds: text (the visible text), links "
@@ -201,10 +214,20 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
         prompt_text: Annotated[str | None, Field(max_length=MAX_TEXT_CHARS)] = None,
         snapshot: bool = True,
         target: TargetName | None = None,
+        x: _Coordinate | None = None,
+        y: _Coordinate | None = None,
+        to_x: _Coordinate | None = None,
+        to_y: _Coordinate | None = None,
+        clicks: Annotated[int, Field(ge=1, le=3)] = 1,
     ) -> str:
         act = Act(
             action=action,
             ref=ref,
+            x=x,
+            y=y,
+            to_x=to_x,
+            to_y=to_y,
+            clicks=clicks,
             text=text,
             values=tuple(values or ()),
             submit=submit,
@@ -235,6 +258,11 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
                 "prompt_text": prompt_text,
                 "snapshot": snapshot,
                 "target": target,
+                "x": x,
+                "y": y,
+                "to_x": to_x,
+                "to_y": to_y,
+                "clicks": clicks if clicks != 1 else None,
             }.items()
             if value is not None
         }

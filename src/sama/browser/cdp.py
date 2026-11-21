@@ -25,6 +25,11 @@ Playwright client only, no browser binaries.
 - ``fill_login`` fills a saved login (M5.3) into the password field and the user name field of
   the active tab, only in a document of the site of the login. A snapshot shows the value of a
   password field as ``[hidden]``, and an extract of a password field gives ``[hidden]``.
+- Vision mode (M5.2): ``click``, ``type``, ``hover``, ``drag``, and ``scroll`` can act at a point
+  (``x``, ``y``) instead of a ref, with the mouse and the keyboard of Playwright (CDP
+  ``Input`` events). A point is in CSS pixels of the viewport. A viewport screenshot has the
+  scale ``css``, so one pixel of the image is one CSS pixel, and the agent can give a point of
+  the image. A point outside the viewport fails before the browser acts.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -90,6 +95,9 @@ MAX_TEXT_CHARS: Final = 100_000
 MAX_LINKS: Final = 500
 MAX_TABLES: Final = 20
 MAX_ROWS: Final = 200
+DRAG_STEPS: Final = 12
+"""The mouse moves of a drag at points. A page that draws while the mouse moves (a canvas)
+sees the path, not one jump."""
 MAX_SCREENSHOT_HEIGHT: Final = 6_000
 """A full-page screenshot stops at this height. A model cannot read a very tall image."""
 SCREENSHOT_QUALITY: Final = 70
@@ -222,6 +230,11 @@ def hide_values(tree: str, values: list[str]) -> str:
     return "\n".join(lines)
 
 
+_VIEWPORT_JS: Final = "() => [window.innerWidth, window.innerHeight]"
+_SOF_MARKERS: Final = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+"""The JPEG start-of-frame markers: they have the size of the image."""
+
+
 def _opens_pages(act: Act) -> bool:
     return act.action in {"click", "press"} or (act.action == "type" and act.submit)
 
@@ -239,6 +252,27 @@ def _http_url(url: str) -> str:
     return f"{mapped}{sep}{rest}" if mapped else url
 
 
+def jpeg_size(data: bytes) -> tuple[int, int]:
+    """The width and height of a JPEG image, or ``(0, 0)`` when the data is not a JPEG."""
+    if data[:2] != b"\xff\xd8":
+        return (0, 0)
+    at = 2
+    while at + 9 < len(data):
+        if data[at] != 0xFF:
+            return (0, 0)
+        marker = data[at + 1]
+        if marker == 0xFF:  # a fill byte
+            at += 1
+            continue
+        length = int.from_bytes(data[at + 2 : at + 4], "big")
+        if marker in _SOF_MARKERS:
+            height = int.from_bytes(data[at + 5 : at + 7], "big")
+            width = int.from_bytes(data[at + 7 : at + 9], "big")
+            return (width, height)
+        at += 2 + length
+    return (0, 0)
+
+
 def _short(error: Exception) -> str:
     """The first line of a Playwright error, without the call log."""
     text = str(getattr(error, "message", None) or error).strip().splitlines()
@@ -248,6 +282,9 @@ def _short(error: Exception) -> str:
 
 class PlaywrightSession:
     """One browser of one run. The service calls it one call at a time."""
+
+    vision: ClassVar[bool] = True
+    """The session can act at a point (vision mode, M5.2)."""
 
     def __init__(
         self,
@@ -487,6 +524,25 @@ class PlaywrightSession:
         with contextlib.suppress(PlaywrightError):
             await page.wait_for_load_state("domcontentloaded", timeout=SETTLE_TIMEOUT_MS)
 
+    async def _viewport(self, page: Page) -> tuple[int, int]:
+        """The width and height of the viewport in CSS pixels."""
+        size = page.viewport_size
+        if size is not None:
+            return (size["width"], size["height"])
+        # A browser over CDP (Browserbase) can have no viewport emulation: ask the page.
+        width, height = await page.evaluate(_VIEWPORT_JS)
+        return (int(width), int(height))
+
+    async def _in_viewport(self, page: Page, point: tuple[float, float]) -> tuple[float, float]:
+        width, height = await self._viewport(page)
+        x, y = point
+        if not (0 <= x < width and 0 <= y < height):
+            raise BrowserError(
+                f"the point ({x:g}, {y:g}) is outside the viewport ({width}x{height}); take a "
+                "new screenshot (full_page=false) and use a point in it"
+            )
+        return point
+
     def _no_dialog(self, page: Page) -> None:
         dialog = self._dialog_of(page)
         if dialog is not None:
@@ -565,10 +621,13 @@ class PlaywrightSession:
         return await self._state(await self._page())
 
     async def _do(self, page: Page, act: Act) -> None:
+        if act.point is not None:
+            await self._do_at_point(page, act, act.point)
+            return
         if act.action in ACTIONS_WITH_REF:
             locator = await self._locator(page, act.ref)
             if act.action == "click":
-                await locator.click()
+                await locator.click(click_count=act.clicks)
             elif act.action == "type":
                 await locator.fill(act.text or "")
                 if act.submit:
@@ -610,6 +669,42 @@ class PlaywrightSession:
             await page.reload(wait_until="domcontentloaded")
         else:  # pragma: no cover - the tool schema allows only the known actions
             raise BrowserError(f"unknown action {act.action}")
+
+    async def _do_at_point(self, page: Page, act: Act, point: tuple[float, float]) -> None:
+        """An action at a point of the viewport (vision mode). The service checked that the
+        action can use a point."""
+        x, y = await self._in_viewport(page, point)
+        mouse = page.mouse
+        if act.action == "click":
+            await mouse.click(x, y, click_count=act.clicks)
+        elif act.action == "type":
+            await mouse.click(x, y)
+            await page.keyboard.type(act.text or "")
+            if act.submit:
+                await page.keyboard.press("Enter")
+        elif act.action == "hover":
+            await mouse.move(x, y)
+        elif act.action == "drag":
+            if act.to_point is None:
+                raise BrowserError("drag at a point needs to_x and to_y: the point to drop on")
+            to_x, to_y = await self._in_viewport(page, act.to_point)
+            await mouse.move(x, y)
+            await mouse.down()
+            try:
+                await mouse.move(to_x, to_y, steps=DRAG_STEPS)
+            finally:
+                await mouse.up()
+        elif act.action == "scroll":
+            dx, dy = {
+                "down": (0, act.amount),
+                "up": (0, -act.amount),
+                "right": (act.amount, 0),
+                "left": (-act.amount, 0),
+            }[act.direction]
+            await mouse.move(x, y)
+            await mouse.wheel(dx, dy)
+        else:
+            raise BrowserError(f"{act.action} cannot use a point; use a ref")
 
     async def _answer_dialog(self, page: Page, act: Act) -> PageState:
         dialog = self._dialogs.pop(page, None)
@@ -752,10 +847,11 @@ class PlaywrightSession:
         try:
             if full_page:
                 height = int(await page.evaluate(_HEIGHT_JS))
-                width = (page.viewport_size or {"width": 1280})["width"]
+                width, _ = await self._viewport(page)
                 data = await page.screenshot(
                     type="jpeg",
                     quality=SCREENSHOT_QUALITY,
+                    scale="css",
                     full_page=True,
                     clip={
                         "x": 0,
@@ -765,10 +861,20 @@ class PlaywrightSession:
                     },
                 )
             else:
-                data = await page.screenshot(type="jpeg", quality=SCREENSHOT_QUALITY)
+                # The scale "css" makes one pixel of the image one CSS pixel of the viewport,
+                # so a point of the image is a point for an action (vision mode).
+                data = await page.screenshot(type="jpeg", quality=SCREENSHOT_QUALITY, scale="css")
         except PlaywrightError as error:
             raise BrowserError("the screenshot failed", detail=_short(error)) from None
-        return Screenshot(page=await self._state(page), data=data, mime_type="image/jpeg")
+        width, height = jpeg_size(data)
+        return Screenshot(
+            page=await self._state(page),
+            data=data,
+            mime_type="image/jpeg",
+            width=width,
+            height=height,
+            full_page=full_page,
+        )
 
     async def extract(self, request: ExtractRequest) -> Extracted:
         page = await self._page()

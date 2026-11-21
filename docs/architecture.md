@@ -4560,8 +4560,8 @@ save wins.
 |---|---|---|
 | `browser_open` | `url`, `snapshot` | Opens the URL in the active tab and returns a snapshot. A URL without a scheme gets `https://`. Only `http` and `https` are allowed. |
 | `browser_snapshot` | none | The accessibility tree of the active tab, in YAML, with `[ref=eN]` on the elements that an action can use. A new snapshot makes the old refs invalid. |
-| `browser_act` | `action`, `ref`, `text`, `values`, `submit`, `target_ref`, `direction`, `amount`, `seconds`, `accept`, `prompt_text`, `snapshot` | `click`, `type`, `select`, `hover`, `drag` (these need a `ref`), `scroll`, `press`, `wait` (at most 10 s), `back`, `forward`, `reload`, `dialog`. Returns a new snapshot. After `click`, `press`, and `type` with `submit`, the session waits 0.5 s so that a popup or a navigation can start. |
-| `browser_screenshot` | `full_page` | A JPEG image of the active tab (a full page is at most 6,000 px high) and a caption. |
+| `browser_act` | `action`, `ref`, `text`, `values`, `submit`, `target_ref`, `direction`, `amount`, `seconds`, `accept`, `prompt_text`, `snapshot`; since M5.2 also `x`, `y`, `to_x`, `to_y`, `clicks` | `click`, `type`, `select`, `hover`, `drag` (these need a `ref`, or a point in vision mode, see below), `scroll`, `press`, `wait` (at most 10 s), `back`, `forward`, `reload`, `dialog`. Returns a new snapshot. After `click`, `press`, and `type` with `submit`, the session waits 0.5 s so that a popup or a navigation can start. |
+| `browser_screenshot` | `full_page` | A JPEG image of the active tab (a full page is at most 6,000 px high) and a caption. Since M5.2 the caption gives the size of the image, and for a viewport image the range of the points for `browser_act`. |
 | `browser_extract` | `kind`, `ref`, `fields` | `text` (at most 100,000 characters), `links` (at most 500), `tables` (at most 20, 200 rows each), or `fields` (the text of the elements with the given refs, as JSON). It does not call a model. |
 | `browser_tabs` | `action`, `index`, `url` | `list`, `new`, `select`, `close`. At most 10 tabs. A tab that the page opens (a popup) becomes the active tab. |
 
@@ -4583,9 +4583,8 @@ do not get the toolset.
 **URL policy.** Every navigation goes through the outbound URL policy of Section 16.4 and the
 host lists of the org (M5.3, below). See Section 16.4 for the limits.
 
-**Later items.** M5.2 adds coordinates and vision mode to `browser_act`. M5.5 adds the
-`my_chrome` target (Section 14.2.2). M5.6 adds `browser_task`. The Browserbase key is a setting of the process.
-A key for each org comes later.
+**Later items.** M5.5 adds the `my_chrome` target (Section 14.2.2). M5.6 adds `browser_task`.
+The Browserbase key is a setting of the process. A key for each org comes later.
 
 #### Browser vault and URL policy (M5.3)
 
@@ -4687,6 +4686,63 @@ request while the policy is old or after a failed load.
 Each change writes an audit row (`browser.login_created`, `browser.login_changed`,
 `browser.login_removed`, `browser.url_policy_set`, and the `vault.*` rows) without a secret.
 Without the vault, the login routes answer `503`.
+
+#### Vision mode (M5.2)
+
+Some pages have no usable accessibility tree: a `<canvas>` app (a drawing, a game, a chart, a
+map), a remote desktop in a page, or a page with bad markup. Their snapshot has no refs for the
+parts that the agent must use. In vision mode, the agent looks at a screenshot and acts at a
+point of it, as with computer use.
+
+- **Points.** `browser_act` takes `x` and `y` instead of `ref` for `click`, `type`, `hover`,
+  `drag`, and `scroll`. A `drag` at a point also needs `to_x` and `to_y` (the drop point), not
+  `target_ref`. `clicks` (1 to 3, default 1) gives a double click or a triple click, also with a
+  ref. A point is in CSS pixels from the top left corner of the viewport. The tool schema
+  accepts 0 to 10,000 for each value.
+- **Actions at a point.** The session uses the mouse and the keyboard of Playwright (CDP
+  `Input` events), so the page gets real events (`mousedown`, `mousemove`, `wheel`,
+  `keydown`). `click` clicks at the point. `type` clicks at the point and then types the text
+  with the keyboard (not `fill`), and presses Enter with `submit`. `hover` moves the mouse to
+  the point. `drag` presses the button at the point, moves to the drop point in 12 steps, and
+  releases the button. `scroll` moves the mouse to the point and turns the wheel by `amount`.
+  `press` needs no point: it uses the keyboard of the page.
+- **Screenshots.** A viewport screenshot (`full_page=false`) has the Playwright scale `css`,
+  so one pixel of the image is one CSS pixel of the viewport, also on a screen with a device
+  scale factor above 1. The caption gives the size of the image (sama reads it from the JPEG
+  header) and the range of the points, for example "The image is 1280x720 pixels. It is the
+  viewport: browser_act takes x (0 to 1279) and y (0 to 719)". The caption of a full-page image
+  says that its points are not viewport points.
+- **Checks.** The service refuses arguments that do not fit, before a session starts: `x`
+  without `y`, a ref and a point together, a point on an action that cannot use it (`select`,
+  `press`, and the others), `to_x` and `to_y` without a `drag` at a point, and `clicks` on an
+  action other than `click`. The session refuses a point outside the viewport before the
+  browser acts. The agent gets the size of the viewport in the error.
+- **The hint.** When a snapshot has 2 refs or fewer (and the tab is not blank), the result has
+  the fixed note "the page has few elements with refs (for example a canvas); to act on it,
+  take browser_screenshot and use browser_act with x and y (vision mode)". The note is outside
+  the untrusted block.
+- **Gate.** A point does not change the gate: `browser_act` is `ask` by default, with a ref or
+  with a point. The approval shows the point.
+- **Targets.** A session that can act at a point has the class attribute `vision = True`
+  (`sama.browser.target.has_vision`). `PlaywrightSession` has it, so the `cloud` target has
+  vision mode. A session without it gets the error "the <target> browser cannot act at a point
+  (x, y) yet; use a ref from browser_snapshot". The target protocol does not change, so a
+  target can add vision mode later. For `my_chrome`, see Section 14.2.2.
+- **Tests.** `tests/browser/canvas_app.py` is a canvas app with six steps (click three circles in
+  order, double-click, hover, drag, type, and scroll the wheel). Its accessibility tree is empty.
+  `tests/browser/test_vision.py` does the task at points with a local Chromium.
+  `tests/conformance/test_browser_runtimes.py` does it from the Claude runtime and from the
+  OpenAI runtime over MCP. `tests/browser/test_vision_live.py` does it on Browserbase, and gives
+  a real model of each runtime a canvas app with a random layout (`?seed=N`): the model must
+  look at the screenshots. The live tests need a public URL of the canvas app
+  (`SAMA_LIVE_CANVAS_URL`) and run by hand.
+- **Limits.** Each screenshot is an image in the history of the run, so a long vision task
+  uses many input tokens. The agent must take a new screenshot after an action that changes the
+  page: the result of an action has a snapshot, not an image. A point is good only for the
+  scroll position of the last screenshot.
+- **Vault.** After `browser_vault` fills a saved login, screenshots are off for the rest of the
+  run (M5.3), so vision mode is off too. Actions at a point still work, but the agent cannot see
+  the page.
 
 ### 14.2 Chrome extension
 
@@ -4981,6 +5037,18 @@ warning ("Access the page debugger backend"), and the Chrome Web Store item need
 - The overlay copies the light-theme values of the panel tokens, because the page cannot load
   the CSS of the extension.
 - The keyword list of the sensitive check is in English.
+
+**Vision mode.** The `my_chrome` session does not have vision mode yet (Section 14.1,
+"Vision mode (M5.2)"). The service refuses a point (`x`, `y`) and `clicks` other than 1 on it,
+so a point cannot pass the sensitive check, which reads refs. To add vision mode later:
+
+- the session sends the point to the extension and sets `vision = True`;
+- the extension maps a point to `Input.dispatchMouseEvent` (and `Input.insertText` for
+  `type`), and takes the viewport screenshot with `Page.captureScreenshot` and a device scale
+  factor of 1, so that one pixel is one CSS pixel;
+- the sensitive check covers points: the extension finds the element at the point
+  (`DOM.getNodeForLocation`) and checks it as it checks a ref, and the gate treats a point
+  that it cannot check as a sensitive action.
 
 #### 14.2.3 Publish to the Chrome Web Store
 
@@ -6054,7 +6122,7 @@ later. Each tool is hidden when its service is missing.
 | `text_to_speech(text, voice)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `skill_import(url, path, ref, name, scope)` | 9.6 | The skill store | `ask` |
 | `browser_open`, `browser_snapshot`, `browser_screenshot`, `browser_extract`, `browser_tabs` (M5.1) | 14.1 | A `BrowserService` (the control plane always has one since M5.5) | `allow` |
-| `browser_act` (M5.1) | 14.1 | A `BrowserService` | `ask`; a sensitive action in the user's Chrome is always `ask` (14.2.2) |
+| `browser_act` (M5.1; points in vision mode since M5.2) | 14.1 | A `BrowserService` | `ask`; a sensitive action in the user's Chrome is always `ask` (14.2.2) |
 
 `browser_screenshot` is the only tool that returns an image: a text caption and an MCP
 `ImageContent` (JPEG, base64). The browser tools put page text in an

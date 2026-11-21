@@ -42,7 +42,13 @@ ActionKind = Literal[
     "dialog",
 ]
 ACTIONS_WITH_REF: Final = frozenset({"click", "type", "select", "hover", "drag"})
-"""The actions that need the ``ref`` of an element from the latest snapshot."""
+"""The actions that need the ``ref`` of an element from the latest snapshot, or a point (``x``
+and ``y``) in vision mode. ``select`` needs a ref."""
+ACTIONS_WITH_POINT: Final = frozenset({"click", "type", "hover", "drag", "scroll"})
+"""The actions that can use a point (``x`` and ``y``) instead of a ref: vision mode (M5.2)."""
+MAX_COORDINATE: Final = 10_000
+"""The largest ``x`` or ``y`` that a tool call can give. The session checks the point against
+the viewport."""
 
 ExtractKind = Literal["text", "links", "tables", "fields"]
 TabAction = Literal["list", "new", "select", "close"]
@@ -71,11 +77,21 @@ class BrowserError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Act:
-    """One action of ``browser_act``. M5.2 (vision mode) adds a coordinate point as a second way
-    to name the element."""
+    """One action of ``browser_act``. An action names its element with a ``ref`` from the latest
+    snapshot, or with a point (``x``, ``y``) in the pixels of the latest viewport screenshot
+    (vision mode, M5.2). A point is in CSS pixels from the top left corner of the viewport."""
 
     action: ActionKind
     ref: str | None = None
+    x: float | None = None
+    y: float | None = None
+    """The point of the action in vision mode (``click``, ``type``, ``hover``, ``drag``,
+    ``scroll``)."""
+    to_x: float | None = None
+    to_y: float | None = None
+    """The point to drop on (``drag`` in vision mode)."""
+    clicks: int = 1
+    """The number of clicks (``click``): 2 is a double click."""
     text: str | None = None
     """The text to type (``type``) or the key to press (``press``, for example ``Enter``)."""
     values: tuple[str, ...] = ()
@@ -93,6 +109,19 @@ class Act:
     """Accept or dismiss the open dialog (``dialog``)."""
     prompt_text: str | None = None
     """The answer to a ``prompt`` dialog."""
+
+    @property
+    def point(self) -> tuple[float, float] | None:
+        """The point of the action, or ``None`` when the action uses a ref."""
+        if self.x is None or self.y is None:
+            return None
+        return (self.x, self.y)
+
+    @property
+    def to_point(self) -> tuple[float, float] | None:
+        if self.to_x is None or self.to_y is None:
+            return None
+        return (self.to_x, self.to_y)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +161,12 @@ class Screenshot:
     page: PageState
     data: bytes
     mime_type: str
+    width: int = 0
+    height: int = 0
+    """The size of the image in pixels, or 0 when the target does not know it. For a viewport
+    screenshot of a target with vision mode, one pixel is one CSS pixel of the viewport, so the
+    agent can give a point of the image to ``browser_act``."""
+    full_page: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +195,11 @@ class ExtractRequest:
 
 
 class BrowserSession(Protocol):
-    """One live browser of one run."""
+    """One live browser of one run.
+
+    A session that can act at a point (vision mode, M5.2) has the class attribute
+    ``vision = True``. The service reads it with ``getattr``, so a session without it (for
+    example ``my_chrome`` before it adds vision mode) refuses a point with a clear error."""
 
     @property
     def target(self) -> TargetName: ...
@@ -221,6 +260,11 @@ class LoginFiller(Protocol):
         field in a document that ``site_allows`` refuses. An error message has no part of the
         secret."""
         ...
+
+
+def has_vision(session: object) -> bool:
+    """True when ``session`` can act at a point (vision mode, M5.2)."""
+    return getattr(session, "vision", False) is True
 
 
 class BrowserTarget(Protocol):

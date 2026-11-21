@@ -188,7 +188,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | `browser_dialog` | `tools/browser_*.py` | `browser_act(action="dialog", accept, prompt_text)` answers a dialog. An action that opens a dialog returns at once with a note. Done in M5.1. | Adapt | M5 (done, M5.1) |
 | `browser_vault` (logins never in the transcript) | `agent/vault_*.py` | Saved logins in the sama vault, org or personal. `browser_vault` fills them on their own site inside the control plane, and the results hide the values (§14.1). Done in M5.3. | Adapt | M5 (done, M5.3) |
 | URL policy and SSRF guard | `tools/browser_url_policy.py` | The outbound address rules apply to every navigation of the cloud browser since M5.1 (§16.4). The allow list and the block list of each org apply since M5.3 (§14.1). | Adapt | M5 (done, M5.1 and M5.3) |
-| Vision mode (screenshot and coordinates) | `computer_use` | `browser_screenshot` plus coordinate actions (§14.1). | Adapt | M5 |
+| Vision mode (screenshot and coordinates) | `computer_use` | `browser_screenshot` (one pixel is one CSS pixel of the viewport) plus `browser_act` at a point (`x`, `y`) for `click`, `type`, `hover`, `drag`, and `scroll` (§14.1, "Vision mode (M5.2)"). Done in M5.2 on the `cloud` target. `my_chrome` later (§14.2.2). | Adapt | M5 (done, M5.2) |
 | Visible cursor, click, type in the user's Chrome | none | Overlay with cursor and Stop, CDP input events, consent for each site, a click of the user for sensitive actions, pause on takeover, and a blocked site list (§14.2.2). | New | M5 (done, M5.5) |
 
 ## 12. MCP, integrations, and plugins
