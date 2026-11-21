@@ -13,9 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import Attachment, AuditEntry, ChannelIdentity, Session, SessionBinding
 from sama.gateway.direct import approval_code
-from sama.gateway.sessions import FollowSettings
+from sama.gateway.sessions import BG_EMPTY, JOINED, FollowSettings
 from sama.gateway.whatsapp import WhatsAppGateway
 from sama.gateway.whatsapp_providers import Inbound, MediaRef
+from sama.orchestrator.queue import RunQueue
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
 from tests.gateway.channel_support import MIA, NUMBER, FakeWhatsApp, add_channel, code_for
@@ -402,3 +403,30 @@ async def test_the_coding_commands_route_to_the_coding_agent(
         ).one()
     assert run.coding_agent == "claude_code"
     assert run.content["text"] == "octo/demo fix the typo"
+
+
+async def test_a_message_joins_the_running_run_and_bg_and_stop_work(
+    gateway: WhatsAppGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    provider: FakeWhatsApp,
+) -> None:
+    """M7.1: the busy modes in WhatsApp (and email, which shares the direct gateway)."""
+    await pair(gateway, engine, tenant)
+    queue = RunQueue(engine)
+    await gateway.handle(inbound("write the long report"))
+    main = await queue.claim("test-owner")
+    assert main is not None
+    await gateway.handle(inbound("also add a chart"))
+    assert provider.texts()[-1] == JOINED
+    await gateway.handle(inbound("/bg"))
+    assert provider.texts()[-1] == BG_EMPTY.format(command="/bg")
+    await gateway.handle(inbound("/bg check the weather"))
+    side = await queue.claim("test-owner")
+    assert side is not None
+    assert side.side
+    assert "/stop 2 stops only this run" in provider.texts()[-1]
+    await gateway.handle(inbound("/stop 2"))
+    assert provider.texts()[-1] == "Stopped run 2: check the weather"
+    await gateway.handle(inbound("/stop"))
+    assert provider.texts()[-1] == "Stopped 2 runs."

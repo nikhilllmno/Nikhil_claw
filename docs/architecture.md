@@ -365,7 +365,7 @@ maintenance calls `sweep_steers()`: it sends the pending notes of completed runs
 came in after `complete`) as a new message, and it drops (status `dropped`) the pending notes of
 failed and cancelled runs. It handles at most 50 runs in one pass (`STEER_SWEEP_BATCH`).
 
-**Busy modes and parallel runs (M7.1, migration `0039`).** The busy mode of an agent profile
+**Busy modes and parallel runs (M7.1, migration `0040`).** The busy mode of an agent profile
 (`agent_profiles.busy_mode`) says what a new message does while a run of its session is open.
 The modes follow Claude Code:
 
@@ -3252,6 +3252,11 @@ One gateway service hosts all channel adapters. Each adapter does five things:
 | Handoff | `/handoff slack` or `/handoff web` in the direct chat | `/sama handoff telegram` or `/sama handoff web` in a direct message | `/handoff telegram` or `/handoff slack` in the composer (`POST /sessions/{id}/handoff`). |
 | Undo (M6.4) | `/undo` in the direct chat | `/sama undo` in a direct message | `/undo` in the composer (`POST /sessions/{id}/undo`). |
 | Rollback (M6.4) | `/rollback` lists the checkpoints and `/rollback NUMBER` restores one, in the direct chat | `/sama rollback [NUMBER]` in a direct message | `/rollback [NUMBER]` in the composer (`GET /sessions/{id}/checkpoints`, `POST /sessions/{id}/rollback`). |
+
+WhatsApp and email (M7.8, Section 11.9) use the shared direct gateway
+(`sama.gateway.direct`), so they have the same busy controls as Telegram: a plain message
+joins the running run, `/bg TASK` starts a parallel run, and `/stop [NUMBER]` stops all runs or
+one run. In email, a reply in the thread is the message.
 
 A chat follower that follows a run also follows the new run when the notes of the run are
 requeued (Section 4.3), so the answer to a late note comes in the same chat.
