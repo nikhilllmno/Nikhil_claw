@@ -69,6 +69,7 @@ email) and confirms the address with the admin API, as the link in the email wou
 | `12-admin-help` | Each admin page for the owner; download the org export and my data; a member gets no admin area; help pages without sign-in (M6.8, M6.9). |
 | `13-m7-skills-channels` | The builtin skill library (at least 68 skills) and `/decision-memo` loads its skill; WhatsApp (Meta, Twilio, Gupshup) and email connects refuse fake credentials and leave no row; pairing codes, webhooks, and admin rules of the channels; the Settings link `?connect=whatsapp&provider=twilio` opens the form and shows the refusal (M7.7, M7.8). |
 | `14-console` | Each of the 13 console sections opens; a webhook is made, gets a signed test, is edited, and is deleted; the harness sets the reasoning effort (M7.10). |
+| `15-coding-agents` | Direct mode with `/claude` until `/sama`; `/codex <task>`; the approval card of `coding_agent_run` when the agent calls it (M7.2). |
 
 Add a flow when its item lands on main. The staging web app deploys to Vercel by hand
 (`web/README.md`), not from CI. A flow of a new page fails while that deploy is behind `main`,
