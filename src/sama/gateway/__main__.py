@@ -28,7 +28,9 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import SecretStr
 
+from sama.api.origins import parse_origins
 from sama.db.engine import create_engine
+from sama.gateway.handoff import Handoffs
 from sama.integrations.hub import TelegramHub
 from sama.integrations.slack_hub import SlackHub
 from sama.observability.logs import configure_logging
@@ -55,8 +57,15 @@ def build_app() -> FastAPI:
     keys = OrgKeys(
         vault, {SecretName.OPENAI_API_KEY: SecretStr(openai_key) if openai_key else None}
     )
-    hub = TelegramHub(engine, vault, keys=keys)
-    slack = SlackHub(engine, vault)
+    try:
+        origins = parse_origins(os.environ.get("SAMA_WEB_ORIGINS", ""))
+    except ValueError as error:
+        raise SystemExit(f"SAMA_WEB_ORIGINS: {error}") from None
+    handoffs = Handoffs(engine, web_url=origins[0] if origins else None)
+    hub = TelegramHub(engine, vault, keys=keys, handoffs=handoffs)
+    slack = SlackHub(engine, vault, handoffs=handoffs)
+    handoffs.register("telegram", hub.door)
+    handoffs.register("slack", slack.door)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

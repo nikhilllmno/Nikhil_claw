@@ -114,6 +114,29 @@ export interface ChatMessage {
   created_at: string;
 }
 
+/** The answer of `POST /sessions/{id}/messages`. */
+export interface SentMessage {
+  run_id: string;
+  /** True when the message waits behind an open run of the session (M3.9). */
+  queued: boolean;
+}
+
+/** The answer of `POST /sessions/{id}/steer`. */
+export interface Steered {
+  /** True when the note went to the open run. False when the API sent it as a message. */
+  steered: boolean;
+  /** The open run for a note, or the new run for a message. */
+  run_id: string;
+  queued: boolean;
+}
+
+/** The answer of `POST /sessions/{id}/handoff`. */
+export interface Handoff {
+  to_channel: string;
+  /** The answer for the user. */
+  text: string;
+}
+
 export interface Approval {
   id: string;
   run_id: string;
@@ -978,7 +1001,12 @@ export class ApiClient {
     }
   };
   sendMessage = (id: string, text: string) =>
-    this.json<{ run_id: string }>(`/sessions/${id}/messages`, { method: "POST", body: { text } });
+    this.json<SentMessage>(`/sessions/${id}/messages`, { method: "POST", body: { text } });
+  /** A note for the open run. Without an open run the API sends the text as a message. */
+  steer = (id: string, text: string) =>
+    this.json<Steered>(`/sessions/${id}/steer`, { method: "POST", body: { text } });
+  handoff = (id: string, to: string) =>
+    this.json<Handoff>(`/sessions/${id}/handoff`, { method: "POST", body: { to } });
   compact = (id: string, focus: string) =>
     this.json<{ run_id: string }>(`/sessions/${id}/compact`, { method: "POST", body: { focus } });
   cancelRun = (runId: string) => this.json<{ status: string }>(`/runs/${runId}/cancel`, { method: "POST" });

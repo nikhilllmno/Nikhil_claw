@@ -258,7 +258,7 @@ async def new_session(
                 worker_bot_id=target.worker_bot_id,
             )
         )
-        await _bind(connection, channel, key, target, session_id)
+        await bind(connection, channel, key, target, session_id)
         details: dict[str, str] = {"audience": target.audience, "channel": channel}
         if target.worker_bot_id is not None:
             details["worker_bot_id"] = str(target.worker_bot_id)
@@ -521,7 +521,7 @@ def approval_text(row: Any) -> str:
     return f"{head}\n\n{arguments}".strip()
 
 
-async def _bind(
+async def bind(
     connection: AsyncConnection, channel: str, key: str, target: Target, session_id: uuid.UUID
 ) -> None:
     statement = pg_insert(SessionBinding).values(
@@ -743,6 +743,16 @@ class KeyedLocks:
 PIN_COMMANDS: Final = frozenset({"pin", "pins", "unpin"})
 PIN_USAGE: Final = "Write the text to pin after the command."
 COMPACTING: Final = "Compacting the context. This can take a minute."
+STEERED: Final = "sama adds the note to the current run. The run reads it at its next step."
+STEER_EMPTY: Final = "Write the note after the command, for example: {command} use metric units"
+
+
+def queued_text(steer: str, stop: str) -> str:
+    """The answer to a message that waits for an open run of its session (M3.9)."""
+    return (
+        f"Queued. sama answers after the current run. Send {steer} TEXT to add a note to the"
+        f" current run, or {stop} to stop it."
+    )
 
 
 def _pin_line(number: int, pin: Pin) -> str:

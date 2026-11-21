@@ -236,3 +236,20 @@ async def test_a_repeat_after_a_reconnect_is_dropped(
     assert hub._bots[tenant.ids["slack"]] is not first
     await drain(hub)
     assert slack.texts() == [PAIR_PROMPT]
+
+
+async def test_the_handoff_door_gives_the_gateway_of_an_active_app(
+    hub: SlackHub, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    door = await hub.door(tenant.ids["slack"])
+    assert door is not None
+    assert door._app.integration_id == tenant.ids["slack"]
+    assert await hub.door(tenant.ids["slack"]) is door, "the door shares the cache"
+    assert await hub.door(uuid.uuid4()) is None
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Integration)
+            .where(Integration.id == tenant.ids["slack"])
+            .values(status="pending")
+        )
+    assert await hub.door(tenant.ids["slack"]) is None

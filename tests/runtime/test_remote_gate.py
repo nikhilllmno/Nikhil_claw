@@ -9,7 +9,7 @@ import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from sama.gate.wire import GateRequest
+from sama.gate.wire import STEER_HEADER, GateRequest
 from tests.support import make_scope
 
 pytest.importorskip("claude_agent_sdk")
@@ -106,3 +106,42 @@ async def test_a_bad_answer_raises(response: httpx.Response) -> None:
 
 def test_the_token_is_not_in_the_repr() -> None:
     assert TOKEN not in repr(RemoteGate("http://tools.test/gate", TOKEN))
+
+
+async def test_the_gate_asks_for_steer_notes_and_returns_them() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, json={"action": "allow", "reason": "", "step": "policy", "steer": "go left"}
+        )
+
+    gate = gate_with(httpx.MockTransport(handler))
+    decision = await gate.check(make_scope(), "Bash", {"command": "ls"}, call_id="toolu_1")
+    assert (decision.action, decision.steer) == ("allow", "go left")
+    assert seen[0].headers[STEER_HEADER] == "1"
+
+
+async def test_a_gate_without_steer_does_not_ask_for_notes() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"action": "allow", "reason": "", "step": "policy"})
+
+    gate = RemoteGate(
+        "http://tools.test/gate", TOKEN, transport=httpx.MockTransport(handler), steer=False
+    )
+    decision = await gate.check(make_scope(), "Bash", {"command": "ls"}, call_id="toolu_1")
+    assert (decision.action, decision.steer) == ("allow", "")
+    assert STEER_HEADER not in seen[0].headers
+
+
+async def test_an_answer_without_steer_has_no_notes() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"action": "deny", "reason": "no", "step": "policy"})
+
+    gate = gate_with(httpx.MockTransport(handler))
+    decision = await gate.check(make_scope(), "Bash", {}, call_id="toolu_1")
+    assert (decision.action, decision.steer) == ("deny", "")

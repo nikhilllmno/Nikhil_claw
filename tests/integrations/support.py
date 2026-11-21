@@ -208,6 +208,10 @@ class FakeSlack:
             ts = f"1700000000.{next(self._ts):06d}"
             self.messages[ts] = (body["channel"], body["text"])
             return httpx.Response(200, json={"ok": True, "ts": ts, "channel": body["channel"]})
+        if method == "conversations.open":
+            # The direct message of a user ``U...`` is ``D...`` with the same rest.
+            channel = "D" + str(body["users"])[1:]
+            return httpx.Response(200, json={"ok": True, "channel": {"id": channel}})
         if method == "chat.update" and body["ts"] in self.messages:
             self.messages[body["ts"]] = (body["channel"], body["text"])
         return httpx.Response(200, json={"ok": True})

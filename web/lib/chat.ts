@@ -166,3 +166,47 @@ export function parseCompact(text: string): string | null {
 export function sessionTitle(session: { id: string; title: string | null }): string {
   return session.title?.trim() || `Session ${session.id.slice(0, 8)}`;
 }
+
+/** The places that `/handoff` can move a session to. */
+export const HANDOFF_CHANNELS = ["telegram", "slack", "web"] as const;
+export type HandoffChannel = (typeof HANDOFF_CHANNELS)[number];
+
+/** A busy control or a context command of the composer (M3.9). */
+export type ChatCommand =
+  | { kind: "compact"; focus: string }
+  | { kind: "steer"; note: string }
+  | { kind: "handoff"; to: HandoffChannel | null }
+  | { kind: "stop" };
+
+/**
+ * The command in a composer text, or `null` for a normal message. `/handoff` with an unknown
+ * place gives `to: null`, so that the composer can show the usage.
+ */
+export function parseCommand(text: string): ChatCommand | null {
+  const trimmed = text.trim();
+  const focus = parseCompact(trimmed);
+  if (focus !== null) return { kind: "compact", focus };
+  const steer = /^\/steer(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  if (steer) return { kind: "steer", note: (steer[1] ?? "").trim() };
+  const handoff = /^\/handoff(?:\s+(\S*))?\s*$/i.exec(trimmed);
+  if (handoff) {
+    const to = (handoff[1] ?? "").toLowerCase();
+    return {
+      kind: "handoff",
+      to: (HANDOFF_CHANNELS as readonly string[]).includes(to) ? (to as HandoffChannel) : null,
+    };
+  }
+  if (/^\/stop$/i.test(trimmed)) return { kind: "stop" };
+  return null;
+}
+
+/** The text that the chat shows when a message waits behind an open run. */
+export const QUEUED_NOTICE =
+  "Queued. sama answers after the current run. Type /steer TEXT to add a note to the current run, or press Stop.";
+
+/** The text that the chat shows when a note goes to the open run. */
+export const STEERED_NOTICE = "sama adds the note to the current run. The run reads it at its next step.";
+
+/** The usage text of `/steer` and `/handoff`. */
+export const STEER_USAGE = "Write the note after the command, for example: /steer use metric units";
+export const HANDOFF_USAGE = "Write where the session goes: /handoff telegram or /handoff slack";

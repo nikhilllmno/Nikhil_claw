@@ -180,7 +180,13 @@ def no_followers(gateway: TelegramGateway) -> None:
     """The gateway queues runs but does not follow them."""
 
     async def skip(
-        chat_id: int, target: Any, run_id: uuid.UUID, reply_to: int, place: object
+        chat_id: int,
+        target: Any,
+        run_id: uuid.UUID,
+        reply_to: int | None,
+        place: object,
+        *,
+        via: int | None = None,
     ) -> None:
         gateway._followers.discard(place)
 

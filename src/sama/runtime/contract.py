@@ -110,6 +110,10 @@ class Capabilities(_Frozen):
     Section 6.3). A runtime without it fails such a request with ``INVALID_REQUEST``."""
     compaction_archive: bool = False
     """The runtime gives the transcript to an archiver before it compacts (Section 6.3)."""
+    mid_run_steer: bool = False
+    """The runtime gives the notes of ``/steer`` to the model at the next tool call of the run
+    (Section 4.3). For a runtime without it, the notes stay pending, and they go to the session
+    as one new message after the run completes."""
 
 
 # ---------------------------------------------------------------------------------------------

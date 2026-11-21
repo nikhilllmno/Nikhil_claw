@@ -163,3 +163,25 @@ async def test_a_token_of_another_bot_is_not_used(
     await vault.put(tenant.org, SecretName.TELEGRAM_BOT_TOKEN, "1000:" + "b" * 35)
     url = f"/telegram/{tenant.ids['bot']}/webhook"
     assert (await http.post(url, json=start(), headers={HEADER: SECRET})).status_code == 503
+
+
+async def test_the_handoff_door_gives_the_gateway_of_an_available_bot(
+    hub: TelegramHub, engine: AsyncEngine, tenant: Tenant, vault: Vault
+) -> None:
+    door = await hub.door(tenant.ids["bot"])
+    assert door is not None
+    assert door is await hub.gateway(str(tenant.ids["bot"]), SECRET), "the door shares the cache"
+    assert await hub.door(uuid.uuid4()) is None
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Integration).where(Integration.id == tenant.ids["bot"]).values(status="failed")
+        )
+    assert await hub.door(tenant.ids["bot"]) is None
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Integration).where(Integration.id == tenant.ids["bot"]).values(status="active")
+        )
+    hub.forget(tenant.ids["bot"])
+    await vault.delete(tenant.org, SecretName.TELEGRAM_BOT_TOKEN)
+    assert await hub.door(tenant.ids["bot"]) is None, "a bot without a token has no door"
+    await hub.drain()

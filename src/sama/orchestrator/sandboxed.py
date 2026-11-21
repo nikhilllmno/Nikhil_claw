@@ -116,6 +116,7 @@ CAPABILITIES: Final[Mapping[RuntimeKind, Capabilities]] = {
         mcp_client=True,
         manual_compaction=True,
         compaction_archive=True,
+        mid_run_steer=True,
     ),
     RuntimeKind.OPENAI_AGENTS_SDK: Capabilities(
         streaming=True,

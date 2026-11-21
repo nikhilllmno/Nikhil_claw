@@ -69,7 +69,8 @@ export function Composer({ value, onChange, onSend, sending, running, stopping, 
         </button>
       </div>
       <p className={styles.hint}>
-        Enter to send, Shift+Enter for a new line. Type /compact to shorten the context.
+        Enter to send, Shift+Enter for a new line. Type /compact to shorten the context, /steer TEXT to guide the
+        current run, or /handoff telegram|slack to move the session.
         {nearLimit ? ` ${value.length.toLocaleString()} of ${MAX_MESSAGE_CHARS.toLocaleString()} characters.` : ""}
       </p>
     </form>

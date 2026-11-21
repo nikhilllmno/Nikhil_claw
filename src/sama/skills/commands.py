@@ -27,6 +27,8 @@ RESERVED: Final = frozenset(
         "compact",
         "learn",
         "connect",
+        "steer",
+        "handoff",
         "reset",
         "status",
         "settings",

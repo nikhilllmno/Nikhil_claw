@@ -29,7 +29,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -42,11 +42,20 @@ from sama.db.models import ChannelGroup, ChannelIdentity, Session, SessionBindin
 from sama.gate.service import ApprovalError, GateService
 from sama.gateway.connect import connect_answer
 from sama.gateway.cron import cron_reply
+from sama.gateway.handoff import (
+    USAGE,
+    Chat,
+    HandoffError,
+    Handoffs,
+    moved_away,
+)
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
     COMPACTING,
     PIN_COMMANDS,
+    STEER_EMPTY,
+    STEERED,
     Bound,
     FollowSettings,
     KeyedLocks,
@@ -59,6 +68,7 @@ from sama.gateway.sessions import (
     new_session,
     offers_always,
     pin_reply,
+    queued_text,
     send_ending,
     send_media,
     stop_runs,
@@ -108,6 +118,9 @@ HELP: Final = (
     "Send a direct message to the sama app, or mention it in a linked channel.\n"
     "/sama new - start a new session (direct messages)\n"
     "/sama stop - stop the open runs of this conversation\n"
+    "/sama steer TEXT - add a note to the current run (direct messages). In a thread, mention"
+    " the app and write /steer TEXT\n"
+    "/sama handoff telegram|web - move the session of the direct message to another channel\n"
     "/sama compact [focus] - make the context shorter (direct messages)\n"
     "/sama pin TEXT - keep a text in the context. /sama pins lists the pins. /sama unpin NUMBER"
     " removes one (direct messages)\n"
@@ -123,6 +136,7 @@ HELP: Final = (
 
 _ACTION: Final = re.compile(r"ap:([0-9a-f]{32}):([yna])")
 _SLACK_ID: Final = re.compile(r"[A-Z0-9]{2,32}")
+_STEER: Final = re.compile(r"/steer(?:\s+(.*))?", re.S | re.I)
 
 
 def escape(text: str) -> str:
@@ -347,6 +361,7 @@ class SlackGateway:
         seen: SeenEvents | None = None,
         pins: PinStore | None = None,
         jobs: JobService | None = None,
+        handoffs: Handoffs | None = None,
     ) -> None:
         """``lockout``, ``followers``, and ``seen`` can be shared by all gateways of the process,
         so that the limits and the repeat check hold for the whole process."""
@@ -361,6 +376,7 @@ class SlackGateway:
         self._connections = connections
         self._pins = pins or PinStore(engine)
         self._jobs = jobs
+        self._handoffs = handoffs
         self._lockout = lockout or Lockout()
         self._seen = seen or SeenEvents()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -487,6 +503,18 @@ class SlackGateway:
             await self._say(place, "You do not have access to this workspace now.")
             return
         refs = refs or []
+        steer = _STEER.fullmatch(text) if not refs else None
+        if steer is not None:
+            note = (steer.group(1) or "").strip()
+            if not note:
+                await self._say(place, STEER_EMPTY.format(command="/steer"))
+                return
+            answer = await self._steer(place, target, grants, note)
+            if answer is not None:
+                await self._say(place, answer)
+                return
+            # No run is open: the note is a normal message.
+            text = note
         if not text and not refs:
             return
         if len(text) > MAX_INPUT_CHARS:
@@ -530,6 +558,25 @@ class SlackGateway:
             self._followers.discard(holder)
             raise
         self._spawn(self._follow(place, target, run_id, holder))
+        if await self._queue.waits(org_id=target.org_id, run_id=run_id):
+            how = "/sama steer" if place.thread_ts is None else "a mention with /steer"
+            await self._say(place, queued_text(how, "/sama stop"))
+
+    async def _steer(self, place: _Place, target: Target, grants: Grants, note: str) -> str | None:
+        """Adds ``note`` to the open run of the conversation. ``None`` when no run is open."""
+        current = await self._session(place, target, grants, create=False)
+        if current is None:
+            return None
+        try:
+            steered = await self._queue.steer(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                text=note,
+                user_id=target.user_id,
+            )
+        except QueueError as error:
+            return str(error)
+        return None if steered is None else STEERED
 
     async def _download_images(
         self, place: _Place, refs: list[_ImageRef]
@@ -692,7 +739,16 @@ class SlackGateway:
             identity = await self._identity(sender)
             if name == "pair" and rest:
                 return await self._pair(sender, channel, rest, identity)
-            if name not in ("new", "stop", "compact", "connect", "cron", *PIN_COMMANDS):
+            if name not in (
+                "new",
+                "stop",
+                "compact",
+                "connect",
+                "cron",
+                "steer",
+                "handoff",
+                *PIN_COMMANDS,
+            ):
                 if name not in ("help", "pair"):
                     return await self._skill(sender, channel, identity, name, rest)
                 return HELP
@@ -708,10 +764,91 @@ class SlackGateway:
                 return await self._connect(channel, identity, rest)
             if name == "cron":
                 return await self._cron(sender, channel, identity, rest)
+            if name == "steer":
+                return await self._steer_command(sender, channel, identity, rest)
+            if name == "handoff":
+                return await self._handoff(sender, channel, identity, rest)
             return await self._stop(sender, channel, identity)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
             return "sama cannot do this now. Try again later."
+
+    async def _steer_command(self, sender: str, channel: str, identity: Any, note: str) -> str:
+        """``/sama steer`` in a direct message. A Slack command has no thread, so a thread
+        uses a mention with ``/steer``."""
+        if not channel.startswith("D"):
+            return "In a thread, mention the sama app and write /steer TEXT."
+        if not note:
+            return STEER_EMPTY.format(command="/sama steer")
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        async with self._locks.hold((place.channel, place.thread_ts)):
+            answer = await self._steer(place, target, grants, note)
+            if answer is not None:
+                return answer
+            await self._start(place, target, note)
+        return "No run is open. sama takes the note as a new message."
+
+    async def _handoff(self, sender: str, channel: str, identity: Any, to: str) -> str:
+        """``/sama handoff`` in a direct message (Section 11.1)."""
+        if not channel.startswith("D"):
+            return "Only a direct message with the sama app can move its session."
+        if not to:
+            return USAGE.format(command="/sama handoff")
+        if self._handoffs is None:
+            return "sama cannot move sessions now."
+        place = _Place(channel, None, sender)
+        target = Target.private(identity)
+        async with self._engine.connect() as connection:
+            grants = await load_grants(connection, target.org_id, target.user_id)
+        if not grants.sees_workspace(target.workspace_id):
+            return "You do not have access to this workspace now."
+        async with self._locks.hold((place.channel, place.thread_ts)):
+            current = await self._session(place, target, grants, create=False)
+            if current is None:
+                return "This conversation has no session to move."
+            try:
+                moved = await self._handoffs.move(
+                    org_id=target.org_id,
+                    user_id=target.user_id,
+                    session_id=current.session_id,
+                    from_channel=CHANNEL,
+                    from_key=self._key(place),
+                    to_channel=to,
+                )
+            except HandoffError as error:
+                return str(error)
+        return moved.text
+
+    # -- handoff door ---------------------------------------------------------------------
+
+    async def open_chat(self, identity: Any) -> Chat:
+        """Opens the direct message of the app with a linked Slack user."""
+        opened = await self._client.call("conversations.open", users=str(identity.external_id))
+        place = _Place(str(opened["channel"]["id"]), None, str(identity.external_id))
+        return Chat(self._key(place), place)
+
+    async def adopt(
+        self,
+        chat: Chat,
+        target: Target,
+        run_ids: Sequence[uuid.UUID],
+        text: str,
+        *,
+        handoff_id: int,
+    ) -> None:
+        """Takes a session after a handoff: the open runs of the session, then a note. The
+        followers do not check the limit: the handoff moves them, it does not add them."""
+        place: _Place = chat.address
+        for run_id in run_ids:
+            holder = object()
+            self._followers.add(holder)
+            self._spawn(self._follow(place, target, run_id, holder, via=handoff_id))
+        await self._say(place, text)
 
     async def _new(self, sender: str, channel: str, identity: Any) -> str:
         if not channel.startswith("D"):
@@ -931,32 +1068,54 @@ class SlackGateway:
         return linked is not None
 
     async def _follow(
-        self, place: _Place, target: Target, run_id: uuid.UUID, holder: object
+        self,
+        place: _Place,
+        target: Target,
+        run_id: uuid.UUID,
+        holder: object,
+        *,
+        via: int | None = None,
     ) -> None:
+        """Follows the run, then the run of its late ``/steer`` notes (M3.9). The output stops
+        when the conversation loses its link or a handoff gives the run to another follower.
+        ``via`` is the handoff that started this follower."""
         settings = self._settings
         org_id = target.org_id
 
         async def allowed() -> bool:
             async with self._engine.connect() as connection:
-                return await self._may_deliver(connection, place, target)
+                return await self._may_deliver(connection, place, target) and not await moved_away(
+                    connection, org_id, run_id, via
+                )
 
         outbox = _Outbox(self._client, place, allowed)
-        reply = Reply(outbox, None, settings.edit_interval_s)
 
         async def send_card(row: Any) -> None:
             text, blocks = approval_blocks(row)
             await outbox.send_message(text, blocks=blocks)
 
         try:
-            status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
-            await send_ending(self._engine, outbox, org_id, run_id, status, reply)
-            await send_media(self._engine, outbox, org_id, run_id)
+            while True:
+                reply = Reply(outbox, None, settings.edit_interval_s)
+                status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
+                await send_ending(self._engine, outbox, org_id, run_id, status, reply)
+                await send_media(self._engine, outbox, org_id, run_id)
+                after = await self._queue.requeued_run(org_id=org_id, run_id=run_id)
+                if after is None or await self._handed_off(org_id, run_id, via):
+                    # A handoff gave the run to another follower: that follower takes the run
+                    # of the late notes too.
+                    break
+                run_id = after
         except _Unlinked:
             log.warning("the conversation lost its link; run=%s is not delivered", run_id)
         except SlackError as error:
             log.warning("a Slack reply failed run=%s error=%s", run_id, error)
         finally:
             self._followers.discard(holder)
+
+    async def _handed_off(self, org_id: uuid.UUID, run_id: uuid.UUID, via: int | None) -> bool:
+        async with self._engine.connect() as connection:
+            return await moved_away(connection, org_id, run_id, via)
 
     # -- approvals ------------------------------------------------------------------------
 

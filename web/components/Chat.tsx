@@ -19,9 +19,13 @@ import {
   initialLive,
   isPaused,
   type LiveState,
+  HANDOFF_USAGE,
   openRunIds,
-  parseCompact,
+  parseCommand,
+  QUEUED_NOTICE,
   sessionTitle,
+  STEER_USAGE,
+  STEERED_NOTICE,
 } from "@/lib/chat";
 import { saveFile } from "@/lib/history";
 import { runEventStream } from "@/lib/stream";
@@ -56,6 +60,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  // The answer of a busy control: queued, steered, or moved (M3.9).
+  const [notice, setNotice] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const [tick, setTick] = useState(0);
   const localId = useRef(0);
@@ -168,34 +174,77 @@ export function Chat({ sessionId }: { sessionId: string }) {
     return () => clearInterval(timer);
   }, [running, loadQuestions]);
 
+  // The queued and steered notices are about the open runs: hide them when no run is open.
+  const shownNotice =
+    notice !== null && (running || (notice !== QUEUED_NOTICE && notice !== STEERED_NOTICE)) ? notice : null;
+
   const send = async () => {
     const submitted = draft;
     const text = submitted.trim();
     if (!text) return;
-    setSending(true);
+    // Only the text that was sent goes: what the user typed meanwhile stays.
+    const clearDraft = () => setDraft((current) => (current === submitted ? "" : current));
+    const command = parseCommand(text);
     setSendError(null);
+    setNotice(null);
+    if (command?.kind === "stop") {
+      clearDraft();
+      if (running) await stop();
+      else setNotice("No run is open now.");
+      return;
+    }
+    if (command?.kind === "steer" && !command.note) {
+      setSendError(STEER_USAGE);
+      return;
+    }
+    if (command?.kind === "handoff" && command.to === null) {
+      setSendError(HANDOFF_USAGE);
+      return;
+    }
+    setSending(true);
     setStopping(false);
     try {
-      const focus = parseCompact(text);
-      const { run_id: runId } =
-        focus === null ? await api.sendMessage(sessionId, text) : await api.compact(sessionId, focus);
-      // Only the text that was sent goes: what the user typed meanwhile stays.
-      setDraft((current) => (current === submitted ? "" : current));
-      if (focus === null) {
+      if (command?.kind === "handoff" && command.to !== null) {
+        const moved = await api.handoff(sessionId, command.to);
+        clearDraft();
+        setNotice(moved.text);
+        reloadSessions();
+        return;
+      }
+      let runId: string;
+      let queued = false;
+      let userText: string | null = text;
+      if (command?.kind === "compact") {
+        ({ run_id: runId } = await api.compact(sessionId, command.focus));
+        userText = null;
+      } else if (command?.kind === "steer") {
+        const answer = await api.steer(sessionId, command.note);
+        if (answer.steered) {
+          clearDraft();
+          setNotice(STEERED_NOTICE);
+          return;
+        }
+        // No run was open: the API sent the note as a message.
+        ({ run_id: runId, queued } = answer);
+        userText = command.note;
+      } else {
+        ({ run_id: runId, queued } = await api.sendMessage(sessionId, text));
+      }
+      clearDraft();
+      if (queued) setNotice(QUEUED_NOTICE);
+      if (userText !== null) {
         const now = new Date().toISOString();
         localId.current += 1;
-        setMessages((current) => [
-          ...(current ?? []),
-          {
-            id: `local-${localId.current}`,
-            seq: Number.MAX_SAFE_INTEGER,
-            run_id: runId,
-            role: "user",
-            author_user_id: null,
-            text,
-            created_at: now,
-          },
-        ]);
+        const message: ChatMessage = {
+          id: `local-${localId.current}`,
+          seq: Number.MAX_SAFE_INTEGER,
+          run_id: runId,
+          role: "user",
+          author_user_id: null,
+          text: userText,
+          created_at: now,
+        };
+        setMessages((current) => [...(current ?? []), message]);
       }
       const current = liveRef.current;
       if (current.runs[runId] === undefined) {
@@ -394,6 +443,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
         {sendError ? (
           <p className={`alert alert-error ${styles.banner}`} role="alert">
             {sendError}
+          </p>
+        ) : null}
+        {shownNotice ? (
+          <p className={`alert ${styles.banner}`} role="status">
+            {shownNotice}
           </p>
         ) : null}
         <Composer

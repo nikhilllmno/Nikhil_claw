@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,7 +12,7 @@ import httpx
 import pytest
 
 from sama.gate import GateStep, Verdict
-from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES
+from sama.gate.wire import GATE_PATH, MAX_GATE_BODY_BYTES, STEER_HEADER
 from sama.tenancy import RunTokenClaims, RunTokenSigner
 from sama.tools import MemoryTodoStore, ToolServer
 from tests.conformance.scripted_model import serve
@@ -156,3 +157,73 @@ async def test_the_server_runs_a_tool_call_on_ask_or_allow(server: Server) -> No
     [(name, arguments)] = server.gate.screens
     assert name == "todo"
     assert arguments["todos"][0]["content"] == "Plan"
+
+
+@dataclass
+class FakeSteers:
+    text: str = "The user sent new guidance.\n\ngo left"
+    taken: list[tuple[str, str]] = field(default_factory=list)
+    fail: bool = False
+
+    async def take_steers(self, *, org_id: Any, run_id: Any) -> str:
+        if self.fail:
+            raise RuntimeError("database down")
+        self.taken.append((str(org_id), str(run_id)))
+        text, self.text = self.text, ""
+        return text
+
+
+@pytest.fixture
+def steered() -> Iterator[tuple[Server, FakeSteers]]:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    gate = FakeGate()
+    steers = FakeSteers()
+    tools = ToolServer(signer=signer, todos=MemoryTodoStore(), gate=gate, steers=steers)
+    with serve(tools.app()) as base:
+        yield Server(base, signer, gate), steers
+
+
+STEER_SCOPE = make_scope().model_copy(
+    update={"org_id": str(uuid.uuid4()), "run_id": str(uuid.uuid4())}
+)
+
+
+async def post_steered(server: Server, body: Any, *, header: bool = True) -> httpx.Response:
+    token = server.signer.issue(STEER_SCOPE, ttl_s=600)
+    headers = {"authorization": f"Bearer {token}"}
+    if header:
+        headers[STEER_HEADER] = "1"
+    async with httpx.AsyncClient() as http:
+        return await http.post(server.base + GATE_PATH, headers=headers, json=body)
+
+
+async def test_the_gate_gives_the_steer_notes_once(
+    steered: tuple[Server, FakeSteers],
+) -> None:
+    server, steers = steered
+    first = (await post_steered(server, CALL)).json()
+    assert first["steer"].endswith("go left")
+    assert steers.taken == [(STEER_SCOPE.org_id, STEER_SCOPE.run_id)]
+    assert "steer" not in (await post_steered(server, CALL)).json()
+
+
+async def test_an_old_runner_gets_no_steer_key(steered: tuple[Server, FakeSteers]) -> None:
+    server, steers = steered
+    body = (await post_steered(server, CALL, header=False)).json()
+    assert body == {"action": "allow", "reason": "ok", "step": "policy"}
+    assert steers.taken == []
+
+
+async def test_a_child_call_and_an_ask_keep_the_notes(steered: tuple[Server, FakeSteers]) -> None:
+    server, steers = steered
+    assert "steer" not in (await post_steered(server, {**CALL, "child": True})).json()
+    server.gate.verdict = Verdict("ask", GateStep.POLICY, "needs a human")
+    assert "steer" not in (await post_steered(server, CALL)).json()
+    assert steers.taken == []
+
+
+async def test_a_steer_failure_keeps_the_verdict(steered: tuple[Server, FakeSteers]) -> None:
+    server, steers = steered
+    steers.fail = True
+    response = await post_steered(server, CALL)
+    assert response.json() == {"action": "allow", "reason": "ok", "step": "policy"}

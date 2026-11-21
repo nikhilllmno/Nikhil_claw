@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.connectors.service import ConnectionService
 from sama.db.models import Integration
 from sama.gate.service import GateService
+from sama.gateway.handoff import Handoffs
 from sama.gateway.pairing import Lockout
 from sama.gateway.sessions import FollowSettings
 from sama.gateway.slack import SeenEvents, SlackApp, SlackGateway, escape
@@ -88,6 +89,7 @@ class SlackHub(GatewayCache[_App]):
         reviews: ReviewApplier | None = None,
         connections: ConnectionService | None = None,
         jobs: JobService | None = None,
+        handoffs: Handoffs | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__()
@@ -101,6 +103,7 @@ class SlackHub(GatewayCache[_App]):
         self._reviews = reviews
         self._connections = connections
         self._jobs = jobs
+        self._handoffs = handoffs
         self._clock = clock
         self._lockout = Lockout()
         self._followers: set[object] = set()
@@ -181,23 +184,31 @@ class SlackHub(GatewayCache[_App]):
         except ValueError:
             raise HTTPException(status_code=401, detail=UNKNOWN) from None
         async with self._engine.connect() as connection:
-            row = (
-                await connection.execute(
-                    select(
-                        Integration.id,
-                        Integration.org_id,
-                        Integration.status,
-                        Integration.external_id,
-                        Integration.secret_hash,
-                        Integration.settings,
-                        Integration.updated_at,
-                    ).where(Integration.id == key, Integration.kind == "slack")
-                )
-            ).one_or_none()
+            row = (await connection.execute(self._row(key))).one_or_none()
         if row is None:
             raise HTTPException(status_code=401, detail=UNKNOWN)
         if row.status != "active" or not row.external_id or not row.secret_hash:
             return None
+        app = await self._cached(row)
+        secret = app.signing_secret.get_secret_value()
+        if not signed(secret, timestamp, given, body, self._clock()):
+            raise HTTPException(status_code=401, detail=UNKNOWN)
+        return app
+
+    async def door(self, integration_id: uuid.UUID) -> SlackGateway | None:
+        """The gateway of an active integration for a handoff (M3.9), without a request
+        signature. ``None`` when the app is not available."""
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(self._row(integration_id))).one_or_none()
+        if row is None or row.status != "active" or not row.external_id or not row.secret_hash:
+            return None
+        try:
+            return (await self._cached(row)).gateway
+        except HTTPException:
+            return None
+
+    async def _cached(self, row: Any) -> _App:
+        key = row.id
         app = self._bots.get(key)
         if app is None or app.updated_at != row.updated_at:
             async with self._lock:
@@ -206,10 +217,19 @@ class SlackHub(GatewayCache[_App]):
                     self.forget(key)
                     app = await self._build(row)
                     self._bots[key] = app
-        secret = app.signing_secret.get_secret_value()
-        if not signed(secret, timestamp, given, body, self._clock()):
-            raise HTTPException(status_code=401, detail=UNKNOWN)
         return app
+
+    @staticmethod
+    def _row(integration_id: uuid.UUID) -> Any:
+        return select(
+            Integration.id,
+            Integration.org_id,
+            Integration.status,
+            Integration.external_id,
+            Integration.secret_hash,
+            Integration.settings,
+            Integration.updated_at,
+        ).where(Integration.id == integration_id, Integration.kind == "slack")
 
     async def _build(self, row: Any) -> _App:
         try:
@@ -245,6 +265,7 @@ class SlackHub(GatewayCache[_App]):
             reviews=self._reviews,
             connections=self._connections,
             jobs=self._jobs,
+            handoffs=self._handoffs,
             lockout=self._lockout,
             followers=self._followers,
             seen=self._seen,

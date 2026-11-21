@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.connectors.service import ConnectionService
 from sama.db.models import Integration
 from sama.gate.service import GateService
+from sama.gateway.handoff import Handoffs
 from sama.gateway.pairing import Lockout
 from sama.gateway.sessions import wait_for_tasks
 from sama.gateway.telegram import TelegramBot, TelegramGateway, TelegramSettings
@@ -134,6 +135,7 @@ class TelegramHub(GatewayCache[_Bot]):
         reviews: ReviewApplier | None = None,
         connections: ConnectionService | None = None,
         jobs: JobService | None = None,
+        handoffs: Handoffs | None = None,
     ) -> None:
         """``keys`` gives the OpenAI key of an org for voice notes: the vault entry of the
         org, then the default key of the process. Without a key voice notes are off."""
@@ -150,6 +152,7 @@ class TelegramHub(GatewayCache[_Bot]):
         self._reviews = reviews
         self._connections = connections
         self._jobs = jobs
+        self._handoffs = handoffs
         self._lockout = Lockout()
         self._followers: set[object] = set()
 
@@ -199,6 +202,33 @@ class TelegramHub(GatewayCache[_Bot]):
         matches = hmac.compare_digest(secret_hash(given_secret), stored or "0" * 64)
         if row is None or not stored or not matches or row.status == "failed":
             raise HTTPException(status_code=401, detail=UNKNOWN)
+        return await self._cached(row, stored)
+
+    async def door(self, integration_id: uuid.UUID) -> TelegramGateway | None:
+        """The gateway of an integration for a handoff (M3.9), without a webhook secret.
+        ``None`` when the bot is not available."""
+        async with self._engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        Integration.id,
+                        Integration.org_id,
+                        Integration.status,
+                        Integration.name,
+                        Integration.external_id,
+                        Integration.secret_hash,
+                    ).where(Integration.id == integration_id, Integration.kind == "telegram")
+                )
+            ).one_or_none()
+        if row is None or not row.secret_hash or row.status == "failed":
+            return None
+        try:
+            return await self._cached(row, row.secret_hash)
+        except HTTPException:
+            return None
+
+    async def _cached(self, row: Any, stored: str) -> TelegramGateway:
+        key = row.id
         bot = self._bots.get(key)
         if bot is not None and bot.secret_hash == stored:
             return bot.gateway
@@ -243,6 +273,7 @@ class TelegramHub(GatewayCache[_Bot]):
             reviews=self._reviews,
             connections=self._connections,
             jobs=self._jobs,
+            handoffs=self._handoffs,
             transcriber=transcriber,
             lockout=self._lockout,
             followers=self._followers,

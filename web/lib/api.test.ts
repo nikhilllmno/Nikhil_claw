@@ -282,6 +282,26 @@ describe("listMessages", () => {
   });
 });
 
+describe("busy controls", () => {
+  it("posts a steer note and a handoff", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(202, { steered: true, run_id: "r1", queued: false }))
+      .mockResolvedValueOnce(json(200, { to_channel: "telegram", text: "moved" }))
+      .mockResolvedValueOnce(json(202, { run_id: "r2", queued: true }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.steer("s1", "use metric")).resolves.toEqual({ steered: true, run_id: "r1", queued: false });
+    await expect(client.handoff("s1", "telegram")).resolves.toEqual({ to_channel: "telegram", text: "moved" });
+    await expect(client.sendMessage("s1", "hi")).resolves.toEqual({ run_id: "r2", queued: true });
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method, init.body])).toEqual([
+      ["https://api.test/sessions/s1/steer", "POST", '{"text":"use metric"}'],
+      ["https://api.test/sessions/s1/handoff", "POST", '{"to":"telegram"}'],
+      ["https://api.test/sessions/s1/messages", "POST", '{"text":"hi"}'],
+    ]);
+  });
+});
+
 describe("errorText", () => {
   it("uses the message of an Error and the fallback for anything else", () => {
     expect(errorText(new Error("boom"), "fallback")).toBe("boom");
