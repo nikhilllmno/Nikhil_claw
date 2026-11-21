@@ -28,6 +28,7 @@ from sama.runtime.contract import (
     RunFailed,
     RunRequest,
     RuntimeRegistry,
+    SubagentEvent,
     TextDelta,
     Usage,
 )
@@ -471,3 +472,55 @@ async def test_the_default_worker_times_out_approvals(
     resume = harness.runtime.requests[-1]
     assert isinstance(resume, ResumeRequest)
     assert resume.decision is ApprovalDecision.REJECT
+
+
+class Emitting(FakeRuntime):
+    """A runtime whose run calls ``Worker.emit`` in the middle, as ``browser_task`` does from
+    the tool server of the same process (M5.6)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker: Worker | None = None
+        self.emitted: list[bool] = []
+
+    async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        assert self.worker is not None
+        yield TextDelta(text="a ", usage=Usage(output_tokens=1))
+        progress = SubagentEvent(subagent="browser_task", text="step 1/15: open a", call_id="t1")
+        scope = request.scope
+        self.emitted.append(await self.worker.emit(scope.org_id, scope.run_id, progress))
+        yield RunCompleted(output="done", usage=Usage(output_tokens=2))
+
+
+async def test_a_tool_of_the_process_adds_events_to_a_running_run(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness = Harness(engine)
+    runtime = Emitting()
+    registry = RuntimeRegistry()
+    registry.register(runtime)
+    harness.worker = Worker(harness.queue, registry, owner="w1", flush_s=0.0)
+    runtime.worker = harness.worker
+    run_id = await harness.send(tenant, "s1", "x")
+    assert await harness.worker.run_once()
+    assert runtime.emitted == [True]
+    assert await harness.events(run_id) == [
+        (0, "text_delta"),
+        (1, "subagent_event"),
+        (2, "run_completed"),
+    ]
+    async with engine.connect() as connection:
+        payload = (
+            await connection.execute(
+                select(RunEvent.payload).where(RunEvent.run_id == run_id, RunEvent.seq == 1)
+            )
+        ).scalar_one()
+    assert (payload["subagent"], payload["text"]) == ("browser_task", "step 1/15: open a")
+    # The run ended: an event for it now goes nowhere.
+    late = SubagentEvent(subagent="browser_task", text="late")
+    assert not await harness.worker.emit(str(tenant.org), str(run_id), late)
+    assert await harness.events(run_id) == [
+        (0, "text_delta"),
+        (1, "subagent_event"),
+        (2, "run_completed"),
+    ]

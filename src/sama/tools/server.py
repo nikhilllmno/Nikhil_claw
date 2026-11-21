@@ -114,6 +114,7 @@ from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunToke
 from sama.tools.approved import human_approved
 from sama.tools.board import register_delegation, register_tasks
 from sama.tools.browser import register_browser
+from sama.tools.browser_task import register_browser_task
 from sama.tools.clarify import (
     MAX_QUESTIONS,
     ClarifyBroker,
@@ -174,6 +175,7 @@ from sama.workflows.spec import WorkflowError
 
 if TYPE_CHECKING:
     from sama.browser.service import BrowserService
+    from sama.browser.task import BrowserTaskRunner
     from sama.connectors.service import ConnectionService
     from sama.skills.importer import SkillImporter
 
@@ -395,6 +397,8 @@ class ToolServer:
     - ``tasks``: the task board (``task_*``). Without it, these tools are hidden.
     - ``browser``: the cloud browser (``browser_*``, Section 14.1). Without it, these tools
       are hidden.
+    - ``browser_tasks``: the browser sub-agent (``browser_task``, M5.6). It needs ``browser``.
+      Without it, the tool is hidden.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -432,9 +436,11 @@ class ToolServer:
         steers: SteerBackend | None = None,
         sama_pr: SamaPr | None = None,
         browser: BrowserService | None = None,
+        browser_tasks: BrowserTaskRunner | None = None,
     ) -> None:
         self.signer = signer
         self.browser = browser
+        self.browser_tasks = browser_tasks if browser is not None else None
         self.importer = importer
         self.code = code
         self.images = images
@@ -467,6 +473,8 @@ class ToolServer:
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
+        if self.browser_tasks is not None:
+            await self.browser_tasks.aclose()
         for service in (self.vision, self.images, self.speech, self.importer, self.browser):
             if service is not None:
                 await service.aclose()
@@ -1061,6 +1069,8 @@ class ToolServer:
             register_workflows(server, self._call, self.workflows)
         if self.browser is not None:
             register_browser(server, self._call, self.browser)
+            if self.browser_tasks is not None:
+                register_browser_task(server, self._call, self.browser_tasks)
         if self.importer is not None:
             importer = self.importer
 

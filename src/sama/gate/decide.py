@@ -56,6 +56,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
             "browser_extract",
             "browser_tabs",
             "browser_vault",
+            "browser_task",
         }
     ),
 }
@@ -141,7 +142,8 @@ agent creates or widens waits for the approval of its owner before it fires (Sec
 writes waits for the approval of its owner before it runs (Section 12.3). The browser tools
 that open and read pages are here, as ``web_extract`` is; ``browser_act`` and ``browser_vault``
 are not, because a click, a form, or a saved login can change data with the logins of the user
-(Section 14.1)."""
+(Section 14.1). ``browser_task`` is not here for the same reason: its sub-agent clicks and types
+(M5.6)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"

@@ -18,6 +18,7 @@ takes one unused ticket for the same tool and arguments.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import uuid
@@ -298,6 +299,34 @@ class GateService:
             if verdict.action == "deny":
                 await self._audit(
                     connection, run.ref, "tool_gate.screen", None, _details(name, verdict)
+                )
+        return verdict
+
+    async def inner(
+        self, claims: RunTokenClaims, tool_name: str, arguments: Mapping[str, Any]
+    ) -> Verdict:
+        """The verdict for one step of a sama sub-agent tool, for example a click of
+        ``browser_task`` that the gate judges as ``browser_act`` (Section 14.1, M5.6). The
+        tool server calls it after the gate allowed the call of the sub-agent tool.
+
+        It is ``decide`` with the live context of the run: the authority, the toolsets, the
+        hardline list, and the policy rules. It records no tool call and uses no ticket, because
+        the step has no call id of the runtime. An ``ask`` stays ``ask``: the caller decides if
+        the approval of the sub-agent call covers it. The unattended step of ``decide`` does
+        not apply to the step: the sub-agent call passed it already (a pre-approval or an allow
+        rule of the job), and that decision covers the ``ask`` of its steps. A ``deny`` is in
+        the audit log as ``tool_gate.inner``."""
+        name, _effective = effective_call(tool_name, arguments)
+        ref = _ref_of(claims)
+        async with self._engine.begin() as connection:
+            run = None if ref is None else await self._load(connection, ref, claims, None)
+            if run is None:
+                return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
+            context = dataclasses.replace(run.context, unattended=False, preapproved=())
+            verdict = decide(context, tool_name, arguments)
+            if verdict.action == "deny":
+                await self._audit(
+                    connection, run.ref, "tool_gate.inner", None, _details(name, verdict)
                 )
         return verdict
 

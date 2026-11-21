@@ -863,12 +863,24 @@ def test_browser_vault_asks_by_default(action: str) -> None:
     assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
 
 
+def test_browser_task_asks_by_default_and_unattended_runs_cannot_use_it() -> None:
+    name = "mcp__sama__browser_task"
+    browser = frozenset({"browser"})
+    assert decide(context(toolsets=browser), name, {"goal": "g"}).action == "ask"
+    unattended = decide(context(toolsets=browser, unattended=True), name, {"goal": "g"})
+    assert unattended.action == "deny"
+    allowed = decide(
+        context(toolsets=browser, rules=(rule("browser_task", "allow"),)), name, {"goal": "g"}
+    )
+    assert allowed.action == "allow"
+
+
 def test_the_browser_toolset_is_for_private_runs_only() -> None:
     assert "browser" in DEFAULT_TOOLSETS
     assert "browser" not in DEFAULT_GROUP_TOOLSETS
     assert "browser" in CHILD_BLOCKED_TOOLSETS
     assert TOOLSETS["browser"] == frozenset(
-        {*BROWSER_READS, "browser_tabs", "browser_act", "browser_vault"}
+        {*BROWSER_READS, "browser_tabs", "browser_act", "browser_vault", "browser_task"}
     )
     child = effective_toolsets(
         DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="private", lineage="delegation"

@@ -92,6 +92,21 @@ async def test_vision_needs_a_key_or_the_vault(engine: AsyncEngine) -> None:
     assert with_key.tools.vision.model == "claude-opus-5"
 
 
+async def test_the_browser_key_turns_on_the_browser_sub_agent(engine: AsyncEngine) -> None:
+    assert fake_plane(engine).tools.browser_tasks is None
+    plane = fake_plane(
+        engine,
+        browserbase_key=SecretStr("bb-test"),
+        browserbase_project_id="project-1",
+        browser_task_model="claude-haiku-5-5",
+    )
+    runner = plane.tools.browser_tasks
+    assert runner is not None
+    assert runner.model == "claude-haiku-5-5"
+    assert runner.service is plane.tools.browser
+    await plane.tools.aclose()
+
+
 async def test_a_message_runs_to_the_end_in_the_process(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:

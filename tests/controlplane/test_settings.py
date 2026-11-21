@@ -173,6 +173,15 @@ def test_the_vision_model_has_a_default_and_can_be_set() -> None:
     assert settings(SAMA_VISION_MODEL=" claude-opus-5 ").vision_model == "claude-opus-5"
 
 
+def test_the_browser_task_model_has_a_default_and_needs_a_price() -> None:
+    assert settings().browser_task_model == DEFAULT_VISION_MODEL
+    model = settings(SAMA_BROWSER_TASK_MODEL=" claude-haiku-5-5 ").browser_task_model
+    assert model == "claude-haiku-5-5"
+    for bad in ("gpt-6-luna", "claude-unknown"):
+        with pytest.raises(SettingsError, match="SAMA_BROWSER_TASK_MODEL"):
+            settings(SAMA_BROWSER_TASK_MODEL=bad)
+
+
 GITHUB = {
     "SAMA_GITHUB_APP_ID": "123456",
     "SAMA_GITHUB_APP_SLUG": "sama-test",

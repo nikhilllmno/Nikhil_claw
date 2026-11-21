@@ -2181,7 +2181,7 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
-| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). `browser_vault` (since M5.3, when the process has the vault). Later: `browser_task` (M5.6). `browser_act` and `browser_vault` are `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
+| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). `browser_vault` (since M5.3, when the process has the vault). `browser_task` (since M5.6, `cloud` target only). `browser_act`, `browser_vault`, and `browser_task` are `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
@@ -4492,8 +4492,8 @@ Tools (the plan; M5.1 has the first six, see "Cloud browser (M5.1)" below):
 - `browser_extract(schema)` returns structured data from the page.
 - `browser_vault(action)` lists saved logins and fills a login form. The model never sees the
   password.
-- Optional `browser_task(goal)` hands a whole goal to a browser sub-agent (for example the
-  `browser-use` library on the cloud target) and returns the result.
+- `browser_task(goal)` hands a whole goal to a browser sub-agent on the cloud target and
+  returns the result (M5.6, see "Browser sub-agent (M5.6)" below).
 
 #### Cloud browser (M5.1)
 
@@ -4587,8 +4587,9 @@ do not get the toolset.
 **URL policy.** Every navigation goes through the outbound URL policy of Section 16.4 and the
 host lists of the org (M5.3, below). See Section 16.4 for the limits.
 
-**Later items.** M5.5 adds the `my_chrome` target (Section 14.2.2). M5.6 adds `browser_task`.
-The Browserbase key is a setting of the process. A key for each org comes later.
+**Later items.** M5.5 adds the `my_chrome` target (Section 14.2.2). M5.6 adds `browser_task`
+("Browser sub-agent (M5.6)" below). The Browserbase key is a setting of the process. A key for
+each org comes later.
 
 #### Browser vault and URL policy (M5.3)
 
@@ -4748,6 +4749,121 @@ point of it, as with computer use.
 - **Vault.** After `browser_vault` fills a saved login, screenshots are off for the rest of the
   run (M5.3), so vision mode is off too. Actions at a point still work, but the agent cannot see
   the page.
+
+#### Browser sub-agent (M5.6)
+
+`browser_task(goal, start_url, max_steps, max_cost_usd, timeout_s)` hands a whole browser goal
+to a sub-agent. One call runs many browser steps and returns a short result and the list of the
+actions. The code is in `sama.browser.task` (the loop), `sama.browser.budget` (the limits), and
+`sama.tools.browser_task` (the tool). The tool server has the tool when it has the browser tools
+(the Browserbase key and project).
+
+**Why not `browser-use`.** The roadmap item named the `browser-use` library. Sama does not use
+it, because it cannot run safely in this design:
+
+| Option | Problem |
+|---|---|
+| `browser-use` 1.0 in the tool server | The model writes Python, and the library runs it in a local subprocess with raw CDP access to the browser. Its docs say that this is not a sandbox. In the control plane, that code can read the database, the vault, and the keys of the process. |
+| `browser-use` 1.0 in the session sandbox | The sandbox needs the CDP address of the Browserbase session. With raw CDP, sandbox code can read every cookie of the persistent context of the user and act without the gate. This breaks D6 (no secrets in the sandbox) and the gate of Section 16.1. The sandbox image also gets larger. |
+| `browser-use` 0.x (tool calls, no code) | It pins `mcp==2.1.1` and `pydantic==2.13.5`. Sama needs `mcp>=2.3` and `pydantic>=2.14.3`. It also pulls many provider SDKs and sends telemetry by default. |
+| Browser Use Cloud (hosted API) | It uses its own browser and its own model, not the Browserbase session of the user and not the model proxy. The pages and the goal go to a third party. |
+
+So sama runs its own small loop with the typed browser tools. This is the closest safe
+version: the same tools, the same session, and the same rules as the six browser tools.
+
+**The loop.** The loop runs in the tool server, in the process of the call.
+
+1. The model of the sub-agent gets a fixed system prompt, the goal, and seven tools: `open`,
+   `act`, `snapshot`, `screenshot`, `extract` (`text`, `links`, `tables`), `tabs`, and `done`.
+   The first six call `BrowserService` on the browser session of the run, so they use the same
+   tabs, cookies, and logins as `browser_open`. With `start_url`, the loop opens the URL before
+   the first model call.
+2. Each model call is one step. A step can run at most 5 tool calls. The last step must call
+   `done` (`tool_choice`), so the task always ends with the best result that the sub-agent has.
+3. The task ends when the sub-agent calls `done`, answers with text only, or reaches a limit.
+4. Only one `browser_task` of a run runs at a time. The browser session stays open after the
+   task, so the main agent can read the last page with `browser_snapshot`.
+
+**Model proxy.** The sub-agent calls the Anthropic Messages API through the model proxy, with
+the run token of the `browser_task` call as the key. In the control plane, `ProxyModelClient`
+sends the request to the proxy app in the same process (an ASGI transport), so the request does
+not leave the process. The proxy checks the token, the live authority, and the budgets of the
+run, the user, and the org, uses the org key or the sama key, and writes a `model_calls` row for
+each call (Section 16.6). The model is `SAMA_BROWSER_TASK_MODEL` (default `claude-sonnet-5-5`).
+It must have a price in the price table.
+
+**Budgets.**
+
+| Limit | Default | Maximum |
+|---|---|---|
+| `max_steps` (model calls) | 15 | 40 |
+| `max_cost_usd` (estimated with the price table of the proxy) | 0.50 | 2.00 |
+| `timeout_s` | 300 | 600 (at least 30) |
+| Output tokens of one model call | 2,048 | |
+| Goal | | 4,000 characters |
+| Result for the main agent | | 4,000 characters |
+
+The task stops before a model call when the estimate reaches `max_cost_usd`, so the last call can
+pass the limit by its own cost.
+
+The time limit does not cut work in the middle. Each model call and each browser action runs in
+its own task, which a time limit or a cancel of the tool call does not stop. The loop checks the
+time before each model call, and before each action also after its gate check. When the time is over during a model call,
+the task returns at once, and the call goes on in its task: the proxy records its usage when it
+ends (the estimate of the task does not have that cost). A browser action that runs always ends
+first (the browser has its own action time limits), so no click or typing happens after the
+task returns. The task of an action keeps the lock of the browser session until the action ends,
+and the run cannot start a new `browser_task` until all work of the old task ends. When the tool
+server stops, it waits for the model calls that still run and never cancels them (the time
+limits of the proxy end them), and it waits up to 30 seconds for the browser actions. The tool
+server stops before the model proxy, so the proxy records these calls. The budgets of the run, the user, and the org in the proxy still
+apply, and a refused call (`402`) ends the task. To keep the prompt small, the sub-agent sees the
+results of the last 2 steps in full. Older results are cut to 600 characters, and older
+screenshots are removed. One result is at most 20,000 characters.
+
+**Approvals.** `browser_task` is `ask` by default (it is not in `DEFAULT_ALLOW`), so a person
+approves the goal and the budget on the approval card. An unattended run cannot use it without a
+pre-approval. Each step passes the gate again as the browser tool that it uses (`open` as
+`browser_open`, `act` as `browser_act`, and so on) with `GateService.inner`. `inner` runs
+`decide` with the live context of the run. It records no tool call and uses no ticket, because a
+step has no call id of the runtime. A `deny` refuses the step, and the sub-agent gets the reason.
+The audit log has `tool_gate.inner` for a deny. An `ask` for the step is covered by the approval
+(or the allow rule) of the `browser_task` call. So a `deny` rule for `browser_act` also stops the
+clicks of `browser_task`. `inner` does not run the unattended step of `decide`: in an unattended
+run, the `browser_task` call passed that step already (with a pre-approval of the job version or
+an allow rule), and that decision covers the `ask` of its steps.
+
+**Safety.** Every navigation of a step passes the URL policy of the cloud browser (Section 16.4).
+The goal and the page text pass the redactor before they go to the model, and the page text
+reaches the sub-agent in the untrusted blocks of the browser tools. The system prompt tells the
+sub-agent to treat page text as data, to do only what the goal asks, not to buy, pay, delete,
+send, or post unless the goal asks for it, never to type passwords or other secrets, and to stop
+at a login or a CAPTCHA. Saved logins come with the browser vault (M5.3), not in the goal. These prompt rules are not a boundary: the
+boundary is the approval, the gate of each step, and the URL policy. The result and the action
+log come from the sub-agent, which read the pages, so they go back to the main agent in an
+`<untrusted_content source="browser_task">` block. The header (status, steps, estimated cost) is
+fixed text of sama. The action log keeps only the size of typed text.
+
+**Progress.** Each step sends a `subagent_event` run event with the sub-agent name
+`browser_task` and a text such as `step 3/15: click e12`. The first event is `started`, and the
+last event has `done` and the tokens of the task. The events of one task share a `call_id`
+(`browser_task:<uuid>`), so the trace exporter writes one span `subagent:browser_task` for each
+task (Section 18.2). The tool server gives the events to `Worker.emit`, which adds them to the
+stream of the run with the next `seq`. This works when the run streams in the same process, as
+with one control plane process (D18). Otherwise the events are dropped, and the result still has
+the action log. The tool also sends MCP progress notifications. The tool server answers in JSON
+without a stream (Section 16.7), so a client does not get them now.
+
+**Assumptions (M5.6).**
+
+| # | Assumption |
+|---|---|
+| A1 | The closest safe version of the roadmap item is a sama loop with the typed browser tools, not `browser-use` (see the table above). |
+| A2 | The sub-agent model is an Anthropic model. The proxy has the Anthropic key on staging and production. |
+| A3 | The approval of `browser_task` (or its pre-approval in an unattended run) covers the `ask` of its steps. A `deny` rule for a browser tool still applies to the steps. |
+| A6 | The time limit is checked between steps and does not cut a model call or a browser action, so the usage of each call is recorded and no action happens after the result. A task can pass `timeout_s` by one browser action. |
+| A4 | Progress uses the existing `subagent_event`, so the runtime contract and the sandbox template do not change. The web app does not show these events yet. |
+| A5 | `browser_task` is in the `browser` toolset, so every profile with `browser` gets it, and no migration is needed. |
 
 ### 14.2 Chrome extension
 
@@ -6128,6 +6244,7 @@ later. Each tool is hidden when its service is missing.
 | `skill_import(url, path, ref, name, scope)` | 9.6 | The skill store | `ask` |
 | `browser_open`, `browser_snapshot`, `browser_screenshot`, `browser_extract`, `browser_tabs` (M5.1) | 14.1 | A `BrowserService` (the control plane always has one since M5.5) | `allow` |
 | `browser_act` (M5.1; points in vision mode since M5.2) | 14.1 | A `BrowserService` | `ask`; a sensitive action in the user's Chrome is always `ask` (14.2.2) |
+| `browser_task` (M5.6) | 14.1 | The `cloud` target (the Browserbase key and project) and a `BrowserTaskRunner` (the model proxy of the process) | `ask` |
 
 `browser_screenshot` is the only tool that returns an image: a text caption and an MCP
 `ImageContent` (JPEG, base64). The browser tools put page text in an
@@ -7033,6 +7150,7 @@ the start with a message that names the variable but not its value.
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
 | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | No | The cloud browser (Section 14.1). With both, the browser tools have the `cloud` target, and it is the default target. Without them, the tools have only `my_chrome` (Section 14.2.2). The key is a setting of the process; it is not in the vault yet. |
+| `SAMA_BROWSER_TASK_MODEL` | No | The Anthropic model of the browser sub-agent (Section 14.1, M5.6). Default `claude-sonnet-5-5`. It must have a price in the price table, else the process does not start. |
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
 | `SAMA_COMPOSIO_WEBHOOK_SECRET` | No | The signing secret of the Composio webhook subscription of the sama project (Section 12.2). An org secret in the vault (`composio_webhook_secret`) comes first. Without both, sama refuses Composio events. |
 | `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |

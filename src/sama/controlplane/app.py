@@ -42,7 +42,8 @@ from sama.browser.guard import UrlGuard
 from sama.browser.logins import BrowserLogins
 from sama.browser.policy import PolicyCache, PolicyStore
 from sama.browser.service import BrowserService
-from sama.browser.target import BrowserTarget
+from sama.browser.target import CLOUD, BrowserTarget
+from sama.browser.task import BrowserTaskRunner, ProxyModelClient
 from sama.connectors.database import DatabaseGateway
 from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
@@ -314,6 +315,31 @@ def build(
     # One ledger for every spender of model money: a record that fails to write fences them all.
     ledger = UsageLedger(usage)
     prices = PriceTable.load()
+    proxy = ModelProxy(
+        signer=signer,
+        store=usage,
+        prices=prices,
+        settings=ProxySettings(
+            anthropic_key=settings.anthropic_key, openai_key=settings.openai_key
+        ),
+        keys=keys,
+        ledger=ledger,
+    )
+    # The browser sub-agent calls its model through the proxy app in this process (M5.6).
+    proxy_app = proxy.app()
+    browser_tasks = (
+        BrowserTaskRunner(
+            browser,
+            ProxyModelClient(app=proxy_app),
+            prices,
+            model=settings.browser_task_model,
+            gate=gate,
+            progress=worker,
+        )
+        # The sub-agent works on the cloud target only (Section 14.1, M5.6).
+        if CLOUD in browser.targets
+        else None
+    )
     jobs = JobService(engine, RunQueue(engine))
     # The workflow engine of Section 12.3 runs tool steps with the connector tools.
     workflows = WorkflowService(engine, RunQueue(engine), connections.tool_access)
@@ -402,16 +428,7 @@ def build(
         jobs=jobs,
         workflows=workflows,
         browser=browser,
-    )
-    proxy = ModelProxy(
-        signer=signer,
-        store=usage,
-        prices=prices,
-        settings=ProxySettings(
-            anthropic_key=settings.anthropic_key, openai_key=settings.openai_key
-        ),
-        keys=keys,
-        ledger=ledger,
+        browser_tasks=browser_tasks,
     )
     handoffs = Handoffs(engine, web_url=settings.web_base)
     # /undo and /rollback restore the files of the session sandbox (Section 15.3).
@@ -541,7 +558,6 @@ def build(
     )
     api_app = api.app()
     tools_app = tools.app()
-    proxy_app = proxy.app()
 
     if hub is not None:
         api_app.include_router(hub.router())
