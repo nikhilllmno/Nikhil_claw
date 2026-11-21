@@ -4000,7 +4000,9 @@ kinds (Section 11.6). An org owner or admin connects them on the Settings page o
 | `email_link_secret` | A random key that signs the approval links (below). |
 
 A connect holds the advisory locks of the org and kind and of the `external_id`, as in
-Section 11.6. A new `external_id` deletes the old row with its links. A Meta connect checks
+Section 11.6. A new `external_id` deletes the old row with its links. So a new SendGrid key, a
+new Twilio account, or a new Meta phone number id deletes the links of the old row, and the
+users pair again. A Meta connect checks
 that the phone number id of the token shows the given number. A connect again
 makes a new webhook token and new link secrets.
 
