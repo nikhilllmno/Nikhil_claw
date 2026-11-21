@@ -5,8 +5,8 @@
   has no secret. A member reads only their own rows. Only the control plane writes the table.
 - The default profile gets the toolset ``browser``.
 
-Revision ID: 0034
-Revises: 0033
+Revision ID: 0035
+Revises: 0034
 Create Date: 2026-11-21
 """
 
@@ -15,8 +15,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0034"
-down_revision: str | None = "0033"
+revision: str = "0035"
+down_revision: str | None = "0034"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
