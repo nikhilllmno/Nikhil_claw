@@ -120,7 +120,7 @@ CAPABILITIES: Final[Mapping[RuntimeKind, Capabilities]] = {
     ),
     RuntimeKind.OPENAI_AGENTS_SDK: Capabilities(
         streaming=True,
-        native_subagents=False,
+        native_subagents=True,
         native_compaction=True,
         native_skills=False,
         native_file_checkpoints=False,

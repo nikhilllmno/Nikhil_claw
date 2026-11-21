@@ -30,8 +30,10 @@ from typing import Any, Final
 
 from sqlalchemy import (
     Table,
+    Text,
     and_,
     bindparam,
+    cast,
     delete,
     func,
     insert,
@@ -47,11 +49,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import (
     ENDED_RUN_STATUSES,
+    AgentProfile,
     AuditEntry,
     Base,
     BrowserLogin,
     Connection,
     DataPurge,
+    LibraryAgent,
     Membership,
     Org,
     OrgInvite,
@@ -528,6 +532,29 @@ async def delete_user(
         org_id,
         browser_contexts=await browser_contexts(connection, org_id, user_id),
     )
+    # The personal library agents cascade from the user. The profiles stop naming them
+    # (Section 13.3).
+    agents = [
+        str(agent_id)
+        for agent_id in (
+            await connection.execute(
+                select(LibraryAgent.id).where(
+                    LibraryAgent.org_id == org_id, LibraryAgent.user_id == user_id
+                )
+            )
+        ).scalars()
+    ]
+    if agents:
+        await connection.execute(
+            update(AgentProfile)
+            .where(
+                AgentProfile.org_id == org_id,
+                AgentProfile.library_subagents.op("?|")(cast(agents, ARRAY(Text))),
+            )
+            .values(
+                library_subagents=AgentProfile.library_subagents.op("-")(cast(agents, ARRAY(Text)))
+            )
+        )
     await null_refs(connection, org_id, "users", [user_id])
     await connection.execute(delete(User).where(User.org_id == org_id, User.id == user_id))
     await connection.execute(

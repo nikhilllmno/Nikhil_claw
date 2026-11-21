@@ -88,7 +88,7 @@ from sama.db.models import (
     Session,
     WorkflowInstance,
 )
-from sama.gate.decide import arguments_digest
+from sama.gate.decide import arguments_digest, narrow_toolsets
 from sama.gate.service import APPROVAL_TTL, stored_arguments
 from sama.media.images import NewAttachment
 from sama.orchestrator.limits import ModelQuotas, QueueLimits
@@ -296,6 +296,27 @@ def _check_quota(row: Any) -> None:
             " again tomorrow (UTC), or ask an org admin to change the plan on the Billing page.",
             "model_usd_per_user_day",
         )
+
+
+def library_budget(agent: Mapping[str, Any]) -> dict[str, Any]:
+    """The budget cap of a run of a session that runs as a library agent (Section 13.3)."""
+    out: dict[str, Any] = {}
+    if isinstance(agent.get("max_turns"), int):
+        out["max_turns"] = agent["max_turns"]
+    if agent.get("max_cost_usd") is not None:
+        out["max_cost_usd"] = str(agent["max_cost_usd"])
+    return out
+
+
+def library_toolsets(agent: Mapping[str, Any]) -> list[str]:
+    """The toolset limit of a run of a session that runs as a library agent. The toolsets that
+    a sub-agent never has are out (Section 13.1)."""
+    # Here, not at the top: ``sama.subagents`` imports the orchestrator through the runtime.
+    from sama.subagents import NOT_FOR_SUBAGENTS
+
+    raw = agent.get("toolsets")
+    names = [str(name) for name in raw] if isinstance(raw, list) else []
+    return [name for name in names if name not in NOT_FOR_SUBAGENTS]
 
 
 def narrow_budget(
@@ -731,6 +752,7 @@ class RunQueue:
                     ).label("runtime"),
                     AgentProfile.budget,
                     AgentProfile.busy_mode,
+                    Session.library_agent,
                     *_rate_columns(org_id, user_id),
                 )
                 .join(
@@ -754,6 +776,19 @@ class RunQueue:
             raise QueueError("the session is not active")
         if check_rate:
             _check_rate(session)
+        if isinstance(session.library_agent, dict):
+            # A session that runs as a library agent (Section 13.3): each run of it has the
+            # toolsets and the limits of the agent, and never more than the caller gave.
+            budget = narrow_budget(budget, library_budget(session.library_agent))
+            toolsets = narrow_toolsets(toolsets, library_toolsets(session.library_agent))
+            wanted = session.library_agent.get("model")
+            if (
+                model is None
+                and isinstance(wanted, str)
+                and model_is_known(RuntimeKind(session.runtime), wanted)
+            ):
+                # The model of the agent, when the runtime of the session knows it.
+                model = wanted
         run_id = uuid.uuid4()
         # The run and the message go in one statement: the run insert is a CTE.
         message_id = (

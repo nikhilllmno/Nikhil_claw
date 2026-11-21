@@ -27,6 +27,7 @@ from sama.delegation import (
     ChildTask,
     DelegationError,
     DelegationService,
+    render_agents,
     render_started,
     render_statuses,
 )
@@ -58,6 +59,7 @@ class DelegateTask(BaseModel):
     max_cost_usd: Annotated[
         Decimal | None, Field(gt=0, le=MAX_CHILD_COST_USD, max_digits=8, decimal_places=4)
     ] = None
+    agent: Annotated[str | None, Field(min_length=1, max_length=40)] = None
 
 
 def _child_id(value: str) -> uuid.UUID:
@@ -78,7 +80,9 @@ def register_delegation(server: MCPServer, call: Call, service: DelegationServic
             f"30, at most {MAX_CHILD_TURNS}) and max_cost_usd (default 1, at most "
             f"{MAX_CHILD_COST_USD}). A run can start {MAX_CHILDREN} children in total. With "
             "wait=true the call returns when each child ends or after timeout_s; with "
-            "wait=false it returns at once. Use it for parallel work, not for one small step."
+            "wait=false it returns at once. Use it for parallel work, not for one small step. "
+            "agent: the name of a library sub-agent; the child then runs as that agent, with its "
+            "prompt, toolsets, model, and limits."
         ),
         annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
         structured_output=False,
@@ -98,6 +102,7 @@ def register_delegation(server: MCPServer, call: Call, service: DelegationServic
                         context=task.context,
                         max_turns=task.max_turns,
                         max_cost_usd=task.max_cost_usd,
+                        agent=task.agent,
                     )
                     for task in tasks
                 ],
@@ -121,18 +126,20 @@ def register_delegation(server: MCPServer, call: Call, service: DelegationServic
             "See or control the child agents of this session. Actions: status (all children, "
             "or one with child_id: status, cost, and result), cancel (child_id: stop the "
             "child), steer (child_id and message: the child gets the message after its "
-            "current run)."
+            "current run), agents (the library agents that delegate_task can start with agent)."
         ),
         annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
         structured_output=False,
     )
     async def delegate_status(
         ctx: Context,
-        action: Literal["status", "cancel", "steer"] = "status",
+        action: Literal["status", "cancel", "steer", "agents"] = "status",
         child_id: _Id | None = None,
         message: Annotated[str | None, Field(min_length=1, max_length=MAX_STEER_CHARS)] = None,
     ) -> str:
         async def body(claims: RunTokenClaims) -> str:
+            if action == "agents":
+                return render_agents(await service.agents(claims))
             if action == "status":
                 child = None if child_id is None else _child_id(child_id)
                 return render_statuses(await service.status(claims, child))

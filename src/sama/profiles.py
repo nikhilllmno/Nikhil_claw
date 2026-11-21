@@ -50,6 +50,7 @@ from sama.runtime.contract import (
     SUBAGENT_PROMPT_MAX_CHARS,
     RuntimeKind,
 )
+from sama.subagent_library import LibraryError, check_profile_library, parse_ids
 from sama.subagents import (
     MAX_SUBAGENTS,
     LockedProfile,
@@ -81,6 +82,7 @@ PROFILE_FIELDS: Final = (
     "runtime",
     "model",
     "subagents",
+    "library_subagents",
     "toolsets",
     "group_toolsets",
     "budget",
@@ -99,6 +101,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "runtime",
         "model",
         "subagents",
+        "library_subagents",
         "budget",
         "reasoning_effort",
         "busy_mode",
@@ -155,6 +158,8 @@ class ProfileChanges:
     """``steer``, ``parallel``, or ``queue`` (Section 4.3, M7.1)."""
     max_parallel_runs: int | None = None
     """The most open chat runs of one session, 1 to ``MAX_PARALLEL_RUNS_CAP``."""
+    library_subagents: Sequence[str] | None = None
+    """The ids of library agents (Section 13.3). ``check_library`` checks them."""
 
 
 def profile_options(runtime: RuntimeKind, plan: str | None = None) -> dict[str, Any]:
@@ -404,7 +409,45 @@ def planned_values(profile: LockedProfile, after: Mapping[str, Any]) -> dict[str
         validate_subagents(
             parse_subagents(profile.subagents), toolsets=final_toolsets, runtime=runtime
         )
+    if "library_subagents" in after:
+        try:
+            ids = parse_ids(list(after["library_subagents"] or []))
+        except LibraryError as error:
+            raise ProfileError(str(error)) from None
+        if ids != list(profile.library_subagents or []):
+            values["library_subagents"] = ids
     return values
+
+
+async def check_library(
+    connection: AsyncConnection,
+    org_id: uuid.UUID,
+    profile: LockedProfile,
+    values: Mapping[str, Any],
+    actor_user_id: uuid.UUID | None,
+) -> None:
+    """Checks the library agents of the profile after the change ``values`` (the result of
+    ``planned_values``), in the transaction of the write. The check runs when the change sets
+    the library agents, the inline sub-agents, the toolsets, or the runtime. Raises
+    ``ProfileError``."""
+    if not {"library_subagents", "subagents", "toolsets", "runtime"} & set(values):
+        return
+    before = list(profile.library_subagents or [])
+    inline = values.get("subagents", profile.subagents)
+    try:
+        await check_profile_library(
+            connection,
+            org_id,
+            profile_workspace_id=profile.workspace_id,
+            before=before,
+            after=list(values.get("library_subagents", before)),
+            inline_names=[spec.name for spec in parse_subagents(inline or [])],
+            toolsets=list(values.get("toolsets", profile.toolsets)),
+            runtime=RuntimeKind(values.get("runtime", profile.runtime.value)),
+            actor_user_id=actor_user_id,
+        )
+    except LibraryError as error:
+        raise ProfileError(str(error)) from None
 
 
 def profile_value(profile: LockedProfile, field: str) -> Any:
@@ -413,6 +456,8 @@ def profile_value(profile: LockedProfile, field: str) -> Any:
         return profile.runtime.value
     if field == "budget":
         return budget_json(profile.budget)
+    if field == "library_subagents":
+        return list(profile.library_subagents or [])
     value = getattr(profile, field)
     return list(value) if isinstance(value, list) else value
 
@@ -488,6 +533,8 @@ async def update_profile(
         after["busy_mode"] = changes.busy_mode
     if changes.max_parallel_runs is not None:
         after["max_parallel_runs"] = changes.max_parallel_runs
+    if changes.library_subagents is not None:
+        after["library_subagents"] = list(changes.library_subagents)
     if "soul" in after:
         # Checked before the lock, so a bad soul does not wait for the lock.
         if len(after["soul"]) > SOUL_MAX_CHARS:
@@ -505,6 +552,7 @@ async def update_profile(
         values = planned_values(profile, after)
         if not values:
             return
+        await check_library(connection, org_id, profile, values, actor_user_id)
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)

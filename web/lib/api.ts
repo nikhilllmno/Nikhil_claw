@@ -5,6 +5,16 @@
 // while the call waits, the answer is dropped: it is never retried, and it never signs out
 // the new account.
 
+import type {
+  LibraryAgent,
+  LibraryCreate,
+  LibraryPatch,
+  LibraryTestBody,
+  LibraryTestResult,
+  LibraryVersion,
+  SubagentCatalog,
+} from "./subagents";
+
 // -- types --------------------------------------------------------------------------------------
 
 export interface PublicConfig {
@@ -462,6 +472,8 @@ export interface AgentProfile {
   busy_mode?: BusyMode;
   /** The most open runs of one session in the busy mode `parallel`. */
   max_parallel_runs?: number;
+  /** The ids of the library sub-agents (M7.4), in order. */
+  library_subagents: string[];
   updated_at: string;
   /** True if the user is an org owner or admin. */
   editable: boolean;
@@ -484,6 +496,7 @@ export interface AgentProfilePatch {
   reasoning_effort?: ReasoningEffort | null;
   busy_mode?: BusyMode;
   max_parallel_runs?: number;
+  library_subagents?: string[];
 }
 
 export type ProfileChangeKind = "soul" | "profile" | "toolsets" | "policy";
@@ -2000,6 +2013,39 @@ export class ApiClient {
     this.json<SkillVersion[]>(`/skills/${encodeURIComponent(skillId)}/versions`);
   getSkillVersion = (skillId: string, version: number) =>
     this.json<SkillVersionDetail>(`/skills/${encodeURIComponent(skillId)}/versions/${version}`);
+  listSubagents = (orgId: string, workspaceId: string | null) =>
+    this.json<SubagentCatalog>(
+      `/orgs/${encodeURIComponent(orgId)}/subagents${query({ workspace_id: workspaceId })}`,
+    );
+  getSubagent = (orgId: string, agentId: string) =>
+    this.json<LibraryAgent>(`/orgs/${encodeURIComponent(orgId)}/subagents/${encodeURIComponent(agentId)}`);
+  createSubagent = (orgId: string, body: LibraryCreate) =>
+    this.json<LibraryAgent>(`/orgs/${encodeURIComponent(orgId)}/subagents`, { method: "POST", body });
+  updateSubagent = (orgId: string, agentId: string, patch: LibraryPatch) =>
+    this.json<LibraryAgent>(`/orgs/${encodeURIComponent(orgId)}/subagents/${encodeURIComponent(agentId)}`, {
+      method: "PATCH",
+      body: patch,
+    });
+  /** The API answers 409 when an agent profile uses the agent. The error text names them. */
+  deleteSubagent = (orgId: string, agentId: string) =>
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/subagents/${encodeURIComponent(agentId)}`, {
+      method: "DELETE",
+    });
+  listSubagentVersions = (orgId: string, agentId: string) =>
+    this.json<LibraryVersion[]>(
+      `/orgs/${encodeURIComponent(orgId)}/subagents/${encodeURIComponent(agentId)}/versions`,
+    );
+  revertSubagent = (orgId: string, agentId: string, version: number) =>
+    this.json<LibraryAgent>(
+      `/orgs/${encodeURIComponent(orgId)}/subagents/${encodeURIComponent(agentId)}/versions/${version}/revert`,
+      { method: "POST" },
+    );
+  /** Starts a private session that runs as the library agent. */
+  testSubagent = (orgId: string, agentId: string, body: LibraryTestBody) =>
+    this.json<LibraryTestResult>(
+      `/orgs/${encodeURIComponent(orgId)}/subagents/${encodeURIComponent(agentId)}/test`,
+      { method: "POST", body },
+    );
   searchSessions = (orgId: string, q: string, workspaceId: string | null, limit = 10) =>
     this.json<SearchHit[]>(
       `/orgs/${encodeURIComponent(orgId)}/session-search${query({ q, workspace_id: workspaceId, limit })}`,

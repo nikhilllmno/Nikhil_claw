@@ -19,6 +19,7 @@ import {
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import { ProfileHistory } from "./ProfileHistory";
+import { ProfileLibrarySubagents } from "./ProfileLibrarySubagents";
 import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
 import styles from "./AgentSettings.module.css";
@@ -92,6 +93,7 @@ function SettingsForm({
 }) {
   const api = useApi();
   const { options } = profile;
+  const { workspaceId } = useData();
   const readOnly = !profile.editable;
   const [draft, setDraft] = useState<Draft>(() => toDraft(profile));
   const [saving, setSaving] = useState(false);
@@ -308,7 +310,7 @@ function SettingsForm({
             <button
               type="button"
               className="btn btn-small"
-              disabled={draft.subagents.length >= maxSubagents}
+              disabled={draft.subagents.length + draft.librarySubagents.length >= maxSubagents}
               onClick={() => edit({ subagents: [...draft.subagents, newSubagent()] })}
             >
               Add a sub-agent
@@ -436,6 +438,19 @@ function SettingsForm({
           </ul>
         )}
       </section>
+
+      <ProfileLibrarySubagents
+        orgId={orgId}
+        workspaceId={profile.workspace_id ?? workspaceId}
+        ids={draft.librarySubagents}
+        onChange={(ids) => edit({ librarySubagents: ids })}
+        readOnly={readOnly}
+        supported={runtime.subagents}
+        inlineNames={draft.subagents.map((s) => s.name)}
+        toolsets={draft.toolsets}
+        total={draft.subagents.length + draft.librarySubagents.length}
+        max={maxSubagents}
+      />
 
       {children}
 

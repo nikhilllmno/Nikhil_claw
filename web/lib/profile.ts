@@ -34,6 +34,8 @@ export interface Draft {
   busyMode: BusyMode;
   /** Text of the field: the most open runs of one session. */
   maxParallelRuns: string;
+  /** The ids of the library sub-agents (M7.4), in order. */
+  librarySubagents: string[];
 }
 
 /** The busy modes, with their text for people (M7.1). */
@@ -83,6 +85,7 @@ export function toDraft(profile: AgentProfile): Draft {
       model: s.model ?? "",
       maxTurns: s.max_turns === null ? "" : String(s.max_turns),
     })),
+    librarySubagents: [...profile.library_subagents],
   };
 }
 
@@ -119,6 +122,10 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
   if (draft.busyMode !== (profile.busy_mode ?? "steer")) patch.busy_mode = draft.busyMode;
   const limit = Number(draft.maxParallelRuns.trim());
   if (Number.isInteger(limit) && limit !== (profile.max_parallel_runs ?? 3)) patch.max_parallel_runs = limit;
+  // The order of the library agents is part of the profile, so a move is a change.
+  if (draft.librarySubagents.join("\n") !== profile.library_subagents.join("\n")) {
+    patch.library_subagents = draft.librarySubagents;
+  }
   return patch;
 }
 
@@ -169,8 +176,11 @@ export function validateDraft(
 ): string | null {
   if (draft.name.trim() === "") return "The agent needs a name.";
   if (draft.model === "") return "Choose a model.";
-  if (runtime && !runtime.subagents && draft.subagents.length > 0) {
+  if (runtime && !runtime.subagents && draft.subagents.length + draft.librarySubagents.length > 0) {
     return `The ${runtimeLabel(runtime.name)} runtime has no sub-agents. Remove the sub-agents first.`;
+  }
+  if (draft.subagents.length + draft.librarySubagents.length > limits.max_subagents) {
+    return `An agent can have at most ${limits.max_subagents} sub-agents, from the library and in the agent together.`;
   }
   if (draft.name.trim().length > limits.name_max_chars) {
     return `The name has at most ${limits.name_max_chars} characters.`;

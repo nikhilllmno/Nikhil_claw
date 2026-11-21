@@ -129,9 +129,10 @@ def test_a_profile_has_a_limit() -> None:
 # -- capability --------------------------------------------------------------------------------
 
 
-def test_only_the_claude_runtime_has_native_subagents() -> None:
+def test_both_real_runtimes_have_native_subagents() -> None:
+    # The OpenAI adapter has them as agents as tools since M7.4 (Section 13.3).
     assert supports_subagents(CLAUDE) is True
-    assert supports_subagents(RuntimeKind.OPENAI_AGENTS_SDK) is False
+    assert supports_subagents(RuntimeKind.OPENAI_AGENTS_SDK) is True
     assert supports_subagents(RuntimeKind.FAKE) is False
 
 
@@ -151,7 +152,7 @@ def test_valid_specs_have_no_problem() -> None:
 
 
 def test_a_runtime_without_subagents_is_a_problem() -> None:
-    [found] = check(spec(), runtime=RuntimeKind.OPENAI_AGENTS_SDK)
+    [found] = check(spec(), runtime=RuntimeKind.FAKE)
     assert "no native sub-agents" in found
 
 

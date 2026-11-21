@@ -125,6 +125,7 @@ async def test_a_member_reads_the_profile(client: httpx.AsyncClient, tenant: Ten
         "reasoning_effort",
         "busy_mode",
         "max_parallel_runs",
+        "library_subagents",
         "updated_at",
         "editable",
         "options",
@@ -192,7 +193,7 @@ async def test_the_models_follow_the_runtime(
 
     assert "gpt-6.2-sol" in options["models"]
     assert not any(m.startswith("claude-") for m in options["models"])
-    assert options["subagents"] is False
+    assert options["subagents"] is True
 
 
 async def test_a_user_outside_the_org_gets_404(client: httpx.AsyncClient, tenant: Tenant) -> None:
@@ -415,7 +416,7 @@ async def test_a_toolset_that_a_subagent_uses_cannot_be_removed(
     assert "needs the toolset subagents" in response.json()["detail"]
 
 
-async def test_a_runtime_without_subagents_refuses_them(
+async def test_the_openai_runtime_takes_subagents_with_a_model_of_its_own(
     client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:
     async with engine.begin() as connection:
@@ -427,9 +428,12 @@ async def test_a_runtime_without_subagents_refuses_them(
     admin = await admin_headers(engine, tenant)
 
     response = await client.patch(agent(tenant), headers=admin, json={"subagents": [spec()]})
-
+    assert response.status_code == 200
+    response = await client.patch(
+        agent(tenant), headers=admin, json={"subagents": [spec(model="claude-opus-5-5")]}
+    )
     assert response.status_code == 422
-    assert "has no native sub-agents" in response.json()["detail"]
+    assert "no price" in response.json()["detail"]
 
 
 async def test_an_admin_switches_the_runtime_with_a_model_of_the_new_runtime(
@@ -455,7 +459,7 @@ async def test_an_admin_switches_the_runtime_with_a_model_of_the_new_runtime(
         runtimes["openai_agents_sdk"]["subagents"],
     ) == (
         True,
-        False,
+        True,
     )
 
     # The model of the profile is a Claude model, so the switch needs a new model.
@@ -478,7 +482,7 @@ async def test_an_admin_switches_the_runtime_with_a_model_of_the_new_runtime(
     body = response.json()
     assert (body["runtime"], body["model"]) == ("openai_agents_sdk", "gpt-6.2-sol")
     assert "gpt-6.2-sol" in body["options"]["models"]
-    assert body["options"]["subagents"] is False
+    assert body["options"]["subagents"] is True
     row = await stored(engine, tenant)
     # The review model of the old runtime goes back to the default of the new runtime.
     assert (row.runtime, row.model, row.review_model) == (
@@ -502,14 +506,16 @@ async def test_a_switch_keeps_the_rules_of_the_new_runtime(
 ) -> None:
     admin = await admin_headers(engine, tenant)
     assert (
-        await client.patch(agent(tenant), headers=admin, json={"subagents": [spec()]})
+        await client.patch(
+            agent(tenant), headers=admin, json={"subagents": [spec(model="claude-sonnet-5")]}
+        )
     ).status_code == 200
-    # The OpenAI runtime has no sub-agents, so the stored sub-agents block the switch.
+    # The model of the stored sub-agent is a Claude model, so it blocks the switch.
     response = await client.patch(
         agent(tenant), headers=admin, json={"runtime": "openai_agents_sdk", "model": "gpt-6.2-sol"}
     )
     assert response.status_code == 422
-    assert "has no native sub-agents" in response.json()["detail"]
+    assert "no price" in response.json()["detail"]
     response = await client.patch(
         agent(tenant),
         headers=admin,

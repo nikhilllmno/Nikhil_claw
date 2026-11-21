@@ -125,8 +125,13 @@ class ChangeProposer:
             raise SoulError(
                 f"content is only for the target soul. Give the fields of {request.target}"
             )
-        # A person changes the budget and the reasoning effort in the web app. The agent cannot.
-        allowed = tuple(f for f in KIND_FIELDS[request.target] if f not in ADMIN_ONLY_FIELDS)
+        # A person changes the budget, the reasoning effort, and the library agents in the web
+        # app (Section 13.3). The agent cannot.
+        allowed = tuple(
+            f
+            for f in KIND_FIELDS[request.target]
+            if f not in ADMIN_ONLY_FIELDS and f != "library_subagents"
+        )
         extra = sorted(set(given) - set(allowed))
         if extra:
             raise SoulError(
