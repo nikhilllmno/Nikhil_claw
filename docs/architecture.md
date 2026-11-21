@@ -1726,6 +1726,40 @@ store, and the sync. The rules:
   `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and the
   gate does not allow it.
 
+**Builtin library (M7.7).** `skills/` has 68 builtin skills. Sama wrote all of them. They
+cover the categories of the Hermes bundled skills (docs/feature-map.md, Section 3), except
+`apple`, because those skills need a Mac. No Hermes text is in them. The rules:
+
+- Each skill has at least one category tag: `agents`, `creative`, `data`, `devops`, `email`,
+  `media`, `notes`, `productivity`, `research`, `social`, `software`, `web`, or `writing`.
+  `skills_list` with a category as the query finds the skills of that category.
+- `requires_toolsets` lists each toolset whose tools the steps need. So a skill is not in
+  the index when the profile does not have the tools (conditional activation). A skill can
+  name the tools of `todo`, `clarify`, and `memory` without the requirement, but its steps
+  must work without them.
+- A skill names sama tools by their real names. It does not name the native tools of one
+  runtime (for example `Bash` or `WebFetch`). It says "the shell" or "the sandbox", so that it
+  works on both runtimes.
+- A skill that uses a connector (Gmail, Google Calendar, Notion, Linear, GitHub) requires
+  `connections`, `integrations`, and `tool_search`. It checks the connection with
+  `connections_list`, and it finds and calls the connector tools with `tool_search`,
+  `tool_describe`, and `tool_call`.
+- A skill that writes outside the sandbox (an email, an event, a form, a post) tells the
+  agent to show the change to the user first. The gate still asks for an approval where the
+  policy says `ask`.
+- A skill that makes a scheduled job (Section 12.1) for a watch or a digest sets
+  `attach_to_session`, so that each run sees the answers of the runs before. It tells the user
+  that each run sends its answer, because a job cannot stay silent unless `deliver` is `none`.
+- A skill that sends data to a public service follows the usage policy of that service. For
+  example, `maps` does not send a private address to Nominatim.
+- The test `tests/skills/test_builtin_library.py` runs on each folder. It checks the lint and
+  the injection scan, the secret scan of the redactor, a category tag, a version of the form
+  `x.y.z`, the sections, and the tool names in code font and in calls against
+  `sama.gate.decide.TOOLSETS`. It also checks that the skill hides when a required toolset is
+  missing, and that `/<name>` starts it.
+- In a profile with all toolsets, the index lines of these skills have about 4,300 characters
+  in total. The index has a limit of 200 skills.
+
 ### 9.4 Self-improvement loop
 
 ```mermaid

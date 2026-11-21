@@ -1,8 +1,8 @@
 ---
 name: pdf
 description: Read, extract, and create PDF files
-version: 1.0.0
-tags: [pdf, documents]
+version: 1.0.1
+tags: [productivity, pdf, documents]
 requires_toolsets: [core]
 ---
 

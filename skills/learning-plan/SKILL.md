@@ -1,8 +1,8 @@
 ---
 name: learning-plan
 description: Build a study plan for a new topic or skill
-version: 1.0.0
-tags: [learning, planning]
+version: 1.0.1
+tags: [productivity, learning, planning]
 requires_toolsets: [web]
 ---
 

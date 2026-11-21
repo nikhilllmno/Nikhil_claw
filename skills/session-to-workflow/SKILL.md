@@ -1,8 +1,8 @@
 ---
 name: session-to-workflow
 description: Turn the work of this session into a saved workflow
-version: 1.0.0
-tags: [workflows, automation]
+version: 1.0.1
+tags: [agents, workflows, automation]
 requires_toolsets: [workflows]
 ---
 

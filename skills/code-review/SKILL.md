@@ -1,8 +1,8 @@
 ---
 name: code-review
 description: Review a code change for bugs, risk, and clarity
-version: 1.0.0
-tags: [code, review]
+version: 1.0.1
+tags: [software, code, review]
 ---
 
 # Code review
