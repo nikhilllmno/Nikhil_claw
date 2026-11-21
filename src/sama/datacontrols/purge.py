@@ -6,7 +6,8 @@ tries again with a backoff until it works:
 
 - ``sandboxes``: kills the E2B sandboxes of the deleted sessions. It finds them by their
   labels, so it kills only a sandbox of the org and of a deleted session;
-- ``traces``: asks Langfuse to delete the traces of the deleted runs.
+- ``traces``: asks Langfuse to delete the traces of the deleted runs. The delete writes these
+  rows with a later ``next_attempt_at`` (``TRACE_DELAY``).
 
 A process without E2B or without Langfuse leaves those rows for a process that has them.
 """
@@ -156,27 +157,19 @@ class PurgeWorker:
         if self._sandboxes is None:
             return False
         org = str(org_id)
-        if refs.get("all"):
-            found = await self._sandboxes.find({ORG_LABEL: org})
-            await self._kill(org, found, None)
-            return len(found) < FIND_LIMIT
+        sessions: list[str | None] = (
+            [None] if refs.get("all") else [str(session) for session in refs.get("session_ids", [])]
+        )
         complete = True
-        for session in refs.get("session_ids", []):
-            found = await self._sandboxes.find({ORG_LABEL: org, SESSION_LABEL: str(session)})
-            await self._kill(org, found, str(session))
+        for session in sessions:
+            labels = {ORG_LABEL: org} | ({SESSION_LABEL: session} if session else {})
+            found = await self._sandboxes.find(labels)
+            for sandbox in found:
+                # The labels prove that the sandbox is of the org and of the deleted session.
+                if all(sandbox.labels.get(key) == value for key, value in labels.items()):
+                    await self._sandboxes.kill(sandbox.sandbox_id)
             complete = complete and len(found) < FIND_LIMIT
         return complete
-
-    async def _kill(self, org: str, found: Sequence[FoundSandbox], session: str | None) -> None:
-        if self._sandboxes is None:
-            return
-        for sandbox in found:
-            # The labels prove that the sandbox is of the org and of the deleted session.
-            if sandbox.labels.get(ORG_LABEL) != org:
-                continue
-            if session is not None and sandbox.labels.get(SESSION_LABEL) != session:
-                continue
-            await self._sandboxes.kill(sandbox.sandbox_id)
 
     async def _done(self, row_id: uuid.UUID) -> None:
         async with self._engine.begin() as connection:

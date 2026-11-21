@@ -9,8 +9,12 @@ The control plane deletes as the table owner, in one transaction for each delete
   that column. ``no_action_refs`` finds these columns in the models, so a new table is safe.
 - A running run blocks a delete. The delete asks the run to stop and raises
   ``DataBusyError``. The caller tries again later. A queued or paused run is deleted.
+- A user delete also ends the open runs that the user started in shared sessions: a queued or
+  paused run is cancelled, and a running run blocks the delete. A run with no user has no
+  user limits, so a run of a deleted user must not go on.
 - The delete writes the cleanups outside Postgres to ``data_purges`` in the same transaction:
-  the sandboxes of the deleted sessions and the Langfuse traces of the deleted runs.
+  the sandboxes of the deleted sessions and the Langfuse traces of the deleted runs. A trace
+  purge waits ``TRACE_DELAY``, so a trace that the exporter sends now is in Langfuse first.
 """
 
 from __future__ import annotations
@@ -18,16 +22,18 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 from functools import cache
 from typing import Any, Final
 
-from sqlalchemy import Table, bindparam, delete, insert, select, text, update
+from sqlalchemy import Table, bindparam, delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import (
+    ENDED_RUN_STATUSES,
     AuditEntry,
     Base,
     Connection,
@@ -42,17 +48,26 @@ from sama.db.models import (
     VaultSecret,
     WorkflowInstance,
 )
+from sama.observability.langfuse import MAX_DELETE_IDS
 from sama.vault.store import connection_secret, trigger_secret
 
 CHILD_LINEAGES: Final = ("compaction", "delegation")
 """A child session of these lineages is part of its parent and goes with it."""
 LOCK_TIMEOUT: Final = "5s"
 """A delete waits at most this long for a row lock. Then it raises ``DataBusyError``."""
-TRACE_BATCH: Final = 1000
-"""The most trace ids in one ``data_purges`` row: one Langfuse delete request."""
+TRACE_DELAY: Final = timedelta(hours=1)
+"""A trace purge waits this long. The trace exporter marks a run as sent, then sends the trace
+(a 10 s request), and Langfuse stores what it gets some time later. The wait lets a trace that
+is on its way arrive before the delete."""
 _BUSY_SQLSTATES: Final = frozenset({"55P03", "40P01"})
 """``lock_not_available`` and ``deadlock_detected``."""
-_UUIDS: Final = ARRAY(PG_UUID(as_uuid=True))
+UUIDS: Final = ARRAY(PG_UUID(as_uuid=True))
+"""The Postgres type of a bound list of ids."""
+_CANCELLED: Final = {
+    "status": "cancelled",
+    "failure_code": "cancelled",
+    "failure_message": "cancelled: the user was deleted",
+}
 
 
 class DataError(Exception):
@@ -77,6 +92,9 @@ class LastOwnerError(DataError):
     """The user is the last owner of the org. Delete the org, or make another owner first."""
 
     status = 409
+
+
+LAST_OWNER: Final = "the last owner cannot leave; delete the org instead"
 
 
 @dataclass(slots=True)
@@ -142,7 +160,7 @@ async def session_closure(
             " WHERE s.org_id = :org AND s.lineage = ANY(:lineages)"
             ") SELECT id FROM closure"
         ).bindparams(
-            bindparam("ids", type_=_UUIDS),
+            bindparam("ids", type_=UUIDS),
             bindparam("lineages", type_=ARRAY(Base.metadata.tables["sessions"].c.lineage.type)),
         ),
         {"org": org_id, "ids": list(session_ids), "lineages": list(CHILD_LINEAGES)},
@@ -262,12 +280,83 @@ async def write_purges(
     elif sessions:
         refs = {"session_ids": sorted(str(session) for session in sessions)}
         rows.append({"org_id": org_id, "kind": "sandboxes", "refs": refs})
-    ids = sorted(set(trace_ids))
-    for start in range(0, len(ids), TRACE_BATCH):
-        refs = {"trace_ids": ids[start : start + TRACE_BATCH]}
-        rows.append({"org_id": org_id, "kind": "traces", "refs": refs})
     if rows:
         await connection.execute(insert(DataPurge), rows)
+    ids = sorted(set(trace_ids))
+    if ids:
+        await connection.execute(
+            insert(DataPurge).values(next_attempt_at=func.now() + TRACE_DELAY),
+            [
+                {
+                    "org_id": org_id,
+                    "kind": "traces",
+                    "refs": {"trace_ids": ids[start : start + MAX_DELETE_IDS]},
+                }
+                for start in range(0, len(ids), MAX_DELETE_IDS)
+            ],
+        )
+
+
+async def owner_ids(
+    connection: AsyncConnection, org_id: uuid.UUID, *, lock: bool = False
+) -> set[uuid.UUID]:
+    """The owners of the org. ``lock`` locks their membership rows."""
+    statement = select(Membership.user_id).where(
+        Membership.org_id == org_id,
+        Membership.workspace_id.is_(None),
+        Membership.role == "owner",
+    )
+    if lock:
+        statement = statement.with_for_update()
+    return set((await connection.execute(statement)).scalars())
+
+
+async def private_sessions(
+    connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """The private sessions of the user."""
+    return list(
+        (
+            await connection.execute(
+                select(Session.id).where(
+                    Session.org_id == org_id,
+                    Session.owner_user_id == user_id,
+                    Session.audience == "private",
+                )
+            )
+        ).scalars()
+    )
+
+
+async def end_user_runs(
+    connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Cancels the queued and paused runs that the user started, and returns the running runs.
+
+    The rows are locked, so the queue cannot claim them now. Call after the user row is locked:
+    a new run of the user waits for that lock, then fails."""
+    runs = (
+        await connection.execute(
+            select(Run.id, Run.status)
+            .where(
+                Run.org_id == org_id,
+                Run.triggered_by_user_id == user_id,
+                Run.status.not_in(ENDED_RUN_STATUSES),
+            )
+            .with_for_update()
+        )
+    ).all()
+    running = [run.id for run in runs if run.status == "running"]
+    if running:
+        return running
+    waiting = [run.id for run in runs]
+    if waiting:
+        await connection.execute(
+            update(Run)
+            .where(Run.org_id == org_id, Run.id.in_(waiting))
+            .values(**_CANCELLED, cancel_requested_at=text("now()"), finished_at=text("now()"))
+        )
+    return []
 
 
 async def delete_user(
@@ -292,31 +381,15 @@ async def delete_user(
     ).scalar_one_or_none()
     if found is None:
         raise DataNotFoundError("the user does not exist")
-    owners = (
-        await connection.execute(
-            select(Membership.user_id)
-            .where(
-                Membership.org_id == org_id,
-                Membership.workspace_id.is_(None),
-                Membership.role == "owner",
-            )
-            .with_for_update()
-        )
-    ).scalars()
-    owner_ids = set(owners)
-    if owner_ids == {user_id}:
-        raise LastOwnerError("the last owner cannot leave; delete the org instead")
+    if await owner_ids(connection, org_id, lock=True) == {user_id}:
+        raise LastOwnerError(LAST_OWNER)
 
-    private = (
-        await connection.execute(
-            select(Session.id).where(
-                Session.org_id == org_id,
-                Session.owner_user_id == user_id,
-                Session.audience == "private",
-            )
-        )
-    ).scalars()
-    removed = await delete_sessions(connection, org_id, list(private))
+    removed = await delete_sessions(
+        connection, org_id, await private_sessions(connection, org_id, user_id)
+    )
+    if removed.running:
+        return removed
+    removed.running = await end_user_runs(connection, org_id, user_id)
     if removed.running:
         return removed
 

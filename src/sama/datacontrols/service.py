@@ -7,15 +7,16 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.datacontrols.delete import (
+    LAST_OWNER,
     DataBusyError,
     DataNotFoundError,
     LastOwnerError,
@@ -23,6 +24,8 @@ from sama.datacontrols.delete import (
     busy,
     delete_org,
     delete_user,
+    owner_ids,
+    private_sessions,
     request_cancel,
     session_closure,
 )
@@ -32,10 +35,8 @@ from sama.db.models import (
     AuditEntry,
     Connection,
     Integration,
-    Membership,
     Org,
     Run,
-    Session,
     Trigger,
     User,
 )
@@ -65,13 +66,7 @@ class RetentionView:
     effective_days: int | None
 
     def as_json(self) -> dict[str, Any]:
-        return {
-            "plan": self.plan,
-            "retention_days": self.retention_days,
-            "plan_default_days": self.plan_default_days,
-            "plan_max_days": self.plan_max_days,
-            "effective_days": self.effective_days,
-        }
+        return asdict(self)
 
 
 class DataControls:
@@ -97,18 +92,19 @@ class DataControls:
         user_id: uuid.UUID | None = None,
     ) -> ExportFile:
         """Writes the export from one snapshot of the database, then writes the audit row."""
-        if kind == "user":
-            async with self._engine.connect() as connection:
-                found = (
-                    await connection.execute(
-                        select(User.id).where(User.org_id == org_id, User.id == user_id)
-                    )
-                ).scalar_one_or_none()
-            if found is None:
-                raise DataNotFoundError("the user does not exist")
         async with self._engine.connect() as connection:
             snapshot = await connection.execution_options(isolation_level="REPEATABLE READ")
             async with snapshot.begin():
+                if (
+                    kind == "user"
+                    and (
+                        await snapshot.execute(
+                            select(User.id).where(User.org_id == org_id, User.id == user_id)
+                        )
+                    ).scalar_one_or_none()
+                    is None
+                ):
+                    raise DataNotFoundError("the user does not exist")
                 result = await write_export(
                     snapshot, org_id, kind=kind, user_id=user_id, directory=self._export_dir
                 )
@@ -154,7 +150,7 @@ class DataControls:
             ).scalar_one_or_none()
             if found is None:
                 raise DataNotFoundError("the org does not exist")
-            await self._check_running(connection, org_id, None)
+            await self._check_running(connection, org_id)
         if self._cleanup is not None:
             await self._cleanup.before_org_delete(org_id, actor_user_id)
         removed = await self._delete(org_id, lambda connection: delete_org(connection, org_id))
@@ -168,45 +164,34 @@ class DataControls:
         """The checks of ``delete_user`` before the cleanup outside sama, which sama cannot
         undo. The delete does the checks again under its locks."""
         async with self._engine.connect() as connection:
-            owners = set(
+            if await owner_ids(connection, org_id) == {user_id}:
+                raise LastOwnerError(LAST_OWNER)
+            closure = await session_closure(
+                connection, org_id, await private_sessions(connection, org_id, user_id)
+            )
+            running = list(
                 (
                     await connection.execute(
-                        select(Membership.user_id).where(
-                            Membership.org_id == org_id,
-                            Membership.workspace_id.is_(None),
-                            Membership.role == "owner",
+                        select(Run.id).where(
+                            Run.org_id == org_id,
+                            Run.status == "running",
+                            or_(Run.session_id.in_(closure), Run.triggered_by_user_id == user_id),
                         )
                     )
                 ).scalars()
             )
-            if owners == {user_id}:
-                raise LastOwnerError("the last owner cannot leave; delete the org instead")
-            private = list(
-                (
-                    await connection.execute(
-                        select(Session.id).where(
-                            Session.org_id == org_id,
-                            Session.owner_user_id == user_id,
-                            Session.audience == "private",
-                        )
-                    )
-                ).scalars()
-            )
-            closure = await session_closure(connection, org_id, private)
-            await self._check_running(connection, org_id, closure)
+            if running:
+                await connection.rollback()
+                await self._stop(org_id, running)
 
-    async def _check_running(
-        self,
-        connection: AsyncConnection,
-        org_id: uuid.UUID,
-        sessions: list[uuid.UUID] | None,
-    ) -> None:
-        statement = select(Run.id).where(Run.org_id == org_id, Run.status == "running")
-        if sessions is not None:
-            if not sessions:
-                return
-            statement = statement.where(Run.session_id.in_(sessions))
-        running = list((await connection.execute(statement)).scalars())
+    async def _check_running(self, connection: AsyncConnection, org_id: uuid.UUID) -> None:
+        running = list(
+            (
+                await connection.execute(
+                    select(Run.id).where(Run.org_id == org_id, Run.status == "running")
+                )
+            ).scalars()
+        )
         if running:
             await connection.rollback()
             await self._stop(org_id, running)

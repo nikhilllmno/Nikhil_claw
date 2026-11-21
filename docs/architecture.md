@@ -6039,14 +6039,22 @@ log of the org, so the control plane logs it instead.
   personal memory, skills, connections, rules, chat links, jobs, triggers, workflows, and the
   vault secrets of the personal connections and triggers. Shared content stays. Its user
   columns get a null. The last owner of an org cannot be deleted.
+- A user delete also ends the open runs that the user started in shared sessions. A queued or
+  paused run is cancelled. A running run blocks the delete, as above. A run with no user has
+  no user limits (the live authority, Section 16.6), so a run of a deleted user must not go on.
 - An org delete removes the org row, and every table cascades. It sets `sama.audit_purge`, so
   the audit log of the org goes too (Section 17.1).
 - Before the database delete, `ServiceCleanup` removes the accounts outside sama: the
   Composio accounts and triggers, the connector hosts, the Telegram webhooks, and the Slack
-  tokens. A failure there is logged and does not stop the delete.
+  tokens. A failure there is logged and does not stop the delete. The cleanup comes before
+  the transaction and is not undone. Sama checks the last owner and the running runs before the
+  cleanup, so a `409` after the cleanup is rare: a run that starts or an owner that leaves in
+  between. The cleanup does the same work again without harm, so the client tries again.
 - In the same transaction the delete writes `data_purges` rows: the sandboxes of the deleted
   sessions (or all sandboxes of a deleted org) and the Langfuse traces of the deleted runs
-  that the exporter sent (at most 1,000 trace ids in one row).
+  that the exporter sent (at most 1,000 trace ids in one row). A trace row waits one hour
+  first: the exporter marks a run as sent before it sends the trace, and Langfuse stores a
+  trace some time after it gets it.
 - The Supabase Auth user is not deleted. A person can be a user in more than one org.
 
 **Purge worker.** `PurgeWorker` runs in the monitor of each control plane. It claims rows
@@ -6071,7 +6079,9 @@ turns the sweep on.
   the cutoff: no new message, no run that is open or ended after the cutoff, and no job that
   uses the session. A `branch` or `retry` child is checked on its own.
 - It deletes at most 500 sessions of one org in one pass, in batches of 50, and it skips a
-  session that is busy. Each pass writes the audit row `data.retention`.
+  session that is busy. A session with its children goes in one transaction, so it does not go
+  when it is more than what is left of the limit. A session with more than 500 children goes
+  alone, as the first delete of a pass. Each pass writes the audit row `data.retention`.
 - The retention does not apply to the audit log, memory, skills, or other rows that are not
   in a session.
 

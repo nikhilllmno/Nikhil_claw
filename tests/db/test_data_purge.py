@@ -12,8 +12,9 @@ import pytest
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.datacontrols import sweep as sweep_module
 from sama.datacontrols.purge import FIND_LIMIT, PurgeWorker
-from sama.datacontrols.service import ServiceCleanup
+from sama.datacontrols.service import DataControls, ServiceCleanup
 from sama.datacontrols.sweep import RetentionSweep
 from sama.db.models import AuditEntry, DataPurge, Job, Message, Org, Run, Session
 from sama.tenancy.access import Grants
@@ -168,6 +169,38 @@ async def test_the_worker_deletes_traces_and_leaves_kinds_it_cannot_do(
     assert waiting.attempts == 0
 
 
+async def test_a_trace_purge_waits_for_a_trace_that_the_exporter_sends_now(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    # The exporter claimed the run (``trace_exported_at``) and sends the trace later.
+    org_b = fresh.ids["org-b"]
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run)
+            .where(Run.id == fresh.ids["run:b1-shared"])
+            .values(trace_exported_at=func.now())
+        )
+    await DataControls(engine).delete_org(org_b, actor_user_id=fresh.ids["bob"])
+    fake = FakeTraces()
+
+    await PurgeWorker(engine, traces=fake).run_once()
+
+    assert fake.deleted == []
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(DataPurge)
+            .where(
+                DataPurge.org_id == org_b,
+                DataPurge.kind == "traces",
+                DataPurge.done_at.is_(None),
+                DataPurge.next_attempt_at < text("now() + interval '1 year'"),
+            )
+            .values(next_attempt_at=func.now())
+        )
+    await PurgeWorker(engine, traces=fake).run_once()
+    assert fake.deleted == [fresh.ids["run:b1-shared"].hex]
+
+
 async def test_old_done_purges_are_forgotten(engine: AsyncEngine, fresh: World) -> None:
     row = await add_purge(engine, fresh.ids["org-a"], "traces", {"trace_ids": []})
     async with engine.begin() as connection:
@@ -266,6 +299,44 @@ async def test_the_sweep_keeps_recent_running_and_scheduled_sessions(
     if job is not None:
         assert fresh.ids["a2-shared"] in kept
         assert deleted == 0
+
+
+async def test_the_sweep_stops_at_the_limit_of_a_pass(
+    engine: AsyncEngine, fresh: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    org_a = fresh.ids["org-a"]
+    root = fresh.ids["a1-shared"]
+    child = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Session).values(
+                id=child,
+                org_id=org_a,
+                workspace_id=fresh.ids["a1"],
+                agent_profile_id=fresh.ids["profile-a"],
+                audience="shared",
+                parent_session_id=root,
+                lineage="compaction",
+                title="c",
+            )
+        )
+    for session in ("a1-shared", "a1-alice", "a2-shared"):
+        await age(engine, fresh, session, 40)
+    async with engine.begin() as connection:
+        past = text("now() - interval '40 days'")
+        await connection.execute(
+            update(Session).where(Session.id == child).values(created_at=past, updated_at=past)
+        )
+    monkeypatch.setattr(sweep_module, "MAX_PER_ORG", 1)
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    sweep = RetentionSweep(engine)
+
+    # a1-shared is the oldest. With its child it is more than the limit, so it goes alone.
+    assert await sweep.sweep_org(org_a, cutoff) == 2
+    assert root not in await session_ids(engine, org_a)
+    assert await sweep.sweep_org(org_a, cutoff) == 1
+    assert await sweep.sweep_org(org_a, cutoff) == 1
+    assert await session_ids(engine, org_a) == set()
 
 
 async def test_run_once_uses_the_org_setting(engine: AsyncEngine, fresh: World) -> None:

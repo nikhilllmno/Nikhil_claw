@@ -9,8 +9,10 @@ its last message, and the start or the end of its last run. A session stays when
 - a ``compaction`` or ``delegation`` child of it has newer activity.
 
 The sweep deletes one session (with its children) in each transaction, with
-``delete_sessions``. A lock wait or a running run skips the session until the next sweep. The
-audit log, the org and user rows, memory, skills, and the other settings stay.
+``delete_sessions``. A lock wait or a running run skips the session until the next sweep. One
+pass deletes at most ``MAX_PER_ORG`` sessions in an org. A session with more children than
+that limit goes alone, in a pass of its own. The audit log, the org and user rows, memory,
+skills, and the other settings stay.
 """
 
 from __future__ import annotations
@@ -24,12 +26,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 
 from sqlalchemy import bindparam, insert, select, text
-from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.datacontrols.delete import busy, delete_sessions, lock_timeout, session_closure
+from sama.datacontrols.delete import (
+    UUIDS,
+    busy,
+    delete_sessions,
+    lock_timeout,
+    session_closure,
+)
 from sama.datacontrols.retention import effective_days
 from sama.db.models import AuditEntry, Org, Session
 
@@ -39,7 +45,6 @@ BATCH: Final = 50
 """The candidates of one query."""
 MAX_PER_ORG: Final = 500
 """The most sessions that one sweep deletes in one org. The next sweep does the rest."""
-_UUIDS: Final = ARRAY(PG_UUID(as_uuid=True))
 _STALE: Final = """
     s.updated_at < :cutoff
     AND NOT EXISTS (
@@ -63,14 +68,18 @@ _CANDIDATES: Final = text(
     " AND (s.lineage IS NULL OR s.lineage IN ('branch', 'retry'))"
     " AND NOT (s.id = ANY(:skip))"
     " AND " + _STALE + " ORDER BY s.created_at, s.id LIMIT :limit"
-).bindparams(bindparam("skip", type_=_UUIDS))
+).bindparams(bindparam("skip", type_=UUIDS))
 
 _FRESH: Final = text(
     "SELECT count(*) FROM sessions s WHERE s.org_id = :org AND s.id = ANY(:ids)"  # noqa: S608
     + " AND NOT ("
     + _STALE
     + ")"
-).bindparams(bindparam("ids", type_=_UUIDS))
+).bindparams(bindparam("ids", type_=UUIDS))
+
+
+class _OverBudget(Exception):
+    """The session and its children are more than the sessions that the pass can delete."""
 
 
 class RetentionSweep:
@@ -107,7 +116,8 @@ class RetentionSweep:
         skip: list[uuid.UUID] = []
         deleted = 0
         runs = 0
-        while deleted < MAX_PER_ORG:
+        full = False
+        while not full:
             async with self._engine.connect() as connection:
                 roots = list(
                     (
@@ -120,12 +130,21 @@ class RetentionSweep:
             if not roots:
                 break
             for root in roots:
-                removed = await self._delete(org_id, root, cutoff)
+                # The first delete of a pass has no limit: a session goes with all its children.
+                budget = MAX_PER_ORG - deleted if deleted else None
+                try:
+                    removed = await self._delete(org_id, root, cutoff, budget)
+                except _OverBudget:
+                    full = True
+                    break
                 if removed is None:
                     skip.append(root)
                     continue
                 deleted += removed[0]
                 runs += removed[1]
+                full = deleted >= MAX_PER_ORG
+                if full:
+                    break
         if deleted:
             async with self._engine.begin() as connection:
                 await connection.execute(
@@ -145,13 +164,18 @@ class RetentionSweep:
         return deleted
 
     async def _delete(
-        self, org_id: uuid.UUID, root: uuid.UUID, cutoff: datetime
+        self, org_id: uuid.UUID, root: uuid.UUID, cutoff: datetime, budget: int | None
     ) -> tuple[int, int] | None:
-        """Deletes one root session and its children. None: the session stays for now."""
+        """Deletes one root session and its children. None: the session stays for now.
+        Raises ``_OverBudget`` when the closure has more than ``budget`` sessions."""
         try:
             async with self._engine.begin() as connection:
                 await lock_timeout(connection)
                 closure = await session_closure(connection, org_id, [root])
+                if not closure:
+                    return None
+                if budget is not None and len(closure) > budget:
+                    raise _OverBudget
                 # The lock comes before the check: a new message or run of a locked session
                 # waits for the delete, then fails.
                 await connection.execute(
@@ -159,7 +183,7 @@ class RetentionSweep:
                     .where(Session.org_id == org_id, Session.id.in_(closure))
                     .with_for_update()
                 )
-                if not closure or await _fresh(connection, org_id, closure, cutoff):
+                if await _fresh(connection, org_id, closure, cutoff):
                     await connection.rollback()
                     return None
                 removed = await delete_sessions(connection, org_id, closure)

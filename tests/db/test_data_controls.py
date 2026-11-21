@@ -8,16 +8,20 @@ import json
 import uuid
 import zipfile
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.datacontrols.delete import (
+    TRACE_DELAY,
     DataBusyError,
     DataNotFoundError,
     LastOwnerError,
     delete_sessions,
+    delete_user,
 )
 from sama.datacontrols.export import SECRET_COLUMNS, export_tables
 from sama.datacontrols.service import DataControls
@@ -90,6 +94,16 @@ async def test_an_org_delete_removes_every_row_of_the_org_and_no_row_of_the_othe
     assert ("sandboxes", '{"all": true}') in refs
     trace = fresh.ids["run:b1-shared"].hex
     assert ("traces", json.dumps({"trace_ids": [trace]})) in refs
+    async with engine.connect() as connection:
+        due = (
+            await connection.execute(
+                select(func.min(DataPurge.next_attempt_at)).where(
+                    DataPurge.org_id == org_b, DataPurge.kind == "traces"
+                )
+            )
+        ).scalar_one()
+    # The exporter can send a claimed trace now. The purge comes after it.
+    assert due > datetime.now(UTC) + TRACE_DELAY - timedelta(minutes=5)
 
 
 async def test_a_user_delete_removes_the_private_data_and_keeps_the_shared_data(
@@ -177,6 +191,64 @@ async def test_a_running_run_blocks_the_delete_and_is_asked_to_stop(
         ).scalar_one_or_none()
     assert cancel is not None
     assert user is not None
+
+
+async def started_by(engine: AsyncEngine, world: World, run: str, user: str, status: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run)
+            .where(Run.id == world.ids[run])
+            .values(triggered_by_user_id=world.ids[user], status=status)
+        )
+
+
+async def run_state(engine: AsyncEngine, run_id: uuid.UUID) -> Any:
+    async with engine.connect() as connection:
+        return (
+            await connection.execute(
+                select(Run.status, Run.triggered_by_user_id, Run.cancel_requested_at).where(
+                    Run.id == run_id
+                )
+            )
+        ).one()
+
+
+async def test_a_user_delete_cancels_the_waiting_shared_runs_of_the_user(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    await started_by(engine, fresh, "run:a1-shared", "alice", "queued")
+    await started_by(engine, fresh, "run:a2-shared", "carol", "queued")
+
+    await DataControls(engine).delete_user(
+        fresh.ids["org-a"], fresh.ids["alice"], actor_user_id=fresh.ids["carol"]
+    )
+
+    # A run with no user has no user limits, so the run of alice must not go on.
+    cancelled = await run_state(engine, fresh.ids["run:a1-shared"])
+    assert (cancelled.status, cancelled.triggered_by_user_id) == ("cancelled", None)
+    assert (await run_state(engine, fresh.ids["run:a2-shared"])).status == "queued"
+
+
+async def test_a_running_shared_run_of_the_user_blocks_the_delete(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    run_id = fresh.ids["run:a1-shared"]
+    await started_by(engine, fresh, "run:a1-shared", "alice", "queued")
+    await set_running(engine, run_id)
+    with pytest.raises(DataBusyError, match="asked them to stop"):
+        await DataControls(engine).delete_user(
+            fresh.ids["org-a"], fresh.ids["alice"], actor_user_id=fresh.ids["carol"]
+        )
+    state = await run_state(engine, run_id)
+    assert state.triggered_by_user_id == fresh.ids["alice"]
+    assert state.cancel_requested_at is not None
+    # The delete checks again under its locks: a run that starts after the first check.
+    async with engine.begin() as connection:
+        removed = await delete_user(
+            connection, fresh.ids["org-a"], fresh.ids["alice"], actor_user_id=fresh.ids["carol"]
+        )
+        await connection.rollback()
+    assert removed.running == [run_id]
 
 
 async def test_an_org_delete_waits_for_running_runs(engine: AsyncEngine, fresh: World) -> None:
