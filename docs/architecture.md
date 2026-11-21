@@ -4780,6 +4780,8 @@ version: the same tools, the same session, and the same rules as the six browser
    The sub-agent never uses `my_chrome` (Section 14.2.2): the user is not there to click for a
    sensitive action. Without the `cloud` target (no Browserbase key), the tool is hidden. With `start_url`, the loop opens the URL before
    the first model call.
+   The `act` tool has the vision mode of M5.2: `x` and `y` (and `to_x`, `to_y`, `clicks`) in
+   place of a ref, after a `screenshot`.
 2. Each model call is one step. A step can run at most 5 tool calls. The last step must call
    `done` (`tool_choice`), so the task always ends with the best result that the sub-agent has.
 3. The task ends when the sub-agent calls `done`, answers with text only, or reaches a limit.

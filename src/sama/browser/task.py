@@ -235,9 +235,17 @@ class _Open(_Input):
     url: _Url
 
 
+_Coordinate = Annotated[float, Field(ge=0, le=10_000)]
+
+
 class _Act(_Input):
     action: ActionKind
     ref: _Ref | None = None
+    x: _Coordinate | None = None
+    y: _Coordinate | None = None
+    to_x: _Coordinate | None = None
+    to_y: _Coordinate | None = None
+    clicks: Annotated[int, Field(ge=1, le=3)] = 1
     text: Annotated[str | None, Field(max_length=10_000)] = None
     values: Annotated[list[Annotated[str, Field(max_length=500)]], Field(max_length=50)] = Field(
         default_factory=list
@@ -281,10 +289,13 @@ TOOLS: Final[list[dict[str, Any]]] = [
     {
         "name": "act",
         "description": (
-            "Do one action in the active tab and get a new snapshot. Actions: click (ref), type "
-            "(ref, text, submit), select (ref, values), hover (ref), drag (ref, target_ref), "
-            "scroll (direction, amount, or ref), press (text: a key such as Enter), wait "
-            "(seconds, at most 10), back, forward, reload, dialog (accept, prompt_text)."
+            "Do one action in the active tab and get a new snapshot. Actions: click (ref, "
+            "clicks), type (ref, text, submit), select (ref, values), hover (ref), drag (ref, "
+            "target_ref), scroll (direction, amount, or ref), press (text: a key such as "
+            "Enter), wait (seconds, at most 10), back, forward, reload, dialog (accept, "
+            "prompt_text). Vision mode: when the page has no refs for what you need (a "
+            "canvas), take a screenshot and give x and y (CSS pixels of the screenshot) in "
+            "place of ref for click, type, hover, and scroll, and to_x and to_y for drag."
         ),
         "input_schema": _schema(
             {
@@ -306,6 +317,11 @@ TOOLS: Final[list[dict[str, Any]]] = [
                     ],
                 },
                 "ref": _REF_PROP,
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "to_x": {"type": "number"},
+                "to_y": {"type": "number"},
+                "clicks": {"type": "integer", "minimum": 1, "maximum": 3},
                 "text": {"type": "string"},
                 "values": {"type": "array", "items": {"type": "string"}},
                 "submit": {"type": "boolean"},
@@ -368,6 +384,7 @@ How to work:
 - Each browser tool returns the page as an accessibility tree. Elements that you can use have \
 [ref=eN]. Use only refs from the latest result: a new snapshot makes old refs invalid.
 - Work in small steps. After each action, read the new page before the next action.
+- A note can name browser_act or browser_screenshot: these are your act and screenshot tools.
 - When you have the answer, call done at once with a short, complete result: the facts, \
 values, and URLs that the goal asks for. When the goal cannot be done, call done with \
 success=false and the reason.
@@ -716,6 +733,11 @@ def _parse(name: str, arguments: Mapping[str, Any]) -> _Call:
             act = Act(
                 action=parsed.action,
                 ref=parsed.ref,
+                x=parsed.x,
+                y=parsed.y,
+                to_x=parsed.to_x,
+                to_y=parsed.to_y,
+                clicks=parsed.clicks,
                 text=parsed.text,
                 values=tuple(parsed.values),
                 submit=parsed.submit,
@@ -773,6 +795,8 @@ def _act_summary(parsed: _Act) -> str:
     parts: list[str] = [parsed.action]
     if parsed.ref:
         parts.append(parsed.ref)
+    elif parsed.x is not None and parsed.y is not None:
+        parts.append(f"at {parsed.x:g},{parsed.y:g}")
     if parsed.action in {"type", "press"} and parsed.text:
         # The text can be long or personal: the log keeps only its size.
         parts.append(f"({len(parsed.text)} characters)" if parsed.action == "type" else parsed.text)

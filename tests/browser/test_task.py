@@ -179,6 +179,7 @@ async def test_the_sub_agent_uses_the_browser_and_returns_an_untrusted_result(
     assert world.gate.calls[1][1] == {
         "action": "click",
         "ref": "e1",
+        "clicks": 1,
         "values": [],
         "submit": False,
         "direction": "down",
@@ -396,7 +397,7 @@ async def test_a_bad_input_or_an_unknown_tool_is_an_error_for_the_sub_agent(worl
     texts = [r["content"][0]["text"] for r in results]
     assert texts[0] == "the input of act is not valid: action"
     assert texts[1] == "unknown tool shell"
-    assert texts[2] == "click needs ref: the ref of an element from the snapshot"
+    assert texts[2].startswith("click needs ref: the ref of an element from the snapshot")
     assert all(r["is_error"] for r in results)
 
 
@@ -603,3 +604,16 @@ async def test_the_org_url_policy_applies_to_each_step() -> None:
     assert result["is_error"] is True
     assert "evil.test is in the block list of the org" in result["content"][0]["text"]
     assert all("evil.test" not in call for s in target.sessions for call in s.calls)
+
+
+async def test_the_sub_agent_can_act_at_a_point_in_vision_mode(world: World) -> None:
+    await world.service.snapshot(make_claims())  # The session of the run exists now.
+    world.target.sessions[0].vision = True
+    model = ScriptedModel(
+        [message(tool_use("act", {"action": "click", "x": 120, "y": 45.5, "clicks": 2})), done()]
+    )
+    text = await world.runner(model).run(make_claims(), TOKEN, "Click the canvas")
+    (session,) = world.target.sessions
+    assert "act click None at (120, 45.5)" in session.calls
+    assert "1. click at 120,45.5" in text
+    assert world.gate.calls[0][1]["x"] == 120
