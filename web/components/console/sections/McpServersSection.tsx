@@ -27,6 +27,7 @@ import {
   type ServerNotice,
   SCOPE_TEXT,
   serverAddress,
+  serverError,
   serverKindLabel,
   serverTitle,
   testNotice,
@@ -52,7 +53,8 @@ export function McpServersSection() {
   const [notice, setNotice] = useState<string | null>(null);
   const load = useCallback(() => api.listConnections(workspaceId), [api, workspaceId]);
   const connections = useLoad(load, "Could not load the MCP servers.");
-  const canAdd = can(org, "connections.add");
+  // The API lets a workspace admin or the org owner add a server; the web knows only the org role.
+  const canAdd = can(org, "connections.add") && org.admin;
 
   const rows = connections.data === null ? null : mcpServers(connections.data);
   const replace = (saved: Connection) =>
@@ -81,7 +83,7 @@ export function McpServersSection() {
             </button>
           ) : null
         }
-        meta={canAdd ? undefined : "Your role cannot add MCP servers. An org admin can change this."}
+        meta={canAdd ? undefined : "A workspace admin or the org owner adds MCP servers. An org owner can take this right away from a role."}
       />
       {notice ? (
         <p className="alert alert-success" role="status">
@@ -178,7 +180,7 @@ function ServerList({
               </div>
               {address ? <p className={styles.text}>{address}</p> : null}
               <p className={styles.meta}>{tools ?? "No tools found yet."}</p>
-              {c.last_error ? <p className={styles.error}>{c.last_error}</p> : null}
+              {c.last_error ? <p className={styles.error}>{serverError(c.last_error)}</p> : null}
               <div className={styles.actions}>
                 <button type="button" className="btn btn-small" onClick={() => onOpen(c.id)}>
                   Open
@@ -387,7 +389,7 @@ function ServerDetail({
         {connection.kind === "mcp_hosted" && custom !== null ? <HostedInfo hosted={custom as HostedCustom} /> : null}
         {connection.last_error ? (
           <p className="alert alert-error" role="alert">
-            Last error: {connection.last_error}
+            Last error: {serverError(connection.last_error)}
           </p>
         ) : null}
         {changeable ? (

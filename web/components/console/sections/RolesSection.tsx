@@ -29,6 +29,7 @@ import { useConsole } from "../Console";
 import { SectionHeader } from "../parts";
 import styles from "../../Page.module.css";
 import own from "../../Members.module.css";
+import roles from "./Roles.module.css";
 
 export function RolesSection() {
   const { org } = useConsole();
@@ -142,9 +143,9 @@ function PermissionTable({
           <thead>
             <tr>
               <th scope="col">Permission</th>
-              <th scope="col">Owner</th>
+              <th scope="col" className={roles.roleHead}>Owner</th>
               {EDITABLE_ROLES.map((role) => (
-                <th key={role} scope="col">
+                <th key={role} scope="col" className={roles.roleHead}>
                   {EDITABLE_ROLE_LABELS[role]}
                 </th>
               ))}

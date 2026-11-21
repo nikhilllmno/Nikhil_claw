@@ -7164,7 +7164,7 @@ The console reuses their screens. Each write goes to the API, and the API writes
 | Group | Section | What it does |
 |---|---|---|
 | Org | Setup | The steps of the setup guide (Section 17.6) as a list, with a link to the section that does each step |
-| Org | Slack | The Slack and Telegram apps (connect, disconnect, and a test), the linked chat accounts, and pairing codes. A card shows that more channels come with M7.8 |
+| Org | Slack | The chat apps of the org: Slack and Telegram (connect, disconnect, and a test), WhatsApp with the choice of its provider, and email (Section 11.9), and the linked chat accounts and pairing codes |
 | Org | Roles | The members, the invites, and an editor of the permissions of each role |
 | Agents | Harness | The runtime, the model, the reasoning effort, the busy mode, and the run budget of each agent |
 | Agents | Tools | The toolsets of each agent, the policy of each tool for the agent, and the rules for every agent of the org |
@@ -7180,8 +7180,7 @@ The console reuses their screens. Each write goes to the API, and the API writes
 Each section has a list, a detail view, a create form, and a delete with a confirm. A section
 shows its fields as read-only when the role of the user cannot change them, and says who can.
 A part that another M7 item adds (the busy mode of M7.1, custom tools of M7.3, the sub-agent
-library of M7.4, and the channels of M7.8) shows a card "Not available yet" until the API gives
-it. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
+library of M7.4) shows a card "Not available yet" until the API gives it. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
 without a change of the web app.
 
 **Role permissions.** Migration `0040` adds the table `org_role_permissions` (`org_id`, `role`,
@@ -7268,8 +7267,9 @@ session with an open run cannot be archived (`409`). The audit rows are `session
 
 **Test of a chat app.** `POST /orgs/{org_id}/integrations/{kind}/check` (an admin with
 `chat_apps.manage`) calls Telegram `getMe` or Slack `auth.test` with the stored token and gives
-`{"ok", "detail", "integration"}`. A failure sets `last_error`. The audit row is
-`integration.checked`.
+`{"ok", "detail", "integration"}`. A failure sets `last_error`. A WhatsApp or email app has no
+test (`409`). The audit row is `integration.checked`. The connect and disconnect routes of
+WhatsApp and email (Section 11.9) also need `chat_apps.manage`.
 
 **Enable a connection.** `POST /connections/{connection_id}/enable` moves a `disabled`
 connection out of `disabled` and runs the check of Section 10.3, so the state comes from the

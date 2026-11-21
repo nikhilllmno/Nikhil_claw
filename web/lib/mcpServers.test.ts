@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Connection } from "./api";
 import {
+  serverError,
   canChangeServer,
   canDisableServer,
   canEnableServer,
@@ -155,5 +156,18 @@ describe("testNotice and enableNotice", () => {
   it("reports an enable by the state that the API gives", () => {
     expect(enableNotice({ state: "connected", last_error: null }).tone).toBe("success");
     expect(enableNotice({ state: "failed", last_error: "No answer." }).text).toContain("No answer.");
+  });
+});
+
+describe("serverError", () => {
+  it("gives a sentence for a web page", () => {
+    expect(serverError("<!doctype html><html><body>Not found</body></html>")).toContain("web page");
+    expect(serverError("&lt;!doctype html&gt;&lt;html&gt;")).toContain("web page");
+  });
+
+  it("keeps a short error and cuts a long one", () => {
+    expect(serverError("401 Unauthorized")).toBe("401 Unauthorized");
+    expect(serverError("x".repeat(400))?.length).toBe(301);
+    expect(serverError(null)).toBeNull();
   });
 });

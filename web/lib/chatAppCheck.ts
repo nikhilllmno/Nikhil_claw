@@ -3,7 +3,12 @@
 
 import type { ChatChannel, IntegrationCheck, IntegrationSummary } from "./api";
 
-export const CHAT_APP_TITLES: Record<ChatChannel, string> = { telegram: "Telegram", slack: "Slack" };
+export const CHAT_APP_TITLES: Record<ChatChannel, string> = {
+  telegram: "Telegram",
+  slack: "Slack",
+  whatsapp: "WhatsApp",
+  email: "Email",
+};
 
 /** The chat apps of the org that work, so the screen offers a test for each. */
 export function activeChatApps(integrations: readonly IntegrationSummary[]): ChatChannel[] {

@@ -1,0 +1,7 @@
+/* The permission table of the Roles section (M7.10). A role name in the head of a column does
+   not break inside the word on a narrow screen. */
+
+.roleHead {
+  overflow-wrap: normal;
+  white-space: nowrap;
+}

@@ -1,7 +1,8 @@
 "use client";
 
-// The Slack section: the chat apps of the org (Slack and Telegram), a test of each active app,
-// the chat accounts that the user linked, and the place of the channels that come later (M7.8).
+// The Slack section: the chat apps of the org (Slack, Telegram, WhatsApp with its provider, and
+// email; M7.8), a test of each active Slack or Telegram app, and the chat accounts that the user
+// linked.
 
 import { useState } from "react";
 import { errorText, type ChatChannel, type IntegrationSummary, type Org } from "@/lib/api";
@@ -13,7 +14,7 @@ import { ChatApps } from "../../ChatApps";
 import { useData } from "../../DataProvider";
 import { LinkedAccounts } from "../../Settings";
 import { useConsole } from "../Console";
-import { ComingCard, SectionHeader } from "../parts";
+import { SectionHeader } from "../parts";
 import styles from "../../Page.module.css";
 
 export function SlackSection() {
@@ -30,16 +31,13 @@ export function SlackSection() {
       {manage ? <ChatApps org={org} onChanged={reloadMe} /> : <ChatAppStatus org={org} />}
       {manage ? <ConnectionTest org={org} onChecked={reloadMe} /> : null}
       <LinkedAccounts orgs={me?.orgs ?? [org]} workspaceId={workspaceId} org={org} />
-      <ComingCard title="More channels">
-        Email and WhatsApp come later. Then you can pick a provider for WhatsApp here.
-      </ComingCard>
     </>
   );
 }
 
 /** The state of the chat apps for a user who cannot change them. */
 function ChatAppStatus({ org }: { org: Org }) {
-  const apps: { kind: ChatChannel; summary: IntegrationSummary | undefined }[] = (["slack", "telegram"] as const).map(
+  const apps: { kind: ChatChannel; summary: IntegrationSummary | undefined }[] = (["slack", "telegram", "whatsapp", "email"] as const).map(
     (kind) => ({ kind, summary: org.integrations.find((i) => i.kind === kind) }),
   );
   return (

@@ -74,11 +74,26 @@ export interface ServerNotice {
   text: string;
 }
 
+const ERROR_MAX_CHARS = 300;
+
+/**
+ * The last error of a server as short text. A server that answers with a web page (HTML) gives a
+ * short sentence and not the page. A long text is cut.
+ */
+export function serverError(error: string | null | undefined): string | null {
+  if (!error) return null;
+  const text = error.trim();
+  if (/<\s*(!doctype|html|head|body)\b/i.test(text) || /&lt;\s*(!doctype|html)\b/i.test(text)) {
+    return "The server answered with a web page, not with MCP. Check the address.";
+  }
+  return text.length > ERROR_MAX_CHARS ? `${text.slice(0, ERROR_MAX_CHARS)}…` : text;
+}
+
 /** The notice after a test of the connection. The state comes from the API. */
 export function testNotice(connection: Pick<Connection, "state" | "last_error">): ServerNotice {
   const tone = stateTone(connection.state);
   if (tone === "ok") return { tone: "success", text: "The test worked. The server is connected." };
-  const why = connection.last_error ? ` ${connection.last_error}` : "";
+  const why = connection.last_error ? ` ${serverError(connection.last_error)}` : "";
   if (tone === "wait") return { tone: "info", text: `The server is not ready. Its state is: ${stateLabel(connection.state)}.${why}` };
   return { tone: "error", text: `The test failed. Its state is: ${stateLabel(connection.state)}.${why}` };
 }
@@ -87,6 +102,6 @@ export function testNotice(connection: Pick<Connection, "state" | "last_error">)
 export function enableNotice(connection: Pick<Connection, "state" | "last_error">): ServerNotice {
   const tone = stateTone(connection.state);
   if (tone === "ok") return { tone: "success", text: "The server is enabled and connected." };
-  const why = connection.last_error ? ` ${connection.last_error}` : "";
+  const why = connection.last_error ? ` ${serverError(connection.last_error)}` : "";
   return { tone: tone === "off" ? "info" : "error", text: `The server is enabled. Its state is: ${stateLabel(connection.state)}.${why}` };
 }
