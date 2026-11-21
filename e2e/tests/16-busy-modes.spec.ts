@@ -103,3 +103,24 @@ test("/stop NUMBER stops one of two open runs", async ({ ownerPage: page, ownerA
   const final = await ownerApi.runs(sessionId);
   expect(final.filter((r) => r.status === "completed")).toHaveLength(1);
 });
+
+test("two messages that join a run add to the first request (PR 92)", async ({ ownerPage: page }) => {
+  // The repro of the M7.1 finding: each joined message is an added request, so the answer
+  // has all three words, not only the newest one.
+  const first = marker("first");
+  const steer = marker("steer");
+  const second = marker("second");
+  await startSession(page, `e2e join three ${first}`);
+  await send(
+    page,
+    "Use the session_search tool three times, one call at a time, with the queries alpha, " +
+      `beta, and gamma. Then reply with the word ${first}.`,
+  );
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await send(page, `Also put the word ${steer} at the end of your reply.`);
+  await send(page, `Reply with the word ${second}.`);
+  await waitForReply(page, first);
+  await waitForReply(page, steer);
+  await waitForReply(page, second);
+  await waitIdle(page);
+});

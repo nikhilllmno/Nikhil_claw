@@ -70,12 +70,15 @@ email) and confirms the address with the admin API, as the link in the email wou
 | `13-m7-skills-channels` | The builtin skill library (at least 68 skills) and `/decision-memo` loads its skill; WhatsApp (Meta, Twilio, Gupshup) and email connects refuse fake credentials and leave no row; pairing codes, webhooks, and admin rules of the channels; the Settings link `?connect=whatsapp&provider=twilio` opens the form and shows the refusal (M7.7, M7.8). |
 | `14-console` | Each of the 13 console sections opens; a webhook is made, gets a signed test, is edited, and is deleted; the harness sets the reasoning effort (M7.10). |
 | `15-coding-agents` | Direct mode with `/claude` until `/sama`; `/codex <task>`; the approval card of `coding_agent_run` when the agent calls it (M7.2). |
-| `16-busy-modes` | A message during a run joins it (note queued, then delivered or requeued); `/bg` and the Run in parallel button start a second run at the same time; `/stop 2` stops one of two runs (M7.1). |
+| `16-busy-modes` | A message during a run joins it (note queued, then delivered or requeued); two joined messages add to the first request, and the answer has all three words (PR 92); `/bg` and the Run in parallel button start a second run at the same time; `/stop 2` stops one of two runs (M7.1). |
 | `17-api-server` | An admin makes an API key on Admin > API keys; the official OpenAI Node SDK chats through `/v1` (also a stream that continues the session); the MCP TypeScript SDK lists the tools and sends a message through `/mcp`; a revoked key gets `401`; a member cannot make keys (M7.6). |
 
 Add a flow when its item lands on main. The staging web app deploys to Vercel by hand
 (`web/README.md`), not from CI. A flow of a new page fails while that deploy is behind `main`,
-so deploy the web app first. Keep each test independent of the order of the files,
+so deploy the web app first.
+
+A staging deploy replaces the API machine. A test that runs during the switch can get a `503`.
+The nightly run starts at 03:00 IST, when deploys are rare, and CI retries a failed test once. Keep each test independent of the order of the files,
 except inside a file with `test.describe.configure({ mode: "serial" })`.
 
 ## Rules for tests
