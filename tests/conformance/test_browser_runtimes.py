@@ -314,3 +314,44 @@ async def test_the_openai_runtime_solves_a_canvas_app_in_vision_mode(
         )
     finally:
         await runtime.aclose()
+
+
+class SlowTarget(FakeTarget):
+    """A target that takes longer to start than the 5-second MCP default of the OpenAI SDK, as
+    a Browserbase session does."""
+
+    async def start(self, **kwargs: Any) -> Any:
+        import asyncio
+
+        await asyncio.sleep(6.5)
+        return await super().start(**kwargs)
+
+
+@pytest.mark.skipif(not HAS_OPENAI_SDK, reason="openai-agents is not installed")
+async def test_the_openai_runtime_waits_for_a_slow_sama_tool(
+    tmp_path: Path, scripted_responses: tuple[ScriptedResponses, str]
+) -> None:
+    from sama.runtime.openai_agents import OpenAIRuntime, OpenAISettings
+    from sama.runtime.session_items import MemorySessionItems
+
+    world = Browser(SlowTarget())
+    _, responses_url = scripted_responses
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    runtime = OpenAIRuntime(
+        items=MemorySessionItems(),
+        gate=AllowGate(),
+        settings=OpenAISettings(
+            cwd=str(workdir), model_url=f"{responses_url}/v1", api_key="scripted-model"
+        ),
+    )
+    try:
+        with serve(world.server.app()) as url:
+            request = request_for(world, url, RuntimeKind.OPENAI_AGENTS_SDK, "gpt-6-luna", OPEN)
+            events = await collect(runtime.run(request))
+        done = events[-1]
+        assert isinstance(done, RunCompleted), events
+        assert "An error occurred" not in done.output
+        check_open(world, done.output)
+    finally:
+        await runtime.aclose()

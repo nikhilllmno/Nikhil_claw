@@ -671,7 +671,9 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
 
 - **Agent.** Each run builds one `SandboxAgent` with the sama prefix as `instructions`, the
   `Shell` and `Compaction` capabilities, and one `MCPServerStreamableHttp` for each MCP
-  server of the config, with the run token in an `Authorization` header. The SDK sandbox
+  server of the config, with the run token in an `Authorization` header. Each MCP call can
+  take 1,200 seconds (`MCP_CALL_TIMEOUT_S`). The SDK default is 5 seconds, which fails every
+  sama tool that takes longer (for example a new browser session or `clarify`). The SDK sandbox
   client is `UnixLocalSandboxClient` in the work folder, with no snapshot. The model is
   `OpenAIResponsesModel` over an `AsyncOpenAI` client with the proxy URL and the run token.
 - **Session items.** The SDK `Session` of the run is a sama store (`_Store`) over
@@ -4905,9 +4907,12 @@ point of it, as with computer use.
   the point. `drag` presses the button at the point, moves to the drop point in 12 steps, and
   releases the button. `scroll` moves the mouse to the point and turns the wheel by `amount`.
   `press` needs no point: it uses the keyboard of the page.
-- **Screenshots.** A viewport screenshot (`full_page=false`) has the Playwright scale `css`,
-  so one pixel of the image is one CSS pixel of the viewport, also on a screen with a device
-  scale factor above 1. The caption gives the size of the image (sama reads it from the JPEG
+- **Screenshots.** A viewport screenshot (`full_page=false`) has one pixel for each CSS pixel
+  of the viewport, also when the device scale factor is above 1 (it is 2 on Browserbase). The
+  session calls CDP `Page.captureScreenshot` with a clip in CSS pixels and a `scale`. When the
+  image is not as wide as the clip, it takes the image again with the corrected scale, and keeps
+  that scale for the tab. The Playwright scale `css` is not enough: over `connect_over_cdp`
+  Playwright does not know the device scale factor of the browser. The caption gives the size of the image (sama reads it from the JPEG
   header) and the range of the points, for example "The image is 1280x720 pixels. It is the
   viewport: browser_act takes x (0 to 1279) and y (0 to 719)". The caption of a full-page image
   says that its points are not viewport points.
