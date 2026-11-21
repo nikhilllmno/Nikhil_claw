@@ -3,6 +3,7 @@ name: diagram
 description: Draw architecture, flow, and sequence diagrams
 version: 1.0.0
 tags: [creative, diagrams, software]
+requires_toolsets: [core]
 ---
 
 # Diagram
@@ -22,9 +23,12 @@ than text: an architecture, a data flow, a user journey, a state machine, or an 
    - timeline or Gantt chart: work over time.
 3. List the nodes and the links in text first. Keep to about 12 nodes. Split a bigger
    picture into an overview and detail diagrams.
-4. Write the diagram in Mermaid. Mermaid renders in most chat apps, GitHub, and Notion.
-5. When the user needs an image file, render it in the sandbox with the Mermaid command-line
-   tool (`mmdc`) if it is installed, or write an SVG by hand for a simple diagram.
+4. Write the diagram in Mermaid, in a code block. GitHub, GitLab, and Notion render Mermaid.
+   A chat can show it only as code, so also give an image file when the user reads the
+   diagram in the chat.
+5. To make an image file, render the Mermaid text in the sandbox with the Mermaid
+   command-line tool (`mmdc`, from the npm package `@mermaid-js/mermaid-cli`), or write an
+   SVG by hand for a simple diagram. Save a PNG or an SVG in the work folder.
 6. Read the diagram again and check that each link has a direction and, when useful, a
    label.
 

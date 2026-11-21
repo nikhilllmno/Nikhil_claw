@@ -16,8 +16,11 @@ task took many steps and will come again.
 1. Check that a skill is the right tool. A skill is a guide for a kind of task. A fact about
    the user belongs in memory. Work that must run again with no person belongs in a scheduled
    job or a workflow.
-2. Call `skills_list` with a query. When a skill for the task exists, change it with
-   `skill_manage` and `action: patch` instead of a new one.
+2. Call `skills_list` with a query. When a skill for the task exists, look at its scope:
+   - `user`, `workspace`, or `org`: change it with `skill_manage` and `action: patch`,
+   - `builtin`: you cannot change it. Load it with `skill_view`, then make a skill with the
+     same name in the default scope with `action: create`. The new skill replaces the builtin
+     skill for its scope.
 3. Write `SKILL.md`:
    - frontmatter with `name` (lowercase letters, digits, and single hyphens), a
      `description` of at most 60 characters that says when to use the skill, `version`,
@@ -25,10 +28,12 @@ task took many steps and will come again.
    - one line that says when to use the skill,
    - numbered steps that worked, with the exact commands, URLs, and settings,
    - rules: the mistakes to avoid and the checks to do.
-4. Put long reference text or scripts in files under `references/` or `scripts/` with
-   `action: write_file`.
-5. Call `skill_manage` with `action: create`. Use the default scope unless the user asks for
-   another one. Show the user the result.
+4. Call `skill_manage` with `action: create`. Use the default scope unless the user asks for
+   another one.
+5. Then put long reference text or scripts in files under `references/` or `scripts/` with
+   `action: write_file`. When the create is a proposal that waits for an approval, add the
+   files only after the approval.
+6. Show the user the result.
 
 ## Rules
 

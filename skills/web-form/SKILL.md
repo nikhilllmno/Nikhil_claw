@@ -17,8 +17,12 @@ application, a booking, a support request, or a settings page.
    ask for the missing values in one message.
 2. Open the page with `browser_open`. Use the target `my_chrome` when the user must be logged
    in to the site in their own browser. Else use `cloud`.
-3. If the site needs a login, use `browser_vault` with `action: list`, then `action: fill`.
-   You never see the password.
+3. If the site needs a login:
+   - with `cloud`, use `browser_vault` with `action: list`, then `action: fill`. You never see
+     the password. When the tool is missing or has no login for the site, ask the user to
+     save the login in Settings,
+   - with `my_chrome`, ask the user to sign in in their own tab, then continue. Saved logins
+     do not work with this target.
 4. Read the form in the snapshot. Match each field to a value. Fill the fields with
    `browser_act` (`type` for text, `select` for lists, `click` for boxes and buttons).
 5. Before you submit, take a `browser_screenshot` and show the user a list of the field

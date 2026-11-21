@@ -87,8 +87,35 @@ def _body(skill: SkillDoc) -> str:
     return skill.skill_md.split("\n---\n", 1)[1]
 
 
+_CALL: Final = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _names(body: str) -> set[str]:
+    """The names in code font that can be a tool: a whole code span, or the name of a call in a
+    code span (``web_search(query="x")``). A name in quotes is an argument, not a call."""
+    names: set[str] = set()
+    for span in _CODE.findall(body):
+        names.add(span.strip())
+        names.update(_CALL.findall(span))
+    return names
+
+
 def _named_tools(skill: SkillDoc) -> set[str]:
-    return {token for token in _CODE.findall(_body(skill)) if token in TOOL_NAMES}
+    return {name for name in _names(_body(skill)) if name in TOOL_NAMES}
+
+
+def _tool_problems(body: str, requires: tuple[str, ...]) -> list[str]:
+    """Why the tool names of a skill body break the rules of Section 9.2, if they do."""
+    allowed = set(requires) | OPTIONAL_TOOLSETS
+    problems: list[str] = []
+    for name in sorted(_names(body)):
+        if name in TOOL_NAMES and TOOL_NAMES[name] not in allowed:
+            problems.append(f"{name} needs the toolset {TOOL_NAMES[name]}")
+        if _TOOL_LIKE.fullmatch(name) and name not in TOOL_NAMES and name not in NOT_TOOLS:
+            problems.append(f"{name} is not a sama tool")
+        if name in NATIVE_TOOLS:
+            problems.append(f"{name} is a tool of one runtime")
+    return problems
 
 
 def test_the_library_has_a_skill_for_each_folder() -> None:
@@ -152,13 +179,29 @@ def test_the_skill_has_the_builtin_shape(name: str) -> None:
 @pytest.mark.parametrize("name", NAMES)
 def test_the_skill_names_only_tools_that_it_requires(name: str) -> None:
     skill = SKILLS[name]
-    allowed = set(skill.requires_toolsets) | OPTIONAL_TOOLSETS
-    for tool in _named_tools(skill):
-        assert TOOL_NAMES[tool] in allowed, f"{tool} needs the toolset {TOOL_NAMES[tool]}"
-    for token in _CODE.findall(_body(skill)):
-        if _TOOL_LIKE.fullmatch(token) and token not in NOT_TOOLS:
-            assert token in TOOL_NAMES, f"{token} is not a sama tool"
-        assert token not in NATIVE_TOOLS, f"{token} is a tool of one runtime"
+    assert _tool_problems(_body(skill), skill.requires_toolsets) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "requires", "problem"),
+    [
+        ("Use `web_search`.", (), "web_search needs the toolset web"),
+        ('Call `web_search(query="x")`.', (), "web_search needs the toolset web"),
+        ('Call `web_search_typo(query="x")`.', ("web",), "web_search_typo is not a sama tool"),
+        ("Use `browser_task`.", ("browser",), "browser_task is not a sama tool"),
+        ('Run `Bash("ls")`.', ("core",), "Bash is a tool of one runtime"),
+        ("Use `WebFetch`.", ("core",), "WebFetch is a tool of one runtime"),
+    ],
+)
+def test_the_tool_check_finds_each_kind_of_problem(
+    body: str, requires: tuple[str, ...], problem: str
+) -> None:
+    assert problem in _tool_problems(body, requires)
+
+
+def test_the_tool_check_allows_required_and_optional_tools() -> None:
+    body = 'Use `web_search`, `todo`, and `clarify`. Then `sama_tools.call("x", **arguments)`.'
+    assert _tool_problems(body, ("web",)) == []
 
 
 @pytest.mark.parametrize("name", NAMES)

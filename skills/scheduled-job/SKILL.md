@@ -19,13 +19,17 @@ month, collect Z".
 2. Write the job prompt. The job does not see this chat. Put in the prompt:
    - the goal and the exact output format,
    - the sources, the URLs, or the connectors to use,
-   - what to do when there is nothing new (for example, send nothing),
+   - what to answer when there is nothing new (a short line such as "No change"). Each
+     successful run sends its answer to the deliver target. A job cannot stay silent, unless
+     `deliver` is `none`,
    - what to do on an error.
 3. List the tools that the job must use with no approval. Give each tool in
    `preapproved_tools` with limits on its arguments where you can. Use the smallest list.
 4. Call `cronjob_manage` with `action: preview` and show the next three fire times.
 5. Call `cronjob_manage` with `action: create`. Give `deliver` (`origin` for this chat) and,
-   if the user wants, `failure_deliver`.
+   if the user wants, `failure_deliver`. Set `attach_to_session: true` when a run must see
+   the results of earlier runs, for example to report only what is new. Give `skills` when
+   the job must follow a skill.
 6. Tell the user that a job with pre-approved tools, a script, or another deliver target
    waits for the approval of its owner (`/cron approve` or the jobs page).
 7. Offer a test with `action: run`.
