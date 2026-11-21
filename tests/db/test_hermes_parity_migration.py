@@ -1,4 +1,4 @@
-"""Migration 0039: Hermes tool parity (docs/architecture.md, Sections 8.2, 9.8, 10.2.2, and
+"""Migration 0040: Hermes tool parity (docs/architecture.md, Sections 8.2, 9.8, 10.2.2, and
 13.2; roadmap M7.5)."""
 
 from __future__ import annotations
@@ -140,14 +140,14 @@ def test_the_upgrade_adds_the_columns_the_table_and_the_toolset() -> None:
             "settings array": False,
         }
         config = alembic_config(url)
-        command.downgrade(config, "0038")
+        command.downgrade(config, "0039")
         assert not _exists(url)
         _set(url, "profile-a", OLD)
         _set(url, "profile-a2", CUSTOM)
-        command.upgrade(config, "0039")
+        command.upgrade(config, "0040")
         toolsets = _toolsets(url)
         assert toolsets["profile-a"] == [*OLD, "moa"]
         assert toolsets["profile-a2"] == CUSTOM  # a person changed it
-        command.downgrade(config, "0038")
+        command.downgrade(config, "0039")
         assert _toolsets(url)["profile-a"] == OLD
         command.upgrade(config, "head")
