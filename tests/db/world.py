@@ -50,6 +50,7 @@ from sama.db.models import (
     MessageEmbedding,
     ModelCall,
     Org,
+    OrgInvite,
     PairingCode,
     ReviewProposal,
     Run,
@@ -139,6 +140,19 @@ def plan(
             user_id=ids[user],
             workspace_id=ids[workspace] if workspace else None,
             role=role,
+        )
+    # An open invite in each org. Only the admins and owners of the org read it.
+    for org, inviter, workspace in (("org-a", "carol", "a1"), ("org-b", "bob", None)):
+        add(
+            OrgInvite,
+            f"invite:{org}",
+            org_id=ids[org],
+            email=f"new-{org}@example.test",
+            role="member",
+            workspace_id=ids[workspace] if workspace else None,
+            token_hash=uuid.uuid4().bytes * 2,
+            invited_by_user_id=ids[inviter],
+            expires_at=text("now() + interval '7 days'"),
         )
     profiles: tuple[tuple[str, str, str | None], ...] = (
         ("profile-a", "org-a", None),

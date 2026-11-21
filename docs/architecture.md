@@ -3019,8 +3019,12 @@ cross-org check of Section 17.1 through the API.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /config` | The Supabase URL and the public anon key, for the web page. |
-| `GET /me` | The orgs, workspaces, and agent profiles that the user can see. |
+| `GET /config` | The Supabase URL and the public anon key, for the web page. `signup` is `open` or `invite_only` (Section 17.2). |
+| `GET /me` | The orgs, workspaces, and agent profiles that the user can see. Each org has the `role` and the `plan` of the user. |
+| `POST /orgs` | Make an org with the user as the owner (`201`). `403` when sign-up is closed, the email is not confirmed, or the domain is blocked. `429` over a rate limit (Section 17.2). |
+| `GET /orgs/{org_id}/members`, `PATCH`, `DELETE /orgs/{org_id}/members/{user_id}` | The members of the org. `PATCH` changes `role` or `workspace_ids` (an admin). `DELETE` removes a member (an admin) or leaves the org (the user). `409` for the last owner (Section 17.2). |
+| `GET`, `POST /orgs/{org_id}/invites`, `DELETE /orgs/{org_id}/invites/{invite_id}` | The invites of the org, for an admin. `POST` takes `email`, `role`, and `workspace_id`, and gives the token one time (`201`). `429` over the plan caps (Section 17.2). |
+| `GET /invites`, `POST /invites/accept` | The open invites for the confirmed email of the user. Accept with `token` or `invite_id`. `403` for another email, `410` for an ended invite (Section 17.2). |
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
 | `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
@@ -5336,8 +5340,9 @@ environment as the default (Section 16.3).
 - Every table has `org_id`, and most have `workspace_id`. RLS policies check membership from
   the Supabase JWT. The API also checks scope in code (two guards).
 - **Now (team)**: one org for our team, invite-only sign-up.
-- **Later (customers, M6)**: self-serve sign-up, plans and usage billing (Stripe), quotas,
-  org-level keys, data export and delete, and a region per org.
+- **Customers (M6)**: self-serve sign-up, org creation, invites, and roles are done (M6.5,
+  Section 17.2). Plans and usage billing (Stripe), quotas, org-level keys, data export and
+  delete, and a region per org come later.
 - **Products on top**: vorflux creates one sama workspace per hotel and adds its own tables
   and tools through the extension points (D16).
 
@@ -5441,6 +5446,76 @@ Row-level security:
   `0014`). CI runs them with a Postgres service from `pgvector/pgvector:pg17`.
   A live test (`-m live`) checks isolation on the Supabase project through the Data API and
   through SQL. The sama HTTP API repeats the check in code and reads with RLS (Section 11.4).
+
+### 17.2 Customer sign-up, invites, and roles (M6.5)
+
+A person signs up with Supabase Auth, makes an org, and invites other people. The code is in
+`sama.orgs` (`OrgService`, the plans, and the email checks) and `sama.api.orgs` (the routes in
+Section 11.4). Migration `0031` adds the table `org_invites` and the column
+`orgs.created_by_auth_user_id`.
+
+**Sign-up.** The web app signs the person up with the Supabase Auth REST API
+(`/auth/v1/signup` with a PKCE `code_challenge`). When the project needs a confirmed email,
+Supabase sends a link that comes back to `/login?code=`, and the web app changes the code for
+a session as for a sign-in link (Section 11.4). A Supabase Auth user is not a sama user yet.
+The person becomes a sama user when the person makes an org or accepts an invite.
+
+**Org creation.** `POST /orgs` makes, in one transaction: the org on the sign-up plan, the
+`users` row, the org-level `owner` membership, the workspace `Main` (`main`), the agent
+profile `sama` (the same default as `python -m sama.admin bootstrap`, Section 19.4), and the
+audit row `org.created`. Guards against abuse:
+
+- `SAMA_SIGNUP` must be `open`. The default is `invite_only`: then `POST /orgs` gives `403`.
+  Invites work in both modes.
+- The email comes from `auth.users`, and `email_confirmed_at` must be set. sama does not use
+  the `email` claim of the token or the user metadata. If the API cannot read `auth.users`,
+  the check fails (`403`).
+- The email domain must not be a disposable-email domain (a built-in list) or a domain in
+  `SAMA_SIGNUP_BLOCKED_DOMAINS`. A subdomain of a listed domain is blocked too (`403`).
+- Rate limits (`429`): one Supabase Auth user makes at most 3 orgs in 24 hours and at most 10
+  orgs in total. All users together make at most 50 orgs in one hour. A transaction-level
+  advisory lock serializes the checks, so parallel requests cannot pass a limit.
+- The name has 1 to 100 characters. The optional slug has 3 to 48 characters (`a-z`, `0-9`,
+  and `-`, with no `-` at the start or the end) and is not a reserved word. Without a slug, sama makes one from the name and adds
+  a short random suffix when it is taken.
+
+**Plans.** `sama.orgs.plans` is the seam for M6.6 (billing) and M6.9. A `Plan` has a name,
+a member cap, an invite cap per day, the org limits (Section 4.3), and the run budget of the
+default agent profile. A new org gets the `free` plan: 5 members (with open invites), 20
+invites in a day, 2 running runs, 10 messages per user and 30 per org in a minute, and a run
+budget of 40 turns, USD 1.00, and 15 minutes. The `team` plan has no caps. An unknown plan name
+counts as `free`. `GET /me` gives the plan and the role of the user for each org. Spend
+enforcement per plan comes in M6.6.
+
+**Invites.** An org owner or admin invites an email address with the role `admin` or
+`member`. A `member` invite can name one workspace. An invite never gives the role `owner`.
+
+- The API makes a random token, keeps only its SHA-256 hash, and gives the token one time in
+  the answer of `POST /orgs/{org_id}/invites`. sama does not send email. The web app shows the
+  link `<origin>/invite#<token>`: the token is in the fragment, so it does not go to a server
+  log.
+- An invite ends after 7 days (`SignupPolicy.invite_days`). A new invite for the same email ends the open one. The admin
+  can revoke an open invite.
+- The invite is for one email. To accept it, the confirmed email of the user (from
+  `auth.users`) must be the same. A user accepts with the token of the link, or with the id
+  from `GET /invites`, which lists the open invites for the email of the user.
+- Accepting adds the `users` row (or uses the old row of a removed member), the org
+  membership, and the workspace membership. The audit rows are `invite.created`,
+  `invite.revoked`, and `invite.accepted`.
+- RLS: an org admin reads the invites of the org. No role reads `token_hash` through the Data
+  API (a column grant). Writes go through the API only.
+
+**Roles.** `GET /orgs/{org_id}/members` lists the members for every member of the org. An
+owner or admin changes a role and the workspaces of a member, and removes a member. Only an
+owner gives, changes, or removes the role `owner`. The last owner cannot leave, lose the role,
+or be removed (`409`). Every member can leave. A removed member keeps the `users` row, so the
+history of the org stays complete. The audit rows are `member.role_changed`,
+`member.workspaces_changed`, `member.removed`, and `member.left`.
+
+**Web app.** `/login` has a "Create an account" mode. A signed-in user without an org sees
+the open invites and, when sign-up is open, the form for a new org. `/invite` reads the token
+of a link, keeps it in `localStorage` for one hour while the person signs in, and accepts it.
+`/members` shows the members, the roles, the invite form, and the open invites.
 
 ---
 
@@ -5655,6 +5730,8 @@ the start with a message that names the variable but not its value.
 | `SAMA_GITHUB_APP_ID`, `SAMA_GITHUB_APP_SLUG`, `SAMA_GITHUB_CLIENT_ID`, `SAMA_GITHUB_APP_PRIVATE_KEY`, `SAMA_GITHUB_CLIENT_SECRET` | No | The sama GitHub App (Section 19.5). With `SAMA_GITHUB_APP_ID`, all five are required. The private key can have `\n` in place of its line breaks. Without them, the git proxy and the pull request tools are off. |
 | `SAMA_SELF_REPO` | No | The sama repository of `sama_pr`, as `<owner>/<name>` (Section 15.2.1). Default: `nikhilllmno/Nikhil_claw`. |
 | `SAMA_SENDGRID_API_KEY`, `SAMA_EMAIL_FROM` | No | Email delivery of jobs (Section 12.1). Without both, an `email:` delivery fails. |
+| `SAMA_SIGNUP` | No | `open` lets a user with a confirmed email make an org. The default, `invite_only`, adds users only with an invite (Section 17.2). |
+| `SAMA_SIGNUP_BLOCKED_DOMAINS` | No | More email domains that cannot make an org, comma-separated (Section 17.2). |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first

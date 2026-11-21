@@ -233,7 +233,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | CLI and TUI | `cli.py`, `ui-tui/` | Cloud only. A small admin CLI (`sama`) for operators may come later. | Skip | — |
 | Desktop app | `apps/desktop/` | No desktop app. The web app and the Chrome extension cover it. | Skip | — |
 | Profiles (separate homes) | `~/.hermes/profiles/` | Agent profiles and workspaces in Postgres (§17). | Adapt | M1 |
-| Setup wizard, doctor, update | `hermes setup`, `hermes doctor` | Web onboarding for customers (M6). Health checks and alerts (§18). | Adapt | M6 |
+| Setup wizard, doctor, update | `hermes setup`, `hermes doctor` | Web onboarding for customers (M6): sign-up, a first org, and invites are done (§17.2, M6.5). Health checks and alerts (§18). | Adapt | M6 |
 | Gateway service management | `hermes gateway install` | Fly.io process groups, deploys from CI (§19). | Adapt | M1 |
 | Batch runner and trajectories | `batch_runner.py`, `trajectory_compressor.py` | Not planned. Langfuse datasets cover evals. | Defer | — |
 | Evals | `evals/` | Conformance suite in CI and a nightly live suite (§5.5). | Adapt | M1 |
@@ -252,4 +252,4 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Versioned and revertible self-improvement | D14 | M2 |
 | GitHub App and git proxy: no token in the sandbox, `sama/*` branches only, no force-push or delete, pull requests by tool | §15.1 | M3 (M3.7 done) |
 | Self-modification through pull requests | §15.2 | M6 |
-| Customer sign-up, billing, quotas | §17 | M6 |
+| Customer sign-up, billing, quotas | §17 (sign-up, invites, and roles in §17.2) | M6 (M6.5 done) |

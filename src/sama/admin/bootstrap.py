@@ -8,6 +8,7 @@ nothing. The owner is an org-level ``owner`` membership, so the owner sees every
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -48,6 +49,26 @@ sandboxes and budget. Migrations 0017 and 0023 have a copy of this list."""
 
 class BootstrapError(ValueError):
     pass
+
+
+def default_profile(
+    org_id: uuid.UUID,
+    *,
+    name: str = "sama",
+    model: str = DEFAULT_MODEL,
+    budget: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The values of the org-wide agent profile of a new org. Sign-up (``sama.orgs``) uses
+    them too, with the run budget of the plan."""
+    return {
+        "org_id": org_id,
+        "workspace_id": None,
+        "name": name,
+        "model": model,
+        "toolsets": list(DEFAULT_TOOLSETS),
+        "group_toolsets": list(DEFAULT_GROUP_TOOLSETS),
+        "budget": dict(budget or {}),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,14 +159,7 @@ async def bootstrap(
             .order_by(AgentProfile.created_at)
             .limit(1),
             insert(AgentProfile)
-            .values(
-                org_id=org_id,
-                workspace_id=None,
-                name=profile_name,
-                model=model,
-                toolsets=list(DEFAULT_TOOLSETS),
-                group_toolsets=list(DEFAULT_GROUP_TOOLSETS),
-            )
+            .values(**default_profile(org_id, name=profile_name, model=model))
             .returning(AgentProfile.id),
         )
     return Bootstrapped(org_id, user_id, workspace_id, profile_id, added)

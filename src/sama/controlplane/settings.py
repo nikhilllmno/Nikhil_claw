@@ -16,6 +16,7 @@ from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
 from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
 from sama.media.vision import DEFAULT_VISION_MODEL
+from sama.orgs.service import SignupPolicy
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
 from sama.vault.crypto import VaultKey
 
@@ -154,6 +155,8 @@ class ControlPlaneSettings:
     self_repo: str = DEFAULT_SELF_REPO
     """The sama repository that ``sama_pr`` changes (``SAMA_SELF_REPO``, ``<owner>/<name>``,
     Section 15.2)."""
+    signup: SignupPolicy = field(default_factory=SignupPolicy)
+    """Self-serve sign-up (``SAMA_SIGNUP``, ``SAMA_SIGNUP_BLOCKED_DOMAINS``, Section 17.2)."""
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -234,6 +237,10 @@ class ControlPlaneSettings:
             web_origins = parse_origins(env.get("SAMA_WEB_ORIGINS", ""))
         except ValueError as error:
             raise SettingsError(f"SAMA_WEB_ORIGINS: {error}") from None
+        try:
+            signup = SignupPolicy.from_env(env)
+        except ValueError as error:
+            raise SettingsError(str(error)) from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
             github=_github(env),
@@ -263,4 +270,5 @@ class ControlPlaneSettings:
             sendgrid_key=_secret(env, "SAMA_SENDGRID_API_KEY"),
             email_from=env.get("SAMA_EMAIL_FROM", "").strip() or None,
             self_repo=_self_repo(env),
+            signup=signup,
         )

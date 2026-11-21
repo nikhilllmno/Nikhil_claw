@@ -56,6 +56,7 @@ from sama.api.history import (
     SearchHit,
     SessionHistory,
 )
+from sama.api.orgs import router as org_router
 from sama.api.origins import check_origins
 from sama.api.skill_editor import (
     ReadScope,
@@ -129,6 +130,7 @@ from sama.memory import (
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
 from sama.orchestrator.queue import QueueError, RateLimitedError, RunQueue
+from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
 from sama.profiles import (
     NAME_MAX_CHARS,
     SOUL_MAX_CHARS,
@@ -192,6 +194,8 @@ class ApiSettings(BaseModel):
     web_origins: tuple[str, ...] = ()
     """The exact origins of the web app (``SAMA_WEB_ORIGINS``). With none, the API sends no CORS
     headers."""
+    signup: SignupPolicy = SignupPolicy()
+    """Self-serve sign-up (Section 17.2). The default is ``invite_only``."""
 
     @field_validator("web_origins")
     @classmethod
@@ -870,6 +874,7 @@ class SamaApi:
         search: SessionSearch | None = None,
         workflows: WorkflowService | None = None,
         handoffs: Handoffs | None = None,
+        orgs: OrgService | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
@@ -878,7 +883,8 @@ class SamaApi:
         answer ``409``. Without ``skills``,
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command. Without ``search``, the session search of the web app uses full-text search
-        only."""
+        only. Without ``orgs``, sign-up reads the verified emails from ``auth.users`` and uses
+        ``settings.signup``."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
@@ -906,6 +912,9 @@ class SamaApi:
         self._gate = gate or GateService(engine)
         self._clarify = clarify
         self._settings = settings or ApiSettings()
+        self._org_service = orgs or OrgService(
+            engine, AuthUsersEmails(engine), self._settings.signup
+        )
         self._streams: Counter[uuid.UUID] = Counter()
 
     async def principal(self, request: Request) -> Principal:
@@ -974,7 +983,10 @@ class SamaApi:
                 "supabase_anon_key": settings.supabase_anon_key,
                 "integrations": self._integrations is not None and self._integrations.enabled,
                 "connections": self._connections is not None,
+                "signup": self._org_service.policy.mode,
             }
+
+        app.include_router(org_router(self._org_service, _principal))
 
         @app.get("/me")
         async def me(principal: Me) -> dict[str, Any]:
@@ -1717,7 +1729,7 @@ class SamaApi:
         result: list[dict[str, Any]] = []
         async with as_user(self._engine, principal.auth_user_id) as connection:
             users = await connection.execute(
-                select(User.id, User.org_id, User.display_name, Org.name)
+                select(User.id, User.org_id, User.display_name, Org.name, Org.plan)
                 .join(Org, Org.id == User.org_id)
                 .where(User.auth_user_id == principal.auth_user_id)
                 .order_by(Org.name, Org.id)
@@ -1771,6 +1783,8 @@ class SamaApi:
                         "user_id": str(user.id),
                         "display_name": user.display_name,
                         "admin": grants.org_admin,
+                        "role": next(role for ws, role in grants.rows if ws is None),
+                        "plan": user.plan,
                         "workspaces": workspaces,
                         "agent_profiles": profiles,
                         "integrations": integrations,

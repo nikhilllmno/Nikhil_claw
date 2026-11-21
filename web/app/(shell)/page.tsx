@@ -5,6 +5,7 @@ import { useState } from "react";
 import { useApi } from "@/components/AuthProvider";
 import { useData } from "@/components/DataProvider";
 import { ErrorState, LoadingState } from "@/components/ui";
+import { Welcome } from "@/components/Welcome";
 import { type Audience, errorText } from "@/lib/api";
 import styles from "./home.module.css";
 
@@ -25,6 +26,8 @@ export default function HomePage() {
 
   if (meError) return <ErrorState message={meError} onRetry={reloadMe} />;
   if (me === null) return <LoadingState label="Loading your workspaces" />;
+  // A user without an org: invites, and sign-up (docs/architecture.md, Section 17.2).
+  if (me.orgs.length === 0) return <Welcome />;
   if (workspaces.length === 0) {
     return (
       <main className={styles.page}>

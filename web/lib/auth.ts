@@ -129,6 +129,26 @@ export class AuthSession implements TokenSource {
     this.signedIn(await this.auth("token?grant_type=password", { email, password }));
   }
 
+  /**
+   * Makes a Supabase Auth account. When the project needs a confirmed email, Supabase emails a
+   * link that comes back to `redirectTo` with a `code` (PKCE), and this returns `"confirm"`.
+   * Otherwise the user is signed in and this returns `"signed-in"`.
+   */
+  async signUp(email: string, password: string, redirectTo: string): Promise<"confirm" | "signed-in"> {
+    const challenge = await newPkce(this.deps.local, this.now());
+    const data = await this.auth(`signup?redirect_to=${encodeURIComponent(redirectTo)}`, {
+      email,
+      password,
+      code_challenge: challenge,
+      code_challenge_method: "s256",
+    });
+    if (typeof data.access_token === "string" && data.access_token !== "") {
+      this.signedIn(data);
+      return "signed-in";
+    }
+    return "confirm";
+  }
+
   /** Asks Supabase to email a sign-in link that comes back to `redirectTo` with a `code`. */
   async sendSignInLink(email: string, redirectTo: string): Promise<void> {
     const challenge = await newPkce(this.deps.local, this.now());

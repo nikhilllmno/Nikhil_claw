@@ -103,4 +103,37 @@ describe("AuthSession", () => {
     expect(typeof exchange.code_verifier).toBe("string");
     await expect(auth.exchangeCode("abc")).rejects.toThrow(/not from this browser/);
   });
+  it("signs up with PKCE: a confirm link comes back as a code for this browser", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(reply({ id: "u1", email: "a@b.c" }))
+      .mockResolvedValueOnce(reply({ access_token: "a1", refresh_token: "r1", expires_in: 3600 }));
+    const { auth, session } = make(fetcher);
+    expect(await auth.signUp("a@b.c", "long-password", "https://app.test/login")).toBe("confirm");
+    expect((fetcher.mock.calls[0] as unknown[] | undefined)?.[0]).toBe(
+      "https://x.supabase.co/auth/v1/signup?redirect_to=https%3A%2F%2Fapp.test%2Flogin",
+    );
+    const body = JSON.parse(fetcher.mock.calls[0]?.[1].body);
+    expect(body).toMatchObject({ email: "a@b.c", password: "long-password", code_challenge_method: "s256" });
+    expect(typeof body.code_challenge).toBe("string");
+    expect(session.getItem(AUTH_KEY)).toBeNull();
+    await auth.exchangeCode("abc");
+    expect(await auth.getToken()).toBe("a1");
+  });
+
+  it("signs in at once when the project does not ask for a confirmed email", async () => {
+    const fetcher = vi.fn(async () =>
+      reply({ access_token: "a1", refresh_token: "r1", expires_in: 3600, user: { id: "u1" } }),
+    );
+    const { auth } = make(fetcher);
+    expect(await auth.signUp("a@b.c", "long-password", "https://app.test/login")).toBe("signed-in");
+    expect(await auth.getToken()).toBe("a1");
+  });
+
+  it("shows the error text of a failed sign-up", async () => {
+    const { auth } = make(vi.fn(async () => reply({ msg: "Signups not allowed for this instance" }, 422)));
+    await expect(auth.signUp("a@b.c", "long-password", "https://app.test/login")).rejects.toThrow(
+      "Signups not allowed",
+    );
+  });
 });

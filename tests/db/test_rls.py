@@ -25,6 +25,8 @@ TABLES = sorted(Base.metadata.tables)
 COLUMNS = ("attachments", "generated_media")
 """The tables whose grant is on columns: the bytes of an image or a voice note are not
 readable."""
+SECRET_COLUMNS = {"org_invites": "token_hash"}
+"""More tables whose grant is on columns: the column has a secret (Section 17.2)."""
 SESSION_CHILDREN = (
     "runs",
     "messages",
@@ -51,6 +53,7 @@ INSUFFICIENT_PRIVILEGE = "42501"
 VISIBLE: dict[str, dict[str, set[str]]] = {
     "alice": {
         "orgs": {"org-a"},
+        "org_invites": set(),
         "users": {"alice", "carol", "dave"},
         "workspaces": {"a1"},
         "agent_profiles": {"profile-a"},
@@ -79,6 +82,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     },
     "carol": {
         "orgs": {"org-a"},
+        "org_invites": {"invite:org-a"},
         "users": {"alice", "carol", "dave"},
         "workspaces": {"a1", "a2"},
         "agent_profiles": {"profile-a", "profile-a2"},
@@ -107,6 +111,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     },
     "dave": {
         "orgs": {"org-a"},
+        "org_invites": set(),
         "users": {"alice", "carol", "dave"},
         "workspaces": set(),
         "agent_profiles": {"profile-a"},
@@ -135,6 +140,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     },
     "bob": {
         "orgs": {"org-b"},
+        "org_invites": {"invite:org-b"},
         "users": {"bob"},
         "workspaces": {"b1"},
         "agent_profiles": {"profile-b"},
@@ -163,6 +169,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
     },
     "stranger": {
         "orgs": set(),
+        "org_invites": set(),
         "users": set(),
         "workspaces": set(),
         "agent_profiles": set(),
@@ -456,8 +463,35 @@ async def test_only_authenticated_select_is_granted(engine: AsyncEngine) -> None
         grants = {(grantee, table, privilege) for grantee, table, privilege in rows}
     # ``COLUMNS`` have a grant on columns only: the table grant is absent on purpose.
     assert grants == {
-        ("authenticated", table, "SELECT") for table in TABLES if table not in COLUMNS
+        ("authenticated", table, "SELECT")
+        for table in TABLES
+        if table not in COLUMNS and table not in SECRET_COLUMNS
     }
+
+
+@pytest.mark.parametrize(("table", "secret"), sorted(SECRET_COLUMNS.items()))
+async def test_nobody_reads_a_secret_column_through_the_data_api(
+    engine: AsyncEngine, world: World, table: str, secret: str
+) -> None:
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT grantee, column_name, privilege_type"
+                " FROM information_schema.column_privileges"
+                " WHERE table_schema = 'public' AND table_name = :table"
+                " AND grantee IN ('anon', 'authenticated', 'PUBLIC')"
+            ),
+            {"table": table},
+        )
+        columns = {(grantee, column, privilege) for grantee, column, privilege in rows}
+    assert {grantee for grantee, _, _ in columns} == {"authenticated"}
+    assert {privilege for _, _, privilege in columns} == {"SELECT"}
+    assert secret not in {column for _, column, _ in columns}
+    async with as_user(engine, world.auth["carol"]) as connection:
+        assert await count(connection, table) >= 1
+        with pytest.raises(DBAPIError) as error:
+            await connection.execute(text(f"SELECT {secret} FROM {table}"))  # noqa: S608
+    assert sqlstate(error.value) == INSUFFICIENT_PRIVILEGE
 
 
 @pytest.mark.parametrize("table", COLUMNS)

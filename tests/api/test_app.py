@@ -90,6 +90,7 @@ async def test_the_page_and_the_config_are_public(client: httpx.AsyncClient) -> 
         "supabase_anon_key": "anon-key",
         "integrations": False,
         "connections": False,
+        "signup": "invite_only",
     }
 
 
@@ -118,6 +119,7 @@ async def test_me_lists_what_the_user_can_see(client: httpx.AsyncClient, tenant:
     assert [p["id"] for p in orgs[0]["agent_profiles"]] == [str(tenant.ids["profile"])]
     assert orgs[0]["user_id"] == str(tenant.ids["mia"])
     assert (orgs[0]["admin"], orgs[0]["integrations"]) == (False, [])
+    assert (orgs[0]["role"], orgs[0]["plan"]) == ("member", "team")
     stranger = (await client.get("/me", headers=bearer(uuid.uuid4()))).json()
     assert stranger == {"orgs": []}
 

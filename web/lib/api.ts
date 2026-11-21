@@ -13,7 +13,11 @@ export interface PublicConfig {
   integrations: boolean;
   /** True when the API has the connection routes. */
   connections?: boolean;
+  /** `open`: a user with a confirmed email can make an org. `invite_only`: only invites. */
+  signup?: SignupMode;
 }
+
+export type SignupMode = "open" | "invite_only";
 
 export interface Workspace {
   id: string;
@@ -43,6 +47,10 @@ export interface Org {
   display_name: string | null;
   /** True for an org owner or admin. */
   admin: boolean;
+  /** The org role of the user. */
+  role: OrgRole;
+  /** The plan of the org, for example `free` or `team`. */
+  plan: string;
   workspaces: Workspace[];
   agent_profiles: AgentProfileSummary[];
   integrations: IntegrationSummary[];
@@ -51,6 +59,64 @@ export interface Org {
 export interface Me {
   orgs: Org[];
 }
+
+export type OrgRole = "owner" | "admin" | "member";
+/** An invite cannot give the role owner. */
+export type InviteRole = "admin" | "member";
+
+export interface CreatedOrg {
+  id: string;
+  name: string;
+  slug: string;
+  plan: string;
+  user_id: string;
+  workspace_id: string;
+  agent_profile_id: string;
+}
+
+export interface OrgMember {
+  user_id: string;
+  display_name: string;
+  email: string | null;
+  role: OrgRole;
+  joined_at: string | null;
+  workspace_ids: string[];
+}
+
+export interface OrgInvite {
+  id: string;
+  email: string;
+  role: InviteRole;
+  workspace_id: string | null;
+  invited_by: string | null;
+  expires_at: string | null;
+  created_at: string | null;
+  expired: boolean;
+}
+
+/** A new invite. The API gives the token only here, once. */
+export interface CreatedInvite extends OrgInvite {
+  token: string;
+}
+
+/** An open invite for the email of the user. */
+export interface MyInvite {
+  id: string;
+  org_id: string;
+  org_name: string;
+  role: InviteRole;
+  invited_by: string | null;
+  expires_at: string | null;
+}
+
+export interface AcceptedInvite {
+  org_id: string;
+  org_name: string;
+  user_id: string;
+  role: InviteRole;
+}
+
+export type InviteAnswer = { token: string } | { invite_id: string };
 
 export type Audience = "private" | "shared";
 
@@ -980,6 +1046,50 @@ export class ApiClient {
   }
 
   me = () => this.json<Me>("/me");
+  /** Makes an org with the user as the owner (sign-up). */
+  createOrg = (name: string, displayName: string | null) =>
+    this.json<CreatedOrg>("/orgs", {
+      method: "POST",
+      body: displayName ? { name, display_name: displayName } : { name },
+    });
+  listMembers = (orgId: string) =>
+    this.json<OrgMember[]>(`/orgs/${encodeURIComponent(orgId)}/members`);
+  /** Changes the role or the workspaces (the whole set) of a member. */
+  changeMember = (
+    orgId: string,
+    userId: string,
+    change: { role?: OrgRole; workspace_ids?: string[] },
+  ) =>
+    this.json<OrgMember>(
+      `/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`,
+      { method: "PATCH", body: change },
+    );
+  /** Removes a member. With the user's own id: leaves the org. */
+  removeMember = (orgId: string, userId: string) =>
+    this.json<null>(`/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+    });
+  listInvites = (orgId: string) =>
+    this.json<OrgInvite[]>(`/orgs/${encodeURIComponent(orgId)}/invites`);
+  createInvite = (
+    orgId: string,
+    body: { email: string; role: InviteRole; workspace_id: string | null },
+  ) =>
+    this.json<CreatedInvite>(`/orgs/${encodeURIComponent(orgId)}/invites`, {
+      method: "POST",
+      body,
+    });
+  revokeInvite = (orgId: string, inviteId: string) =>
+    this.json<null>(
+      `/orgs/${encodeURIComponent(orgId)}/invites/${encodeURIComponent(inviteId)}`,
+      { method: "DELETE" },
+    );
+  myInvites = () => this.json<MyInvite[]>("/invites");
+  acceptInvite = (answer: InviteAnswer, displayName: string | null = null) =>
+    this.json<AcceptedInvite>("/invites/accept", {
+      method: "POST",
+      body: displayName ? { ...answer, display_name: displayName } : answer,
+    });
   listSessions = (limit = 50) => this.json<SessionOut[]>(`/sessions?limit=${limit}`);
   createSession = (body: NewSession) =>
     this.json<SessionOut>("/sessions", { method: "POST", body });
