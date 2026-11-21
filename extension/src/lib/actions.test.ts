@@ -39,7 +39,9 @@ const FACTS: Record<string, ElementFacts> = {
   o5: { tag: "button", type: "button", role: "", name: "Hello", autocomplete: "", field: "", form: null },
 };
 
-function rig(siteAnswers: SiteAnswer[] = ["allow"], actionAnswers: ActionAnswer[] = []) {
+type Hook = (params: Record<string, unknown>) => Promise<void> | void;
+
+function rig(siteAnswers: SiteAnswer[] = ["allow"], actionAnswers: ActionAnswer[] = [], hooks: Record<string, Hook> = {}) {
   const sent: string[] = [];
   const cancelled: string[] = [];
   const asked: string[] = [];
@@ -58,10 +60,15 @@ function rig(siteAnswers: SiteAnswer[] = ["allow"], actionAnswers: ActionAnswer[
   };
   const actor = new Actor({
     cdp: {
-      attach: async () => undefined,
-      detach: async () => undefined,
+      attach: async () => {
+        await hooks.attach?.({});
+      },
+      detach: async () => {
+        sent.push("detach");
+      },
       send: async <T,>(_tabId: number, method: string, params: Record<string, unknown> = {}) => {
         sent.push(method);
+        await hooks[method]?.(params);
         const expression = String(params.expression ?? "");
         const answers: Record<string, unknown> = {
           "Page.getFrameTree": { frameTree: { frame: { id: "f" } } },
@@ -91,7 +98,9 @@ function rig(siteAnswers: SiteAnswer[] = ["allow"], actionAnswers: ActionAnswer[
       cancelled.push(runId);
     },
     onChange: () => undefined,
-    sleep: async () => undefined,
+    sleep: async (ms: number) => {
+      await hooks.sleep?.({ ms });
+    },
   });
   return { actor, sent, cancelled, asked, consent, tab };
 }
@@ -258,5 +267,66 @@ describe("actor", () => {
       ok: false,
       error: { code: "failed" },
     });
+  });
+
+  it("an expired call sends nothing after the next call starts", async () => {
+    let release: () => void = () => undefined;
+    let holding = false;
+    const hooks: Record<string, Hook> = {
+      "DOM.getContentQuads": () => {
+        if (!holding) return;
+        return new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+    };
+    const { actor, sent } = rig(["allow"], [], hooks);
+    await actor.handle(call("snapshot"));
+    holding = true;
+    const slow = { ...call("act", { action: "click", ref: "e3" }), timeout_ms: 1_000 };
+    expect(await actor.handle(slow)).toMatchObject({ ok: false, error: { code: "timeout" } });
+    holding = false;
+    const next = actor.handle(call("snapshot"));
+    release();
+    expect((await next).ok).toBe(true);
+    expect(sent.filter((method) => method === "Input.dispatchMouseEvent")).toHaveLength(0);
+  });
+
+  it("does not click when the page navigates or the user takes over during the cursor move", async () => {
+    for (const event of ["navigate", "takeover"] as const) {
+      let actor: Actor | null = null;
+      const hooks: Record<string, Hook> = {
+        sleep: ({ ms }) => {
+          if (ms !== 250 || actor === null) return;
+          if (event === "navigate") actor.onEvent(1, "Page.frameNavigated", { frame: { id: "f" } });
+          else actor.onEvent(1, "Runtime.bindingCalled", { name: "__samaSignal", payload: "takeover", executionContextId: 9 });
+        },
+      };
+      const made = rig(["allow"], [], hooks);
+      await made.actor.handle(call("snapshot"));
+      actor = made.actor;
+      const result = await made.actor.handle(call("act", { action: "click", ref: "e3" }));
+      expect(result).toMatchObject({ ok: false, error: { code: event === "navigate" ? "stale_ref" : "taken_over" } });
+      expect(made.sent.filter((method) => method === "Input.dispatchMouseEvent")).toHaveLength(0);
+    }
+  });
+
+  it("detaches an attach that ends after the run was released", async () => {
+    let finish: () => void = () => undefined;
+    const hooks: Record<string, Hook> = {
+      attach: () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    };
+    const { actor, sent, consent } = rig(["allow"], [], hooks);
+    await consent.set("https://shop.test/", "allow");
+    const pending = actor.handle(call("snapshot"));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await actor.handle(call("release"));
+    finish();
+    expect(await pending).toMatchObject({ ok: false });
+    expect(sent).toContain("detach");
+    expect(actor.agentTabs()).toEqual([]);
   });
 });

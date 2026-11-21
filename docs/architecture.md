@@ -4792,6 +4792,15 @@ sama is paused." with "Give back to sama" and Stop. The side panel shows the sam
 buttons. The next call of the run waits until the user gives the tab back. After 120 seconds it
 fails with "the user took over the tab", and the agent tells the user what it was doing.
 
+**Calls and cancellation.** The calls of one run run one at a time in the extension: a call
+starts only after the work of the last call ended. Each CDP command of a call checks first that
+the run is not stopped or released and that the deadline of the call did not pass, so a call that
+timed out sends no more input. Right before input, the extension checks again that the page did
+not navigate since the checks, that the site is still allowed, and that the user does not have
+control. When Chrome attaches after a Stop or a release, the extension detaches at once. When
+the WebSocket closes, the extension releases all runs, because the API cannot release them
+later.
+
 **Stop.** Stop in the overlay or in the side panel cancels the run (`POST /runs/{id}/cancel`),
 closes the open questions of the run, and detaches. Later calls of the run fail with "stopped".
 When the user closes the debugging bar of Chrome, the extension stops the run the same way.
@@ -4835,6 +4844,16 @@ There are two checks:
    user ("Allow this action on shop.example? sama asks to buy or pay: 'Place order'.") and waits.
    This check covers a page that changed after the snapshot, and Enter without a ref.
 
+An approval in the gate is good only for the element that the person saw. The session keeps
+the snapshot and the reason of each call when the gate first asks for it. The extension skips
+its own question only when the call runs in that same snapshot with that same reason
+(`approved_reason` in the `tool_call` frame). After a new snapshot, the extension asks again. A
+ticket of an approved call that then runs under an `allow` rule is used up, so it cannot approve
+a later call with the same arguments (Section 16.1).
+
+Keys count too: Enter or Space on a sensitive button, Enter in a text field of a form that
+writes, and a key with text in a password or payment field.
+
 **Address rules.** The address rules of Section 16.4 do not apply to `my_chrome`: the browser
 of the user is on the network of the user, and a DNS check from sama means nothing there. The
 blocked list and the consent of the user apply instead.
@@ -4853,8 +4872,10 @@ warning ("Access the page debugger backend"), and the Chrome Web Store item need
 - The snapshot has the main frame only. Frames of other sites are not in the tree.
 - A takeover is a pointer or key event of the user in the page. A scroll with the mouse wheel
   is not a takeover. An event that comes while the agent sends input is not a takeover.
-- The overlay is in the DOM of the page. A page can hide or remove it; the extension draws it
-  again at the next call.
+- The overlay is in the DOM of the page. A page can hide or remove it; the extension checks its
+  own host element (not an id that the page can copy) and puts it back at the next call.
+- The overlay copies the light-theme values of the panel tokens, because the page cannot load
+  the CSS of the extension.
 - The keyword list of the sensitive check is in English.
 
 #### 14.2.3 Publish to the Chrome Web Store

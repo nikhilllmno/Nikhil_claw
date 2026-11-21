@@ -321,6 +321,13 @@ REASONS: Final[Mapping[str, str]] = {
 """The fixed text of each reason code of the extension (extension/src/lib/sensitive.ts)."""
 
 
+def _call_key(arguments: Mapping[str, Any]) -> tuple[Any, ...]:
+    """The fields of a ``browser_act`` call that name what it does."""
+    ref = arguments.get("ref")
+    ref = ref.removeprefix("ref=").strip() if isinstance(ref, str) else None
+    return (arguments.get("action"), ref, arguments.get("text"), arguments.get("submit") is True)
+
+
 def _reason_text(code: str) -> str:
     """The text of a reason code for the approval card. The code comes from the extension, so
     an unknown code gets a fixed text, never the code itself."""
@@ -416,6 +423,11 @@ class ChromeSession:
         self._timeout_s = timeout_s
         self.sensitivity = Sensitivity()
         self.closed = False
+        self._generation = 0
+        """Grows at each snapshot: a ref names an element of one snapshot only."""
+        self._asked: dict[tuple[Any, ...], tuple[int, str]] = {}
+        """The snapshot and the reason of each sensitive call when the gate first asked for it.
+        A person approved that call for that element only."""
         self._link: ChromeLink | None = None
         self._used: list[ChromeLink] = []
         """The connections that this session used. ``close`` releases the run on each."""
@@ -441,8 +453,12 @@ class ChromeSession:
         return link
 
     def sensitive_reason(self, arguments: Mapping[str, Any]) -> str | None:
+        """The text for the gate. The first ask for a call keeps its snapshot and its reason."""
         reason = sensitive_reason(self.sensitivity, arguments)
-        return None if reason is None else _reason_text(reason)
+        if reason is None:
+            return None
+        self._asked.setdefault(_call_key(arguments), (self._generation, reason))
+        return _reason_text(reason)
 
     async def _call(
         self,
@@ -488,6 +504,7 @@ class ChromeSession:
             refs={ref: reason for ref, reason in shot.sensitive.items()},
             submits=frozenset(shot.submits),
         )
+        self._generation += 1
         dialog = None if shot.dialog is None else Dialog(shot.dialog.kind, shot.dialog.message)
         return Snapshot(page=shot.page.state(), tree=shot.tree, dialog=dialog)
 
@@ -505,8 +522,12 @@ class ChromeSession:
             "accept": act.accept,
             "prompt_text": act.prompt_text,
         }
-        # The extension skips its own question only for the reason that the person approved.
-        code = sensitive_reason(self.sensitivity, args) if human_approved.get() else None
+        # The extension skips its own question only when a person approved this element: the
+        # gate asked for it in this snapshot, for this reason. Else the extension asks.
+        asked = self._asked.pop(_call_key(args), None)
+        code = sensitive_reason(self.sensitivity, args)
+        if not human_approved.get() or code is None or asked != (self._generation, code):
+            code = None
         return _parse(_Page, await self._call("act", args, approved_reason=code)).state()
 
     async def screenshot(self, *, full_page: bool = False) -> Screenshot:

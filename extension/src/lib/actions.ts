@@ -102,8 +102,12 @@ interface RunState {
   once: Set<string>;
   stopped: boolean;
   notes: string[];
-  /** The deadline of the call that runs now. */
+  /** The deadline of the call that runs now. A call that times out sets it to 0, so its work
+   * that still runs cannot send more commands. */
   deadline: number;
+  /** The work of the last call. The next call of the run starts only after it ends, so it
+   * cannot give its deadline to the old work. */
+  chain: Promise<unknown>;
 }
 
 interface TabState {
@@ -117,6 +121,10 @@ interface TabState {
   dialog: { kind: string; message: string } | null;
   resumed: (() => void)[];
   dialogWaiters: (() => void)[];
+  /** Counts the navigations of the main frame. */
+  navs: number;
+  /** The navigation count that the action of the call expects. */
+  expectNav: number | null;
 }
 
 /** The state of a tab for the side panel. */
@@ -174,6 +182,11 @@ export class Actor {
       const result = await Promise.race([this.run(frame, deadline), expired]);
       return { type: "tool_result", call_id: frame.call_id, ok: true, result };
     } catch (error) {
+      if (error instanceof ToolFailure && error.code === "timeout") {
+        // The work of this call may still run: it must send nothing more.
+        const run = this.runs.get(frame.run_id);
+        if (run !== undefined && run.deadline === deadline) run.deadline = 0;
+      }
       const failure =
         error instanceof ToolFailure
           ? error
@@ -195,7 +208,27 @@ export class Actor {
       return {};
     }
     const run = await this.runOf(frame);
+    // Wait for the work of the last call of the run (it stops at its own deadline).
+    let wait: ReturnType<typeof setTimeout> | undefined;
+    const previous = await Promise.race([
+      run.chain.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        wait = setTimeout(() => resolve(false), Math.max(0, deadline - this.now()));
+      }),
+    ]);
+    clearTimeout(wait);
+    if (!previous) throw new ToolFailure("timeout", "the last call of this run did not end");
+    if (run.stopped) throw new ToolFailure("stopped");
     run.deadline = deadline;
+    const work = this.operate(run, frame, deadline);
+    run.chain = work;
+    return work;
+  }
+
+  private async operate(run: RunState, frame: ToolCallFrame, deadline: number): Promise<Record<string, unknown>> {
     const args = frame.args;
     switch (frame.op) {
       case "navigate":
@@ -228,6 +261,7 @@ export class Actor {
         stopped: false,
         notes: [],
         deadline: 0,
+        chain: Promise.resolve(),
       };
       const bound = frame.session_id ? await this.deps.boundTab(frame.session_id) : null;
       if (bound !== null && (await this.deps.tabs.get(bound)) !== null) {
@@ -373,6 +407,8 @@ export class Actor {
         dialog: null,
         resumed: [],
         dialogWaiters: [],
+        navs: 0,
+        expectNav: null,
       };
       this.tabStates.set(tabId, tab);
     }
@@ -381,6 +417,11 @@ export class Actor {
         await this.deps.cdp.attach(tabId);
       } catch (error) {
         throw new ToolFailure("debugger", error instanceof Error ? error.message : "");
+      }
+      // Stop or release can come while Chrome attaches: then detach at once.
+      if (this.tabStates.get(tabId) !== tab || this.runs.get(run.runId) !== run || run.stopped) {
+        await this.deps.cdp.detach(tabId).catch(() => undefined);
+        throw new ToolFailure("stopped");
       }
       tab.attached = true;
       tab.world = null;
@@ -401,15 +442,14 @@ export class Actor {
       try {
         const check = await this.cmd<{ result?: { value?: unknown } }>(tab, "Runtime.evaluate", {
           contextId: tab.world,
-          expression:
-            "typeof globalThis.__sama === 'object' && document.getElementById('sama-agent-overlay') !== null",
+          expression: "globalThis.__sama?.ok() === true",
           returnByValue: true,
         });
         if (check.result?.value === true) return tab.world;
-        // The world is there but the page removed the overlay: build it again in this world.
+        // The world is there but the page removed or changed the overlay: repair it.
         await this.cmd(tab, "Runtime.evaluate", {
           contextId: tab.world,
-          expression: `(${installOverlay.toString()})(${JSON.stringify(OVERLAY_BINDING)})`,
+          expression: `globalThis.__sama ? globalThis.__sama.repair() : (${installOverlay.toString()})(${JSON.stringify(OVERLAY_BINDING)})`,
           returnByValue: true,
         });
         await this.overlay(tab, `mode(${JSON.stringify(tab.paused ? "paused" : tab.mode)})`);
@@ -540,12 +580,21 @@ export class Actor {
 
   private async detachRun(run: RunState): Promise<void> {
     for (const tabId of run.tabs) {
-      if (this.owners.get(tabId) === run.runId) this.owners.delete(tabId);
       const tab = this.tabStates.get(tabId);
-      if (tab === undefined || tab.runId !== run.runId) continue;
-      await this.overlay(tab, "remove()");
-      if (tab.attached) await this.deps.cdp.detach(tabId).catch(() => undefined);
-      this.tabStates.delete(tabId);
+      if (tab !== undefined && tab.runId === run.runId) {
+        // Forget the state first, so an attach that ends later detaches itself. The tab stays
+        // owned by this run until the detach ends, so no other run takes it in between.
+        this.tabStates.delete(tabId);
+        const attached = tab.attached;
+        tab.attached = false;
+        if (attached && tab.world !== null && tab.dialog === null) {
+          await this.deps.cdp
+            .send(tabId, "Runtime.evaluate", { contextId: tab.world, expression: "globalThis.__sama?.remove()" })
+            .catch(() => undefined);
+        }
+        if (attached) await this.deps.cdp.detach(tabId).catch(() => undefined);
+      }
+      if (this.owners.get(tabId) === run.runId) this.owners.delete(tabId);
     }
   }
 
@@ -566,6 +615,9 @@ export class Actor {
       tab.dialog = null;
     } else if (method === "Runtime.executionContextsCleared") {
       tab.world = null;
+    } else if (method === "Page.frameNavigated") {
+      const frame = params.frame as { parentId?: string } | undefined;
+      if (frame !== undefined && frame.parentId === undefined) tab.navs += 1;
     }
   }
 
@@ -672,9 +724,12 @@ export class Actor {
     if (tab.dialog !== null) {
       return { page: await this.page(run), tree: "", dialog: tab.dialog, sensitive: {}, submits: [] };
     }
+    const nav = tab.navs;
     const document = await this.cmd<{ root: DomNode }>(tab, "DOM.getDocument", { depth: -1, pierce: true });
     const facts = domFacts(document.root);
     const ax = await this.cmd<{ nodes: AXNode[] }>(tab, "Accessibility.getFullAXTree");
+    if (tab.navs !== nav) throw new ToolFailure("failed", "the page changed during the snapshot; take a new one");
+    await this.stillAllowed(run, tab);
     const built = buildTree(ax.nodes, (id) => facts.get(id) ?? null);
     tab.refs = built.refs;
     return { page: await this.page(run), tree: built.tree, sensitive: built.sensitive, submits: built.submits };
@@ -761,6 +816,15 @@ export class Actor {
   /** Sends input events with the overlay told that the agent acts, so it is not a takeover. A
    * dialog that the input opens ends the wait at once. */
   private async input(tab: TabState, events: [string, Record<string, unknown>][]): Promise<boolean> {
+    // The last check before input: the page is the page of the snapshot and of the checks, on an
+    // allowed site, and the user does not have control.
+    const run = this.alive(tab.runId);
+    if (tab.expectNav !== null && tab.navs !== tab.expectNav) {
+      throw new ToolFailure("stale_ref", "the page changed before the action");
+    }
+    if (tab.paused) throw new ToolFailure("taken_over");
+    await this.stillAllowed(run, tab);
+    if (tab.paused) throw new ToolFailure("taken_over");
     await this.overlay(tab, "busy(true)");
     try {
       for (const [method, params] of events) {
@@ -843,6 +907,7 @@ export class Actor {
     await this.checkSensitive(run, tab, args, approved, approvedReason, deadline);
     if (tab.paused) await this.waitForResume(run, tab, deadline);
     await this.stillAllowed(run, tab);
+    tab.expectNav = tab.navs;
     let settle = false;
     let dialog = false;
     switch (action) {
@@ -963,6 +1028,7 @@ export class Actor {
       default:
         throw new ToolFailure("invalid", "unknown action");
     }
+    tab.expectNav = null;
     await this.overlay(tab, "box(null)");
     if (settle && !dialog) {
       await this.sleep(SETTLE_MS);

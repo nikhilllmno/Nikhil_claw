@@ -190,6 +190,8 @@ async def test_the_frame_has_the_run_and_the_approval() -> None:
     # A person approved the call, but e1 is not sensitive in the snapshot: nothing to skip.
     assert second["approved"] is False
     one.sensitivity = Sensitivity(refs={"e1": "pay"})
+    # The gate asked for this call in this snapshot, and a person approved it.
+    assert one.sensitive_reason({"action": "click", "ref": "e1", "target": "my_chrome"})
     link.answers.append(ok({"page": page()}))
     token = human_approved.set(True)
     try:
@@ -199,6 +201,30 @@ async def test_the_frame_has_the_run_and_the_approval() -> None:
     assert link.frames[-1]["approved"] is True
     assert link.frames[-1]["approved_reason"] == "pay"
     assert 0 < first["timeout_ms"] < chrome.CALL_TIMEOUT_S * 1000
+
+
+async def test_an_approval_does_not_carry_to_a_new_snapshot() -> None:
+    """The gate asks for e1 ("Send"). A new snapshot gives e1 to "Pay" before the call runs.
+    The approval of the old element must not skip the question of the extension."""
+    link = FakeLink(
+        ok({"page": page(), "tree": "", "sensitive": {"e1": "send"}}),
+        ok({"page": page(), "tree": "", "sensitive": {"e1": "pay"}}),
+        ok({"page": page(), "tree": "", "sensitive": {"e1": "send"}}),
+        ok({"page": page()}),
+        ok({"page": page()}),
+    )
+    one = session(link)
+    await one.snapshot()
+    assert one.sensitive_reason({"action": "click", "ref": "e1"}) == "send or publish"
+    await one.snapshot()  # e1 is "Pay" now
+    await one.snapshot()  # and the same reason again, but in another snapshot
+    token = human_approved.set(True)
+    try:
+        await one.act(Act(action="click", ref="e1"))
+    finally:
+        human_approved.reset(token)
+    assert link.frames[-1]["approved"] is False
+    assert link.frames[-1]["approved_reason"] is None
 
 
 @pytest.mark.parametrize("code", ["blocked", "never", "taken_over", "stopped", "stale_ref"])

@@ -22,6 +22,10 @@ export interface OverlayApi {
   busy(value: boolean): void;
   hidden(value: boolean): void;
   remove(): void;
+  /** True when the real overlay is in the page and visible. */
+  ok(): boolean;
+  /** Puts the real overlay back into the page. */
+  repair(): void;
 }
 
 /**
@@ -31,18 +35,22 @@ export interface OverlayApi {
 export function installOverlay(binding: string): boolean {
   const scope = globalThis as unknown as { __sama?: OverlayApi } & Record<string, unknown>;
   if (scope.__sama !== undefined) {
-    if (document.getElementById("sama-agent-overlay") !== null) return false;
-    // The page removed the overlay: build it again.
-    scope.__sama.remove();
+    // The world keeps a reference to its own host. An element with the same id from the page
+    // is not the overlay.
+    if (scope.__sama.ok()) return false;
+    scope.__sama.repair();
+    return false;
   }
-  document.getElementById("sama-agent-overlay")?.remove();
   const signal = (value: OverlaySignal) => {
     const send = scope[binding];
     if (typeof send === "function") (send as (payload: string) => void)(value);
   };
   const host = document.createElement("div");
   host.id = "sama-agent-overlay";
-  host.style.cssText = "all: initial; position: fixed; inset: 0; z-index: 2147483647; pointer-events: none;";
+  const HOST_STYLE =
+    "all: initial !important; display: block !important; position: fixed !important; inset: 0 !important; " +
+    "z-index: 2147483647 !important; pointer-events: none !important; visibility: visible !important; opacity: 1 !important;";
+  host.style.cssText = HOST_STYLE;
   const root = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `
@@ -95,6 +103,7 @@ export function installOverlay(binding: string): boolean {
   (document.documentElement ?? document.body).append(host);
 
   let busy = false;
+  let hiddenByAgent = false;
   const setMode = (mode: OverlayMode) => {
     bar.dataset.mode = mode;
     text.textContent =
@@ -144,7 +153,18 @@ export function installOverlay(binding: string): boolean {
       busy = value;
     },
     hidden: (value) => {
-      host.style.display = value ? "none" : "";
+      hiddenByAgent = value;
+      host.style.cssText = value ? `${HOST_STYLE} display: none !important;` : HOST_STYLE;
+    },
+    ok: () =>
+      host.isConnected &&
+      host.parentNode === (document.documentElement ?? document.body) &&
+      (hiddenByAgent || getComputedStyle(host).display !== "none"),
+    repair: () => {
+      host.style.cssText = hiddenByAgent ? `${HOST_STYLE} display: none !important;` : HOST_STYLE;
+      if (!host.isConnected || host.parentNode !== (document.documentElement ?? document.body)) {
+        (document.documentElement ?? document.body).append(host);
+      }
     },
     remove: () => {
       removeEventListener("pointerdown", onInput, true);

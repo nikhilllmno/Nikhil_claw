@@ -74,6 +74,9 @@ const gateway = new Gateway({
     else broadcast({ kind: "frame", frame });
   },
   onStatus: (next, text) => {
+    // The API forgets the browser calls of a closed connection, so the actor ends its runs:
+    // no debugger, overlay, or tab stays for a run that the API cannot release.
+    if (status === "open" && next !== "open") void actor.releaseAll();
     status = next;
     detail = text;
     // The server refused the token and no fresh token came: the sign-in ended.
