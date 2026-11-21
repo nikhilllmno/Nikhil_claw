@@ -387,12 +387,18 @@ def _check_read(statement: exp.Expr, policy: Policy) -> frozenset[str]:
 
 
 def _takes_sequence_value(node: exp.Expr) -> bool:
-    """``NEXT VALUE FOR s``, ``nextval(s)``, ``setval(...)``, or ``s.nextval``."""
+    """``NEXT VALUE FOR s``, ``nextval(s)``, ``setval(...)``, or (Snowflake) ``s.nextval``.
+    A column named ``nextval`` without a qualifier is a column."""
     if type(node).__name__ == "NextValueFor":
         return True
     if isinstance(node, exp.Func) and _SEQUENCE_FUNCTIONS.match(_function_name(node)):
         return True
-    return isinstance(node, exp.Column) and node.name.lower() == "nextval"
+    return (
+        _DIALECT.get() is SNOWFLAKE
+        and isinstance(node, exp.Column)
+        and bool(node.table)
+        and node.name.lower() == "nextval"
+    )
 
 
 def _check_execute(text: str, statement: exp.Expr, policy: Policy) -> Checked:
@@ -530,9 +536,18 @@ def _relation_function(node: exp.Expr) -> exp.Func | None:
     if not (isinstance(node, (exp.Table, exp.Lateral)) or rows):
         return None
     inner = node.this
+    qualifier = ""
     if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Func):
-        inner = inner.expression  # A function with a schema: sys.dm_exec_sql_text(...).
+        qualifier = inner.this.sql()  # A function with a schema: sys.dm_exec_sql_text(...).
+        inner = inner.expression
+    elif isinstance(node, exp.Table) and (node.args.get("db") or node.args.get("catalog")):
+        qualifier = ".".join(part.name for part in node.parts[:-1])
     if isinstance(inner, exp.Func):
+        if qualifier:
+            # A function in a schema can be a user function with the name of a listed
+            # function (``private.string_split``), so its name has the schema, which no list
+            # has.
+            return exp.Anonymous(this=f"{qualifier}.{_function_name(inner)}")
         return inner
     if isinstance(node, exp.Table) or isinstance(inner, (exp.Subquery, exp.Query)):
         return None

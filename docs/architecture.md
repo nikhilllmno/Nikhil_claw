@@ -2659,15 +2659,19 @@ at the driver, so a prompt cannot remove them.
     the time limit. So the check cannot trust a comment. A comment-like text in a string is a
     value and is allowed.
   - **Table functions.** A function in `FROM`, `JOIN`, `LATERAL`, or `CROSS APPLY` must be
-    on the list of the engine. Other table functions can read files, URLs, logs, or other
+    on the list of the engine, without a schema or a database part: `private.string_split`
+    can be a user function, so it is refused. Other table functions can read files, URLs, logs, or other
     servers. The lists: MySQL and MariaDB `JSON_TABLE`; SQL Server `OPENJSON`,
     `STRING_SPLIT`, and `GENERATE_SERIES`; Snowflake `FLATTEN`, `SPLIT_TO_TABLE`, and
     `GENERATOR`; ClickHouse `numbers` and `generate_series`; BigQuery none (`UNNEST` is not
     a function here, so it is allowed).
   - **Names from text.** Snowflake `IDENTIFIER('...')` is refused, because the check cannot
     see the name.
-  - **Sequences.** `query` and `export` refuse `NEXT VALUE FOR`, `NEXTVAL`, `SETVAL`, and
-    `GETNEXTVAL`. A rollback does not undo a sequence value, so use `execute`.
+  - **Sequences.** `query` and `export` refuse `NEXT VALUE FOR`, `NEXTVAL(...)`,
+    `SETVAL(...)`, `GETNEXTVAL(...)`, and on Snowflake `name.NEXTVAL`. A rollback does not
+    undo a sequence value, so use `execute`. A column named `nextval` without a qualifier is
+    a column and is allowed. On Snowflake, `t.nextval` is refused, because the check cannot
+    tell it from a sequence.
 - **Names.** A schema is a database for MySQL, MariaDB, and ClickHouse, and a dataset for
   BigQuery. A name without a schema is in the database of the form (MySQL, ClickHouse), the
   default dataset (BigQuery), or the schema of the form (Snowflake). Snowflake makes names
@@ -2696,8 +2700,11 @@ at the driver, so a prompt cannot remove them.
     and each change of a setting (also a `SETTINGS` clause). The time limit is
     `max_execution_time`. A write is done at once.
   - BigQuery: the time limit is `timeoutMs`, and each job also has `jobTimeoutMs`, so
-    BigQuery stops a job that runs longer. The gateway cancels the job when the time limit
-    ends, when a poll fails, and when the call is cancelled.
+    BigQuery tries to stop a job that runs longer. After the first answer gives the job ID,
+    the gateway cancels the job when the time limit ends, when a poll fails, and when the call
+    is cancelled. If the first request fails or the call stops before its answer, the gateway
+    does not know the job ID and cannot cancel the job. Then only `jobTimeoutMs` (a best
+    effort of BigQuery) and `maximumBytesBilled` limit the job.
     Each job has `maximumBytesBilled` (the form value, default 1 GB, at least 10 MB): BigQuery
     refuses a query that would bill more, and the query costs nothing.
   - Snowflake: each statement has `MULTI_STATEMENT_COUNT` 1. The gateway polls a long

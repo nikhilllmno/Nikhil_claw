@@ -228,7 +228,9 @@ class BigQuerySession:
             "useLegacySql": False,
             "dryRun": False,
             "timeoutMs": max(1, int(self._timeout_s * 1000)),
-            # The job itself stops at the time limit, also when the gateway cannot cancel it.
+            # BigQuery tries to stop the job at the time limit, also when the gateway cannot
+            # cancel it (for example when the call stops before the answer to this request
+            # gives the job ID). ``maximumBytesBilled`` limits the cost of such a job.
             "jobTimeoutMs": str(max(1000, int(self._timeout_s * 1000))),
             "maxResults": PAGE_ROWS,
         }

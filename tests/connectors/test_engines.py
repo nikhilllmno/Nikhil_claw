@@ -110,6 +110,13 @@ def test_mysql_executable_comments_and_hints_are_refused(sql: str) -> None:
         (TSQL, "select * from sys.fn_xe_file_target_read_file('a', null, null, null)"),
         (TSQL, "select * from dbo.t cross apply sys.dm_exec_sql_text(t.h) q"),
         (MYSQL, "select * from some_table_function(1) f"),
+        # A function in a schema can be a user function with the name of a listed one.
+        (TSQL, "select * from private.string_split(1)"),
+        (TSQL, "select * from otherdb.private.string_split(1)"),
+        (TSQL, "select * from dbo.orders o cross apply private.string_split(o.id) x"),
+        (TSQL, "select * from dbo.orders o cross apply otherdb.private.openjson(o.id) x"),
+        (CLICKHOUSE, "select * from shop.numbers(3)"),
+        (SNOWFLAKE, "select * from TABLE(PRIVATE.FLATTEN(input => 1))"),
     ],
 )
 def test_dynamic_names_and_unlisted_table_functions_are_refused(dialect: Any, sql: str) -> None:
@@ -148,6 +155,21 @@ def test_query_mode_refuses_sequence_changes(dialect: Any, sql: str) -> None:
     """A sequence value is not rolled back, so it is a write."""
     with pytest.raises(SqlRejectedError):
         check(sql, "query", dict(ALL)[dialect], dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (MYSQL, "select `nextval` from users"),
+        (MYSQL, "select nextval from users"),
+        (BIGQUERY, "select nextval from users"),
+        (TSQL, "select nextval from dbo.users"),
+        (CLICKHOUSE, "select u.nextval from users u"),
+        (SNOWFLAKE, "select NEXTVAL from USERS"),
+    ],
+)
+def test_a_column_named_nextval_is_a_column(dialect: Any, sql: str) -> None:
+    check(sql, "query", dict(ALL)[dialect], dialect)
 
 
 def test_bigquery_select_as_struct_is_refused_when_columns_are_hidden() -> None:
