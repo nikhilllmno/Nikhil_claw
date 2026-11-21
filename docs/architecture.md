@@ -8267,9 +8267,10 @@ The console reuses their screens. Each write goes to the API, and the API writes
 
 Each section has a list, a detail view, a create form, and a delete with a confirm. A section
 shows its fields as read-only when the role of the user cannot change them, and says who can.
-A part that another M7 item adds (the busy mode of M7.1, the sub-agent library of M7.4) shows
-a card "Not available yet" until the API gives it. Since M7.3, the Tools section shows the custom
-tools of the workspace (`CustomToolsPanel`, Section 10.8). The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
+The Tools section shows the custom tools of the workspace (M7.3, `CustomToolsPanel`, Section
+10.8), and the Sub-agents section shows the sub-agent library (M7.4). The Harness section sets the
+busy mode of M7.1 (`steer`, the default, `parallel`, or `queue`) and the most parallel runs of
+one session. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
 without a change of the web app.
 
 **Role permissions.** Migration `0040` adds the table `org_role_permissions` (`org_id`, `role`,

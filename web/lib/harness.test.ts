@@ -4,8 +4,6 @@ import type { AgentProfile } from "./api";
 import {
   budgetChanged,
   budgetFromDraft,
-  busyModeHelp,
-  busyModeLabel,
   capHint,
   harnessPatch,
   reasoningLabel,
@@ -201,6 +199,25 @@ describe("harnessPatch", () => {
     expect(harnessPatch(p, toHarnessDraft(p))).toEqual({});
   });
 
+  it("sends the parallel run limit only when it changes", () => {
+    const p = profile();
+    p.options.busy_modes = ["steer", "parallel", "queue"];
+    expect(toHarnessDraft(p).maxParallelRuns).toBe("3");
+    expect(harnessPatch(p, toHarnessDraft(p))).toEqual({});
+    expect(harnessPatch(p, { ...toHarnessDraft(p), maxParallelRuns: "5" })).toEqual({ max_parallel_runs: 5 });
+    p.max_parallel_runs = 5;
+    expect(harnessPatch(p, { ...toHarnessDraft(p), maxParallelRuns: "5" })).toEqual({});
+  });
+
+  it("checks the parallel run limit", () => {
+    const p = profile();
+    const draft = toHarnessDraft(p);
+    expect(validateHarness({ ...draft, maxParallelRuns: "0" }, undefined, 10)).toContain("1 to 10");
+    expect(validateHarness({ ...draft, maxParallelRuns: "11" }, undefined, 10)).toContain("1 to 10");
+    expect(validateHarness({ ...draft, maxParallelRuns: "2.5" }, undefined, 10)).toContain("whole number");
+    expect(validateHarness({ ...draft, maxParallelRuns: "4" }, undefined, 10)).toBeNull();
+  });
+
   it("sends the whole budget when one field changed", () => {
     const p = profile();
     const draft = toHarnessDraft(p);
@@ -223,13 +240,6 @@ describe("labels", () => {
   it("names the reasoning efforts", () => {
     expect(reasoningLabel("")).toBe("Model default");
     expect(reasoningLabel("high")).toBe("High");
-  });
-
-  it("names and explains the busy modes", () => {
-    expect(busyModeLabel("steer")).toBe("Steer");
-    expect(busyModeHelp("steer")).toContain("joins the open run");
-    expect(busyModeHelp("parallel")).toContain("second run");
-    expect(busyModeHelp("queue")).toContain("waits");
   });
 
   it("says what the plan allows", () => {
