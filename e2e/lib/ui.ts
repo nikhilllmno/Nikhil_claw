@@ -52,7 +52,8 @@ export async function waitForReply(page: Page, text: string | RegExp, timeout = 
 
 /** Waits until no run of the session is open: the Working badge is gone. */
 export async function waitIdle(page: Page, timeout = REPLY_TIMEOUT_MS): Promise<void> {
-  await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0, { timeout });
+  // "Stop all" when more than one run is open (M7.1).
+  await expect(page.getByRole("button", { name: /^Stop( all)?$/ })).toHaveCount(0, { timeout });
 }
 
 /** The approval card for a tool. */
