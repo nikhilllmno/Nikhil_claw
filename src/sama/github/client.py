@@ -9,8 +9,9 @@ a sandbox, a prompt, or a log.
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 from urllib.parse import quote
@@ -286,6 +287,61 @@ class GitHubClient:
                 return False
             raise
         return body.get("status") in {"ahead", "identical"}
+
+    async def compare(
+        self, installation_id: int, owner: str, name: str, base: str, head: str
+    ) -> dict[str, Any]:
+        """The comparison of two branches or commits: ``status``, ``ahead_by``, and ``files``.
+        GitHub gives at most 300 files."""
+        span = quote(f"{base}...{head}", safe="/.")
+        return await self._as(
+            installation_id,
+            "GET",
+            f"/repos/{_path(owner)}/{_path(name)}/compare/{span}?per_page=1",
+        )
+
+    async def file_text(
+        self, installation_id: int, owner: str, name: str, path: str, ref: str
+    ) -> str | None:
+        """The text of a file at ``ref``, or ``None`` if the file does not exist. Raises
+        ``GitHubError`` if the path is not a regular file or GitHub does not give its
+        content."""
+        try:
+            body = await self._as(
+                installation_id,
+                "GET",
+                f"/repos/{_path(owner)}/{_path(name)}/contents/{quote(path, safe='/')}"
+                f"?ref={quote(ref, safe='')}",
+            )
+        except GitHubError as error:
+            if error.status_code == 404:
+                return None
+            raise
+        if body.get("type") != "file":
+            raise GitHubError(f"{path} is not a file")
+        if body.get("encoding") != "base64" or not isinstance(body.get("content"), str):
+            raise GitHubError(f"GitHub did not give the content of {path}")
+        try:
+            return base64.b64decode(body["content"]).decode("utf-8", errors="replace")
+        except ValueError:
+            raise GitHubError(f"GitHub gave content of {path} that is not base64") from None
+
+    async def request_reviewers(
+        self,
+        installation_id: int,
+        owner: str,
+        name: str,
+        number: int,
+        *,
+        users: Sequence[str],
+        teams: Sequence[str],
+    ) -> dict[str, Any]:
+        return await self._as(
+            installation_id,
+            "POST",
+            f"/repos/{_path(owner)}/{_path(name)}/pulls/{number}/requested_reviewers",
+            json={"reviewers": list(users), "team_reviewers": list(teams)},
+        )
 
     async def _as(
         self, installation_id: int, method: str, path: str, json: Any = None

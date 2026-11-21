@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.2 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -270,6 +270,17 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13 (below
   M4.13: a static egress address (architecture Section 10.6), `mongodb+srv://` strings,
   MongoDB writes, connection pools for the new engines, the private network relay, Parquet
   export, and live tests against BigQuery and Snowflake.
+- M6.2: `sama_pr` in `src/sama/tools/sama_pr.py` and the code owners parser in
+  `src/sama/github/codeowners.py` (architecture Section 15.2). No migration. The tool is in
+  the toolset `self` and works only on `SAMA_SELF_REPO` (default `nikhilllmno/Nikhil_claw`),
+  which must be on the GitHub allowlist of the org. `start` clones the repo through the git
+  proxy and makes the branch `sama/<name>`. The agent changes the code, runs the tests,
+  commits, and pushes. `open` needs a summary and the tests that the agent ran. It reads the
+  code owners file of the base branch, names the owners of each changed path in the pull
+  request body, and asks them for a review. `.github/CODEOWNERS` names the owner of the
+  protected paths. Sama has no merge tool. Not in M6.2: the real App, its install on the sama
+  repo, the ruleset with "Require review from Code Owners" (a person makes them, architecture
+  Section 19.5), and a live E2B test of the full flow.
 - M3.7: the GitHub App, the git proxy, and pull requests in `src/sama/github/` and
   `src/sama/tools/github.py` (architecture Sections 15.1 and 19.5). Migration `0024` adds
   `github_installations`, `github_repos`, and `github_push_grants` with RLS. An org admin
@@ -454,7 +465,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13 (below
 | # | Item | Acceptance criteria |
 |---|---|---|
 | M6.1 | `change_propose` | The agent proposes changes to SOUL, profile, toolsets, and policy. An approval card shows the diff. Approved changes apply from the next session. History and revert in the web app. The SOUL target is done in M3.2 (no diff on the card). |
-| M6.2 | `sama_pr` | The agent clones the sama repo, changes code, runs tests, and opens a pull request with a summary. Changes to protected paths request the owner's review (CODEOWNERS). The agent cannot merge. |
+| M6.2 | `sama_pr` | The agent clones the sama repo, changes code, runs tests, and opens a pull request with a summary. Changes to protected paths request the owner's review (CODEOWNERS). The agent cannot merge. Done. A person still creates the real App, installs it on the sama repo, and adds the ruleset with "Require review from Code Owners" (architecture §19.5). |
 | M6.3 | Curator | Weekly job per workspace. Usage counts, active to stale to archived, pins, report to the owner. Never deletes. |
 | M6.4 | Checkpoints | Shadow git snapshots before file changes in the sandbox. `/undo` and `/rollback` in channels. |
 | M6.5 | Customer sign-up | Self-serve sign-up, org creation, invites, roles. |

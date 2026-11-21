@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable
 from typing import Any
@@ -298,3 +299,64 @@ async def test_convert_manifest(fake: Fake) -> None:
     with pytest.raises(GitHubError) as caught:
         await convert_manifest("used", http=http, api_url="https://api.example.test")
     assert caught.value.status_code == 404
+
+
+async def test_compare_reads_the_files_of_two_branches(fake: Fake) -> None:
+    seen: list[str] = []
+
+    def compare(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"ahead_by": 1, "files": [{"filename": "a.py"}]})
+
+    fake.routes["GET /repos/acme/demo/compare/main...sama/fix-1"] = compare
+    found = await fake.client().compare(7, "acme", "demo", "main", "sama/fix-1")
+    assert found["files"] == [{"filename": "a.py"}]
+    assert seen[0].endswith("/compare/main...sama/fix-1?per_page=1")
+
+
+async def test_file_text_decodes_a_file_and_gives_none_for_no_file(fake: Fake) -> None:
+    content = base64.encodebytes(b"* @owner\n").decode()
+    seen: list[str] = []
+
+    def contents(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.query.decode())
+        return httpx.Response(200, json={"type": "file", "encoding": "base64", "content": content})
+
+    fake.routes["GET /repos/acme/demo/contents/.github/CODEOWNERS"] = contents
+    fake.routes["GET /repos/acme/demo/contents/docs"] = lambda _: httpx.Response(
+        200, json=[{"name": "a.md"}]
+    )
+    fake.routes["GET /repos/acme/demo/contents/big"] = lambda _: httpx.Response(
+        200, json={"type": "file", "encoding": "none", "content": ""}
+    )
+    client = fake.client()
+    assert await client.file_text(7, "acme", "demo", ".github/CODEOWNERS", "main") == "* @owner\n"
+    assert seen == ["ref=main"]
+    assert await client.file_text(7, "acme", "demo", "CODEOWNERS", "main") is None
+    with pytest.raises(GitHubError, match="docs is not a file"):
+        await client.file_text(7, "acme", "demo", "docs", "main")
+    with pytest.raises(GitHubError, match="did not give the content of big"):
+        await client.file_text(7, "acme", "demo", "big", "main")
+
+
+async def test_file_text_raises_on_a_server_error(fake: Fake) -> None:
+    fake.routes["GET /repos/acme/demo/contents/CODEOWNERS"] = lambda _: httpx.Response(
+        500, json={"message": "boom"}
+    )
+    with pytest.raises(GitHubError) as caught:
+        await fake.client().file_text(7, "acme", "demo", "CODEOWNERS", "main")
+    assert caught.value.status_code == 500
+
+
+async def test_request_reviewers_names_users_and_teams(fake: Fake) -> None:
+    seen: dict[str, Any] = {}
+
+    def reviewers(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(201, json={"number": 5})
+
+    fake.routes["POST /repos/acme/demo/pulls/5/requested_reviewers"] = reviewers
+    await fake.client().request_reviewers(
+        7, "acme", "demo", 5, users=("alice",), teams=("security",)
+    )
+    assert seen == {"reviewers": ["alice"], "team_reviewers": ["security"]}

@@ -129,7 +129,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Curator (7 days, active, stale, archived) | `agent/curator*.py` | Weekly curator job per workspace. Archive, never delete. Pins (§9). | Adapt | M6 |
 | Checkpoints and `/rollback`, `/undo` | `agent/checkpoints/` | Shadow git in the sandbox or Claude file checkpointing. User commands, not model tools (§15.3). | Adapt | M6 |
 | Config changes by the agent | `hermes config set` through the terminal | `change_propose` creates an approval card for SOUL, profile, toolsets, and policy (§15.2). The SOUL target is done in M3.2 (§9.4.2). | Adapt | M6 |
-| Changes to its own code | `self_repo_guard.py`, `hermes update` | `sama_pr`: a pull request to the sama repo that a human merges. CI deploys (§15.2). | New | M6 |
+| Changes to its own code | `self_repo_guard.py`, `hermes update` | `sama_pr`: the agent clones the sama repo, changes it, runs the tests, and opens a pull request that a human merges. Code owners of changed paths get a review request. CI deploys (§15.2). | New | M6 (M6.2 done) |
 | Version history and revert for all agent changes | partial (curator backups) | Every self-improvement write is a versioned row with provenance (D14). | New | M2 |
 
 ## 8. Scheduler, cron, and automation

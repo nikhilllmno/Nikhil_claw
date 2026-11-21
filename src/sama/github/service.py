@@ -51,6 +51,8 @@ STATE_TTL_S: Final = 30 * 60
 PUSH_GRANT_TTL: Final = timedelta(hours=1)
 SAMA_BRANCH_PREFIX: Final = "sama/"
 SAMA_REF_PREFIX: Final = f"refs/heads/{SAMA_BRANCH_PREFIX}"
+DEFAULT_SELF_REPO: Final = "nikhilllmno/Nikhil_claw"
+"""The sama repository of ``sama_pr`` when ``SAMA_SELF_REPO`` is not set (Section 15.2)."""
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 _NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")

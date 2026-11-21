@@ -2058,7 +2058,7 @@ as it is.
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
-| `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets, and `sama_pr`, come in M6. | Sama MCP |
+| `self` | `change_propose` (SOUL, profile, toolsets), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul` only (Section 9.4.2). The targets profile and toolsets come in M6. `sama_pr` is done in M6.2 (Section 15.2.1). | Sama MCP |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run). | Sama MCP |
 
 Agent profiles combine toolsets. Built-in presets: `assistant` (everything except `self`),
@@ -4529,9 +4529,54 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
 | Level | What | How it applies |
 |---|---|---|
 | Configuration (data) | SOUL, agent profiles, toolsets, approval rules, skills, memory, jobs, workflows, connections | Through sama tools and the web app. Versioned rows. Low-risk changes apply at once (user skills, user memory). Others create a `change_propose` card and apply after approval. Prompt content (SOUL, memory, skills) applies from the next session. Restrictions (deny rules, removed tools, revoked connections, lower budgets) apply at once (Section 5.1). Every change can be reverted from the history view. |
-| Code | Sama itself (and later products such as vorflux) | The agent uses `sama_pr`: it clones the sama repo in its sandbox, makes the change, runs the tests, and opens a pull request. A human reviews and merges. CI deploys. Changes to protected paths (auth, tenancy, approvals, model proxy, sandbox, CI) need the owner's review. |
+| Code | Sama itself (and later products such as vorflux) | The agent uses `sama_pr`: it clones the sama repo in its sandbox, makes the change, runs the tests, and opens a pull request. A human reviews and merges. CI deploys. Changes to protected paths (auth, tenancy, approvals, model proxy, sandbox, CI) need the owner's review (Section 15.2.1). |
 
 The agent never edits the running service, its database schema, or its secrets directly.
+
+#### 15.2.1 `sama_pr` (M6.2)
+
+`sama_pr(action, ...)` is in the toolset `self`. It works only on one repository: the sama
+repository of the deployment, `SAMA_SELF_REPO` (default `nikhilllmno/Nikhil_claw`). It uses
+the GitHub App, the git proxy, and the allowlist of Section 15.1, so the repository must be
+on the allowlist of the org. The tool is not in `DEFAULT_ALLOW`, so each call gets `ask`
+unless a policy rule allows it. A delegated child gets `deny` for `ask`, and `execute_code`
+cannot call the tool.
+
+| Part | What it does |
+|---|---|
+| `start(name, folder)` | Clones the repository into the sandbox through the git proxy (as `repo_clone`) and makes the branch `sama/<name>`. A clone that does not use the proxy fails. The result tells the agent what to do next: change the code and the docs, run `ruff`, `mypy`, and `pytest`, commit, `git push origin sama/<name>`, and call `sama_pr` with `open`. |
+| `open(branch, title, summary, tests, draft)` | Opens a pull request from the pushed `sama/*` branch to the default branch. `summary` and `tests` (the tests that the agent ran and their results) are required. The tool compares the branch with the default branch on GitHub. A branch that is not pushed, has no new commits, or changes 300 files or more fails. |
+| Body | `## Summary`, `## Changes` (at most 100 files, each with its owners), `## Tests`, `## Owner review` (the changed paths with code owners, and the changed protected paths of the git proxy), and a line that says that a person merges. |
+| Owner review | The tool reads the code owners file of the default branch (`.github/CODEOWNERS`, then `CODEOWNERS`, then `docs/CODEOWNERS`), because GitHub uses that file for the review rule. A change to the file on the branch does not change the owners of the pull request. The old path of a renamed file counts. The tool asks the user and team owners for a review. A failed review request does not fail the tool, because the ruleset still requires the approval. |
+
+The repository has `.github/CODEOWNERS`. It names an owner for the protected paths: CI and
+`.github/`, the deploy files, migrations, authentication (`src/sama/api/auth.py`), tenancy,
+approvals (`src/sama/gate/`), the model proxy, the vault, the sandbox, and the GitHub code
+with `sama_pr`. The code owners file is also a protected path of the git proxy, so a push
+that changes it needs a `repo_push_approval`.
+
+The parser supports the patterns of GitHub: `*`, `**`, `?`, a leading `/`, a trailing `/`,
+and the rule that the last matching line wins. It skips lines with `!` or `[ ]`, which
+GitHub does not support either. Matching is case-sensitive, as on GitHub.
+
+The agent cannot merge:
+
+- Sama has no merge tool, and no GitHub token goes to the sandbox.
+- The git proxy refuses a push to a branch that is not `sama/*`.
+- The App has no `workflows` permission, so GitHub refuses a push that changes
+  `.github/workflows/`. A person changes CI.
+- The ruleset of the default branch requires a pull request, an approval, and the review of
+  the code owners, with no bypass for the App (Section 19.5).
+
+Residual risks:
+
+- GitHub ignores the code owners rule if the ruleset does not have "Require review from Code
+  Owners". The tool cannot check the ruleset, because the App has no `administration`
+  permission.
+- An owner in the code owners file that has no write access to the repository gets no review
+  request. GitHub shows the file as having an error.
+- The tool checks the changed paths that GitHub gives at the time of `open`. A later push to
+  the branch can change more paths. GitHub then asks the new owners itself.
 
 ### 15.3 Checkpoints
 
@@ -5605,6 +5650,7 @@ the start with a message that names the variable but not its value.
 | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Traces |
 | `SAMA_ALERT_SLACK_WEBHOOK_URL` | No | Error rate alerts |
 | `SAMA_GITHUB_APP_ID`, `SAMA_GITHUB_APP_SLUG`, `SAMA_GITHUB_CLIENT_ID`, `SAMA_GITHUB_APP_PRIVATE_KEY`, `SAMA_GITHUB_CLIENT_SECRET` | No | The sama GitHub App (Section 19.5). With `SAMA_GITHUB_APP_ID`, all five are required. The private key can have `\n` in place of its line breaks. Without them, the git proxy and the pull request tools are off. |
+| `SAMA_SELF_REPO` | No | The sama repository of `sama_pr`, as `<owner>/<name>` (Section 15.2.1). Default: `nikhilllmno/Nikhil_claw`. |
 | `SAMA_SENDGRID_API_KEY`, `SAMA_EMAIL_FROM` | No | Email delivery of jobs (Section 12.1). Without both, an `email:` delivery fails. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
@@ -5700,6 +5746,11 @@ A person must do these steps. Sama cannot create a GitHub App or a ruleset by it
    `"protected_paths"` to change the default list (Section 15.1).
 8. Give the agent profiles the toolset `github`. The tools `pr_create` and `pr_comment` get
    `ask` by default. An admin can add `allow` rules in `tool_policies`.
+9. **For `sama_pr` (M6.2).** Install the App on the sama repository (`SAMA_SELF_REPO`) and add
+   the repository to the allowlist (steps 5 and 7). In the ruleset of step 6, also turn on
+   "Require review from Code Owners". The file `.github/CODEOWNERS` of the default branch
+   names the owners. Each owner must have write access to the repository. Then give the agent
+   profile the toolset `self`. `sama_pr` gets `ask` by default.
 
 The process turns the App on when `SAMA_GITHUB_APP_ID` is set (Section 19.2). Then the API
 has the routes `/orgs/{org_id}/github/...`, the pages `/github/app/created` and
