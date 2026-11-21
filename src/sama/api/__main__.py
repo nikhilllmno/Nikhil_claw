@@ -17,6 +17,9 @@ Environment:
   (Section 17.2). The default, ``invite_only``, adds users only with an invite.
 - ``SAMA_SIGNUP_BLOCKED_DOMAINS``: optional. More email domains that cannot make an org,
   comma-separated.
+- ``SAMA_EXTENSION_IDS``: optional. The ids of the Chrome extensions that may open the
+  extension channel (``/channels/chrome/ws``), comma-separated. Without it, any
+  ``chrome-extension://`` origin may open it. The channel always needs a valid access token.
 - ``SAMA_PUBLIC_URL``: optional. With ``SAMA_VAULT_KEY`` it turns on the integrations
   (Section 11.6): org admins connect their own Telegram bot on the web page. The vault keeps the
   bot token. ``python -m sama.gateway`` takes the updates of the bots at ``SAMA_PUBLIC_URL``.
@@ -39,7 +42,7 @@ from pydantic import SecretStr
 
 from sama.api.app import ApiSettings, SamaApi
 from sama.api.auth import JwtVerifier, issuer, jwks_url
-from sama.api.origins import parse_origins
+from sama.api.origins import parse_extension_ids, parse_origins
 from sama.db.engine import create_engine
 from sama.integrations.service import Integrations
 from sama.observability.logs import configure_logging
@@ -71,6 +74,10 @@ def build_app() -> FastAPI:
         signup = SignupPolicy.from_env(os.environ)
     except ValueError as error:
         raise SystemExit(str(error)) from None
+    try:
+        extension_ids = parse_extension_ids(os.environ.get("SAMA_EXTENSION_IDS", ""))
+    except ValueError as error:
+        raise SystemExit(f"SAMA_EXTENSION_IDS: {error}") from None
     secret = os.environ.get("SAMA_SUPABASE_JWT_SECRET", "")
     verifier = JwtVerifier(
         secret=SecretStr(secret) if secret else None,
@@ -99,6 +106,7 @@ def build_app() -> FastAPI:
             supabase_anon_key=_required("SAMA_SUPABASE_ANON_KEY"),
             web_origins=web_origins,
             signup=signup,
+            extension_ids=extension_ids,
         ),
         integrations=integrations,
         skills=SkillLibrary(engine, BuiltinSkills().all()),

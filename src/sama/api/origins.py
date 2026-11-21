@@ -1,4 +1,5 @@
-"""The origins of the web app that may call the API from a browser (``SAMA_WEB_ORIGINS``).
+"""The origins of the web app that may call the API from a browser (``SAMA_WEB_ORIGINS``), and
+the ids of the Chrome extensions that may open the extension channel (``SAMA_EXTENSION_IDS``).
 
 An origin is ``http://host`` or ``https://host``, with an optional port. It has no path, no
 query, and no wildcard. The check at start-up refuses anything else, so a typo cannot open the
@@ -37,3 +38,23 @@ def check_origins(origins: Iterable[str]) -> tuple[str, ...]:
 def parse_origins(text: str) -> tuple[str, ...]:
     """The origins in a comma-separated list. An empty value, or empty items, are skipped."""
     return check_origins(part for part in text.split(",") if part.strip())
+
+
+_EXTENSION_ID: Final = re.compile(r"^[a-p]{32}$")
+
+
+def check_extension_ids(ids: Iterable[str]) -> tuple[str, ...]:
+    """The Chrome extension ids, without duplicates. An id is 32 letters from ``a`` to ``p``.
+    Raises ``ValueError`` for anything else."""
+    checked: dict[str, None] = {}
+    for extension_id in ids:
+        value = extension_id.strip()
+        if not _EXTENSION_ID.fullmatch(value):
+            raise ValueError(f"{extension_id!r} is not a Chrome extension id: use 32 letters a-p")
+        checked[value] = None
+    return tuple(checked)
+
+
+def parse_extension_ids(text: str) -> tuple[str, ...]:
+    """The extension ids in a comma-separated list. Empty items are skipped."""
+    return check_extension_ids(part for part in text.split(",") if part.strip())

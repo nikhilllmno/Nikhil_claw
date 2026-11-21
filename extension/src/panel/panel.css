@@ -1,0 +1,330 @@
+/* The side panel. Only the tokens of tokens.css; no literal values. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  min-height: var(--touch-target);
+  padding: var(--space-0) var(--space-4);
+  border: var(--border-width) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-out);
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: var(--border-width-accent) solid var(--focus-ring);
+  outline-offset: var(--border-width);
+}
+
+button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+button.soft {
+  border-color: transparent;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+button.link {
+  min-height: auto;
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+textarea {
+  resize: vertical;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--topbar-height);
+  padding: var(--space-0) var(--space-4);
+  border-bottom: var(--border-width) solid var(--border);
+  background: var(--surface);
+}
+
+.brand {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-right: auto;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.dot {
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--border-strong);
+}
+
+.status[data-status="open"] .dot {
+  background: var(--accent);
+}
+
+.status[data-status="reconnecting"] .dot,
+.status[data-status="connecting"] .dot {
+  background: var(--warning);
+}
+
+.status[data-status="refused"] .dot {
+  background: var(--danger);
+}
+
+.pane {
+  padding: var(--space-5) var(--space-4);
+  overflow-y: auto;
+}
+
+h1 {
+  margin: var(--space-0) var(--space-0) var(--space-2);
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: var(--space-4) var(--space-0);
+}
+
+.form label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.more {
+  margin-top: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.more summary {
+  cursor: pointer;
+}
+
+.error,
+.notice {
+  margin: var(--space-2) var(--space-0);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+}
+
+.error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.notice {
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+}
+
+.chat {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  padding: var(--space-0) var(--space-4) var(--space-4);
+}
+
+.tabbar {
+  padding: var(--space-2) var(--space-0);
+  overflow: hidden;
+  border-bottom: var(--border-width) solid var(--border);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-title {
+  font-weight: var(--weight-medium);
+}
+
+.messages {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-0);
+  overflow-y: auto;
+}
+
+.empty {
+  margin: auto var(--space-0);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.message {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.message.user {
+  align-self: flex-end;
+  max-width: 90%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--user-bubble);
+}
+
+.message.page {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.message.live {
+  color: var(--text-muted);
+}
+
+.tool {
+  color: var(--text-subtle);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.approvals:empty {
+  display: none;
+}
+
+.approval {
+  margin-bottom: var(--space-2);
+  padding: var(--space-3);
+  border-left: var(--border-width-accent) solid var(--warning);
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  font-size: var(--text-sm);
+}
+
+.approval pre {
+  max-height: var(--scroll-list-max);
+  margin: var(--space-2) var(--space-0);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: var(--border-width) solid var(--border);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.row.end {
+  justify-content: flex-end;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.check input {
+  width: auto;
+}

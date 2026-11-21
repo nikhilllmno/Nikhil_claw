@@ -19,6 +19,7 @@ dependencies = [
     "sqlglot>=30.33,<31",
     "starlette>=1.10.0,<2",
     "uvicorn>=0.54.0,<1",
+    "websockets>=15,<18",
 ]
 
 [build-system]
@@ -42,6 +43,7 @@ dev = [
     "ruff>=0.17.5,<0.18",
     "types-pyyaml>=6,<7",
     "uvicorn>=0.54.0,<1",
+    "websockets>=15,<18",
 ]
 # Each runtime adapter pins its SDK (docs/architecture.md, Section 5.3).
 # Both are default groups, so the conformance suite runs both runtimes. The sandbox image
