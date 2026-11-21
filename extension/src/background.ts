@@ -1,11 +1,16 @@
 // The service worker of the extension. It owns the sign-in, the one WebSocket to the API
 // (lib/gateway.ts), and the REST calls of the side panel. The panel talks to it through a
 // chrome.runtime port (lib/messages.ts). No token goes to the panel or to a web page.
+//
+// Since M5.5 it also does the browser calls of the `my_chrome` target (lib/actions.ts) with
+// chrome.debugger, and keeps the questions to the user (lib/prompter.ts).
 
+import { Actor, type Cdp, type TabInfo, type Tabs } from "./lib/actions";
 import { errorMessage, type PublicConfig } from "./lib/api";
 import { Auth, AuthError, type SupabaseConfig } from "./lib/auth";
 import { chromeStore, TabBindings } from "./lib/bindings";
 import { API_URL_KEY, defaultApiUrl, normalizeApiUrl } from "./lib/config";
+import { SiteConsent } from "./lib/consent";
 import { Gateway, GatewayError, type GatewayStatus } from "./lib/gateway";
 import {
   type PanelState,
@@ -15,11 +20,13 @@ import {
   type WorkerToPanel,
 } from "./lib/messages";
 import { originPattern } from "./lib/page";
-import { socketUrl } from "./lib/protocol";
+import { Prompts } from "./lib/prompter";
+import { socketUrl, type ToolCallFrame } from "./lib/protocol";
 
 const session = chromeStore(chrome.storage.session);
 const local = chromeStore(chrome.storage.local);
 const bindings = new TabBindings(session);
+const consent = new SiteConsent(local);
 
 let apiUrl = defaultApiUrl();
 let configCache: { url: string; value: SupabaseConfig | null } | null = null;
@@ -61,8 +68,15 @@ const gateway = new Gateway({
   refresh: () => auth.refresh(),
   canRefresh: () => auth.current?.refresh_token != null,
   createSocket: (url) => new WebSocket(url),
-  onFrame: (frame) => broadcast({ kind: "frame", frame }),
+  onFrame: (frame) => {
+    // A browser call of a run is for the actor only: its arguments do not go to the panels.
+    if (frame.type === "tool_call") void toolCall(frame);
+    else broadcast({ kind: "frame", frame });
+  },
   onStatus: (next, text) => {
+    // The API forgets the browser calls of a closed connection, so the actor ends its runs:
+    // no debugger, overlay, or tab stays for a run that the API cannot release.
+    if (status === "open" && next !== "open") void actor.releaseAll();
     status = next;
     detail = text;
     // The server refused the token and no fresh token came: the sign-in ended.
@@ -101,6 +115,94 @@ function unsubscribeIfUnused(sessionId: string): void {
 function broadcastState(): void {
   broadcast({ kind: "state", state: panelState() });
 }
+
+// -- the my_chrome target (M5.5) ------------------------------------------------------------------
+
+const cdp: Cdp = {
+  attach: (tabId) => chrome.debugger.attach({ tabId }, "1.3"),
+  detach: (tabId) => chrome.debugger.detach({ tabId }),
+  send: async <T>(tabId: number, method: string, params?: Record<string, unknown>) =>
+    (await chrome.debugger.sendCommand({ tabId }, method, params)) as T,
+};
+
+function tabInfo(tab: chrome.tabs.Tab): TabInfo {
+  return {
+    id: tab.id ?? -1,
+    url: tab.url ?? tab.pendingUrl ?? "",
+    title: tab.title ?? "",
+    status: tab.status ?? "complete",
+    windowId: tab.windowId,
+  };
+}
+
+const tabs: Tabs = {
+  get: (tabId) => chrome.tabs.get(tabId).then(tabInfo, () => null),
+  create: async ({ url, windowId, openerTabId }) =>
+    tabInfo(await chrome.tabs.create({ url, windowId, openerTabId, active: true })),
+  update: async (tabId, options) => {
+    await chrome.tabs.update(tabId, options);
+  },
+  remove: (tabId) => chrome.tabs.remove(tabId),
+};
+
+let promptWindow: number | null = null;
+
+async function openPromptWindow(): Promise<void> {
+  if (promptWindow !== null) {
+    const focused = await chrome.windows.update(promptWindow, { focused: true }).catch(() => null);
+    if (focused !== null) return;
+  }
+  const created = await chrome.windows.create({
+    url: chrome.runtime.getURL("prompt.html"),
+    type: "popup",
+    width: 420,
+    height: 380,
+    focused: true,
+  });
+  promptWindow = created?.id ?? null;
+}
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === promptWindow) promptWindow = null;
+});
+
+const prompts = new Prompts({
+  publish: (list) => broadcast({ kind: "prompts", prompts: list }),
+  hasViewer: () => ports.size > 0,
+  openWindow: () => void openPromptWindow().catch(() => undefined),
+});
+
+async function broadcastAgent(): Promise<void> {
+  broadcast({ kind: "agent", tabs: actor.agentTabs(), sites: await consent.list() });
+}
+
+const actor = new Actor({
+  cdp,
+  tabs,
+  consent,
+  prompter: prompts,
+  boundTab: (sessionId) => bindings.tabOf(sessionId),
+  cancelRun: async (runId) => {
+    await callApi("POST", `/runs/${runId}/cancel`);
+  },
+  onChange: () => void broadcastAgent(),
+});
+
+async function toolCall(frame: ToolCallFrame): Promise<void> {
+  await ready;
+  const result = await actor.handle(frame);
+  gateway.reply(result);
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (source.tabId !== undefined) actor.onEvent(source.tabId, method, (params ?? {}) as Record<string, unknown>);
+});
+chrome.debugger.onDetach.addListener((source, reason) => {
+  if (source.tabId !== undefined) actor.onDetach(source.tabId, reason);
+});
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.id !== undefined) actor.onTabCreated(tab.id, tab.openerTabId);
+});
 
 const ready = (async () => {
   const saved = await local.get(API_URL_KEY);
@@ -158,6 +260,7 @@ async function handle(port: chrome.runtime.Port, request: Request): Promise<unkn
       return panelState();
     case "signOut":
       gateway.stop();
+      await actor.releaseAll();
       await auth.signOut();
       await bindings.clear();
       return panelState();
@@ -166,6 +269,7 @@ async function handle(port: chrome.runtime.Port, request: Request): Promise<unkn
       const granted = await chrome.permissions.contains({ origins: [originPattern(next)] });
       if (!granted) throw new Error("Give the extension access to this address first.");
       gateway.stop();
+      await actor.releaseAll();
       await auth.signOut();
       await bindings.clear();
       apiUrl = next;
@@ -186,6 +290,18 @@ async function handle(port: chrome.runtime.Port, request: Request): Promise<unkn
       return null;
     case "send":
       return gateway.send(request.sessionId, request.text, request.page);
+    case "answerPrompt":
+      return prompts.answer(request.promptId, request.choice);
+    case "agent":
+      if (request.action === "stop") await actor.stopTab(request.tabId);
+      else actor.resumeTab(request.tabId);
+      return null;
+    case "sites":
+      return consent.list();
+    case "removeSite":
+      await consent.remove(request.site);
+      await broadcastAgent();
+      return null;
   }
 }
 
@@ -215,14 +331,17 @@ chrome.runtime.onConnect.addListener((port) => {
     ports.delete(port);
     for (const sessionId of ids) unsubscribeIfUnused(sessionId);
   });
-  void ready.then(() => {
+  void ready.then(async () => {
     if (auth.current !== null) gateway.start();
     post(port, { kind: "state", state: panelState() });
+    post(port, { kind: "prompts", prompts: prompts.list() });
+    post(port, { kind: "agent", tabs: actor.agentTabs(), sites: await consent.list() });
   });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void bindings.unbind(tabId);
+  actor.onTabRemoved(tabId);
 });
 
 function openOnClick(): void {

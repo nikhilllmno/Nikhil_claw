@@ -12,6 +12,7 @@ import {
   parseServerFrame,
   type SentFrame,
   type ServerFrame,
+  type ToolResultFrame,
 } from "./protocol";
 
 export const PING_MS = 20_000;
@@ -365,6 +366,12 @@ export class Gateway {
   unsubscribe(sessionId: string): void {
     if (!this.wanted.delete(sessionId)) return;
     if (this.ready) this.write({ type: "unsubscribe", session_id: sessionId });
+  }
+
+  /** Answers a `tool_call` of the server. An answer without an open socket is lost; the API then
+   * gives the agent a timeout. */
+  reply(frame: ToolResultFrame): boolean {
+    return this.ready && this.write(frame);
   }
 
   /** Sends a message, with the page for "Ask about this page". Resolves with the run. */

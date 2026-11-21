@@ -241,6 +241,10 @@ class _Link:
     async def send(self, frame: dict[str, Any]) -> None:
         self.frames.append(frame)
 
+    async def call(self, frame: dict[str, Any], timeout_s: float) -> Any:
+        self.frames.append(frame)
+        return {"ok": True, "result": {}}
+
 
 def test_chrome_hub_registers_and_removes_links() -> None:
     hub = ChromeHub(max_per_user=2)

@@ -13,7 +13,7 @@ describe("protocol", () => {
 
   it("reads only known frames", () => {
     expect(parseServerFrame('{"type":"pong"}')).toEqual({ type: "pong" });
-    expect(parseServerFrame('{"type":"tool_call"}')).toBeNull();
+    expect(parseServerFrame('{"type":"not_a_frame"}')).toBeNull();
     expect(parseServerFrame("nope")).toBeNull();
     expect(parseServerFrame("[]")).toBeNull();
   });

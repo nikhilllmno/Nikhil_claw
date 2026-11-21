@@ -34,9 +34,11 @@ from starlette.routing import Mount
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
 from sama.browser.browserbase import BrowserbaseTarget
+from sama.browser.chrome import AuthUsers, ChromeTarget
 from sama.browser.contexts import PostgresContextStore
 from sama.browser.guard import UrlGuard
 from sama.browser.service import BrowserService
+from sama.browser.target import BrowserTarget
 from sama.connectors.database import DatabaseGateway
 from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
@@ -51,6 +53,7 @@ from sama.db.engine import create_engine
 from sama.delegation import DelegationService
 from sama.gate.service import GateService
 from sama.gate.wire import GATE_PATH
+from sama.gateway.chrome import ChromeHub
 from sama.gateway.handoff import Handoffs
 from sama.github.client import GitHubClient
 from sama.github.proxy import GitHubUpstream, GitProxy
@@ -255,9 +258,12 @@ def build(
     # One outbound client for ``web_extract`` and ``@url`` references: the same address rules
     # apply to both (Section 6.3). The tool server closes it.
     outbound = OutboundClient()
-    # The cloud browser (Section 14.1). The worker closes the browser session of a run when the
-    # run ends.
-    browser = _browser_service(settings, engine)
+    # The browser (Section 14.1): the cloud browser and the Chrome of the user (the extension
+    # connections of the API, M5.5). The worker closes the browser sessions of a run when the
+    # run ends. The gate asks the user before a sensitive action in the user's Chrome.
+    chrome = ChromeHub()
+    browser = _browser_service(settings, engine, chrome)
+    gate.escalation = browser.sensitive_reason
     worker = Worker(
         queue,
         registry,
@@ -276,7 +282,7 @@ def build(
             session_sandbox=sandboxed.session_sandbox if sandboxed else None,
         ),
         poll_s=worker_poll_s,
-        on_run_end=[browser.end_run] if browser is not None else [],
+        on_run_end=[browser.end_run],
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
     # index alone (Section 7.1).
@@ -490,6 +496,7 @@ def build(
             signup=settings.signup,
             extension_ids=settings.extension_ids,
         ),
+        chrome=chrome,
         integrations=integrations,
         skills=library,
         reviews=reviews,
@@ -590,16 +597,22 @@ def build(
     return plane
 
 
-def _browser_service(settings: ControlPlaneSettings, engine: AsyncEngine) -> BrowserService | None:
-    """The cloud browser of Section 14.1, or ``None`` without a Browserbase key and project."""
-    if settings.browserbase_key is None or not settings.browserbase_project_id:
-        return None
-    target = BrowserbaseTarget(
-        api_key=settings.browserbase_key,
-        project_id=settings.browserbase_project_id,
-        contexts=PostgresContextStore(engine),
-    )
-    return BrowserService(target, UrlGuard())
+def _browser_service(
+    settings: ControlPlaneSettings, engine: AsyncEngine, chrome: ChromeHub
+) -> BrowserService:
+    """The browser of Section 14.1. The cloud target needs a Browserbase key and project, and
+    it is the default target when it is there. The ``my_chrome`` target is always there."""
+    targets: list[BrowserTarget] = []
+    if settings.browserbase_key is not None and settings.browserbase_project_id:
+        targets.append(
+            BrowserbaseTarget(
+                api_key=settings.browserbase_key,
+                project_id=settings.browserbase_project_id,
+                contexts=PostgresContextStore(engine),
+            )
+        )
+    targets.append(ChromeTarget(chrome, AuthUsers(engine).of))
+    return BrowserService(targets, UrlGuard())
 
 
 async def _close_sandboxes(sandboxed: SandboxedRuntime) -> None:

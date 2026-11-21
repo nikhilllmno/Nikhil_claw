@@ -123,7 +123,13 @@ class FakeTarget:
         return CLOUD
 
     async def start(
-        self, *, org_id: str, user_id: str | None, run_id: str, guard: NavigationGuard
+        self,
+        *,
+        org_id: str,
+        user_id: str | None,
+        run_id: str,
+        guard: NavigationGuard,
+        session_id: str = "",
     ) -> FakeSession:
         if self.gate is not None:
             await self.gate.wait()

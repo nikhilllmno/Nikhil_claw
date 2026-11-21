@@ -15,7 +15,9 @@ import {
 import { chromeStore, TabBindings } from "../lib/bindings";
 import { applyEvent, type Effect, initialLive, isPaused, type LiveState, openRunIds } from "../lib/chat";
 import { normalizeApiUrl } from "../lib/config";
-import type { PanelState, PanelToWorker, Request, WorkerToPanel } from "../lib/messages";
+import type { AgentTab } from "../lib/actions";
+import type { SiteSetting } from "../lib/consent";
+import type { PanelState, PanelToWorker, Prompt, Request, WorkerToPanel } from "../lib/messages";
 import { PORT_NAME } from "../lib/messages";
 import {
   MAX_PAGE_TEXT,
@@ -30,6 +32,7 @@ import {
   splitPageMessage,
 } from "../lib/page";
 import type { ServerFrame } from "../lib/protocol";
+import { renderPrompts } from "./prompts";
 
 // -- DOM ----------------------------------------------------------------------------------------
 
@@ -64,6 +67,12 @@ const ui = {
   screenshot: el<HTMLInputElement>("screenshot"),
   stop: el<HTMLButtonElement>("stop"),
   send: el<HTMLButtonElement>("send"),
+  agentBar: el("agent-bar"),
+  agentText: el("agent-text"),
+  agentResume: el<HTMLButtonElement>("agent-resume"),
+  agentStop: el<HTMLButtonElement>("agent-stop"),
+  prompts: el("prompts"),
+  siteList: el("site-list"),
 };
 
 /** Makes an element with text. Page and agent text is untrusted: never use innerHTML. */
@@ -106,6 +115,13 @@ function connect(): void {
       else entry.reject(new WorkerError(message.error, message.code, message.status));
     } else if (message.kind === "state") {
       void onState(message.state);
+    } else if (message.kind === "prompts") {
+      view.prompts = message.prompts;
+      renderPrompts(ui.prompts, view.prompts, answerPrompt);
+    } else if (message.kind === "agent") {
+      view.agentTabs = message.tabs;
+      view.sites = message.sites;
+      renderAgent();
     } else {
       onFrame(message.frame);
     }
@@ -160,6 +176,9 @@ interface View {
   live: LiveState;
   busy: boolean;
   loadingChat: boolean;
+  prompts: Prompt[];
+  agentTabs: AgentTab[];
+  sites: SiteSetting[];
 }
 
 const view: View = {
@@ -174,6 +193,9 @@ const view: View = {
   live: initialLive,
   busy: false,
   loadingChat: false,
+  prompts: [],
+  agentTabs: [],
+  sites: [],
 };
 
 /** Grows at each tab change, so that a late answer for the old tab is dropped. */
@@ -236,6 +258,7 @@ async function bindTab(tab: chrome.tabs.Tab | null): Promise<void> {
   if (previous !== tab?.id) tabEpoch += 1;
   ui.tabTitle.textContent = tab?.title || tab?.url || "No tab";
   ui.tabTitle.title = tab?.url ?? "";
+  renderAgent();
   const sessionId =
     tab?.id !== undefined && view.worker?.signedIn ? await bindings.get(tab.id) : null;
   if (sessionId === view.sessionId && previous === tab?.id) {
@@ -430,6 +453,45 @@ function renderComposer(): void {
   ui.ask.title = problem ?? "Send the text of this page to sama with your question";
 }
 
+// -- the browser actions of sama (M5.5) -------------------------------------------------------------
+
+function answerPrompt(id: string, choice: "allow" | "once" | "deny" | "never"): void {
+  void rpc({ call: "answerPrompt", promptId: id, choice }).catch((error: unknown) =>
+    show(ui.chatError, errorText(error, "Could not send the answer.")),
+  );
+}
+
+function renderAgent(): void {
+  const agent = view.agentTabs.find((item) => item.tabId === view.tab?.id);
+  ui.agentBar.hidden = agent === undefined;
+  if (agent !== undefined) {
+    ui.agentBar.dataset.paused = String(agent.paused);
+    ui.agentText.textContent = agent.paused ? "You have control. sama is paused in this tab." : "sama is acting in this tab.";
+    ui.agentResume.hidden = !agent.paused;
+  }
+  ui.siteList.replaceChildren(
+    ...(view.sites.length === 0
+      ? [node("li", "muted", "No sites yet.")]
+      : view.sites.map((setting) => {
+          const item = node("li", "");
+          item.append(node("span", "", `${setting.site}: ${setting.choice === "allow" ? "allowed" : "never"}`));
+          const remove = node("button", "link", "Remove") as HTMLButtonElement;
+          remove.type = "button";
+          remove.addEventListener("click", () => void rpc({ call: "removeSite", site: setting.site }));
+          item.append(remove);
+          return item;
+        })),
+  );
+}
+
+function agentAction(action: "stop" | "resume"): void {
+  const tabId = view.tab?.id;
+  if (tabId === undefined) return;
+  void rpc({ call: "agent", action, tabId }).catch((error: unknown) =>
+    show(ui.chatError, errorText(error, "Could not reach the extension.")),
+  );
+}
+
 // -- actions --------------------------------------------------------------------------------------
 
 async function withBusy(action: () => Promise<void>): Promise<void> {
@@ -609,6 +671,8 @@ ui.text.addEventListener("keydown", (event) => {
   }
 });
 ui.ask.addEventListener("click", () => void askAboutPage());
+ui.agentStop.addEventListener("click", () => agentAction("stop"));
+ui.agentResume.addEventListener("click", () => agentAction("resume"));
 ui.stop.addEventListener("click", () => void stopRuns());
 
 chrome.tabs.onActivated.addListener((info) => {

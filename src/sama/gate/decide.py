@@ -448,21 +448,34 @@ def arguments_digest(arguments: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def decide(context: GateContext, tool_name: str, arguments: Mapping[str, Any]) -> Verdict:
-    """The verdict for one call. The steps run in the order of Section 16.1."""
+def decide(
+    context: GateContext,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    escalate: str | None = None,
+) -> Verdict:
+    """The verdict for one call. The steps run in the order of Section 16.1.
+
+    ``escalate`` is a reason why this call needs a person even with an ``allow`` rule, for
+    example a sensitive action in the Chrome of the user (Section 14.2.2). The call then gets
+    ``ask`` as a tool in ``ALWAYS_ASK`` does: a ``deny`` rule still wins, a recorded approval
+    still allows it, and an unattended run gets ``deny`` (a pre-approval does not cover it)."""
     name = canonical_name(tool_name)
     if name == TOOL_CALL:
-        return _decide_wrapped(context, arguments)
+        return _decide_wrapped(context, arguments, escalate)
     early = _authority_and_toolset(context, name)
     if early is not None:
         return early
     problem = hardline_problem(name, arguments)
     if problem is not None:
         return Verdict("deny", GateStep.HARDLINE, f"the command is on the hardline list: {problem}")
-    return _after_hardline(context, name, arguments_digest(arguments), arguments)
+    return _after_hardline(context, name, arguments_digest(arguments), arguments, escalate)
 
 
-def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdict:
+def _decide_wrapped(
+    context: GateContext, arguments: Mapping[str, Any], escalate: str | None = None
+) -> Verdict:
     """``tool_call`` has no verdict of its own. The run needs the toolset of ``tool_call``,
     and no ``deny`` rule can name ``tool_call``. Then the named tool gets the full gate with
     its own arguments: its toolset, the hardline list, its policy, and the unattended rule.
@@ -481,7 +494,7 @@ def _decide_wrapped(context: GateContext, arguments: Mapping[str, Any]) -> Verdi
     name, inner = wrapped
     if name in META_TOOLS or name in TOOL_LOADERS:
         return Verdict("deny", GateStep.TOOLSET, f"{name} cannot be called through tool_call")
-    return decide(context, name, inner)
+    return decide(context, name, inner, escalate=escalate)
 
 
 def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdict:
@@ -502,13 +515,26 @@ def _authority_and_toolset(context: GateContext, name: str) -> Verdict | None:
 
 
 def _after_hardline(
-    context: GateContext, name: str, digest: str, arguments: Mapping[str, Any] | None
+    context: GateContext,
+    name: str,
+    digest: str,
+    arguments: Mapping[str, Any] | None,
+    escalate: str | None = None,
 ) -> Verdict:
     # A deny rule wins over a recorded approval: a newer deny applies at once (Section 5.1).
     policy = context_policy(context, name)
     if policy.action == "deny":
         return policy
-    verdict = _recorded(context.recorded, name, digest) or policy
+    recorded = _recorded(context.recorded, name, digest)
+    if recorded is None and escalate:
+        if context.unattended:
+            return Verdict(
+                "deny",
+                GateStep.CONTEXT,
+                f"{escalate}; this needs a human, and the run is unattended",
+            )
+        return Verdict("ask", GateStep.POLICY, escalate)
+    verdict = recorded or policy
     return _in_context(context, name, verdict, arguments)
 
 

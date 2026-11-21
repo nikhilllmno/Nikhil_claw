@@ -45,7 +45,15 @@
       <div class="tabbar">
         <span class="muted">This tab:</span> <span id="tab-title" class="tab-title"></span>
       </div>
+      <div id="agent-bar" class="agent-bar" role="status" hidden>
+        <span id="agent-text"></span>
+        <span class="row">
+          <button type="button" class="primary" id="agent-resume" hidden>Give back to sama</button>
+          <button type="button" id="agent-stop">Stop</button>
+        </span>
+      </div>
       <section id="messages" class="messages" aria-live="polite" aria-label="Chat"></section>
+      <section id="prompts" class="approvals" aria-label="Questions"></section>
       <section id="approvals" class="approvals" aria-label="Approvals"></section>
       <p class="error" id="chat-error" role="alert" hidden></p>
       <p class="notice" id="chat-notice" role="status" hidden></p>
@@ -61,6 +69,11 @@
           <button type="submit" class="primary" id="send">Send</button>
         </div>
       </form>
+      <details class="more" id="sites">
+        <summary>Site access</summary>
+        <p class="muted">The sites where sama can act in your Chrome. sama asks before it uses a new site. Banks, payments, password managers, and Google account pages are always blocked.</p>
+        <ul id="site-list" class="site-list"></ul>
+      </details>
     </main>
     <script type="module" src="panel.js"></script>
   </body>

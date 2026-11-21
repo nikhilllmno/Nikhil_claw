@@ -2181,7 +2181,7 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
-| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Later: `browser_vault` (M5.3), `browser_task` (M5.6). `browser_act` is `ask` by default. | Sama MCP to Browserbase (`cloud`). Later also the extension (`my_chrome`, M5.5). |
+| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). Later: `browser_vault` (M5.3), `browser_task` (M5.6). `browser_act` is `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
@@ -3042,7 +3042,7 @@ another channel. The rules:
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
 | Slack | Events API, interactivity, and the `/sama` command over HTTP. Web API calls with `httpx` (no Bolt: sama needs only six methods and checks the signature itself) | One Slack app per org. An org admin makes the app from a manifest and connects it as an integration (Section 11.6). Direct messages and mentions in linked channels. A thread in a channel is a session. Approval buttons through Block Kit. Images that users send are stored for `vision_analyze` (Section 11.7). |
 | Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Photos and image files are stored for `vision_analyze` (Section 11.7). Inline keyboards for approvals. |
-| Chrome extension | WebSocket from the extension to the API (`/channels/chrome/ws`, Section 14.2.1). Supabase Auth sign-in, like the web app | Side panel chat bound to the current tab. "Ask about this page" shares the page as untrusted content (M5.4). Later also the `my_chrome` browser target (Section 14.2.2, M5.5). |
+| Chrome extension | WebSocket from the extension to the API (`/channels/chrome/ws`, Section 14.2.1). Supabase Auth sign-in, like the web app | Side panel chat bound to the current tab. "Ask about this page" shares the page as untrusted content (M5.4). The `my_chrome` browser target on the same WebSocket (Section 14.2.2, M5.5). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
 
 ### 11.3 Pairing and access
@@ -4489,15 +4489,17 @@ Tools (the plan; M5.1 has the first six, see "Cloud browser (M5.1)" below):
 
 #### Cloud browser (M5.1)
 
-The package `sama.browser` has the browser. The sama MCP tool server (Section 16.7) has the
-tools when the control plane has `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID`
-(Section 19.2). Without them, the server does not list the browser tools.
+The package `sama.browser` has the browser. The `cloud` target is there when the control plane
+has `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID` (Section 19.2). Since M5.5 the control
+plane always has the `my_chrome` target (Section 14.2.2), so the sama MCP tool server (Section
+16.7) always lists the browser tools. The descriptions of the tools name only the targets that
+the process has.
 
 **Layers.**
 
 | Part | Module | Job |
 |---|---|---|
-| Target | `sama.browser.target` | The `BrowserTarget` and `BrowserSession` protocols. One target for each name: `cloud` now, `my_chrome` in M5.5. The tools do not know the target. |
+| Target | `sama.browser.target` | The `BrowserTarget` and `BrowserSession` protocols. One target for each name: `cloud` (M5.1) and `my_chrome` (M5.5, `sama.browser.chrome`). The tools do not know the target. |
 | Cloud target | `sama.browser.browserbase` | Creates a Browserbase session with the REST API and connects Playwright to it over CDP. The process has no browser binaries. |
 | CDP session | `sama.browser.cdp` | `PlaywrightSession`: snapshots, actions, tabs, dialogs, screenshots, and extracts on a Playwright browser. The `my_chrome` target can use other code with the same protocol. |
 | Contexts | `sama.browser.contexts` | The table `browser_contexts` (migration `0036`): one provider context for each org, user, and target. |
@@ -4578,7 +4580,8 @@ do not get the toolset.
 Section 16.4 for the limits.
 
 **Later items.** M5.2 adds coordinates and vision mode to `browser_act`. M5.3 adds the vault
-and the URL policy for each org. M5.5 adds the `my_chrome` target. M5.6 adds `browser_task`.
+and the URL policy for each org. M5.5 adds the `my_chrome` target (Section 14.2.2). M5.6 adds
+`browser_task`.
 The Browserbase key is a setting of the process. A key for each org comes later.
 
 ### 14.2 Chrome extension
@@ -4686,39 +4689,194 @@ The API (`sama.gateway.chrome.page_message`):
 The question of the user stays outside the untrusted block. The question is "Summarize this
 page." when the composer is empty.
 
+Since M5.5 the server also sends `tool_call`, and the client answers with `tool_result`
+(Section 14.2.2).
+
 **Limits of M5.4.** The API keeps the open connections in memory (`ChromeHub`), one map for
 each API process. The side panel does not show tool call details or traces. The web app shows
 them.
 
-#### 14.2.2 Browser actions in the user's Chrome (M5.5 design)
+#### 14.2.2 Browser actions in the user's Chrome (M5.5)
 
-M5.5 adds the `my_chrome` target of the browser tools (Section 14.1) on the same WebSocket.
-This is a design. M5.4 does not build it.
+M5.5 adds the `my_chrome` target of the browser tools (Section 14.1). The calls go over the
+WebSocket of the extension (Section 14.2.1). The agent uses the same six tools as for the cloud
+browser, so both runtimes have the target.
 
-- **Routing.** `browser_*` tools with `target="my_chrome"` go from the sama MCP server to the
-  control plane. The control plane finds a connection of the user in `ChromeHub`. With more
-  than one API process, a Postgres `LISTEN/NOTIFY` channel for each user sends the call to the
-  process that holds the connection. No connection gives the error "the Chrome extension is
-  offline".
-- **Frames.** The server sends `tool_call {call_id, tool, args, tab_id?, deadline}`. The client
-  sends `tool_result {call_id, ok, result | error}`. A missed deadline is a tool error. The
-  extension acts only in the tab that is bound to the session of the run, or in a tab that the
-  agent opened in the same window group.
-- **Actions.** `chrome.debugger.attach` (CDP `1.3`) on the tab. `Accessibility.getFullAXTree`
-  gives the snapshot with element refs. `Input.dispatchMouseEvent`, `Input.insertText`, and
-  `Input.dispatchKeyEvent` give real clicks and typing. `Page.captureScreenshot` gives vision
-  mode. Chrome shows its "is debugging this browser" bar while the debugger is attached. The
-  extension detaches when the run ends.
-- **Overlay.** A content script draws the agent cursor and a box around the target element,
-  and a "sama is acting - Stop" bar. Stop cancels the run (`/runs/{id}/cancel`) and detaches.
-  A user click or key press in the tab pauses the agent ("you took over").
-- **Consent.** For each site: ask (default), allow for this site, or never. The choice is
-  stored in `chrome.storage.local` and is shown in the side panel. A blocked list (banking,
-  password managers, `accounts.google.com`, the Chrome Web Store) cannot be allowed. Sensitive
-  actions (submit, purchase, send, delete, and type into a password field) always need a click
-  of the user in the side panel, through the approval flow of the tool gate (Section 16.1).
-- **Permissions.** M5.5 adds `debugger` to the manifest. Chrome shows a new warning, so the
-  Web Store item needs a new review.
+**Parts.**
+
+| Part | Where | Job |
+|---|---|---|
+| Target | `sama.browser.chrome` | `ChromeTarget` and `ChromeSession`. A session sends each browser call to the extension and turns the answer into the data classes of `sama.browser.target`. It has the blocked list and the sensitive refs of the latest snapshot. |
+| Hub | `sama.gateway.chrome.ChromeHub` | The open extension connections of each user. `link(user)` gives the newest connection. |
+| Frames | `sama.api.chrome` | `tool_call` (server) and `tool_result` (client) on the WebSocket. |
+| Service | `sama.browser.service` | One session for each run and target. The tools have an optional `target`. |
+| Gate | `sama.gate` | `escalate`: a sensitive action always asks a person (Section 16.1). |
+| Extension | `extension/src/lib/actions.ts` and others | The `Actor`: CDP actions, the overlay, the consent, the sensitive check, Stop, and takeover. |
+
+**Targets of a call.** Each browser tool has an optional `target` (`cloud` or `my_chrome`).
+Without it, the call uses the target of the last browser call of the run, else the default
+target. The default target is `cloud` when the process has the Browserbase key, else
+`my_chrome`. A run has at most one session on each target. The descriptions of the tools name
+only the targets that the process has.
+
+**Routing.** The control plane is one process (D18), so `ChromeHub` is in memory, and the tool
+server and the API share it. A call of the `my_chrome` target goes to the newest connection of
+the Supabase Auth user of the run user (`users.auth_user_id`). A run without a user (a job of an
+org) cannot use the target. When the user has no open connection, the call fails with "the sama
+Chrome extension of this user is offline". When sama has more than one API process, a Postgres
+`LISTEN/NOTIFY` channel for each user must send the call to the process that holds the
+connection. That is not built.
+
+**Frames.**
+
+| Direction | Frame | Use |
+|---|---|---|
+| Server | `tool_call {call_id, op, args, session_id, run_id, approved, timeout_ms}` | One browser call. `op` is `navigate`, `snapshot`, `act`, `screenshot`, `extract`, `tabs`, or `release`. `approved` is true when a person approved this call in the approval card of the gate. |
+| Client | `tool_result {call_id, ok, result \| error {code, message}}` | The answer. The API drops an answer for a call that is not open. |
+
+A connection has at most 16 open calls. The API waits 150 seconds for an answer, because an
+answer can wait for the user. The extension gets a deadline 5 seconds earlier. A closed
+connection fails its open calls with "offline". `release` tells the extension that the run
+ended: the extension detaches the debugger and removes the overlay. The service sends it when
+the run ends, when the session is idle for 10 minutes, and when the process stops.
+
+The extension sends codes, not text, for the notes of a page state and for the errors. The API
+maps each code to fixed text (`NOTES` and `ERRORS` in `sama.browser.chrome`) and drops unknown
+codes. The detail of an error (text of Chrome or of the page) goes in the untrusted block. The
+title, the URL, the tree, and the extracted text are in the untrusted block, as for the cloud
+browser (Section 16.5).
+
+**Tabs.** The agent acts only in the tabs of its run:
+
+- the tab that is bound to the session of the run (Section 14.2.1),
+- the tabs that the agent opens (`browser_open` without a bound tab, or `browser_tabs` `new`),
+- a tab that a page of the run opens (a popup). It becomes the active tab.
+
+`browser_tabs` lists only these tabs, and it closes only the tabs that the agent opened. A run
+has at most 10 tabs. A tab that another run uses gives "busy". The agent opens its tabs in the
+window of the active tab of the run. It does not make a tab group.
+
+**Actions.** The extension attaches `chrome.debugger` (CDP `1.3`) to a tab of the run when the
+first call needs it. Chrome shows its bar "sama started debugging this browser" while the
+debugger is attached.
+
+- Snapshot: `DOM.getDocument` (for the attributes and the forms) and
+  `Accessibility.getFullAXTree`. The tree has the format of the cloud browser
+  (`- button "Pay" [ref=e3]`). The value of a password field is never in the tree. Only the
+  main frame is in the tree.
+- Click, hover, drag: `DOM.scrollIntoViewIfNeeded`, `DOM.getContentQuads`, then
+  `Input.dispatchMouseEvent`.
+- Type: `DOM.focus`, select the old text, then `Input.insertText`. `submit` presses Enter.
+- Press: `Input.dispatchKeyEvent` (for example `Enter` or `Control+A`).
+- Select: sets the options in the page and sends `input` and `change`.
+- Scroll: a `mouseWheel` event, or a scroll of the element into view.
+- Back, forward, reload, dialogs: the `Page` domain. An action that opens a JavaScript dialog
+  returns at once with a note, as in the cloud browser.
+- Navigate: `chrome.tabs.update` (or `chrome.tabs.create`), then a wait for the load.
+- Screenshot: `Page.captureScreenshot` (JPEG, a full page of at most 6,000 px). The overlay is
+  hidden during the capture.
+- Extract: functions in the isolated world of the overlay. A password field gives `(hidden)`.
+
+The functions that run in the page run in an isolated world (`Page.createIsolatedWorld`), not in
+the world of the page scripts.
+
+**Overlay.** The isolated world draws the agent cursor, a box around the element of the action,
+and a bar "sama is acting in this tab" with a Stop button. The overlay is in a closed shadow
+root, and its buttons act only on a real click (`isTrusted`). It talks to the extension through a
+CDP binding of the isolated world (`Runtime.addBinding` with `executionContextName`), so the page
+scripts cannot call it. The extension also checks the execution context of each signal.
+
+**Takeover.** When the user clicks or presses a key in the tab while the agent does not send
+input, the overlay tells the extension, and the tab is paused. The bar says "You have control.
+sama is paused." with "Give back to sama" and Stop. The side panel shows the same state and
+buttons. The next call of the run waits until the user gives the tab back. After 120 seconds it
+fails with "the user took over the tab", and the agent tells the user what it was doing.
+
+**Calls and cancellation.** The calls of one run run one at a time in the extension: a call
+starts only after the work of the last call ended. Each CDP command of a call checks first that
+the run is not stopped or released and that the deadline of the call did not pass, so a call that
+timed out sends no more input. Right before input, the extension checks again that the page did
+not navigate since the checks, that the site is still allowed, and that the user does not have
+control. When Chrome attaches after a Stop or a release, the extension detaches at once. When
+the WebSocket closes, the extension releases all runs, because the API cannot release them
+later.
+
+**Stop.** Stop in the overlay or in the side panel cancels the run (`POST /runs/{id}/cancel`),
+closes the open questions of the run, and detaches. Later calls of the run fail with "stopped".
+When the user closes the debugging bar of Chrome, the extension stops the run the same way.
+
+**Consent.** Before the agent reads or acts on a site (a host name), the site must be allowed:
+
+- "Allow on this site" is kept in `chrome.storage.local` (`sama.site.<host>`).
+- "Allow once" is for this run only.
+- "Not now" refuses this call.
+- "Never" is kept, and later calls on the site fail at once.
+
+The question shows in the side panel. When no side panel is open, the extension opens a small
+sama window (`prompt.html`). Only a click in an extension page answers a question, so a web page
+cannot answer it. A question that nobody answers in 120 seconds fails the call. The side panel
+lists the kept choices under "Site access", and the user can remove each one. Only `http` and
+`https` pages are allowed.
+
+**Blocked sites.** `sama.browser.chrome.BLOCKED_HOSTS` and `extension/src/lib/blocklist.ts`
+have the same list (a test checks it): Google account and payment pages, the Chrome Web Store,
+password managers, payment and exchange sites, and banks. A host with a label that has the word
+`bank` is a bank too. The API refuses a navigation to a blocked site before it calls the
+extension. The extension refuses every call on a blocked site, also after a link or a redirect,
+and the user cannot allow one.
+
+**Sensitive actions.** These always need a click of the user:
+
+| Code | When |
+|---|---|
+| `submit` | A click on the submit button of a form that writes (a method other than GET), or Enter in a text field of such a form. |
+| `pay`, `send`, `delete`, `confirm` | A click on a button or link with a name such as "Pay", "Place order", "Send", "Delete", or "Confirm". |
+| `password`, `payment` | Typing into a password field, or into a payment field (`autocomplete="cc-*"`, or a name such as card number or CVV). |
+
+There are two checks:
+
+1. **The gate.** The snapshot marks these elements with `[needs approval]` and sends their codes
+   to the API. When the agent calls `browser_act` on such a ref, the gate gives `ask` even with an
+   `allow` rule (Section 16.1). The approval card shows "a sensitive action in the user's Chrome:
+   buy or pay". The user approves it in the side panel or in the web app.
+2. **The extension.** Before it acts, the extension reads the live element again. If the action
+   is sensitive and no person approved the call (`approved` is false), the extension asks the
+   user ("Allow this action on shop.example? sama asks to buy or pay: 'Place order'.") and waits.
+   This check covers a page that changed after the snapshot, and Enter without a ref.
+
+An approval in the gate is good only for the element that the person saw. The session keeps
+the snapshot and the reason of each call when the gate first asks for it. The extension skips
+its own question only when the call runs in that same snapshot with that same reason
+(`approved_reason` in the `tool_call` frame). After a new snapshot, the extension asks again. A
+ticket of an approved call that then runs under an `allow` rule is used up, so it cannot approve
+a later call with the same arguments (Section 16.1).
+
+Keys count too: Enter or Space on a sensitive button, Enter in a text field of a form that
+writes, and a key with text in a password or payment field.
+
+**Address rules.** The address rules of Section 16.4 do not apply to `my_chrome`: the browser
+of the user is on the network of the user, and a DNS check from sama means nothing there. The
+blocked list and the consent of the user apply instead.
+
+**Gate.** `browser_act` stays `ask` by default for both targets (M5.1). A user who wants the
+agent to act without a card for each click chooses "Always allow" on a `browser_act` card. The
+sensitive actions still ask. An unattended run cannot do a sensitive action.
+
+**Permissions.** M5.5 adds `debugger` to the manifest (version `0.2.0`). Chrome shows a new
+warning ("Access the page debugger backend"), and the Chrome Web Store item needs a new review
+(Section 14.2.3).
+
+**Limits.**
+
+- One API process (see Routing).
+- The snapshot has the main frame only. Frames of other sites are not in the tree.
+- A takeover is a pointer or key event of the user in the page. A scroll with the mouse wheel
+  is not a takeover. An event that comes while the agent sends input is not a takeover.
+- The overlay is in the DOM of the page. A page can hide or remove it; the extension checks its
+  own host element (not an id that the page can copy) and puts it back at the next call.
+- The overlay copies the light-theme values of the panel tokens, because the page cannot load
+  the CSS of the extension.
+- The keyword list of the sensitive check is in English.
 
 #### 14.2.3 Publish to the Chrome Web Store
 
@@ -4736,7 +4894,9 @@ A person does these steps. The agent cannot do them.
 6. Privacy: give a single purpose ("chat with the sama assistant about the current tab"). Give
    a reason for each permission: `sidePanel` (the chat), `storage` (the sign-in and the tab
    binding), `tabs` (the title and address of the current tab), `scripting` and `activeTab`
-   (read the page when the user clicks "Ask about this page"), host permissions (the sama API
+   (read the page when the user clicks "Ask about this page"), `debugger` (since M5.5: the agent
+   clicks and types in the tabs of the user after the user allows each site; it is attached only
+   while the agent acts, and Chrome shows its bar), host permissions (the sama API
    and the pages that the user shares; the optional `<all_urls>` is requested only when the user
    asks for a screenshot, because `chrome.tabs.captureVisibleTab` needs it). Declare "Website content" and "Authentication
    information" as data that the item uses, not sold, and used only for the single purpose.
@@ -5108,6 +5268,16 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
 the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
+
+**Escalation (M5.5).** `GateService` has an optional `escalation` hook: `(org, run, tool,
+arguments)` gives a reason, or nothing. With a reason, the call gets `ask` at step 4 even with
+an `allow` rule, like a tool in `ALWAYS_ASK`. A `deny` rule still wins, a recorded approval of
+this call still allows it, and an unattended run gets `deny` (a pre-approval does not cover it).
+The reason is the reason of the approval card. The control plane sets the hook to the sensitive
+actions of the browser in the user's Chrome (Section 14.2.2). A hook that raises an error gives
+`ask`. The tool server tells the body of a tool when a person approved the call (a ticket of
+`screen`), in the context variable `sama.tools.approved.human_approved`. The `my_chrome` target
+sends it to the extension, so the user is not asked a second time.
 
 **Review runs (M2.4).** The toolsets of a `review` run are cut to `memory` and `skills` in the
 gate (step 1), so every other tool gets `deny`. The `memory` and `skill_*` tools make a proposal
@@ -5772,8 +5942,8 @@ later. Each tool is hidden when its service is missing.
 | `image_generate(prompt, size)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `text_to_speech(text, voice)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `skill_import(url, path, ref, name, scope)` | 9.6 | The skill store | `ask` |
-| `browser_open`, `browser_snapshot`, `browser_screenshot`, `browser_extract`, `browser_tabs` (M5.1) | 14.1 | A `BrowserService` (the Browserbase key and project) | `allow` |
-| `browser_act` (M5.1) | 14.1 | A `BrowserService` | `ask` |
+| `browser_open`, `browser_snapshot`, `browser_screenshot`, `browser_extract`, `browser_tabs` (M5.1) | 14.1 | A `BrowserService` (the control plane always has one since M5.5) | `allow` |
+| `browser_act` (M5.1) | 14.1 | A `BrowserService` | `ask`; a sensitive action in the user's Chrome is always `ask` (14.2.2) |
 
 `browser_screenshot` is the only tool that returns an image: a text caption and an MCP
 `ImageContent` (JPEG, base64). The browser tools put page text in an
@@ -6435,7 +6605,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
-| `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | No | The cloud browser (Section 14.1). With both, the tool server has the browser tools. The key is a setting of the process; it is not in the vault yet. |
+| `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | No | The cloud browser (Section 14.1). With both, the browser tools have the `cloud` target, and it is the default target. Without them, the tools have only `my_chrome` (Section 14.2.2). The key is a setting of the process; it is not in the vault yet. |
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
 | `SAMA_COMPOSIO_WEBHOOK_SECRET` | No | The signing secret of the Composio webhook subscription of the sama project (Section 12.2). An org secret in the vault (`composio_webhook_secret`) comes first. Without both, sama refuses Composio events. |
 | `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |

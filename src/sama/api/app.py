@@ -967,6 +967,7 @@ class SamaApi:
         checkpoints: CheckpointService | None = None,
         model_keys: ModelKeys | None = None,
         data: DataControls | None = None,
+        chrome: ChromeHub | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
@@ -1013,8 +1014,9 @@ class SamaApi:
             engine, AuthUsersEmails(engine), self._settings.signup
         )
         self._streams: Counter[uuid.UUID] = Counter()
-        self.chrome = ChromeHub()
-        """The open connections of the Chrome extension channel (M5.4)."""
+        self.chrome = chrome or ChromeHub()
+        """The open connections of the Chrome extension channel (M5.4). The ``my_chrome``
+        browser target uses the same hub (M5.5)."""
 
     @property
     def settings(self) -> ApiSettings:

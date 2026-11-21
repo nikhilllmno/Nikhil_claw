@@ -25,6 +25,18 @@ export class TabBindings {
     await this.store.set(keyOf(tabId), sessionId);
   }
 
+  /** The tab that is bound to a session, or `null`. */
+  async tabOf(sessionId: string): Promise<number | null> {
+    for (const key of await this.store.keys()) {
+      if (!key.startsWith(BINDING_PREFIX)) continue;
+      if ((await this.store.get(key)) === sessionId) {
+        const tabId = Number(key.slice(BINDING_PREFIX.length));
+        if (Number.isInteger(tabId)) return tabId;
+      }
+    }
+    return null;
+  }
+
   async unbind(tabId: number): Promise<void> {
     await this.store.remove(keyOf(tabId));
   }

@@ -167,6 +167,11 @@ class RunToolSource(Protocol):
     ) -> tuple[Mapping[str, frozenset[str]], Mapping[str, ToolAccess]]: ...
 
 
+Escalation = Callable[[str, str, str, Mapping[str, Any]], str | None]
+"""``(org_id, run_id, tool name, arguments)`` gives a reason when the call needs a person even
+with an ``allow`` rule, or ``None``. It runs in the event loop, so it must be quick."""
+
+
 class GateService:
     """The real ``ToolGate`` of sama. One instance serves all orgs: every query is scoped by
     the run token claims."""
@@ -179,15 +184,19 @@ class GateService:
         clock: Callable[[], datetime] = _utcnow,
         extra_toolsets: ToolsetSource | None = None,
         run_tools: RunToolSource | None = None,
+        escalation: Escalation | None = None,
     ) -> None:
         """``extra_toolsets`` adds toolsets to the fixed table, for example the deferred tools
         of the tool server (Section 10.3). It is read at each check. ``run_tools`` adds the
-        tools that depend on the run."""
+        tools that depend on the run. ``escalation`` gives a reason when a call needs a person
+        even with an ``allow`` rule (``decide``, ``escalate``); the control plane sets it to
+        the sensitive actions of the browser (Section 14.2.2)."""
         if approval_ttl <= timedelta(0):
             raise ValueError("approval_ttl must be more than 0")
         self._engine = engine
         self._extra_toolsets = extra_toolsets
         self._run_tools = run_tools
+        self.escalation = escalation
         self._ttl = approval_ttl
         self._clock = clock
 
@@ -225,7 +234,8 @@ class GateService:
                     connection, run.ref, "tool_gate.verdict", call_id, _details(name, verdict)
                 )
             else:
-                verdict = decide(run.context, tool_name, original)
+                escalate = self._escalate(claims, name, effective)
+                verdict = decide(run.context, tool_name, original, escalate=escalate)
                 if child and verdict.action == "ask":
                     verdict = Verdict(
                         "deny", GateStep.POLICY, "a sub-agent cannot ask for an approval"
@@ -241,6 +251,18 @@ class GateService:
             verdict.step,
         )
         return verdict
+
+    def _escalate(
+        self, claims: RunTokenClaims, name: str, arguments: Mapping[str, Any]
+    ) -> str | None:
+        if self.escalation is None:
+            return None
+        try:
+            return self.escalation(claims.org_id, claims.run_id, name, arguments)
+        except Exception:
+            # Fail closed: a check that fails asks the user.
+            log.exception("gate: the escalation check failed")
+            return "the sensitivity check failed"
 
     async def screen(
         self, claims: RunTokenClaims, tool_name: str, arguments: Mapping[str, Any]
@@ -258,7 +280,13 @@ class GateService:
             run = None if ref is None else await self._load(connection, ref, claims, None)
             if run is None:
                 return Verdict("deny", GateStep.TOOLSET, "the run is unknown or ended")
-            verdict = decide(run.context, tool_name, arguments)
+            escalate = self._escalate(claims, name, effective)
+            verdict = decide(run.context, tool_name, arguments, escalate=escalate)
+            if verdict.action == "allow" and self.escalation is not None:
+                # An approved call that now runs under an allow rule (the user chose "always
+                # allow") uses up its ticket here, so a later call with the same arguments
+                # cannot use the old approval (Section 14.2.2).
+                await self._take_ticket(connection, run.ref, name, arguments_digest(effective))
             if verdict.action == "ask":
                 digest = arguments_digest(effective)
                 if await self._take_ticket(connection, run.ref, name, digest):

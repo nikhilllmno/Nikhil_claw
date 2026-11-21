@@ -35,7 +35,7 @@ from sama.browser.target import BrowserError
 from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
 from sama.delegation import DelegationError, DelegationService
-from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, Verdict
+from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, GateStep, Verdict
 from sama.gate.wire import (
     GATE_PATH,
     MAX_GATE_BODY_BYTES,
@@ -111,6 +111,7 @@ from sama.subagents import MAX_SUBAGENTS
 from sama.tasks.runs import TaskTools
 from sama.tasks.service import TaskError
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
+from sama.tools.approved import human_approved
 from sama.tools.board import register_delegation, register_tasks
 from sama.tools.browser import register_browser
 from sama.tools.clarify import (
@@ -493,12 +494,20 @@ class ToolServer:
         ok = False
         size = 0
         try:
+            approved = False
             if self.gate is not None:
                 verdict = await self.gate.screen(claims, tool, _raw_arguments(ctx, arguments))
                 if verdict.action == "deny":
                     raise ToolError(f"the tool gate denied the call: {verdict.reason}")
+                approved = verdict.action == "allow" and verdict.step == GateStep.RECORDED
+            # The body can see that a person approved this call (Section 14.2.2).
+            token = human_approved.set(approved)
+            try:
+                result = await body(claims)
+            finally:
+                human_approved.reset(token)
             # Redact first, so a secret never reaches the model, the spill file, or a log.
-            text = await cap(redact(await body(claims)), tool=tool, claims=claims, spill=self.spill)
+            text = await cap(redact(result), tool=tool, claims=claims, spill=self.spill)
             size = len(text.encode("utf-8"))
             ok = True
             return text

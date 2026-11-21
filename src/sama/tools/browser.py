@@ -1,10 +1,12 @@
 """The browser tools (docs/architecture.md, Section 14.1; roadmap M5.1).
 
-The six tools work on one browser session for each run: ``browser_open``,
+The six tools work on one browser session for each run and target: ``browser_open``,
 ``browser_snapshot``, ``browser_act``, ``browser_screenshot``, ``browser_extract``, and
-``browser_tabs``. The agent reads the page as an accessibility tree with refs (``[ref=e12]``) and
-acts on an element by its ref. Each output goes through the gate, the redactor, and the output
-cap of the tool server, as for the other tools.
+``browser_tabs``. Each tool has an optional ``target``: ``cloud`` (Browserbase, M5.1) or
+``my_chrome`` (the Chrome of the user through the sama extension, M5.5). The descriptions name
+only the targets of the service. The agent reads the page as an accessibility tree with refs
+(``[ref=e12]``) and acts on an element by its ref. Each output goes through the gate, the
+redactor, and the output cap of the tool server, as for the other tools.
 
 The gate gives ``browser_act`` ``ask`` by default: an action can use the logins of the user. The
 other tools only read.
@@ -19,7 +21,17 @@ from mcp.server.mcpserver.utilities.types import Image
 from mcp_types import TextContent, ToolAnnotations
 from pydantic import Field
 
-from sama.browser.target import Act, ActionKind, ExtractKind, Screenshot, ScrollDirection, TabAction
+from sama.browser.target import (
+    CLOUD,
+    MY_CHROME,
+    Act,
+    ActionKind,
+    ExtractKind,
+    Screenshot,
+    ScrollDirection,
+    TabAction,
+    TargetName,
+)
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.board import Call
 
@@ -53,11 +65,25 @@ _Ref = Annotated[str, Field(min_length=1, max_length=40, pattern=r"^(ref=)?[A-Za
 _Url = Annotated[str, Field(min_length=1, max_length=MAX_URL_CHARS)]
 
 OPEN_DESCRIPTION: Final = (
-    "Open a URL in the cloud browser of this run. The browser keeps the cookies and logins of "
-    "the user from run to run (not in a shared session). The result is the accessibility tree "
-    "of the page (snapshot=true) with a [ref=...] for each element that browser_act can use. "
-    "The URL policy blocks private and internal addresses."
+    "Open a URL in the browser of this run. The result is the accessibility tree of the page "
+    "(snapshot=true) with a [ref=...] for each element that browser_act can use."
 )
+TARGET_TEXT: Final = {
+    CLOUD: (
+        'target="cloud": a cloud browser. It keeps the cookies and logins of the user from run '
+        "to run (not in a shared session). The URL policy blocks private and internal "
+        "addresses."
+    ),
+    MY_CHROME: (
+        'target="my_chrome": the Chrome of the user, through the sama extension, in the tab of '
+        "this chat or in tabs that you open. The user sees a cursor and can stop you or take "
+        "over at any time. The user allows each site once. Banks, payments, password managers, "
+        "and Google account pages are blocked. A sensitive action (submit a form, buy, send, "
+        "delete, or type into a password or payment field) waits for a click of the user. Use "
+        "it when the user asks you to use their browser or a site where they are logged in."
+    ),
+}
+SAME_TARGET: Final = " Without target, the tool uses the target of the last browser call."
 SNAPSHOT_DESCRIPTION: Final = (
     "Read the active tab as an accessibility tree in YAML. Each element that browser_act can "
     "use has [ref=eN]. A new snapshot makes the old refs invalid. While a JavaScript dialog is "
@@ -87,38 +113,59 @@ TABS_DESCRIPTION: Final = (
 )
 
 
+def _targets_text(service: BrowserService) -> str:
+    names = list(service.targets)
+    lines = " ".join(TARGET_TEXT[name] for name in names if name in TARGET_TEXT)
+    if len(names) == 1:
+        return f" {lines}"
+    return (
+        f" target: {' or '.join(names)}. Without it, the target of the last browser call of "
+        f"this run, else {names[0]}. {lines}"
+    )
+
+
+def _with_target(arguments: dict[str, Any], target: TargetName | None) -> dict[str, Any]:
+    if target is not None:
+        arguments["target"] = target
+    return arguments
+
+
 def register_browser(server: MCPServer, call: Call, service: BrowserService) -> None:
     """Adds the six browser tools to ``server``."""
     reads = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+    targets = _targets_text(service)
     acts = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
     @server.tool(
         name=BROWSER_OPEN,
-        description=OPEN_DESCRIPTION,
+        description=OPEN_DESCRIPTION + targets,
         annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
         structured_output=False,
     )
-    async def browser_open(ctx: Context, url: _Url, snapshot: bool = True) -> str:
+    async def browser_open(
+        ctx: Context, url: _Url, snapshot: bool = True, target: TargetName | None = None
+    ) -> str:
         async def body(claims: RunTokenClaims) -> str:
-            return await service.open(claims, url, snapshot=snapshot)
+            return await service.open(claims, url, snapshot=snapshot, target=target)
 
-        return await call(ctx, BROWSER_OPEN, {"url": url, "snapshot": snapshot}, body)
+        arguments = _with_target({"url": url, "snapshot": snapshot}, target)
+        return await call(ctx, BROWSER_OPEN, arguments, body)
 
     @server.tool(
         name=BROWSER_SNAPSHOT,
-        description=SNAPSHOT_DESCRIPTION,
+        description=SNAPSHOT_DESCRIPTION + SAME_TARGET,
         annotations=reads,
         structured_output=False,
     )
-    async def browser_snapshot(ctx: Context) -> str:
+    async def browser_snapshot(ctx: Context, target: TargetName | None = None) -> str:
         async def body(claims: RunTokenClaims) -> str:
-            return await service.snapshot(claims)
+            return await service.snapshot(claims, target=target)
 
-        return await call(ctx, BROWSER_SNAPSHOT, {}, body)
+        return await call(ctx, BROWSER_SNAPSHOT, _with_target({}, target), body)
 
     @server.tool(
         name=BROWSER_ACT,
-        description=ACT_DESCRIPTION,
+        description=ACT_DESCRIPTION + SAME_TARGET,
         annotations=acts,
         structured_output=False,
     )
@@ -137,6 +184,7 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
         accept: bool = True,
         prompt_text: Annotated[str | None, Field(max_length=MAX_TEXT_CHARS)] = None,
         snapshot: bool = True,
+        target: TargetName | None = None,
     ) -> str:
         act = Act(
             action=action,
@@ -153,7 +201,7 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
         )
 
         async def body(claims: RunTokenClaims) -> str:
-            return await service.act(claims, act, snapshot=snapshot)
+            return await service.act(claims, act, snapshot=snapshot, target=target)
 
         arguments: dict[str, Any] = {
             key: value
@@ -170,6 +218,7 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
                 "accept": accept,
                 "prompt_text": prompt_text,
                 "snapshot": snapshot,
+                "target": target,
             }.items()
             if value is not None
         }
@@ -177,19 +226,22 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
 
     @server.tool(
         name=BROWSER_SCREENSHOT,
-        description=SCREENSHOT_DESCRIPTION,
+        description=SCREENSHOT_DESCRIPTION + SAME_TARGET,
         annotations=reads,
         structured_output=False,
     )
-    async def browser_screenshot(ctx: Context, full_page: bool = False) -> list[Any]:
+    async def browser_screenshot(
+        ctx: Context, full_page: bool = False, target: TargetName | None = None
+    ) -> list[Any]:
         taken: list[Screenshot] = []
 
         async def body(claims: RunTokenClaims) -> str:
-            caption, shot = await service.screenshot(claims, full_page=full_page)
+            caption, shot = await service.screenshot(claims, full_page=full_page, target=target)
             taken.append(shot)
             return caption
 
-        caption = await call(ctx, BROWSER_SCREENSHOT, {"full_page": full_page}, body)
+        arguments = _with_target({"full_page": full_page}, target)
+        caption = await call(ctx, BROWSER_SCREENSHOT, arguments, body)
         content: list[Any] = [TextContent(type="text", text=caption)]
         if taken:
             image_format = taken[0].mime_type.removeprefix("image/")
@@ -198,7 +250,7 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
 
     @server.tool(
         name=BROWSER_EXTRACT,
-        description=EXTRACT_DESCRIPTION,
+        description=EXTRACT_DESCRIPTION + SAME_TARGET,
         annotations=reads,
         structured_output=False,
     )
@@ -207,11 +259,12 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
         ctx: Context,
         ref: _Ref | None = None,
         fields: Annotated[dict[str, _Ref] | None, Field(max_length=MAX_FIELDS)] = None,
+        target: TargetName | None = None,
     ) -> str:
         async def body(claims: RunTokenClaims) -> str:
-            return await service.extract(claims, kind, ref=ref, fields=fields)
+            return await service.extract(claims, kind, ref=ref, fields=fields, target=target)
 
-        arguments: dict[str, Any] = {"kind": kind}
+        arguments: dict[str, Any] = _with_target({"kind": kind}, target)
         if ref is not None:
             arguments["ref"] = ref
         if fields is not None:
@@ -220,7 +273,7 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
 
     @server.tool(
         name=BROWSER_TABS,
-        description=TABS_DESCRIPTION,
+        description=TABS_DESCRIPTION + SAME_TARGET,
         annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
         structured_output=False,
     )
@@ -229,11 +282,12 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
         action: TabAction = "list",
         index: Annotated[int | None, Field(ge=0, le=50)] = None,
         url: _Url | None = None,
+        target: TargetName | None = None,
     ) -> str:
         async def body(claims: RunTokenClaims) -> str:
-            return await service.tabs(claims, action, index=index, url=url)
+            return await service.tabs(claims, action, index=index, url=url, target=target)
 
-        arguments: dict[str, Any] = {"action": action}
+        arguments: dict[str, Any] = _with_target({"action": action}, target)
         if index is not None:
             arguments["index"] = index
         if url is not None:
