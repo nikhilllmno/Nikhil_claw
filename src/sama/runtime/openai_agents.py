@@ -97,6 +97,7 @@ from sama.runtime.contract import (
     Usage,
     bound_subagent_text,
     is_terminal,
+    output_preview,
 )
 from sama.runtime.gating import AllowAllGate, BoundedSet, GateDecision, ToolGate
 from sama.runtime.session_items import (
@@ -472,7 +473,7 @@ def _at_least(usage: Usage, floor: Usage) -> Usage:
 
 def _preview(content: Any) -> str:
     text = content if isinstance(content, str) else json.dumps(content, default=str)
-    return text[:_PREVIEW_CHARS]
+    return output_preview(text, _PREVIEW_CHARS)
 
 
 def _arguments(raw: Any) -> dict[str, Any]:

@@ -39,6 +39,7 @@ from sama.coding.agents import MAX_PROMPT_CHARS as CODING_MAX_PROMPT_CHARS
 from sama.coding.agents import MAX_TIMEOUT_S as CODING_MAX_TIMEOUT_S
 from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
+from sama.db.models import MAX_PLAN_CHARS
 from sama.delegation import DelegationError, DelegationService
 from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, GateStep, Verdict
 from sama.gate.wire import (
@@ -165,6 +166,8 @@ from sama.tools.github import (
 )
 from sama.tools.outbound import OutboundClient
 from sama.tools.output import Spill, cap, untrusted
+from sama.tools.plan import MAX_TITLE_CHARS as PLAN_TITLE_MAX_CHARS
+from sama.tools.plan import PLAN_PROPOSE, PlanError, PlanProposer
 from sama.tools.repos import RepoCloner, RepoError
 from sama.tools.repos import render as render_clone
 from sama.tools.sama_pr import (
@@ -253,6 +256,7 @@ _EXPECTED = (
     MediaError,
     MemoryChangeError,
     MemoryProviderError,
+    PlanError,
     RepoError,
     SamaPrError,
     SearchError,
@@ -434,6 +438,8 @@ class ToolServer:
     - ``delegation``: child agents (``delegate_task``, ``delegate_status``). Without it,
       these tools are hidden.
     - ``tasks``: the task board (``task_*``). Without it, these tools are hidden.
+    - ``plans``: coding mode (Section 15.5). With it, the server has ``plan_propose``.
+      Without it, the tool is hidden.
     - ``browser``: the cloud browser (``browser_*``, Section 14.1). Without it, these tools
       are hidden.
     - ``browser_tasks``: the browser sub-agent (``browser_task``, M5.6). It needs ``browser``.
@@ -486,6 +492,7 @@ class ToolServer:
         moa: MixtureService | None = None,
         recall: MemoryRecall | None = None,
         skill_settings: SkillSettingsStore | None = None,
+        plans: PlanProposer | None = None,
     ) -> None:
         self.signer = signer
         self.custom_tools = custom_tools
@@ -495,6 +502,7 @@ class ToolServer:
         self.moa = moa
         self.recall = recall
         self.skill_settings = skill_settings
+        self.plans = plans
         self.browser = browser
         self.browser_tasks = browser_tasks if browser is not None else None
         self.importer = importer
@@ -839,6 +847,31 @@ class ToolServer:
                 if content is not None:
                     arguments["content"] = content
                 return await self._call(ctx, CHANGE_PROPOSE, arguments, body)
+
+        if self.plans is not None:
+            plans = self.plans
+
+            @server.tool(
+                name=PLAN_PROPOSE,
+                description=(
+                    "Propose a plan for a coding task and wait for the user. Use it in plan "
+                    "mode, and for large changes. Give the plan in Markdown: the goal, the "
+                    "files to change, the steps, and the tests to run. The user approves, "
+                    "edits, or rejects the plan. After the call, end your answer and do not "
+                    "change files: an approval comes back as a new message with the final plan."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
+                structured_output=False,
+            )
+            async def plan_propose(
+                plan: Annotated[str, Field(min_length=1, max_length=MAX_PLAN_CHARS)],
+                ctx: Context,
+                title: Annotated[str | None, Field(max_length=PLAN_TITLE_MAX_CHARS)] = None,
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return await plans.propose(claims, plan, title)
+
+                return await self._call(ctx, PLAN_PROPOSE, {"plan": plan, "title": title}, body)
 
         if self.sessions is not None:
             sessions = self.sessions

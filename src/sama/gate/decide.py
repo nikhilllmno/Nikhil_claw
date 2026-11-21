@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any, Final, Literal, Protocol
 
 from sama.gate.hardline import hardline_problem
+from sama.gate.plan import PLAN_MODE_REASON, PLAN_PROPOSE, plan_mode_allows
 
 Action = Literal["allow", "ask", "deny"]
 
@@ -33,6 +34,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "web": frozenset({"web_search", "web_extract", "x_search"}),
     "clarify": frozenset({"clarify"}),
     "github": frozenset({"repo_clone", "pr_create", "pr_comment", "repo_push_approval"}),
+    "plan": frozenset({PLAN_PROPOSE}),
     "memory": frozenset({"memory", "memory_recall"}),
     "skills": frozenset({"skills_list", "skill_view", "skill_manage", "skill_import"}),
     "sessions": frozenset({"session_search", "session_read"}),
@@ -49,7 +51,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "delegation": frozenset({"delegate_task", "delegate_status"}),
     "tasks": frozenset({"task_create", "task_list", "task_complete", "task_block", "task_comment"}),
     "code_exec": frozenset({"execute_code"}),
-    "coding_agents": frozenset({"coding_agent_run"}),
+    "coding_agents": frozenset({"coding_agent_run", "coding_agent_plan"}),
     "browser": frozenset(
         {
             "browser_open",
@@ -105,6 +107,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "skill_view",
         "skill_manage",
         "change_propose",
+        PLAN_PROPOSE,
         "session_search",
         "session_read",
         "vision_analyze",
@@ -140,7 +143,8 @@ DEFAULT_ALLOW: Final = frozenset(
 rule, they are allowed. Every other tool gets ``ask``. ``skill_manage`` is here because the
 skill store checks the role of the user for the scope of each write (Section 9.2), and every
 write is a version that can be reverted. ``change_propose`` is here because it only stores a
-proposal: a person with the role decides it on an approval card (M3.2). ``connection_request``
+proposal: a person with the role decides it on an approval card (M3.2). ``plan_propose`` only
+stores a plan that a person approves, edits, or rejects (Section 15.5). ``connection_request``
 only sends a link, and the agent cannot give credentials with it (Section 10.3).
 The ``delegation`` and ``tasks`` tools are here because they write only sama state of the same
 workspace and audience, and each child run or task run passes the gate again for every tool
@@ -224,6 +228,7 @@ class GateStep(StrEnum):
     TOOLSET = "toolset"
     HARDLINE = "hardline"
     RECORDED = "recorded"
+    PLAN = "plan"
     POLICY = "policy"
     CONTEXT = "context"
 
@@ -344,6 +349,9 @@ class GateContext:
     """The tools of each toolset. The default is the fixed table."""
     access: Mapping[str, ToolAccess] = field(default_factory=dict)
     """What each deferred tool does, for its default policy (``ToolsetSource.access``)."""
+    plan_mode: bool = False
+    """The session is in plan mode (Section 15.5): the tools that change files or data get
+    ``deny`` (``sama.gate.plan``)."""
     frozen_rules: tuple[PolicyRule, ...] | None = None
     """``rules`` with the profile rules of the session snapshot in place of the profile rules
     of now (Section 11.4), or ``None`` for a session without a snapshot. The policy step uses
@@ -484,6 +492,8 @@ def decide(
     problem = hardline_problem(name, arguments)
     if problem is not None:
         return Verdict("deny", GateStep.HARDLINE, f"the command is on the hardline list: {problem}")
+    if context.plan_mode and not plan_mode_allows(name, arguments, context.access.get(name)):
+        return Verdict("deny", GateStep.PLAN, PLAN_MODE_REASON)
     return _after_hardline(context, name, arguments_digest(arguments), arguments, escalate)
 
 
@@ -513,7 +523,8 @@ def _decide_wrapped(
 
 def decide_recorded(context: GateContext, tool_name: str, digest: str) -> Verdict:
     """The verdict again for a call that a human decided, before the run resumes. It has
-    all the steps of ``decide`` except the hardline step. That step ran at the first check of
+    all the steps of ``decide`` except the hardline step and the plan mode step. A person
+    approved this exact call, so plan mode does not stop it. That step ran at the first check of
     the call, and its result depends only on the tool name and the arguments. The arguments
     are not known here, so a pre-approval with argument limits does not apply."""
     name = canonical_name(tool_name)

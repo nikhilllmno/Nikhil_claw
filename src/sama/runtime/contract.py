@@ -463,6 +463,21 @@ class ToolCallStarted(_Event):
     arguments: FrozenJsonObject = Field(default_factory=dict, validate_default=True)
 
 
+PREVIEW_CHARS: Final = 2_000
+"""The longest ``ToolCallFinished.output_preview``."""
+
+
+def output_preview(text: str, limit: int = PREVIEW_CHARS) -> str:
+    """The preview of a tool output: the whole text, or for a long text its start and its end
+    with a marker between them. The end of a test run has its result line (Section 15.5)."""
+    if len(text) <= limit:
+        return text
+    marker = f"\n[... {len(text) - limit} characters cut ...]\n"
+    head = (limit - len(marker)) // 2
+    tail = limit - len(marker) - head
+    return text[:head] + marker + text[len(text) - tail :]
+
+
 class ToolCallFinished(_Event):
     type: Literal["tool_call_finished"] = "tool_call_finished"
     call_id: str = Field(min_length=1)

@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import ENDED_RUN_STATUSES, AuditEntry, Run, Session
 from sama.sandbox.base import Sandbox, SandboxError
+from sama.vault.redact import redact
 
 log: Final = logging.getLogger("sama.orchestrator.checkpoints")
 
@@ -57,6 +58,8 @@ class CheckpointView:
     """The tool call that came after the checkpoint, or ``rollback``."""
     kind: str
     """``tool``: before a tool call. ``rollback``: the files before a restore."""
+    commit: str = ""
+    """The id of the checkpoint. It does not change when newer checkpoints come."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,29 @@ class RestoreView:
     deleted: int
     kept: int = 0
     """Large or excluded items that the restore did not replace (Section 15.3)."""
+
+
+@dataclass(frozen=True, slots=True)
+class FileDiffView:
+    path: str
+    old_path: str | None
+    status: str
+    additions: int | None
+    deletions: int | None
+    binary: bool
+    patch: str
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiffView:
+    """The changes from checkpoint ``base`` to checkpoint ``head``, or to the current files
+    when ``head`` is None (Section 15.5)."""
+
+    base: CheckpointView
+    head: CheckpointView | None
+    files: list[FileDiffView]
+    truncated: bool
 
 
 class CheckpointService:
@@ -90,15 +116,52 @@ class CheckpointService:
         result = await self._run(org_id, session_id, ["list", "--limit", str(limit)])
         if result is None:
             return []
-        return [
-            CheckpointView(
-                number=int(item["number"]),
-                created_at=_time(item["created_at"]),
-                tool=str(item.get("tool", "")),
-                kind=str(item.get("kind", "tool")),
+        return [_view(item) for item in result.get("checkpoints", [])]
+
+    async def diff(
+        self, *, org_id: uuid.UUID, session_id: uuid.UUID, base: int | None, head: int | None
+    ) -> DiffView:
+        """The file changes from checkpoint ``base`` (None: the oldest) to checkpoint ``head``
+        (None: the current files). It only reads, so it does not lock the session."""
+        args = ["diff", "--base", "oldest" if base is None else str(base)]
+        if head is not None:
+            args += ["--head", str(head)]
+        result = await self._run(org_id, session_id, args)
+        if result is None:
+            raise CheckpointServiceError(NO_CHECKPOINTS)
+        found: dict[str, Any] = result["diff"]
+        return DiffView(
+            base=_view(found["base"]),
+            head=None if found.get("head") is None else _view(found["head"]),
+            files=[
+                FileDiffView(
+                    path=str(item["path"]),
+                    old_path=None if item.get("old_path") is None else str(item["old_path"]),
+                    status=str(item.get("status", "modified")),
+                    additions=_count(item.get("additions")),
+                    deletions=_count(item.get("deletions")),
+                    binary=bool(item.get("binary")),
+                    patch=redact(str(item.get("patch", ""))),
+                    truncated=bool(item.get("truncated")),
+                )
+                for item in found.get("files", [])
+            ],
+            truncated=bool(found.get("truncated")),
+        )
+
+    async def snapshot(
+        self, *, org_id: uuid.UUID, session_id: uuid.UUID, run_id: str, tool: str
+    ) -> bool:
+        """Takes a checkpoint of the session files for a run that does not pass the gate of
+        the runner, for example a coding agent CLI (Section 15.5). True when it made a new
+        checkpoint. A failure only logs: it never stops the run."""
+        try:
+            result = await self._run(
+                org_id, session_id, ["snapshot", "--run", run_id, "--tool", tool]
             )
-            for item in result.get("checkpoints", [])
-        ]
+        except CheckpointServiceError:
+            return False
+        return bool(result and result.get("commit"))
 
     async def undo(
         self, *, org_id: uuid.UUID, user_id: uuid.UUID | None, session_id: uuid.UUID
@@ -107,12 +170,19 @@ class CheckpointService:
         return await self._restore(org_id, user_id, session_id, None)
 
     async def rollback(
-        self, *, org_id: uuid.UUID, user_id: uuid.UUID | None, session_id: uuid.UUID, number: int
+        self,
+        *,
+        org_id: uuid.UUID,
+        user_id: uuid.UUID | None,
+        session_id: uuid.UUID,
+        number: int,
+        commit: str | None = None,
     ) -> RestoreView:
-        """Restores checkpoint ``number`` of ``list``."""
+        """Restores checkpoint ``number`` of ``list``. With ``commit``, only when checkpoint
+        ``number`` is still that commit."""
         if number < 1:
             raise CheckpointServiceError("The checkpoint number must be 1 or more.")
-        return await self._restore(org_id, user_id, session_id, number)
+        return await self._restore(org_id, user_id, session_id, number, commit)
 
     async def _restore(
         self,
@@ -120,6 +190,7 @@ class CheckpointService:
         user_id: uuid.UUID | None,
         session_id: uuid.UUID,
         number: int | None,
+        commit: str | None = None,
     ) -> RestoreView:
         """Runs a restore with the session row locked (``FOR UPDATE``) for the whole command.
 
@@ -129,6 +200,8 @@ class CheckpointService:
         this session during the restore waits for the row with the rate lock held, so the new
         runs of the org wait until the restore ends (about 1 second; Section 15.3)."""
         args = ["undo"] if number is None else ["restore", "--number", str(number)]
+        if number is not None and commit:
+            args += ["--commit", commit]
         async with self._engine.begin() as connection:
             workspace_id = await self._reserve(connection, org_id, session_id)
             result = await self._run(org_id, session_id, args)
@@ -223,6 +296,20 @@ class CheckpointService:
         if not result["ok"]:
             raise CheckpointServiceError(str(result.get("error") or UNAVAILABLE))
         return result
+
+
+def _view(item: dict[str, Any]) -> CheckpointView:
+    return CheckpointView(
+        number=int(item["number"]),
+        created_at=_time(item["created_at"]),
+        tool=str(item.get("tool", "")),
+        kind=str(item.get("kind", "tool")),
+        commit=str(item.get("commit", "")),
+    )
+
+
+def _count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _time(value: Any) -> datetime:

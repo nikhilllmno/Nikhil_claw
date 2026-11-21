@@ -64,6 +64,48 @@ def claude(argv: list[str]) -> int:
     if mode == "hang":
         time.sleep(120)
         return 0
+    if "--permission-mode" in argv and argv[argv.index("--permission-mode") + 1] == "plan":
+        # Plan mode: read only, then ExitPlanMode with the plan. No file changes.
+        _say(
+            {
+                "type": "assistant",
+                "parent_tool_use_id": None,
+                "session_id": session,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_plan",
+                            "name": "ExitPlanMode",
+                            "input": {"plan": "1. Edit change.txt\n2. Run the tests"},
+                        }
+                    ]
+                },
+            }
+        )
+        if mode == "plan_error":
+            _say(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": "API Error: 402 budget_exceeded",
+                    "session_id": session,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            )
+            return 1
+        _say(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "The plan is ready.",
+                "session_id": session,
+                "usage": {"input_tokens": 5, "output_tokens": 5},
+            }
+        )
+        return 0
     _say(
         {
             "type": "assistant",

@@ -59,6 +59,14 @@ class CliUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class CliPlan:
+    """The plan of Claude Code in its plan mode: the input of its ``ExitPlanMode`` tool
+    (coding mode, Section 15.5). Redacted."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class CliResult:
     """The end of the turn. ``text`` is the last answer of the agent."""
 
@@ -67,7 +75,7 @@ class CliResult:
     message: str = ""
 
 
-CliEvent = CliSession | CliText | CliToolStart | CliToolEnd | CliUsage | CliResult
+CliEvent = CliSession | CliText | CliToolStart | CliToolEnd | CliUsage | CliPlan | CliResult
 
 
 def _short(value: Any, limit: int = PREVIEW_CHARS) -> str:
@@ -95,6 +103,18 @@ def _load(line: str) -> dict[str, Any] | None:
     except ValueError:
         return None
     return value if isinstance(value, dict) else None
+
+
+PLAN_TOOL: Final = "ExitPlanMode"
+"""The tool of Claude Code that ends its plan mode. Its input ``plan`` is the plan."""
+MAX_PLAN_CHARS: Final = 20_000
+
+
+def _plan_text(name: str, data: Any) -> str:
+    if name != PLAN_TOOL or not isinstance(data, dict):
+        return ""
+    plan = data.get("plan")
+    return redact(plan.strip())[:MAX_PLAN_CHARS] if isinstance(plan, str) else ""
 
 
 def _tool_summary(name: str, arguments: Any) -> str:
@@ -155,6 +175,9 @@ class ClaudeStream:
                         events.append(
                             CliToolStart(call_id, name, _tool_summary(name, block.get("input")))
                         )
+                        plan = _plan_text(name, block.get("input"))
+                        if plan:
+                            events.append(CliPlan(plan))
         elif kind == "user":
             message = data.get("message") or {}
             content = message.get("content") if isinstance(message, dict) else None

@@ -335,19 +335,91 @@ describe("checkpoints", () => {
     const restored = { created_at: "2026-11-21T09:30:00Z", files: 2, deleted: 1, kept: 0, text: "back" };
     const fetcher = vi
       .fn()
-      .mockResolvedValueOnce(json(200, [{ number: 1, created_at: "2026-11-21T09:30:00Z", tool: "Bash", kind: "tool" }]))
+      .mockResolvedValueOnce(json(200, [{ number: 1, commit: "a".repeat(40), created_at: "2026-11-21T09:30:00Z", tool: "Bash", kind: "tool" }]))
+      .mockResolvedValueOnce(json(200, restored))
       .mockResolvedValueOnce(json(200, restored))
       .mockResolvedValueOnce(json(200, restored));
     const client = new ApiClient("https://api.test", tokens(), fetcher);
     await expect(client.listCheckpoints("s1")).resolves.toHaveLength(1);
     await expect(client.undo("s1")).resolves.toEqual(restored);
     await expect(client.rollback("s1", 2)).resolves.toEqual(restored);
+    await expect(client.rollback("s1", 2, "a".repeat(40))).resolves.toEqual(restored);
     const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
     expect(calls.map(([url, init]) => [url, init.method ?? "GET", init.body])).toEqual([
       ["https://api.test/sessions/s1/checkpoints", "GET", undefined],
       ["https://api.test/sessions/s1/undo", "POST", undefined],
       ["https://api.test/sessions/s1/rollback", "POST", '{"number":2}'],
+      ["https://api.test/sessions/s1/rollback", "POST", `{"number":2,"commit":"${"a".repeat(40)}"}`],
     ]);
+  });
+});
+
+describe("coding mode", () => {
+  it("calls every coding route with the contract method, path, and body", async () => {
+    const plan = { id: "p1", version: 1, status: "approved" };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, { plan_mode: false, repos: [], plan: null }))
+      .mockResolvedValueOnce(json(200, []))
+      .mockResolvedValueOnce(json(201, { id: "r1" }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(json(200, { plan_mode: true }))
+      .mockResolvedValueOnce(json(202, { run_id: "run1", queued: false }))
+      .mockResolvedValueOnce(json(202, { run_id: "run2", queued: false, plan }))
+      .mockResolvedValueOnce(json(202, { run_id: "run3", queued: false, plan }))
+      .mockResolvedValueOnce(json(200, { run_id: null, queued: false, plan }))
+      .mockResolvedValueOnce(json(200, { run_id: "run4", queued: false, plan }))
+      .mockResolvedValueOnce(json(200, { base: {}, head: null, files: [], truncated: false }))
+      .mockResolvedValueOnce(json(200, { base: {}, head: {}, files: [], truncated: false }))
+      .mockResolvedValueOnce(json(200, []))
+      .mockResolvedValueOnce(json(200, []))
+      .mockResolvedValueOnce(json(200, []))
+      .mockResolvedValueOnce(json(202, { run_id: "run5", queued: true }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.getCoding("s1");
+    await client.listPlans("s1");
+    await client.attachRepo("s1", { repo: "o/n", ref: "main" });
+    await expect(client.detachRepo("s1", "r1")).resolves.toBeNull();
+    await client.setPlanMode("s1", true);
+    await client.startPlan("s1", "fix it");
+    await client.approvePlan("s1", "p1");
+    await client.approvePlan("s1", "p1", "new text");
+    await client.rejectPlan("s1", "p1");
+    await client.rejectPlan("s1", "p1", "too big");
+    await client.getDiff("s1");
+    await client.getDiff("s1", 3, 2);
+    await client.listCommands("s1");
+    await client.listCommands("s1", true, 20);
+    await client.listPullRequests("s1");
+    await expect(client.requestPullRequest("s1", { title: "T", draft: true })).resolves.toEqual({
+      run_id: "run5",
+      queued: true,
+    });
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url.replace("https://api.test", ""), init.method ?? "GET", init.body])).toEqual([
+      ["/sessions/s1/coding", "GET", undefined],
+      ["/sessions/s1/plans?limit=10", "GET", undefined],
+      ["/sessions/s1/repos", "POST", '{"repo":"o/n","ref":"main"}'],
+      ["/sessions/s1/repos/r1", "DELETE", undefined],
+      ["/sessions/s1/plan-mode", "PUT", '{"on":true}'],
+      ["/sessions/s1/plan", "POST", '{"task":"fix it"}'],
+      ["/sessions/s1/plans/p1/approve", "POST", "{}"],
+      ["/sessions/s1/plans/p1/approve", "POST", '{"body":"new text"}'],
+      ["/sessions/s1/plans/p1/reject", "POST", "{}"],
+      ["/sessions/s1/plans/p1/reject", "POST", '{"feedback":"too big"}'],
+      ["/sessions/s1/diff?base=oldest", "GET", undefined],
+      ["/sessions/s1/diff?base=3&head=2", "GET", undefined],
+      ["/sessions/s1/commands?tests=false&limit=50", "GET", undefined],
+      ["/sessions/s1/commands?tests=true&limit=20", "GET", undefined],
+      ["/sessions/s1/pull-requests", "GET", undefined],
+      ["/sessions/s1/pull-requests", "POST", '{"title":"T","draft":true}'],
+    ]);
+  });
+
+  it("throws the detail of an error", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(json(409, { detail: "The session has no checkpoints." }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.getDiff("s1")).rejects.toThrow("The session has no checkpoints.");
   });
 });
 

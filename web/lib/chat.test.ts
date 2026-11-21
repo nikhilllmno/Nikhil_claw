@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   applyStreamEvent,
   checkpointListText,
-  codingProgressLine,
   hasPendingNote,
   initialLive,
   isPaused,
@@ -58,43 +57,20 @@ describe("applyStreamEvent", () => {
     expect(done.state.text).toEqual({});
   });
 
-  it("shows the progress of a coding agent as lines of the live text", () => {
-    const event = (seq: number, type: string, payload: Record<string, unknown>) => ({
+  it("keeps coding agent progress as sub-agent events, not as live text", () => {
+    const event = (seq: number, payload: Record<string, unknown>) => ({
       run_id: "r1",
       seq,
-      type,
+      type: "subagent_event",
       payload,
     });
-    let state = applyStreamEvent(initialLive, "run_event", event(1, "text_delta", { text: "Start" })).state;
-    state = applyStreamEvent(
-      state,
-      "run_event",
-      event(2, "subagent_event", { subagent: "claude_code", text: "edited  main.py\nand tests" }),
-    ).state;
-    state = applyStreamEvent(
-      state,
-      "run_event",
-      event(3, "subagent_event", { subagent: "codex", text: "ran pytest" }),
-    ).state;
-    expect(state.text.r1).toBe("Start\n\n> Claude Code: edited main.py and tests\n\n> Codex: ran pytest\n\n");
-  });
-
-  it("ignores native sub-agent events and the events of an ended run", () => {
-    const native = applyStreamEvent(initialLive, "run_event", {
-      run_id: "r1",
-      seq: 1,
-      type: "subagent_event",
-      payload: { subagent: "reviewer", text: "reading" },
-    });
-    expect(native.state).toBe(initialLive);
-    const ended = applyStreamEvent(initialLive, "runs", { runs: [run("r1", "completed")] }).state;
-    const late = applyStreamEvent(ended, "run_event", {
-      run_id: "r1",
-      seq: 2,
-      type: "subagent_event",
-      payload: { subagent: "codex", text: "ran pytest" },
-    });
-    expect(late.state.text).toEqual({});
+    let state = applyStreamEvent(initialLive, "run_event", event(1, { subagent: "claude_code", text: "edited main.py" })).state;
+    state = applyStreamEvent(state, "run_event", event(2, { subagent: "codex", text: "ran pytest" })).state;
+    expect(state.text).toEqual({});
+    expect(state.subagents.r1?.map((e) => [e.subagent, e.text])).toEqual([
+      ["claude_code", "edited main.py"],
+      ["codex", "ran pytest"],
+    ]);
   });
 
   it("clears the live text of a run at its terminal event", () => {
@@ -303,13 +279,6 @@ describe("parseCommand", () => {
     expect(parseCommand("/codex fix the tests")).toBeNull();
   });
 
-  it("gives the progress line of a coding agent only", () => {
-    expect(codingProgressLine({ subagent: "codex", text: "ran pytest" })).toBe("> Codex: ran pytest");
-    expect(codingProgressLine({ subagent: "codex", text: "  " })).toBeNull();
-    expect(codingProgressLine({ subagent: "toString", text: "x" })).toBeNull();
-    expect(codingProgressLine({ text: "x" })).toBeNull();
-  });
-
   it("reads the checkpoint commands", () => {
     expect(parseCommand(" /undo ")).toEqual({ kind: "undo" });
     expect(parseCommand("/rollback")).toEqual({ kind: "rollback", number: null, valid: true });
@@ -318,6 +287,19 @@ describe("parseCommand", () => {
     expect(parseCommand("/rollback 0")).toEqual({ kind: "rollback", number: null, valid: false });
     expect(parseCommand("/rollback 2 3")).toBeNull();
     expect(parseCommand("/undo it")).toBeNull();
+  });
+
+  it("reads the plan commands", () => {
+    expect(parseCommand("/plan")).toEqual({ kind: "plan", plan: { kind: "status" } });
+    expect(parseCommand("/plan fix the login bug")).toEqual({
+      kind: "plan",
+      plan: { kind: "start", task: "fix the login bug" },
+    });
+    expect(parseCommand(" /Plan APPROVE ")).toEqual({ kind: "plan", plan: { kind: "approve" } });
+    expect(parseCommand("/plan edit 1. test")).toEqual({ kind: "plan", plan: { kind: "edit", text: "1. test" } });
+    expect(parseCommand("/plan reject")).toEqual({ kind: "plan", plan: { kind: "reject", feedback: "" } });
+    expect(parseCommand("/plan on")).toEqual({ kind: "plan", plan: { kind: "mode", on: true } });
+    expect(parseCommand("/planet")).toBeNull();
   });
 
   it("treats other text as a normal message", () => {
@@ -344,8 +326,8 @@ describe("checkpointListText", () => {
   it("lists the checkpoints in UTC, newest first", () => {
     expect(
       checkpointListText([
-        { number: 1, created_at: "2026-11-21T09:30:12+00:00", tool: "", kind: "rollback" },
-        { number: 2, created_at: "2026-11-21T15:00:00+05:30", tool: "Bash", kind: "tool" },
+        { number: 1, commit: "a".repeat(40), created_at: "2026-11-21T09:30:12+00:00", tool: "", kind: "rollback" },
+        { number: 2, commit: "b".repeat(40), created_at: "2026-11-21T15:00:00+05:30", tool: "Bash", kind: "tool" },
       ]),
     ).toBe(
       [

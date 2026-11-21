@@ -10,9 +10,13 @@ import {
   type SteerNote,
   type StreamRun,
 } from "./api";
+import { type PlanCommand, parsePlanCommand } from "./coding";
+import { addSubagentEvent, parseSubagentEvent, type SubagentEvent } from "./subagentProgress";
 
 export interface ToolCall {
   callId: string;
+  /** The sequence number of the start event: the place of the call in the run. */
+  seq: number;
   name: string;
   arguments: Record<string, unknown>;
   /** `running` until the finish event arrives. */
@@ -27,6 +31,8 @@ export interface LiveState {
   text: Record<string, string>;
   /** The tool calls of each run, in order. */
   tools: Record<string, ToolCall[]>;
+  /** The `subagent_event` events of each run, in order. See `groupSubagents`. */
+  subagents: Record<string, SubagentEvent[]>;
   /** Failure text of a run that ended in this view and failed. */
   failure: string | null;
   /**
@@ -38,7 +44,7 @@ export interface LiveState {
 
 export type Effect = "reload_messages" | "reload_approvals" | "reload_questions";
 
-export const initialLive: LiveState = { runs: {}, text: {}, tools: {}, failure: null, stopped: {} };
+export const initialLive: LiveState = { runs: {}, text: {}, tools: {}, subagents: {}, failure: null, stopped: {} };
 
 export function openRunIds(state: LiveState): string[] {
   return Object.values(state.runs)
@@ -124,6 +130,7 @@ export function applyStreamEvent(
     case "tool_call_started": {
       const call: ToolCall = {
         callId: String(payload.call_id ?? `${event.run_id}:${event.seq}`),
+        seq: event.seq,
         name: String(payload.name ?? "tool"),
         arguments: (payload.arguments as Record<string, unknown> | undefined) ?? {},
         status: "running",
@@ -150,18 +157,12 @@ export function applyStreamEvent(
       return { state: { ...state, tools: { ...state.tools, [event.run_id]: tools } }, effects };
     }
     case "subagent_event": {
-      // The progress of a coding agent (M7.2). Native sub-agents show nothing here.
-      const line = codingProgressLine(payload);
-      const known = state.runs[event.run_id];
-      if (line === null || (known !== undefined && !OPEN_RUN_STATUSES.has(known.status))) {
-        return { state, effects };
-      }
-      const before = state.text[event.run_id] ?? "";
-      const gap = before === "" || before.endsWith("\n\n") ? "" : before.endsWith("\n") ? "\n" : "\n\n";
-      return {
-        state: { ...state, text: { ...state.text, [event.run_id]: `${before}${gap}${line}\n\n` } },
-        effects,
-      };
+      const parsed = parseSubagentEvent(event.seq, payload);
+      if (parsed === null) return { state, effects };
+      const known = state.subagents[event.run_id] ?? [];
+      const events = addSubagentEvent(known, parsed);
+      if (events === known) return { state, effects };
+      return { state: { ...state, subagents: { ...state.subagents, [event.run_id]: events } }, effects };
     }
     case "approval_required":
       effects.push("reload_approvals");
@@ -197,14 +198,6 @@ export type HandoffChannel = (typeof HANDOFF_CHANNELS)[number];
 export const CODING_AGENTS = { claude_code: "Claude Code", codex: "Codex" } as const;
 export type CodingAgent = keyof typeof CODING_AGENTS;
 
-/** The progress line of a coding agent event, or `null` for any other sub-agent event. */
-export function codingProgressLine(payload: Record<string, unknown>): string | null {
-  const agent = payload.subagent;
-  if (typeof agent !== "string" || !Object.hasOwn(CODING_AGENTS, agent)) return null;
-  const text = typeof payload.text === "string" ? payload.text.split(/\s+/).filter(Boolean).join(" ") : "";
-  return text ? `> ${CODING_AGENTS[agent as CodingAgent]}: ${text}` : null;
-}
-
 /** A busy control or a context command of the composer (M3.9). */
 export type ChatCommand =
   | { kind: "compact"; focus: string }
@@ -213,6 +206,7 @@ export type ChatCommand =
   | { kind: "coding"; agent: CodingAgent | null }
   | { kind: "undo" }
   | { kind: "rollback"; number: number | null; valid: boolean }
+  | { kind: "plan"; plan: PlanCommand }
   | { kind: "bg"; task: string }
   | { kind: "stop"; number: number | null; valid: boolean };
 
@@ -249,6 +243,8 @@ export function parseCommand(text: string): ChatCommand | null {
     const valid = /^[1-9]\d{0,5}$/.test(value);
     return { kind: "rollback", number: valid ? Number(value) : null, valid };
   }
+  const plan = parsePlanCommand(trimmed);
+  if (plan !== null) return { kind: "plan", plan };
   const bg = /^\/bg(?:\s+([\s\S]*))?$/i.exec(trimmed);
   if (bg) return { kind: "bg", task: (bg[1] ?? "").trim() };
   const stop = /^\/stop(?:\s+(all|\d+))?\s*$/i.exec(trimmed);

@@ -75,6 +75,7 @@ const STEP_TITLES: Record<string, string> = {
   run_started: "Run started",
   run_completed: "Run completed",
   run_failed: "Run failed",
+  subagent_event: "Sub-agent step",
 };
 
 /** The title of a trace step. */
@@ -93,6 +94,8 @@ export function stepSummary(step: TraceStep): string {
       return text(p.name) || text(p.tool_name);
     case "tool_call_finished":
       return `${text(p.name) || text(p.call_id)}${p.is_error === true ? " (error)" : ""}`;
+    case "subagent_event":
+      return [text(p.subagent), text(p.text)].filter(Boolean).join(": ");
     case "run_failed":
       return [text(p.code), text(p.message)].filter(Boolean).join(": ");
     default:

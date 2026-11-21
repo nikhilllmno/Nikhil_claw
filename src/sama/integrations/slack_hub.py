@@ -39,6 +39,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.coding_mode.service import CodingService
 from sama.connectors.service import ConnectionService
 from sama.db.models import Integration
 from sama.gate.service import GateService
@@ -92,6 +93,7 @@ class SlackHub(GatewayCache[_App]):
         jobs: JobService | None = None,
         handoffs: Handoffs | None = None,
         checkpoints: CheckpointService | None = None,
+        coding_mode: CodingService | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__()
@@ -107,6 +109,7 @@ class SlackHub(GatewayCache[_App]):
         self._jobs = jobs
         self._handoffs = handoffs
         self._checkpoints = checkpoints
+        self._coding_mode = coding_mode
         self._clock = clock
         self._lockout = Lockout()
         self._followers: set[object] = set()
@@ -270,6 +273,7 @@ class SlackHub(GatewayCache[_App]):
             jobs=self._jobs,
             handoffs=self._handoffs,
             checkpoints=self._checkpoints,
+            coding_mode=self._coding_mode,
             lockout=self._lockout,
             followers=self._followers,
             seen=self._seen,

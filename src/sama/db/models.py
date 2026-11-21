@@ -685,6 +685,9 @@ class Session(Base):
     coding_agent: Mapped[str | None] = mapped_column(Text)
     """The direct mode (Section 15.4): each chat run of the session goes to this coding agent
     (``claude_code`` or ``codex``) until ``/sama``. Null: the runtime of the session."""
+    plan_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """Plan mode of coding mode (Section 15.5, M7.9). While it is on, the gate refuses the
+    tools that change files, and the agent proposes a plan with ``plan_propose``."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -3323,3 +3326,96 @@ class SkillSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+SESSION_REPO_STATUSES: Final = ("pending", "ready", "failed")
+MAX_SESSION_REPOS: Final = 5
+PLAN_STATUSES: Final = ("proposed", "approved", "rejected", "superseded")
+MAX_PLAN_CHARS: Final = 20_000
+MAX_PLAN_FEEDBACK_CHARS: Final = 4_000
+
+
+class SessionRepo(Base):
+    """A repository that is attached to a session in coding mode (docs/architecture.md,
+    Section 15.5, M7.9). A ``pending`` repository clones into the session sandbox when the next
+    run of the session starts. Members read the rows of the sessions that they can see. Only
+    the control plane writes the table."""
+
+    __tablename__ = "session_repos"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("session_id", "folder"),
+        CheckConstraint(_one_of("status", SESSION_REPO_STATUSES), name="status"),
+        CheckConstraint("(status = 'failed') = (error IS NOT NULL)", name="failed_has_error"),
+        CheckConstraint("status <> 'ready' OR commit IS NOT NULL", name="ready_has_commit"),
+        Index(None, "org_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    owner: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    ref: Mapped[str | None] = mapped_column(Text)
+    """The branch or tag to clone. ``None`` is the default branch."""
+    folder: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    path: Mapped[str | None] = mapped_column(Text)
+    proxied: Mapped[bool | None] = mapped_column(Boolean)
+    """True when the clone uses the sama git proxy, so the agent can push ``sama/*`` branches."""
+    commit: Mapped[str | None] = mapped_column(Text)
+    branch: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class SessionPlan(Base):
+    """A plan that the agent proposed in plan mode (docs/architecture.md, Section 15.5, M7.9).
+    A person approves it (also with an edited text) or rejects it. A new plan of the session
+    supersedes the open one. Members read the rows of the sessions that they can see. Only the
+    control plane writes the table."""
+
+    __tablename__ = "session_plans"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "decided_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("session_id", "version"),
+        CheckConstraint(_one_of("status", PLAN_STATUSES), name="status"),
+        CheckConstraint(f"char_length(body) BETWEEN 1 AND {MAX_PLAN_CHARS}", name="body_length"),
+        CheckConstraint(
+            f"char_length(proposed_body) BETWEEN 1 AND {MAX_PLAN_CHARS}",
+            name="proposed_body_length",
+        ),
+        CheckConstraint(
+            f"feedback IS NULL OR char_length(feedback) <= {MAX_PLAN_FEEDBACK_CHARS}",
+            name="feedback_length",
+        ),
+        CheckConstraint(
+            "(status IN ('approved', 'rejected')) = (decided_at IS NOT NULL)", name="decided"
+        ),
+        Index(None, "org_id", "session_id", "version"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The run that proposed the plan. A plain column, not a foreign key: a plan stays when a
+    retention purge removes old runs."""
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    """The plan: the text of the agent, or the edited text of an approve."""
+    proposed_body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="proposed")
+    edited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    feedback: Mapped[str | None] = mapped_column(Text)
+    decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()

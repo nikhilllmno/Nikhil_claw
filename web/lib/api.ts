@@ -424,6 +424,8 @@ export interface Handoff {
 /** A checkpoint of the session files (`GET /sessions/{id}/checkpoints`). */
 export interface CheckpointItem {
   number: number;
+  /** A stable id of the checkpoint (40 to 64 hex characters). The number can shift. */
+  commit: string;
   created_at: string;
   tool: string;
   kind: string;
@@ -444,6 +446,158 @@ export interface Restored {
 export interface CodingAgentAnswer {
   /** The answer for the user. */
   text: string;
+}
+
+/** A repo that is attached to a session (M7.9). */
+export interface RepoOut {
+  id: string;
+  /** `owner/name`. */
+  repo: string;
+  url: string;
+  /** The branch or tag the user asked for. `null`: the default branch. */
+  ref: string | null;
+  folder: string;
+  /** Set when the status is `ready`. */
+  path: string | null;
+  /** A `pending` repo clones into the sandbox when the next run starts. */
+  status: "pending" | "ready" | "failed";
+  /** True: the repo clones through the sama git proxy and can push `sama/*` branches. */
+  proxied: boolean | null;
+  commit: string | null;
+  branch: string | null;
+  /** Set when the status is `failed`. */
+  error: string | null;
+  created_at: string;
+}
+
+export type PlanStatus = "proposed" | "approved" | "rejected" | "superseded";
+
+/** A plan that the agent proposed in plan mode (M7.9). */
+export interface PlanOut {
+  id: string;
+  version: number;
+  /** The text of the plan, as Markdown. After an edit, this is the edited text. */
+  body: string;
+  /** The text that the agent proposed. */
+  proposed_body: string;
+  status: PlanStatus;
+  edited: boolean;
+  /** The text of a reject. */
+  feedback: string | null;
+  run_id: string | null;
+  decided_at: string | null;
+  created_at: string;
+}
+
+/** The answer of `GET /sessions/{id}/coding`. */
+export interface CodingOut {
+  plan_mode: boolean;
+  repos: RepoOut[];
+  /** The newest plan of the session. */
+  plan: PlanOut | null;
+}
+
+/** The body of `POST /sessions/{id}/repos`. */
+export interface NewRepo {
+  /** A GitHub URL or `owner/name`. */
+  repo: string;
+  ref?: string;
+  folder?: string;
+}
+
+/** The answer of the plan routes that start a run. */
+export interface PlanRun {
+  run_id: string;
+  queued: boolean;
+}
+
+/** The answer of `POST /sessions/{id}/plans/{plan_id}/approve`. */
+export interface PlanApproved extends PlanRun {
+  plan: PlanOut;
+}
+
+/** The answer of `POST /sessions/{id}/plans/{plan_id}/reject`. Without feedback, no run starts. */
+export interface PlanRejected {
+  run_id: string | null;
+  queued: boolean;
+  plan: PlanOut;
+}
+
+/** A checkpoint that a diff starts or ends at. */
+export interface DiffPoint {
+  number: number;
+  /** A stable id of the checkpoint (40 to 64 hex characters). */
+  commit: string;
+  created_at: string;
+  tool: string;
+  kind: string;
+}
+
+export type FileStatus = "added" | "modified" | "deleted" | "renamed" | "type_changed";
+
+/** One changed file of a diff. */
+export interface DiffFile {
+  path: string;
+  old_path: string | null;
+  status: FileStatus;
+  /** `null` for a binary file. */
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean;
+  /** The unified diff of the file. It starts with `diff --git`. */
+  patch: string;
+  /** The API cut the patch of this file. */
+  truncated: boolean;
+}
+
+/** The answer of `GET /sessions/{id}/diff`. */
+export interface DiffOut {
+  base: DiffPoint;
+  /** `null`: the current files. */
+  head: DiffPoint | null;
+  files: DiffFile[];
+  /** The API cut the list of files or the total text. */
+  truncated: boolean;
+}
+
+/** A command or test run of the agent (`GET /sessions/{id}/commands`). */
+export interface CommandOut {
+  run_id: string;
+  call_id: string;
+  tool: string;
+  command: string;
+  /** True when sama thinks the command runs tests. */
+  test: boolean;
+  status: "running" | "ok" | "failed";
+  /** The end of the output (at most 4,000 characters). */
+  output: string;
+  /** A result line that sama found in the output. */
+  summary: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+/** A pull request of the agent (`GET /sessions/{id}/pull-requests`). */
+export interface PullRequestOut {
+  run_id: string;
+  call_id: string;
+  repo: string | null;
+  title: string | null;
+  head: string | null;
+  base: string | null;
+  url: string | null;
+  status: "running" | "opened" | "failed";
+  /** The tool result or the error (at most 2,000 characters). */
+  output: string;
+  created_at: string;
+}
+
+/** The body of `POST /sessions/{id}/pull-requests`. */
+export interface NewPullRequest {
+  repo?: string;
+  title?: string;
+  base?: string;
+  draft?: boolean;
 }
 
 export interface Approval {
@@ -1974,8 +2128,52 @@ export class ApiClient {
     this.json<CodingAgentAnswer>(`/sessions/${id}/coding-agent`, { method: "POST", body: { agent } });
   listCheckpoints = (id: string) => this.json<CheckpointItem[]>(`/sessions/${id}/checkpoints`);
   undo = (id: string) => this.json<Restored>(`/sessions/${id}/undo`, { method: "POST" });
-  rollback = (id: string, number: number) =>
-    this.json<Restored>(`/sessions/${id}/rollback`, { method: "POST", body: { number } });
+  /**
+   * Restores a checkpoint. With `commit`, the API restores only if checkpoint `number` is still
+   * that commit. Else it answers 409 and changes nothing.
+   */
+  rollback = (id: string, number: number, commit?: string) =>
+    this.json<Restored>(`/sessions/${id}/rollback`, {
+      method: "POST",
+      body: commit === undefined ? { number } : { number, commit },
+    });
+  /** The state of coding mode: plan mode, the repos, and the newest plan (M7.9). */
+  getCoding = (id: string) => this.json<CodingOut>(`/sessions/${id}/coding`);
+  /** The plans of a session, newest first. */
+  listPlans = (id: string, limit = 10) =>
+    this.json<PlanOut[]>(`/sessions/${id}/plans${query({ limit })}`);
+  attachRepo = (id: string, body: NewRepo) =>
+    this.json<RepoOut>(`/sessions/${id}/repos`, { method: "POST", body });
+  detachRepo = (id: string, repoId: string) =>
+    this.json<null>(`/sessions/${id}/repos/${encodeURIComponent(repoId)}`, { method: "DELETE" });
+  setPlanMode = (id: string, on: boolean) =>
+    this.json<{ plan_mode: boolean }>(`/sessions/${id}/plan-mode`, { method: "PUT", body: { on } });
+  /** Turns plan mode on and sends the task as a message. */
+  startPlan = (id: string, task: string) =>
+    this.json<PlanRun>(`/sessions/${id}/plan`, { method: "POST", body: { task } });
+  /** Approves a proposed plan. With `body`, the agent gets that text in place of the plan. */
+  approvePlan = (id: string, planId: string, body?: string) =>
+    this.json<PlanApproved>(`/sessions/${id}/plans/${encodeURIComponent(planId)}/approve`, {
+      method: "POST",
+      body: body === undefined ? {} : { body },
+    });
+  rejectPlan = (id: string, planId: string, feedback?: string) =>
+    this.json<PlanRejected>(`/sessions/${id}/plans/${encodeURIComponent(planId)}/reject`, {
+      method: "POST",
+      body: feedback ? { feedback } : {},
+    });
+  /**
+   * The file changes between two checkpoints. `base`: a checkpoint number or `oldest`. `head`:
+   * a checkpoint number, or `null` for the current files.
+   */
+  getDiff = (id: string, base: number | "oldest" = "oldest", head: number | null = null) =>
+    this.json<DiffOut>(`/sessions/${id}/diff${query({ base, head })}`);
+  listCommands = (id: string, tests = false, limit = 50) =>
+    this.json<CommandOut[]>(`/sessions/${id}/commands${query({ tests: String(tests), limit })}`);
+  listPullRequests = (id: string) => this.json<PullRequestOut[]>(`/sessions/${id}/pull-requests`);
+  /** Asks the agent to open a pull request. A person approves the `pr_create` call. */
+  requestPullRequest = (id: string, body: NewPullRequest) =>
+    this.json<PlanRun>(`/sessions/${id}/pull-requests`, { method: "POST", body });
   compact = (id: string, focus: string) =>
     this.json<{ run_id: string }>(`/sessions/${id}/compact`, { method: "POST", body: { focus } });
   cancelRun = (runId: string) => this.json<{ status: string }>(`/runs/${runId}/cancel`, { method: "POST" });

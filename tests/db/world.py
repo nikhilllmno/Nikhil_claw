@@ -67,6 +67,8 @@ from sama.db.models import (
     SessionBinding,
     SessionCompaction,
     SessionHandoff,
+    SessionPlan,
+    SessionRepo,
     SessionTodo,
     SkillSettings,
     StoredContextFile,
@@ -416,6 +418,23 @@ def plan(
             from_channel="telegram",
             from_key=f"telegram:{ids[session]}",
             to_channel="web",
+        )
+        add(
+            SessionRepo,
+            org_id=org_id,
+            session_id=ids[session],
+            owner="octo",
+            name=f"repo-{session}",
+            folder="app",
+        )
+        add(
+            SessionPlan,
+            org_id=org_id,
+            session_id=ids[session],
+            run_id=run_id,
+            version=1,
+            body=f"plan of {session}",
+            proposed_body=f"plan of {session}",
         )
     # One job for each owner, with a fire and a delivery. A job is private to its owner.
     for user, org, workspace, profile in (

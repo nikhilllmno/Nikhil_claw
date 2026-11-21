@@ -50,6 +50,7 @@
   --console-nav-width: 13rem;
   --touch-target: 2.5rem;
   --field-basis: 14rem;
+  --preview-basis: 8rem;
   --editor-min-height: 16rem;
   --viewer-max-height: 24rem;
   --scroll-list-max: 20rem;
@@ -57,6 +58,7 @@
   --chart-height: 8rem;
   --chart-gap: 2px;
   --table-name-min: 8rem;
+  --diff-gutter: 3.25rem;
   --code-inline-padding: 0.1em 0.35em;
   --code-inline-size: 0.9em;
   --z-sticky: 10;

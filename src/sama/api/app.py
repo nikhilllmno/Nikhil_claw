@@ -66,6 +66,8 @@ from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.billing import router as billing_router
 from sama.api.browser import BrowserSettings, LoginChange, LoginIn, UrlPolicyIn
 from sama.api.chrome import ChromeChannel
+from sama.api.coding_mode import Access as CodingAccess
+from sama.api.coding_mode import router as coding_router
 from sama.api.custom_tools import router as custom_tools_router
 from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
 from sama.api.history import (
@@ -116,6 +118,7 @@ from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
 from sama.coding.agents import CodingAgent
 from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
+from sama.coding_mode.service import CodingService
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
@@ -354,6 +357,9 @@ class HandoffOut(BaseModel):
 class Rollback(_Body):
     number: int = Field(ge=1, le=MAX_HISTORY)
     """The number of a checkpoint in ``GET /sessions/{id}/checkpoints``. 1 is the newest."""
+    commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40,64}$")
+    """The ``commit`` of the checkpoint in the list. With it, the restore fails (``409``) when
+    the checkpoint ``number`` is another checkpoint now (Section 15.5)."""
 
 
 class CodingAgentBody(_Body):
@@ -372,6 +378,8 @@ class CheckpointOut(BaseModel):
     created_at: datetime
     tool: str
     kind: str
+    commit: str
+    """The id of the checkpoint. It does not change when newer checkpoints come."""
 
 
 class RestoreOut(BaseModel):
@@ -1187,6 +1195,7 @@ class SamaApi:
         billing: BillingService | None = None,
         browser: BrowserSettings | None = None,
         custom_tools: CustomToolService | None = None,
+        coding_mode: CodingService | None = None,
     ) -> None:
         """Without ``custom_tools``, the custom tool routes answer ``409``. Without
         ``integrations`` the integration routes answer ``409``. Without ``github``,
@@ -1201,8 +1210,10 @@ class SamaApi:
         ``settings.signup``. Without ``model_keys`` (no vault), the model key
         routes answer ``503``. Without ``billing``, billing is off: the billing pages show the
         plan and the quotas, and a purchase answers ``409``. Without ``browser``, the browser
-        settings routes answer ``409``."""
+        settings routes answer ``409``. Without ``coding_mode``, the coding mode routes that write
+        answer ``409`` (Section 15.5)."""
         self._engine = engine
+        self._coding_mode = coding_mode
         self._browser = browser
         self._api_keys = ApiKeyStore(engine)
         self._library = LibraryRoutes(SubagentLibrary(engine), self._can_manage_agents)
@@ -1345,6 +1356,11 @@ class SamaApi:
                 self._require_custom_tools, _principal, self._workspace_grants, self._tool_grants
             )
         )
+        app.include_router(
+            coding_router(
+                self._engine, self._coding_mode, self._checkpoints, _principal, self._coding_access
+            )
+        )
 
         @app.get("/me")
         async def me(principal: Me) -> dict[str, Any]:
@@ -1441,7 +1457,7 @@ class SamaApi:
 
         @app.post("/sessions/{session_id}/rollback")
         async def rollback(principal: Me, session_id: uuid.UUID, body: Rollback) -> RestoreOut:
-            return await self._restore(principal, session_id, body.number)
+            return await self._restore(principal, session_id, body.number, body.commit)
 
         @app.post("/sessions/{session_id}/compact", status_code=202)
         async def compact(
@@ -4253,7 +4269,11 @@ class SamaApi:
         return [CheckpointOut.model_validate(item, from_attributes=True) for item in listed]
 
     async def _restore(
-        self, principal: Principal, session_id: uuid.UUID, number: int | None
+        self,
+        principal: Principal,
+        session_id: uuid.UUID,
+        number: int | None,
+        commit: str | None = None,
     ) -> RestoreOut:
         """``POST /sessions/{id}/undo`` and ``/rollback`` (M6.4, Section 15.3)."""
         access = await self._access(principal, session_id)
@@ -4269,6 +4289,7 @@ class SamaApi:
                     user_id=access.user_id,
                     session_id=session_id,
                     number=number,
+                    commit=commit,
                 )
         except CheckpointServiceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
@@ -4279,6 +4300,10 @@ class SamaApi:
             kept=restored.kept,
             text=restored_text(restored, "/rollback"),
         )
+
+    async def _coding_access(self, principal: Principal, session_id: uuid.UUID) -> CodingAccess:
+        access = await self._access(principal, session_id)
+        return CodingAccess(org_id=access.org_id, user_id=access.user_id)
 
     async def _access(self, principal: Principal, session_id: uuid.UUID) -> SessionAccess:
         async with as_user(self._engine, principal.auth_user_id) as connection:

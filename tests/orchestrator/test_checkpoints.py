@@ -247,3 +247,32 @@ async def test_the_reply_of_a_chat(
     assert no_session == NO_CHECKPOINTS
     await RunQueue(engine).enqueue(org_id=tenant.org, session_id=session, text="hi", user_id=None)
     assert await reply("undo") == BUSY
+
+
+async def test_the_service_diffs_and_takes_a_snapshot(
+    engine: AsyncEngine, tenant: Tenant, sandbox: LocalSandbox
+) -> None:
+    """Coding mode (Section 15.5): the diff of the checkpoints, and one checkpoint for a run
+    that does not pass the gate of the runner (a coding agent CLI)."""
+    work = Path(sandbox.workdir)
+    service = CheckpointService(engine, _Sandboxes(sandbox), argv=ARGV)
+    org, session = tenant.org, tenant.ids["mine"]
+    with pytest.raises(CheckpointServiceError, match=NO_CHECKPOINTS):
+        await service.diff(org_id=org, session_id=session, base=None, head=None)
+    (work / "a.py").write_text("x = 1\n")
+    assert await service.snapshot(org_id=org, session_id=session, run_id="r1", tool="codex")
+    assert not await service.snapshot(org_id=org, session_id=session, run_id="r1", tool="codex")
+    (work / "a.py").write_text("x = 2\n")
+    found = await service.diff(org_id=org, session_id=session, base=None, head=None)
+    assert (found.base.number, found.base.tool, found.head) == (1, "codex", None)
+    (changed,) = found.files
+    assert (changed.path, changed.status, changed.additions, changed.deletions) == (
+        "a.py",
+        "modified",
+        1,
+        1,
+    )
+    with pytest.raises(CheckpointServiceError, match="no checkpoint 3"):
+        await service.diff(org_id=org, session_id=session, base=3, head=None)
+    gone = CheckpointService(engine, _Sandboxes(None), argv=ARGV)
+    assert not await gone.snapshot(org_id=org, session_id=session, run_id="r", tool="t")

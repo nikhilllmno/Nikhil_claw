@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Final, Protocol
 
 from sama.coding.agents import (
+    CODING_AGENT_PLAN,
     CODING_AGENT_RUN,
     MAX_TIMEOUT_S,
     CodingAgent,
@@ -35,7 +36,7 @@ from sama.coding.agents import (
     coding_model,
     label,
 )
-from sama.coding.events import CliEvent, CliText, CliToolEnd, CliToolStart, CliUsage
+from sama.coding.events import CliEvent, CliPlan, CliText, CliToolEnd, CliToolStart, CliUsage
 from sama.coding.service import (
     CodingOutcome,
     CodingRequest,
@@ -53,13 +54,14 @@ from sama.runtime.contract import (
     RunEvent,
     RunFailed,
     RunRequest,
+    RunScope,
     RuntimeKind,
     TextDelta,
     ToolCallFinished,
     ToolCallStarted,
     Usage,
 )
-from sama.sandbox.base import SandboxError
+from sama.sandbox.base import Sandbox, SandboxError
 from sama.tenancy.run_token import RunTokenClaims, RunTokenSigner
 from sama.tools.repos import RepoError, parse_repo
 
@@ -212,6 +214,41 @@ class _State:
         return json.dumps(data, sort_keys=True).encode()
 
 
+PLAN_SAVE_TIMEOUT_S: Final = 30.0
+"""The longest time to store the plan of a plan mode run."""
+
+
+@dataclass(frozen=True, slots=True)
+class CodingModePrep:
+    """What coding mode (Section 15.5) gives a run before the CLI starts."""
+
+    note: str = ""
+    """Text after the task: the attached repositories, and the plan mode rules."""
+    plan_mode: bool = False
+    plan_args: tuple[str, ...] = ()
+
+
+class CodingModeHooks(Protocol):
+    """Coding mode for the runtimes ``claude_code`` and ``codex`` (Section 15.5). The control
+    plane gives ``sama.coding_mode.harness.HarnessHooks``. A hook must not raise."""
+
+    async def planning(self, scope: RunScope) -> bool:
+        """True when the session of the run is in plan mode."""
+        ...
+
+    async def before(
+        self, sandbox: Sandbox, scope: RunScope, token: str, agent: str, plan: bool
+    ) -> CodingModePrep: ...
+
+    async def checkpoint(self, scope: RunScope, agent: str) -> None:
+        """Takes a checkpoint of the work folder before the CLI starts."""
+        ...
+
+    async def plan(self, scope: RunScope, text: str) -> str:
+        """Stores the plan of the run and returns a line for the user, or ""."""
+        ...
+
+
 class CodingAgentRuntime:
     """``AgentRuntime`` for ``claude_code`` and ``codex``. ``sandboxes`` gives the session
     sandbox and the run token, as for the other runtimes."""
@@ -224,6 +261,7 @@ class CodingAgentRuntime:
         signer: RunTokenSigner,
         service: CodingService,
         gate: CodingGate | None = None,
+        hooks: CodingModeHooks | None = None,
     ) -> None:
         agent = agent_for(kind)
         if agent is None:
@@ -234,7 +272,11 @@ class CodingAgentRuntime:
         self._signer = signer
         self._service = service
         self._gate = gate
+        self._hooks = hooks
         self._active: dict[str, asyncio.Task[CodingOutcome]] = {}
+        self._saving: dict[str, asyncio.Task[str]] = {}
+        """The plan save of a run in plan mode. A cancel stops it, so its transaction rolls
+        back."""
         self._cancelled: set[str] = set()
         self._used: set[str] = set()
 
@@ -256,13 +298,21 @@ class CodingAgentRuntime:
             signer=self._signer,
             service=self._service,
             gate=self._gate,
+            hooks=self._hooks,
         )
+
+    def set_hooks(self, hooks: CodingModeHooks | None) -> None:
+        """Sets coding mode (Section 15.5). The control plane builds it after the runtime."""
+        self._hooks = hooks
 
     async def cancel(self, run_id: str) -> None:
         self._cancelled.add(run_id)
         task = self._active.get(run_id)
         if task is not None:
             task.cancel()
+        saving = self._saving.get(run_id)
+        if saving is not None:
+            saving.cancel()
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         scope = request.scope
@@ -286,14 +336,18 @@ class CodingAgentRuntime:
         token = self._sandboxes.issue_token(scope, request.budget)
         claims = self._signer.verify(token)
         call_id = f"coding-{scope.run_id}"
+        # Plan mode (Section 15.5): the CLI starts in its plan mode, and the gate judges
+        # ``coding_agent_plan``, which plan mode does not block. No pull request.
+        planning = self._hooks is not None and await self._hooks.planning(scope)
+        tool = CODING_AGENT_PLAN if planning else CODING_AGENT_RUN
         arguments = {
             "agent": self._agent.value,
             "repo": parsed.repo or "",
             "prompt": parsed.prompt[:GATE_PROMPT_CHARS],
-            "open_pr": parsed.open_pr,
+            "open_pr": parsed.open_pr and not planning,
         }
         if self._gate is not None:
-            verdict = await self._gate.check(claims, call_id, CODING_AGENT_RUN, arguments)
+            verdict = await self._gate.check(claims, call_id, tool, arguments)
             if scope.run_id in self._cancelled:
                 # A cancel during the gate check: the CLI must not start.
                 yield RunFailed(code=FailureCode.CANCELLED, message="cancelled")
@@ -301,7 +355,7 @@ class CodingAgentRuntime:
             if verdict.action == "deny":
                 yield RunFailed(
                     code=FailureCode.TOOL_ERROR,
-                    message=f"The tool gate refused {CODING_AGENT_RUN}: {verdict.reason}",
+                    message=f"The tool gate refused {tool}: {verdict.reason}",
                     runtime_state=state.dump(),
                 )
                 return
@@ -311,17 +365,18 @@ class CodingAgentRuntime:
                     "prompt": parsed.prompt,
                     "repo": parsed.repo,
                     "open_pr": parsed.open_pr,
+                    "plan": planning,
                 }
                 yield ApprovalRequired(
                     approval_id=call_id,
                     call_id=call_id,
-                    tool_name=CODING_AGENT_RUN,
+                    tool_name=tool,
                     arguments=arguments,
                     reason=verdict.reason,
                     runtime_state=state.dump(),
                 )
                 return
-        async for event in self._execute(request, state, parsed, token, claims):
+        async for event in self._execute(request, state, parsed, token, claims, planning):
             yield event
 
     async def resume(self, request: ResumeRequest) -> AsyncIterator[RunEvent]:
@@ -359,7 +414,8 @@ class CodingAgentRuntime:
         run_request = RunRequest(
             scope=scope, input=parsed.prompt, config=request.config, budget=request.budget
         )
-        async for event in self._execute(run_request, state, parsed, token, claims):
+        planning = bool(pending.get("plan"))
+        async for event in self._execute(run_request, state, parsed, token, claims, planning):
             yield event
 
     async def _execute(
@@ -369,6 +425,7 @@ class CodingAgentRuntime:
         parsed: ParsedRequest,
         token: str,
         claims: RunTokenClaims,
+        planning: bool = False,
     ) -> AsyncIterator[RunEvent]:
         scope = request.scope
         run_id = scope.run_id
@@ -383,6 +440,18 @@ class CodingAgentRuntime:
         async def job() -> CodingOutcome:
             sandbox = await self._sandboxes.acquire(scope, request.budget)
             try:
+                prep = CodingModePrep(plan_mode=planning)
+                if self._hooks is not None:
+                    prep = await self._hooks.before(
+                        sandbox, scope, token, self._agent.value, planning
+                    )
+                prompt = f"{parsed.prompt}\n\n{prep.note}" if prep.note else parsed.prompt
+                hooks = self._hooks
+
+                async def ready() -> None:
+                    if hooks is not None:
+                        await hooks.checkpoint(scope, self._agent.value)
+
                 folder = state.folder
                 space_key = None
                 if parsed.repo:
@@ -390,12 +459,14 @@ class CodingAgentRuntime:
                 resume = state.sessions.get(space_key or folder or sandbox.workdir)
                 coding = CodingRequest(
                     agent=self._agent,
-                    prompt=parsed.prompt,
+                    prompt=prompt,
                     repo=parsed.repo,
-                    open_pr=parsed.open_pr,
+                    # No pull request before a person approved the plan.
+                    open_pr=parsed.open_pr and not prep.plan_mode,
                     resume=resume,
                     folder=folder,
                     baseline=state.baseline(resume),
+                    plan_args=prep.plan_args if prep.plan_mode else (),
                 )
                 outcome = await self._service.run(
                     sandbox,
@@ -405,6 +476,7 @@ class CodingAgentRuntime:
                     model=model,
                     timeout_s=timeout_s,
                     on_event=events.put,
+                    on_ready=ready,
                 )
                 if resume and outcome.is_error and not outcome.worked:
                     # The saved CLI session is gone (a new sandbox): start a new one.
@@ -423,6 +495,7 @@ class CodingAgentRuntime:
                 with contextlib.suppress(SandboxError):
                     await self._sandboxes.release(scope, sandbox)
 
+        plan_text: list[str] = []
         task = asyncio.ensure_future(job())
         self._active[run_id] = task
         usage = Usage()
@@ -436,6 +509,8 @@ class CodingAgentRuntime:
                 event = getter.result()
                 if isinstance(event, CliUsage):
                     usage = event.usage
+                if isinstance(event, CliPlan):
+                    plan_text.append(event.text)
                 mapped = _map(event, usage)
                 if mapped is not None:
                     yield mapped
@@ -443,6 +518,8 @@ class CodingAgentRuntime:
                 event = events.get_nowait()
                 if isinstance(event, CliUsage):
                     usage = event.usage
+                if isinstance(event, CliPlan):
+                    plan_text.append(event.text)
                 mapped = _map(event, usage)
                 if mapped is not None:
                     yield mapped
@@ -491,6 +568,32 @@ class CodingAgentRuntime:
             tail = _tail(outcome)
             if tail:
                 yield TextDelta(text="\n\n" + tail, usage=usage)
+            if self._hooks is not None and planning and not outcome.timed_out:
+                # Plan mode (Section 15.5): the plan of Claude Code (``ExitPlanMode``), else the
+                # answer of a CLI that ended well, is the plan that a person decides. A failure
+                # of the CLI stays a failure. No plan is stored after a cancel.
+                plan = plan_text[-1] if plan_text else ("" if outcome.is_error else outcome.text)
+                if plan.strip() and run_id not in self._cancelled:
+                    saving = asyncio.ensure_future(self._hooks.plan(scope, plan))
+                    self._saving[run_id] = saving
+                    try:
+                        line = await asyncio.wait_for(saving, timeout=PLAN_SAVE_TIMEOUT_S)
+                    except TimeoutError:
+                        line = "sama could not save the plan in time. Send /plan to check."
+                    except asyncio.CancelledError:
+                        if not (saving.cancelled() and run_id in self._cancelled):
+                            raise
+                        line = ""
+                    finally:
+                        self._saving.pop(run_id, None)
+                    if run_id in self._cancelled:
+                        yield RunFailed(
+                            code=FailureCode.CANCELLED, message="cancelled", usage=usage
+                        )
+                        return
+                    if line:
+                        yield TextDelta(text="\n\n" + line, usage=usage)
+                        text = f"{text}\n\n{line}"
             if outcome.timed_out:
                 yield RunFailed(
                     code=FailureCode.TIMEOUT,

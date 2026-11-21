@@ -46,6 +46,8 @@ SESSION_CHILDREN = (
     "trigger_events",
     "run_steers",
     "session_handoffs",
+    "session_repos",
+    "session_plans",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 

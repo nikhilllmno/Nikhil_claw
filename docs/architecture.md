@@ -2416,6 +2416,7 @@ config:
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
+| `plan` | `plan_propose` (since M7.9): the agent proposes a plan in coding mode, and a person approves, edits, or rejects it (Section 15.5). | Sama MCP |
 | `self` | `change_propose` (SOUL, profile, toolsets, policy), `sama_pr` (code change to sama, Section 15). Since M3.2, `change_propose` has the target `soul`; since M6.1, also `profile`, `toolsets`, and `policy` (Section 9.4.2). `sama_pr` is done in M6.2 (Section 15.2.1). | Sama MCP |
 | `custom_tools` | The custom HTTP and script tools of the user, the workspace, and the org (`custom_<name>`, since M7.3, Section 10.8), behind `tool_search`. | Sama MCP (HTTP on the control plane, scripts in the session sandbox) |
 | `tool_search` | `tool_search`, `tool_describe`, `tool_call` (since M2.6, Section 6.3). The server has them when a product has registered a deferred tool, or when the connection service is on (since M3.5: the tools of a remote MCP server come for each run), or when the custom tool service is on (since M7.3). | Sama MCP |
@@ -3738,6 +3739,7 @@ cross-org check of Section 17.1 through the API.
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
 | `POST /sessions/{id}/undo` | Restore the session files to before the last run that changed them (`200` with `created_at`, `files`, `deleted`, `kept`, and `text`). `409` with the reason when the session has an open run, no sandbox, or nothing to undo (Section 15.3, M6.4). |
 | `POST /sessions/{id}/rollback` | Restore the checkpoint `number` (1 is the newest) of `GET /sessions/{id}/checkpoints`. The answer and the `409` reasons are the same as for `undo` (Section 15.3, M6.4). |
+| `GET /sessions/{id}/coding`, `GET /sessions/{id}/plans`, `POST`, `DELETE /sessions/{id}/repos`, `PUT /sessions/{id}/plan-mode`, `POST /sessions/{id}/plan`, `POST /sessions/{id}/plans/{plan_id}/approve`, `/reject`, `GET /sessions/{id}/diff`, `GET /sessions/{id}/commands`, `GET`, `POST /sessions/{id}/pull-requests` | Coding mode: attached repositories, plan mode and plans, diffs of the checkpoints, commands and test runs, and pull requests (Section 15.5, M7.9). |
 | `POST /sessions/{id}/compact` | Queue a `/compact` run (`202` with `run_id`). The body is optional: `focus`, at most 6,000 characters. `409` if the session is busy, not active, or has nothing to compact. `429` over a rate limit (Section 6.3, M2.6). |
 | `GET /sessions/{id}/compactions` | The compactions of the session, newest first: `trigger`, token counts, the archive session, `completed_at`. |
 | `GET /sessions/{id}/lineage` | The ancestors and the children of the session. A linked session that the user cannot read is not in the answer. |
@@ -6389,6 +6391,9 @@ changes the template makes a new sandbox, and the work folder with its checkpoin
 stay (Section 16.2). The commands also answer that checkpoints are not available when the
 session has no sandbox yet, or when its sandbox is from an old template.
 
+**Diffs (M7.9).** The command `diff` compares two checkpoints, or a checkpoint and the current
+files. The Code page of the web app shows it (Section 15.5).
+
 **Limits.** The agent can change or delete `.sama/checkpoints` with `Bash`. Checkpoints are a
 help for the user, not a security control.
 
@@ -6577,6 +6582,225 @@ The names `claude`, `codex`, and `sama` are reserved for the commands.
 | A7 | The pull request is not a draft. The ruleset of the repository stops a merge without a review (Section 19.5). |
 | A8 | The CLI writes its transcript in the home folder of the sandbox. The sama archive of compactions (Section 6.3) does not see it. The run events and the messages of the session have the text that the user saw. |
 
+### 15.5 Coding mode (M7.9)
+
+Coding mode makes the web app work like Claude Code and Codex for a coding task. A person
+attaches a repository to a session, asks for a plan, approves or edits the plan, and then sees
+the file changes as diffs, the commands and the test runs, and the checkpoints with undo. At the
+end, the agent opens a pull request. Each part is control plane code or a sama tool, so it works
+the same for both runtimes and for the coding agent harnesses of M7.2 (below).
+
+| Part | Where | What it does |
+|---|---|---|
+| Service | `src/sama/coding_mode/service.py` | `CodingService`: attach and detach repositories, plan mode, plans (propose, approve, edit, reject), and the messages for the agent. Each change writes an audit entry. |
+| Before a run | `src/sama/coding_mode/prepare.py`, `src/sama/orchestrator/sandboxed.py` | `CodingPreparer` clones the pending repositories into the session sandbox and gives a note to the run input. |
+| Plan mode in the gate | `src/sama/gate/plan.py`, `src/sama/gate/decide.py` | The step `plan` refuses the tools that change files or data while the session is in plan mode (Section 16.1). |
+| Tool | `src/sama/tools/plan.py`, `src/sama/coding_mode/tool.py` | `plan_propose(plan, title)` in the toolset `plan`. |
+| Diffs | `src/sama/runtime/checkpoints.py`, `src/sama/orchestrator/checkpoints.py` | The command `diff` of the checkpoint module, and `CheckpointService.diff`. |
+| Commands and pull requests | `src/sama/coding_mode/activity.py` | Read from the run events of the session. |
+| Chat command | `src/sama/coding_mode/commands.py` | `/plan` in the web composer, Telegram, and Slack. |
+| API | `src/sama/api/coding_mode.py` | The routes below. |
+| Web app | `web/app/(shell)/s/[sessionId]/code/page.tsx`, `web/components/CodingPanel.tsx` | The Code page of a session. |
+| Claude Code and Codex | `src/sama/coding_mode/harness.py`, `src/sama/coding/runtime.py` | `HarnessHooks`: clone, note, checkpoint, and plan mode for the runtimes of M7.2. |
+| Tables | migration `0047` | `sessions.plan_mode`, `session_repos`, `session_plans`. |
+
+**Attach a repository.** `POST /sessions/{id}/repos` takes `repo` (as for `repo_clone`), an
+optional `ref` (a branch or a tag), and an optional `folder` (default: the repository name). The
+service checks the values with the rules of `repo_clone` (Section 15.1). A session has at most
+5 repositories, and each has its own folder. The row has the status `pending`.
+
+- The repository clones when the next run of the session starts. `SandboxedRuntime` calls
+  `CodingPreparer.prepare` after it has the session sandbox and the run token, and before it
+  starts the runner. The step uses `RepoCloner` with the run token of the run. So a repository
+  on the allowlist of the org clones through the git proxy, and the agent can push `sama/*`
+  branches. Any other repository clones from GitHub without credentials, so only a public
+  repository clones, and it is read-only.
+- The row becomes `ready` (with the path, the commit, the branch, and `proxied`) or `failed`
+  (with the reason). A failed clone does not stop the run.
+- The step adds a note after the message of the run: the repositories that it cloned, their
+  folders, and whether the agent can push them, or the reason of a failed clone. The stored
+  message does not change. The instruction files of the repository are not in the note: the
+  agent reads `AGENTS.md` and `CLAUDE.md` in the folder, as data.
+- A background review run and a `/compact` run have no coding step. Each clone has a time limit
+  of 330 seconds (`git clone` stops after 300). A clone that fails or takes too long marks only
+  its repository `failed` with the reason; the notes of the other repositories and of plan mode
+  stay. The step never raises.
+- `DELETE /sessions/{id}/repos/{repo_id}` removes the attachment. The folder in the sandbox
+  stays. A clone is not a checkpoint tool call: the checkpoint of the next tool call has its
+  files.
+
+**Plan mode.** `sessions.plan_mode` is true while the session is in plan mode.
+
+- `/plan TASK` (or `POST /sessions/{id}/plan`) turns plan mode on and sends TASK as a message.
+  The coding step adds the plan mode note to each run while plan mode is on: read and explore,
+  then call `plan_propose` with the plan, and stop.
+- The gate refuses the tools that change files or data (`deny`, step `plan`, Section 16.1). The
+  agent can read files, search, run read-only shell commands, clone a repository, ask the user,
+  and keep its task list.
+- `plan_propose(plan, title)` stores the plan as a new version in `session_plans` with the
+  status `proposed`. An open plan of the session becomes `superseded`. The tool turns plan mode
+  on, and it tells the agent to end its answer. The tool does not wait for the person: a run
+  that waits for many hours would hold the sandbox and the run slot. `plan_propose` is in
+  `DEFAULT_ALLOW`, because it only stores a plan that a person decides.
+- A person decides the newest plan in the web app or with a chat command. `/plan approve`
+  approves it. `/plan edit TEXT` approves it with TEXT in its place (`edited` is true, and
+  `proposed_body` keeps the text of the agent). An approval turns plan mode off and sends the
+  final plan to the agent as a message, so the agent does the work in a new run.
+  `/plan reject FEEDBACK` rejects it. Plan mode stays on, and the feedback goes to the agent as
+  a message. A reject without feedback sends nothing.
+- When the queue refuses the message of a decision (a rate limit, a quota, or a busy rule), the
+  decision goes back: the plan is `proposed` again, plan mode is as before, and the audit log has
+  `plan.decision_undone`. The person sees the queue error and can try again.
+- `/plan` shows plan mode and the newest plan. `/plan on` and `/plan off` turn plan mode on or
+  off without a plan.
+- Any user who can read the session decides a plan, as for `/undo`. The work after the
+  approval still passes the gate: each tool call that asks still needs its approval.
+- The chat commands work in a Telegram direct chat, a Slack direct message (`/sama plan`), and
+  the web composer, as the checkpoint commands do. `/plan TASK` makes the session of the chat
+  when it has none.
+- A plan has at most 20,000 characters, and feedback at most 4,000. The service redacts both.
+
+**Diffs.** `GET /sessions/{id}/diff?base=N|oldest&head=M` runs
+`python -m sama.runtime.checkpoints diff` in the session sandbox. The diff goes from the
+checkpoint `base` (default: the oldest checkpoint of the session) to the checkpoint `head`, or
+to the current files when `head` is not given. Checkpoint N holds the files before a tool call,
+so `base=N&head=N-1` is what that call changed, and `base=oldest` is all changes of the session.
+
+- The command uses `git diff-tree -M` on the trees of the shadow repository, with no external
+  diff program and no text conversion. It reads the patch output of git in parts and stops git
+  when the budget below is used, so a large diff does not fill the memory of the sandbox. A file has its path, the old path of a rename, the
+  status (`added`, `modified`, `deleted`, `renamed`, or `type_changed`), the counts of added and
+  deleted lines (none for a binary file), and its patch.
+- A diff lists at most 500 files. The patch of one file has at most 100,000 characters, and all
+  patches together at most 1,000,000 characters. A cut patch has `truncated`, and the files
+  after the end of the budget have an empty, cut patch. The diff of the
+  current files writes the index of the shadow repository under the checkpoint lock. It does not
+  make a checkpoint.
+- The files that a checkpoint does not hold (Section 15.3), for example `node_modules`, the
+  `.git` folders, and files larger than 10 MiB, are not in a diff.
+- The control plane redacts each patch. `409` when the session has no sandbox or no
+  checkpoints.
+
+**Commands and test runs.** `GET /sessions/{id}/commands` reads the `tool_call_started` and
+`tool_call_finished` events of the session as the user (row-level security). It lists the calls
+of `Bash` (also the shell of the second runtime) and `execute_code`, newest first, with the
+command, the status (`running`, `ok`, or `failed`), and the end of the output. A command that
+runs tests (for example `pytest`, `npm test`, `go test`, `cargo test`, `make test`) has `test`
+true and the last result line of the output as `summary`. `?tests=true` lists only these.
+
+- Since M7.9 the output preview of a tool call keeps its start and its end (2,000 characters
+  with a marker in the middle), so the result line of a long test run is in the preview. The
+  preview was the start only before.
+
+**Checkpoints and undo.** The Code page lists the checkpoints and has Undo and Restore, through
+the routes of Section 15.3. Since M7.9 each checkpoint in `GET /sessions/{id}/checkpoints` has
+its `commit`, and `POST /sessions/{id}/rollback` takes an optional `commit`. With it, the restore
+gives `409` and changes nothing when checkpoint `number` is another checkpoint now (for example
+after a new run). So a person who confirms a restore on the page gets the checkpoint that they
+saw. The checkpoint command also has `snapshot --run RUN --tool TOOL`
+(`CheckpointService.snapshot`): a run that does not pass the gate of the runner, such as a
+coding agent CLI of M7.2, takes one checkpoint before it changes files.
+
+**Pull requests.** `GET /sessions/{id}/pull-requests` lists the `pr_create` calls and the
+`sama_pr` `open` calls of the session from the run events, with the URL of the pull request.
+`POST /sessions/{id}/pull-requests` (optional `repo`, `title`, `base`, `draft`) sends a message
+to the agent: commit, push a `sama/*` branch through the git proxy, and call `pr_create`. The
+agent does the git work, so the git proxy and its checks apply (Section 15.1), and a person
+approves the `pr_create` call on the approval card. A repository that did not clone through the
+proxy cannot get a push: the message tells the agent to say that an org admin must add the
+repository to the allowlist.
+
+**API.**
+
+| Method and path | Purpose |
+|---|---|
+| `GET /sessions/{id}/coding` | `plan_mode`, the attached `repos`, and the newest `plan`. |
+| `GET /sessions/{id}/plans?limit=` | The plans, newest first (1 to 50, default 10). |
+| `POST /sessions/{id}/repos`, `DELETE /sessions/{id}/repos/{repo_id}` | Attach (`201`) or detach (`204`) a repository. `422` for a bad value, `409` for a full session, a used folder, or a session that is not active. |
+| `PUT /sessions/{id}/plan-mode` | `{on}`. |
+| `POST /sessions/{id}/plan` | `{task}`: plan mode on, and the task as a message (`202` with `run_id` and `queued`). |
+| `POST /sessions/{id}/plans/{plan_id}/approve` | Optional `{body}` (the edited plan). `202` with `run_id`, `queued`, and `plan`. `409` when the plan is not `proposed`. |
+| `POST /sessions/{id}/plans/{plan_id}/reject` | Optional `{feedback}`. `run_id` is null without feedback. |
+| `GET /sessions/{id}/diff` | The diff above. |
+| `GET /sessions/{id}/commands?tests=&limit=` | The commands above (1 to 200, default 50). |
+| `GET`, `POST /sessions/{id}/pull-requests` | The pull requests above, and the request to the agent (`202`). |
+
+The routes that send a message have the answers of `POST /sessions/{id}/messages`: `402`, `409`,
+and `429`. Without a coding service, the write routes answer `409`.
+
+**Web app.** The Code page (`/s/{id}/code`, a link in the chat header) has six tabs: Repos,
+Plan, Changes, Commands and tests, Checkpoints, and Pull requests. Each tab is a component that
+takes the session id (`RepoAttach`, `PlanPanel`, `DiffViewer`, `TestRuns`, `Checkpoints`,
+`PullRequests`), so the settings console of M7.10 can use them again. `CodingPanel` puts them
+together and reads the state again every 5 seconds while the tab is visible. The diff view shows
+each file with its line numbers, and it closes large files at first. The plan tab shows the plan
+as Markdown with Approve, Edit and approve, and Reject. The chat shows a short card when a plan
+waits for a decision, and the web composer has the `/plan` commands.
+
+**Tables.** `session_repos` (org, session, owner, name, ref, folder, status, path, proxied,
+commit, branch, error, the user who attached it; unique per session and folder) and
+`session_plans` (org, session, the run, version, body, proposed body, status, edited, feedback,
+the user who decided, the time; unique per session and version). Members read the rows of the
+sessions that they can see (`sama_private.can_read_session`). No policy allows writes: the
+control plane writes them. Migration `0047` also adds the toolset `plan` to each profile that has
+the toolset `github`, and `python -m sama.admin bootstrap` gives it to new profiles.
+
+**Claude Code and Codex (M7.2).** The runtimes `claude_code` and `codex` (Section 15.4) run a
+CLI in the session sandbox, and the runner does not start it. Coding mode works for them, also
+in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding_agent`), through
+`HarnessHooks` (`src/sama/coding_mode/harness.py`), which `CodingAgentRuntime` calls:
+
+- Before the gate check, the runtime reads plan mode. In plan mode the gate judges the name
+  `coding_agent_plan` (toolset `coding_agents`, default `ask`), which plan mode does not
+  block, with `open_pr` false. No MCP tool has this name, so only the runtime asks for it. The
+  tool `coding_agent_run` of a sama agent stays blocked in plan mode, because it starts the CLI
+  with all permissions.
+- After it has the sandbox, the hooks clone the pending repositories and give the note
+  (`CodingPreparer`, the same step as for the SDK runtimes; the note goes after the task). The
+  hooks add the plan mode rules themselves, from the plan mode that the gate judged, so neither
+  a change of plan mode during an approval nor a failed read can start a plan run without them.
+- When the folder of the request is ready (also after a clone of the repository of the task)
+  and before the CLI starts, the hooks take one checkpoint of the work folder
+  (`CheckpointService.snapshot`, tool `claude_code` or `codex`). The tools of the CLI do not
+  pass the gate of the runner, so they take no checkpoints. With this checkpoint, the diff of
+  the Code page and `/undo` cover the changes of the CLI.
+- In plan mode, Claude Code starts with `--permission-mode plan` in place of
+  `--dangerously-skip-permissions`, and the note asks it to end with `ExitPlanMode`. The parser
+  gives the input `plan` of that tool as `CliPlan`. Codex keeps its flags: its own read-only
+  sandbox (bubblewrap) does not work in the E2B VM, and with it every command fails. So Codex
+  gets only the plan-first note, and its answer is the plan.
+- At the end of a plan mode run, the plan (`CliPlan`, else the answer of a CLI that ended
+  without an error) becomes a proposed plan (`CodingService.propose`, at most 30 seconds), and
+  the answer of the run says how to decide it. A failure of the CLI, for example a refused
+  budget, stays a failure of the run. A cancel stops the save, and its transaction rolls
+  back; a save that committed before the cancel stays. An
+  approval sends the plan as a message; in the direct mode that message goes to the same CLI,
+  which then works with all permissions.
+- The commands and the test runs of the CLI come from its `tool_call_*` run events. For
+  `Bash`, the arguments have a one-line `summary` (at most 160 characters) and not the full
+  command; the commands list reads it, so a long command is cut.
+- The chat shows the progress of `coding_agent_run` (`subagent_event`) as a sub-agent group
+  with the name "Claude Code" or "Codex", as for other sub-agents.
+
+**Limits and risks.**
+
+- The read-only command check of plan mode is strict and simple: no redirect, no substitution,
+  no variable, no background job, only known read commands, and an allow list of the options
+  of `git` (`status`, `log`, `diff`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `blame`,
+  `describe`, `shortlog`, `branch`, `remote`). Commands with an option that writes or runs a
+  program (for example `sort -o`, `uniq IN OUT`, `git grep -O`, `find -exec`, `rg --pre`) are
+  not allowed. It refuses many safe commands. It is a guard for the plan step, not a security
+  boundary: for example a git configuration that the agent wrote before plan mode can still
+  run a program from `git diff`.
+- Plan mode does not stop a call that a person approved before (the recorded decision,
+  Section 16.1). The tool server check honors the ticket of such a call once.
+- Codex in plan mode has no technical guard: the CLI runs with all permissions and only the
+  note asks it not to change files. The checkpoint before the run lets a person undo a change.
+- The test detection reads the command text. A test that runs through a script with another
+  name is a normal command.
+- A diff of a session with a very large work folder (more than 50,000 files) fails, as a
+  checkpoint does.
+
 ---
 
 ## 16. Safety: approvals, sandbox, secrets
@@ -6605,6 +6829,10 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
    live profile rules. The stricter verdict wins, and the reason of a stricter frozen verdict
    ends with "(until the next session)". So a looser profile rule applies from the next
    session, and a stricter one applies at once.
+4a. **Plan mode** (M7.9): while the session is in plan mode, a tool that can change files or
+   data gets `deny` before the policy step (Section 15.5, `sama.gate.plan`). Read tools,
+   `plan_propose`, and read-only `Bash` commands go on to the policy step. A recorded approval
+   is not stopped. A `review` run has no plan mode.
 5. **Context**: in unattended runs, `ask` becomes `deny` unless a human approved a
    pre-approval for this tool in this job version, and the call fits its connection and
    argument limits (Section 12.1).
@@ -6671,7 +6899,7 @@ Rules of the steps:
 - **Toolsets.** `core` (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`,
   `Grep`, `WebFetch`), `todo` (`todo`, `TodoWrite`), `web` (`web_search`, `web_extract`),
   `clarify`, `github` (`repo_clone`, M1.16; `pr_create`, `pr_comment`, `repo_push_approval`,
-  M3.7), and `skills` (`skills_list`, `skill_view`,
+  M3.7), `plan` (`plan_propose`, M7.9), and `skills` (`skills_list`, `skill_view`,
   `skill_manage`, M2.2; allowed without a rule, because the store checks the role of the
   user), and `subagents` (`Task`, `Agent`, M2.7). They come from `agent_profiles.toolsets`. An unknown name has no tools. The
   default is an empty list, so a new profile can use no tool until an admin sets its toolsets.

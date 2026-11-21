@@ -9,6 +9,8 @@ snapshot. They run this module as a command in the session sandbox:
     python -m sama.runtime.checkpoints list [--limit N]
     python -m sama.runtime.checkpoints undo
     python -m sama.runtime.checkpoints restore --number N
+    python -m sama.runtime.checkpoints diff --base N|oldest [--head M]
+    python -m sama.runtime.checkpoints snapshot --run RUN --tool TOOL
 
 Each command writes one JSON object to stdout. The module uses only the standard library and
 the ``git`` program of the sandbox image, so the runner can import it at a low cost.
@@ -46,6 +48,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -61,6 +64,7 @@ __all__ = [
     "CheckpointError",
     "CheckpointGate",
     "Checkpoints",
+    "Diff",
     "Restored",
 ]
 
@@ -97,6 +101,12 @@ MAX_FILES: Final = 50_000
 LIST_LIMIT: Final = 10
 MAX_HISTORY: Final = 1_000
 """How many checkpoints ``undo`` and ``restore`` look at."""
+MAX_DIFF_FILES: Final = 500
+"""A diff lists at most this many files."""
+MAX_FILE_PATCH_CHARS: Final = 100_000
+"""The patch of one file is cut after this many characters."""
+MAX_PATCH_CHARS: Final = 1_000_000
+"""All patches of a diff together have at most this many characters."""
 RUNNER_LOCK_WAIT_S: Final = 10.0
 GIT_TIMEOUT_S: Final = 60.0
 GIT: Final = shutil.which("git") or "/usr/bin/git"
@@ -155,6 +165,42 @@ class Restored:
     kept: int = 0
     """Files of the target that the restore did not write: writing them would remove a large
     file or excluded files, which the ``rollback`` checkpoint does not hold."""
+
+
+@dataclass(frozen=True, slots=True)
+class FileDiff:
+    path: str
+    old_path: str | None
+    """The old path of a renamed file."""
+    status: str
+    """``added``, ``modified``, ``deleted``, ``renamed``, or ``type_changed``."""
+    additions: int | None
+    """None for a binary file."""
+    deletions: int | None
+    binary: bool
+    patch: str
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Diff:
+    """The changes from the checkpoint ``base`` to the checkpoint ``head``, or to the current
+    files when ``head`` is None (Section 15.5)."""
+
+    base: Checkpoint
+    head: Checkpoint | None
+    files: list[FileDiff]
+    truncated: bool = False
+
+
+_STATUS: Final = {
+    "A": "added",
+    "M": "modified",
+    "D": "deleted",
+    "R": "renamed",
+    "C": "added",
+    "T": "type_changed",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,11 +426,162 @@ class Checkpoints:
         with self._lock(CHECKPOINT_LOCK):
             return self._history(limit)
 
-    def restore(self, number: int) -> Restored:
-        """Restores checkpoint ``number`` of ``list``."""
+    def diff(self, base: int | None, head: int | None = None) -> Diff:
+        """The changes from checkpoint ``base`` (None: the oldest checkpoint) to checkpoint
+        ``head`` (None: the current files). Excluded and large files are not in a diff."""
+        if not self._exists():
+            raise CheckpointError("This session has no checkpoints yet.")
+        with self._lock(CHECKPOINT_LOCK):
+            history = self._history(MAX_HISTORY)
+            if not history:
+                raise CheckpointError("This session has no checkpoints yet.")
+            start = history[-1] if base is None else _pick(history, base)
+            end = None if head is None else _pick(history, head)
+            if end is None:
+                files = self._walk()
+                if files is None:
+                    raise CheckpointError(
+                        f"The work folder has more than {MAX_FILES} files. sama cannot compare it."
+                    )
+                target = self._tree(files)
+            else:
+                target = end.commit
+            return Diff(start, end, *self._changes(start.commit, target))
+
+    def _changes(self, old: str, new: str) -> tuple[list[FileDiff], bool]:
+        """The changed files between two tree-ish ids, with their patches."""
+        common = ("diff-tree", "-r", "-M", "--no-ext-diff", "--no-textconv", "-z")
+        listed = _split(self._git(*common, "--name-status", old, new))
+        numbers = _split(self._git(*common, "--numstat", old, new))
+        entries: list[tuple[str, str | None, str]] = []
+        index = 0
+        while index < len(listed):
+            letter = listed[index][:1]
+            if letter in ("R", "C"):
+                entries.append((listed[index + 2], listed[index + 1], letter))
+                index += 3
+            else:
+                entries.append((listed[index + 1], None, letter))
+                index += 2
+        counts: list[tuple[int | None, int | None]] = []
+        index = 0
+        while index < len(numbers):
+            added, deleted, named = [*numbers[index].split("\t", 2), "", ""][:3]
+            # A rename has an empty path here, and the two paths follow.
+            index += 3 if named == "" else 1
+            if added == "-":
+                counts.append((None, None))
+            else:
+                counts.append((int(added), int(deleted)))
+        shown = entries[:MAX_DIFF_FILES]
+        chunks = self._patches(old, new, len(shown))
+        if len(counts) != len(entries):
+            counts = [(None, None)] * len(entries)
+        out: list[FileDiff] = []
+        for index, ((path, old_path, letter), (plus, minus)) in enumerate(
+            zip(shown, counts, strict=False)
+        ):
+            text, cut = chunks[index] if index < len(chunks) else ("", True)
+            out.append(
+                FileDiff(
+                    path=path,
+                    old_path=old_path,
+                    status=_STATUS.get(letter, "modified"),
+                    additions=plus,
+                    deletions=minus,
+                    binary=plus is None,
+                    patch=text,
+                    truncated=cut,
+                )
+            )
+        truncated = len(entries) > MAX_DIFF_FILES or any(item.truncated for item in out)
+        return out, truncated
+
+    def _patches(self, old: str, new: str, files: int) -> list[tuple[str, bool]]:
+        """The patch of each of the first ``files`` changed files, with a flag when the patch
+        is cut. It reads the output of git in parts and keeps at most ``MAX_FILE_PATCH_CHARS``
+        bytes of each file and ``MAX_PATCH_CHARS`` bytes in total, so a large diff cannot fill
+        the memory. When the budget ends, it stops git; the later files get an empty, cut
+        patch."""
+        argv = [
+            GIT,
+            *("-c", "core.autocrlf=false", "-c", f"core.attributesFile={os.devnull}"),
+            *("diff-tree", "-r", "-M", "-p", "--no-color", "--no-ext-diff", "--no-textconv"),
+            *("--full-index", old, new),
+        ]
+        process = subprocess.Popen(  # noqa: S603 -- fixed git arguments, no shell
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=self._env(),
+            cwd=self.workdir,
+        )
+        stdout = process.stdout
+        if stdout is None:  # pragma: no cover -- stdout=PIPE always gives a stream
+            raise CheckpointError("git diff-tree has no output stream")
+        # readline blocks, so a timer stops a git that takes too long.
+        fired = threading.Event()
+
+        def stop() -> None:
+            fired.set()
+            process.kill()
+
+        timer = threading.Timer(GIT_TIMEOUT_S, stop)
+        timer.start()
+        out: list[tuple[bytearray, bool]] = []
+        room = MAX_PATCH_CHARS
+        at_start = True
+        header = b""
+        try:
+            while True:
+                part = stdout.readline(64 * 1024)
+                if not part:
+                    break
+                new_file = at_start and part.startswith(b"diff --git ")
+                at_start = part.endswith(b"\n")
+                if new_file and part != header:
+                    if len(out) >= files:
+                        break
+                    header = part
+                    out.append((bytearray(), False))
+                # A type change (a file that becomes a link) has two patches with the same
+                # header. Both go to the same file.
+                if not out:
+                    continue
+                buffer = out[-1][0]
+                keep = max(0, min(len(part), MAX_FILE_PATCH_CHARS - len(buffer), room))
+                buffer += part[:keep]
+                room -= keep
+                if keep < len(part):
+                    out[-1] = (buffer, True)
+                if room <= 0:
+                    break
+        finally:
+            timer.cancel()
+            if process.poll() is None:
+                process.kill()
+            stdout.close()
+            process.wait()
+        if fired.is_set():
+            raise CheckpointError("git took too long to compare the files.")
+        return [(bytes(buffer).decode(errors="replace"), cut) for buffer, cut in out]
+
+    def restore(self, number: int, commit: str | None = None) -> Restored:
+        """Restores checkpoint ``number`` of ``list``. With ``commit``, the checkpoint must be
+        that commit: a list that changed since the caller read it gives an error, and nothing
+        changes (Section 15.5)."""
         if number < 1:
             raise CheckpointError("The checkpoint number must be 1 or more.")
-        return self._restore(lambda history, _tree: _pick(history, number))
+
+        def choose(history: Sequence[Checkpoint], _tree: str) -> Checkpoint:
+            target = _pick(history, number)
+            if commit is not None and target.commit != commit:
+                raise CheckpointError(
+                    "The checkpoints changed since you looked at them. Look at the list again."
+                )
+            return target
+
+        return self._restore(choose)
 
     def undo(self) -> Restored:
         """Undoes the file changes of the latest run that changed files: restores the first
@@ -626,6 +823,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser("undo")
     restore = commands.add_parser("restore")
     restore.add_argument("--number", type=int, required=True)
+    restore.add_argument("--commit", default=None)
+    snap = commands.add_parser("snapshot")
+    snap.add_argument("--run", required=True)
+    snap.add_argument("--tool", required=True)
+    diff = commands.add_parser("diff")
+    diff.add_argument("--base", default="oldest")
+    diff.add_argument("--head", type=int, default=None)
     args = parser.parse_args(argv)
     workdir = args.workdir or os.environ.get("SAMA_WORKDIR") or WORKDIR
     checkpoints = Checkpoints(workdir)
@@ -636,14 +840,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = {"ok": True, "checkpoints": [asdict(c) for c in checkpoints.listing(limit)]}
         elif args.command == "undo":
             result = {"ok": True, "restored": asdict(checkpoints.undo())}
+        elif args.command == "snapshot":
+            # A run that does not pass the gate of the runner (a coding agent CLI, M7.2)
+            # takes one checkpoint before it changes files (Section 15.5).
+            result = {"ok": True, "commit": checkpoints.snapshot(args.run, args.tool)}
+        elif args.command == "diff":
+            base = None if args.base == "oldest" else _number(args.base)
+            result = {"ok": True, "diff": asdict(checkpoints.diff(base, args.head))}
         else:
-            result = {"ok": True, "restored": asdict(checkpoints.restore(args.number))}
+            result = {"ok": True, "restored": asdict(checkpoints.restore(args.number, args.commit))}
     except BusyError as error:
         result = {"ok": False, "busy": True, "error": str(error)}
     except CheckpointError as error:
         result = {"ok": False, "error": str(error)}
     sys.stdout.write(json.dumps(result) + "\n")
     return 0
+
+
+def _number(text: str) -> int:
+    if not text.isdigit() or int(text) < 1:
+        raise CheckpointError("The checkpoint number must be 1 or more.")
+    return int(text)
 
 
 if __name__ == "__main__":

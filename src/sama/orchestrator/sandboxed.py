@@ -231,6 +231,14 @@ class SandboxSettings:
     the Claude CLI, which holds the transcripts that a run resumes."""
 
 
+class RunPreparer(Protocol):
+    """A step before a new run starts in the session sandbox (coding mode, Section 15.5). It
+    gets the sandbox and the run token of the run, and returns a note for the run input, or
+    "". It must not raise."""
+
+    async def prepare(self, sandbox: Sandbox, scope: RunScope, token: str) -> str: ...
+
+
 class SandboxDirectory(Protocol):
     """Stores the sandbox id of each session, so that every process uses the same sandbox."""
 
@@ -252,6 +260,7 @@ class SandboxedRuntime:
         gate: GatePolicy | None = None,
         directory: SandboxDirectory | None = None,
         skills: SkillSource | None = None,
+        preparer: RunPreparer | None = None,
     ) -> None:
         if kind not in CAPABILITIES:
             raise ValueError(f"the runner does not support runtime {kind}")
@@ -264,6 +273,7 @@ class SandboxedRuntime:
         self._gate = gate or GatePolicy()
         self._directory = directory
         self._skills = skills
+        self._preparer = preparer
         self._sandbox_ids: dict[tuple[str, str], str] = {}
         self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._session_runs: dict[tuple[str, str], int] = {}
@@ -291,6 +301,11 @@ class SandboxedRuntime:
         other = copy.copy(self)
         other._kind = kind
         return other
+
+    def set_preparer(self, preparer: RunPreparer | None) -> None:
+        """Sets the coding step of new runs (Section 15.5). The control plane builds it after
+        the runtime, because it needs the repository cloner."""
+        self._preparer = preparer
 
     def sandbox_id(self, org_id: str, session_id: str) -> str | None:
         return self._sandbox_ids.get((org_id, session_id))
@@ -632,11 +647,17 @@ class SandboxedRuntime:
                 wanted = await files
                 steps.mark("files")
                 ttl = min(_wall_time_s(budget) + TOKEN_MARGIN_S, RUN_TOKEN_MAX_TTL_S)
+                token = self._signer.issue(scope, ttl_s=ttl, budget=budget)
                 env = {
                     WORKDIR_ENV: sandbox.workdir,
                     **self._settings.extra_env,
-                    RUN_TOKEN_ENV: self._signer.issue(scope, ttl_s=ttl, budget=budget),
+                    RUN_TOKEN_ENV: token,
                 }
+                job = await self._prepare(job, sandbox, scope, token)
+                steps.mark("prepare")
+                if active.cancelled.is_set():
+                    events.put_nowait(_cancelled(usage))
+                    return
                 if self._settings.model_url:
                     env[MODEL_URL_ENV] = self._settings.model_url
                 argv = list(self._settings.runner_argv)
@@ -740,6 +761,20 @@ class SandboxedRuntime:
                 await _bounded_kill(process)
             if sandbox is not None:
                 await self._end_session_run(key, sandbox)
+
+    async def _prepare(
+        self, job: RunnerJob, sandbox: Sandbox, scope: RunScope, token: str
+    ) -> RunnerJob:
+        """Runs the coding step for a new run with a message (Section 15.5). Its note goes
+        after the message of the run. A resume and a ``/compact`` run have no step."""
+        request = job.run
+        if self._preparer is None or request is None or request.compact is not None:
+            return job
+        note = await self._preparer.prepare(sandbox, scope, token)
+        if not note:
+            return job
+        text = f"{request.input}\n\n{note}" if request.input else note
+        return job.model_copy(update={"run": request.model_copy(update={"input": text})})
 
     async def _skill_files(self, scope: RunScope) -> dict[str, str] | None:
         """The skill files to sync (``wanted_files``), or None: no skill source, or the read

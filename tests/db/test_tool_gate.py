@@ -1189,3 +1189,66 @@ async def test_inner_judges_a_step_of_browser_task_without_a_record(
             await connection.execute(select(ToolCall).where(ToolCall.org_id == org.ids["org"]))
         ).all()
     assert calls == []
+
+
+async def test_plan_mode_keeps_an_approved_ticket_and_blocks_other_calls(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """Coding mode (Section 15.5): plan mode denies a tool that changes files, but a call
+    that a person approved before still runs once with its ticket."""
+    from sqlalchemy import update as sql_update
+
+    from sama.db.models import Session as SessionRow
+
+    gate = GateService(engine)
+    await approve(gate, org)
+    async with engine.begin() as connection:
+        await connection.execute(
+            sql_update(SessionRow).where(SessionRow.id == org.ids["shared"]).values(plan_mode=True)
+        )
+    blocked = await gate.screen(org.claims(), "Bash", {"command": "touch x"})
+    assert (blocked.action, blocked.step) == ("deny", GateStep.PLAN)
+    assert (await reconfirm(gate, org)).action == "allow"
+    used = await gate.screen(org.claims(), "Bash", ARGS)
+    assert (used.action, used.reason) == ("allow", "the call has an approved ticket")
+    again = await gate.screen(org.claims(), "Bash", ARGS)
+    assert (again.action, again.step) == ("deny", GateStep.PLAN)
+
+
+async def test_plan_mode_keeps_a_ticket_after_always_allow(engine: AsyncEngine, org: Org1) -> None:
+    from sama.db.models import Session as SessionRow
+    from sama.db.models import ToolPolicy
+
+    gate = GateService(engine)
+    await approve(gate, org)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(SessionRow).where(SessionRow.id == org.ids["shared"]).values(plan_mode=True)
+        )
+        await connection.execute(
+            insert(ToolPolicy).values(org_id=org.ids["org"], tool="Bash", action="allow")
+        )
+    assert (await reconfirm(gate, org)).action == "allow"
+    used = await gate.screen(org.claims(), "Bash", ARGS)
+    assert (used.action, used.reason) == ("allow", "the call has an approved ticket")
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).step is GateStep.PLAN
+
+
+async def test_plan_mode_with_a_ticket_still_obeys_a_new_deny_rule(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    from sama.db.models import Session as SessionRow
+    from sama.db.models import ToolPolicy
+
+    gate = GateService(engine)
+    await approve(gate, org)
+    assert (await reconfirm(gate, org)).action == "allow"
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(SessionRow).where(SessionRow.id == org.ids["shared"]).values(plan_mode=True)
+        )
+        await connection.execute(
+            insert(ToolPolicy).values(org_id=org.ids["org"], tool="Bash", action="deny")
+        )
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"
+    assert (await call_row(engine, org, "c1")).status != "finished"

@@ -512,3 +512,42 @@ async def test_the_hermes_parity_tools_show_with_their_services() -> None:
         for tool in await ToolServer(signer=signer, todos=MemoryTodoStore()).mcp().list_tools()
     }
     assert not {"video_analyze", "x_search", "moa", "memory_recall"} & plain
+
+
+class FakePlans:
+    """The store of ``plan_propose`` (Section 15.5)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    async def propose(self, claims: object, plan: str, title: str | None) -> str:
+        from sama.tools.plan import PlanError
+
+        if plan == "bad":
+            raise PlanError("the session is not active")
+        self.calls.append((getattr(claims, "run_id", ""), plan, title))
+        return "The plan is saved as version 1."
+
+
+async def test_plan_propose_is_hidden_without_a_store() -> None:
+    server = ToolServer(signer=RunTokenSigner(secrets.token_bytes(32)), todos=MemoryTodoStore())
+    names = {tool.name for tool in await server.mcp().list_tools()}
+    assert "plan_propose" not in names
+
+
+async def test_plan_propose_sends_the_plan_to_the_store() -> None:
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    plans = FakePlans()
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), plans=plans)
+    with serve(server.app()) as base:
+        token = signer.issue(make_scope("run-9"), ttl_s=600)
+        async with connect(base + "/mcp", token) as client:
+            ok = await client.call_tool("plan_propose", {"plan": "1. a", "title": "Fix"})
+            refused = await client.call_tool("plan_propose", {"plan": "bad"})
+            empty = await client.call_tool("plan_propose", {"plan": ""})
+    assert not ok.is_error
+    assert text_of(ok) == "The plan is saved as version 1."
+    assert refused.is_error
+    assert "not active" in text_of(refused)
+    assert empty.is_error
+    assert plans.calls == [("run-9", "1. a", "Fix")]
