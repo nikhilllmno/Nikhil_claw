@@ -34,8 +34,11 @@ jobs:
           echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum --check --strict
           tar -xzf gitleaks.tgz gitleaks
           rm gitleaks.tgz
-      - name: Scan full git history
-        run: ./gitleaks git --config .gitleaks.toml --redact --no-banner --verbose .
+      # Scan the full history of the checked-out commit only. The checkout fetches every branch,
+      # and a plain scan would also read the commits of other open branches, so one branch with
+      # a flagged test value would fail the check of every pull request and of main.
+      - name: Scan full git history of this commit
+        run: ./gitleaks git --config .gitleaks.toml --redact --no-banner --verbose --log-opts="HEAD" .
 
   python:
     name: Python (ruff, mypy, pytest)
