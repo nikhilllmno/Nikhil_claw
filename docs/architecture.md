@@ -352,8 +352,12 @@ open. Sama has three controls, and they work in Telegram, Slack, and the web app
 The tool gate gives the notes to the run. At each tool call of a `running` run, `take_steers`
 marks the pending notes as `delivered` and returns one text block (`steer_block`). A note adds
 to the request of the run and does not replace it (M7.1). So the block, in an
-`<added_messages>` tag, tells the model to keep doing the original request and to also handle
-each added message, and to follow an added message only for the part that it changes. The
+`<added_messages>` tag, tells the model that each note is a new request in addition to the
+original request, and that a note cancels or replaces the original request only when it says so
+in clear words ("stop", "instead", "do not"). If two requests seem to conflict, the model does
+both. The final reply must answer every request. (A first wording that said "follow the added
+message for the part that it changes" made `claude-sonnet-5-5` drop the original request when a
+note asked for a different reply word.) The
 block repeats the original request (the first user message of the run, cut to 2,000
 characters) and lists every open note of the run, oldest first: the notes of earlier steps are
 marked "you got this one before", then the new ones. A note cannot close the tag. The gate

@@ -225,7 +225,9 @@ def steer_block(notes: Sequence[str], *, request: str = "", earlier: Sequence[st
     if there are no new notes.
 
     A note is a ``/steer`` note or a message that joined the run (busy mode ``steer``). Each one
-    adds to the request of the run and does not replace it, so the text repeats ``request`` (the
+    adds to the request of the run and replaces it only when it says so in clear words. Two
+    requests that seem to conflict are both done: a model that reads "change this part" drops
+    the original request (the staging repro of M7.1). The text repeats ``request`` (the
     first message of the run) and lists every open note: ``earlier`` (the notes that the run got
     at an earlier step) and ``notes`` (the new ones), oldest first. A note cannot close its
     block."""
@@ -242,11 +244,12 @@ def steer_block(notes: Sequence[str], *, request: str = "", earlier: Sequence[st
     lines = "\n".join(f"{number}. {safe(text)}" for number, text in enumerate(items, start=1))
     parts = [
         f"<{_STEER_TAG}>",
-        "The user added these messages while you work. They add to the original request. They"
-        " do not replace it. Keep doing the original request, and also handle each added"
-        " message. If an added message changes a part of the original request, follow the added"
-        " message for that part only. Your final reply must cover the original request and every"
-        " added message.",
+        "The user sent more messages while you work. Each one is a new request in addition to"
+        " the original request. None of them cancels or replaces the original request, unless it"
+        ' says so in clear words (for example "stop", "instead", or "do not"). Do every request:'
+        " the original request and each added message. If two requests seem to conflict (for"
+        " example, two different words to reply with), do both of them: include what each one"
+        " asks for. Your final reply must answer the original request and every added message.",
     ]
     if original:
         parts.append(f"\nThe original request:\n{safe(original)}")
