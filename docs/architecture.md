@@ -4661,7 +4661,9 @@ lists, then the address rules, for each navigation of a tab or a frame, each red
 each WebSocket. The block list applies also to the other requests of a page (images, scripts,
 `fetch`). The allow list does not, because a page loads scripts and styles from other hosts.
 The error names the host and the list, for example "the URL policy blocked
-https://www.evil.test/: www.evil.test is in the block list of the org".
+https://www.evil.test/: www.evil.test is in the block list of the org". The lists apply to the `cloud`
+target. The `my_chrome` target runs on the network of the user and keeps its own rules (the
+blocked list and the consent of the user, Section 14.2.2).
 
 `PolicyCache` keeps the policy of an org for 30 seconds. A change applies at once in the process
 of the API that took it, and after at most 30 seconds in another process, also in a live browser
