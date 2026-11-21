@@ -1,4 +1,4 @@
-"""Migration 0039: the role permissions, the delivery log of the triggers, and the reasoning
+"""Migration 0040: the role permissions, the delivery log of the triggers, and the reasoning
 effort of the profiles, with their RLS (docs/architecture.md, Sections 12.2 and 17.2; roadmap
 M7.10)."""
 
@@ -45,7 +45,7 @@ def test_the_upgrade_adds_the_tables_and_the_downgrade_removes_them() -> None:
     with migrated_database() as url:
         assert asyncio.run(_state(url)) == (True, True, True)
         config = alembic_config(url)
-        command.downgrade(config, "0038")
+        command.downgrade(config, "0039")
         assert asyncio.run(_state(url)) == (False, False, False)
         command.upgrade(config, "head")
         assert asyncio.run(_state(url)) == (True, True, True)

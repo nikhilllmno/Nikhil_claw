@@ -206,6 +206,10 @@ def secret_hash(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()
 
 
+_CHECKED_KINDS: Final = ("telegram", "slack")
+"""The kinds of chat app that ``check`` can test (M7.10)."""
+
+
 class Integrations:
     def __init__(
         self,
@@ -843,6 +847,8 @@ class Integrations:
         row = await self._read(org_id, kind)
         if row is None:
             raise IntegrationError("the org has no such integration", status_code=404)
+        if kind not in _CHECKED_KINDS:
+            raise IntegrationError("only a Telegram or a Slack app has a test", status_code=409)
         detail = await self._probe(vault, org_id, kind)
         ok = detail is None
         values: dict[str, Any] = {"last_error": detail}

@@ -78,7 +78,7 @@ CATALOG: Final = (
     Permission(
         "chat_apps.manage",
         "Connect and disconnect chat apps",
-        "Connect and disconnect Telegram and Slack.",
+        "Connect and disconnect Telegram, Slack, WhatsApp, and email.",
         ("admin",),
     ),
 )

@@ -12,8 +12,8 @@
 
 Only the control plane writes the two tables.
 
-Revision ID: 0039
-Revises: 0038
+Revision ID: 0040
+Revises: 0039
 Create Date: 2026-11-21
 """
 
@@ -22,8 +22,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0039"
-down_revision: str | None = "0038"
+revision: str = "0040"
+down_revision: str | None = "0039"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

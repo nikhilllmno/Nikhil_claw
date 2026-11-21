@@ -7184,7 +7184,7 @@ library of M7.4, and the channels of M7.8) shows a card "Not available yet" unti
 it. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
 without a change of the web app.
 
-**Role permissions.** Migration `0039` adds the table `org_role_permissions` (`org_id`, `role`,
+**Role permissions.** Migration `0040` adds the table `org_role_permissions` (`org_id`, `role`,
 `permission`, `allowed`). The catalog is in `sama.orgs.permissions`:
 
 | Key | Roles | Route that checks it |
@@ -7242,7 +7242,7 @@ without a change of the web app.
   `ModelSettings(reasoning=Reasoning(effort=...))`. As the model, it applies from the next
   session.
 
-**Trigger delivery log and test send.** Migration `0039` adds the table `trigger_deliveries`.
+**Trigger delivery log and test send.** Migration `0040` adds the table `trigger_deliveries`.
 
 - sama writes one row for each delivery to a known trigger, also for a refused one. The
   `outcome` is `accepted`, `duplicate`, `bad_signature`, `disabled`, `bad_body`,

@@ -363,6 +363,6 @@ async def test_the_check_needs_an_admin_and_an_integration(
     assert (await tg.post(f"{base}/telegram/check", headers=mia(tenant))).status_code == 403
     admin = bearer(await add_user(engine, tenant, workspace_member=True, role="admin"))
     assert (await tg.post(f"{base}/slack/check", headers=admin)).status_code == 404
-    assert (await tg.post(f"{base}/email/check", headers=admin)).status_code == 422
+    assert (await tg.post(f"{base}/discord/check", headers=admin)).status_code == 422
     other = bearer("33333333-3333-3333-3333-333333333333")
     assert (await tg.post(f"{base}/telegram/check", headers=other)).status_code == 404

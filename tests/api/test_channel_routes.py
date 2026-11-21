@@ -9,11 +9,11 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import delete
+from sqlalchemy import delete, insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import JwtVerifier, SamaApi
-from sama.db.models import ChannelIdentity
+from sama.db.models import ChannelIdentity, OrgRolePermission
 from sama.gateway.sendgrid_client import SendGridClient
 from sama.gateway.whatsapp_providers import WhatsAppCredentials, build_provider
 from sama.integrations.service import Integrations
@@ -144,3 +144,34 @@ async def test_an_admin_connects_email_and_a_member_pairs(
     assert code["link"] == f"mailto:sama@mail.sama.test?subject={code['code']}"
     listed = (await http.get("/channels/email/identities", headers=mia(tenant))).json()
     assert listed == []
+
+
+async def test_whatsapp_and_email_follow_the_chat_app_permission(
+    http: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    admin = bearer(await add_user(engine, tenant, workspace_member=True, role="admin"))
+    url = f"/orgs/{tenant.org}/integrations/whatsapp"
+    response = await http.post(url, headers=admin, json=whatsapp_body())
+    assert response.status_code == 201, response.text
+    # The test of a chat app is only for Telegram and Slack.
+    check = await http.post(f"/orgs/{tenant.org}/integrations/whatsapp/check", headers=admin)
+    assert check.status_code == 409
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(OrgRolePermission).values(
+                org_id=tenant.org, role="admin", permission="chat_apps.manage", allowed=False
+            )
+        )
+    try:
+        refused = await http.post(url, headers=admin, json=whatsapp_body())
+        assert refused.status_code == 403
+        assert "Connect and disconnect chat apps" in refused.json()["detail"]
+        email = await http.post(f"/orgs/{tenant.org}/integrations/email", headers=admin, json={})
+        assert email.status_code in (403, 422)
+        assert (await http.delete(url, headers=admin)).status_code == 403
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(OrgRolePermission).where(OrgRolePermission.org_id == tenant.org)
+            )
+    assert (await http.delete(url, headers=admin)).status_code == 204

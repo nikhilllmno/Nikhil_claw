@@ -1589,7 +1589,7 @@ class SamaApi:
         async def connect_whatsapp(
             principal: Me, org_id: uuid.UUID, body: WhatsAppConnect
         ) -> dict[str, Any]:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             credentials = WhatsAppCredentials(
                 provider=body.provider,
                 number=body.number.strip(),
@@ -1616,7 +1616,7 @@ class SamaApi:
         async def connect_email(
             principal: Me, org_id: uuid.UUID, body: EmailConnect
         ) -> dict[str, Any]:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 setup = await self._require_integrations().connect_email(
                     org_id,
@@ -1639,7 +1639,7 @@ class SamaApi:
         async def set_model_key(
             principal: Me, org_id: uuid.UUID, provider: Provider, body: ModelKeyIn
         ) -> dict[str, Any]:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 status = await self._require_model_keys().set(
                     org_id, provider, body.api_key, grants.user_id
@@ -1652,7 +1652,7 @@ class SamaApi:
         async def remove_model_key(
             principal: Me, org_id: uuid.UUID, provider: Provider
         ) -> Response:
-            grants = await self._org_admin(principal, org_id)
+            grants = await self._chat_admin(principal, org_id)
             try:
                 await self._require_model_keys().remove(org_id, provider, grants.user_id)
             except ModelKeyError as error:
