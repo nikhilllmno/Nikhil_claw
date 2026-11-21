@@ -27,6 +27,8 @@ from sama.coding.workspace import (
 )
 from sama.orchestrator.sandboxed import SandboxedRuntime
 from sama.runtime.contract import Budget
+from sama.sandbox.base import SandboxError
+from sama.sandbox.local import LocalSandbox
 from sama.tenancy import RunTokenSigner
 from sama.tools.github import GitHubToolError
 from sama.tools.repos import RepoRef
@@ -184,3 +186,28 @@ def test_a_secret_across_a_field_cut_of_the_body_is_scrubbed() -> None:
     outcome = CodingOutcome(CodingAgent.CLAUDE_CODE, "m", text=text)
     body = pull_body(request, outcome, token)
     assert "plain-run" not in body
+
+
+class StrictSandbox(LocalSandbox):
+    """Refuses a command whose ``cwd`` does not exist, as E2B does."""
+
+    async def exec(self, argv: Any, **kwargs: Any) -> Any:
+        cwd = kwargs.get("cwd")
+        if cwd is not None and not Path(cwd).is_dir():  # noqa: ASYNC240 -- a test double
+            raise SandboxError("exec failed: InvalidArgumentException")
+        return await super().exec(argv, **kwargs)
+
+
+async def test_a_folder_that_does_not_exist_is_not_a_cwd(
+    sandboxes: SandboxedRuntime, signer: RunTokenSigner
+) -> None:
+    sandbox = StrictSandbox((await session_sandbox(sandboxes)).root)
+    claims = signer.verify(sandboxes.issue_token(make_scope(), Budget()))
+    # A repository that is not cloned: the folder does not exist yet.
+    with pytest.raises(WorkspaceError, match="cannot clone"):
+        await prepare(sandbox, claims, "t", repo="octo/demo", cloner=None)
+    # The folder of an earlier request is gone: the work folder is used.
+    gone = await prepare(
+        sandbox, claims, "t", repo=None, cloner=None, folder=f"{sandbox.workdir}/old"
+    )
+    assert gone.path == sandbox.workdir
