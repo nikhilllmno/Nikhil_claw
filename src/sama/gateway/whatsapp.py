@@ -79,6 +79,8 @@ def card_buttons(row: Any) -> list[Button]:
 
 
 def card_text(row: Any, *, with_codes: bool) -> str:
+    """The text of a card. The reply codes come first, so that a cut at the text limit of the
+    provider never removes them."""
     text = approval_text(row)
     if not with_codes:
         return text
@@ -86,7 +88,7 @@ def card_text(row: Any, *, with_codes: bool) -> str:
     lines = [f"Reply yes {code} to approve or no {code} to deny."]
     if offers_always(row):
         lines.append(f"Reply always {code} to approve and always allow this tool for you.")
-    return text + "\n\n" + " ".join(lines)
+    return " ".join(lines) + "\n\n" + text
 
 
 class _Outbox(RunOutbox):
@@ -133,7 +135,7 @@ class _Outbox(RunOutbox):
                 self._to, card_text(row, with_codes=False), card_buttons(row)
             )
         else:
-            await self._provider.send_text(self._to, card_text(row, with_codes=True))
+            await self.send_message(card_text(row, with_codes=True))
 
 
 class WhatsAppGateway(DirectGateway[WhatsAppChat]):

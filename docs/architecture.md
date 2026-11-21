@@ -3986,7 +3986,8 @@ kinds (Section 11.6). An org owner or admin connects them on the Settings page o
 
 | Column | WhatsApp | Email |
 |---|---|---|
-| `external_id`, `name` | The number in E.164 form. Unique per kind, so one number belongs to one org. | The inbound address in lower case. Unique per kind. |
+| `external_id` | The account or app that the credentials prove: `meta:<phone number id>`, `twilio:<account SID>:<number>`, or `gupshup:<app id>`. Unique per kind. A number alone is not proven, so it does not block the same number in another org. | `sendgrid:<16 hex characters of the key digest>:<address>`. Unique per kind. The address alone is not proven. |
+| `name` | The number in E.164 form. | The inbound address in lower case. |
 | `settings` | `provider`, and `phone_number_id` (Meta), `account_sid` (Twilio), or `app_id`, `app_name`, and `subscription_id` (Gupshup). | `public_key` of the parse security policy and `sender_name`. |
 | `secret_hash` | The SHA-256 digest of the random token in the webhook URL. | The SHA-256 digest of the SendGrid key. The hub refuses a vault key with another digest (`503`). |
 
@@ -3998,8 +3999,9 @@ kinds (Section 11.6). An org owner or admin connects them on the Settings page o
 | `sendgrid_api_key` | The SendGrid key with `mail.send`. |
 | `email_link_secret` | A random key that signs the approval links (below). |
 
-A connect holds the advisory locks of the org and kind and of the number or address, as in
-Section 11.6. A new number or address deletes the old row with its links. A connect again
+A connect holds the advisory locks of the org and kind and of the `external_id`, as in
+Section 11.6. A new `external_id` deletes the old row with its links. A Meta connect checks
+that the phone number id of the token shows the given number. A connect again
 makes a new webhook token and new link secrets.
 
 **WhatsApp providers.** The gateway sees one interface, `WhatsAppProvider`: `verify`, `parse`,
@@ -4011,7 +4013,7 @@ credentials.
 |---|---|---|---|
 | Meta WhatsApp Cloud API | `X-Hub-Signature-256`: the HMAC-SHA256 of the raw body with the app secret. `GET` with `hub.verify_token` answers `hub.challenge`. | Reply buttons (`interactive`). | 4,096 |
 | Twilio | `X-Twilio-Signature`: the HMAC-SHA1 of the public webhook URL and the sorted form fields with the auth token. | Reply codes, because buttons need an approved content template. | 1,600 |
-| Gupshup | Gupshup does not sign its callbacks. sama adds the subscription itself (version 3, the Meta format) with the header `X-Sama-Webhook-Secret`, and checks the header. The token of the URL is the second check. | Quick reply buttons. | 4,096 |
+| Gupshup | Gupshup does not sign its callbacks. sama adds the subscription itself (version 3, the Meta format) with the header `X-Sama-Webhook-Secret`, and checks the header. The token of the URL is the second check. A row without the header secret in the vault gets `503` (fail closed). | Quick reply buttons. | 4,096 |
 
 **WhatsApp webhook.** Every provider posts to `POST /whatsapp/<integration id>/webhook/<token>`.
 The hub compares the digest of the token with `secret_hash` in constant time (also for an
@@ -4029,7 +4031,8 @@ number of the provider is dropped. A repeated message id is dropped.
 - An approval card has the buttons Approve, Deny, and "Always allow for me" (when the tool
   allows it, Section 9.4.2). A button sends the text `yes CODE`, `no CODE`, or `always CODE`,
   where `CODE` is the first 6 characters of the approval id. A typed reply with the same text
-  decides too. The gateway looks for the code only among the open approvals of the session of
+  decides too. A card without buttons starts with the reply codes, so a cut at the text limit
+  keeps them. The gateway looks for the code only among the open approvals of the session of
   the chat, and `decide` checks the user as for Telegram.
 - Images go to `vision_analyze` (Section 11.7). A voice note is transcribed with the OpenAI key
   of the org (Section 11.5). Another file type gets a short refusal.
@@ -4060,7 +4063,9 @@ MIME message (`send_raw`).
 - **Commands.** An email whose whole text is `/stop`, `/steer TEXT`, `/skills`, `/<skill> TEXT`,
   `/pair CODE`, or `/help`.
 - **Output.** The reply of a run goes out as one plain text email in the thread (a reply over
-  100,000 characters goes on in a second email). A file of a run is an attachment.
+  100,000 characters goes on in a second email). A stored answer of a run without text deltas
+  goes to the outbox whole (at most 200,000 characters), so it follows the same rule. A file of
+  a run is an attachment.
 - **Approvals.** The card email has one link for each choice:
   `<public url>/email/<integration id>/approvals/<token>`. The token holds the approval, the
   choice, the user, and an expiry of 24 hours, with an HMAC-SHA256 of `email_link_secret`.
@@ -4068,6 +4073,10 @@ MIME message (`send_raw`).
   decides nothing. `POST` decides as the user of the link, only while that user still has a
   linked address on the integration. `decide` and the gate check the user as for the other
   channels. A forwarded email lets its reader decide as the user; the card says so.
+
+**Capability URLs in logs.** The webhook token, the approval token, the media signature, and
+`hub.verify_token` are parts of URLs, and access logs show paths. The redactor of the logs
+(`sama.vault.redact`) replaces them with `[REDACTED]` in every log line (Section 16.3).
 
 **Setup through the agent.** `connection_request` accepts the channel names `whatsapp`,
 `whatsapp_meta`, `whatsapp_twilio`, `whatsapp_gupshup`, `email`, `telegram`, and `slack`. For
@@ -4094,9 +4103,9 @@ web app.
 
 - Discord is not in this step: no bot token exists. Microsoft Teams and other channels are
   later.
-- `/handoff` to WhatsApp or email is not available, because WhatsApp needs a template outside
-  the 24-hour window, and an email thread starts only from the user. A web handoff of a session
-  of these channels works (it deletes the binding).
+- `/handoff` from or to WhatsApp or email is not available, because WhatsApp needs a template
+  outside the 24-hour window, and an email thread starts only from the user. An unlink of the
+  number or the address stops the output of its sessions.
 - A job with the target `origin` in these channels keeps its result in the session (Section
   12.1). `email:<address>` delivery works as before.
 - The repeat filter, the pairing lockout, the prompt limit, and the run followers are in memory,

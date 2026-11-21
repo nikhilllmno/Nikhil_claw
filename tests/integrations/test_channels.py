@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import AuditEntry, ChannelIdentity, Integration, VaultSecret
@@ -138,7 +138,8 @@ async def test_twilio_connects_and_gives_the_webhook_url(
 ) -> None:
     setup = await integrations.connect_whatsapp(tenant.org, tenant.ids["mia"], twilio())
     view = setup.integration
-    assert (view.kind, view.status, view.external_id) == ("whatsapp", "active", NUMBER)
+    assert (view.kind, view.status, view.name) == ("whatsapp", "active", NUMBER)
+    assert view.external_id == f"twilio:{SID}:{NUMBER}", "unique only with the proven account"
     token = setup.webhook_url.rsplit("/", 1)[1]
     assert setup.webhook_url == f"{PUBLIC}/whatsapp/{view.id}/webhook/{token}"
     assert setup.verify_token is None
@@ -216,7 +217,7 @@ async def test_wrong_whatsapp_credentials_are_refused(
         assert await connection.scalar(select(Integration.id)) is None
 
 
-async def test_a_number_of_another_org_is_refused(
+async def test_a_number_of_another_org_is_refused_only_with_the_same_account(
     engine: AsyncEngine, tenant: Tenant, integrations: Integrations
 ) -> None:
     await integrations.connect_whatsapp(tenant.org, tenant.ids["mia"], twilio())
@@ -224,6 +225,25 @@ async def test_a_number_of_another_org_is_refused(
     with pytest.raises(IntegrationError) as error:
         await integrations.connect_whatsapp(other.org, other.ids["mia"], twilio())
     assert error.value.status_code == 409
+    # Another Twilio account cannot block the number: the number alone is not proven.
+    third = await add_tenant(engine)
+    another = WhatsAppCredentials("twilio", NUMBER, SecretStr(AUTH), account_sid="AC" + "3" * 32)
+    setup = await integrations.connect_whatsapp(third.org, third.ids["mia"], another)
+    assert setup.integration.status == "active"
+
+
+async def test_meta_refuses_a_phone_number_id_of_another_number(
+    tenant: Tenant, integrations: Integrations
+) -> None:
+    other = WhatsAppCredentials(
+        "meta",
+        "+15559998888",
+        SecretStr("EAA" + "t" * 40),
+        app_secret=SecretStr(APP_SECRET),
+        phone_number_id="7777777",
+    )
+    with pytest.raises(IntegrationError, match="did not accept"):
+        await integrations.connect_whatsapp(tenant.org, tenant.ids["mia"], other)
 
 
 async def test_email_connects_with_a_sendgrid_key_and_a_public_key(
@@ -238,7 +258,8 @@ async def test_email_connects_with_a_sendgrid_key_and_a_public_key(
         api_key=key,
         parse_public_key=public,
     )
-    assert setup.integration.external_id == "sama@mail.sama.test"
+    assert setup.integration.name == "sama@mail.sama.test"
+    assert str(setup.integration.external_id).endswith(":sama@mail.sama.test")
     assert setup.webhook_url == f"{PUBLIC}/email/{setup.integration.id}/inbound"
     assert any("mx.sendgrid.net" in step for step in setup.steps)
     assert await names(engine, tenant.org) == {"sendgrid_api_key", "email_link_secret"}
@@ -372,3 +393,28 @@ async def test_a_media_link_works_only_with_its_signature(
     assert answer.headers["content-type"] == "image/png"
     assert (await http.get(path, params={"e": expires, "s": sig + "x"})).status_code == 404
     assert (await http.get(path, params={"e": expires + 1, "s": sig})).status_code == 404
+
+
+async def test_a_gupshup_number_without_its_header_secret_is_not_available(
+    engine: AsyncEngine,
+    tenant: Tenant,
+    integrations: Integrations,
+    vault: Vault,
+    http: httpx.AsyncClient,
+) -> None:
+    setup = await integrations.connect_whatsapp(tenant.org, tenant.ids["mia"], gupshup())
+    path = setup.webhook_url.removeprefix(PUBLIC)
+    header = await vault.get(tenant.org, SecretName.WHATSAPP_APP_SECRET, fresh=True)
+    assert header is not None
+    body = b'{"type": "message", "app": "samaapp", "payload": {}}'
+    good = await http.post(
+        path, content=body, headers={"X-Sama-Webhook-Secret": header.get_secret_value()}
+    )
+    assert good.status_code == 200
+    assert (await http.post(path, content=body)).status_code == 401
+    await vault.delete(tenant.org, SecretName.WHATSAPP_APP_SECRET)
+    async with integrations._engine.begin() as connection:
+        await connection.execute(
+            update(Integration).values(updated_at=func.now() + text("interval '1 second'"))
+        )
+    assert (await http.post(path, content=body)).status_code == 503

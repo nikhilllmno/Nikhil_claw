@@ -197,13 +197,14 @@ class EmailHub(GatewayCache[_Address]):
                         Integration.org_id,
                         Integration.status,
                         Integration.external_id,
+                        Integration.name,
                         Integration.secret_hash,
                         Integration.settings,
                         Integration.updated_at,
                     ).where(Integration.id == key, Integration.kind == "email")
                 )
             ).one_or_none()
-        if row is None or row.status != "active" or not row.external_id or not row.secret_hash:
+        if row is None or row.status != "active" or not row.name or not row.secret_hash:
             raise HTTPException(status_code=401, detail=UNKNOWN)
         return row
 
@@ -249,7 +250,7 @@ class EmailHub(GatewayCache[_Address]):
             address=EmailAddress(
                 row.id,
                 row.org_id,
-                str(row.external_id),
+                str(row.name),
                 str(settings.get("sender_name") or "sama"),
             ),
             public_url=self._public_url,

@@ -318,3 +318,22 @@ async def test_an_image_attachment_is_stored(
     async with engine.connect() as connection:
         names = (await connection.scalars(select(Attachment.name))).all()
     assert names == ["cat.png"]
+
+
+async def test_a_long_stored_answer_goes_out_as_one_email(
+    http: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    keys: Any,
+    hub: EmailHub,
+    sendgrid: FakeSendGrid,
+) -> None:
+    await pair(http, engine, tenant, keys, hub)
+    harness = Harness(engine)
+    answer = "word " * 5000
+    harness.runtime.add_script(FakeScript(events=(RunCompleted(output=answer),)))
+    await post_mail(http, tenant, keys, hub, subject="Long", text="write a lot", runs=True)
+    assert await harness.worker.run_once()
+    await hub.drain()
+    assert sendgrid.texts(MIA)[-1] == answer.strip() or sendgrid.texts(MIA)[-1] == answer
+    assert len(sendgrid.texts(MIA)) == 2, "the pairing answer and one reply"

@@ -268,6 +268,7 @@ def test_gupshup_checks_its_header_and_parses_both_formats() -> None:
     provider = gupshup(Recorder())
     assert provider.verify("u", {SECRET_HEADER: "hs"}, b"")
     assert not provider.verify("u", {SECRET_HEADER: "no"}, b"")
+    assert not gupshup(Recorder(), header=None).verify("u", {SECRET_HEADER: ""}, b""), "fail closed"
     v2 = json.dumps(
         {
             "app": "samaapp",

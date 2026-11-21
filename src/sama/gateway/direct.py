@@ -66,6 +66,8 @@ log: Final = logging.getLogger("sama.gateway.direct")
 
 MAX_INPUT_CHARS: Final = 32_000
 """The same cap as ``POST /sessions/{id}/messages``."""
+MAX_STORED_ANSWER_CHARS: Final = 200_000
+"""The most text of a stored answer that a direct channel sends when the run sent no deltas."""
 BUSY: Final = "sama is busy now. Send the message again in a few minutes."
 NO_ACCESS: Final = "You do not have access to this workspace now."
 WRONG_CODE: Final = "This code is wrong, used, or expired. Make a new code on the sama web page."
@@ -539,7 +541,18 @@ class DirectGateway[C: Conversation](abc.ABC):
                 status = await follow_run(
                     self._engine, org_id, run_id, reply, self._settings, outbox.send_card
                 )
-                await send_ending(self._engine, outbox, org_id, run_id, status, reply)
+                # The outbox splits by the limits of the channel (one email, or WhatsApp
+                # messages), so the stored answer goes to it whole.
+                await send_ending(
+                    self._engine,
+                    outbox,
+                    org_id,
+                    run_id,
+                    status,
+                    reply,
+                    max_chars=MAX_STORED_ANSWER_CHARS,
+                    split_at=None,
+                )
                 await send_media(self._engine, outbox, org_id, run_id)
                 after = await self._queue.requeued_run(org_id=org_id, run_id=run_id)
                 if after is None:

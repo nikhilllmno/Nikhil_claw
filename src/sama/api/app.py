@@ -2792,10 +2792,10 @@ class SamaApi:
         link: str | None
         if channel == "whatsapp":
             # The link opens a chat with the number and fills in the code.
-            link = f"https://wa.me/{str(bot.external_id).lstrip('+')}?text={code}"
+            link = f"https://wa.me/{str(bot.name).lstrip('+')}?text={code}"
             command = code
         elif channel == "email":
-            link = f"mailto:{bot.external_id}?subject={code}"
+            link = f"mailto:{bot.name}?subject={code}"
             command = code
         elif channel == "slack":
             # The link opens the direct messages with the app. The code goes in by hand.

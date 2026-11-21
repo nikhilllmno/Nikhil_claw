@@ -586,7 +586,7 @@ class Integrations:
             async with _locked(
                 self._engine,
                 _org_key(org_id, "whatsapp"),
-                _external_key("whatsapp", credentials.number),
+                _external_key("whatsapp", whatsapp_external_id(credentials)),
             ):
                 old = await self._old_gupshup(vault, org_id)
                 async with self._engine.begin() as connection:
@@ -595,7 +595,8 @@ class Integrations:
                         org_id,
                         user_id,
                         kind="whatsapp",
-                        external_id=credentials.number,
+                        external_id=whatsapp_external_id(credentials),
+                        name=credentials.number,
                         settings=settings,
                         digest=secret_hash(token),
                         details={"kind": "whatsapp", "provider": credentials.provider},
@@ -724,8 +725,10 @@ class Integrations:
         if SEND_SCOPE not in scopes:
             raise IntegrationError("the SendGrid API key needs the Mail Send permission.")
         settings = {"public_key": parse_public_key.strip(), "sender_name": sender_name}
+        # The address is not proven, so it is unique only with the SendGrid key (Section 11.9).
+        email_id = f"sendgrid:{secret_hash(key)[:16]}:{address}"
         async with (
-            _locked(self._engine, _org_key(org_id, "email"), _external_key("email", address)),
+            _locked(self._engine, _org_key(org_id, "email"), _external_key("email", email_id)),
             self._engine.begin() as connection,
         ):
             view = await self._store_channel(
@@ -733,7 +736,8 @@ class Integrations:
                 org_id,
                 user_id,
                 kind="email",
-                external_id=address,
+                external_id=email_id,
+                name=address,
                 settings=settings,
                 digest=secret_hash(key),
                 details={"kind": "email", "address": address},
@@ -755,6 +759,7 @@ class Integrations:
         *,
         kind: str,
         external_id: str,
+        name: str,
         settings: dict[str, Any],
         digest: str,
         details: dict[str, Any],
@@ -791,7 +796,7 @@ class Integrations:
         values = {
             "status": "active",
             "external_id": external_id,
-            "name": external_id,
+            "name": name,
             "settings": settings,
             "secret_hash": digest,
             "last_error": None,
@@ -951,6 +956,17 @@ _NOUNS: Final = {"whatsapp": "WhatsApp number", "email": "email address"}
 
 def _org_key(org_id: uuid.UUID, kind: str) -> str:
     return f"sama.integration:org:{org_id}:{kind}"
+
+
+def whatsapp_external_id(credentials: WhatsAppCredentials) -> str:
+    """The ``external_id`` of a WhatsApp row: the account or app of the provider that the
+    credentials proved, with the number. A number alone is not proven, so it cannot block the
+    same number in another org (Section 11.9)."""
+    if credentials.provider == "meta":
+        return f"meta:{credentials.phone_number_id}"
+    if credentials.provider == "twilio":
+        return f"twilio:{credentials.account_sid}:{credentials.number}"
+    return f"gupshup:{credentials.app_id}"
 
 
 def _external_key(kind: str, external_id: str) -> str:

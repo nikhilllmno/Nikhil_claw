@@ -312,8 +312,8 @@ class MetaProvider(WhatsAppProvider):
 
     async def check(self) -> None:
         data = await self._call("GET", f"{self.phone_number_id}?fields=display_phone_number")
-        shown = e164(data.get("display_phone_number"))
-        if shown is not None and shown != self.number:
+        # The token proves the phone number id. The number must be the number of that id.
+        if e164(data.get("display_phone_number")) != self.number:
             raise WhatsAppError("the phone number id belongs to another number")
 
     async def _send(self, to: str, body: dict[str, Any]) -> str:
@@ -461,10 +461,10 @@ class GupshupProvider(WhatsAppProvider):
         self.http = http or httpx.AsyncClient(timeout=20.0)
 
     def verify(self, url: str, headers: Mapping[str, str], body: bytes) -> bool:
-        # The hub checked the token of the webhook URL. The header is a second check, for a
-        # subscription that sends it.
-        if self.header_secret is None:
-            return True
+        # The hub checked the token of the webhook URL. The header of the subscription is the
+        # second check. Without a secret the check fails closed.
+        if self.header_secret is None or not self.header_secret.get_secret_value():
+            return False
         given = headers.get(SECRET_HEADER, "")
         return hmac.compare_digest(self.header_secret.get_secret_value(), given)
 

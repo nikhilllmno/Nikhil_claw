@@ -198,14 +198,14 @@ class WhatsAppHub(GatewayCache[_Number]):
             token is None
             or link is None
             or provider_name not in PROVIDERS
-            or (provider_name == "meta" and app_secret is None)
+            or (provider_name in ("meta", "gupshup") and app_secret is None)
         ):
             log.error("a WhatsApp integration has no secrets id=%s", row.id)
             raise HTTPException(status_code=503, detail="the number is not available")
         provider = self._whatsapp_provider(
             WhatsAppCredentials(
                 provider=provider_name,
-                number=str(row.external_id),
+                number=str(row.name),
                 api_token=token,
                 app_secret=app_secret,
                 phone_number_id=settings.get("phone_number_id"),
@@ -284,6 +284,7 @@ def _select() -> Any:
         Integration.org_id,
         Integration.status,
         Integration.external_id,
+        Integration.name,
         Integration.secret_hash,
         Integration.settings,
         Integration.updated_at,

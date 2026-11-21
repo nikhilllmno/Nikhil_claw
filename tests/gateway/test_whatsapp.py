@@ -348,3 +348,26 @@ async def test_a_repeated_message_is_dropped(
 def test_the_approval_code_is_the_start_of_the_id() -> None:
     approval_id = uuid.UUID("ab12cd34-0000-4000-8000-000000000000")
     assert approval_code(approval_id) == "AB12CD"
+
+
+async def test_a_long_card_without_buttons_keeps_its_reply_code(
+    gateway: WhatsAppGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    provider: FakeWhatsApp,
+) -> None:
+    provider.buttons = False
+    provider.max_text = 120
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(approval_script())
+    await gateway.handle(inbound("clean up"))
+    assert await harness.worker.run_once()
+
+    async def carded() -> bool:
+        return any("Reply yes" in text for text in provider.texts())
+
+    await until(carded)
+    first = next(text for text in provider.texts() if "Reply yes" in text)
+    assert first.startswith("Reply yes ")
+    assert all(len(text) <= 120 for text in provider.texts())

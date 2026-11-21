@@ -181,3 +181,17 @@ def test_a_mail_body_for_sendgrid() -> None:
     assert body["personalizations"] == [{"to": [{"email": "mia@example.com"}]}]
     assert body["reply_to"] == {"email": "sama+t1@mail.sama.test"}
     assert body["attachments"][0]["content"] == "cG5n"
+
+
+def test_capability_urls_are_redacted_in_logs() -> None:
+    from sama.vault.redact import redact
+
+    integration = uuid.uuid4()
+    lines = (
+        f"POST /whatsapp/{integration}/webhook/tok_SECRET-1 HTTP/1.1",
+        f"GET /email/{integration}/approvals/abc.SECRET_2 HTTP/1.1",
+        f"GET /whatsapp/{integration}/media/{uuid.uuid4()}?e=1&s=SECRET_3 HTTP/1.1",
+        "GET /x?hub.mode=subscribe&hub.verify_token=SECRET_4",
+    )
+    for line in lines:
+        assert "SECRET" not in redact(line)

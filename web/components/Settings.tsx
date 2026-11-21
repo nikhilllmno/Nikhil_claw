@@ -171,15 +171,15 @@ function Agents({
   );
 }
 
-type PairTarget = { workspaceId: string; profileId: string };
+type PairTarget = { workspaceId: string; profileId: string; channel: ChatChannel };
 type PairResult = { code: PairingCode | null; error: string | null };
 
 function pairKey(t: PairTarget): string {
-  return `${t.workspaceId}:${t.profileId}`;
+  return `${t.channel}:${t.workspaceId}:${t.profileId}`;
 }
 
 function samePair(a: PairTarget, b: PairTarget | null): boolean {
-  return b !== null && a.workspaceId === b.workspaceId && a.profileId === b.profileId;
+  return b !== null && a.workspaceId === b.workspaceId && a.profileId === b.profileId && a.channel === b.channel;
 }
 
 function LinkedAccounts({
@@ -201,21 +201,25 @@ function LinkedAccounts({
   const identities = useLoad(load, "Could not load the linked chat accounts.");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // A code belongs to one workspace and one agent. It shows only for that pair. An answer that
-  // comes after the pair changed is kept under its own pair and does not show for the new pair.
+  // A code belongs to one channel, one workspace, and one agent. It shows only for that target. An
+  // answer that comes after the target changed is kept under its own target and does not show for
+  // the new one.
   const [pairing, setPairing] = useState<PairTarget | null>(null);
   const [pairResults, setPairResults] = useState<Record<string, PairResult>>({});
   const profiles = profilesFor(workspaceId);
   const [profileId, setProfileId] = useState<string | null>(null);
   const agent = profiles.find((p) => p.id === profileId) ?? profiles[0] ?? null;
-  const target = workspaceId !== null && agent !== null ? { workspaceId, profileId: agent.id } : null;
-  const pairingHere = pairing !== null && samePair(pairing, target);
-  const result = target === null ? null : (pairResults[pairKey(target)] ?? null);
   const active = PAIRING_CHANNELS.filter(
     (c) => org?.integrations.some((i) => i.kind === c && i.status === "active") ?? false,
   );
   const [chosen, setChosen] = useState<ChatChannel | null>(null);
   const channel = chosen !== null && active.includes(chosen) ? chosen : (active[0] ?? null);
+  const target =
+    workspaceId !== null && agent !== null && channel !== null
+      ? { workspaceId, profileId: agent.id, channel }
+      : null;
+  const pairingHere = pairing !== null && samePair(pairing, target);
+  const result = target === null ? null : (pairResults[pairKey(target)] ?? null);
   const [now] = useState(() => Date.now());
 
   const where = (identity: ChannelIdentity) => {
@@ -240,7 +244,7 @@ function LinkedAccounts({
   };
 
   const pair = async () => {
-    if (target === null || channel === null) return;
+    if (target === null) return;
     const started = { ...target };
     setPairing(started);
     const key = pairKey(started);
@@ -251,7 +255,7 @@ function LinkedAccounts({
       return next;
     });
     try {
-      const code = await api.createPairingCode(channel, started.workspaceId, started.profileId);
+      const code = await api.createPairingCode(started.channel, started.workspaceId, started.profileId);
       keep({ code, error: null });
     } catch (e) {
       keep({ code: null, error: errorText(e, "No code was made.") });
