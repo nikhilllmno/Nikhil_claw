@@ -5,17 +5,27 @@ assembler keeps the runtime of the profile in the frozen config."""
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.coding.agents import CodingAgent
-from sama.coding.commands import DIRECT_OFF, NOT_DIRECT, parse_command, set_direct
-from sama.db.models import Run, Session
+from sama.coding.commands import (
+    DIRECT_OFF,
+    NOT_DIRECT,
+    SwitchNotAllowedError,
+    may_switch,
+    parse_command,
+    set_direct,
+)
+from sama.db.models import Membership, Run, Session, User
 from sama.orchestrator.queue import RunQueue
 from sama.prompt import PromptAssembler
 from sama.runtime.contract import RuntimeKind
+from sama.tenancy.access import Grants
 from tests.orchestrator.conftest import Tenant
 from tests.review.support import OWNER, set_profile
 
@@ -61,7 +71,14 @@ async def test_the_direct_mode_sends_chat_runs_to_the_agent_until_sama(
 ) -> None:
     queue = RunQueue(engine)
     await set_profile(engine, tenant, runtime="claude_agent_sdk", model="claude-sonnet-4-5")
-    answer = await set_direct(engine, tenant.org, tenant.ids["s1"], CodingAgent.CLAUDE_CODE)
+    mia = tenant.ids["mia"]
+    # s1 is a shared session with no owner: mia, a member, may not switch it.
+    with pytest.raises(SwitchNotAllowedError, match="Only the owner or an admin"):
+        await set_direct(engine, tenant.org, tenant.ids["s1"], CodingAgent.CLAUDE_CODE, user_id=mia)
+    await _make_admin(engine, tenant)
+    answer = await set_direct(
+        engine, tenant.org, tenant.ids["s1"], CodingAgent.CLAUDE_CODE, user_id=mia
+    )
     assert "Claude Code" in answer
     await _enqueue(queue, tenant)
     run = await queue.claim(OWNER)
@@ -73,12 +90,68 @@ async def test_the_direct_mode_sends_chat_runs_to_the_agent_until_sama(
             .where(Run.id == run.run_id)
             .values(status="cancelled", lease_owner=None, lease_expires_at=None)
         )
-    assert await set_direct(engine, tenant.org, tenant.ids["s1"], None) == DIRECT_OFF
-    assert await set_direct(engine, tenant.org, tenant.ids["s1"], None) == NOT_DIRECT
+    assert await set_direct(engine, tenant.org, tenant.ids["s1"], None, user_id=mia) == DIRECT_OFF
+    assert await set_direct(engine, tenant.org, tenant.ids["s1"], None, user_id=mia) == NOT_DIRECT
     await _enqueue(queue, tenant)
     run = await queue.claim(OWNER)
     assert run is not None
     assert run.runtime == "claude_agent_sdk"
+
+
+async def _make_admin(engine: AsyncEngine, tenant: Tenant) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Membership)
+            .where(
+                Membership.org_id == tenant.org,
+                Membership.user_id == tenant.ids["mia"],
+                Membership.workspace_id == tenant.ids["ws"],
+            )
+            .values(role="admin")
+        )
+
+
+async def test_the_owner_switches_a_private_session_and_others_cannot_see_it(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    mine = tenant.ids["mine"]
+    answer = await set_direct(
+        engine, tenant.org, mine, CodingAgent.CODEX, user_id=tenant.ids["mia"]
+    )
+    assert "Codex" in answer
+    # Another user of the org cannot see the private session, so it does not exist for them.
+    other = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(User).values(
+                id=other,
+                org_id=tenant.org,
+                auth_user_id=uuid.uuid4(),
+                email="bo@example.test",
+                display_name="bo",
+            )
+        )
+        await connection.execute(
+            insert(Membership).values(org_id=tenant.org, user_id=other, role="admin")
+        )
+    with pytest.raises(SwitchNotAllowedError, match="does not exist"):
+        await set_direct(engine, tenant.org, mine, None, user_id=other)
+
+
+def test_the_switch_rule() -> None:
+    user, ws = uuid.uuid4(), uuid.uuid4()
+    member = Grants(user, ((None, "member"), (ws, "member")))
+    ws_admin = Grants(user, ((None, "member"), (ws, "admin")))
+    org_admin = Grants(user, ((None, "admin"),))
+    assert may_switch(member, audience="private", owner_user_id=user, workspace_id=ws)
+    assert not may_switch(member, audience="shared", owner_user_id=None, workspace_id=ws)
+    assert may_switch(member, audience="shared", owner_user_id=user, workspace_id=ws)
+    assert may_switch(ws_admin, audience="shared", owner_user_id=None, workspace_id=ws)
+    assert may_switch(org_admin, audience="shared", owner_user_id=None, workspace_id=ws)
+    # An admin never switches the private session of another user.
+    assert not may_switch(
+        org_admin, audience="private", owner_user_id=uuid.uuid4(), workspace_id=ws
+    )
 
 
 async def test_a_compact_run_stays_on_the_sama_runtime(engine: AsyncEngine, tenant: Tenant) -> None:

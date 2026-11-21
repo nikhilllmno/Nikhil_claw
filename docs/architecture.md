@@ -5999,6 +5999,14 @@ the session. They have no provider key and no GitHub token:
 | `/claude <task>`, `/codex <task>` | The channel queues one message for the coding agent (`runs.coding_agent`). The run uses the runtime of the agent and not the runtime of the session. |
 | Direct mode | `/claude` or `/codex` with no task sets `sessions.coding_agent`. Each later chat message of the session goes to that CLI until `/sama`. An agent profile with the runtime `claude_code` or `codex` is in the direct mode for all its sessions. |
 
+**Who may switch.** A switch of the direct mode changes the session for each person in it, so
+it follows the rule of the settings console (`PATCH /sessions/{id}`, M7.10): in a private
+session the owner; in a shared session the owner of the session or an admin of the workspace
+or the org (`sama.coding.commands.may_switch`). Others get `403` from
+`POST /sessions/{id}/coding-agent`, and `/claude`, `/codex`, or `/sama` with no task answers
+that only the owner or an admin can switch the session. A task (`/claude <task>`) is one
+message: each member who may send messages may send it, and the tool gate asks as usual.
+
 The commands work in Telegram (`/claude`, `/codex`, `/sama`), in Slack (`/sama claude
 [task]`, `/sama codex [task]`, `/sama sama` in a direct message, or a mention with `/claude
 <task>`), in WhatsApp and email (M7.8: `/claude`, `/codex`, `/sama` as the whole text), and in

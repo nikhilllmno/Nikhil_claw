@@ -7,6 +7,11 @@ Section 15.4).
   message goes to that coding agent (``sessions.coding_agent``).
 - ``/sama`` ends the direct mode.
 
+A switch changes the session for each person in it, so only the owner of the session, or an
+admin of the workspace or the org in a shared session, may switch (``may_switch``, the rule of
+the settings console). A task (``/claude <task>``) is open to each member who may send
+messages; the tool gate asks for it as usual.
+
 The commands work in Telegram, in Slack (``/sama claude ...``, ``/sama codex ...``,
 ``/sama sama``, or a mention with ``/claude ...``), and in the web composer.
 """
@@ -23,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.coding.agents import CodingAgent, label
 from sama.db.models import Session
+from sama.tenancy.access import Grants, load_grants
 
 COMMANDS: Final = {"/claude": CodingAgent.CLAUDE_CODE, "/codex": CodingAgent.CODEX}
 SAMA_COMMAND: Final = "/sama"
@@ -35,6 +41,10 @@ DIRECT_ON: Final = (
 )
 DIRECT_OFF: Final = "sama answers the messages of this session again."
 NOT_DIRECT: Final = "This session is not in a direct mode. sama answers its messages."
+NOT_ALLOWED: Final = (
+    "Only the owner or an admin can switch this shared session to a coding agent and back. "
+    "You can still send one task: write /claude or /codex, then the task."
+)
 HELP_LINES: Final = (
     "/claude <task> - send a coding task to Claude Code. /claude alone sends each message to "
     "Claude Code until /sama",
@@ -68,28 +78,64 @@ def parse_command(text: str) -> CodingCommand | None:
     return CodingCommand(COMMANDS[name], task)
 
 
+class SwitchNotAllowedError(Exception):
+    """The user may not switch the direct mode of the session. The message is for the user."""
+
+
+def may_switch(
+    grants: Grants, *, audience: str, owner_user_id: uuid.UUID | None, workspace_id: uuid.UUID
+) -> bool:
+    """The rule of the settings console (``PATCH /sessions/{id}``, M7.10): the owner of the
+    session may switch it. In a shared session an admin of the workspace or of the org may too.
+    A switch changes the session for each person in it."""
+    return bool(
+        owner_user_id == grants.user_id
+        or (audience == "shared" and (grants.org_admin or grants.admins_workspace(workspace_id)))
+    )
+
+
 async def set_direct(
     engine: AsyncEngine,
     org_id: uuid.UUID,
     session_id: uuid.UUID,
     agent: CodingAgent | None,
+    *,
+    user_id: uuid.UUID,
 ) -> str:
-    """Starts or ends the direct mode of a session and returns the answer for the user. The
-    caller checked that the user can use the session."""
+    """Starts or ends the direct mode of a session for ``user_id`` and returns the answer for
+    the user. Raises ``SwitchNotAllowedError`` when the user may not switch the session
+    (``may_switch``) or cannot see it."""
     async with engine.begin() as connection:
-        was = (
+        row = (
             await connection.execute(
-                select(Session.coding_agent)
+                select(
+                    Session.coding_agent,
+                    Session.audience,
+                    Session.owner_user_id,
+                    Session.workspace_id,
+                )
                 .where(Session.org_id == org_id, Session.id == session_id)
                 .with_for_update()
             )
-        ).scalar_one_or_none()
+        ).one_or_none()
+        if row is None:
+            raise SwitchNotAllowedError("The session does not exist.")
+        grants = await load_grants(connection, org_id, user_id)
+        if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
+            raise SwitchNotAllowedError("The session does not exist.")
+        if not may_switch(
+            grants,
+            audience=row.audience,
+            owner_user_id=row.owner_user_id,
+            workspace_id=row.workspace_id,
+        ):
+            raise SwitchNotAllowedError(NOT_ALLOWED)
         await connection.execute(
             update(Session)
             .where(Session.org_id == org_id, Session.id == session_id)
             .values(coding_agent=None if agent is None else agent.value)
         )
-    return direct_answer(agent, was)
+    return direct_answer(agent, row.coding_agent)
 
 
 def direct_answer(agent: CodingAgent | None, was: str | None) -> str:
