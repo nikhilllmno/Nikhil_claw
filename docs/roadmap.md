@@ -379,7 +379,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.1,
   M4.3: an approval card for a job in a chat, email from a provider other than SendGrid, and
   an admin view of the jobs of other users.
 - M6.1: `change_propose` for the soul, the settings (name, runtime, model, sub-agents), the
-  toolsets, and the profile policy rules (architecture Sections 9.4.2 and 11.4). Migration `0032`
+  toolsets, and the profile policy rules (architecture Sections 9.4.2 and 11.4). Migration `0033`
   adds the proposal kinds `profile`, `toolsets`, and `policy`, `sessions.profile_snapshot`, and
   `profile_changes` (the history, with RLS like `agent_profiles`). The approval card in the web
   app, Telegram, and Slack shows a diff. An approval, an admin edit, and a revert each write a

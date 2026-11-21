@@ -859,7 +859,7 @@ Rules:
   at the same time. A change to the profile SOUL, model, or runtime, or to a context file,
   applies from the next session.
 - Since M6.1, the assembler also writes `sessions.profile_snapshot` when it freezes the config
-  (migration `0032`): the toolsets, the group toolsets, and the policy rules of the profile at
+  (migration `0033`): the toolsets, the group toolsets, and the policy rules of the profile at
   that time. The gate uses it (Section 16.1), so a new toolset or a looser profile rule applies
   from the next session. A session from before M6.1 has no snapshot and uses the live values.
 - `RunQueue.enqueue` takes the runtime from the frozen config of the session, if there is
@@ -1958,7 +1958,7 @@ The card shows a diff in place of the arguments, in the web app, Telegram, and S
 that the change applies to new sessions.
 
 Each approved change, each edit of an admin (Section 11.4), and each revert writes one row of
-`profile_changes` (the history, migration `0032`) and the audit row `profile.updated` with the
+`profile_changes` (the history, migration `0033`) and the audit row `profile.updated` with the
 `change_id`. A row has the kind (`soul`, `profile`, `toolsets`, or `policy`), the source
 (`proposal`, `edit`, or `revert`), `before`, `after`, the actor, and the proposal. RLS on
 `profile_changes` is the same as for `agent_profiles`: an org owner or admin sees every row of
