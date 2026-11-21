@@ -201,7 +201,12 @@ async def test_a_drag_that_fails_while_it_moves_releases_the_button(
 
 
 def test_the_cdp_session_has_vision_mode() -> None:
+    from sama.browser.chrome import ChromeSession
+
     assert has_vision(PlaywrightSession)
+    # The my_chrome session gets vision mode later (Section 14.2.2): the service refuses a
+    # point on it, so a point cannot pass its sensitive check, which reads refs.
+    assert not has_vision(ChromeSession)
     assert not has_vision(object())
 
 
