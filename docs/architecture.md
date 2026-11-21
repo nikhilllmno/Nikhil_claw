@@ -3042,6 +3042,8 @@ with the API (Section 11.4).
   of the create. The table `api_keys` keeps only the SHA-256 hash (`key_hash`) and the first 12
   characters (`prefix`). Org admins read the rows through the Data API, but not `key_hash`
   (column grants, as for `org_invites`). Only the control plane writes the table.
+- The redactor knows the form `sama_sk_...`, so a key that a person pastes in a message, a
+  log, or a trace becomes `[REDACTED]` (Section 16.3).
 - A create and a revoke write the audit entries `api_key.created` and `api_key.revoked`. A
   revoke applies at the next request.
 - Each request checks the key again: it exists, it is not revoked or expired, it has the
@@ -3106,7 +3108,8 @@ in the web app:
   `budget_exceeded`), `409` `run_cancelled`, and `504` `run_timeout`. After the answer
   started, or in a stream, the error is in the body or in a `data:` event.
 - One process lets at most 200 requests wait for runs at one time, and one key at most 16
-  (`429`).
+  (`429`). The answer gives its place back in a `finally` when it ends, also when the client
+  goes away or a send fails. A streamed answer ends at most 60 seconds after the wait limit.
 
 **MCP server for other agents.** The tools give JSON text. Each tool call checks the key
 again. A tool call waits at most 45 seconds, because a stateless MCP answer sends no byte
@@ -3118,9 +3121,9 @@ before it ends. A longer run gives its `run_id`, and the client asks again with 
 | `send_message(text, session_id, agent, wait_s)` | Starts a run: a message to a session of the key, or to a new session with the agent. Waits up to `wait_s` (default 30, at most 45) and gives the reply, or the `run_id`, the status, and the approval that the run waits for. |
 | `run_get(run_id, wait_s)` | The status and the reply of a run of the key. |
 | `session_read(session_id, after_seq, limit)` | The user and assistant messages of a session, oldest first, at most 50, each cut at 8,000 characters. |
-| `session_search(query, limit)` | The sessions of the key workspace that the user sees (Section 7.1). |
+| `session_search(query, limit)` | The sessions of the key workspace that the user sees (Section 7.1). A key for one agent profile finds only the sessions of that profile. |
 | `skills_list()` | The skills that the user sees in the key workspace (Section 9.2). |
-| `workflows_list()`, `workflow_run(workflow_id, inputs)`, `workflow_get(instance_id)` | The workflows of the key user in the key workspace (Section 12.3). A version that waits for a human approval does not start. |
+| `workflows_list()`, `workflow_run(workflow_id, inputs)`, `workflow_get(instance_id)` | The workflows of the key user in the key workspace (Section 12.3). A version that waits for a human approval does not start. A key for one agent profile cannot use these tools (`403`), because an agent step can name another profile. |
 
 A request without a valid key gets `401` before MCP reads it. The MCP check of the `Host`
 header is off, as in the tool server: a browser cannot add the key. The tool text is redacted

@@ -9,7 +9,7 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.apikeys import ApiKeyStore, KeyContext
-from sama.db.models import AgentProfile
+from sama.db.models import AgentProfile, Session
 from sama.orchestrator.queue import RunQueue
 from sama.scheduler.jobs import Actor
 from sama.server import ServerCore, ServerError
@@ -98,3 +98,49 @@ async def test_a_workflow_of_the_key_user_starts_and_shows(
     with pytest.raises(ServerError) as error:
         await core.start_workflow(key, uuid.uuid4(), {})
     assert error.value.status == 404
+
+
+async def test_a_profile_bound_key_searches_only_its_profile(
+    engine: AsyncEngine, keys: Keys, admin: Tenant
+) -> None:
+    other = uuid.uuid4()
+    hidden = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(AgentProfile).values(
+                id=other, org_id=admin.org, name="second", runtime="fake", model="fake-model"
+            )
+        )
+        await connection.execute(
+            insert(Session).values(
+                id=hidden,
+                org_id=admin.org,
+                workspace_id=admin.ids["ws"],
+                agent_profile_id=other,
+                audience="shared",
+                title="secret plans",
+            )
+        )
+    core = ServerCore(engine, settings=FAST)
+    free = {hit["session_id"] for hit in await core.search(await context(engine, keys), "", 10)}
+    assert str(hidden) in free
+    bound = await context(engine, keys, profile=True)
+    found = {hit["session_id"] for hit in await core.search(bound, "", 10)}
+    assert found
+    assert str(hidden) not in found
+
+
+async def test_a_profile_bound_key_cannot_use_workflows(engine: AsyncEngine, keys: Keys) -> None:
+    tools = FakeTools()
+    core = ServerCore(
+        engine, workflows=WorkflowService(engine, RunQueue(engine), tools.access), settings=FAST
+    )
+    bound = await context(engine, keys, profile=True)
+    for call in (
+        core.workflows(bound),
+        core.start_workflow(bound, uuid.uuid4(), {}),
+        core.workflow_instance(bound, uuid.uuid4()),
+    ):
+        with pytest.raises(ServerError) as error:
+            await call
+        assert error.value.status == 403

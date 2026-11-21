@@ -14,7 +14,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from typing import Annotated, Any, Final, Literal, Self
+from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -335,10 +335,14 @@ class OpenAICompat:
             release()
             raise
         headers = {SESSION_HEADER: str(session_id), RUN_HEADER: str(run_id)}
+        # The generators end at ``max_wait_s``. The margin covers the last reads and sends.
+        lifetime = self._core.settings.max_wait_s + 60.0
         include_usage = bool(body.stream_options and body.stream_options.include_usage)
         if body.stream:
-            return StreamingResponse(
-                _Released(self._stream(key, run_id, profile, include_usage), release),
+            return _HeldStream(
+                self._stream(key, run_id, profile, include_usage),
+                release,
+                lifetime,
                 media_type="text/event-stream",
                 headers={**headers, "Cache-Control": "no-store", "X-Accel-Buffering": "no"},
             )
@@ -352,8 +356,10 @@ class OpenAICompat:
                 return await self._answer(key, result, profile, headers)
             finally:
                 release()
-        return StreamingResponse(
-            _Released(self._late_answer(key, run_id, profile), release),
+        return _HeldStream(
+            self._late_answer(key, run_id, profile),
+            release,
+            lifetime,
             media_type="application/json",
             headers={**headers, "Cache-Control": "no-store"},
         )
@@ -496,26 +502,30 @@ async def refused_handler(_request: Request, exc: Exception) -> Response:
     return response
 
 
-class _Released:
-    """An async iterator that gives back the waiter place when it ends, also when the client
-    goes away."""
+class _HeldStream(StreamingResponse):
+    """A streaming answer that holds a waiter place. ``__call__`` gives the place back in a
+    ``finally``, so a client that goes away, a failed send, or a cancel never keeps it. The
+    whole answer, also a send that blocks, ends after ``lifetime_s``."""
 
-    def __init__(self, inner: AsyncIterator[bytes], release: Callable[[], None]) -> None:
-        self._inner = inner
+    def __init__(
+        self,
+        content: AsyncIterator[bytes],
+        release: Callable[[], None],
+        lifetime_s: float,
+        **options: Any,
+    ) -> None:
+        super().__init__(content, **options)
         self._release = release
+        self._lifetime_s = lifetime_s
 
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> bytes:
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
-            return await self._inner.__anext__()
-        except BaseException:
+            async with asyncio.timeout(self._lifetime_s):
+                await super().__call__(scope, receive, send)
+        except TimeoutError:
+            pass
+        finally:
             self._release()
-            raise
-
-    async def aclose(self) -> None:
-        self._release()
-        close = getattr(self._inner, "aclose", None)
-        if close is not None:
-            await close()
+            close = getattr(self.body_iterator, "aclose", None)
+            if close is not None:
+                await close()

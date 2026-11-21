@@ -194,6 +194,11 @@ class ServerCore:
 
     # -- limits -----------------------------------------------------------------------------
 
+    @property
+    def waiting(self) -> int:
+        """The requests of this process that wait for a run now."""
+        return sum(self._waiters.values())
+
     def hold_waiter(self, key: KeyContext) -> Callable[[], None]:
         """Takes one place for a request that waits for a run. Returns the call that gives the
         place back. Raises ``ServerError`` (``429``) when the process or the key is full."""
@@ -507,6 +512,7 @@ class ServerCore:
                 query.strip() or None,
                 max(1, min(limit, MAX_LIMIT)),
                 workspace_id=key.workspace_id,
+                agent_profile_id=key.agent_profile_id,
             )
         except SessionSearchError as error:
             raise ServerError(400, "invalid_request", str(error)) from None
@@ -543,6 +549,12 @@ class ServerCore:
     def _workflow_actor(self, key: KeyContext) -> tuple[WorkflowService, JobActor]:
         if self._workflows is None:
             raise ServerError(409, "not_available", "workflows are off in this process")
+        if key.agent_profile_id is not None:
+            # An agent step of a workflow can name another profile, so a key that may use
+            # only one profile cannot run workflows.
+            raise ServerError(
+                403, "not_allowed", "a key for one agent profile cannot use workflows"
+            )
         return self._workflows, JobActor(org_id=key.org_id, user_id=key.user_id, kind="user")
 
     async def workflows(self, key: KeyContext) -> list[dict[str, Any]]:

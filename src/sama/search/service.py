@@ -147,16 +147,20 @@ class SessionSearch:
         limit: int,
         *,
         workspace_id: uuid.UUID | None = None,
+        agent_profile_id: uuid.UUID | None = None,
     ) -> list[SessionHit]:
         """The search of the web app (Section 11.4). The user sees what a private run of the
         user sees: the shared sessions and the own private sessions in the workspaces that the
-        user sees. ``workspace_id`` limits the result to one workspace."""
+        user sees. ``workspace_id`` limits the result to one workspace, and
+        ``agent_profile_id`` to the sessions of one agent profile (an API key, Section 10.7)."""
 
         async def scope(connection: AsyncConnection) -> ColumnElement[bool]:
             visible = await self.visible_to_user(connection, org_id, user_id)
-            if workspace_id is None:
-                return visible
-            return and_(visible, Session.workspace_id == workspace_id)
+            if workspace_id is not None:
+                visible = and_(visible, Session.workspace_id == workspace_id)
+            if agent_profile_id is not None:
+                visible = and_(visible, Session.agent_profile_id == agent_profile_id)
+            return visible
 
         return await self._search(org_id, scope, query, limit)
 

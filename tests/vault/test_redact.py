@@ -17,16 +17,23 @@ TELEGRAM = "123456789:AA" + "b" * 33
 GOOGLE = "AIza" + "c" * 35
 STRIPE = "sk_" + "live_" + "d" * 24
 JWT = "eyJ" + "h" * 12 + ".eyJ" + "p" * 12 + "." + "s" * 12
+SAMA_KEY = "sama_" + "sk_" + "Zz9-" * 11
 PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----"
 
 
 @pytest.mark.parametrize(
-    "secret", [GITHUB, OPENAI, AWS, SLACK, TELEGRAM, GOOGLE, STRIPE, JWT, PRIVATE_KEY]
+    "secret", [GITHUB, OPENAI, AWS, SLACK, TELEGRAM, GOOGLE, STRIPE, JWT, PRIVATE_KEY, SAMA_KEY]
 )
 def test_a_known_form_is_redacted(secret: str) -> None:
     out = Redactor().text(f"the key is {secret} now")
     assert secret not in out
     assert out == f"the key is {REDACTED} now"
+
+
+def test_a_sama_api_key_in_config_text_is_redacted() -> None:
+    out = Redactor().text(f'api_key="{SAMA_KEY}"\nSAMA_KEY={SAMA_KEY}')
+    assert SAMA_KEY not in out
+    assert out == f'api_key="{REDACTED}"\nSAMA_KEY={REDACTED}'
 
 
 def test_a_bearer_token_and_a_url_password_keep_their_prefix() -> None:

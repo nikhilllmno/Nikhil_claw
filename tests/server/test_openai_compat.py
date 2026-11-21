@@ -21,9 +21,11 @@ from sama.runtime.fake import FakeScript
 from sama.server.openai import RUN_HEADER, SESSION_HEADER, compose
 from sama.server.openai import ChatMessage as Msg
 from tests.api.conftest import bearer
+from tests.conformance.scripted_model import serve
 from tests.orchestrator.conftest import Tenant
 from tests.orchestrator.test_worker import Harness
 from tests.server.conftest import Keys, answer, reply
+from tests.waiting import async_wait_until
 
 pytestmark = pytest.mark.usefixtures("admin")
 
@@ -416,3 +418,20 @@ def test_compose_keeps_only_the_last_message_in_a_session() -> None:
     messages = [Msg(role="user", content="a"), Msg(role="user", content="b")]
     assert compose(messages, new_session=False) == ("b", "b")
     assert compose([Msg(role="user", content="only")], new_session=True) == ("only", "only")
+
+
+async def test_a_client_that_goes_away_gives_back_its_waiter_place(
+    chat_app: FastAPI, keys: Keys, core: Any
+) -> None:
+    key = await keys.make()
+    body = {"messages": [{"role": "user", "content": "x"}], "stream": True}
+    # A real server: the ASGI transport of httpx reads the whole answer before it returns.
+    with serve(chat_app) as base:
+        async with (
+            httpx.AsyncClient(base_url=base, timeout=30) as client,
+            client.stream("POST", "/v1/chat/completions", json=body, headers=auth(key)) as response,
+        ):
+            async for _line in response.aiter_lines():
+                break
+            assert core.waiting == 1
+        await async_wait_until(lambda: core.waiting == 0, what="the waiter place to come back")
