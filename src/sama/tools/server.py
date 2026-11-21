@@ -1373,7 +1373,7 @@ class ToolServer:
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
                 # A chat channel is an integration of the org, not a connection (Section 11.9).
-                guide = channel_guide(connector, connections.web_base)
+                guide = channel_guide(connector, getattr(connections, "web_base", None))
                 if guide is not None:
                     return guide
                 return await connections.request_for_agent(claims, connector, scope)

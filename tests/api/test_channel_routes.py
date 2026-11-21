@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -26,7 +27,7 @@ from tests.orchestrator.conftest import Tenant
 
 pytestmark = pytest.mark.usefixtures("tenant")
 
-AUTH = "e" * 32
+AUTH = uuid.uuid4().hex  # random: vault values join the log redactor of the process
 SID = "AC" + "2" * 32
 
 

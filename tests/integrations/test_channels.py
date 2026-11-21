@@ -37,8 +37,8 @@ from tests.orchestrator.conftest import Tenant, add_tenant
 PUBLIC = "https://sama.test"
 NUMBER = "+15550001111"
 SID = "AC" + "1" * 32
-AUTH = "c" * 32
-APP_SECRET = "d" * 32
+AUTH = uuid.uuid4().hex  # random: vault values join the log redactor of the process
+APP_SECRET = uuid.uuid4().hex
 APP_ID = str(uuid.UUID(int=99))
 NOW = 1_800_000_000
 
@@ -121,7 +121,7 @@ def meta() -> WhatsAppCredentials:
 
 def gupshup() -> WhatsAppCredentials:
     return WhatsAppCredentials(
-        "gupshup", NUMBER, SecretStr("k" * 32), app_id=APP_ID, app_name="samaapp"
+        "gupshup", NUMBER, SecretStr(uuid.uuid4().hex), app_id=APP_ID, app_name="samaapp"
     )
 
 
