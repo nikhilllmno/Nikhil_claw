@@ -43,6 +43,7 @@ from pydantic import (
 )
 from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Lifespan
 
 from sama import workerbots
@@ -93,8 +94,13 @@ from sama.context import (
     children,
     list_compactions,
 )
+from sama.datacontrols.delete import DataError
+from sama.datacontrols.export import ExportFile
+from sama.datacontrols.retention import RetentionError
+from sama.datacontrols.service import DataControls
 from sama.db.engine import as_user
 from sama.db.models import (
+    MAX_RETENTION_DAYS,
     MAX_STEER_CHARS,
     AgentProfile,
     Approval,
@@ -324,6 +330,12 @@ class Decision(_Body):
 class Approve(Decision):
     always_allow: bool = False
     """Also allow this tool for this user and this agent profile from now on."""
+
+
+class DataSettingsIn(_Body):
+    retention_days: int | None = Field(ge=1, le=MAX_RETENTION_DAYS)
+    """Sama deletes a session after this many days without activity. Null uses the default of
+    the plan (Section 17.4)."""
 
 
 class NewPairingCode(_Body):
@@ -730,6 +742,9 @@ class SessionAccess:
 
 
 _ADMIN_ONLY: Final = "only an org owner or admin can do this"
+_OWNER_ONLY: Final = "only an org owner can do this"
+_SELF_OR_OWNER: Final = "only the user or an org owner can do this"
+_SELF_OR_ADMIN: Final = "only the user or an org owner or admin can do this"
 _BOT_ADMIN_ONLY: Final = "only a workspace admin or an org owner or admin can do this"
 
 
@@ -880,6 +895,26 @@ def _chat_runs(session_id: uuid.UUID) -> Any:
     return select(Run.id).where(Run.session_id == session_id, Run.kind == "chat")
 
 
+async def _data_call[T](call: Awaitable[T]) -> T:
+    """Maps the errors of the data controls to HTTP answers."""
+    try:
+        return await call
+    except DataError as error:
+        raise HTTPException(status_code=error.status, detail=str(error)) from None
+    except RetentionError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
+def _zip(result: ExportFile) -> FileResponse:
+    """Sends the export, then deletes the file."""
+    return FileResponse(
+        str(result.path),
+        media_type="application/zip",
+        filename=result.filename,
+        background=BackgroundTask(result.path.unlink, missing_ok=True),
+    )
+
+
 async def _job_call[T](call: Awaitable[T]) -> T:
     """Maps the errors of the job service to HTTP answers."""
     try:
@@ -931,6 +966,7 @@ class SamaApi:
         orgs: OrgService | None = None,
         checkpoints: CheckpointService | None = None,
         model_keys: ModelKeys | None = None,
+        data: DataControls | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
@@ -952,6 +988,7 @@ class SamaApi:
         self._handoffs = handoffs
         self._checkpoints = checkpoints
         self._model_keys = model_keys
+        self._data = data or DataControls(engine)
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -1605,6 +1642,7 @@ class SamaApi:
             return Response(status_code=204)
 
         self._workflow_routes(app)
+        self._data_routes(app)
 
         @app.get("/skills/{skill_id}/versions")
         async def skill_versions(principal: Me, skill_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -2632,6 +2670,82 @@ class SamaApi:
         if not (grants.org_admin or grants.admins_workspace(workspace_id)):
             raise HTTPException(status_code=403, detail=_BOT_ADMIN_ONLY)
         return org_id, grants
+
+    def _data_routes(self, app: FastAPI) -> None:
+        """The data control routes of Section 17.4: export, delete, and retention."""
+        data = self._data
+
+        @app.get("/orgs/{org_id}/export")
+        async def export_org(principal: Me, org_id: uuid.UUID) -> FileResponse:
+            grants = await self._org_grants(principal, org_id)
+            if not grants.org_owner:
+                raise HTTPException(status_code=403, detail=_OWNER_ONLY)
+            result = await _data_call(data.export(org_id, kind="org", actor_user_id=grants.user_id))
+            return _zip(result)
+
+        @app.get("/orgs/{org_id}/users/{user_id}/export")
+        async def export_user(principal: Me, org_id: uuid.UUID, user_id: uuid.UUID) -> FileResponse:
+            grants = await self._org_grants(principal, org_id)
+            if grants.user_id != user_id and not grants.org_owner:
+                raise HTTPException(status_code=403, detail=_SELF_OR_OWNER)
+            result = await _data_call(
+                data.export(org_id, kind="user", user_id=user_id, actor_user_id=grants.user_id)
+            )
+            return _zip(result)
+
+        @app.delete("/orgs/{org_id}/users/{user_id}")
+        async def delete_user(
+            principal: Me, org_id: uuid.UUID, user_id: uuid.UUID
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            if grants.user_id != user_id:
+                if not grants.org_admin:
+                    raise HTTPException(status_code=403, detail=_SELF_OR_ADMIN)
+                async with self._engine.connect() as connection:
+                    target = await load_grants(connection, org_id, user_id)
+                if target.org_owner and not grants.org_owner:
+                    raise HTTPException(
+                        status_code=403, detail="only an org owner can delete an owner"
+                    )
+            removed = await _data_call(
+                data.delete_user(org_id, user_id, actor_user_id=grants.user_id)
+            )
+            return {"sessions": len(removed.sessions), "runs": removed.runs}
+
+        @app.delete("/orgs/{org_id}")
+        async def delete_org(
+            principal: Me,
+            org_id: uuid.UUID,
+            confirm: Annotated[str, Query(max_length=200)],
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            if not grants.org_owner:
+                raise HTTPException(status_code=403, detail=_OWNER_ONLY)
+            async with self._engine.connect() as connection:
+                slug = (
+                    await connection.execute(select(Org.slug).where(Org.id == org_id))
+                ).scalar_one_or_none()
+            if slug is None or confirm != slug:
+                raise HTTPException(
+                    status_code=400, detail="set confirm to the slug of the org to delete it"
+                )
+            removed = await _data_call(data.delete_org(org_id, actor_user_id=grants.user_id))
+            return {"sessions": len(removed.sessions), "runs": removed.runs}
+
+        @app.get("/orgs/{org_id}/data-settings")
+        async def data_settings(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            await self._org_grants(principal, org_id)
+            return (await _data_call(data.retention(org_id))).as_json()
+
+        @app.put("/orgs/{org_id}/data-settings")
+        async def set_data_settings(
+            principal: Me, org_id: uuid.UUID, body: DataSettingsIn
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            view = await _data_call(
+                data.set_retention(org_id, body.retention_days, actor_user_id=grants.user_id)
+            )
+            return view.as_json()
 
     def _workflow_routes(self, app: FastAPI) -> None:
         """The workflow routes of Section 12.3. A user sees and changes only the workflows that

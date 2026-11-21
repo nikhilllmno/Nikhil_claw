@@ -35,6 +35,7 @@ from sama.db.models import (
     ChannelIdentity,
     Connection,
     ContextPin,
+    DataPurge,
     Delivery,
     GeneratedMedia,
     GitHubInstallation,
@@ -686,6 +687,14 @@ def plan(
             key_id="seed",
             wrapped_key=b"wrapped",
             ciphertext=b"sealed",
+        )
+        # A purge that waits far in the future, so that no purge worker of a test takes it.
+        add(
+            DataPurge,
+            org_id=ids[org],
+            kind="traces",
+            refs={"trace_ids": []},
+            next_attempt_at=text("now() + interval '100 years'"),
         )
     return rows
 

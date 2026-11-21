@@ -40,6 +40,9 @@ from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
 from sama.context.session_items import PostgresSessionItems
 from sama.controlplane.settings import ControlPlaneSettings
+from sama.datacontrols.purge import PurgeWorker, SandboxBackend
+from sama.datacontrols.service import DataControls, ServiceCleanup
+from sama.datacontrols.sweep import RetentionSweep
 from sama.db.engine import create_engine
 from sama.delegation import DelegationService
 from sama.gate.service import GateService
@@ -187,11 +190,11 @@ def build(
     database = DatabaseGateway()
     # A stdio MCP server runs in its own E2B sandbox, the connector host (Section 10.3.2).
     hosts: ConnectorHosts | None = None
+    # The purge worker kills the sandboxes of deleted sessions with the same backend.
+    e2b: E2BHostBackend | None = None
     if runtimes is None:
-        hosts = ConnectorHosts(
-            E2BHostBackend(settings.e2b_api_key.get_secret_value()),
-            template=settings.connector_host_template,
-        )
+        e2b = E2BHostBackend(settings.e2b_api_key.get_secret_value())
+        hosts = ConnectorHosts(e2b, template=settings.connector_host_template)
     connections = ConnectionService(
         engine,
         Catalog.load(),
@@ -444,6 +447,24 @@ def build(
         public_url=settings.public_url,
         on_change=forget if vault is not None else None,
     )
+    triggers = TriggerService(
+        engine,
+        queue=RunQueue(engine),
+        vault=vault,
+        connections=connections,
+        public_url=settings.public_url,
+        composio_secret=settings.composio_webhook_secret,
+        workflows=workflows,
+    )
+    data = DataControls(
+        engine,
+        cleanup=ServiceCleanup(
+            engine,
+            connections=connections,
+            triggers=triggers,
+            integrations=integrations if integrations.enabled else None,
+        ),
+    )
     api = SamaApi(
         engine,
         queue=queue,
@@ -466,21 +487,14 @@ def build(
         github=github,
         connections=connections,
         jobs=jobs,
-        triggers=TriggerService(
-            engine,
-            queue=RunQueue(engine),
-            vault=vault,
-            connections=connections,
-            public_url=settings.public_url,
-            composio_secret=settings.composio_webhook_secret,
-            workflows=workflows,
-        ),
+        triggers=triggers,
         skill_store=skill_store,
         search=sessions,
         workflows=workflows,
         handoffs=handoffs,
         checkpoints=checkpoints,
         model_keys=model_keys,
+        data=data,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -513,7 +527,8 @@ def build(
                 stack.push_async_callback(upstream.aclose)
             if slack is not None:
                 stack.push_async_callback(slack.aclose)
-            loops = _monitor(settings, engine, stack)
+            loops = _monitor(settings, engine, stack, sandboxes=e2b)
+            loops.append(RetentionSweep(engine))
             loops.append(TaskDispatcher(engine, queue))
             if embedder is not None:
                 stack.push_async_callback(embedder.aclose)
@@ -618,10 +633,17 @@ class _Loop(Protocol):
 
 
 def _monitor(
-    settings: ControlPlaneSettings, engine: AsyncEngine, stack: contextlib.AsyncExitStack
+    settings: ControlPlaneSettings,
+    engine: AsyncEngine,
+    stack: contextlib.AsyncExitStack,
+    *,
+    sandboxes: SandboxBackend | None = None,
 ) -> list[_Loop]:
-    """The trace export and the error rate alerts of Section 18, when they are set."""
+    """The trace export and the error rate alerts of Section 18, when they are set, and the
+    purge worker of Section 17.4. The purge worker deletes the Langfuse traces and kills the
+    sandboxes of deleted data."""
     loops: list[_Loop] = []
+    langfuse: LangfuseClient | None = None
     if settings.langfuse is not None:
         langfuse = LangfuseClient(
             settings.langfuse.base_url,
@@ -642,4 +664,6 @@ def _monitor(
         slack = SlackWebhook(settings.slack_webhook_url)
         stack.push_async_callback(slack.aclose)
         loops.append(ErrorRateAlerter(engine, slack, environment=settings.environment))
+    if langfuse is not None or sandboxes is not None:
+        loops.append(PurgeWorker(engine, sandboxes=sandboxes, traces=langfuse))
     return loops

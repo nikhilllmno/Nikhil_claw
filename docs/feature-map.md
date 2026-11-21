@@ -104,8 +104,8 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Session lineage after compression | `agent/context_compressor*.py` | Parent and child sessions with the archived transcript (§6.2). | Adapt | M2 |
 | Queue, interrupt, steer while busy | `gateway/session_*.py` | New message while a run is busy: queue by default, `/stop` cancels, `/steer` adds a note that the tool gate gives to the run at its next tool call. A note that the run does not read becomes a new message (§4.3). Telegram, Slack, and the web app. | Adapt | M3 (M3.9 done) |
 | Cross-platform handoff (`/handoff`) | `gateway/` | `/handoff telegram`, `/handoff slack`, or `/handoff web` moves a private session to the direct chat of the user in that channel. The open runs answer there (§11.1). | Adapt | M3 (M3.9 done) |
-| Retention and housekeeping | `session_retention.py` | Retention per org plan. Export and delete per user. | Adapt | M6 |
-| Export and import | `/export`, `/import` | Session export to Markdown and JSON from the web app (M3.12, `GET /sessions/{id}/export`). Full account export with data controls (M6). | Adapt | M3 (M3.12 done), M6 |
+| Retention and housekeeping | `session_retention.py` | Retention per org inside the plan limits. An hourly sweep deletes old sessions with their sandboxes and traces (§17.4). | Adapt | M6 (M6.8 done) |
+| Export and import | `/export`, `/import` | Session export to Markdown and JSON from the web app (M3.12, `GET /sessions/{id}/export`). Org and user export as a ZIP of JSON lines, and delete per user and per org (M6.8, §17.4). No import. | Adapt | M3 (M3.12 done), M6 (M6.8 done) |
 
 ## 6. Context management
 
