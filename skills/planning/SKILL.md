@@ -1,8 +1,8 @@
 ---
 name: planning
 description: Break a goal into a plan with steps and risks
-version: 1.0.0
-tags: [planning, projects]
+version: 1.0.1
+tags: [productivity, planning, projects]
 requires_toolsets: [todo]
 ---
 

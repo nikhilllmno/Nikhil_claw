@@ -1,9 +1,9 @@
 ---
 name: api-integration
 description: Plan and test a call to an HTTP API
-version: 1.0.0
-tags: [api, code]
-requires_toolsets: [core]
+version: 1.1.0
+tags: [software, api]
+requires_toolsets: [core, web]
 ---
 
 # API integration
