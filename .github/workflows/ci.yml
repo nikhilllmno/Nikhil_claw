@@ -159,6 +159,7 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             extension/package-lock.json
+            e2e/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npx tsc --noEmit
@@ -185,3 +186,17 @@ jobs:
         env:
           SAMA_API_URL: https://sama-staging.fly.dev
         run: npm run build
+      # The end-to-end suite (M7.11) runs on staging in e2e.yml, not here. This job checks only
+      # that it compiles and that its helpers work, so a pull request does not break it.
+      - name: E2E suite install
+        working-directory: e2e
+        run: npm ci
+      - name: E2E suite lint
+        working-directory: e2e
+        run: npm run lint
+      - name: E2E suite typecheck
+        working-directory: e2e
+        run: npm run typecheck
+      - name: E2E suite helper tests
+        working-directory: e2e
+        run: npm test

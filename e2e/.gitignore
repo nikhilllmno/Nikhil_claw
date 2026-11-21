@@ -1,0 +1,6 @@
+node_modules/
+playwright-report/
+test-results/
+blob-report/
+# The world file has the tokens of the test users. It never leaves the machine.
+.state/

@@ -7290,6 +7290,7 @@ src/sama/
 skills/           # builtin skills (SKILL.md folders)
 extension/        # Chrome extension (TypeScript)
 web/              # Next.js app
+e2e/              # Playwright end-to-end suite against staging (M7.11, Section 19.6)
 sandbox/          # Dockerfile of the sama image (Docker and the E2B template)
 deploy/           # Dockerfile of the control plane and the Fly.io configs (M1.15)
 migrations/       # Alembic
@@ -7473,6 +7474,48 @@ A person must do these steps. Sama cannot create a GitHub App or a ruleset by it
 The process turns the App on when `SAMA_GITHUB_APP_ID` is set (Section 19.2). Then the API
 has the routes `/orgs/{org_id}/github/...`, the pages `/github/app/created` and
 `/github/setup`, and the git proxy at `/git`.
+
+### 19.6 End-to-end tests on staging (M7.11)
+
+The Playwright suite in `e2e/` (TypeScript) tests the main flows on a deployed system. It
+drives the web app in Chromium, as a person does. It uses the API for flows that have no page
+yet (triggers, workflows) and to check results. `e2e/README.md` lists the flows and the rules
+for tests.
+
+- **When.** The workflow `.github/workflows/e2e.yml` runs it against staging each night at
+  21:30 UTC (03:00 IST), after the nightly live suite, and by hand (`workflow_dispatch`, with
+  an optional title pattern and other URLs). It is not a check of pull requests, because it
+  tests what staging runs now, and a run takes about 15 minutes and costs model tokens. The CI
+  job "Web" lints and typechecks the suite and runs the unit tests of its helpers, so a pull
+  request cannot break the code of the suite.
+- **Test data.** Each run makes its own data, so two runs do not share state:
+  - Two Supabase users with confirmed emails, `sama-e2e+<run>-owner@example.com` and
+    `sama-e2e+<run>-member@example.com`, with random passwords. The domain is reserved, so no
+    mail goes anywhere.
+  - One org `e2e-<run>-main` that the owner makes with self-serve sign-up (Section 17.2). It
+    is on the free plan, so the plan caps (2 runs at the same time, 10 messages a minute)
+    also apply to the suite. One worker runs the tests in order.
+  - The global teardown deletes each test org with `DELETE /orgs/{org_id}` (all its rows go,
+    Section 17.4), and then the users. The sweep (`npm run sweep`) runs first in each nightly
+    run. It removes each user with the `sama-e2e+` prefix that is older than 3 hours, and the
+    `e2e-` orgs that the user owns. It gets a token of each user with an admin magic link
+    (no email) and deletes each org with the slug from `GET /me`.
+- **Credentials.** The repository secret `E2E_SUPABASE_SERVICE_ROLE_KEY` (the `service_role`
+  key of the staging Supabase project) makes and removes the test users. Only the setup, the
+  teardown, and the sweep use it. The tests use the tokens of the test users, as the web app
+  does (`sessionStorage` key `sama.auth`). The world file of a run (`e2e/.state/world.json`,
+  mode 0600, ignored by git) has the test passwords, and the teardown removes it.
+- **Sign-up.** The staging project sends email with the built-in mailer, which sends only to
+  the team. So the sign-up test sends the browser's `POST /auth/v1/signup` to the admin API
+  (`generate_link` with `type: signup` makes the same unconfirmed user and sends no email),
+  confirms the address with the admin API, and then signs in on the page.
+- **Results.** The workflow keeps the HTML report, the JUnit file, and the screenshots,
+  videos, and traces of failed tests for 7 days. A trace can have the short-lived token of a
+  test user. The teardown deletes the user and the org, so the token gives access to nothing.
+- **Billing.** The billing test opens Stripe Checkout in test mode (`cs_test_`) and does not
+  pay.
+
+Add the flows of a new item to the suite in the pull request of the item, or in the next one.
 
 ---
 

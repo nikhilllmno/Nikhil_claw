@@ -1,0 +1,89 @@
+name: End-to-end (staging)
+
+# Runs the Playwright suite in e2e/ against staging every night and on demand
+# (docs/architecture.md, Section 19.6; roadmap M7.11). It is not a check of pull requests:
+# it tests what staging runs now.
+#
+# It needs the repository secret E2E_SUPABASE_SERVICE_ROLE_KEY: the service_role key of the
+# staging Supabase project. The suite uses it only to make and remove its test users.
+#
+# Each run makes its own test users and test org, and removes them at the end. The sweep
+# step first removes what an old run left (test users older than 3 hours).
+
+on:
+  schedule:
+    - cron: "30 21 * * *" # 21:30 UTC = 03:00 IST, after the nightly live suite
+  workflow_dispatch:
+    inputs:
+      grep:
+        description: Run only the tests whose title matches this pattern (empty runs all).
+        required: false
+        type: string
+      web_url:
+        description: The web app to test (empty is the staging web app).
+        required: false
+        type: string
+      api_url:
+        description: The API to test (empty is sama-staging).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-staging
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: Playwright on staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: e2e
+    env:
+      E2E_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
+      E2E_WEB_URL: ${{ inputs.web_url }}
+      E2E_API_URL: ${{ inputs.api_url }}
+      E2E_RUN_ID: gh${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check the secret
+        run: |
+          if [ -z "$E2E_SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::error::Add the repository secret E2E_SUPABASE_SERVICE_ROLE_KEY."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Remove the test data of old runs
+        run: npm run sweep
+      - name: Run the suite
+        env:
+          GREP: ${{ inputs.grep }}
+        run: |
+          if [ -n "$GREP" ]; then
+            npx playwright test --grep "$GREP"
+          else
+            npx playwright test
+          fi
+      # The report has screenshots, videos, and traces of the failed tests. The traces can
+      # have the short-lived tokens of the test users, which the teardown removes.
+      - name: Upload the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
