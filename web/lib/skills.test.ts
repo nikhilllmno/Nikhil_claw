@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SkillSummary } from "./api";
-import { curatorBadges, filterSkills, nameProblem, pathProblem, skillTemplate } from "./skills";
+import { curatorBadge, filterSkills, nameProblem, pathProblem, skillTemplate } from "./skills";
 
 function skill(name: string, description: string, tags: string[] = []): SkillSummary {
   return {
@@ -44,9 +44,9 @@ describe("skill helpers", () => {
   });
 
   it("shows one curator badge: pinned wins over stale", () => {
-    expect(curatorBadges({ status: "active", pinned: false })).toEqual([]);
-    expect(curatorBadges({ status: "stale", pinned: false })).toEqual([{ label: "Stale", tone: "warning" }]);
-    expect(curatorBadges({ status: "stale", pinned: true })).toEqual([{ label: "Pinned", tone: "accent" }]);
-    expect(curatorBadges({ status: "active", pinned: true })).toEqual([{ label: "Pinned", tone: "accent" }]);
+    expect(curatorBadge({ status: "active", pinned: false })).toBeNull();
+    expect(curatorBadge({ status: "stale", pinned: false })).toEqual({ label: "Stale", tone: "warning" });
+    expect(curatorBadge({ status: "stale", pinned: true })).toEqual({ label: "Pinned", tone: "accent" });
+    expect(curatorBadge({ status: "active", pinned: true })).toEqual({ label: "Pinned", tone: "accent" });
   });
 });

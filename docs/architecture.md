@@ -2072,6 +2072,10 @@ the job does not get it back. The job has `created_by_kind = 'system'`, and the 
     from the agents.
 - **Exempt.** A pinned skill, and a skill whose name is in the `skills` of a job or a
   workflow that is not removed. A name match exempts the skill in each scope.
+- **Run.** A run reads only the skills that must change, the oldest activity first, at most
+  2000 for each run. The next run continues with the rest. Each change checks the row again in
+  its update: a pin, a use, or a write that commits during the run wins, and the curator keeps
+  the skill.
 - **Never deletes.** The curator changes only `status`, `stale_since`, and the archive
   version. Each change writes the audit entry `skill.stale`, `skill.active`, or
   `skill.archive` with `actor_kind = 'system'`.

@@ -18,9 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final
 
-from sqlalchemy import ColumnElement, and_, func, insert, or_, select, update
+from sqlalchemy import ColumnElement, and_, exists, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
-from sqlalchemy.orm import aliased
 
 from sama.curator.policy import (
     ARCHIVE_AFTER,
@@ -28,6 +27,7 @@ from sama.curator.policy import (
     MEMORY_FULL_RATIO,
     MEMORY_OLD_AFTER,
     STALE_AFTER,
+    STALE_NOTICE,
     SkillState,
     decide,
     entry_ages,
@@ -48,10 +48,12 @@ from sama.db.models import (
     Workspace,
 )
 from sama.memory.core import CAPS, Target, used
+from sama.skills.sql import copy_version
 from sama.vault.redact import redact
 
 MAX_SKILLS: Final = 2000
-"""The most skills that one run reads. The rest wait for the next run."""
+"""The most skills that one run changes. The run reads only skills that change, so the rest
+come first in the next run."""
 TOP_SKILLS: Final = 5
 PREVIEW_CHARS: Final = 80
 MAX_PREVIEWS: Final = 5
@@ -72,16 +74,6 @@ class SkillOutcome:
     exempt: int = 0
     top: list[tuple[str, str, int, int, int]] = field(default_factory=list)
     """``(name, scope, uses, views, patches)`` of the most used shared skills."""
-
-
-@dataclass(slots=True)
-class MemoryOutcome:
-    lines: list[str] = field(default_factory=list)
-
-
-async def _now(connection: AsyncConnection) -> datetime:
-    value: datetime = (await connection.execute(select(func.now()))).scalar_one()
-    return value
 
 
 async def is_first_workspace(
@@ -147,75 +139,111 @@ async def _audit(
     )
 
 
+def _agent_written() -> ColumnElement[bool]:
+    """The skill is managed: an agent wrote its first version."""
+    return exists().where(
+        SkillVersion.org_id == Skill.org_id,
+        SkillVersion.skill_id == Skill.id,
+        SkillVersion.version_no == 1,
+        SkillVersion.author_kind == "agent",
+    )
+
+
+def _idle_since() -> ColumnElement[datetime]:
+    return func.coalesce(Skill.last_used_at, Skill.created_at)
+
+
+def _needs_change(exempt: set[str], now: datetime) -> ColumnElement[bool]:
+    """The skills that ``decide`` moves. The batch reads only these, so skills that stay as they
+    are (for example pinned skills) never take the place of the others. ``decide`` is the rule;
+    this filter is the same rule in SQL."""
+    idle_since = _idle_since()
+    protected = or_(Skill.pinned, Skill.name.in_(exempt))
+    to_stale = and_(Skill.status == "active", ~protected, idle_since <= now - STALE_AFTER)
+    to_archive = and_(idle_since <= now - ARCHIVE_AFTER, Skill.stale_since <= now - STALE_NOTICE)
+    from_stale = and_(
+        Skill.status == "stale", or_(protected, idle_since > now - STALE_AFTER, to_archive)
+    )
+    return or_(to_stale, from_stale)
+
+
+async def _move(
+    connection: AsyncConnection,
+    job: Any,
+    skill: SkillState,
+    *,
+    guard: ColumnElement[bool],
+    values: dict[Any, Any],
+    action: str,
+) -> bool:
+    """One status change. ``guard`` checks the row again in the update: a use, a write, or a pin
+    that commits while the curator runs wins, and the update changes nothing."""
+    done = (
+        await connection.execute(
+            update(Skill)
+            .where(Skill.org_id == job.org_id, Skill.id == skill.skill_id, guard)
+            .values(values)
+            .returning(Skill.id)
+        )
+    ).one_or_none()
+    if done is not None:
+        await _audit(connection, job, skill, action)
+    return done is not None
+
+
 async def _mark_stale(
     connection: AsyncConnection, job: Any, skill: SkillState, now: datetime
 ) -> bool:
-    done = (
-        await connection.execute(
-            update(Skill)
-            .where(Skill.org_id == job.org_id, Skill.id == skill.skill_id, Skill.status == "active")
-            .values(status="stale", stale_since=now)
-            .returning(Skill.id)
-        )
-    ).one_or_none()
-    if done is not None:
-        await _audit(connection, job, skill, "skill.stale")
-    return done is not None
+    guard = and_(Skill.status == "active", ~Skill.pinned, _idle_since() <= now - STALE_AFTER)
+    return await _move(
+        connection,
+        job,
+        skill,
+        guard=guard,
+        values={Skill.status: "stale", Skill.stale_since: now},
+        action="skill.stale",
+    )
 
 
 async def _revive(connection: AsyncConnection, job: Any, skill: SkillState) -> bool:
-    done = (
-        await connection.execute(
-            update(Skill)
-            .where(Skill.org_id == job.org_id, Skill.id == skill.skill_id, Skill.status == "stale")
-            .values(status="active", stale_since=None)
-            .returning(Skill.id)
-        )
-    ).one_or_none()
-    if done is not None:
-        await _audit(connection, job, skill, "skill.active")
-    return done is not None
+    return await _move(
+        connection,
+        job,
+        skill,
+        guard=Skill.status == "stale",
+        values={Skill.status: "active", Skill.stale_since: None},
+        action="skill.active",
+    )
 
 
 async def _archive(connection: AsyncConnection, job: Any, skill: SkillState, now: datetime) -> bool:
     """A new version with the same text, the change ``archive``, and the author ``system``.
-    The row lock waits for a write of the skill that runs now, and the status check skips a
-    skill that the write made active again."""
+    The row lock waits for a write of the skill that runs now. The lock reads the row again, so
+    a skill that a use, a write, or a pin made active, or that is pinned now, is skipped."""
     row = (
         await connection.execute(
             select(Skill.current_version)
-            .where(Skill.org_id == job.org_id, Skill.id == skill.skill_id, Skill.status == "stale")
+            .where(
+                Skill.org_id == job.org_id,
+                Skill.id == skill.skill_id,
+                Skill.status == "stale",
+                ~Skill.pinned,
+                _idle_since() <= now - ARCHIVE_AFTER,
+            )
             .with_for_update()
         )
     ).one_or_none()
     if row is None:
         return False
-    current = (
-        await connection.execute(
-            select(SkillVersion).where(
-                SkillVersion.org_id == job.org_id,
-                SkillVersion.skill_id == skill.skill_id,
-                SkillVersion.version_no == row.current_version,
-            )
-        )
-    ).one()
-    version = row.current_version + 1
     days = (now - skill.last_active).days
-    await connection.execute(
-        insert(SkillVersion).values(
-            org_id=job.org_id,
-            skill_id=skill.skill_id,
-            version_no=version,
-            name=current.name,
-            description=current.description,
-            skill_md=current.skill_md,
-            files=dict(current.files),
-            tags=list(current.tags),
-            requires_toolsets=list(current.requires_toolsets),
-            change="archive",
-            summary=f"The curator archived the skill: no view, use, or change for {days} days.",
-            author_kind="system",
-        )
+    version = await copy_version(
+        connection,
+        job.org_id,
+        skill.skill_id,
+        row.current_version,
+        change="archive",
+        summary=f"The curator archived the skill: no view, use, or change for {days} days.",
+        author_kind="system",
     )
     await connection.execute(
         update(Skill)
@@ -226,13 +254,41 @@ async def _archive(connection: AsyncConnection, job: Any, skill: SkillState, now
     return True
 
 
+async def _totals(
+    connection: AsyncConnection,
+    managed: ColumnElement[bool],
+    exempt: set[str],
+    outcome: SkillOutcome,
+) -> None:
+    """The totals of the report, after the changes."""
+    kept = Skill.status != "archived"
+    row = (
+        await connection.execute(
+            select(
+                func.count().filter(kept).label("checked"),
+                func.count().filter(Skill.status == "active").label("active"),
+                func.count().filter(Skill.status == "stale").label("stale"),
+                func.count().filter(Skill.status == "archived").label("archived"),
+                func.count().filter(kept, Skill.pinned).label("pinned"),
+                func.count().filter(kept, ~Skill.pinned, Skill.name.in_(exempt)).label("exempt"),
+            ).where(managed)
+        )
+    ).one()
+    outcome.checked = int(row.checked)
+    outcome.active = int(row.active)
+    outcome.stale_total = int(row.stale)
+    outcome.archived_total = int(row.archived)
+    outcome.pinned = int(row.pinned)
+    outcome.exempt = int(row.exempt)
+
+
 async def curate_skills(
     connection: AsyncConnection, job: Any, *, first: bool, now: datetime
 ) -> SkillOutcome:
     outcome = SkillOutcome()
     exempt = await exempt_names(connection, job.org_id)
-    first_version = aliased(SkillVersion)
     coverage = _coverage(job.org_id, job.workspace_id, first)
+    managed = and_(coverage, _agent_written())
     rows = (
         await connection.execute(
             select(
@@ -241,21 +297,11 @@ async def curate_skills(
                 Skill.name,
                 Skill.status,
                 Skill.pinned,
-                Skill.last_used_at,
-                Skill.created_at,
+                _idle_since().label("last_active"),
                 Skill.stale_since,
             )
-            .join(
-                first_version,
-                and_(
-                    first_version.org_id == Skill.org_id,
-                    first_version.skill_id == Skill.id,
-                    first_version.version_no == 1,
-                ),
-            )
-            .where(coverage, Skill.status.in_(("active", "stale")))
-            .where(first_version.author_kind == "agent")
-            .order_by(Skill.last_used_at.asc().nulls_first(), Skill.id)
+            .where(managed, _needs_change(exempt, now))
+            .order_by(_idle_since(), Skill.id)
             .limit(MAX_SKILLS)
         )
     ).all()
@@ -267,51 +313,24 @@ async def curate_skills(
             status=row.status,
             pinned=row.pinned,
             exempt=row.name in exempt,
-            last_active=max(row.last_used_at or row.created_at, row.created_at),
+            last_active=row.last_active,
             stale_since=row.stale_since,
         )
-        outcome.checked += 1
-        outcome.pinned += state.pinned
-        outcome.exempt += state.exempt and not state.pinned
         decision = decide(state, now)
         private = state.scope == "user"
-        status = state.status
         if decision == "stale" and await _mark_stale(connection, job, state, now):
-            status = "stale"
             if private:
                 outcome.user_stale += 1
             else:
                 outcome.stale.append(state.name)
         elif decision == "archive" and await _archive(connection, job, state, now):
-            status = "archived"
             if private:
                 outcome.user_archived += 1
             else:
                 outcome.archived.append(state.name)
-        elif decision == "revive" and await _revive(connection, job, state):
-            status = "active"
-            if not private:
-                outcome.revived.append(state.name)
-        if status == "active":
-            outcome.active += 1
-        elif status == "stale":
-            outcome.stale_total += 1
-    archived_before = (
-        await connection.execute(
-            select(func.count())
-            .select_from(Skill)
-            .join(
-                first_version,
-                and_(
-                    first_version.org_id == Skill.org_id,
-                    first_version.skill_id == Skill.id,
-                    first_version.version_no == 1,
-                ),
-            )
-            .where(coverage, Skill.status == "archived", first_version.author_kind == "agent")
-        )
-    ).scalar_one()
-    outcome.archived_total = int(archived_before)
+        elif decision == "revive" and await _revive(connection, job, state) and not private:
+            outcome.revived.append(state.name)
+    await _totals(connection, managed, exempt, outcome)
     top = await connection.execute(
         select(Skill.name, Skill.scope, Skill.use_count, Skill.view_count, Skill.patch_count)
         .where(coverage, Skill.scope != "user", Skill.status != "archived")
@@ -330,9 +349,9 @@ def _preview(entry: str) -> str:
 
 async def curate_memory(
     connection: AsyncConnection, job: Any, *, first: bool, now: datetime
-) -> MemoryOutcome:
+) -> list[str]:
     """The report lines about memory. Nothing changes."""
-    outcome = MemoryOutcome()
+    lines: list[str] = []
     rows = (
         await connection.execute(
             select(Memory.id, Memory.scope, Memory.entries, Memory.created_at, AgentProfile.name)
@@ -359,7 +378,7 @@ async def curate_memory(
         line = f"- {title}: {len(entries)} entries, {size}/{cap} characters ({percent(size, cap)}%)"
         if size >= MEMORY_FULL_RATIO * cap:
             line += ". It is nearly full: remove or merge old entries."
-        outcome.lines.append(line)
+        lines.append(line)
         if not entries:
             continue
         revisions = [
@@ -377,11 +396,11 @@ async def curate_memory(
             if now - (since or row.created_at) >= MEMORY_OLD_AFTER
         ]
         if old:
-            outcome.lines.append(
+            lines.append(
                 f"  {len(old)} entries did not change for {MEMORY_OLD_AFTER.days} days or more."
                 " Check that they are still true:"
             )
-            outcome.lines.extend(f'  - "{_preview(entry)}"' for entry in old[:MAX_PREVIEWS])
+            lines.extend(f'  - "{_preview(entry)}"' for entry in old[:MAX_PREVIEWS])
     if first:
         cap = CAPS[Target.USER]
         sizes = [
@@ -393,14 +412,14 @@ async def curate_memory(
         full = sum(1 for size in sizes if size >= MEMORY_FULL_RATIO * cap)
         line = f"- User profiles: {len(sizes)} users have notes"
         line += f"; {full} of them are nearly full." if full else "."
-        outcome.lines.append(line)
-    if not outcome.lines:
-        outcome.lines.append("- This workspace has no memory yet.")
-    return outcome
+        lines.append(line)
+    if not lines:
+        lines.append("- This workspace has no memory yet.")
+    return lines
 
 
 def render_report(
-    workspace: str, now: datetime, first: bool, skills: SkillOutcome, memory: MemoryOutcome
+    workspace: str, now: datetime, first: bool, skills: SkillOutcome, memory: list[str]
 ) -> str:
     scope_text = "workspace skills" + (", org skills, and user skills" if first else "")
     lines = [
@@ -437,7 +456,7 @@ def render_report(
             f"- {name} ({scope}): {uses} uses, {views} views, {patches} changes"
             for name, scope, uses, views, patches in skills.top
         ]
-    lines += ["", "Memory:", *memory.lines, ""]
+    lines += ["", "Memory:", *memory, ""]
     lines.append(
         "The curator never deletes anything. Pin a skill on the skills page to keep it active."
         " Restore an archived skill on the skills page."
@@ -447,7 +466,7 @@ def render_report(
 
 async def curate(connection: AsyncConnection, job: Any) -> str:
     """Runs the curator for the workspace of ``job`` and returns the report."""
-    now = await _now(connection)
+    now: datetime = (await connection.execute(select(func.now()))).scalar_one()
     workspace = (
         await connection.execute(
             select(Workspace.name).where(

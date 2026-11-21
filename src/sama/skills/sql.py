@@ -6,7 +6,8 @@ from __future__ import annotations
 import uuid
 from collections.abc import Collection, Iterable
 
-from sqlalchemy import ColumnElement, and_, func, or_, select, update
+from sqlalchemy import ColumnElement, and_, func, insert, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.db.models import AgentProfile, Membership, Run, Session, Skill, SkillVersion
@@ -199,3 +200,59 @@ async def load_actor(
         review=kind == "review",
         attended=kind == "chat" and not unattended and lineage != "delegation",
     )
+
+
+async def copy_version(
+    connection: AsyncConnection,
+    org_id: uuid.UUID,
+    skill_id: uuid.UUID,
+    from_version: int,
+    *,
+    change: str,
+    summary: str,
+    author_kind: str,
+    author_user_id: uuid.UUID | None = None,
+) -> int:
+    """Writes version ``from_version + 1`` with the text and files of ``from_version`` and
+    returns its number. An archive and a restore change no text, so they copy the version.
+    The caller updates ``skills.current_version``."""
+    version = from_version + 1
+    await connection.execute(
+        insert(SkillVersion).from_select(
+            [
+                "org_id",
+                "skill_id",
+                "version_no",
+                "name",
+                "description",
+                "skill_md",
+                "files",
+                "tags",
+                "requires_toolsets",
+                "change",
+                "summary",
+                "author_kind",
+                "author_user_id",
+            ],
+            select(
+                SkillVersion.org_id,
+                SkillVersion.skill_id,
+                literal(version),
+                SkillVersion.name,
+                SkillVersion.description,
+                SkillVersion.skill_md,
+                SkillVersion.files,
+                SkillVersion.tags,
+                SkillVersion.requires_toolsets,
+                literal(change),
+                literal(summary),
+                literal(author_kind),
+                literal(author_user_id, type_=PG_UUID(as_uuid=True)),
+            ).where(
+                SkillVersion.org_id == org_id,
+                SkillVersion.skill_id == skill_id,
+                SkillVersion.version_no == from_version,
+            ),
+        )
+    )
+    return version

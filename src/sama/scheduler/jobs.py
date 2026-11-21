@@ -71,6 +71,21 @@ def _stored(spec: JobSpec, name: str) -> Any:
     return list(value) if isinstance(value, tuple) else value
 
 
+def _check_curator(given: JobInput, old: JobSpec) -> None:
+    """A curator job runs the curator, not a prompt or a script (Section 9.7). A person
+    changes its name, schedule, profile, and targets only."""
+    fixed = [
+        name
+        for name in CURATOR_FIXED
+        if name in given.model_fields_set and getattr(given, name) != _stored(old, name)
+    ]
+    if fixed:
+        raise JobError(
+            f"a curator job has a fixed {', '.join(fixed)}. You can change its name, "
+            "schedule, and delivery targets."
+        )
+
+
 RECENT_FIRES: Final = 10
 
 ActorKind = Literal["user", "agent"]
@@ -626,8 +641,18 @@ class JobService:
             schedule = preview(old.schedule, given.tz)["schedule"]
         if schedule is None:
             raise JobError("a job needs a schedule")
+        deliver = parse_target(pick("deliver", "origin") or "origin")
+        failure = pick("failure_deliver", None)
+        failure = parse_target(failure, field="failure_deliver") if failure else None
         if old is not None and old.mode == "curator":
-            return self._curator_spec(given, old, profile_id, schedule)
+            _check_curator(given, old)
+            return replace(
+                old,
+                agent_profile_id=profile_id,
+                schedule=schedule,
+                deliver=deliver,
+                failure_deliver=failure,
+            )
         mode = pick("mode", "agent") or "agent"
         prompt = (pick("prompt", "") or "").strip()
         script = pick("script", None)
@@ -643,9 +668,6 @@ class JobService:
                     f"the {label} contains a secret. Keep secrets in the vault, and use a "
                     "connection or a vault reference."
                 )
-        deliver = parse_target(pick("deliver", "origin") or "origin")
-        failure = pick("failure_deliver", None)
-        failure = parse_target(failure, field="failure_deliver") if failure else None
         if "preapproved_tools" in sent:
             tools = tuple(parse_preapproval(item) for item in given.preapproved_tools or [])
         else:
@@ -664,33 +686,6 @@ class JobService:
             failure_deliver=failure,
             preapproved_tools=tools,
             attach_to_session=bool(pick("attach_to_session", False)),
-        )
-
-    @staticmethod
-    def _curator_spec(
-        given: JobInput, old: JobSpec, profile_id: uuid.UUID, schedule: dict[str, Any]
-    ) -> JobSpec:
-        """A curator job runs the curator, not a prompt or a script (Section 9.7). A person
-        changes its name, schedule, profile, and targets only."""
-        fixed = [
-            name
-            for name in CURATOR_FIXED
-            if name in given.model_fields_set and getattr(given, name) != _stored(old, name)
-        ]
-        if fixed:
-            raise JobError(
-                f"a curator job has a fixed {', '.join(fixed)}. You can change its name, "
-                "schedule, and delivery targets."
-            )
-        sent = given.model_fields_set
-        deliver = parse_target(given.deliver or "origin") if "deliver" in sent else old.deliver
-        failure = given.failure_deliver if "failure_deliver" in sent else old.failure_deliver
-        return replace(
-            old,
-            agent_profile_id=profile_id,
-            schedule=schedule,
-            deliver=deliver,
-            failure_deliver=parse_target(failure, field="failure_deliver") if failure else None,
         )
 
     def _approval(self, actor: Actor, spec: JobSpec, version: int) -> dict[str, Any]:

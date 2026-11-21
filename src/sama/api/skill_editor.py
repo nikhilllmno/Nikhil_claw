@@ -15,8 +15,7 @@ from typing import Any, Final, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, func, insert, literal, select, update
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy import and_, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api.auth import Principal
@@ -33,7 +32,7 @@ from sama.skills.lint import (
     MAX_SUMMARY_CHARS,
 )
 from sama.skills.service import SkillLibrary
-from sama.skills.sql import load_docs, scope_filter
+from sama.skills.sql import copy_version, load_docs, scope_filter
 from sama.skills.store import PostgresSkillStore
 from sama.tenancy.access import Grants, load_grants
 
@@ -398,44 +397,15 @@ class SkillEditor:
             if action == "restore":
                 if row.status != "archived":
                     raise HTTPException(status_code=409, detail="the skill is not archived")
-                version += 1
-                await connection.execute(
-                    insert(SkillVersion).from_select(
-                        [
-                            "org_id",
-                            "skill_id",
-                            "version_no",
-                            "name",
-                            "description",
-                            "skill_md",
-                            "files",
-                            "tags",
-                            "requires_toolsets",
-                            "change",
-                            "summary",
-                            "author_kind",
-                            "author_user_id",
-                        ],
-                        select(
-                            SkillVersion.org_id,
-                            SkillVersion.skill_id,
-                            literal(version),
-                            SkillVersion.name,
-                            SkillVersion.description,
-                            SkillVersion.skill_md,
-                            SkillVersion.files,
-                            SkillVersion.tags,
-                            SkillVersion.requires_toolsets,
-                            literal("restore"),
-                            literal("A person restored the archived skill."),
-                            literal("user"),
-                            literal(actor.user_id, type_=PG_UUID(as_uuid=True)),
-                        ).where(
-                            SkillVersion.org_id == actor.org_id,
-                            SkillVersion.skill_id == row.id,
-                            SkillVersion.version_no == row.current_version,
-                        ),
-                    )
+                version = await copy_version(
+                    connection,
+                    actor.org_id,
+                    row.id,
+                    version,
+                    change="restore",
+                    summary="A person restored the archived skill.",
+                    author_kind="user",
+                    author_user_id=actor.user_id,
                 )
                 values |= {
                     "status": "active",

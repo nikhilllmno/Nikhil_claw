@@ -19,7 +19,7 @@ import {
   type WritableSkillScope,
 } from "@/lib/api";
 import {
-  curatorBadges,
+  curatorBadge,
   filterSkills,
   nameProblem,
   pathProblem,
@@ -179,6 +179,16 @@ function SkillsHome({
 
   // The list shows again after a skill or the new skill form closes. The focus goes back to
   // the button that opened it, or to the heading if that button is gone.
+  // After a restore, the focus goes to the restored skill when the new list has it, else to the
+  // heading. The Restore button that had the focus is gone.
+  const restoring = useRef<{ key: string; from: SkillCatalog } | null>(null);
+  useEffect(() => {
+    const pending = restoring.current;
+    if (pending === null || pending.from === catalog) return;
+    restoring.current = null;
+    (rows.current.get(pending.key) ?? heading.current)?.focus();
+  }, [catalog]);
+
   useEffect(() => {
     if (focusKey === null) return;
     const target = focusKey === "new" ? newButton.current : rows.current.get(focusKey);
@@ -215,12 +225,24 @@ function SkillsHome({
         registerRow={registerRow}
         onOpen={onOpen}
       />
-      <ArchivedSkills workspaceId={workspaceId} onRestored={onRestored} />
+      <ArchivedSkills
+        workspaceId={workspaceId}
+        onRestored={(skill) => {
+          restoring.current = { key: `${skill.scope}:${skill.name}`, from: catalog };
+          onRestored(skill.name);
+        }}
+      />
     </>
   );
 }
 
-function ArchivedSkills({ workspaceId, onRestored }: { workspaceId: string; onRestored: (name: string) => void }) {
+function ArchivedSkills({
+  workspaceId,
+  onRestored,
+}: {
+  workspaceId: string;
+  onRestored: (skill: ArchivedSkill) => void;
+}) {
   const api = useApi();
   const load = useCallback(() => api.listArchivedSkills(workspaceId), [api, workspaceId]);
   const archived = useLoad(load, "Could not load the archived skills.");
@@ -234,7 +256,7 @@ function ArchivedSkills({ workspaceId, onRestored }: { workspaceId: string; onRe
     try {
       await api.setSkillState(workspaceId, skill.name, skill.scope, "restore");
       archived.reload();
-      onRestored(skill.name);
+      onRestored(skill);
     } catch (e) {
       setError(errorText(e, "The skill was not restored."));
     } finally {
@@ -245,7 +267,8 @@ function ArchivedSkills({ workspaceId, onRestored }: { workspaceId: string; onRe
   if (archived.error) {
     return <ErrorState title="The archived skills did not load" message={archived.error} onRetry={archived.reload} />;
   }
-  if (archived.data === null || archived.data.length === 0) return null;
+  if (archived.data === null) return <LoadingState label="Loading the archived skills" />;
+  if (archived.data.length === 0) return null;
   return (
     <details className={`card ${styles.card}`}>
       <summary>Archived skills ({archived.data.length})</summary>
@@ -313,11 +336,7 @@ function SkillList({
                 <span className={s.scope === "builtin" ? "badge" : "badge badge-accent"}>
                   {SCOPE_LABELS[s.scope]}
                 </span>
-                {curatorBadges(s).map((b) => (
-                  <span key={b.label} className={`badge badge-${b.tone}`}>
-                    {b.label}
-                  </span>
-                ))}
+                <CuratorBadge skill={s} />
                 <span className={styles.meta}>v{s.version}</span>
               </div>
             </div>
@@ -559,11 +578,7 @@ function SkillView({
             <span className={skill.scope === "builtin" ? "badge" : "badge badge-accent"}>
               {SCOPE_LABELS[skill.scope]}
             </span>
-            {curatorBadges(skill).map((b) => (
-              <span key={b.label} className={`badge badge-${b.tone}`}>
-                {b.label}
-              </span>
-            ))}
+            <CuratorBadge skill={skill} />
             <span className={styles.meta}>v{skill.version}</span>
           </div>
         </div>
@@ -668,6 +683,11 @@ function SkillView({
       </section>
     </>
   );
+}
+
+function CuratorBadge({ skill }: { skill: SkillSummary }) {
+  const badge = curatorBadge(skill);
+  return badge ? <span className={`badge badge-${badge.tone}`}>{badge.label}</span> : null;
 }
 
 function BackButton({ onBack }: { onBack: () => void }) {

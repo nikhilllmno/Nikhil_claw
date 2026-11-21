@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.curator import curate as curate_module
 from sama.curator.ensure import ensure_curator_jobs
+from sama.curator.policy import SkillState, decide
 from sama.db.models import (
     AuditEntry,
     Delivery,
@@ -322,6 +325,60 @@ async def test_only_the_first_workspace_covers_org_and_user_skills(
     assert (await _skill(engine, org_skill)).status == "active"
     await service.run_now(tenant.user(), jobs[tenant.ids["ws"]].id)
     assert (await _skill(engine, org_skill)).status == "stale"
+
+
+async def test_kept_skills_do_not_fill_the_batch(
+    engine: AsyncEngine, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch reads only skills that change, so old pinned skills never hide the others."""
+    monkeypatch.setattr(curate_module, "MAX_SKILLS", 2)
+    await _own_workspace(engine, tenant)
+    for n in range(3):
+        await _add_skill(engine, tenant, f"kept-{n}", idle_days=400, pinned=True)
+    late = await _add_skill(engine, tenant, "late", idle_days=40)
+    await _ensure(engine)
+    [job] = await _curator_jobs(engine, tenant)
+    await JobService(engine, RunQueue(engine)).run_now(tenant.user(), job.id)
+    assert (await _skill(engine, late)).status == "stale"
+
+
+async def test_a_pin_or_a_use_during_the_run_wins(engine: AsyncEngine, tenant: Tenant) -> None:
+    """The curator decides from a snapshot. A pin or a use that commits after the snapshot
+    keeps the skill: the update checks the row again."""
+    pinned = await _add_skill(engine, tenant, "pinned-late", idle_days=40)
+    used = await _add_skill(
+        engine, tenant, "used-late", idle_days=100, status="stale", stale_days=10
+    )
+    now = datetime.now(UTC)
+    job = SimpleNamespace(org_id=tenant.org, workspace_id=tenant.ids["ws"], id=uuid.uuid4())
+
+    def snapshot(skill_id: uuid.UUID, name: str, status: str, idle: int) -> SkillState:
+        return SkillState(
+            skill_id=skill_id,
+            scope="workspace",
+            name=name,
+            status=status,
+            pinned=False,
+            exempt=False,
+            last_active=now - timedelta(days=idle),
+            stale_since=now - timedelta(days=10) if status == "stale" else None,
+        )
+
+    before_pin = snapshot(pinned, "pinned-late", "active", 40)
+    before_use = snapshot(used, "used-late", "stale", 100)
+    assert decide(before_pin, now) == "stale"
+    assert decide(before_use, now) == "archive"
+    async with engine.begin() as connection:
+        await connection.execute(update(Skill).where(Skill.id == pinned).values(pinned=True))
+        await connection.execute(
+            update(Skill).where(Skill.id == used).values(last_used_at=func.now())
+        )
+    async with engine.begin() as connection:
+        assert not await curate_module._mark_stale(connection, job, before_pin, now)
+        assert not await curate_module._archive(connection, job, before_use, now)
+    assert (await _skill(engine, pinned)).status == "active"
+    after = await _skill(engine, used)
+    assert (after.status, after.current_version) == ("stale", 1)
 
 
 async def test_a_person_changes_only_the_name_schedule_and_targets(

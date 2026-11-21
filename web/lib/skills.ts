@@ -51,12 +51,13 @@ export function filterSkills(skills: readonly SkillSummary[], text: string): Ski
   });
 }
 
-/** The curator badges of a skill (Section 9.7): pinned, or stale. */
-export function curatorBadges(skill: Pick<SkillSummary, "status" | "pinned">): { label: string; tone: "accent" | "warning" }[] {
-  const badges: { label: string; tone: "accent" | "warning" }[] = [];
-  if (skill.pinned) badges.push({ label: "Pinned", tone: "accent" });
-  else if (skill.status === "stale") badges.push({ label: "Stale", tone: "warning" });
-  return badges;
+/** The curator badge of a skill (Section 9.7): pinned, else stale, else none. */
+export function curatorBadge(
+  skill: Pick<SkillSummary, "status" | "pinned">,
+): { label: string; tone: "accent" | "warning" } | null {
+  if (skill.pinned) return { label: "Pinned", tone: "accent" };
+  if (skill.status === "stale") return { label: "Stale", tone: "warning" };
+  return null;
 }
 
 export const STALE_TEXT =
