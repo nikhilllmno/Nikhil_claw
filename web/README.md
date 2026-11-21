@@ -64,7 +64,10 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/memory` | Memory editor: agent notes, your profile, and workspace notes, with the revision history and revert. |
 | `/skills` | Skill editor: list, new skill, `SKILL.md`, files, versions, and archive. Built-in skills are read-only. |
 | `/members` | The members of an org and their roles. An owner or admin changes roles and workspaces, removes members, makes invite links, and revokes invites. |
-| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot), linked chat accounts with link codes, and the agents. |
+| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot and the Slack app), linked chat accounts with link codes, the agents (an admin creates a new agent), and "Your data" (download or delete your data in an org). |
+| `/onboarding` | The setup guide after sign-up: connect a chat app, pick or create an agent, send a first message. |
+| `/admin` | The admin area (an org owner or admin): overview, `/admin/usage`, `/admin/audit`, `/admin/changes` (agent changes), `/admin/curator`, `/admin/keys` (org keys and region), and `/admin/data` (retention, org export, org delete). |
+| `/help`, `/help/[topic]` | Help pages for customers. They need no sign-in. |
 
 ## Layout
 
@@ -72,7 +75,8 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 app/          routes, global CSS and design tokens (tokens.css)
 components/   UI: shell, sidebar, chat, composer, cards, agent settings, providers,
               memory editor, skill editor, session search, run traces, settings,
-              welcome (no org yet), members,
+              welcome (no org yet), members, chat apps, org keys, onboarding, admin
+              (usage, audit log, agent changes, curator reports, data controls), help,
               the shared page frame (Page.module.css, PageHeader)
 lib/          framework-free logic with unit tests:
               api (client with one refresh and retry on 401), auth (Supabase, PKCE),
@@ -80,7 +84,8 @@ lib/          framework-free logic with unit tests:
               profile (settings draft and validation), memory (entries and caps),
               skills (name and path checks), history (cost, tokens, trace steps, file
               download), connections, tasks, time, config, orgs (invite links,
-              the kept invite token, role rules)
+              the kept invite token, role rules), admin (usage, audit, retention),
+              onboarding (setup progress), help (the help text)
 ```
 
 Tokens: all colours, spacing and type come from CSS custom properties in `app/tokens.css`. Light and dark follow `prefers-color-scheme`.
@@ -89,4 +94,4 @@ Auth: tokens live in `sessionStorage` (cleared when the tab closes). A 401 trigg
 
 ## Not in this version
 
-A Slack connect form (the settings page shows only the Slack status), per-skill settings, and a skill revert (load an old version into the editor and save it). Tool calls that finished before the page was opened are not shown in the chat; only new ones stream in.
+Per-skill settings, and a skill revert (load an old version into the editor and save it). Tool calls that finished before the page was opened are not shown in the chat; only new ones stream in.

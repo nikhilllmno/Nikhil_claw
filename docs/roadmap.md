@@ -39,7 +39,7 @@ M2 and M3 can run in parallel after M1.
 
 ## M1 — Core engine
 
-Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.1, M6.2, M6.3, M6.4, M6.5 (below the list of M1 notes).
+Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.1, M6.2, M6.3, M6.4, M6.5, M6.9 (below the list of M1 notes).
 
 - M1.2: migrations in `migrations/`, models in `src/sama/db/`, RLS tests in `tests/db/`. The
   Supabase project `sama` (`ap-south-1`) has the migrations. The tenancy check through the
@@ -484,7 +484,7 @@ Done: M1.1 to M1.19, M2.1 to M2.6, M3.5, M3.6, M3.11, M4.1 to M4.3, M4.13, M6.1,
 | M6.6 | Billing and quotas | Stripe plans and usage billing from proxy cost. Quotas per plan. Done (architecture §17.5): Checkout, the customer portal, a signed webhook, a usage meter fed from `model_calls`, model quotas per plan in the queue (`402`) and the proxy, and the `/billing` page. Billing is off without a valid Stripe key. A person still runs the setup script with a real key, sets the staging and live secrets, and tests a real checkout. |
 | M6.7 | Org keys, bots, and regions | An org can bring its own Anthropic and OpenAI keys (its own Telegram bot came in M1.19). Region per org. Done: the keys go in the vault, and the model proxy and the media tools use the org key first and record `key_source`. An org admin sets the keys on the settings page. Each org has a region. A deployment serves only its home region (`SAMA_REGION`), and the API sends members of an org in another region to its deployment (`421`). A second region is not deployed: the setting, the routing seam, and the operator steps are in architecture §17.3. |
 | M6.8 | Data controls | Export and delete per user and per org. Retention per org, with a seam for the plans of M6.6 (architecture §17.4). Done. |
-| M6.9 | Customer-ready web app | Onboarding, billing pages, admin views, and docs. |
+| M6.9 | Customer-ready web app | Onboarding, billing pages, admin views, and docs. Done (architecture §17.5): a setup guide after sign-up (chat app, agent, first message), the admin area (usage, audit log, agent changes, curator reports, org keys and region, data controls), the Slack connect form, new agent profiles, help pages, and one navigation for all pages. |
 
 ---
 

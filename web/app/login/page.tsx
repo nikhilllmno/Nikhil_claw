@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
@@ -218,6 +219,9 @@ export default function LoginPage() {
               </button>
             </form>
           </details>
+          <p className={styles.help}>
+            New to sama? <Link href="/help/getting-started">Read how to get started</Link>.
+          </p>
         </div>
       </main>
     </AuthStatusScreen>

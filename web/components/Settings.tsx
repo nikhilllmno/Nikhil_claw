@@ -1,30 +1,30 @@
 "use client";
 
-// The settings page (docs/architecture.md, Sections 11.4 and 17.3). It shows the account, the
-// chat apps of each org, the model keys and the region of each org, the browser settings of each
-// org (Section 14.1), the chat accounts that the user linked, and the agents. An org admin connects or disconnects the Telegram bot and sets
-// the model keys of the org here. A bot token or a model key goes only into the form of this
-// page.
+// The settings page (docs/architecture.md, Sections 11.4, 14.1, 17.4, and 17.6). It shows the
+// account, the chat apps of each org, the browser settings of each org, the chat accounts that
+// the user linked, the agents, and the data of the user in each org. An org admin connects or
+// disconnects the chat apps and creates agents here. The model keys and the region are in the
+// admin area (Org keys and region).
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 import {
+  type AgentProfileSummary,
   type ChannelIdentity,
   type ChatChannel,
   errorText,
   type Org,
-  type IntegrationSummary,
-  type ModelKeyStatus,
-  type ModelProvider,
   type PairingCode,
 } from "@/lib/api";
-import { integrationTone, toneBadge } from "@/lib/history";
-import { keyProblem, keyUse, MAX_KEY_CHARS, PROVIDER_TITLES, regionText } from "@/lib/orgkeys";
 import { ROLE_LABELS, roleBadge } from "@/lib/orgs";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
 import { BrowserSettings } from "./BrowserSettings";
+import { ChatApps } from "./ChatApps";
+import { MyData } from "./DataControls";
 import { useData } from "./DataProvider";
+import { NewAgentForm } from "./NewAgentForm";
 import { PageHeader } from "./PageHeader";
 import { ErrorState, LoadingState } from "./ui";
 import { useLoad } from "./useLoad";
@@ -41,7 +41,7 @@ export function Settings() {
 
   return (
     <div className={styles.page}>
-      <PageHeader title="Settings" meta="Your account, the chat apps, and the agents." />
+      <PageHeader title="Settings" meta="Your account, the chat apps, the agents, and your data." />
 
       <section className={`card ${styles.card}`} aria-labelledby="settings-account">
         <h2 id="settings-account" className={styles.heading}>
@@ -62,6 +62,12 @@ export function Settings() {
                 <span className={styles.meta}>
                   {o.display_name ? `${o.display_name} · ` : ""}
                   {o.workspaces.length === 1 ? "1 workspace" : `${o.workspaces.length} workspaces`}
+                  {o.admin ? (
+                    <>
+                      {" · "}
+                      <Link href="/admin">Admin</Link>
+                    </>
+                  ) : null}
                 </span>
               </li>
             ))}
@@ -69,13 +75,11 @@ export function Settings() {
         )}
       </section>
 
-      {me.orgs.map((o) => (
-        <ChatApps key={o.id} org={o} onChanged={reloadMe} />
-      ))}
-
-      {me.orgs.map((o) => (
-        <OrgKeys key={o.id} org={o} />
-      ))}
+      {me.orgs
+        .filter((o) => o.region_here)
+        .map((o) => (
+          <ChatApps key={o.id} org={o} onChanged={reloadMe} />
+        ))}
 
       {me.orgs.map((o) => (
         <BrowserSettings key={o.id} org={o} />
@@ -83,11 +87,53 @@ export function Settings() {
 
       <LinkedAccounts orgs={me.orgs} workspaceId={workspaceId} org={org} />
 
-      <section className={`card ${styles.card}`} aria-labelledby="settings-agents">
+      <Agents org={org} workspaceId={workspaceId} profiles={profiles} />
+
+      {me.orgs
+        .filter((o) => o.region_here)
+        .map((o) => (
+          <MyData key={o.id} org={o} />
+        ))}
+    </div>
+  );
+}
+
+function Agents({
+  org,
+  workspaceId,
+  profiles,
+}: {
+  org: Org | null;
+  workspaceId: string | null;
+  profiles: AgentProfileSummary[];
+}) {
+  const router = useRouter();
+  const { reloadMe } = useData();
+  const [creating, setCreating] = useState(false);
+  return (
+    <section className={`card ${styles.card}`} aria-labelledby="settings-agents">
+      <div className={styles.cardHead}>
         <h2 id="settings-agents" className={styles.heading}>
           Agents
         </h2>
-        {profiles.length === 0 ? (
+        {org?.admin && !creating ? (
+          <button type="button" className="btn btn-small" onClick={() => setCreating(true)}>
+            New agent
+          </button>
+        ) : null}
+      </div>
+      {org?.admin && creating ? (
+        <NewAgentForm
+          org={org}
+          workspaceId={workspaceId}
+          onCreated={(profile) => {
+            reloadMe();
+            router.push(`/agents/${profile.id}`);
+          }}
+          onCancel={() => setCreating(false)}
+        />
+      ) : null}
+      {profiles.length === 0 ? (
           <p className={styles.meta}>This workspace has no agents.</p>
         ) : (
           <ul className={styles.list}>
@@ -106,317 +152,6 @@ export function Settings() {
           the <Link href="/memory">Memory</Link> page, and the guides on the{" "}
           <Link href="/skills">Skills</Link> page.
         </p>
-      </section>
-    </div>
-  );
-}
-
-function statusBadge(status: string | undefined): string {
-  return toneBadge(integrationTone(status));
-}
-
-/** The text of a Telegram connect: a success only when the bot is active. */
-function connectResult(view: IntegrationSummary): string | { failure: string } {
-  if (view.status === "active") return `The Telegram bot${view.name ? ` @${view.name}` : ""} is connected.`;
-  const why = view.last_error ? ` Telegram gave this error: ${view.last_error}` : "";
-  return { failure: `The Telegram bot is not active.${why} Check the token and connect again.` };
-}
-
-function ChatApps({ org, onChanged }: { org: Org; onChanged: () => void }) {
-  const api = useApi();
-  const telegram = org.integrations.find((i) => i.kind === "telegram");
-  const slack = org.integrations.find((i) => i.kind === "slack");
-  const [token, setToken] = useState("");
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-
-  // An action gives the text of its success, or `{ failure }` when the API said yes but the
-  // change did not work.
-  const act = async (label: string, action: () => Promise<string | { failure: string }>) => {
-    setBusy(label);
-    setError(null);
-    setNotice(null);
-    try {
-      const done = await action();
-      if (typeof done === "string") setNotice(done);
-      else setError(done.failure);
-      onChanged();
-    } catch (e) {
-      setError(errorText(e, "The change failed."));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const connect = (event: React.FormEvent) => {
-    event.preventDefault();
-    const value = token.trim();
-    if (value === "") {
-      setError("Give the token of the bot.");
-      return;
-    }
-    void act("connect", async () => {
-      const view = await api.connectTelegram(org.id, value);
-      // The secret leaves the page state as soon as the API has it.
-      setToken("");
-      return connectResult(view);
-    });
-  };
-
-  return (
-    <section className={`card ${styles.card}`} aria-label={`Chat apps of ${org.name}`}>
-      <div className={styles.cardHead}>
-        <h2 className={styles.heading}>Chat apps</h2>
-        <span className={styles.meta}>{org.name}</span>
-      </div>
-      <p className={styles.text}>
-        People talk to the agents of the org in these apps. Each org has its own bot.
-      </p>
-      {notice ? (
-        <p className="alert alert-success" role="status">
-          {notice}
-        </p>
-      ) : null}
-      <div className={styles.section}>
-        <div className={styles.row}>
-          <div className={styles.name}>
-            <span>Telegram</span>
-            <span className={statusBadge(telegram?.status)}>{telegram ? telegram.status : "Not connected"}</span>
-            {telegram?.name ? <span className={styles.meta}>@{telegram.name}</span> : null}
-          </div>
-          {org.admin && telegram ? (
-            <button
-              type="button"
-              className="btn btn-danger btn-small"
-              disabled={busy !== null}
-              onClick={() => {
-                if (!window.confirm("Disconnect the Telegram bot? People can no longer talk to the agents there.")) return;
-                void act("disconnect", async () => {
-                  await api.disconnectIntegration(org.id, "telegram");
-                  return "The Telegram bot is disconnected.";
-                });
-              }}
-            >
-              {busy === "disconnect" ? "Disconnecting" : "Disconnect"}
-            </button>
-          ) : null}
-        </div>
-        {telegram && telegram.status !== "active" ? (
-          <p className={styles.error}>
-            {telegram.last_error
-              ? `The bot is not active. Telegram gave this error: ${telegram.last_error}`
-              : `The bot is not active. Its status is ${telegram.status}.`}
-            {org.admin ? " Connect it again with the token of the bot." : " An org admin must connect it again."}
-          </p>
-        ) : null}
-        {org.admin && telegram?.status !== "active" ? (
-          <form className={styles.form} onSubmit={connect} aria-label="Connect a Telegram bot">
-            <label className="field">
-              <span className="label">Bot token</span>
-              <input
-                className="input"
-                type="password"
-                autoComplete="off"
-                value={token}
-                maxLength={200}
-                onChange={(e) => setToken(e.target.value)}
-              />
-              <span className="hint">Make a bot with @BotFather in Telegram and paste its token here. Never paste it in a chat.</span>
-            </label>
-            <div className={styles.actions}>
-              <button type="submit" className="btn btn-primary btn-small" disabled={busy !== null}>
-                {busy === "connect" ? "Connecting" : telegram ? "Connect again" : "Connect"}
-              </button>
-            </div>
-          </form>
-        ) : null}
-        {!org.admin && !telegram ? <p className={styles.meta}>An org admin connects the Telegram bot.</p> : null}
-      </div>
-      <div className={styles.section}>
-        <div className={styles.row}>
-          <div className={styles.name}>
-            <span>Slack</span>
-            <span className={statusBadge(slack?.status)}>{slack ? slack.status : "Not connected"}</span>
-            {slack?.name ? <span className={styles.meta}>{slack.name}</span> : null}
-          </div>
-        </div>
-      </div>
-      {error ? (
-        <p className="alert alert-error" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </section>
-  );
-}
-
-function OrgKeys({ org }: { org: Org }) {
-  const api = useApi();
-  const load = useCallback(() => api.modelKeys(org.id), [api, org.id]);
-  // Only an admin of an org that this deployment serves can read the keys.
-  const keys = useLoad(org.admin && org.region_here ? load : null, "Could not load the model keys.");
-  const [drafts, setDrafts] = useState<Record<ModelProvider, string>>({ anthropic: "", openai: "" });
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [now] = useState(() => Date.now());
-
-  const act = async (label: string, action: () => Promise<ModelKeyStatus[]>, done: string) => {
-    setBusy(label);
-    setError(null);
-    setNotice(null);
-    try {
-      keys.setData(await action());
-      setNotice(done);
-    } catch (e) {
-      setError(errorText(e, "The change failed."));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const save = (event: React.FormEvent, provider: ModelProvider) => {
-    event.preventDefault();
-    const problem = keyProblem(provider, drafts[provider]);
-    if (problem !== null) {
-      setNotice(null);
-      setError(problem);
-      return;
-    }
-    const value = drafts[provider].trim();
-    // The secret leaves the page state before the call.
-    setDrafts((all) => ({ ...all, [provider]: "" }));
-    void act(
-      `set-${provider}`,
-      async () => {
-        const status = await api.setModelKey(org.id, provider, value);
-        return (keys.data ?? []).map((row) => (row.provider === provider ? status : row));
-      },
-      `The ${PROVIDER_TITLES[provider]} key of the org is set. The agents use it from now on.`,
-    );
-  };
-
-  const remove = (provider: ModelProvider) => {
-    const title = PROVIDER_TITLES[provider];
-    if (!window.confirm(`Remove the ${title} key of the org? The agents then use the key of sama, if there is one.`))
-      return;
-    void act(
-      `remove-${provider}`,
-      async () => {
-        await api.removeModelKey(org.id, provider);
-        return await api.modelKeys(org.id);
-      },
-      `The ${title} key of the org is removed.`,
-    );
-  };
-
-  return (
-    <section className={`card ${styles.card}`} aria-label={`Org keys and region of ${org.name}`}>
-      <div className={styles.cardHead}>
-        <h2 className={styles.heading}>Org keys and region</h2>
-        <span className={styles.meta}>{org.name}</span>
-      </div>
-      <div className={styles.row}>
-        <div className={styles.name}>
-          <span>Region</span>
-          <span className="badge mono">{org.region}</span>
-        </div>
-      </div>
-      <p className={styles.text}>
-        {regionText(org)}{" "}
-        {org.region_here ? (
-          "An operator moves an org to another region."
-        ) : org.region_url ? (
-          <a href={org.region_url} rel="noopener noreferrer">
-            Open the org there
-          </a>
-        ) : (
-          "Ask the operator for its address."
-        )}
-      </p>
-      {!org.region_here ? null : !org.admin ? (
-        <p className={styles.meta}>An org admin manages the model keys of the org.</p>
-      ) : (
-        <>
-          <p className={styles.text}>
-            The agents use the key of the org for a provider when the org has one. Else they use the key of sama.
-            The cost shows the same way for both keys.
-          </p>
-          {notice ? (
-            <p className="alert alert-success" role="status">
-              {notice}
-            </p>
-          ) : null}
-          {keys.error ? (
-            <ErrorState title="The model keys did not load" message={keys.error} onRetry={keys.reload} />
-          ) : keys.data === null ? (
-            <LoadingState label="Loading the model keys" />
-          ) : (
-            keys.data.map((status) => {
-              const title = PROVIDER_TITLES[status.provider];
-              const use = keyUse(status);
-              return (
-                <div key={status.provider} className={styles.section}>
-                  <div className={styles.row}>
-                    <div className={styles.name}>
-                      <span>{title}</span>
-                      <span className={status.org_key ? "badge badge-accent" : "badge"}>{use.badge}</span>
-                      <span className={styles.meta}>
-                        {use.text}
-                        {status.org_key && status.updated_at ? ` Set ${relativeTime(status.updated_at, now)}.` : ""}
-                      </span>
-                    </div>
-                    {status.org_key ? (
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-small"
-                        disabled={busy !== null}
-                        onClick={() => remove(status.provider)}
-                      >
-                        {busy === `remove-${status.provider}` ? "Removing" : "Remove"}
-                      </button>
-                    ) : null}
-                  </div>
-                  <form
-                    className={styles.form}
-                    onSubmit={(event) => save(event, status.provider)}
-                    aria-label={`Set the ${title} key of the org`}
-                  >
-                    <label className="field">
-                      <span className="label">{status.org_key ? `New ${title} key` : `${title} key`}</span>
-                      <input
-                        className="input"
-                        type="password"
-                        autoComplete="off"
-                        value={drafts[status.provider]}
-                        maxLength={MAX_KEY_CHARS}
-                        onChange={(e) => {
-                          const value = e.target.value;
-                          setDrafts((all) => ({ ...all, [status.provider]: value }));
-                        }}
-                      />
-                      <span className="hint">
-                        Sama checks the key with {title} before it keeps it. Never paste a key in a chat.
-                      </span>
-                    </label>
-                    <div className={styles.actions}>
-                      <button type="submit" className="btn btn-primary btn-small" disabled={busy !== null}>
-                        {busy === `set-${status.provider}` ? "Checking" : status.org_key ? "Replace" : "Set"}
-                      </button>
-                    </div>
-                  </form>
-                </div>
-              );
-            })
-          )}
-          {error ? (
-            <p className="alert alert-error" role="alert">
-              {error}
-            </p>
-          ) : null}
-        </>
-      )}
     </section>
   );
 }

@@ -3,6 +3,7 @@
 // The first screen of a user without an org (docs/architecture.md, Section 17.2): the open
 // invites for the email of the user, and, when sign-up is open, the form for a new org.
 
+import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 import { errorText, type MyInvite } from "@/lib/api";
 import { checkOrgName, ROLE_LABELS } from "@/lib/orgs";
@@ -15,6 +16,7 @@ import styles from "./Page.module.css";
 export function Welcome() {
   const api = useApi();
   const { signup } = useAuth();
+  const router = useRouter();
   const { reloadMe, reloadSessions } = useData();
   const loadInvites = useCallback(() => api.myInvites(), [api]);
   const { data: invites, error: invitesError, reload } = useLoad(loadInvites, "Could not load your invites.");
@@ -40,6 +42,8 @@ export function Welcome() {
     try {
       await api.createOrg(checked.name, null);
       done();
+      // A new owner continues with the setup guide (Section 17.5).
+      router.push("/onboarding");
     } catch (e) {
       setError(errorText(e, "Could not create the org."));
       setBusy(null);

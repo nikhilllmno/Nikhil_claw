@@ -2021,7 +2021,15 @@ class SamaApi:
         regions = home_regions()
         async with as_user(self._engine, principal.auth_user_id) as connection:
             users = await connection.execute(
-                select(User.id, User.org_id, User.display_name, Org.name, Org.plan, Org.region)
+                select(
+                    User.id,
+                    User.org_id,
+                    User.display_name,
+                    Org.name,
+                    Org.slug,
+                    Org.plan,
+                    Org.region,
+                )
                 .join(Org, Org.id == User.org_id)
                 .where(User.auth_user_id == principal.auth_user_id)
                 .order_by(Org.name, Org.id)
@@ -2033,6 +2041,7 @@ class SamaApi:
                 entry: dict[str, Any] = {
                     "id": str(user.org_id),
                     "name": user.name,
+                    "slug": user.slug,
                     "user_id": str(user.id),
                     "display_name": user.display_name,
                     "admin": grants.org_admin,

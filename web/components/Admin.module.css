@@ -1,0 +1,415 @@
+/* The admin area, the setup guide, and the help pages. It adds only the parts that
+   Page.module.css does not have. */
+
+.tabs {
+  display: flex;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0 0 var(--space-1);
+  list-style: none;
+  overflow-x: auto;
+  border-bottom: var(--border-width) solid var(--border);
+  scrollbar-width: thin;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--touch-target);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.tab[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--field-basis), 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  height: 100%;
+  padding: var(--space-4);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
+  color: var(--text);
+  text-decoration: none;
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+a.tile:hover {
+  border-color: var(--border-strong);
+}
+
+.tileTitle {
+  font-weight: var(--weight-medium);
+}
+
+.tileText {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+}
+
+.stat dt {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.stat dd {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 8rem;
+  padding: var(--space-2) 0 0;
+  border-bottom: var(--border-width) solid var(--border);
+}
+
+.bar {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+
+.barFill {
+  width: 100%;
+  min-height: 1px;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  background: var(--accent);
+}
+
+.bar:hover .barFill {
+  background: var(--accent-hover);
+}
+
+.axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-xs);
+  color: var(--text-subtle);
+}
+
+.share {
+  display: block;
+  height: var(--space-1);
+  border-radius: var(--radius-full);
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+
+.shareFill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+
+/* A table of numbers: the first column is a name, the other columns are right-aligned. */
+.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.data th,
+.data td {
+  padding: var(--space-2);
+  border-bottom: var(--border-width) solid var(--border);
+  text-align: right;
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.data th {
+  color: var(--text-muted);
+  font-weight: var(--weight-medium);
+}
+
+.data th:first-child,
+.data td:first-child {
+  width: 100%;
+  min-width: 8rem;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.segmented button {
+  min-height: var(--space-6);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.segmented button[aria-pressed="true"] {
+  background: var(--surface-raised);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+
+.event {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) 0;
+  border-top: var(--border-width) solid var(--border);
+}
+
+.event:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.eventHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+}
+
+.eventTitle {
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.chip {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--space-5);
+  overflow-wrap: anywhere;
+}
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.step[aria-current="step"] {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+
+.stepMark {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  border: var(--border-width) solid var(--border-strong);
+  border-radius: var(--radius-full);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.stepDone .stepMark {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.stepBody {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.stepTitle {
+  font-weight: var(--weight-medium);
+}
+
+.choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--field-basis), 1fr));
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  cursor: pointer;
+}
+
+.choice:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice input {
+  margin-top: var(--space-1);
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.choiceText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.prose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: var(--text-md);
+  line-height: var(--leading-loose);
+}
+
+.prose ol,
+.prose ul {
+  margin: 0;
+  padding-left: var(--space-5);
+}
+
+.prose li + li {
+  margin-top: var(--space-1);
+}
+
+.danger {
+  border-color: var(--danger);
+}
+
+.report {
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.setup {
+  border-color: var(--accent);
+}
+
+@media (max-width: 40rem) {
+  .hideNarrow {
+    display: none;
+  }
+}
+
+.article {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* The head of a report in a <details>: the marker and the head on one line. */
+.summary {
+  cursor: pointer;
+}
+
+.summary > .eventHead {
+  display: inline-flex;
+  width: calc(100% - var(--space-5));
+  vertical-align: baseline;
+}
+
+.summary + * {
+  margin-top: var(--space-2);
+}

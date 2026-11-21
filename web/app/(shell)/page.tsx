@@ -1,19 +1,30 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useApi } from "@/components/AuthProvider";
 import { useData } from "@/components/DataProvider";
 import { ErrorState, LoadingState } from "@/components/ui";
 import { Welcome } from "@/components/Welcome";
-import { type Audience, errorText } from "@/lib/api";
+import { type Audience, errorText, type Org } from "@/lib/api";
+import { currentStep, loadProgress, onboardingSteps, saveProgress, showSetupCard } from "@/lib/onboarding";
 import styles from "./home.module.css";
 
 export default function HomePage() {
   const api = useApi();
   const router = useRouter();
-  const { me, meError, reloadMe, workspaces, workspaceId, setWorkspaceId, profilesFor, reloadSessions } =
-    useData();
+  const {
+    me,
+    meError,
+    reloadMe,
+    workspaces,
+    workspaceId,
+    setWorkspaceId,
+    profilesFor,
+    orgOfWorkspace,
+    reloadSessions,
+  } = useData();
   const profiles = profilesFor(workspaceId);
   const [chosenProfile, setProfileId] = useState("");
   const [audience, setAudience] = useState<Audience>("private");
@@ -61,6 +72,8 @@ export default function HomePage() {
 
   return (
     <main className={styles.page}>
+      <div className={styles.panel}>
+        <SetupCard org={orgOfWorkspace(workspaceId)} />
       <form className={styles.panel} onSubmit={submit}>
         <h1 className={styles.title}>What should we work on?</h1>
         <p className={styles.lead}>Pick an agent and start a session. You can send the first message next.</p>
@@ -129,6 +142,43 @@ export default function HomePage() {
           {busy ? "Starting…" : "Start session"}
         </button>
       </form>
+      </div>
     </main>
+  );
+}
+
+/** The card that brings an admin back to the setup guide until it is done (Section 17.5). */
+function SetupCard({ org }: { org: Org | null }) {
+  const [hidden, setHidden] = useState(false);
+  if (org === null || hidden || !org.region_here) return null;
+  const progress = loadProgress(window.localStorage, org.id);
+  if (!showSetupCard(org, progress)) return null;
+  const steps = onboardingSteps(org, progress);
+  const done = steps.filter((s) => s.done).length;
+  const next = steps.find((s) => s.id === currentStep(steps));
+  return (
+    <section className={`card ${styles.setup}`} aria-labelledby="setup-card">
+      <h2 id="setup-card" className={styles.setupTitle}>
+        Finish setting up {org.name}
+      </h2>
+      <p className={styles.lead}>
+        {done} of {steps.length} steps done.{next ? ` Next: ${next.title.toLowerCase()}.` : ""}
+      </p>
+      <div className={styles.setupActions}>
+        <Link href="/onboarding" className="btn btn-primary btn-small">
+          Continue the setup
+        </Link>
+        <button
+          type="button"
+          className="btn btn-quiet btn-small"
+          onClick={() => {
+            saveProgress(window.localStorage, org.id, { ...progress, done: true });
+            setHidden(true);
+          }}
+        >
+          Hide
+        </button>
+      </div>
+    </section>
   );
 }
