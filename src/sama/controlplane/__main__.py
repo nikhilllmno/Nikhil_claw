@@ -24,6 +24,9 @@ Optional environment:
 - ``SAMA_WEB_ORIGINS``: the origins of the web app (``web/``) that may call the API from a
   browser, comma-separated, for example ``https://sama-web.vercel.app,http://localhost:3000``.
   An origin has no path and no ``*``. Without it, the API sends no CORS headers.
+- ``SAMA_EXTENSION_IDS``: the ids of the Chrome extensions that may open the extension channel
+  (``/channels/chrome/ws``), comma-separated. Without it, any ``chrome-extension://`` origin may
+  open it. The channel always needs a valid access token.
 - ``SAMA_ENVIRONMENT``, ``SAMA_TRACE_CONTENT``, ``SAMA_SUPABASE_JWT_SECRET``,
   ``SAMA_SANDBOX_TEMPLATE``, ``SAMA_SANDBOX_ALLOW_OUT`` (comma-separated hosts),
   ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_VISION_MODEL`` (the model of

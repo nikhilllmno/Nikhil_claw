@@ -66,10 +66,20 @@ class Reference:
         return f"@{self.kind}:{self.target}"
 
 
+# An untrusted block (``sama.tools.output.untrusted``) to its end. The body of a block cannot
+# contain its closing tag, so the first closing tag ends the block. A block without its closing
+# tag goes to the end of the text.
+UNTRUSTED_BLOCK: Final = re.compile(
+    r"<untrusted_content\b[^>]*>.*?(?:</untrusted_content>|\Z)", re.IGNORECASE | re.DOTALL
+)
+
+
 def find_references(text: str) -> list[Reference]:
-    """The references of a message, in order, without repeats."""
+    """The references of a message, in order, without repeats. The text of an untrusted block
+    (for example a page from the Chrome extension) has no references: content from outside
+    must not make sama read files, sessions, or URLs."""
     found: list[Reference] = []
-    for match in REFERENCE.finditer(text):
+    for match in REFERENCE.finditer(UNTRUSTED_BLOCK.sub(" ", text)):
         target = match.group(2).rstrip(TRAILING)
         reference = Reference(match.group(1), target)
         if target and reference not in found:

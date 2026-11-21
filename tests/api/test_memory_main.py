@@ -109,3 +109,11 @@ async def test_the_standalone_api_allows_the_web_origin(monkeypatch: pytest.Monk
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "https://web.example.test"
+
+
+@pytest.mark.usefixtures("standalone_env")
+def test_the_standalone_api_refuses_a_bad_extension_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SAMA_EXTENSION_IDS", "not-an-extension-id")
+
+    with pytest.raises(SystemExit, match="SAMA_EXTENSION_IDS"):
+        build_app()

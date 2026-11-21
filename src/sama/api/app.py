@@ -47,6 +47,8 @@ from starlette.types import ASGIApp, Lifespan
 
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
+from sama.api.chrome import ChromeChannel
+from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
 from sama.api.history import (
     DEFAULT_RUNS,
     MAX_RUNS,
@@ -57,7 +59,7 @@ from sama.api.history import (
     SessionHistory,
 )
 from sama.api.orgs import router as org_router
-from sama.api.origins import check_origins
+from sama.api.origins import check_extension_ids, check_origins
 from sama.api.skill_editor import (
     ArchivedSkill,
     ReadScope,
@@ -112,12 +114,14 @@ from sama.db.models import (
 )
 from sama.db.models import Connection as ConnectionRow
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
+from sama.gateway.chrome import ChromeHub, PageContext, PageError, page_message
 from sama.gateway.handoff import HandoffError, Handoffs
 from sama.gateway.pairing import PairingError, create_code
 from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
 from sama.media.generate import GeneratedMediaStore
+from sama.media.images import NewAttachment
 from sama.memory import (
     CAPS,
     MemoryChangeError,
@@ -167,7 +171,6 @@ from sama.workflows.spec import WorkflowError, WorkflowNotFoundError
 
 log = logging.getLogger("sama.api")
 
-MAX_MESSAGE_CHARS: Final = 32_000
 MAX_TITLE_CHARS: Final = 200
 MAX_REASON_CHARS: Final = 500
 STREAM_BATCH: Final = 500
@@ -201,10 +204,20 @@ class ApiSettings(BaseModel):
     signup: SignupPolicy = SignupPolicy()
     """Self-serve sign-up (Section 17.2). The default is ``invite_only``."""
 
+    extension_ids: tuple[str, ...] = ()
+    """The ids of the Chrome extensions that may open the extension channel
+    (``SAMA_EXTENSION_IDS``). With none, every ``chrome-extension://`` origin may open it. The
+    channel always needs a valid access token."""
+
     @field_validator("web_origins")
     @classmethod
     def _origins_are_exact(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return check_origins(value)
+
+    @field_validator("extension_ids")
+    @classmethod
+    def _extension_ids_are_valid(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return check_extension_ids(value)
 
 
 # -- request and response bodies ------------------------------------------------------------
@@ -920,6 +933,16 @@ class SamaApi:
             engine, AuthUsersEmails(engine), self._settings.signup
         )
         self._streams: Counter[uuid.UUID] = Counter()
+        self.chrome = ChromeHub()
+        """The open connections of the Chrome extension channel (M5.4)."""
+
+    @property
+    def settings(self) -> ApiSettings:
+        return self._settings
+
+    @property
+    def verifier(self) -> JwtVerifier:
+        return self._verifier
 
     async def principal(self, request: Request) -> Principal:
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
@@ -1103,13 +1126,9 @@ class SamaApi:
             after: Annotated[int | None, Query(ge=0)] = None,
             last_event_id: Annotated[str | None, Header()] = None,
         ) -> StreamingResponse:
-            cursor = _cursor(after, last_event_id)
-            async with as_user(self._engine, principal.auth_user_id) as connection:
-                await session_access(connection, principal, session_id)
-                if cursor is None:
-                    cursor = await self._last_event_id(connection, session_id)
+            cursor = await self.first_cursor(principal, session_id, _cursor(after, last_event_id))
             lifetime = self._stream_lifetime(principal)
-            release = self._open_stream(principal.auth_user_id)
+            release = self.open_stream(principal.auth_user_id)
             return _EventStream(
                 self._stream(principal, session_id, cursor, lifetime),
                 release=release,
@@ -1117,6 +1136,8 @@ class SamaApi:
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
+
+        app.add_api_websocket_route("/channels/chrome/ws", ChromeChannel(self).serve)
 
         @app.post("/runs/{run_id}/cancel")
         async def cancel(principal: Me, run_id: uuid.UUID) -> dict[str, str]:
@@ -2753,23 +2774,63 @@ class SamaApi:
     async def _send(
         self, principal: Principal, session_id: uuid.UUID, body: NewMessage
     ) -> JSONResponse:
+        try:
+            sent = await self.submit(principal, session_id, body.text)
+        except SendError as error:
+            headers = {}
+            if error.retry_after_s is not None:
+                headers["Retry-After"] = str(error.retry_after_s)
+            return JSONResponse(
+                status_code=error.status, content={"detail": error.detail}, headers=headers
+            )
+        return JSONResponse(status_code=202, content=sent.model_dump(mode="json"))
+
+    async def submit(
+        self,
+        principal: Principal,
+        session_id: uuid.UUID,
+        text: str,
+        *,
+        page: PageContext | None = None,
+    ) -> Sent:
+        """Queues a user message, as ``POST /sessions/{id}/messages`` does. Raises
+        ``SendError``.
+
+        With ``page`` (the extension channel, M5.4), the message has the page of the tab as
+        untrusted content, and a skill command is not expanded. Page content can hold private
+        data of the user, so only the owner of a private session can share a page in it.
+        """
         async with as_user(self._engine, principal.auth_user_id) as connection:
-            access = await session_access(connection, principal, session_id)
-        text = await self._expand_skill(access, body.text)
+            try:
+                access = await session_access(connection, principal, session_id)
+            except HTTPException as error:
+                raise SendError(error.status_code, str(error.detail)) from None
+        attachments: tuple[NewAttachment, ...] = ()
+        if page is None:
+            text = await self._expand_skill(access, text)
+        else:
+            session = access.session
+            if session.audience != "private" or session.owner_user_id != access.user_id:
+                raise SendError(403, "share a page only in a private session of your own")
+            try:
+                message = page_message(text, page)
+            except PageError as error:
+                raise SendError(422, str(error)) from None
+            text, attachments = message.text, message.attachments
         try:
             run_id = await self._queue.enqueue(
-                org_id=access.org_id, session_id=session_id, text=text, user_id=access.user_id
+                org_id=access.org_id,
+                session_id=session_id,
+                text=text,
+                user_id=access.user_id,
+                attachments=attachments,
             )
         except RateLimitedError as error:
-            return JSONResponse(
-                status_code=429,
-                content={"detail": str(error)},
-                headers={"Retry-After": str(error.retry_after_s)},
-            )
+            raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None
         except QueueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from None
+            raise SendError(409, str(error)) from None
         queued = await self._queue.waits(org_id=access.org_id, run_id=run_id)
-        return JSONResponse(status_code=202, content={"run_id": str(run_id), "queued": queued})
+        return Sent(run_id=run_id, queued=queued)
 
     async def _steer(self, principal: Principal, session_id: uuid.UUID, text: str) -> JSONResponse:
         """``POST /sessions/{id}/steer`` (M3.9): a note for the open run of the session. When no
@@ -3093,8 +3154,9 @@ class SamaApi:
 
     # -- the event stream -------------------------------------------------------------------
 
-    def _open_stream(self, user: uuid.UUID) -> Callable[[], None]:
-        """Takes one stream slot of the user, or raises ``429``. Returns the release."""
+    def open_stream(self, user: uuid.UUID) -> Callable[[], None]:
+        """Takes one stream slot of the user, or raises ``429``. Returns the release. The
+        extension channel takes one slot for each session that it follows."""
         settings = self._settings
         if (
             self._streams.total() >= settings.max_streams
@@ -3125,36 +3187,64 @@ class SamaApi:
             lifetime = min(lifetime, principal.expires_at - time.time())
         return lifetime
 
+    async def first_cursor(
+        self, principal: Principal, session_id: uuid.UUID, after: int | None
+    ) -> int:
+        """Checks the access to the session and returns the cursor of a new stream: ``after``,
+        or the last event of the session. Raises ``404``."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            await session_access(connection, principal, session_id)
+            if after is None:
+                return await self._last_event_id(connection, session_id)
+        return after
+
     async def _stream(
         self, principal: Principal, session_id: uuid.UUID, cursor: int, lifetime: float
     ) -> AsyncIterator[str]:
-        """Server-sent events of a session.
+        """Server-sent events of a session (``session_events``). The SSE id of a
+        ``run_event`` is the ``run_events.id``."""
+        end = asyncio.get_running_loop().time() + lifetime
+        yield "retry: 2000\n\n"
+        async for item in self.session_events(principal, session_id, cursor, lambda: end):
+            if item.event == "ping":
+                yield ": ping\n\n"
+            else:
+                yield _sse(item.event, item.data, item.event_id)
+
+    async def session_events(
+        self,
+        principal: Principal,
+        session_id: uuid.UUID,
+        cursor: int,
+        deadline: Callable[[], float],
+    ) -> AsyncIterator[StreamEvent]:
+        """The events of a session after ``cursor``, until ``deadline()`` (event loop time).
 
         - ``runs``: the first event. The status of each open run and of the recent runs. A
           client that connects again uses it to correct the runs that it shows as open.
-        - ``run_event``: one stored run event. The SSE id is the ``run_events.id``. One worker
-          writes the events of a session at a time, so the ids of a session grow in the order
-          of the commits.
+        - ``run_event``: one stored run event. ``event_id`` is the ``run_events.id``. One
+          worker writes the events of a session at a time, so the ids of a session grow in the
+          order of the commits.
         - ``run``: the status of a run changed.
-        - ``end``: the user cannot read the session any more. The stream ends.
+        - ``end``: the user cannot read the session any more. The events stop.
+        - ``ping``: the heartbeat, every ``heartbeat_s``.
 
-        Each poll checks the access again, with both guards. The stream ends when the access
-        token expires, so that a stream does not live longer than its token.
+        Each poll checks the access again, with both guards. The caller sets the deadline to
+        the token expiry, so that a stream does not live longer than its token. The extension
+        channel moves the deadline when the client sends a fresh token.
         """
         settings = self._settings
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + lifetime
         next_ping = loop.time() + settings.heartbeat_s
         statuses: dict[uuid.UUID, str] = {}
         first = True
-        yield "retry: 2000\n\n"
-        while loop.time() < deadline:
-            out: list[str] = []
+        while loop.time() < deadline():
+            out: list[StreamEvent] = []
             async with as_user(self._engine, principal.auth_user_id) as connection:
                 try:
                     access = await session_access(connection, principal, session_id)
                 except HTTPException:
-                    yield _sse("end", {"reason": "the session is not visible"})
+                    yield StreamEvent("end", {"reason": "the session is not visible"})
                     return
                 events = await connection.execute(
                     select(
@@ -3176,7 +3266,7 @@ class SamaApi:
                 for event in events:
                     cursor = event.id
                     out.append(
-                        _sse(
+                        StreamEvent(
                             "run_event",
                             {
                                 "run_id": str(event.run_id),
@@ -3189,21 +3279,21 @@ class SamaApi:
                     )
                 runs = await self._stream_runs(connection, access.org_id, session_id, statuses)
                 if first:
-                    out.insert(0, _sse("runs", {"runs": [_run_out(run) for run in runs]}))
+                    out.insert(0, StreamEvent("runs", {"runs": [_run_out(run) for run in runs]}))
                 changed = [run for run in runs if statuses.get(run.id) != run.status]
                 statuses.update((run.id, run.status) for run in runs)
                 if not first:
-                    out += [_sse("run", _run_out(run)) for run in changed]
+                    out += [StreamEvent("run", _run_out(run)) for run in changed]
             first = False
-            if loop.time() >= deadline:
+            if loop.time() >= deadline():
                 return  # The token can have expired during the reads.
-            for chunk in out:
-                yield chunk
+            for item in out:
+                yield item
             if loop.time() >= next_ping:
                 next_ping = loop.time() + settings.heartbeat_s
-                yield ": ping\n\n"
+                yield StreamEvent("ping", {})
             if len(out) < STREAM_BATCH:
-                await asyncio.sleep(max(0.0, min(settings.poll_s, deadline - loop.time())))
+                await asyncio.sleep(max(0.0, min(settings.poll_s, deadline() - loop.time())))
 
     @staticmethod
     async def _stream_runs(

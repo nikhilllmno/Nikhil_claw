@@ -13,7 +13,12 @@ from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
-from sama.api.origins import check_origins, parse_origins
+from sama.api.origins import (
+    check_extension_ids,
+    check_origins,
+    parse_extension_ids,
+    parse_origins,
+)
 from sama.db.models import AgentProfile, AuditEntry, Membership, Run, User
 from sama.gate import GateStep
 from sama.gate.decide import TOOLSETS
@@ -864,3 +869,18 @@ async def test_an_unhandled_error_answer_has_the_cors_header(
     assert "detail-that-stays-in-the-log" not in listed.text
     assert other.status_code == 500
     assert "access-control-allow-origin" not in other.headers
+
+
+def test_extension_ids_are_exact() -> None:
+    ext = "abcdefghijklmnopabcdefghijklmnop"
+    assert check_extension_ids([f" {ext} ", ext]) == (ext,)
+    assert parse_extension_ids("") == ()
+    assert parse_extension_ids(f" , {ext},") == (ext,)
+    for value in (
+        "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP",
+        "a" * 33,
+        "z" * 32,
+        f"chrome-extension://{ext}",
+    ):
+        with pytest.raises(ValueError, match="not a Chrome extension id"):
+            check_extension_ids([value])

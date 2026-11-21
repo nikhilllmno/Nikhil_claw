@@ -150,7 +150,9 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            extension/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npx tsc --noEmit
@@ -158,4 +160,22 @@ jobs:
       - name: Build
         env:
           NEXT_PUBLIC_SAMA_API_URL: https://sama-staging.fly.dev
+        run: npm run build
+      # The Chrome extension (M5.4) shares this job so the required check name stays the same.
+      - name: Extension install
+        working-directory: extension
+        run: npm ci
+      - name: Extension lint
+        working-directory: extension
+        run: npm run lint
+      - name: Extension typecheck
+        working-directory: extension
+        run: npm run typecheck
+      - name: Extension test
+        working-directory: extension
+        run: npm test
+      - name: Extension build
+        working-directory: extension
+        env:
+          SAMA_API_URL: https://sama-staging.fly.dev
         run: npm run build

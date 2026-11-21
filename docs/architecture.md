@@ -1220,6 +1220,9 @@ for it.
 - **Syntax.** A reference starts after a space or at the start of the text. The form is
   `@file:<path>`, `@url:<url>`, or `@session:<id>`. Sama removes a final `.`, `,`, `;`, `:`,
   `!`, `?`, a closing bracket, or a quote from the target. A repeated reference counts once.
+  Text in an `<untrusted_content>` block (for example a page from the Chrome extension,
+  Section 14.2.1) has no references: content from outside cannot make sama read a file, a
+  session, or a URL.
 - **Where.** Only a new `chat` run gets the attachment. A resumed run and a compact run do
   not. The stored message stays as the user wrote it, so the transcript and the search show
   the original text. Only the input of the run changes.
@@ -2990,7 +2993,7 @@ another channel. The rules:
 | Web app | REST and server-sent events from the API | Full features: chat, approvals, settings, memory and skill editors, jobs, workflows, connections, run traces. |
 | Slack | Events API, interactivity, and the `/sama` command over HTTP. Web API calls with `httpx` (no Bolt: sama needs only six methods and checks the signature itself) | One Slack app per org. An org admin makes the app from a manifest and connects it as an integration (Section 11.6). Direct messages and mentions in linked channels. A thread in a channel is a session. Approval buttons through Block Kit. Images that users send are stored for `vision_analyze` (Section 11.7). |
 | Telegram | Bot API webhook | One bot per org. An org admin connects the bot of the org as an integration (Section 11.6), and the vault keeps its token (Q3). DMs and groups (mention or reply only in groups). Voice notes are transcribed. Photos and image files are stored for `vision_analyze` (Section 11.7). Inline keyboards for approvals. |
-| Chrome extension | WebSocket from the extension to the gateway | Side panel chat bound to the current tab. Also the `my_chrome` browser target (Section 14). |
+| Chrome extension | WebSocket from the extension to the API (`/channels/chrome/ws`, Section 14.2.1). Supabase Auth sign-in, like the web app | Side panel chat bound to the current tab. "Ask about this page" shares the page as untrusted content (M5.4). Later also the `my_chrome` browser target (Section 14.2.2, M5.5). |
 | Later | Email (inbound address per agent), WhatsApp, Discord, Microsoft Teams | Same adapter shape. |
 
 ### 11.3 Pairing and access
@@ -4425,6 +4428,157 @@ Tools:
 - **Limits**: no access to `chrome://` pages or other extensions. Banking and password
   manager sites are blocked by default.
 
+#### 14.2.1 Extension core (M5.4)
+
+M5.4 builds the side panel chat and "Ask about this page". It does not build browser actions.
+The code is in `extension/` (TypeScript, Manifest V3, esbuild). The server side is
+`sama.api.chrome` (the WebSocket) and `sama.gateway.chrome` (page content and connections).
+
+**Parts of the extension.**
+
+- **Service worker** (`background.ts`). It keeps the Supabase Auth tokens in
+  `chrome.storage.session`, so the tokens go away when the browser closes. It opens the
+  WebSocket, calls the REST API for the side panel, and adds the bearer token. On a `401`, it
+  refreshes the token one time and tries again. The side panel never sees the tokens. When
+  the sign-in service does not answer, the worker keeps the sign-in and tries again later. It
+  signs out only when Supabase refuses the refresh token, or when the API refuses a token that
+  cannot refresh. Chrome can stop the worker when no side panel is open; a panel that opens
+  starts the worker and the connection again.
+- **Side panel** (`panel/`). It talks to the service worker through a `chrome.runtime` port.
+  It shows the sign-in form, the chat of the current tab, the approvals, and the composer.
+  It builds the DOM with `textContent` only. The CSP of the manifest allows only the scripts
+  of the extension.
+- **Tab binding**. The extension keeps the session of each tab in `chrome.storage.session`,
+  one key for each tab (`sama.tab.<tab id>`), so two writers do not overwrite each other.
+  The first message in a tab makes a private session ("Chrome: <tab title>") in the first
+  workspace that has an agent profile. A message goes to the session of the tab where the user
+  clicked, also when the user changes the tab before the message is sent. A closed tab removes
+  its binding. The session stays in the web app.
+
+**Sign-in.** Email and password through Supabase Auth, with the anonymous key from
+`GET /config`. Like the web app, the extension does not keep a password. An advanced form
+accepts an access token (for tests and for staging). The API address is set at build time
+(`SAMA_API_URL`, default staging). The user can change it in the side panel. The extension
+then asks for the host permission of the new address and signs out.
+
+**WebSocket protocol** (`/channels/chrome/ws`, protocol `1`). JSON text frames with a `type`.
+
+| Direction | Frame | Use |
+|---|---|---|
+| Client | `auth {token}` | The first frame, within 10 seconds. The token is never in the URL, so it is not in access logs. A later `auth` with a fresh token of the same user moves the end of the connection. |
+| Client | `subscribe {session_id, after?}`, `unsubscribe {session_id}` | Follow the events of a session from an event id. At most 8 sessions for each connection. Each followed session uses one event stream slot of the user, as SSE does. |
+| Client | `send {id, session_id, text, page?}` | Queue a user message. `page` is "Ask about this page". |
+| Client | `ping` | Keep the connection and the service worker alive (every 20 seconds). |
+| Server | `ready {protocol, expires_at, max_frame_chars}`, `auth_ok {expires_at}` | The connection is signed in until `expires_at` (epoch seconds, from the token). |
+| Server | `runs`, `run_event`, `run`, `end` with `session_id`, `data`, `event_id` | The same events as the SSE stream of Section 11.4. |
+| Server | `sent {id, run_id, queued}`, `error {id?, code, message, retry_after_s?}`, `pong` | Replies. The error codes are `forbidden`, `not_found`, `busy`, `invalid`, and `rate_limited`. |
+
+Close codes: `4400` frame that is not valid, `4401` token that expired or is not valid,
+`4403` origin that is not allowed or a token of a different user, `4408` no `auth` in time,
+`4429` too many connections (4 for each user and process) or too many frames (40 in 10
+seconds), `1009` frame larger than 6,000,000 characters. The extension refreshes the token
+after `4401`. It does not reconnect after `4403`. For other closes, it reconnects with back-off
+(1 to 30 seconds) and follows its sessions again from the last event id.
+
+**Origin.** A browser always sends the `Origin` of a WebSocket. The API accepts
+`chrome-extension://<id>`, and refuses all other browser origins before it accepts the
+connection, so a web page cannot use the cookie-free socket with a stolen token. A client that
+is not a browser sends no `Origin` and must still send a valid token.
+`SAMA_EXTENSION_IDS` (comma-separated 32-letter ids) limits the accepted extensions. Set it
+in production to the id of the Chrome Web Store item.
+
+**Ask about this page.** The user clicks the button. The side panel asks for the host
+permission of the origin of the tab (an optional permission, one time for each site). It then
+reads `document.title`, `innerText`, and the selection with `chrome.scripting`. With "Include
+a screenshot", it takes a JPEG of the visible tab. Chrome takes a screenshot only with the
+`<all_urls>` host permission (a host permission for one site is not sufficient), so in this case
+the same request also asks for `<all_urls>`. Chrome takes the visible tab of the window, so the
+side panel takes the screenshot only if the tab of the click is still the visible tab before and
+after the capture. If it has no screenshot, the side panel sends
+the text and shows a notice. Pages that are not `http` or `https`, and the
+Chrome Web Store, are refused. The `send` frame has `page {url, title, text, screenshot?}`.
+
+The API (`sama.gateway.chrome.page_message`):
+
+- accepts a page only in a private session that the user owns, because the page can hold
+  private data;
+- accepts only `http` and `https` URLs without user info;
+- redacts secrets in the URL, the title, and the text, then cuts the text to 20,000
+  characters with a note (redaction first, so a cut cannot leave part of a secret). The
+  extension sends at most 28,000 characters. When it cuts the text, it drops the last 8,000
+  characters of the part that it cut, and the API drops the last 8,000 characters of a text of
+  28,000 characters, because a cut can go through a secret that the redactor then cannot find.
+  A known secret longer than 8,000 characters is not covered;
+- puts the title, the URL, the selection, and the text in an
+  `<untrusted_content source="chrome_page">` block after a header that tells the model to treat
+  it as data (Section 16.5);
+- stores the screenshot as an image attachment for `vision_analyze` (Section 11.7).
+
+The question of the user stays outside the untrusted block. The question is "Summarize this
+page." when the composer is empty.
+
+**Limits of M5.4.** The API keeps the open connections in memory (`ChromeHub`), one map for
+each API process. The side panel does not show tool call details or traces. The web app shows
+them.
+
+#### 14.2.2 Browser actions in the user's Chrome (M5.5 design)
+
+M5.5 adds the `my_chrome` target of the browser tools (Section 14.1) on the same WebSocket.
+This is a design. M5.4 does not build it.
+
+- **Routing.** `browser_*` tools with `target="my_chrome"` go from the sama MCP server to the
+  control plane. The control plane finds a connection of the user in `ChromeHub`. With more
+  than one API process, a Postgres `LISTEN/NOTIFY` channel for each user sends the call to the
+  process that holds the connection. No connection gives the error "the Chrome extension is
+  offline".
+- **Frames.** The server sends `tool_call {call_id, tool, args, tab_id?, deadline}`. The client
+  sends `tool_result {call_id, ok, result | error}`. A missed deadline is a tool error. The
+  extension acts only in the tab that is bound to the session of the run, or in a tab that the
+  agent opened in the same window group.
+- **Actions.** `chrome.debugger.attach` (CDP `1.3`) on the tab. `Accessibility.getFullAXTree`
+  gives the snapshot with element refs. `Input.dispatchMouseEvent`, `Input.insertText`, and
+  `Input.dispatchKeyEvent` give real clicks and typing. `Page.captureScreenshot` gives vision
+  mode. Chrome shows its "is debugging this browser" bar while the debugger is attached. The
+  extension detaches when the run ends.
+- **Overlay.** A content script draws the agent cursor and a box around the target element,
+  and a "sama is acting - Stop" bar. Stop cancels the run (`/runs/{id}/cancel`) and detaches.
+  A user click or key press in the tab pauses the agent ("you took over").
+- **Consent.** For each site: ask (default), allow for this site, or never. The choice is
+  stored in `chrome.storage.local` and is shown in the side panel. A blocked list (banking,
+  password managers, `accounts.google.com`, the Chrome Web Store) cannot be allowed. Sensitive
+  actions (submit, purchase, send, delete, and type into a password field) always need a click
+  of the user in the side panel, through the approval flow of the tool gate (Section 16.1).
+- **Permissions.** M5.5 adds `debugger` to the manifest. Chrome shows a new warning, so the
+  Web Store item needs a new review.
+
+#### 14.2.3 Publish to the Chrome Web Store
+
+A person does these steps. The agent cannot do them.
+
+1. Build: `cd extension && npm ci && SAMA_API_URL=https://sama-production.fly.dev npm run build`.
+2. Make the zip: `cd dist && zip -r ../sama-extension.zip .`.
+3. Open the Chrome Web Store Developer Dashboard
+   (`https://chrome.google.com/webstore/devconsole`) with the publisher Google account. Pay
+   the one-time developer fee and verify the email if this is the first item.
+4. Click "New item" and upload `sama-extension.zip`.
+5. Store listing: name, short and full description, the 128 px icon
+   (`extension/static/icons/128.png`), at least one 1280x800 screenshot of the side panel,
+   category "Productivity", and the language.
+6. Privacy: give a single purpose ("chat with the sama assistant about the current tab"). Give
+   a reason for each permission: `sidePanel` (the chat), `storage` (the sign-in and the tab
+   binding), `tabs` (the title and address of the current tab), `scripting` and `activeTab`
+   (read the page when the user clicks "Ask about this page"), host permissions (the sama API
+   and the pages that the user shares; the optional `<all_urls>` is requested only when the user
+   asks for a screenshot, because `chrome.tabs.captureVisibleTab` needs it). Declare "Website content" and "Authentication
+   information" as data that the item uses, not sold, and used only for the single purpose.
+   Add a privacy policy URL.
+7. Distribution: choose "Private" (a list of testers or a Google Workspace domain) or
+   "Unlisted" for the first release. Submit for review.
+8. After the item has an id, set `SAMA_EXTENSION_IDS=<id>` on the production app, for example
+   `fly secrets set SAMA_EXTENSION_IDS=<id> -a sama-production`.
+9. For each new version, increase `version` in `extension/manifest.json`, build, zip, and
+   upload on the "Package" page.
+
 ---
 
 ## 15. Code editing and self-modification
@@ -5811,6 +5965,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_SENDGRID_API_KEY`, `SAMA_EMAIL_FROM` | No | Email delivery of jobs (Section 12.1). Without both, an `email:` delivery fails. |
 | `SAMA_SIGNUP` | No | `open` lets a user with a confirmed email make an org. The default, `invite_only`, adds users only with an invite (Section 17.2). |
 | `SAMA_SIGNUP_BLOCKED_DOMAINS` | No | More email domains that cannot make an org, comma-separated (Section 17.2). |
+| `SAMA_EXTENSION_IDS` | No | The Chrome extension ids that may open the extension WebSocket (Section 14.2.1). Without it, every `chrome-extension://` origin may connect with a valid token. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first

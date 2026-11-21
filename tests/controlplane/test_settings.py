@@ -88,6 +88,21 @@ def test_a_web_origin_that_is_not_exact_is_refused(value: str) -> None:
         settings(SAMA_WEB_ORIGINS=value)
 
 
+EXTENSION = "abcdefghijklmnopabcdefghijklmnop"
+
+
+def test_the_extension_ids_are_read() -> None:
+    assert settings().extension_ids == ()
+    s = settings(SAMA_EXTENSION_IDS=f" {EXTENSION},,{'p' * 32},{EXTENSION} ")
+    assert s.extension_ids == (EXTENSION, "p" * 32)
+
+
+@pytest.mark.parametrize("value", ["*", "chrome-extension://" + EXTENSION, "q" * 32, "a" * 31])
+def test_an_extension_id_that_is_not_valid_is_refused(value: str) -> None:
+    with pytest.raises(SettingsError, match="SAMA_EXTENSION_IDS"):
+        settings(SAMA_EXTENSION_IDS=value)
+
+
 def test_the_options_are_read() -> None:
     s = settings(
         SAMA_SANDBOX_ALLOW_OUT=" GitHub.com, pypi.org,,example.org,sama-staging.fly.dev ",

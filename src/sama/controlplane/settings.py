@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
-from sama.api.origins import parse_origins
+from sama.api.origins import parse_extension_ids, parse_origins
 from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
 from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
@@ -145,6 +145,8 @@ class ControlPlaneSettings:
     vault_key: VaultKey | None = None
     web_origins: tuple[str, ...] = ()
     """The origins of the web app that may call the API from a browser (``SAMA_WEB_ORIGINS``)."""
+    extension_ids: tuple[str, ...] = ()
+    """The Chrome extensions that may open the extension channel (``SAMA_EXTENSION_IDS``)."""
     github: GitHubAppConfig | None = None
     """The sama GitHub App (``SAMA_GITHUB_*``). Without it, the git proxy and the pull request
     tools are off."""
@@ -241,6 +243,10 @@ class ControlPlaneSettings:
             signup = SignupPolicy.from_env(env)
         except ValueError as error:
             raise SettingsError(str(error)) from None
+        try:
+            extension_ids = parse_extension_ids(env.get("SAMA_EXTENSION_IDS", ""))
+        except ValueError as error:
+            raise SettingsError(f"SAMA_EXTENSION_IDS: {error}") from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
             github=_github(env),
@@ -267,6 +273,7 @@ class ControlPlaneSettings:
             worker_concurrency=_count(env, "SAMA_WORKER_CONCURRENCY", 4),
             vault_key=vault_key,
             web_origins=web_origins,
+            extension_ids=extension_ids,
             sendgrid_key=_secret(env, "SAMA_SENDGRID_API_KEY"),
             email_from=env.get("SAMA_EMAIL_FROM", "").strip() or None,
             self_repo=_self_repo(env),
