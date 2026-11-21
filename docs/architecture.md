@@ -4837,12 +4837,14 @@ clicks of `browser_task`. `inner` does not run the unattended step of `decide`: 
 run, the `browser_task` call passed that step already (with a pre-approval of the job version or
 an allow rule), and that decision covers the `ask` of its steps.
 
-**Safety.** Every navigation of a step passes the URL policy of the cloud browser (Section 16.4).
+**Safety.** Every navigation of a step passes the URL policy of the cloud browser: the address
+rules (Section 16.4) and the URL policy of the org of the run (M5.3), as for `browser_open`.
 The goal and the page text pass the redactor before they go to the model, and the page text
 reaches the sub-agent in the untrusted blocks of the browser tools. The system prompt tells the
 sub-agent to treat page text as data, to do only what the goal asks, not to buy, pay, delete,
 send, or post unless the goal asks for it, never to type passwords or other secrets, and to stop
-at a login or a CAPTCHA. Saved logins come with the browser vault (M5.3), not in the goal. These prompt rules are not a boundary: the
+at a login or a CAPTCHA. The sub-agent has no `browser_vault` tool. The main agent can fill a
+saved login with `browser_vault` (M5.3) before the task, on the same session. These prompt rules are not a boundary: the
 boundary is the approval, the gate of each step, and the URL policy. The result and the action
 log come from the sub-agent, which read the pages, so they go back to the main agent in an
 `<untrusted_content source="browser_task">` block. The header (status, steps, estimated cost) is

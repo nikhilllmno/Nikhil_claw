@@ -18,6 +18,7 @@ import pytest
 
 from sama.browser import task as task_module
 from sama.browser.budget import MAX_STEPS, TaskBudget, parse_budget
+from sama.browser.policy import OrgUrlPolicy
 from sama.browser.service import BrowserService
 from sama.browser.target import MY_CHROME, BrowserError, TargetName
 from sama.browser.task import (
@@ -34,7 +35,7 @@ from sama.modelproxy.prices import PriceTable
 from sama.runtime.contract import RunEvent, SubagentEvent
 from sama.tenancy.run_token import RunTokenClaims, RunTokenSigner
 from sama.vault.redact import default_redactor
-from tests.browser.fakes import DenyHosts, FakeTarget
+from tests.browser.fakes import AllowAll, DenyHosts, FakeTarget
 from tests.modelproxy.test_app import KEY, Upstream, make_proxy, reply
 from tests.support import make_claims, make_scope
 
@@ -578,3 +579,27 @@ async def test_a_quota_block_of_the_proxy_ends_the_task_with_its_reason(world: W
         "browser_task stopped: the model call failed: the org used its monthly model quota."
     )
     assert upstream.requests == []
+
+
+async def test_the_org_url_policy_applies_to_each_step() -> None:
+    """The sub-agent uses the cloud sessions of the browser service, so the URL policy of the
+    org of the run (M5.3) blocks its navigation as it blocks browser_open."""
+
+    class Policies:
+        async def policy(self, org_id: str) -> OrgUrlPolicy:
+            return OrgUrlPolicy(block_hosts=("evil.test",) if org_id == "org-1" else ())
+
+    target = FakeTarget()
+    service = BrowserService(target, AllowAll(), policies=Policies())
+    model = ScriptedModel(
+        [message(tool_use("open", {"url": "https://evil.test/x"})), done("blocked", False)]
+    )
+    runner = BrowserTaskRunner(service, model, PriceTable.load(), model=MODEL)
+    try:
+        await runner.run(make_claims(), TOKEN, "Open evil.test")
+    finally:
+        await service.aclose()
+    result = model.bodies[1]["messages"][-1]["content"][0]
+    assert result["is_error"] is True
+    assert "evil.test is in the block list of the org" in result["content"][0]["text"]
+    assert all("evil.test" not in call for s in target.sessions for call in s.calls)
