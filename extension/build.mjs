@@ -17,7 +17,7 @@ await rm("dist", { recursive: true, force: true });
 await mkdir("dist", { recursive: true });
 
 await build({
-  entryPoints: { background: "src/background.ts", panel: "src/panel/panel.ts" },
+  entryPoints: { background: "src/background.ts", panel: "src/panel/panel.ts", prompt: "src/panel/prompt.ts" },
   bundle: true,
   format: "esm",
   target: "chrome116",
@@ -31,6 +31,7 @@ await build({
 
 await cp("static", "dist", { recursive: true });
 await cp("src/panel/panel.html", "dist/panel.html");
+await cp("src/panel/prompt.html", "dist/prompt.html");
 await cp("src/panel/panel.css", "dist/panel.css");
 await cp("src/panel/tokens.css", "dist/tokens.css");
 

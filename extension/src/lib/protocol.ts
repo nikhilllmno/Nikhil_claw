@@ -15,7 +15,48 @@ export type ClientFrame =
   | { type: "subscribe"; session_id: string; after?: number }
   | { type: "unsubscribe"; session_id: string }
   | { type: "send"; id: string; session_id: string; text: string; page?: PageContext }
-  | { type: "ping" };
+  | { type: "ping" }
+  | ToolResultFrame;
+
+/** The operations of the `my_chrome` browser target (src/sama/browser/chrome.py). */
+export type ToolOp = "navigate" | "snapshot" | "act" | "screenshot" | "extract" | "tabs" | "release";
+
+/** A browser call of a run in the Chrome of the user (M5.5). */
+export interface ToolCallFrame {
+  type: "tool_call";
+  call_id: string;
+  op: ToolOp;
+  args: Record<string, unknown>;
+  session_id: string;
+  run_id: string;
+  /** A person approved this call in the approval card of the tool gate. */
+  approved: boolean;
+  /** The time that the extension has to answer. */
+  timeout_ms: number;
+}
+
+/** The error codes of a tool result. The API maps each code to fixed text for the agent. */
+export type ToolErrorCode =
+  | "blocked"
+  | "never"
+  | "consent_denied"
+  | "consent_timeout"
+  | "sensitive_denied"
+  | "sensitive_timeout"
+  | "taken_over"
+  | "stopped"
+  | "no_tab"
+  | "stale_ref"
+  | "not_web"
+  | "debugger"
+  | "busy"
+  | "timeout"
+  | "invalid"
+  | "failed";
+
+export type ToolResultFrame =
+  | { type: "tool_result"; call_id: string; ok: true; result: Record<string, unknown> }
+  | { type: "tool_result"; call_id: string; ok: false; error: { code: ToolErrorCode; message: string } };
 
 export interface ReadyFrame {
   type: "ready";
@@ -58,7 +99,8 @@ export type ServerFrame =
   | { type: "auth_ok"; expires_at: number | null }
   | { type: "subscribed"; session_id: string; after: number }
   | { type: "unsubscribed"; session_id: string }
-  | { type: "pong" };
+  | { type: "pong" }
+  | ToolCallFrame;
 
 /** The close codes of the server. */
 export const CLOSE = {
@@ -81,6 +123,7 @@ const SERVER_TYPES = new Set([
   "subscribed",
   "unsubscribed",
   "pong",
+  "tool_call",
 ]);
 
 /** Reads one text frame of the server. Returns `null` for a frame that is not known. */

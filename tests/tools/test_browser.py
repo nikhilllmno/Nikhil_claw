@@ -126,3 +126,42 @@ async def test_the_schema_refuses_a_bad_ref(world: World) -> None:
         )
     assert result.is_error
     assert world.target.sessions == []
+
+
+async def test_the_tools_take_a_target_when_the_service_has_two() -> None:
+    import uuid
+
+    from sama.browser.chrome import ChromeTarget
+    from sama.gateway.chrome import ChromeHub
+    from tests.browser.test_chrome import FakeLink, ok, page
+
+    user = uuid.uuid4()
+    link = FakeLink(ok({"page": page()}), ok({"page": page(), "tree": '- link "Home" [ref=e1]'}))
+    hub = ChromeHub()
+    hub.register(user, link)
+
+    async def lookup(org_id: str, user_id: str) -> uuid.UUID | None:
+        return user
+
+    signer = RunTokenSigner(secrets.token_bytes(32))
+    target = FakeTarget()
+    service = BrowserService([target, ChromeTarget(hub, lookup)], DenyHosts(frozenset()))
+    server = ToolServer(signer=signer, todos=MemoryTodoStore(), browser=service)
+    with serve(server.app()) as base:
+        async with connect(base + "/mcp", signer.issue(make_scope(), ttl_s=600)) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            opened = await client.call_tool(
+                "browser_open", {"url": "https://example.com", "target": "my_chrome"}
+            )
+    open_tool = tools["browser_open"]
+    assert 'target="my_chrome"' in (open_tool.description or "")
+    assert set(open_tool.input_schema["properties"]["target"]["anyOf"][0]["enum"]) == {
+        "cloud",
+        "my_chrome",
+    }
+    assert not opened.is_error, text_of(opened)
+    assert '- link "Home" [ref=e1]' in text_of(opened)
+    # The server closes the session when it stops: the extension gets a release.
+    assert [frame["op"] for frame in link.frames] == ["navigate", "snapshot", "release"]
+    assert link.frames[0]["approved"] is False
+    assert target.sessions == []

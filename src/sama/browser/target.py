@@ -5,7 +5,8 @@ session for a run. The session does the page work: navigate, snapshot with refs,
 screenshot, extract, and tabs.
 
 - ``cloud`` (M5.1) is a Browserbase session with a persistent context per user.
-- ``my_chrome`` (M5.5) will relay the same calls to the Chrome extension of the user.
+- ``my_chrome`` (M5.5) relays the same calls to the Chrome extension of the user
+  (``sama.browser.chrome``).
 
 The tool service (``sama.browser.service``) owns the sessions, the URL guard, and the text for
 the model. A target knows only its browser.
@@ -16,8 +17,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
-
-from sama.tools.output import untrusted
 
 TargetName = Literal["cloud", "my_chrome"]
 CLOUD: Final = "cloud"
@@ -61,6 +60,10 @@ class BrowserError(Exception):
     def __str__(self) -> str:
         if not self.detail:
             return self.message
+        # Imported here: ``sama.tools`` imports this module (the tool server), so a module-level
+        # import makes an import cycle when ``sama.browser`` is imported first.
+        from sama.tools.output import untrusted
+
         return f"{self.message}\n{untrusted(self.detail, source=UNTRUSTED_SOURCE)}"
 
 
@@ -191,11 +194,18 @@ class BrowserTarget(Protocol):
     def name(self) -> TargetName: ...
 
     async def start(
-        self, *, org_id: str, user_id: str | None, run_id: str, guard: NavigationGuard
+        self,
+        *,
+        org_id: str,
+        user_id: str | None,
+        run_id: str,
+        guard: NavigationGuard,
+        session_id: str = "",
     ) -> BrowserSession:
         """Starts a session. With a ``user_id``, the session uses the persistent context of the
         user, so logins stay from run to run. Without one (a shared session), the context is
-        new and is not kept."""
+        new and is not kept. ``session_id`` is the sama session of the run: the ``my_chrome``
+        target acts in the tab that is bound to it."""
         ...
 
     async def aclose(self) -> None: ...

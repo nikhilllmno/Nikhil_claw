@@ -18,6 +18,11 @@ block.
 
 The limits on open sessions count a session from the start of ``target.start``: the service
 reserves the place before the call, so calls at the same time cannot pass the limits.
+
+The service has one or more targets (Section 14.1): ``cloud`` (Browserbase) and ``my_chrome``
+(the extension of the user, M5.5). A run has at most one session on each target. A tool call
+names its target, or uses the target of the last browser call of the run, or the first target
+of the service. The limits count the sessions of each target.
 """
 
 from __future__ import annotations
@@ -27,12 +32,13 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Final
+from typing import Any, Final
 
 from sama.browser.target import (
     ACTIONS_WITH_REF,
+    MY_CHROME,
     UNTRUSTED_SOURCE,
     Act,
     BrowserError,
@@ -47,6 +53,7 @@ from sama.browser.target import (
     Snapshot,
     Tab,
     TabAction,
+    TargetName,
 )
 from sama.tenancy.run_token import RunTokenClaims
 from sama.tools.outbound import BlockedUrlError
@@ -59,11 +66,13 @@ REAP_EVERY_S: Final = 30.0
 MAX_SESSIONS_PER_ORG: Final = 5
 MAX_SESSIONS: Final = 20
 SOURCE: Final = UNTRUSTED_SOURCE
+SAMA_PREFIX: Final = "mcp__sama__"
 
 
 @dataclass(slots=True)
 class _Live:
     org_id: str
+    target: TargetName
     session: BrowserSession | None = None
     reserved: bool = False
     """The entry has a place in the limits: its session is open or starting."""
@@ -77,7 +86,7 @@ class BrowserService:
 
     def __init__(
         self,
-        target: BrowserTarget,
+        target: BrowserTarget | Sequence[BrowserTarget],
         guard: NavigationGuard,
         *,
         idle_s: float = DEFAULT_IDLE_S,
@@ -85,53 +94,73 @@ class BrowserService:
         max_sessions: int = MAX_SESSIONS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.target = target
+        targets = [target] if not isinstance(target, Sequence) else list(target)
+        if not targets:
+            raise ValueError("the browser service needs a target")
+        self.targets: dict[TargetName, BrowserTarget] = {item.name: item for item in targets}
+        self.target = targets[0]
+        """The default target: the target of a run that names none."""
         self.guard = guard
         self._idle_s = idle_s
         self._max_per_org = max_sessions_per_org
         self._max = max_sessions
         self._clock = clock
-        self._live: dict[tuple[str, str], _Live] = {}
+        self._live: dict[tuple[str, str, TargetName], _Live] = {}
+        self._current: dict[tuple[str, str], TargetName] = {}
+        """The target of the last browser call of each run."""
         self._closing: set[asyncio.Task[None]] = set()
         self._reaper: asyncio.Task[None] | None = None
         self._closed = False
 
     # -- the life of a session ---------------------------------------------------------------
 
-    async def _session(self, claims: RunTokenClaims) -> tuple[_Live, BrowserSession]:
-        """The live entry of the run, locked by the caller. It starts the session if the run
-        has none."""
-        live = self._live_of(claims)
+    def target_of(self, claims: RunTokenClaims, target: TargetName | None) -> TargetName:
+        """The target of a call: the named one, else the target of the last browser call of
+        the run, else the default target. Raises ``BrowserError`` for a target that this
+        process does not have."""
+        name = target or self._current.get((claims.org_id, claims.run_id)) or self.target.name
+        if name not in self.targets:
+            have = ", ".join(sorted(self.targets))
+            raise BrowserError(f"the browser target {name} is not available here; use {have}")
+        return name
+
+    async def _session(self, claims: RunTokenClaims, live: _Live) -> tuple[_Live, BrowserSession]:
+        """The session of the live entry, locked by the caller. It starts the session if the
+        entry has none."""
         if live.session is None:
             # Check and reserve with no await between them, so concurrent starts see the place.
-            self._check_limits(claims.org_id)
+            self._check_limits(claims.org_id, live.target)
             live.reserved = True
             try:
-                live.session = await self.target.start(
+                live.session = await self.targets[live.target].start(
                     org_id=claims.org_id,
                     user_id=claims.user_id,
                     run_id=claims.run_id,
                     guard=self.guard,
+                    session_id=claims.session_id,
                 )
             except BaseException:
                 live.reserved = False
                 raise
             self._start_reaper()
         live.used = self._clock()
+        self._current[(claims.org_id, claims.run_id)] = live.target
         return live, live.session
 
-    def _live_of(self, claims: RunTokenClaims) -> _Live:
+    def _live_of(self, claims: RunTokenClaims, target: TargetName) -> _Live:
         if self._closed:
             raise BrowserError("the browser service is stopping")
-        key = (claims.org_id, claims.run_id)
+        key = (claims.org_id, claims.run_id, target)
         live = self._live.get(key)
         if live is None or live.ended:
-            live = _Live(org_id=claims.org_id, used=self._clock())
+            live = _Live(org_id=claims.org_id, target=target, used=self._clock())
             self._live[key] = live
         return live
 
-    def _check_limits(self, org_id: str) -> None:
-        open_sessions = [live for live in self._live.values() if live.reserved]
+    def _check_limits(self, org_id: str, target: TargetName) -> None:
+        open_sessions = [
+            live for live in self._live.values() if live.reserved and live.target == target
+        ]
         if len(open_sessions) >= self._max:
             raise BrowserError("too many browser sessions are open; try again in a few minutes")
         if sum(1 for live in open_sessions if live.org_id == org_id) >= self._max_per_org:
@@ -141,13 +170,13 @@ class BrowserService:
             )
 
     def end_run(self, org_id: str, run_id: str) -> None:
-        """The run-end hook of the worker. It closes the session of the run in the
+        """The run-end hook of the worker. It closes the sessions of the run in the
         background."""
-        live = self._live.pop((org_id, run_id), None)
-        if live is None:
-            return
-        live.ended = True
-        self._spawn_close(live)
+        self._current.pop((org_id, run_id), None)
+        for key in [key for key in self._live if key[0] == org_id and key[1] == run_id]:
+            live = self._live.pop(key)
+            live.ended = True
+            self._spawn_close(live)
 
     def _spawn_close(self, live: _Live) -> None:
         try:
@@ -185,7 +214,7 @@ class BrowserService:
             live = self._live.pop(key)
             live.ended = True
             if live.session is not None:
-                log.info("closing an idle browser session org=%s run=%s", key[0], key[1])
+                log.info("closing an idle browser session org=%s run=%s target=%s", *key)
             self._spawn_close(live)
         return len(idle)
 
@@ -197,34 +226,69 @@ class BrowserService:
                 await self._reaper
         lives = list(self._live.values())
         self._live.clear()
+        self._current.clear()
         for live in lives:
             live.ended = True
             self._spawn_close(live)
         if self._closing:
             await asyncio.gather(*self._closing, return_exceptions=True)
-        await self.target.aclose()
+        for target in self.targets.values():
+            await target.aclose()
 
     def open_sessions(self) -> int:
         return sum(1 for live in self._live.values() if live.session is not None)
 
+    def sensitive_reason(
+        self, org_id: str, run_id: str, tool_name: str, arguments: Mapping[str, Any]
+    ) -> str | None:
+        """Why a ``browser_act`` call on the ``my_chrome`` target is a sensitive action (a
+        submit, a purchase, a send, a delete, or typing into a password or payment field), or
+        ``None``. The tool gate asks the user for such a call even with an ``allow`` rule
+        (Section 16.1). It reads the latest snapshot of the session of the run."""
+        if tool_name.removeprefix(SAMA_PREFIX) != "browser_act":
+            return None
+        target = arguments.get("target") or self._current.get((org_id, run_id))
+        if target != MY_CHROME:
+            return None
+        live = self._live.get((org_id, run_id, MY_CHROME))
+        session = None if live is None else live.session
+        check = getattr(session, "sensitive_reason", None)
+        if check is None:
+            return None
+        reason = check(arguments)
+        return None if reason is None else f"a sensitive action in the user's Chrome: {reason}"
+
     # -- the tools ---------------------------------------------------------------------------
 
-    async def _checked(self, url: str) -> str:
+    async def _checked(self, url: str, target: TargetName) -> str:
         url = url.strip()
         scheme = url.split(":", 1)[0].lower() if ":" in url else ""
         if not scheme or "//" not in url:
             url = f"https://{url}"
         elif scheme not in {"http", "https"}:
             raise BrowserError("the browser opens only http and https URLs")
+        if target == MY_CHROME:
+            # The user's Chrome is on the network of the user, not of sama: the address rules
+            # of Section 16.4 do not apply. The blocked list and the consent of the user for
+            # each site apply (the session and the extension check them, Section 14.2.2).
+            return url
         try:
             await self.guard.check(url)
         except BlockedUrlError as error:
             raise BrowserError(f"the URL policy blocked {url}: {error}") from None
         return url
 
-    async def open(self, claims: RunTokenClaims, url: str, *, snapshot: bool = True) -> str:
-        url = await self._checked(url)
-        live, session = await self._locked_session(claims)
+    async def open(
+        self,
+        claims: RunTokenClaims,
+        url: str,
+        *,
+        snapshot: bool = True,
+        target: TargetName | None = None,
+    ) -> str:
+        name = self.target_of(claims, target)
+        url = await self._checked(url, name)
+        live, session = await self._locked_session(claims, name)
         try:
             try:
                 state = await session.navigate(url)
@@ -235,20 +299,27 @@ class BrowserService:
             self._release(live)
         return render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
 
-    async def snapshot(self, claims: RunTokenClaims) -> str:
-        live, session = await self._locked_session(claims)
+    async def snapshot(self, claims: RunTokenClaims, *, target: TargetName | None = None) -> str:
+        live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             shot = await session.snapshot()
         finally:
             self._release(live)
         return render_snapshot(shot)
 
-    async def act(self, claims: RunTokenClaims, act: Act, *, snapshot: bool = True) -> str:
+    async def act(
+        self,
+        claims: RunTokenClaims,
+        act: Act,
+        *,
+        snapshot: bool = True,
+        target: TargetName | None = None,
+    ) -> str:
         if act.action in ACTIONS_WITH_REF and not act.ref:
             raise BrowserError(f"{act.action} needs ref: the ref of an element from the snapshot")
         if act.action == "drag" and not act.target_ref:
             raise BrowserError("drag needs target_ref: the element to drop on")
-        live, session = await self._locked_session(claims)
+        live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             state = await session.act(act)
             shot = await session.snapshot() if snapshot else None
@@ -257,10 +328,14 @@ class BrowserService:
         return render_snapshot(_merged(state, shot)) if shot is not None else render_state(state)
 
     async def screenshot(
-        self, claims: RunTokenClaims, *, full_page: bool = False
+        self,
+        claims: RunTokenClaims,
+        *,
+        full_page: bool = False,
+        target: TargetName | None = None,
     ) -> tuple[str, Screenshot]:
         """The caption for the model and the image."""
-        live, session = await self._locked_session(claims)
+        live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             shot = await session.screenshot(full_page=full_page)
         finally:
@@ -274,9 +349,10 @@ class BrowserService:
         *,
         ref: str | None = None,
         fields: Mapping[str, str] | None = None,
+        target: TargetName | None = None,
     ) -> str:
         request = extract_request(kind, ref=ref, fields=fields)
-        live, session = await self._locked_session(claims)
+        live, session = await self._locked_session(claims, self.target_of(claims, target))
         try:
             result = await session.extract(request)
         finally:
@@ -290,11 +366,13 @@ class BrowserService:
         *,
         index: int | None = None,
         url: str | None = None,
+        target: TargetName | None = None,
     ) -> str:
         if action == "select" and index is None:
             raise BrowserError("select needs index: the index of a tab from the list")
-        checked = await self._checked(url) if url else None
-        live, session = await self._locked_session(claims)
+        name = self.target_of(claims, target)
+        checked = await self._checked(url, name) if url else None
+        live, session = await self._locked_session(claims, name)
         try:
             try:
                 tabs = await session.tabs(action, index=index, url=checked)
@@ -304,13 +382,15 @@ class BrowserService:
             self._release(live)
         return render_tabs(tabs)
 
-    async def _locked_session(self, claims: RunTokenClaims) -> tuple[_Live, BrowserSession]:
-        live = self._live_of(claims)
+    async def _locked_session(
+        self, claims: RunTokenClaims, target: TargetName
+    ) -> tuple[_Live, BrowserSession]:
+        live = self._live_of(claims, target)
         await live.lock.acquire()
         try:
             if live.ended:
                 raise BrowserError("the run ended; the browser session is closed")
-            return await self._session(claims)
+            return await self._session(claims, live)
         except BaseException:
             live.lock.release()
             raise

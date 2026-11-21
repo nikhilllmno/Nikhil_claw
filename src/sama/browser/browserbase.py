@@ -146,7 +146,13 @@ class BrowserbaseTarget:
         await self._client.aclose()
 
     async def start(
-        self, *, org_id: str, user_id: str | None, run_id: str, guard: NavigationGuard
+        self,
+        *,
+        org_id: str,
+        user_id: str | None,
+        run_id: str,
+        guard: NavigationGuard,
+        session_id: str = "",
     ) -> BrowserSession:
         context_id = await self._context_of(org_id, user_id) if user_id else None
         claimed: list[str] = []

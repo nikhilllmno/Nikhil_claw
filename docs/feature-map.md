@@ -184,12 +184,12 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Browser over CDP (`browser_exec`, `browser_cdp`) | `tools/browser_*.py` | Typed tools on snapshots with refs: `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (§14.1). No raw CDP tool. Done in M5.1. | Adapt | M5 (done, M5.1) |
 | Cloud browsers (Browserbase, Browser Use cloud) | `agent/browser_session_cloud*.py` | Browserbase with a persistent context per user (§14.1, table `browser_contexts`). Browser Use cloud is not used. Done in M5.1. | Adapt | M5 (done, M5.1) |
 | Local Chromium and real profile | `agent/browser_launcher*.py` | Not in the cloud. The Chrome extension replaces the real-profile mode. | Skip | — |
-| Attach to the user's Chrome over CDP | `/browser connect` | Chrome extension with `chrome.debugger` on the M5.4 WebSocket (§14.2.2, design only). | New | M5 (M5.5) |
+| Attach to the user's Chrome over CDP | `/browser connect` | The `my_chrome` target: the extension uses `chrome.debugger` in the tabs of the run, on the M5.4 WebSocket (§14.2.2). | New | M5 (done, M5.5) |
 | `browser_dialog` | `tools/browser_*.py` | `browser_act(action="dialog", accept, prompt_text)` answers a dialog. An action that opens a dialog returns at once with a note. Done in M5.1. | Adapt | M5 (done, M5.1) |
 | `browser_vault` (logins never in the transcript) | `agent/vault_*.py` | Sama vault fills logins inside the tool (§14.1). | Adapt | M5 |
 | URL policy and SSRF guard | `tools/browser_url_policy.py` | The outbound address rules apply to every navigation of the cloud browser since M5.1 (§16.4). The lists per org come in M5.3. | Adapt | M5 (M5.1 in part, M5.3) |
 | Vision mode (screenshot and coordinates) | `computer_use` | `browser_screenshot` plus coordinate actions (§14.1). | Adapt | M5 |
-| Visible cursor, click, type in the user's Chrome | none | Extension overlay and CDP input events, per-site consent (§14.2.2, design only). | New | M5 (M5.5) |
+| Visible cursor, click, type in the user's Chrome | none | Overlay with cursor and Stop, CDP input events, consent for each site, a click of the user for sensitive actions, pause on takeover, and a blocked site list (§14.2.2). | New | M5 (done, M5.5) |
 
 ## 12. MCP, integrations, and plugins
 
@@ -248,7 +248,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Multi-user orgs, workspaces, roles, RLS | §17 | M1 |
 | Model proxy with budgets and no keys in the sandbox | D6, §18 | M1 |
 | Workflows with approval steps | §12.3 | M4 (M4.5 done) |
-| Chrome extension: side panel chat and "Ask about this page" (M5.4 done); click, type, cursor in the user's browser (M5.5) | §14.2 | M5 |
+| Chrome extension: side panel chat and "Ask about this page" (M5.4 done); click, type, cursor in the user's browser (M5.5 done) | §14.2 | M5 |
 | Versioned and revertible self-improvement | D14 | M2 |
 | GitHub App and git proxy: no token in the sandbox, `sama/*` branches only, no force-push or delete, pull requests by tool | §15.1 | M3 (M3.7 done) |
 | Self-modification through pull requests | §15.2 | M6 |

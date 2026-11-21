@@ -1,7 +1,7 @@
 # sama Chrome extension
 
-The sama side panel for Chrome (Manifest V3, TypeScript). Roadmap item M5.4. The design is in
-`docs/architecture.md` §14.2.1. The browser actions of M5.5 are a design in §14.2.2.
+The sama side panel for Chrome (Manifest V3, TypeScript). Roadmap items M5.4 and M5.5. The
+design is in `docs/architecture.md` §14.2.1 (side panel) and §14.2.2 (browser actions).
 
 ## What it does
 
@@ -11,6 +11,10 @@ The sama side panel for Chrome (Manifest V3, TypeScript). Roadmap item M5.4. The
 - Show a chat in the side panel. Each tab has its own private session.
 - "Ask about this page": send the title, address, text, and selection of the tab, and an
   optional screenshot, as untrusted content.
+- The `my_chrome` browser target (M5.5): the agent clicks and types in the tabs of its run with
+  `chrome.debugger`. The page shows the agent cursor and a Stop button. The user allows each
+  site once, approves each sensitive action, and can take over the tab at any time. Banks,
+  payments, password managers, and Google account pages are blocked.
 
 ## Build
 
@@ -41,7 +45,9 @@ to the id of the store item in production.
 |---|---|
 | `manifest.json` | The manifest. `build.mjs` adds the API origin. |
 | `src/background.ts` | The service worker: tokens, the WebSocket, the REST proxy, tab bindings. |
-| `src/panel/` | The side panel: HTML, CSS (tokens from `web/app/tokens.css`), and the UI code. |
+| `src/panel/` | The side panel and the sama window (`prompt.html`, the questions when no panel is open): HTML, CSS (tokens from `web/app/tokens.css`), and the UI code. |
+| `src/lib/actions.ts` | The browser calls of the `my_chrome` target (CDP), the consent, the sensitive check, Stop, and takeover. |
+| `src/lib/overlay.ts` | The overlay in the page: cursor, box, bar, and Stop. |
 | `src/lib/` | Code without Chrome calls, with unit tests (`*.test.ts`). |
 | `static/icons/` | The icons. |
 

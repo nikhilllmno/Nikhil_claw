@@ -864,3 +864,45 @@ def test_the_browser_toolset_is_for_private_runs_only() -> None:
     assert "browser" not in child
     shared = effective_toolsets(DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="shared")
     assert "browser" not in shared
+
+
+# -- sensitive actions in the user's Chrome (M5.5) ---------------------------------------------
+
+SENSITIVE = "a sensitive action in the user's Chrome: buy or pay"
+CLICK = {"action": "click", "ref": "e1", "target": "my_chrome"}
+
+
+def test_an_escalated_call_asks_even_with_an_allow_rule() -> None:
+    allowed = context(toolsets=frozenset({"browser"}), rules=(rule("browser_act", "allow"),))
+    assert decide(allowed, "mcp__sama__browser_act", CLICK).action == "allow"
+    verdict = decide(allowed, "mcp__sama__browser_act", CLICK, escalate=SENSITIVE)
+    assert verdict.action == "ask"
+    assert verdict.reason == SENSITIVE
+
+
+def test_a_deny_rule_wins_over_an_escalation() -> None:
+    denied = context(toolsets=frozenset({"browser"}), rules=(rule("browser_act", "deny"),))
+    assert decide(denied, "browser_act", CLICK, escalate=SENSITIVE).action == "deny"
+
+
+def test_an_approval_of_a_person_allows_an_escalated_call() -> None:
+    approved = Recorded(
+        tool_name="browser_act", arguments_digest=arguments_digest(CLICK), status="approved"
+    )
+    ctx = context(toolsets=frozenset({"browser"}), recorded=approved)
+    verdict = decide(ctx, "browser_act", CLICK, escalate=SENSITIVE)
+    assert verdict.action == "allow"
+    assert verdict.step == GateStep.RECORDED
+
+
+def test_an_unattended_run_cannot_do_an_escalated_call() -> None:
+    preapproved = Preapproval(tool="browser_act")
+    ctx = context(
+        toolsets=frozenset({"browser"}),
+        rules=(rule("browser_act", "allow"),),
+        unattended=True,
+        preapproved=(preapproved,),
+    )
+    verdict = decide(ctx, "browser_act", CLICK, escalate=SENSITIVE)
+    assert verdict.action == "deny"
+    assert verdict.step == GateStep.CONTEXT

@@ -6,8 +6,9 @@ The extension in ``extension/`` opens one WebSocket to the API for each signed-i
 - ``PageContext`` and ``page_message``: "Ask about this page". The page text and the screenshot
   come from a web page that sama does not control, so the message marks them as untrusted
   content (Section 16.5). The redactor removes the known secrets from the text and the URL.
-- ``ChromeHub``: the open connections of each user. M5.5 routes the ``my_chrome`` browser tool
-  calls of a user to one of these connections (D12).
+- ``ChromeHub``: the open connections of each user. The ``my_chrome`` browser target
+  (``sama.browser.chrome``, M5.5) sends the browser calls of a user to the newest of these
+  connections (D12).
 
 The control plane is one process (D18), so the hub is in memory.
 """
@@ -154,13 +155,23 @@ def page_message(question: str, page: PageContext) -> PageMessage:
 
 
 class ChromeLink(Protocol):
-    """One open extension connection. M5.5 sends ``tool_call`` frames through it."""
+    """One open extension connection."""
 
     async def send(self, frame: dict[str, Any]) -> None: ...
+
+    async def call(self, frame: dict[str, Any], timeout_s: float) -> Any:
+        """Sends a ``tool_call`` frame with ``frame`` and a new ``call_id``, and returns the
+        ``tool_result`` frame of the extension as a dict. Raises ``TimeoutError`` when no answer
+        comes in ``timeout_s``, and ``ChromeOfflineError`` when the connection closes first."""
+        ...
 
 
 class TooManyConnectionsError(Exception):
     pass
+
+
+class ChromeOfflineError(Exception):
+    """The extension connection closed before it answered."""
 
 
 class ChromeHub:
@@ -190,6 +201,12 @@ class ChromeHub:
     def links(self, auth_user_id: uuid.UUID) -> list[ChromeLink]:
         """The open connections of the user, the newest last."""
         return list(self._links.get(auth_user_id, []))
+
+    def link(self, auth_user_id: uuid.UUID) -> ChromeLink | None:
+        """The newest open connection of the user: the browser that the user used last. The
+        browser calls of the ``my_chrome`` target go to it."""
+        links = self._links.get(auth_user_id)
+        return links[-1] if links else None
 
     def count(self) -> int:
         return sum(len(links) for links in self._links.values())

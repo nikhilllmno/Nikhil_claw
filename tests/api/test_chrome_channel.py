@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import uuid
 from typing import Any
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.api import SamaApi
 from sama.api import chrome as channel
 from sama.db.models import Attachment, Message
-from sama.gateway.chrome import ChromeHub
+from sama.gateway.chrome import ChromeHub, ChromeOfflineError
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
 from tests.api.conftest import STREAM_LIFETIME_S, token
@@ -397,3 +398,83 @@ async def test_a_long_question_with_a_page_is_refused(chrome_app: FastAPI, tenan
             }
         )
         assert (await socket.receive())["code"] == "invalid"
+
+
+# -- browser calls of the my_chrome target (M5.5) ----------------------------------------------
+
+
+async def test_a_tool_call_gets_the_tool_result_of_the_extension(
+    chrome_api: SamaApi, chrome_app: FastAPI, tenant: Tenant
+) -> None:
+    user = tenant.ids["mia_auth"]
+    async with open_socket(chrome_app) as socket:
+        await signed_in(socket, user)
+        link = chrome_api.chrome.link(user)
+        assert link is not None
+        call = asyncio.create_task(link.call({"op": "snapshot", "args": {}, "run_id": "r"}, 5))
+        frame = await socket.receive()
+        assert frame["type"] == "tool_call"
+        assert frame["op"] == "snapshot"
+        assert frame["run_id"] == "r"
+        # An answer for a call that is not open is dropped.
+        await socket.send({"type": "tool_result", "call_id": "other", "ok": True, "result": {}})
+        await socket.send(
+            {"type": "tool_result", "call_id": frame["call_id"], "ok": True, "result": {"a": 1}}
+        )
+        assert await call == {"ok": True, "result": {"a": 1}}
+        failing = asyncio.create_task(link.call({"op": "act", "args": {}}, 5))
+        frame = await socket.receive()
+        await socket.send(
+            {
+                "type": "tool_result",
+                "call_id": frame["call_id"],
+                "ok": False,
+                "error": {"code": "blocked", "message": "detail"},
+            }
+        )
+        assert await failing == {"ok": False, "error": {"code": "blocked", "message": "detail"}}
+
+
+async def test_a_tool_call_fails_when_the_extension_goes_away(
+    chrome_api: SamaApi, chrome_app: FastAPI, tenant: Tenant
+) -> None:
+    user = tenant.ids["mia_auth"]
+    async with open_socket(chrome_app) as socket:
+        await signed_in(socket, user)
+        link = chrome_api.chrome.link(user)
+        assert link is not None
+        call = asyncio.create_task(link.call({"op": "snapshot", "args": {}}, 5))
+        assert (await socket.receive())["type"] == "tool_call"
+    with pytest.raises(ChromeOfflineError):
+        await call
+    with pytest.raises(ChromeOfflineError):
+        await link.call({"op": "snapshot", "args": {}}, 5)
+
+
+async def test_a_tool_call_times_out(
+    chrome_api: SamaApi, chrome_app: FastAPI, tenant: Tenant
+) -> None:
+    user = tenant.ids["mia_auth"]
+    async with open_socket(chrome_app) as socket:
+        await signed_in(socket, user)
+        link = chrome_api.chrome.link(user)
+        assert link is not None
+        with pytest.raises(TimeoutError):
+            await link.call({"op": "snapshot", "args": {}}, 0.2)
+        frame = await socket.receive()
+        # A late answer does nothing.
+        await socket.send({"type": "tool_result", "call_id": frame["call_id"], "ok": True})
+        await socket.send({"type": "ping"})
+        assert (await socket.receive())["type"] == "pong"
+
+
+async def test_the_hub_gives_the_newest_connection(
+    chrome_api: SamaApi, chrome_app: FastAPI, tenant: Tenant
+) -> None:
+    user = tenant.ids["mia_auth"]
+    assert chrome_api.chrome.link(user) is None
+    async with open_socket(chrome_app) as first:
+        await signed_in(first, user)
+        async with open_socket(chrome_app) as second:
+            await signed_in(second, user)
+            assert chrome_api.chrome.link(user) is chrome_api.chrome.links(user)[-1]

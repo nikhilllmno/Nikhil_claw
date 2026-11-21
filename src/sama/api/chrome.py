@@ -18,8 +18,12 @@ The client sends:
 The server sends ``ready``, ``auth_ok``, ``subscribed``, ``unsubscribed``, the events of
 ``SamaApi.session_events`` (``runs``, ``run_event``, ``run``, ``end``, each with
 ``session_id`` and ``data``), ``sent {id, run_id, queued}``, ``error {id?, code, message}``,
-and ``pong``. M5.5 adds ``tool_call`` (server) and ``tool_result`` (client) for the
-``my_chrome`` browser target.
+and ``pong``.
+
+Since M5.5 the server also sends ``tool_call {call_id, op, args, session_id, run_id, approved,
+timeout_ms}`` for the ``my_chrome`` browser target (``sama.browser.chrome``), and the client
+answers with ``tool_result {call_id, ok, result | error}``. An answer that comes after the
+deadline, or for a call that is not open, is dropped.
 
 The connection closes with code ``4401`` when the token expires or is not valid, ``4403`` for
 an origin that is not an allowed extension or a token of another user, ``4408`` when no
@@ -43,7 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from sama.api.auth import AuthError, Principal
 from sama.api.events import MAX_MESSAGE_CHARS, SendError
-from sama.gateway.chrome import PageContext, TooManyConnectionsError
+from sama.gateway.chrome import ChromeOfflineError, PageContext, TooManyConnectionsError
 
 if TYPE_CHECKING:
     from sama.api.app import SamaApi
@@ -58,6 +62,8 @@ FRAME_WINDOW_S: Final = 10.0
 MAX_FRAMES_PER_WINDOW: Final = 40
 MAX_SUBSCRIPTIONS: Final = 8
 """The sessions that one connection follows at a time."""
+MAX_OPEN_CALLS: Final = 16
+"""The ``tool_call`` frames that wait for an answer on one connection."""
 SEND_TIMEOUT_S: Final = 15.0
 """A frame that the client does not take in this time closes the connection."""
 MAX_TOKEN_CHARS: Final = 8_192
@@ -110,8 +116,21 @@ class PingFrame(_Frame):
     type: Literal["ping"]
 
 
+class ToolErrorBody(_Frame):
+    code: str = Field(min_length=1, max_length=40)
+    message: str = Field(default="", max_length=2_000)
+
+
+class ToolResultFrame(_Frame):
+    type: Literal["tool_result"]
+    call_id: str = Field(min_length=1, max_length=64)
+    ok: bool
+    result: dict[str, Any] | None = None
+    error: ToolErrorBody | None = None
+
+
 ClientFrame = Annotated[
-    AuthFrame | SubscribeFrame | UnsubscribeFrame | SendFrame | PingFrame,
+    AuthFrame | SubscribeFrame | UnsubscribeFrame | SendFrame | PingFrame | ToolResultFrame,
     Field(discriminator="type"),
 ]
 _FRAMES: Final[TypeAdapter[ClientFrame]] = TypeAdapter(ClientFrame)
@@ -236,6 +255,8 @@ class _Connection:
         self._stop = asyncio.Event()
         self._close: tuple[int, str] | None = None
         self._timeout: asyncio.Timeout | None = None
+        self._calls: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._gone = False
 
     def _end_of(self, principal: Principal) -> float:
         """The event loop time when the token of ``principal`` expires."""
@@ -247,6 +268,43 @@ class _Connection:
         async with self._lock:
             async with asyncio.timeout(SEND_TIMEOUT_S):
                 await self._ws.send_text(json.dumps(frame, separators=(",", ":")))
+
+    async def call(self, frame: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        """Sends a ``tool_call`` and waits for its ``tool_result`` (``ChromeLink.call``)."""
+        if self._gone or self._stop.is_set():
+            raise ChromeOfflineError
+        if len(self._calls) >= MAX_OPEN_CALLS:
+            raise ChromeOfflineError
+        call_id = uuid.uuid4().hex
+        future: asyncio.Future[dict[str, Any]] = self._loop.create_future()
+        self._calls[call_id] = future
+        try:
+            try:
+                await self.send({**frame, "type": "tool_call", "call_id": call_id})
+            except (TimeoutError, OSError, RuntimeError):
+                raise ChromeOfflineError from None
+            async with asyncio.timeout(timeout_s):
+                return await future
+        finally:
+            self._calls.pop(call_id, None)
+
+    def _answer(self, frame: ToolResultFrame) -> None:
+        future = self._calls.get(frame.call_id)
+        if future is None or future.done():
+            return
+        answer: dict[str, Any] = {"ok": frame.ok}
+        if frame.ok:
+            answer["result"] = frame.result or {}
+        else:
+            error = frame.error or ToolErrorBody(code="failed")
+            answer["error"] = {"code": error.code, "message": error.message}
+        future.set_result(answer)
+
+    def _fail_calls(self) -> None:
+        self._gone = True
+        for future in self._calls.values():
+            if not future.done():
+                future.set_exception(ChromeOfflineError())
 
     def stop(self, code: int, reason: str) -> None:
         if self._close is None:
@@ -278,6 +336,7 @@ class _Connection:
                     log.error("the extension connection failed", exc_info=error)
                     self.stop(1011, "the server failed")
         finally:
+            self._fail_calls()
             subs = [task for task, _ in self._subs.values()]
             for task in [*tasks, *subs]:
                 task.cancel()
@@ -337,6 +396,8 @@ class _Connection:
                 await self.send({"type": "unsubscribed", "session_id": str(frame.session_id)})
             case SendFrame():
                 await self._send(frame)
+            case ToolResultFrame():
+                self._answer(frame)
 
     async def _reauth(self, frame: AuthFrame) -> None:
         try:
