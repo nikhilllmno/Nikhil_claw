@@ -2181,7 +2181,7 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
-| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). Later: `browser_vault` (M5.3), `browser_task` (M5.6). `browser_act` is `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
+| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). `browser_vault` (since M5.3, when the process has the vault). Later: `browser_task` (M5.6). `browser_act` and `browser_vault` are `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
@@ -4580,13 +4580,113 @@ accept=..., prompt_text=...)`. Then the first action finishes.
 other browser tools are `allow`. A child run of `delegate_task` and a run in a shared session
 do not get the toolset.
 
-**URL policy.** Every navigation goes through the outbound URL policy of Section 16.4. See
-Section 16.4 for the limits.
+**URL policy.** Every navigation goes through the outbound URL policy of Section 16.4 and the
+host lists of the org (M5.3, below). See Section 16.4 for the limits.
 
-**Later items.** M5.2 adds coordinates and vision mode to `browser_act`. M5.3 adds the vault
-and the URL policy for each org. M5.5 adds the `my_chrome` target (Section 14.2.2). M5.6 adds
-`browser_task`.
-The Browserbase key is a setting of the process. A key for each org comes later.
+**Later items.** M5.2 adds coordinates and vision mode to `browser_act`. M5.5 adds the
+`my_chrome` target (Section 14.2.2). M5.6 adds `browser_task`. The Browserbase key is a setting of the process.
+A key for each org comes later.
+
+#### Browser vault and URL policy (M5.3)
+
+**Saved logins.** A saved login has a name (for example `GitHub`), a site, a user name, and a
+password. The agent asks to sign in with a saved login by its name. Sama fills the user name and
+the password into the page. The agent never sees them.
+
+| Part | Module | Job |
+|---|---|---|
+| Logins | `sama.browser.logins` | `BrowserLogins`: add, change, remove, and list. The table `browser_logins` (migration `0038`) keeps the name and the site. The vault entry `browser_login:<id>` keeps the user name and the password, as JSON. One transaction writes both. |
+| Fill | `sama.browser.cdp` | `PlaywrightSession.fill_login`: finds the fields and fills them. The protocol `LoginFiller` of `sama.browser.target` is separate from `BrowserSession`, so a target without it (for example `my_chrome`) gives a clear error. |
+| Tool | `sama.tools.browser` | `browser_vault(action, name, username_ref, password_ref, submit, snapshot)`. |
+| API and web | `sama.api.browser`, `web/components/BrowserSettings.tsx` | The settings routes and the "Browser" card of the settings page. |
+
+- **Scopes.** An org login (no `user_id`) is for every member of the org. Only an org admin adds,
+  changes, or removes it. A personal login is for one user. The user adds it, and the user or an
+  org admin changes or removes it. A name is unique for each scope (case does not matter). When a
+  personal login and an org login have the same name, the personal login wins.
+- **Site.** The site is an origin: `https://host` or `https://host:port`. A value without a
+  scheme gets `https://`. Sama fills a login only into a field whose document has the same
+  scheme, the same port, and the same host or a subdomain of it. Sama checks the URL of the
+  frame of each field, so a login form of another site in a frame does not get the login, and a
+  login form of the site in a frame of another page does. The frame comes from the browser
+  (`ElementHandle.owner_frame`), not from page JavaScript, which a page can change. Each field is
+  a pinned element handle, and sama checks its frame again just before the fill. So a frame that
+  navigates to another site during the fill does not get the value: the handle of the old
+  document fails. Sama writes the value to the pinned element itself (the native `value` setter
+  and the `input` and `change` events), not with keyboard input, so a page that takes the focus
+  during the fill does not get the value.
+- **Fields.** Without refs, sama takes the first visible password field in a frame of the site.
+  The user name field is in the same form: a field with `autocomplete="username"`, else an
+  `email` field, else the last text field before the password field. A page with no password
+  field (the first step of a sign-in in two steps) gets the user name only. The agent can give
+  `username_ref` and `password_ref` from a snapshot. `password_ref` must be a password field.
+  `submit=true` presses Enter in the last filled field.
+- **The secret stays out of the transcript.**
+  - The tool arguments have the name and the refs only. The approval card shows them.
+  - A snapshot shows the value of each password field as `[hidden]`, and an extract of a
+    password field gives `[hidden]`.
+  - After a fill, each result of the run (also an error) has the filled user name and password
+    replaced with `[REDACTED]`, also when the page shows them later. Sama replaces the value as
+    it is, escaped in JSON (an extract), escaped in HTML (a URL attribute), and encoded in a URL
+    (a form that sends with GET, as a browser encodes it, and as `encodeURIComponent` encodes
+    it). A user name shorter than 3 characters is not replaced: such a
+    short word is in too much page text.
+  - After a fill, `browser_screenshot` refuses for the rest of the run, because an image cannot
+    be scrubbed: the page can show the user name, or the password after "show password".
+  - The vault gives each value to the redactor of the process (Section 16.3). So the logs, the
+    stored tool calls, the run events, and the Langfuse spans have no value of 8 or more
+    characters.
+  - An error of the fill is fixed text: a Playwright error can hold a part of the value.
+  - Browserbase records no session and keeps no session log by default (`recordSession` and
+    `logSession` are false), because a log can keep a form body with a password.
+    `SAMA_BROWSERBASE_RECORD=1` turns them on for a test.
+- **Gate.** `browser_vault` is in the toolset `browser` and is `ask` by default, also for
+  `list`. A rule can allow it. A run in a shared session and a child run of `delegate_task` do
+  not have the toolset, and the tool refuses a run without a user.
+- **Limits.** The page gets the password, so a script of the site can read it. The user name and
+  the password go to Browserbase over CDP when sama fills them. The `my_chrome` target (M5.5)
+  does not fill logins yet.
+
+**URL policy of each org.** An org admin sets two lists of hosts on the settings page
+(`browser_url_policies`, migration `0038`, one row for each org):
+
+- `block_hosts`: the browser never opens these hosts and their subdomains.
+- `allow_hosts`: when the list is not empty, the browser opens only these hosts and their
+  subdomains (allow list mode).
+
+An entry can be `example.com`, `*.example.com`, or a URL (sama keeps the host). Sama keeps each
+host in its IDNA form, in lower case. A list has at most 200 hosts. The private address rules of
+Section 16.4 apply also to a host in the allow list. `sama.browser.guard.OrgGuard` checks the
+lists, then the address rules, for each navigation of a tab or a frame, each redirect hop, and
+each WebSocket. The block list applies also to the other requests of a page (images, scripts,
+`fetch`). The allow list does not, because a page loads scripts and styles from other hosts.
+The error names the host and the list, for example "the URL policy blocked
+https://www.evil.test/: www.evil.test is in the block list of the org". The lists apply to the `cloud`
+target. The `my_chrome` target runs on the network of the user and keeps its own rules (the
+blocked list and the consent of the user, Section 14.2.2).
+
+`PolicyCache` keeps the policy of an org for 30 seconds. A change applies at once in the process
+of the API that took it, and after at most 30 seconds in another process, also in a live browser
+session. A session starts only after the policy of the org loads. When the policy cannot be read,
+the check fails closed. Before the quick check of another request of a page, the session awaits
+`OrgGuard.fresh`: when the cache time of the policy is over or an admin changed it, the request
+waits for a new load (requests at the same time share one load). The guard keeps the expiry of
+the cache, so a cached policy does not get a second period. The quick check refuses every
+request while the policy is old or after a failed load.
+
+**Routes.**
+
+| Route | Who | Use |
+|---|---|---|
+| `GET /orgs/{org}/browser/logins` | a member | The org logins and the own logins. An org admin gets every login of the org. No answer has a user name or a password. |
+| `POST /orgs/{org}/browser/logins` | a member (`scope: personal`), an org admin (`scope: org`) | `{name, site, username, password, scope}`. `409` for a name that exists. |
+| `PATCH /orgs/{org}/browser/logins/{id}` | the owner or an org admin | Change the name, the site, the user name, or the password. A new user name keeps the password, and the reverse. |
+| `DELETE /orgs/{org}/browser/logins/{id}` | the owner or an org admin | Removes the row and the vault entry. |
+| `GET`, `PUT /orgs/{org}/browser/url-policy` | an org admin | `{allow_hosts, block_hosts}`. The answer has `mode` (`allow_list` or `block_list`). |
+
+Each change writes an audit row (`browser.login_created`, `browser.login_changed`,
+`browser.login_removed`, `browser.url_policy_set`, and the `vault.*` rows) without a secret.
+Without the vault, the login routes answer `503`.
 
 ### 14.2 Chrome extension
 
@@ -5661,7 +5761,8 @@ The nightly job builds the E2B template from `main` and runs the E2B tests.
 
 - The **sama vault** (`sama.vault`, M1.17) holds the secrets of each org. M1 stores the
   Anthropic, OpenAI, and Brave keys and the tokens of the integrations (Section 11.6).
-  Connection tokens and browser logins come with their milestones (M3, M5). Since M4.4, the
+  Connection tokens come with M3. Since M5.3, the vault holds the saved logins of the browser
+  (`browser_login:<id>`, Section 14.1). Since M4.4, the
   vault also holds the signing secret of each webhook trigger (`trigger:<id>`) and the
   Composio webhook secret of an org (`composio_webhook_secret`, Section 12.2).
 - **Envelope encryption.** Each entry has its own random 256-bit data key. AES-256-GCM
@@ -5785,7 +5886,10 @@ policy for all of them:
     fully stopped. A subresource with a host name that resolves to a private address passes
     the quick check. A WebSocket of a worker is not checked. Browserbase runs outside our
     network, so it cannot reach our private addresses. The guard stops the agent from asking
-    it to try. The per-org lists come in M5.3.
+    it to try.
+  - **Lists of each org (M5.3).** `OrgGuard` adds the allow list and the block list of the org
+    (Section 14.1) to these rules. The lists apply to the browser only. The other outbound
+    requests (`web_extract`, connectors) do not use them yet.
 
 ### 16.5 Untrusted content
 
@@ -6087,6 +6191,8 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
+| `browser_logins` | The saved logins of the browser: `org_id`, `user_id` (null for an org login), `name` (unique for each scope, case does not matter), `site`, `created_by_user_id`. The vault entry `browser_login:<id>` has the secret (migration `0038`, Section 14.1). A member reads the org logins and their own logins. An org admin reads all. Only the control plane writes. |
+| `browser_url_policies` | The URL policy of the browser of each org: `org_id` (the key), `allow_hosts`, `block_hosts` (at most 200 each), `updated_by_user_id` (migration `0038`, Section 16.4). An org admin reads the row. Only the control plane writes. |
 | `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, or `browser_contexts` since migration `0036`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
@@ -6374,6 +6480,8 @@ log of the org, so the control plane logs it instead.
 - A user delete and an org delete also write a `browser_contexts` row with the Browserbase
   context ids of the deleted users (Section 14.1, at most 1,000 ids in one row). The rows of
   the table `browser_contexts` cascade from the user.
+- A user delete removes the personal saved logins of the user (they cascade) and their vault
+  entries `browser_login:<id>` (M5.3). An org login that the user made stays.
 - The Supabase Auth user is not deleted. A person can be a user in more than one org.
 
 **Purge worker.** `PurgeWorker` runs in the monitor of each control plane. It claims rows

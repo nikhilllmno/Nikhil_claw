@@ -136,6 +136,9 @@ CONNECTION_STATES: Final = ("pending", "initiated", "connected", "failed", "expi
 """The states of a connection (Section 10.3). Only the backend sets ``connected``."""
 TRIGGER_SECRET_PATTERN: Final = "^trigger:[0-9a-f-]{36}$"  # noqa: S105 (a name pattern)
 """The vault name of the signing secret of one webhook trigger (Section 12.2): ``trigger:<id>``."""
+BROWSER_LOGIN_SECRET_PATTERN: Final = "^browser_login:[0-9a-f-]{36}$"  # noqa: S105 (a pattern)
+"""The vault name of the user name and the password of one saved browser login (Section 14.1):
+``browser_login:<id>``."""
 TRIGGER_KINDS: Final = ("webhook", "composio")
 TRIGGER_STATUSES: Final = ("active", "disabled")
 TRIGGER_TARGETS: Final = ("run", "workflow")
@@ -1371,7 +1374,7 @@ class VaultSecret(Base):
         UniqueConstraint("org_id", "name"),
         CheckConstraint(
             f"{_one_of('name', VAULT_NAMES)} OR name ~ '{CONNECTION_SECRET_PATTERN}'"
-            f" OR name ~ '{TRIGGER_SECRET_PATTERN}'",
+            f" OR name ~ '{TRIGGER_SECRET_PATTERN}' OR name ~ '{BROWSER_LOGIN_SECRET_PATTERN}'",
             name="name",
         ),
     )
@@ -2793,5 +2796,78 @@ class PersistentBrowserContext(Base):
     provider_context_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = _created_at()
     last_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BrowserLogin(Base):
+    """A saved login of the browser vault (docs/architecture.md, Section 14.1, M5.3). The user
+    name and the password are in the vault (``browser_login:<id>``), never in this row. A login
+    with ``user_id`` is personal: only that user can use it. A login without ``user_id`` is for
+    every member of the org. ``site`` is the origin where sama fills the login (``https://host``
+    or ``https://host:port``). Members read the org logins and their own logins. Only the control
+    plane writes the table."""
+
+    __tablename__ = "browser_logins"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 80", name="name_length"),
+        CheckConstraint("char_length(site) BETWEEN 1 AND 300", name="site_length"),
+        Index(
+            "uq_browser_logins_org_name",
+            "org_id",
+            text("lower(name)"),
+            unique=True,
+            postgresql_where=text("user_id IS NULL"),
+        ),
+        Index(
+            "uq_browser_logins_user_name",
+            "org_id",
+            "user_id",
+            text("lower(name)"),
+            unique=True,
+            postgresql_where=text("user_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    site: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BrowserUrlPolicy(Base):
+    """The URL policy of the browser of one org (docs/architecture.md, Section 16.4, M5.3). With
+    ``allow_hosts``, the browser opens only these hosts and their subdomains. ``block_hosts`` and
+    their subdomains are always refused. The private address rules apply in all cases. An org
+    admin reads the row. Only the control plane writes the table."""
+
+    __tablename__ = "browser_url_policies"
+    __table_args__ = (
+        ForeignKeyConstraint(["org_id", "updated_by_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint("cardinality(allow_hosts) <= 200", name="allow_hosts_count"),
+        CheckConstraint("cardinality(block_hosts) <= 200", name="block_hosts_count"),
+    )
+
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orgs.id", ondelete="CASCADE"), primary_key=True
+    )
+    allow_hosts: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
+    )
+    block_hosts: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
+    )
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

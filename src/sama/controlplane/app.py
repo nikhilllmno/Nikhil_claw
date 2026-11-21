@@ -33,11 +33,14 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.api.browser import BrowserSettings
 from sama.billing import BillingService, StripeClient
 from sama.browser.browserbase import BrowserbaseTarget
 from sama.browser.chrome import AuthUsers, ChromeTarget
 from sama.browser.contexts import PostgresContextStore
 from sama.browser.guard import UrlGuard
+from sama.browser.logins import BrowserLogins
+from sama.browser.policy import PolicyCache, PolicyStore
 from sama.browser.service import BrowserService
 from sama.browser.target import BrowserTarget
 from sama.connectors.database import DatabaseGateway
@@ -263,7 +266,7 @@ def build(
     # connections of the API, M5.5). The worker closes the browser sessions of a run when the
     # run ends. The gate asks the user before a sensitive action in the user's Chrome.
     chrome = ChromeHub()
-    browser = _browser_service(settings, engine, chrome)
+    browser = _browser_service(settings, engine, chrome, vault)
     gate.escalation = browser.sensitive_reason
     worker = Worker(
         queue,
@@ -526,6 +529,13 @@ def build(
         handoffs=handoffs,
         checkpoints=checkpoints,
         model_keys=model_keys,
+        # The browser settings of the org (M5.3). A change of the URL policy applies at once to
+        # the browser sessions of this process.
+        browser=BrowserSettings(
+            PolicyStore(engine),
+            BrowserLogins(engine, vault) if vault is not None else None,
+            on_policy_change=browser.forget_policy,
+        ),
         data=data,
         billing=billing,
     )
@@ -618,10 +628,12 @@ def build(
 
 
 def _browser_service(
-    settings: ControlPlaneSettings, engine: AsyncEngine, chrome: ChromeHub
+    settings: ControlPlaneSettings, engine: AsyncEngine, chrome: ChromeHub, vault: Vault | None
 ) -> BrowserService:
     """The browser of Section 14.1. The cloud target needs a Browserbase key and project, and
-    it is the default target when it is there. The ``my_chrome`` target is always there."""
+    it is the default target when it is there. The ``my_chrome`` target is always there. The URL
+    policy of each org applies to the cloud target, and with the vault the service has the
+    saved logins (M5.3)."""
     targets: list[BrowserTarget] = []
     if settings.browserbase_key is not None and settings.browserbase_project_id:
         targets.append(
@@ -629,10 +641,16 @@ def _browser_service(
                 api_key=settings.browserbase_key,
                 project_id=settings.browserbase_project_id,
                 contexts=PostgresContextStore(engine),
+                record=settings.browserbase_record,
             )
         )
     targets.append(ChromeTarget(chrome, AuthUsers(engine).of))
-    return BrowserService(targets, UrlGuard())
+    return BrowserService(
+        targets,
+        UrlGuard(),
+        policies=PolicyCache(PolicyStore(engine)),
+        logins=BrowserLogins(engine, vault) if vault is not None else None,
+    )
 
 
 async def _close_sandboxes(sandboxed: SandboxedRuntime) -> None:

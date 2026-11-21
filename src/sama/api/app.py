@@ -49,6 +49,7 @@ from starlette.types import ASGIApp, Lifespan
 from sama import workerbots
 from sama.api.auth import AuthError, JwtVerifier, Principal
 from sama.api.billing import router as billing_router
+from sama.api.browser import BrowserSettings, LoginChange, LoginIn, UrlPolicyIn
 from sama.api.chrome import ChromeChannel
 from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
 from sama.api.history import (
@@ -981,6 +982,7 @@ class SamaApi:
         data: DataControls | None = None,
         chrome: ChromeHub | None = None,
         billing: BillingService | None = None,
+        browser: BrowserSettings | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
@@ -993,8 +995,10 @@ class SamaApi:
         only. Without ``orgs``, sign-up reads the verified emails from ``auth.users`` and uses
         ``settings.signup``. Without ``model_keys`` (no vault), the model key
         routes answer ``503``. Without ``billing``, billing is off: the billing pages show the
-        plan and the quotas, and a purchase answers ``409``."""
+        plan and the quotas, and a purchase answers ``409``. Without ``browser``, the browser
+        settings routes answer ``409``."""
         self._engine = engine
+        self._browser = browser
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._github = github
@@ -1371,6 +1375,45 @@ class SamaApi:
                 await self._require_model_keys().remove(org_id, provider, grants.user_id)
             except ModelKeyError as error:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/browser/url-policy")
+        async def browser_url_policy(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._require_browser().policy(org_id, grants)
+
+        @app.put("/orgs/{org_id}/browser/url-policy")
+        async def set_browser_url_policy(
+            principal: Me, org_id: uuid.UUID, body: UrlPolicyIn
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._require_browser().set_policy(org_id, grants, body)
+
+        @app.get("/orgs/{org_id}/browser/logins")
+        async def browser_logins(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._require_browser().logins(org_id, grants)
+
+        @app.post("/orgs/{org_id}/browser/logins", status_code=201)
+        async def add_browser_login(
+            principal: Me, org_id: uuid.UUID, body: LoginIn
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._require_browser().add_login(org_id, grants, body)
+
+        @app.patch("/orgs/{org_id}/browser/logins/{login_id}")
+        async def change_browser_login(
+            principal: Me, org_id: uuid.UUID, login_id: uuid.UUID, body: LoginChange
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._require_browser().change_login(org_id, login_id, grants, body)
+
+        @app.delete("/orgs/{org_id}/browser/logins/{login_id}", status_code=204)
+        async def remove_browser_login(
+            principal: Me, org_id: uuid.UUID, login_id: uuid.UUID
+        ) -> Response:
+            grants = await self._org_grants(principal, org_id)
+            await self._require_browser().remove_login(org_id, login_id, grants)
             return Response(status_code=204)
 
         @app.post("/orgs/{org_id}/integrations/slack/setup")
@@ -2644,6 +2687,11 @@ class SamaApi:
                 detail="only the owner, a workspace admin, or the org owner can change it",
             )
         return org_id, view, grants
+
+    def _require_browser(self) -> BrowserSettings:
+        if self._browser is None:
+            raise HTTPException(status_code=409, detail="the browser is off in this process")
+        return self._browser
 
     def _require_model_keys(self) -> ModelKeys:
         if self._model_keys is None:

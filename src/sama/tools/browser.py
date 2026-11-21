@@ -1,4 +1,4 @@
-"""The browser tools (docs/architecture.md, Section 14.1; roadmap M5.1).
+"""The browser tools (docs/architecture.md, Section 14.1; roadmaps M5.1 and M5.3).
 
 The six tools work on one browser session for each run and target: ``browser_open``,
 ``browser_snapshot``, ``browser_act``, ``browser_screenshot``, ``browser_extract``, and
@@ -8,13 +8,17 @@ only the targets of the service. The agent reads the page as an accessibility tr
 (``[ref=e12]``) and acts on an element by its ref. Each output goes through the gate, the
 redactor, and the output cap of the tool server, as for the other tools.
 
-The gate gives ``browser_act`` ``ask`` by default: an action can use the logins of the user. The
-other tools only read.
+``browser_vault`` (M5.3) lists the saved logins of the user and fills one into the page. The
+agent names the login. sama fills the user name and the password, and the result never shows
+them. The server has the tool only when the process has the vault.
+
+The gate gives ``browser_act`` and ``browser_vault`` ``ask`` by default: an action can use the
+logins of the user. The other tools only read.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, Final
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.utilities.types import Image
@@ -26,6 +30,7 @@ from sama.browser.target import (
     MY_CHROME,
     Act,
     ActionKind,
+    BrowserError,
     ExtractKind,
     Screenshot,
     ScrollDirection,
@@ -46,6 +51,7 @@ BROWSER_ACT: Final = "browser_act"
 BROWSER_SCREENSHOT: Final = "browser_screenshot"
 BROWSER_EXTRACT: Final = "browser_extract"
 BROWSER_TABS: Final = "browser_tabs"
+BROWSER_VAULT: Final = "browser_vault"
 BROWSER_TOOLS: Final = frozenset(
     {
         BROWSER_OPEN,
@@ -56,6 +62,7 @@ BROWSER_TOOLS: Final = frozenset(
         BROWSER_TABS,
     }
 )
+"""The tools that the server has with the browser. ``browser_vault`` needs the vault too."""
 
 MAX_URL_CHARS: Final = 2_000
 MAX_TEXT_CHARS: Final = 10_000
@@ -106,6 +113,14 @@ EXTRACT_DESCRIPTION: Final = (
     "(text and href), tables (rows of cells), fields (fields: a name for each ref; the value "
     "or the text of each element). ref limits text, links, and tables to one element."
 )
+VAULT_DESCRIPTION: Final = (
+    "Use the saved logins of the user. action=list gives the name and the site of each saved "
+    "login. action=fill (name) fills the user name and the password of that login into the "
+    "sign-in form of the active tab, only on the site of the login; you never see the values. "
+    "username_ref and password_ref pick the fields when sama cannot find them; submit=true "
+    "presses Enter after the fill. For a sign-in in two steps, fill, continue, and fill again. "
+    "Do not ask the user for a password: ask them to save the login in Settings."
+)
 TABS_DESCRIPTION: Final = (
     "Manage the tabs of the browser. Actions: list, new (url optional; the new tab becomes "
     "active), select (index), close (index, or the active tab). A tab that a page opens becomes "
@@ -131,7 +146,8 @@ def _with_target(arguments: dict[str, Any], target: TargetName | None) -> dict[s
 
 
 def register_browser(server: MCPServer, call: Call, service: BrowserService) -> None:
-    """Adds the six browser tools to ``server``."""
+    """Adds the six browser tools to ``server``, and ``browser_vault`` when the service has the
+    saved logins."""
     reads = ToolAnnotations(read_only_hint=True, open_world_hint=True)
     targets = _targets_text(service)
     acts = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
@@ -293,3 +309,53 @@ def register_browser(server: MCPServer, call: Call, service: BrowserService) -> 
         if url is not None:
             arguments["url"] = url
         return await call(ctx, BROWSER_TABS, arguments, body)
+
+    if service.logins is None:
+        return
+
+    @server.tool(
+        name=BROWSER_VAULT,
+        description=VAULT_DESCRIPTION,
+        annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+        structured_output=False,
+    )
+    async def browser_vault(
+        action: Literal["list", "fill"],
+        ctx: Context,
+        name: Annotated[str | None, Field(min_length=1, max_length=80)] = None,
+        username_ref: _Ref | None = None,
+        password_ref: _Ref | None = None,
+        submit: bool = False,
+        snapshot: bool = True,
+        target: TargetName | None = None,
+    ) -> str:
+        async def body(claims: RunTokenClaims) -> str:
+            if action == "list":
+                return await service.vault_list(claims)
+            if not name:
+                raise BrowserError("fill needs name: the name of a saved login from the list")
+            return await service.vault_fill(
+                claims,
+                name,
+                username_ref=username_ref,
+                password_ref=password_ref,
+                submit=submit,
+                snapshot=snapshot,
+                target=target,
+            )
+
+        # The arguments have no secret: only the name of the login and the refs.
+        arguments: dict[str, Any] = {
+            key: value
+            for key, value in {
+                "action": action,
+                "name": name,
+                "username_ref": username_ref,
+                "password_ref": password_ref,
+                "submit": submit if action == "fill" else None,
+                "snapshot": snapshot if action == "fill" else None,
+                "target": target,
+            }.items()
+            if value is not None
+        }
+        return await call(ctx, BROWSER_VAULT, arguments, body)

@@ -555,3 +555,35 @@ describe("model key calls", () => {
     ]);
   });
 });
+
+describe("browser settings calls", () => {
+  it("lists, adds, and removes logins and sets the URL policy", async () => {
+    const policy = { allow_hosts: [], block_hosts: ["evil.test"], mode: "block_list", updated_at: null };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, []))
+      .mockResolvedValueOnce(json(201, { id: "l1" }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(json(200, policy))
+      .mockResolvedValueOnce(json(200, policy));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    const login = { name: "Mail", site: "mail.test", username: "me", password: "pw", scope: "personal" as const };
+    await expect(client.browserLogins("o 1")).resolves.toEqual([]);
+    await expect(client.addBrowserLogin("o 1", login)).resolves.toEqual({ id: "l1" });
+    await expect(client.removeBrowserLogin("o 1", "l 1")).resolves.toBeNull();
+    await expect(client.browserUrlPolicy("o 1")).resolves.toEqual(policy);
+    await expect(client.setBrowserUrlPolicy("o 1", [], ["evil.test"])).resolves.toEqual(policy);
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method, init.body])).toEqual([
+      ["https://api.test/orgs/o%201/browser/logins", "GET", undefined],
+      ["https://api.test/orgs/o%201/browser/logins", "POST", JSON.stringify(login)],
+      ["https://api.test/orgs/o%201/browser/logins/l%201", "DELETE", undefined],
+      ["https://api.test/orgs/o%201/browser/url-policy", "GET", undefined],
+      [
+        "https://api.test/orgs/o%201/browser/url-policy",
+        "PUT",
+        '{"allow_hosts":[],"block_hosts":["evil.test"]}',
+      ],
+    ]);
+  });
+});

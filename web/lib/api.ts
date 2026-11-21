@@ -74,6 +74,37 @@ export interface ModelKeyStatus {
   default_key: boolean;
 }
 
+/** A saved login of the browser vault. It has no user name and no password. */
+export interface BrowserLogin {
+  id: string;
+  name: string;
+  /** The origin where sama fills the login, for example `https://github.com`. */
+  site: string;
+  scope: "org" | "personal";
+  user_id: string | null;
+  created_at: string;
+  updated_at: string;
+  /** True when the login belongs to the user who asks. */
+  mine: boolean;
+  can_manage: boolean;
+}
+
+export interface BrowserLoginAdd {
+  name: string;
+  site: string;
+  username: string;
+  password: string;
+  scope: "org" | "personal";
+}
+
+/** The URL policy of the browser of an org. */
+export interface BrowserUrlPolicy {
+  allow_hosts: string[];
+  block_hosts: string[];
+  mode: "allow_list" | "block_list";
+  updated_at: string | null;
+}
+
 export interface Me {
   orgs: Org[];
 }
@@ -1488,6 +1519,26 @@ export class ApiClient {
     });
   removeModelKey = (orgId: string, provider: ModelProvider) =>
     this.json<null>(`/orgs/${encodeURIComponent(orgId)}/model-keys/${provider}`, { method: "DELETE" });
+  browserLogins = (orgId: string) =>
+    this.json<BrowserLogin[]>(`/orgs/${encodeURIComponent(orgId)}/browser/logins`);
+  /** Sends the user name and the password. They go only to this call, never to the chat. */
+  addBrowserLogin = (orgId: string, body: BrowserLoginAdd) =>
+    this.json<BrowserLogin>(`/orgs/${encodeURIComponent(orgId)}/browser/logins`, {
+      method: "POST",
+      body,
+    });
+  removeBrowserLogin = (orgId: string, loginId: string) =>
+    this.json<null>(
+      `/orgs/${encodeURIComponent(orgId)}/browser/logins/${encodeURIComponent(loginId)}`,
+      { method: "DELETE" },
+    );
+  browserUrlPolicy = (orgId: string) =>
+    this.json<BrowserUrlPolicy>(`/orgs/${encodeURIComponent(orgId)}/browser/url-policy`);
+  setBrowserUrlPolicy = (orgId: string, allowHosts: string[], blockHosts: string[]) =>
+    this.json<BrowserUrlPolicy>(`/orgs/${encodeURIComponent(orgId)}/browser/url-policy`, {
+      method: "PUT",
+      body: { allow_hosts: allowHosts, block_hosts: blockHosts },
+    });
   listIdentities = (channel: ChatChannel) =>
     this.json<ChannelIdentity[]>(`/channels/${channel}/identities`);
   unlinkIdentity = (channel: ChatChannel, identityId: string) =>

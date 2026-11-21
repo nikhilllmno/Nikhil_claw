@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 from sama.browser.target import (
     CLOUD,
     Act,
+    BrowserError,
     Extracted,
     ExtractRequest,
+    Filled,
+    FillRequest,
     NavigationGuard,
     PageState,
     Screenshot,
@@ -64,6 +67,9 @@ class FakeSession:
     """When set, ``snapshot`` waits for it, so a test can hold the lock of the session."""
     notes: tuple[str, ...] = ()
     blocked: tuple[str, ...] = ()
+    tree: str = '- button "Go" [ref=e1]'
+    error: BrowserError | None = None
+    """When set, ``snapshot`` raises it."""
 
     @property
     def target(self) -> TargetName:
@@ -85,7 +91,9 @@ class FakeSession:
         self.calls.append("snapshot")
         if self.gate is not None:
             await self.gate.wait()
-        return Snapshot(page=self._state(), tree='- button "Go" [ref=e1]')
+        if self.error is not None:
+            raise self.error
+        return Snapshot(page=self._state(), tree=self.tree)
 
     async def act(self, act: Act) -> PageState:
         self.calls.append(f"act {act.action} {act.ref}")
@@ -110,6 +118,21 @@ class FakeSession:
 
 
 @dataclass
+class FillSession(FakeSession):
+    """A fake session that can fill a saved login, like ``PlaywrightSession``."""
+
+    fills: list[FillRequest] = field(default_factory=list)
+
+    async def fill_login(self, request: FillRequest) -> Filled:
+        if not request.site_allows(self.url):
+            raise BrowserError("the field is not on the site of this login")
+        self.fills.append(request)
+        self.calls.append("fill_login")
+        fields = ("username", "password") if request.password_ref != "none" else ("username",)
+        return Filled(page=self._state(), fields=fields)
+
+
+@dataclass
 class FakeTarget:
     sessions: list[FakeSession] = field(default_factory=list)
     starts: list[tuple[str, str | None, str]] = field(default_factory=list)
@@ -117,6 +140,8 @@ class FakeTarget:
     fail: Exception | None = None
     gate: asyncio.Event | None = None
     """When set, ``start`` waits for it, so a test can run starts at the same time."""
+    session_class: type[FakeSession] = FakeSession
+    guards: list[NavigationGuard] = field(default_factory=list)
 
     @property
     def name(self) -> TargetName:
@@ -136,7 +161,8 @@ class FakeTarget:
         if self.fail is not None:
             raise self.fail
         self.starts.append((org_id, user_id, run_id))
-        session = FakeSession(run_id)
+        self.guards.append(guard)
+        session = self.session_class(run_id)
         self.sessions.append(session)
         return session
 

@@ -22,6 +22,9 @@ Playwright client only, no browser binaries.
 - A blocked navigation leaves an error page in the tab. The session goes back to the page
   before it.
 - A tab that a page opens (a popup or ``target=_blank``) becomes the active tab.
+- ``fill_login`` fills a saved login (M5.3) into the password field and the user name field of
+  the active tab, only in a document of the site of the login. A snapshot shows the value of a
+  password field as ``[hidden]``, and an extract of a password field gives ``[hidden]``.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Final
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from sama.browser.guard import BLANK, PAGE_SCHEMES
+from sama.browser.guard import BLANK, PAGE_SCHEMES, FreshGuard
 from sama.browser.target import (
     ACTIONS_WITH_REF,
     Act,
@@ -44,6 +47,8 @@ from sama.browser.target import (
     Dialog,
     Extracted,
     ExtractRequest,
+    Filled,
+    FillRequest,
     NavigationGuard,
     PageState,
     Screenshot,
@@ -59,6 +64,7 @@ if TYPE_CHECKING:
         Browser,
         BrowserContext,
         CDPSession,
+        ElementHandle,
         Locator,
         Page,
         WebSocketRoute,
@@ -96,6 +102,9 @@ WS_CLOSE_POLICY: Final = 1008
 BLOCKED_NOTE: Final = (
     "the URL policy blocked a request of the page; the blocked URLs are in the untrusted block"
 )
+_OTHER_SITE: Final = (
+    "the field is not on the site of this login; sama fills a login only on its own site"
+)
 REDIRECT_BLOCKED: Final = (
     "the URL policy blocked the navigation (for example a redirect to a blocked address); the "
     "page did not open"
@@ -127,12 +136,90 @@ _TABLES_JS: Final = """(root, limits) => {
 }"""
 _FIELD_JS: Final = """el => {
   const tag = el.tagName;
+  if (tag === 'INPUT' && el.type === 'password') return el.value ? '[hidden]' : '';
   if (tag === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) return el.checked;
   if (tag === 'INPUT' || tag === 'TEXTAREA') return el.value;
   if (tag === 'SELECT') return Array.from(el.selectedOptions, o => o.label).join(', ');
   return (el.innerText || '').trim();
 }"""
 _HEIGHT_JS: Final = "() => document.documentElement.scrollHeight"
+HIDDEN: Final = "[hidden]"
+"""What a snapshot shows in place of the value of a password field."""
+FILL_MARK: Final = "data-sama-login"
+"""A short-lived attribute that marks the user name field that the page script found."""
+_PASSWORD_VALUES_JS: Final = """() => Array.from(
+  document.querySelectorAll('input[type=password]'), e => e.value).filter(v => v)"""  # noqa: S105
+_IS_PASSWORD_JS: Final = "el => el.tagName === 'INPUT' && el.type === 'password'"  # noqa: S105
+_IS_TEXT_JS: Final = """el => (el.tagName === 'INPUT'
+  && ['text', 'email', 'tel', ''].includes(el.getAttribute('type') || ''))
+  || el.tagName === 'TEXTAREA'"""
+_MARK_USERNAME_JS: Final = """(pw) => {
+  const mark = 'data-sama-login';
+  for (const old of document.querySelectorAll('[' + mark + ']')) old.removeAttribute(mark);
+  const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+    && getComputedStyle(el).visibility !== 'hidden' && !el.disabled && !el.readOnly;
+  const textual = el => el.tagName === 'INPUT'
+    && ['text', 'email', 'tel', ''].includes(el.getAttribute('type') || '');
+  const scope = (pw && pw.form) || document;
+  const inputs = Array.from(scope.querySelectorAll('input'))
+    .filter(el => textual(el) && visible(el));
+  const named = inputs.find(
+    el => /(^|\\s)username(\\s|$)/.test(el.getAttribute('autocomplete') || ''))
+    || inputs.find(el => el.type === 'email');
+  let found = named;
+  if (!found && pw) {
+    const before = inputs.filter(
+      el => el.compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING);
+    found = before[before.length - 1];
+  }
+  if (!found) {
+    found = inputs.find(el => /user|email|login|account|identifier/i.test(
+      (el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '')));
+  }
+  if (!found) return false;
+  found.setAttribute(mark, 'username');
+  return true;
+}"""
+_SET_VALUE_JS: Final = """(el, value) => {
+  if (el.disabled || el.readOnly) return false;
+  const proto = el.tagName === 'TEXTAREA'
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value);
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return true;
+}"""
+_UNMARK_JS: Final = """() => {
+  const mark = 'data-sama-login';
+  for (const el of document.querySelectorAll('[' + mark + ']')) el.removeAttribute(mark);
+}"""
+
+
+async def _handle_allowed(handle: ElementHandle, request: FillRequest) -> bool:
+    """True if the frame of the element, as the browser reports it, is of the site. The page
+    cannot change this answer with JavaScript."""
+    try:
+        frame = await handle.owner_frame()
+    except PlaywrightError:
+        return False
+    return frame is not None and not frame.is_detached() and request.site_allows(frame.url)
+
+
+def hide_values(tree: str, values: list[str]) -> str:
+    """Replaces the value of each password field in a snapshot with ``[hidden]``. A snapshot
+    shows the value of a text box after its name (``- textbox "Password" [ref=e6]: value``)."""
+    if not values:
+        return tree
+    lines = tree.split("\n")
+    for number, line in enumerate(lines):
+        if "textbox" not in line:
+            continue
+        for value in values:
+            suffix = f": {value}"
+            if line.endswith(suffix):
+                lines[number] = line[: -len(suffix)] + f": {HIDDEN}"
+                break
+    return "\n".join(lines)
 
 
 def _opens_pages(act: Act) -> bool:
@@ -267,6 +354,8 @@ class PlaywrightSession:
             if navigation:
                 await self._guard.check(url)
             else:
+                if isinstance(self._guard, FreshGuard):
+                    await self._guard.fresh()  # the request waits for an old policy to load
                 problem = self._guard.quick_problem(url)
                 if problem is not None:
                     raise BlockedUrlError(problem)
@@ -442,7 +531,18 @@ class PlaywrightSession:
             tree = await page.aria_snapshot(mode="ai")
         except PlaywrightError as error:
             raise BrowserError("the snapshot failed", detail=_short(error)) from None
+        tree = hide_values(tree, await self._password_values(page))
         return Snapshot(page=await self._state(page), tree=tree)
+
+    async def _password_values(self, page: Page) -> list[str]:
+        """The values of the password fields of all frames of the page, longest first, so a
+        value that ends another value does not hide only a part."""
+        values: set[str] = set()
+        for frame in page.frames:
+            with contextlib.suppress(PlaywrightError):
+                found = await frame.evaluate(_PASSWORD_VALUES_JS)
+                values.update(str(v) for v in found if v)
+        return sorted(values, key=len, reverse=True)
 
     async def act(self, act: Act) -> PageState:
         page = await self._page()
@@ -525,6 +625,126 @@ class PlaywrightSession:
         await self._finish_pending()
         await self._settle(page)
         return await self._state(await self._page())
+
+    async def fill_login(self, request: FillRequest) -> Filled:
+        """Fills a saved login. Each field must be in a document that ``site_allows`` accepts.
+
+        The fields are pinned element handles, not locators: a locator finds its element again
+        at each call, so a frame that navigates between the check and the fill could give it an
+        element of another site. A handle of a document that is gone fails. The site check uses
+        the frame of the element as the browser reports it, not page JavaScript, which a page
+        can change. An error has fixed text only: a Playwright error can hold a part of the
+        value."""
+        page = await self._page()
+        self._no_dialog(page)
+        try:
+            password = await self._password_field(page, request)
+            username = await self._username_field(page, request, password)
+        finally:
+            for frame in page.frames:
+                with contextlib.suppress(PlaywrightError):
+                    await frame.evaluate(_UNMARK_JS)
+        if password is None and username is None:
+            raise BrowserError(
+                "no login field of the site of this login is on the page; open the sign-in page"
+                " of the site, or give username_ref and password_ref from a snapshot"
+            )
+        fields: list[str] = []
+        last: ElementHandle | None = None
+        try:
+            for name, handle, value in (
+                ("username", username, request.username),
+                ("password", password, request.password),
+            ):
+                if handle is None:
+                    continue
+                # Check again just before the fill: the document must still be of the site.
+                if not await _handle_allowed(handle, request):
+                    raise BrowserError(_OTHER_SITE)
+                # A write to the pinned element itself, not keyboard input to the focused
+                # element: a page cannot move the focus to its own field during the fill.
+                if not await handle.evaluate(_SET_VALUE_JS, value.get_secret_value()):
+                    raise BrowserError("the field is disabled or read-only; take a new snapshot")
+                fields.append(name)
+                last = handle
+            if request.submit and last is not None:
+                if not await _handle_allowed(last, request):
+                    raise BrowserError(_OTHER_SITE)
+                await self._until_dialog(last.press("Enter", timeout=ACTION_TIMEOUT_MS))
+        except PlaywrightTimeoutError:
+            raise BrowserError(
+                "the fill did not finish in time; the field can be hidden, covered, or disabled."
+                " Take a new snapshot."
+            ) from None
+        except PlaywrightError:
+            raise BrowserError("the fill failed; take a new snapshot and try again") from None
+        if request.submit and self._dialog_of(page) is None:
+            await asyncio.sleep(SETTLE_DELAY_S)
+            await self._settle(await self._page())
+        return Filled(page=await self._state(await self._page()), fields=tuple(fields))
+
+    async def _pin(self, locator: Locator, request: FillRequest) -> ElementHandle | None:
+        """The element of ``locator`` as a pinned handle, if its frame is of the site."""
+        try:
+            handle = await locator.element_handle(timeout=ACTION_TIMEOUT_MS)
+        except PlaywrightError:
+            return None
+        if handle is None or not await _handle_allowed(handle, request):
+            return None
+        return handle
+
+    async def _password_field(self, page: Page, request: FillRequest) -> ElementHandle | None:
+        if request.password_ref:
+            locator = await self._locator(page, request.password_ref)
+            if not await locator.evaluate(_IS_PASSWORD_JS):
+                raise BrowserError("password_ref must be a password field")
+            handle = await self._pin(locator, request)
+            if handle is None:
+                raise BrowserError(_OTHER_SITE)
+            return handle
+        for frame in page.frames:
+            if not request.site_allows(frame.url):
+                continue
+            locator = frame.locator("input[type=password]:visible").first
+            with contextlib.suppress(PlaywrightError):
+                if await locator.count():
+                    handle = await self._pin(locator, request)
+                    if handle is not None:
+                        return handle
+        return None
+
+    async def _username_field(
+        self, page: Page, request: FillRequest, password: ElementHandle | None
+    ) -> ElementHandle | None:
+        if request.username_ref:
+            locator = await self._locator(page, request.username_ref)
+            if not await locator.evaluate(_IS_TEXT_JS):
+                raise BrowserError("username_ref must be a text field")
+            handle = await self._pin(locator, request)
+            if handle is None:
+                raise BrowserError(_OTHER_SITE)
+            return handle
+        if password is not None:
+            # The user name field is in the form (or the document) of the password field.
+            try:
+                frame = await password.owner_frame()
+                if frame is None or not await password.evaluate(_MARK_USERNAME_JS):
+                    return None
+            except PlaywrightError:
+                return None
+            return await self._pin(frame.locator(f"[{FILL_MARK}=username]").first, request)
+        # No password field: a first step that asks only for the user name.
+        for frame in page.frames:
+            if not request.site_allows(frame.url):
+                continue
+            with contextlib.suppress(PlaywrightError):
+                if await frame.evaluate(_MARK_USERNAME_JS, None):
+                    handle = await self._pin(
+                        frame.locator(f"[{FILL_MARK}=username]").first, request
+                    )
+                    if handle is not None:
+                        return handle
+        return None
 
     async def screenshot(self, *, full_page: bool = False) -> Screenshot:
         page = await self._page()

@@ -142,6 +142,8 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     "workflow_instances": "owner_user_id = :user",
     "workflow_steps": _INSTANCES,
     "workflow_receipts": _INSTANCES,
+    "browser_logins": "user_id = :user OR created_by_user_id = :user",
+    "browser_url_policies": None,
 }
 """The rows of a user export, as a filter in each table of the org. None: the table has no
 personal data, or the data is not for an export (secrets, the outbox, embeddings)."""

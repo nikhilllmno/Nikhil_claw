@@ -11,15 +11,24 @@ org, so the same address rules as ``web_extract`` apply:
   literal private addresses, ``localhost``, and the metadata hosts.
 
 The browser resolves the host again when it connects, so a DNS answer that changes between the
-check and the connection (DNS rebinding) is not fully stopped. M5.3 adds the per-org URL policy.
+check and the connection (DNS rebinding) is not fully stopped.
+
+``OrgGuard`` adds the host lists of one org (``sama.browser.policy``, M5.3) to these rules.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
-from typing import Final
+import logging
+import math
+import time
+from collections.abc import Callable
+from typing import Final, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+from sama.browser.policy import CACHE_S, OPEN, OrgUrlPolicy, PolicySource, url_host
+from sama.browser.target import NavigationGuard
 from sama.tools.outbound import (
     METADATA_HOSTS,
     BlockedUrlError,
@@ -28,6 +37,8 @@ from sama.tools.outbound import (
     UrlPolicy,
     address_problem,
 )
+
+log = logging.getLogger("sama.browser")
 
 BLANK: Final = "about:blank"
 PAGE_SCHEMES: Final = frozenset({"http", "https"})
@@ -76,3 +87,110 @@ class UrlGuard:
         except ValueError:
             return None
         return address_problem(address)
+
+
+class OrgGuard:
+    """The URL guard of the browser sessions of one org: the host lists of the org first, then
+    the address rules of ``UrlGuard``.
+
+    ``check`` reads the policy of the org (through a cache) each time, so a change applies to a
+    live session too. When the policy cannot be read, the check fails closed.
+
+    ``quick_problem`` (the requests of a page that are not a navigation) has no await, so the
+    session first awaits ``fresh``: it loads the policy again when it is past the time of the
+    cache or an admin changed it, and the request waits for the load. ``quick_problem`` refuses
+    every request while the policy is old or after a failed load, so it fails closed also for a
+    caller that does not call ``fresh``.
+    """
+
+    def __init__(
+        self,
+        base: NavigationGuard,
+        org_id: str,
+        policies: PolicySource | None,
+        *,
+        policy: OrgUrlPolicy = OPEN,
+        fresh_s: float = CACHE_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._base = base
+        self._org_id = org_id
+        self._policies = policies
+        self._policy = policy
+        self._fresh_s = fresh_s
+        self._clock = clock
+        self._fresh_until = -math.inf if policies is not None else math.inf
+        self._failed = False
+        self._loading: asyncio.Future[OrgUrlPolicy] | None = None
+
+    async def load(self) -> OrgUrlPolicy:
+        """Reads the policy of the org. Raises ``BlockedUrlError`` when it cannot be read. The
+        policy is fresh until the cache of the source drops it, so a cached policy does not get
+        a second period."""
+        if self._policies is None:
+            return self._policy
+        try:
+            until_of = getattr(self._policies, "policy_until", None)
+            policy: OrgUrlPolicy
+            if until_of is not None:
+                policy, until = await until_of(self._org_id)
+            else:
+                policy = await self._policies.policy(self._org_id)
+                until = self._clock() + self._fresh_s
+        except Exception:
+            self._failed = True
+            log.warning("the URL policy cannot be read org=%s", self._org_id, exc_info=True)
+            raise BlockedUrlError("the URL policy of the org cannot be read; try again") from None
+        self._policy, self._failed, self._fresh_until = policy, False, until
+        return policy
+
+    def _stale(self) -> bool:
+        return self._failed or self._clock() >= self._fresh_until
+
+    async def fresh(self) -> None:
+        """Loads the policy when it is old, changed, or not readable last time. Callers at the
+        same time share one load. Raises ``BlockedUrlError`` when it cannot be read."""
+        if not self._stale():
+            return
+        if self._loading is None or self._loading.done():
+            self._loading = asyncio.ensure_future(self.load())
+        await asyncio.shield(self._loading)
+
+    def invalidate(self) -> None:
+        """Marks the kept policy as old, after an admin changed it."""
+        if self._policies is not None:
+            self._fresh_until = -math.inf
+
+    async def check(self, url: str) -> None:
+        if url == BLANK:
+            return
+        policy = await self.load()
+        problem = _list_problem(url, policy.host_problem)
+        if problem is not None:
+            raise BlockedUrlError(problem)
+        await self._base.check(url)
+
+    def quick_problem(self, url: str) -> str | None:
+        problem = self._base.quick_problem(url)
+        if problem is not None:
+            return problem
+        if self._failed:
+            return "the URL policy of the org cannot be read"
+        if self._stale():
+            return "the URL policy of the org is not loaded"
+        return _list_problem(url, self._policy.block_problem)
+
+
+@runtime_checkable
+class FreshGuard(Protocol):
+    """A guard whose ``quick_problem`` needs a load first (``OrgGuard``)."""
+
+    async def fresh(self) -> None: ...
+
+
+def _list_problem(url: str, rule: Callable[[str], str | None]) -> str | None:
+    try:
+        host = url_host(url)
+    except ValueError:
+        return "the URL is not valid"
+    return rule(host) if host is not None else None
