@@ -57,7 +57,7 @@ email) and confirms the address with the admin API, as the link in the email wou
 | `00-smoke` | API health and config; each page of the shell opens, also Admin and the setup guide; the agent page (M3.8, M3.12, M6.9). |
 | `01-auth` | Wrong password; sign-up, email confirmation, sign-in, first org, the setup guide with a first message and its answer, sign-out (M3.8, M6.5, M6.9). |
 | `02-chat` | Chat with a streamed answer on the Claude runtime; run traces; export as Markdown and JSON; session search; chat on the OpenAI runtime after a switch on the agent page; an OpenAI-runtime chat that calls the slow `browser_open` tool (M1, M2.5, M3.6, M3.12, PR 77). |
-| `03-approvals-steer` | Approve and deny a `Bash` call; `/steer` and a second request while a run is busy, both answered; Stop (M1.13, M3.2, M3.9, M7.1). |
+| `03-approvals-steer` | Approve and deny a `Bash` call; Stop (M1.13, M3.2, M3.9). |
 | `04-memory` | Edit the user profile, the agent uses it in a new session, history and revert (M2.1, M3.12). |
 | `05-skills` | Make, edit, version, archive, and restore a skill; built-in skills are read-only (M2.2, M3.12). |
 | `06-members` | Invite link from the Members page, join from `/invite`, member view, admin routes refused (M6.5). |
@@ -70,6 +70,8 @@ email) and confirms the address with the admin API, as the link in the email wou
 | `13-m7-skills-channels` | The builtin skill library (at least 68 skills) and `/decision-memo` loads its skill; WhatsApp (Meta, Twilio, Gupshup) and email connects refuse fake credentials and leave no row; pairing codes, webhooks, and admin rules of the channels; the Settings link `?connect=whatsapp&provider=twilio` opens the form and shows the refusal (M7.7, M7.8). |
 | `14-console` | Each of the 13 console sections opens; a webhook is made, gets a signed test, is edited, and is deleted; the harness sets the reasoning effort (M7.10). |
 | `15-coding-agents` | Direct mode with `/claude` until `/sama`; `/codex <task>`; the approval card of `coding_agent_run` when the agent calls it (M7.2). |
+| `16-busy-modes` | A message during a run joins it (note queued, then delivered or requeued); `/bg` and the Run in parallel button start a second run at the same time; `/stop 2` stops one of two runs (M7.1). |
+| `17-api-server` | An admin makes an API key on Admin > API keys; the official OpenAI Node SDK chats through `/v1` (also a stream that continues the session); the MCP TypeScript SDK lists the tools and sends a message through `/mcp`; a revoked key gets `401`; a member cannot make keys (M7.6). |
 
 Add a flow when its item lands on main. The staging web app deploys to Vercel by hand
 (`web/README.md`), not from CI. A flow of a new page fails while that deploy is behind `main`,
