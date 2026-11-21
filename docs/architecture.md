@@ -5752,7 +5752,7 @@ migrated schema.
 
 | Table | Key columns |
 |---|---|
-| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0032`, Section 17.3) |
+| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0033`, Section 17.3) |
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
@@ -5783,7 +5783,7 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0032`, Section 17.3). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0033`, Section 17.3). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -6041,12 +6041,15 @@ log of the org, so the control plane logs it instead.
   vault secrets of the personal connections and triggers. Shared content stays. Its user
   columns get a null. The last owner of an org cannot be deleted. The invites that the user
   accepted and the open invites to the email of the user go too. The invites that the user sent
-  stay without the user.
+  stay without the user. The org keys in the vault (the provider keys of M6.7) belong to the
+  org, so a user delete keeps them.
 - A user delete also ends the open runs that the user started in shared sessions. A queued or
   paused run is cancelled. A running run blocks the delete, as above. A run with no user has
   no user limits (the live authority, Section 16.6), so a run of a deleted user must not go on.
 - An org delete removes the org row, and every table cascades. It sets `sama.audit_purge`, so
-  the audit log of the org goes too (Section 17.1).
+  the audit log of the org goes too (Section 17.1). The vault rows cascade too, so the org
+  keys go in the same transaction. A vault cache in another process can keep a key for its
+  cache time, but no run of the org can start, because the org row is gone.
 - Before the database delete, `ServiceCleanup` removes the accounts outside sama: the
   Composio accounts and triggers, the connector hosts, the Telegram webhooks, and the Slack
   tokens. A failure there is logged and does not stop the delete. The cleanup comes before

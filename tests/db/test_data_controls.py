@@ -35,7 +35,9 @@ from sama.db.models import (
     Run,
     Session,
     User,
+    VaultSecret,
 )
+from sama.vault.store import SecretName
 from tests.db.world import World
 
 
@@ -113,6 +115,59 @@ async def test_an_org_delete_removes_every_row_of_the_org_and_no_row_of_the_othe
         ).scalar_one()
     # The exporter can send a claimed trace now. The purge comes after it.
     assert due > datetime.now(UTC) + TRACE_DELAY - timedelta(minutes=5)
+
+
+ORG_KEYS = frozenset({SecretName.ANTHROPIC_API_KEY.value, SecretName.OPENAI_API_KEY.value})
+"""The provider keys that an org brings (M6.7, Section 16.6)."""
+
+
+async def _add_org_keys(engine: AsyncEngine, *orgs: uuid.UUID) -> None:
+    """The provider keys of each org in the vault (M6.7, Section 16.6)."""
+    async with engine.begin() as connection:
+        for org_id in orgs:
+            for name in sorted(ORG_KEYS):
+                await connection.execute(
+                    insert(VaultSecret).values(
+                        org_id=org_id,
+                        name=name,
+                        key_id="seed",
+                        wrapped_key=b"wrapped",
+                        ciphertext=b"sealed",
+                    )
+                )
+
+
+async def _org_key_names(engine: AsyncEngine, org_id: uuid.UUID) -> set[str]:
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            select(VaultSecret.name).where(
+                VaultSecret.org_id == org_id, VaultSecret.name.in_(ORG_KEYS)
+            )
+        )
+        return set(rows.scalars())
+
+
+async def test_an_org_delete_removes_the_org_keys_of_the_org_only(
+    engine: AsyncEngine, fresh: World
+) -> None:
+    org_a, org_b = fresh.ids["org-a"], fresh.ids["org-b"]
+    await _add_org_keys(engine, org_a, org_b)
+
+    await DataControls(engine).delete_org(org_b, actor_user_id=fresh.ids["bob"])
+
+    assert await _org_key_names(engine, org_b) == set()
+    assert await _org_key_names(engine, org_a) == ORG_KEYS
+
+
+async def test_a_user_delete_keeps_the_org_keys(engine: AsyncEngine, fresh: World) -> None:
+    org_a = fresh.ids["org-a"]
+    await _add_org_keys(engine, org_a)
+
+    await DataControls(engine).delete_user(
+        org_a, fresh.ids["alice"], actor_user_id=fresh.ids["carol"]
+    )
+
+    assert await _org_key_names(engine, org_a) == ORG_KEYS
 
 
 async def test_a_user_delete_removes_the_private_data_and_keeps_the_shared_data(
