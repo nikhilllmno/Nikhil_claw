@@ -278,6 +278,36 @@ export interface SentMessage {
   run_id: string;
   /** True when the message waits behind an open run of the session (M3.9). */
   queued: boolean;
+  /**
+   * True when the message joined the running run at its next step (busy mode `steer`, M7.1).
+   * `run_id` is then the running run, and the note is in `GET /sessions/{id}/steers`.
+   */
+  steered?: boolean;
+}
+
+export type SteerStatus = "pending" | "delivered" | "requeued" | "dropped";
+
+/** One row of `GET /sessions/{id}/steers` (M7.1): a message that joined a run. */
+export interface SteerNote {
+  id: string;
+  run_id: string;
+  text: string;
+  status: SteerStatus;
+  created_at: string;
+  delivered_at: string | null;
+  requeued_run_id: string | null;
+}
+
+
+/** One row of `GET /sessions/{id}/open-runs` (M7.1), oldest first. */
+export interface OpenRun {
+  /** The place of the run for `/stop NUMBER`, from 1. */
+  number: number;
+  run_id: string;
+  status: string;
+  /** True when the run started next to another open run. */
+  side: boolean;
+  text: string;
 }
 
 /** The answer of `POST /sessions/{id}/steer`. */
@@ -413,6 +443,8 @@ export interface AgentProfileLimits {
   subagent_description_max_chars: number;
   subagent_prompt_max_chars: number;
   subagent_max_turns: number;
+  /** The highest parallel run limit (M7.1). */
+  max_parallel_runs?: number;
 }
 
 export interface AgentProfile {
@@ -426,6 +458,10 @@ export interface AgentProfile {
   toolsets: string[];
   group_toolsets: string[];
   subagents: Subagent[];
+  /** What a message does while a run is open (M7.1). */
+  busy_mode?: BusyMode;
+  /** The most open runs of one session in the busy mode `parallel`. */
+  max_parallel_runs?: number;
   updated_at: string;
   /** True if the user is an org owner or admin. */
   editable: boolean;
@@ -434,8 +470,6 @@ export interface AgentProfile {
   budget: ProfileBudget;
   /** `null`: the default of the model. */
   reasoning_effort: ReasoningEffort | null;
-  /** The busy mode (M7.1). Only when the API has it. */
-  busy_mode?: BusyMode;
 }
 
 /** The body of `PATCH /orgs/{org_id}/agent-profiles/{profile_id}`. Each field is optional. */
@@ -449,6 +483,7 @@ export interface AgentProfilePatch {
   budget?: ProfileBudget;
   reasoning_effort?: ReasoningEffort | null;
   busy_mode?: BusyMode;
+  max_parallel_runs?: number;
 }
 
 export type ProfileChangeKind = "soul" | "profile" | "toolsets" | "policy";
@@ -1787,8 +1822,14 @@ export class ApiClient {
       if (page.length < MESSAGE_PAGE) return all;
     }
   };
-  sendMessage = (id: string, text: string) =>
-    this.json<SentMessage>(`/sessions/${id}/messages`, { method: "POST", body: { text } });
+  /** `parallel`: start a run next to the open runs (`/bg`, M7.1). */
+  sendMessage = (id: string, text: string, parallel = false) =>
+    this.json<SentMessage>(`/sessions/${id}/messages`, {
+      method: "POST",
+      body: parallel ? { text, parallel } : { text },
+    });
+  listSteers = (id: string) => this.json<SteerNote[]>(`/sessions/${id}/steers`);
+  listOpenRuns = (id: string) => this.json<OpenRun[]>(`/sessions/${id}/open-runs`);
   /** A note for the open run. Without an open run the API sends the text as a message. */
   steer = (id: string, text: string) =>
     this.json<Steered>(`/sessions/${id}/steer`, { method: "POST", body: { text } });

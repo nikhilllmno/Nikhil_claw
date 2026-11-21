@@ -290,6 +290,8 @@ class LockedProfile(NamedTuple):
     reasoning_effort: str | None = None
     plan: str | None = None
     """The plan of the org. A budget change must stay in the caps of the plan (M7.10)."""
+    busy_mode: str = "steer"
+    max_parallel_runs: int = 3
 
 
 async def lock_profile(
@@ -317,6 +319,8 @@ async def lock_profile(
                 .where(Org.id == AgentProfile.org_id)
                 .scalar_subquery()
                 .label("plan"),
+                AgentProfile.busy_mode,
+                AgentProfile.max_parallel_runs,
             )
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .with_for_update()
@@ -339,6 +343,8 @@ async def lock_profile(
         budget=row.budget if isinstance(row.budget, dict) else {},
         reasoning_effort=row.reasoning_effort,
         plan=row.plan,
+        busy_mode=row.busy_mode,
+        max_parallel_runs=row.max_parallel_runs,
     )
 
 

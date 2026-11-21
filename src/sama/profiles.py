@@ -28,7 +28,16 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.admin.bootstrap import DEFAULT_MODEL, default_profile
-from sama.db.models import AgentProfile, AuditEntry, Membership, Org, ProfileChange, Workspace
+from sama.db.models import (
+    BUSY_MODES,
+    MAX_PARALLEL_RUNS_CAP,
+    AgentProfile,
+    AuditEntry,
+    Membership,
+    Org,
+    ProfileChange,
+    Workspace,
+)
 from sama.gate.decide import TOOLSETS
 from sama.orgs.plans import plan_of
 from sama.runtime.contract import (
@@ -76,6 +85,8 @@ PROFILE_FIELDS: Final = (
     "group_toolsets",
     "budget",
     "reasoning_effort",
+    "busy_mode",
+    "max_parallel_runs",
 )
 """The fields of a profile that an edit, a proposal, or a revert can change."""
 ADMIN_ONLY_FIELDS: Final = ("budget", "reasoning_effort")
@@ -83,7 +94,16 @@ ADMIN_ONLY_FIELDS: Final = ("budget", "reasoning_effort")
 must not raise its own budget."""
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "soul": ("soul",),
-    "profile": ("name", "runtime", "model", "subagents", "budget", "reasoning_effort"),
+    "profile": (
+        "name",
+        "runtime",
+        "model",
+        "subagents",
+        "budget",
+        "reasoning_effort",
+        "busy_mode",
+        "max_parallel_runs",
+    ),
     "toolsets": ("toolsets", "group_toolsets"),
     "policy": ("rules",),
 }
@@ -131,6 +151,10 @@ class ProfileChanges:
     """The whole run budget. A key that is missing or ``None`` is no limit."""
     reasoning_effort: str | Unset | None = UNSET
     """``None`` sets the default of the model, so ``None`` is a value and ``UNSET`` keeps it."""
+    busy_mode: str | None = None
+    """``steer``, ``parallel``, or ``queue`` (Section 4.3, M7.1)."""
+    max_parallel_runs: int | None = None
+    """The most open chat runs of one session, 1 to ``MAX_PARALLEL_RUNS_CAP``."""
 
 
 def profile_options(runtime: RuntimeKind, plan: str | None = None) -> dict[str, Any]:
@@ -166,7 +190,9 @@ def profile_options(runtime: RuntimeKind, plan: str | None = None) -> dict[str, 
             "subagent_description_max_chars": SUBAGENT_DESCRIPTION_MAX_CHARS,
             "subagent_prompt_max_chars": SUBAGENT_PROMPT_MAX_CHARS,
             "subagent_max_turns": SUBAGENT_MAX_TURNS,
+            "max_parallel_runs": MAX_PARALLEL_RUNS_CAP,
         },
+        "busy_modes": list(BUSY_MODES),
     }
 
 
@@ -350,6 +376,22 @@ def planned_values(profile: LockedProfile, after: Mapping[str, Any]) -> dict[str
             raise ProfileError("the reasoning effort is low, medium, or high")
         if effort != profile.reasoning_effort:
             values["reasoning_effort"] = effort
+    if "busy_mode" in after:
+        mode = str(after["busy_mode"])
+        if mode not in BUSY_MODES:
+            raise ProfileError("the busy mode is steer, parallel, or queue")
+        if mode != profile.busy_mode:
+            values["busy_mode"] = mode
+    if "max_parallel_runs" in after:
+        limit = after["max_parallel_runs"]
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_PARALLEL_RUNS_CAP
+        ):
+            raise ProfileError(f"the parallel run limit is 1 to {MAX_PARALLEL_RUNS_CAP}")
+        if limit != profile.max_parallel_runs:
+            values["max_parallel_runs"] = limit
     final_toolsets = values.get("toolsets", profile.toolsets)
     if "subagents" in after:
         specs = parse_subagents(list(after["subagents"] or []))
@@ -442,6 +484,10 @@ async def update_profile(
         after["budget"] = dict(changes.budget)
     if not isinstance(changes.reasoning_effort, Unset):
         after["reasoning_effort"] = changes.reasoning_effort
+    if changes.busy_mode is not None:
+        after["busy_mode"] = changes.busy_mode
+    if changes.max_parallel_runs is not None:
+        after["max_parallel_runs"] = changes.max_parallel_runs
     if "soul" in after:
         # Checked before the lock, so a bad soul does not wait for the lock.
         if len(after["soul"]) > SOUL_MAX_CHARS:

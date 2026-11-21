@@ -372,6 +372,10 @@ class RunRequest(_Frozen):
     compact: CompactRequest | None = None
     """Set for a ``/compact`` run: the runtime compacts the session and sends no answer. It
     needs ``runtime_state``, because a session with no earlier run has nothing to compact."""
+    parallel: bool = False
+    """True for a side run (M7.1): it runs at the same time as another run of the session, in
+    the same sandbox. It has no ``runtime_state`` and starts a new runtime session, so it never
+    writes the runtime files of another run. The runner does not wait for the runner lock."""
 
 
 class ApprovalDecision(StrEnum):
@@ -390,6 +394,8 @@ class ResumeRequest(_Frozen):
     budget: Budget = Budget()
     runtime_state: bytes | None = None
     """The state from the ``ApprovalRequired`` event."""
+    parallel: bool = False
+    """True when the run is a side run (``RunRequest.parallel``)."""
 
 
 # ---------------------------------------------------------------------------------------------

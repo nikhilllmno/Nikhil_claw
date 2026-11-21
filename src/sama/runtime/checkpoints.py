@@ -444,8 +444,8 @@ class CheckpointGate:
     ``CHANGE_TOOLS``, it takes a snapshot before the call runs.
 
     It also takes a snapshot when the gate answers ``ask``: the run pauses, and the call runs
-    after the approval without a new gate check. No run can change the files of the session
-    while the run is paused, so the snapshot holds the files before the call."""
+    after the approval without a new gate check. A side run of the same session (M7.1) can
+    change files while the run is paused, so then the snapshot is older than the call."""
 
     def __init__(self, inner: ToolGate, checkpoints: Checkpoints) -> None:
         self._inner = inner
@@ -490,7 +490,8 @@ def _pick(history: Sequence[Checkpoint], number: int) -> Checkpoint:
 
 def _undo_target(history: Sequence[Checkpoint], current: str) -> Checkpoint:
     """The first checkpoint of the newest run whose first checkpoint differs from the current
-    files. ``history`` is newest first, and the checkpoints of one run are next to each other.
+    files. ``history`` is newest first. The checkpoints of one run are next to each other,
+    unless parallel runs changed files at the same time: then ``undo`` refuses (``_check_alone``).
 
     When the newest checkpoint is a restore, the search starts after the checkpoint that the
     restore wrote. So each ``undo`` goes one run further back, and a new run starts again from
@@ -507,11 +508,27 @@ def _undo_target(history: Sequence[Checkpoint], current: str) -> Checkpoint:
             groups[-1].append(checkpoint)
         else:
             groups.append([checkpoint])
+    tools = [checkpoint for checkpoint in history[start:] if checkpoint.kind != "rollback"]
     for group in groups:
         first = group[-1]
         if first.tree != current:
+            _check_alone(tools, first.run_id)
             return first
     raise CheckpointError("There is nothing to undo: no older checkpoint has other files.")
+
+
+def _check_alone(tools: Sequence[Checkpoint], run_id: str) -> None:
+    """Raises ``CheckpointError`` when parallel runs (M7.1) changed files at the same time as
+    the run: another run has a checkpoint between the checkpoints of the run. Then the
+    checkpoints of the run are not next to each other, and an undo of the run would also undo
+    a part of the work of the other run. ``/rollback`` lets the user choose a checkpoint."""
+    places = [i for i, checkpoint in enumerate(tools) if checkpoint.run_id == run_id]
+    if places and places[-1] - places[0] + 1 != len(places):
+        raise CheckpointError(
+            "The last run changed files at the same time as another run of this session. /undo"
+            " would also undo files of the other run, so it does nothing. Use /rollback to list"
+            " the checkpoints and choose one."
+        )
 
 
 def _prune(workdir: str, rel_dir: str) -> None:

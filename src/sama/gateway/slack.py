@@ -55,7 +55,9 @@ from sama.gateway.handoff import (
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
+    BG_EMPTY,
     COMPACTING,
+    JOINED,
     PIN_COMMANDS,
     STEER_EMPTY,
     STEERED,
@@ -65,15 +67,16 @@ from sama.gateway.sessions import (
     Reply,
     Target,
     approval_text,
+    busy_text,
     decide,
     find_session,
     follow_run,
     new_session,
     offers_always,
     pin_reply,
-    queued_text,
     send_ending,
     send_media,
+    stop_reply,
     stop_runs,
     wait_for_tasks,
 )
@@ -125,7 +128,10 @@ LINK_FIRST: Final = (
 HELP: Final = (
     "Send a direct message to the sama app, or mention it in a linked channel.\n"
     "/sama new - start a new session (direct messages)\n"
-    "/sama stop - stop the open runs of this conversation\n"
+    "A message while sama works joins the current run at its next step.\n"
+    "/sama stop - stop the open runs of this conversation. /sama stop NUMBER stops one run\n"
+    "  (direct messages). In a thread, mention the app and write /stop or /stop NUMBER\n"
+    "/bg TASK - in a message, start a run at the same time as the current run\n"
     "/sama steer TEXT - add a note to the current run (direct messages). In a thread, mention"
     " the app and write /steer TEXT\n"
     "/sama handoff telegram|web - move the session of the direct message to another channel\n"
@@ -153,6 +159,8 @@ HELP: Final = (
 _ACTION: Final = re.compile(r"ap:([0-9a-f]{32}):([yna])")
 _SLACK_ID: Final = re.compile(r"[A-Z0-9]{2,32}")
 _STEER: Final = re.compile(r"/steer(?:\s+(.*))?", re.S | re.I)
+_BG: Final = re.compile(r"/bg(?:\s+(.*))?", re.S | re.I)
+_STOP: Final = re.compile(r"/stop(?:\s+(\S+))?\s*", re.I)
 
 
 def escape(text: str) -> str:
@@ -542,6 +550,26 @@ class SlackGateway:
                 return
             # No run is open: the note is a normal message.
             text = note
+        parallel = False
+        background = _BG.fullmatch(text) if steer is None else None
+        if background is not None:
+            text = (background.group(1) or "").strip()
+            if not text:
+                await self._say(place, BG_EMPTY.format(command="/bg"))
+                return
+            parallel = True
+        stop = _STOP.fullmatch(text) if not refs and steer is None else None
+        if stop is not None and place.thread_ts is not None:
+            current = await self._session(place, target, grants, create=False)
+            answer = await stop_reply(
+                self._engine,
+                self._queue,
+                target.org_id,
+                None if current is None else current.session_id,
+                stop.group(1) or "",
+            )
+            await self._say(place, answer)
+            return
         if not text and not refs:
             return
         if len(text) > MAX_INPUT_CHARS:
@@ -556,6 +584,17 @@ class SlackGateway:
                 limit = await bot_limit(connection, target.org_id, target.worker_bot_id, None)
             if limit.problem is not None:
                 await self._whisper(place, BUDGET_WHISPER)
+                return
+        if (
+            not parallel
+            and coding_agent is None
+            and not refs
+            and steer is None
+            and not text.startswith("/")
+        ):
+            joined = await self._join(place, target, grants, text)
+            if joined is not None:
+                await self._say(place, joined)
                 return
         if text.startswith("/") and coding_agent is None:
             text = await self._expand(place, target, grants, text) or text
@@ -577,6 +616,7 @@ class SlackGateway:
                 user_id=target.user_id,
                 attachments=images,
                 coding_agent=None if coding_agent is None else coding_agent.value,
+                parallel=parallel,
             )
         except QueueError as error:
             self._followers.discard(holder)
@@ -586,9 +626,35 @@ class SlackGateway:
             self._followers.discard(holder)
             raise
         self._spawn(self._follow(place, target, run_id, holder))
-        if await self._queue.waits(org_id=target.org_id, run_id=run_id):
-            how = "/sama steer" if place.thread_ts is None else "a mention with /steer"
-            await self._say(place, queued_text(how, "/sama stop"))
+        threaded = place.thread_ts is not None
+        notice = await busy_text(
+            self._queue,
+            target.org_id,
+            bound.session_id,
+            run_id,
+            steer="a mention with /steer" if threaded else "/sama steer",
+            stop="a mention with /stop" if threaded else "/sama stop",
+        )
+        if notice is not None:
+            await self._say(place, notice)
+
+    async def _join(self, place: _Place, target: Target, grants: Grants, text: str) -> str | None:
+        """Busy mode ``steer`` (M7.1): adds a plain message to the running run of the
+        conversation. ``None`` when no run takes it: then the message starts or queues a run."""
+        current = await self._session(place, target, grants, create=False)
+        if current is None or not text.strip():
+            return None
+        try:
+            steered = await self._queue.steer(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                text=text,
+                user_id=target.user_id,
+                busy_mode=True,
+            )
+        except QueueError as error:
+            return str(error)
+        return None if steered is None else JOINED
 
     async def _direct(
         self, place: _Place, target: Target, grants: Grants, agent: CodingAgent | None
@@ -813,7 +879,7 @@ class SlackGateway:
                 return await self._coding_command(sender, channel, identity, name, rest)
             if name in CHECKPOINT_COMMANDS:
                 return await self._checkpoint(sender, channel, identity, name, rest)
-            return await self._stop(sender, channel, identity)
+            return await self._stop(sender, channel, identity, rest)
         except Exception:
             log.exception("a Slack command failed name=%s", name)
             return "sama cannot do this now. Try again later."
@@ -1039,15 +1105,28 @@ class SlackGateway:
 
         return await cron_reply(self._jobs, target, rest, session_of, command="/sama cron")
 
-    async def _stop(self, sender: str, channel: str, identity: Any) -> str:
-        """Stops the open runs of the direct message, or of all threads of the channel."""
+    async def _stop(self, sender: str, channel: str, identity: Any, rest: str = "") -> str:
+        """Stops the open runs of the direct message, or of all threads of the channel. In a
+        direct message, ``/sama stop NUMBER`` stops one run (M7.1)."""
         if channel.startswith("D"):
             place = _Place(channel, None, sender)
             target = Target.private(identity)
             async with self._engine.connect() as connection:
                 grants = await load_grants(connection, target.org_id, target.user_id)
             current = await self._session(place, target, grants, create=False)
-            session_ids = [] if current is None else [current.session_id]
+            return await stop_reply(
+                self._engine,
+                self._queue,
+                target.org_id,
+                None if current is None else current.session_id,
+                rest,
+                command="/sama stop",
+            )
+        if rest.strip():
+            return (
+                "A number works in a direct message. In a thread, mention the app and write"
+                " /stop NUMBER. /sama stop with no number stops the runs of all threads here."
+            )
         else:
             group = await self._group_target(channel, identity)
             if group is None:

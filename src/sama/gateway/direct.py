@@ -38,6 +38,8 @@ from sama.gate.service import ApprovalError, GateService
 from sama.gateway.handoff import moved_away
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
+    BG_EMPTY,
+    JOINED,
     STEER_EMPTY,
     STEERED,
     Bound,
@@ -45,14 +47,14 @@ from sama.gateway.sessions import (
     FollowSettings,
     KeyedLocks,
     Target,
+    busy_text,
     decide,
     find_session,
     follow_run,
     new_session,
-    queued_text,
     send_ending,
     send_media,
-    stop_runs,
+    stop_reply,
     wait_for_tasks,
 )
 from sama.gateway.transcribe import Transcriber
@@ -77,7 +79,19 @@ CODE_CHARS: Final = 6
 """The approval reply code: the first characters of the approval id (Section 11.9)."""
 
 OWN_COMMANDS: Final = frozenset(
-    {"/new", "/stop", "/steer", "/help", "/pair", "/start", "/skills", "/claude", "/codex", "/sama"}
+    {
+        "/new",
+        "/stop",
+        "/steer",
+        "/bg",
+        "/help",
+        "/pair",
+        "/start",
+        "/skills",
+        "/claude",
+        "/codex",
+        "/sama",
+    }
 )
 """Commands of the gateway. Any other command can be a skill (Section 9.5)."""
 
@@ -300,11 +314,17 @@ class DirectGateway[C: Conversation](abc.ABC):
                 chat, target, grants, coding.task, [], coding_agent=coding.agent.value
             )
             return
+        parallel = False
+        if command == "/bg":
+            if not rest:
+                await self._say(chat, BG_EMPTY.format(command="/bg"))
+                return
+            command, text, parallel = None, rest, True
         skill_command = (
             command is not None and command not in OWN_COMMANDS and self._skills is not None
         )
         if command is not None and not skill_command:
-            await self._command(chat, command, target, grants)
+            await self._command(chat, command, target, grants, rest)
             return
         images: list[NewAttachment] = []
         if media is not None:
@@ -329,9 +349,44 @@ class DirectGateway[C: Conversation](abc.ABC):
             elif skill_command:
                 await self._say(chat, self.help_text)
                 return
+        if (
+            not parallel
+            and not images
+            and not skill_command
+            and not text.startswith("/")
+            and await self._join(chat, self._framed(chat, text), target, grants)
+        ):
+            return
         await self._enqueue(
-            chat, target, grants, with_markers(self._framed(chat, text), images), images
+            chat,
+            target,
+            grants,
+            with_markers(self._framed(chat, text), images),
+            images,
+            parallel=parallel,
         )
+
+    async def _join(self, chat: C, text: str, target: Target, grants: Grants) -> bool:
+        """Busy mode ``steer`` (M7.1): adds a plain message to the running run of the session.
+        False when no run takes it: then the message starts or queues a run."""
+        current = await self._session(chat, target, grants, create=False)
+        if current is None or not text.strip():
+            return False
+        try:
+            steered = await self._queue.steer(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                text=text,
+                user_id=target.user_id,
+                busy_mode=True,
+            )
+        except QueueError as error:
+            await self._say(chat, str(error))
+            return True
+        if steered is None:
+            return False
+        await self._say(chat, JOINED)
+        return True
 
     async def _enqueue(
         self,
@@ -342,6 +397,7 @@ class DirectGateway[C: Conversation](abc.ABC):
         images: list[NewAttachment],
         *,
         coding_agent: str | None = None,
+        parallel: bool = False,
     ) -> None:
         place = object()
         self._followers.add(place)
@@ -354,6 +410,7 @@ class DirectGateway[C: Conversation](abc.ABC):
                 user_id=target.user_id,
                 attachments=images,
                 coding_agent=coding_agent,
+                parallel=parallel,
             )
         except QueueError as error:
             self._followers.discard(place)
@@ -363,8 +420,11 @@ class DirectGateway[C: Conversation](abc.ABC):
             self._followers.discard(place)
             raise
         self._spawn(self._follow(chat, target, run_id, place))
-        if await self._queue.waits(org_id=target.org_id, run_id=run_id):
-            await self._say(chat, queued_text("/steer", "/stop"))
+        notice = await busy_text(
+            self._queue, target.org_id, bound.session_id, run_id, steer="/steer", stop="/stop"
+        )
+        if notice is not None:
+            await self._say(chat, notice)
 
     async def _prompt(self, chat: C) -> None:
         await self._say(chat, self._pair_prompt())
@@ -456,7 +516,9 @@ class DirectGateway[C: Conversation](abc.ABC):
         await self._say(chat, STEERED)
         return True
 
-    async def _command(self, chat: C, command: str, target: Target, grants: Grants) -> None:
+    async def _command(
+        self, chat: C, command: str, target: Target, grants: Grants, rest: str = ""
+    ) -> None:
         if command == "/new":
             current = await self._session(chat, target, grants, create=False)
             profile = target.agent_profile_id if current is None else current.agent_profile_id
@@ -464,12 +526,14 @@ class DirectGateway[C: Conversation](abc.ABC):
             await self._say(chat, "A new session started.")
         elif command == "/stop":
             current = await self._session(chat, target, grants, create=False)
-            stopped = (
-                0
-                if current is None
-                else await stop_runs(self._engine, self._queue, target.org_id, [current.session_id])
+            answer = await stop_reply(
+                self._engine,
+                self._queue,
+                target.org_id,
+                None if current is None else current.session_id,
+                rest,
             )
-            await self._say(chat, "Stopped." if stopped else "No run is open now.")
+            await self._say(chat, answer)
         elif command == "/skills":
             await self._skill_list(chat, target, grants)
         else:

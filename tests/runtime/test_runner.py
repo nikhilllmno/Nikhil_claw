@@ -381,6 +381,27 @@ async def test_a_runner_fails_when_the_last_runner_does_not_stop(
     assert failed.retryable
 
 
+async def test_a_side_run_runs_next_to_the_runner_that_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7.1: a side run has a runtime session of its own, so it does not wait for the lock."""
+    monkeypatch.setattr(runner_module, "LOCK_WAIT_S", 0.1)
+    first = await runner_module._take_lock(str(tmp_path))
+    assert first is not None
+    request = RunRequest(scope=make_scope("run-2"), input="hi", config=make_config(), parallel=True)
+    job = RunnerJob(op="run", run=request, fake_scripts=(_reply("side"),))
+    env = {**ENV, WORKDIR_ENV: str(tmp_path)}
+    out = io.StringIO()
+    try:
+        code = await serve(_lines([job.model_dump_json()]), Output(out), env)
+    finally:
+        os.close(first)
+    assert code == 0
+    last = run_event_adapter.validate_json(out.getvalue().splitlines()[-1])
+    assert isinstance(last, RunCompleted)
+    assert last.output == "side"
+
+
 async def test_no_lock_without_a_work_folder(tmp_path: Path) -> None:
     assert await runner_module._take_lock(str(tmp_path / "missing")) is None
     assert not (tmp_path / "missing").exists()

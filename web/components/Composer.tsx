@@ -9,15 +9,29 @@ interface Props {
   value: string;
   onChange: (value: string) => void;
   onSend: () => void;
+  /** Sends the text as a run at the same time as the open runs (M7.1). */
+  onSendParallel?: () => void;
   /** A send is in flight. */
   sending: boolean;
   /** The agent works: the Stop button shows. */
   running: boolean;
   stopping: boolean;
   onStop: () => void;
+  /** The text of the Stop button, for example "Stop all" when many runs are open. */
+  stopLabel?: string;
 }
 
-export function Composer({ value, onChange, onSend, sending, running, stopping, onStop }: Props) {
+export function Composer({
+  value,
+  onChange,
+  onSend,
+  onSendParallel,
+  sending,
+  running,
+  stopping,
+  onStop,
+  stopLabel = "Stop",
+}: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
 
   // The field grows with the text, up to the CSS max-height.
@@ -61,7 +75,18 @@ export function Composer({ value, onChange, onSend, sending, running, stopping, 
       <div className={styles.actions}>
         {running ? (
           <button type="button" className="btn btn-danger" onClick={onStop} disabled={stopping}>
-            {stopping ? "Stopping…" : "Stop"}
+            {stopping ? "Stopping…" : stopLabel}
+          </button>
+        ) : null}
+        {running && onSendParallel ? (
+          <button
+            type="button"
+            className="btn"
+            disabled={!canSend}
+            onClick={onSendParallel}
+            title="Start a second run at the same time, in the same session"
+          >
+            Run in parallel
           </button>
         ) : null}
         <button type="submit" className="btn btn-primary" disabled={!canSend}>
@@ -69,8 +94,9 @@ export function Composer({ value, onChange, onSend, sending, running, stopping, 
         </button>
       </div>
       <p className={styles.hint}>
-        Enter to send, Shift+Enter for a new line. Type /compact to shorten the context, /steer TEXT to guide the
-        current run, or /handoff telegram|slack to move the session.
+        Enter to send, Shift+Enter for a new line. While the agent works, a message joins the current run at its
+        next step. Type /bg TASK or press Run in parallel to start a second run, /stop NUMBER to stop one run, /compact
+        to shorten the context, or /handoff telegram|slack to move the session.
         {nearLimit ? ` ${value.length.toLocaleString()} of ${MAX_MESSAGE_CHARS.toLocaleString()} characters.` : ""}
       </p>
     </form>

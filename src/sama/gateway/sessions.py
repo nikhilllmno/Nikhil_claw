@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Hashable
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
@@ -42,7 +42,7 @@ from sama.gate.approvers import Approvers, approvers_of
 from sama.gate.decide import always_asks
 from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
 from sama.media.generate import GeneratedMediaStore, StoredMedia
-from sama.orchestrator.queue import RunQueue
+from sama.orchestrator.queue import OpenRun, RunQueue
 from sama.review.apply import ReviewApplier
 from sama.review.shown import shown_proposal
 from sama.tenancy.access import Grants, load_grants
@@ -321,6 +321,73 @@ async def stop_runs(
     for run_id in run_ids:
         await queue.cancel(org_id=org_id, run_id=run_id)
     return len(run_ids)
+
+
+async def stop_reply(
+    engine: AsyncEngine,
+    queue: RunQueue,
+    org_id: uuid.UUID,
+    session_id: uuid.UUID | None,
+    rest: str,
+    *,
+    command: str = "/stop",
+) -> str:
+    """The answer to ``/stop`` and ``/stop NUMBER`` (M7.1). Without a number it stops all open
+    runs of the session. With a number it stops the run at that place of the open runs, oldest
+    first. A wrong number lists the open runs."""
+    rest = rest.strip()
+    if session_id is None:
+        return "No run is open now."
+    if not rest or rest.lower() == "all":
+        stopped = await stop_runs(engine, queue, org_id, [session_id])
+        if not stopped:
+            return "No run is open now."
+        return "Stopped." if stopped == 1 else f"Stopped {stopped} runs."
+    runs = await queue.open_runs(org_id=org_id, session_id=session_id)
+    if not runs:
+        return "No run is open now."
+    chosen = next((run for run in runs if rest == str(run.number)), None)
+    if chosen is None:
+        return (
+            f"Write the number of a run, for example: {command} 2. {command} with no number stops"
+            " all runs.\n" + open_runs_text(runs)
+        )
+    await queue.cancel(org_id=org_id, run_id=chosen.run_id)
+    return f"Stopped run {chosen.number}: {chosen.text}"
+
+
+def open_runs_text(runs: Sequence[OpenRun]) -> str:
+    """The open runs of a session, one line each, with the number for ``/stop NUMBER``."""
+    lines = [f"{run.number}. {RUN_STATES.get(run.status, run.status)} - {run.text}" for run in runs]
+    return "Open runs:\n" + "\n".join(lines)
+
+
+RUN_STATES: Final = {"queued": "waiting", "running": "working", "paused": "waiting for you"}
+
+
+async def busy_text(
+    queue: RunQueue,
+    org_id: uuid.UUID,
+    session_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    steer: str,
+    stop: str,
+) -> str | None:
+    """The answer to a new message while the session is busy (M3.9, M7.1): the message waits
+    (``queued_text``), or it runs at the same time as the other open runs. None when the run is
+    the only open run of the session."""
+    if await queue.waits(org_id=org_id, run_id=run_id):
+        return queued_text(steer, stop)
+    runs = await queue.open_runs(org_id=org_id, session_id=session_id)
+    mine = next((run for run in runs if run.run_id == run_id), None)
+    if mine is None or len(runs) < 2:
+        return None
+    return (
+        f"Started run {mine.number} at the same time as the other open runs. Each answer comes"
+        f" when its run ends. {stop} {mine.number} stops only this run, and {stop} stops all"
+        " runs."
+    )
 
 
 async def read_run(
@@ -807,6 +874,14 @@ def queued_text(steer: str, stop: str) -> str:
         f"Queued. sama answers after the current run. Send {steer} TEXT to add a note to the"
         f" current run, or {stop} to stop it."
     )
+
+
+JOINED: Final = (
+    "sama adds this message to the current run. The run reads it at its next step. If the run"
+    " ends first, the message starts the next run."
+)
+"""The answer to a message that joined the running run (busy mode ``steer``, M7.1)."""
+BG_EMPTY: Final = "Write the task after the command, for example: {command} summarise the logs"
 
 
 def _pin_line(number: int, pin: Pin) -> str:

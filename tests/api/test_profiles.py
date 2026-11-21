@@ -123,6 +123,8 @@ async def test_a_member_reads_the_profile(client: httpx.AsyncClient, tenant: Ten
         "subagents",
         "budget",
         "reasoning_effort",
+        "busy_mode",
+        "max_parallel_runs",
         "updated_at",
         "editable",
         "options",
@@ -143,6 +145,7 @@ async def test_a_member_reads_the_profile(client: httpx.AsyncClient, tenant: Ten
         ["core"],
     )
     assert (body["subagents"], body["editable"]) == ([], False)
+    assert (body["busy_mode"], body["max_parallel_runs"]) == ("steer", 3)
     options = body["options"]
     assert [t["name"] for t in options["toolsets"]] == sorted(TOOLSETS)
     assert options["toolsets"][0]["tools"] == sorted(TOOLSETS[options["toolsets"][0]["name"]])
@@ -160,7 +163,9 @@ async def test_a_member_reads_the_profile(client: httpx.AsyncClient, tenant: Ten
         "subagent_description_max_chars",
         "subagent_prompt_max_chars",
         "subagent_max_turns",
+        "max_parallel_runs",
     }
+    assert options["busy_modes"] == ["steer", "parallel", "queue"]
 
 
 async def test_an_admin_sees_the_profile_as_editable(
@@ -229,6 +234,22 @@ async def test_a_profile_of_a_hidden_workspace_gets_404(
 
 
 # -- update ----------------------------------------------------------------------------------
+
+
+async def test_an_admin_sets_the_busy_mode_and_the_parallel_limit(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """M7.1: the busy mode of a profile is steer, parallel, or queue."""
+    admin = await admin_headers(engine, tenant)
+    response = await client.patch(
+        agent(tenant), headers=admin, json={"busy_mode": "parallel", "max_parallel_runs": 5}
+    )
+    assert response.status_code == 200
+    assert (response.json()["busy_mode"], response.json()["max_parallel_runs"]) == ("parallel", 5)
+    for body in ({"busy_mode": "later"}, {"max_parallel_runs": 0}, {"max_parallel_runs": 11}):
+        assert (await client.patch(agent(tenant), headers=admin, json=body)).status_code == 422
+    changes = (await client.get(f"{agent(tenant)}/changes", headers=admin)).json()
+    assert changes[0]["after"] == {"busy_mode": "parallel", "max_parallel_runs": 5}
 
 
 async def test_an_admin_changes_each_field(

@@ -18,8 +18,10 @@ secret is in its environment (decision D6).
 Approval state is in the control plane, not here: each invocation is a new process. The
 orchestrator refuses a second resume of the same approval before it starts a runner.
 
-One runner at a time runs in a sandbox. A runner takes the runner lock before it builds the
-runtime, so it waits until the runner of the last run has stopped. The orchestrator does not
+One main runner at a time runs in a sandbox. A runner takes the runner lock before it builds
+the runtime, so it waits until the runner of the last run has stopped. A side run (M7.1,
+``RunRequest.parallel``) has a runtime session of its own, so it runs next to the main runner
+and takes no runner lock. The orchestrator does not
 wait for that stop before it reports the run (Section 16.2). ``sama.warm`` can start this
 module in a process that has the imports already (the warm runner).
 """
@@ -404,7 +406,10 @@ async def _serve(
         out.event(_failed(FailureCode.SANDBOX_ERROR, f"{RUN_TOKEN_ENV} is not set"))
         return 3
     try:
-        lock = await _take_lock(env.get(WORKDIR_ENV) or WORKDIR)
+        # A side run (M7.1) runs next to the runner of the session: it has a runtime session of
+        # its own, so it takes no runner lock.
+        parallel = job.request.parallel
+        lock = None if parallel else await _take_lock(env.get(WORKDIR_ENV) or WORKDIR)
     except LockBusyError:
         message = "the runner of the last run of this session did not stop"
         out.event(RunFailed(code=FailureCode.SANDBOX_ERROR, message=message, retryable=True))

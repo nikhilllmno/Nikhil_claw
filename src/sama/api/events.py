@@ -24,7 +24,12 @@ class StreamEvent:
 
 class Sent(BaseModel):
     run_id: uuid.UUID
+    """The run that answers the message. For a message that joined an open run (``steered``),
+    that open run."""
     queued: bool
+    steered: bool = False
+    """True when the message joined the open run at its next step (busy mode ``steer``, M7.1).
+    The note waits in ``GET /sessions/{id}/steers``."""
 
 
 class SendError(Exception):

@@ -54,7 +54,9 @@ UNSUPPORTED_MEDIA: Final = "sama reads only images and voice notes here. Send te
 HELP: Final = (
     "Send a message to talk to sama.\n"
     "/new - start a new session\n"
-    "/stop - stop the current run\n"
+    "A message while sama works joins the current run at its next step.\n"
+    "/bg <task> - start a run at the same time as the current run\n"
+    "/stop - stop all runs. /stop <number> stops one run\n"
     "/steer <text> - add a note to the current run\n"
     "/skills - list the skills. /<skill> <request> uses a skill\n"
     "/claude <task> or /codex <task> - send a coding task to Claude Code or Codex. /claude or\n"

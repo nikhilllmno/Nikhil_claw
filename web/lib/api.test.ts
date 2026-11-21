@@ -300,6 +300,34 @@ describe("busy controls", () => {
       ["https://api.test/sessions/s1/messages", "POST", '{"text":"hi"}'],
     ]);
   });
+
+  it("starts a parallel run and lists the notes that joined a run", async () => {
+    const note = {
+      id: "n1",
+      run_id: "r1",
+      text: "also add tests",
+      status: "pending",
+      created_at: "2026-11-21T09:30:00Z",
+      delivered_at: null,
+      requeued_run_id: null,
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(202, { run_id: "r3", queued: false, steered: false }))
+      .mockResolvedValueOnce(json(200, [note]));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.sendMessage("s1", "check logs", true)).resolves.toEqual({
+      run_id: "r3",
+      queued: false,
+      steered: false,
+    });
+    await expect(client.listSteers("s1")).resolves.toEqual([note]);
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method ?? "GET", init.body])).toEqual([
+      ["https://api.test/sessions/s1/messages", "POST", '{"text":"check logs","parallel":true}'],
+      ["https://api.test/sessions/s1/steers", "GET", undefined],
+    ]);
+  });
 });
 
 describe("checkpoints", () => {

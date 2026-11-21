@@ -53,7 +53,9 @@ from sama.gateway.handoff import (
 from sama.gateway.pairing import Lockout, normalize, redeem
 from sama.gateway.sessions import (
     ALWAYS_LABEL,
+    BG_EMPTY,
     COMPACTING,
+    JOINED,
     STEER_EMPTY,
     STEERED,
     Bound,
@@ -62,16 +64,16 @@ from sama.gateway.sessions import (
     Reply,
     Target,
     approval_text,
+    busy_text,
     decide,
     find_session,
     follow_run,
     new_session,
     offers_always,
     pin_reply,
-    queued_text,
     send_ending,
     send_media,
-    stop_runs,
+    stop_reply,
     wait_for_tasks,
 )
 from sama.gateway.telegram_client import TelegramClient, TelegramError
@@ -113,7 +115,9 @@ PAIR_PROMPT: Final = (
 HELP: Final = (
     "Send a message to talk to sama.\n"
     "/new - start a new session\n"
-    "/stop - stop the current run\n"
+    "A message while sama works joins the current run at its next step.\n"
+    "/bg <task> - start a run at the same time as the current run\n"
+    "/stop - stop all runs. /stop <number> stops one run\n"
     "/steer <text> - add a note to the current run\n"
     "/handoff <telegram|slack|web> - move this session to another channel\n"
     "/model - show the agent profiles. /model <name> starts a new session with that profile\n"
@@ -146,6 +150,7 @@ OWN_COMMANDS: Final = frozenset(
         "/connect",
         "/cron",
         "/steer",
+        "/bg",
         "/handoff",
         "/undo",
         "/rollback",
@@ -475,6 +480,12 @@ class TelegramGateway:
             agent = CODING_COMMANDS.get(command)
             await self._direct(chat_id, message_id, agent, target, grants)
             return
+        parallel = False
+        if command == "/bg":
+            if not rest:
+                await self._say(chat_id, BG_EMPTY.format(command="/bg"), reply_to=message_id)
+                return
+            command, text, parallel = None, rest, True
         skill_command = (
             command is not None and command not in OWN_COMMANDS and self._skills is not None
         )
@@ -503,6 +514,14 @@ class TelegramGateway:
             elif skill_command:
                 await self._say(chat_id, HELP, reply_to=message_id)
                 return
+        if (
+            not parallel
+            and coding is None
+            and not refs
+            and not skill_command
+            and await self._join(chat_id, message_id, text, target, grants)
+        ):
+            return
         images = await self._download_images(chat_id, message_id, refs)
         if images is None:
             return
@@ -521,6 +540,7 @@ class TelegramGateway:
                 user_id=target.user_id,
                 attachments=images,
                 coding_agent=None if coding is None else coding.value,
+                parallel=parallel,
             )
         except QueueError as error:
             self._followers.discard(place)
@@ -530,8 +550,37 @@ class TelegramGateway:
             self._followers.discard(place)
             raise
         self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
-        if await self._queue.waits(org_id=target.org_id, run_id=run_id):
-            await self._say(chat_id, queued_text("/steer", "/stop"), reply_to=message_id)
+        notice = await busy_text(
+            self._queue, target.org_id, bound.session_id, run_id, steer="/steer", stop="/stop"
+        )
+        if notice is not None:
+            await self._say(chat_id, notice, reply_to=message_id)
+
+    async def _join(
+        self, chat_id: int, message_id: int, text: str, target: Target, grants: Grants
+    ) -> bool:
+        """Busy mode ``steer`` (M7.1): adds a plain message to the running run of the chat
+        session. False when no run takes it: then the message starts or queues a run."""
+        if not text.strip() or text.startswith("/"):
+            return False
+        current = await self._session(chat_id, target, grants, create=False)
+        if current is None:
+            return False
+        try:
+            steered = await self._queue.steer(
+                org_id=target.org_id,
+                session_id=current.session_id,
+                text=text,
+                user_id=target.user_id,
+                busy_mode=True,
+            )
+        except QueueError as error:
+            await self._say(chat_id, str(error), reply_to=message_id)
+            return True
+        if steered is None:
+            return False
+        await self._say(chat_id, JOINED, reply_to=message_id)
+        return True
 
     async def _direct(
         self,
@@ -845,10 +894,14 @@ class TelegramGateway:
             await self._say(chat_id, "A new session started.", reply_to=message_id)
         elif command == "/stop":
             current = await self._session(chat_id, target, grants, create=False)
-            stopped = 0 if current is None else await self._stop(target.org_id, current.session_id)
-            await self._say(
-                chat_id, "Stopped." if stopped else "No run is open now.", reply_to=message_id
+            answer = await stop_reply(
+                self._engine,
+                self._queue,
+                target.org_id,
+                None if current is None else current.session_id,
+                rest,
             )
+            await self._say(chat_id, answer, reply_to=message_id)
         elif command == "/handoff":
             answer = await self._handoff(chat_id, rest, target, grants)
             await self._say(chat_id, answer, reply_to=message_id)
@@ -918,9 +971,6 @@ class TelegramGateway:
             raise
         await self._say(chat_id, COMPACTING, reply_to=message_id)
         self._spawn(self._follow_run(chat_id, target, run_id, message_id, place))
-
-    async def _stop(self, org_id: uuid.UUID, session_id: uuid.UUID) -> int:
-        return await stop_runs(self._engine, self._queue, org_id, [session_id])
 
     async def _model(
         self, chat_id: int, message_id: int, name: str, target: Target, grants: Grants

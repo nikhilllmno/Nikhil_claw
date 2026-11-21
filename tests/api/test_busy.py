@@ -124,6 +124,67 @@ async def test_steer_adds_a_note_to_the_running_run(
     assert tuple(note) == (run.run_id, tenant.ids["mia"], "use metric units")
 
 
+async def test_a_message_joins_the_running_run_by_default(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """M7.1: in the busy mode ``steer`` (the default), a message joins the running run."""
+    session = tenant.ids["s1"]
+    url = f"/sessions/{session}/messages"
+    await client.post(url, headers=mia(tenant), json={"text": "write the report"})
+    run = await RunQueue(engine).claim("test-owner")
+    assert run is not None
+    joined = await client.post(url, headers=mia(tenant), json={"text": "add a chart too"})
+    assert joined.status_code == 202
+    assert joined.json() == {"run_id": str(run.run_id), "queued": False, "steered": True}
+    notes = await client.get(f"/sessions/{session}/steers", headers=mia(tenant))
+    assert notes.status_code == 200
+    [note] = notes.json()
+    assert (note["run_id"], note["text"], note["status"]) == (
+        str(run.run_id),
+        "add a chart too",
+        "pending",
+    )
+    await RunQueue(engine).take_steers(org_id=tenant.org, run_id=run.run_id)
+    [note] = (await client.get(f"/sessions/{session}/steers", headers=mia(tenant))).json()
+    assert note["status"] == "delivered"
+    assert note["delivered_at"] is not None
+
+
+async def test_a_parallel_message_starts_a_second_run(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    session = tenant.ids["s1"]
+    url = f"/sessions/{session}/messages"
+    await client.post(url, headers=mia(tenant), json={"text": "slow task"})
+    queue = RunQueue(engine)
+    first = await queue.claim("test-owner")
+    assert first is not None
+    sent = await client.post(
+        url, headers=mia(tenant), json={"text": "quick question", "parallel": True}
+    )
+    assert sent.status_code == 202
+    body = sent.json()
+    assert (body["queued"], body["steered"]) == (False, False)
+    second = await queue.claim("test-owner")
+    assert second is not None
+    assert str(second.run_id) == body["run_id"]
+    assert second.side
+    runs = (await client.get(f"/sessions/{session}/open-runs", headers=mia(tenant))).json()
+    assert [(r["number"], r["text"], r["side"]) for r in runs] == [
+        (1, "slow task", False),
+        (2, "quick question", True),
+    ]
+
+
+async def test_the_steers_and_open_runs_need_access(
+    client: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    other = bearer(uuid.uuid4())
+    for path in ("steers", "open-runs"):
+        response = await client.get(f"/sessions/{tenant.ids['s1']}/{path}", headers=other)
+        assert response.status_code in (401, 403, 404)
+
+
 async def test_steer_without_an_open_run_sends_a_message(
     client: httpx.AsyncClient, tenant: Tenant
 ) -> None:
