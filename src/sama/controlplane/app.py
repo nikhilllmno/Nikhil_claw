@@ -619,6 +619,7 @@ def build(
             triggers=triggers,
             integrations=integrations if integrations.enabled else None,
             billing=billing,
+            memories=mem0,
         ),
     )
     api = SamaApi(

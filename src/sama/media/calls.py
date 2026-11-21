@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -133,7 +133,6 @@ class Call:
     model: str
     endpoint: Endpoint
     url: str
-    headers: Mapping[str, str] = field(repr=False)
     body: Mapping[str, Any] = field(repr=False)
     estimate: TokenCounts
     label: str
@@ -156,7 +155,6 @@ async def metered_post(
     key: ProviderKey,
     *,
     timeout_s: float,
-    counts: Callable[[Mapping[str, Any]], TokenCounts | None] | None = None,
 ) -> dict[str, Any]:
     """Sends ``call`` and settles its record. Returns the JSON body of a ``200`` answer.
     Raises ``MediaError`` with a safe text for every failure. Run it with
@@ -182,7 +180,7 @@ async def metered_post(
     try:
         response = await http.post(
             call.url,
-            headers={**call.headers, **auth_headers(call.provider, key)},
+            headers=auth_headers(call.provider, key),
             json=dict(call.body),
             timeout=timeout_s,
         )
@@ -198,7 +196,7 @@ async def metered_post(
         raise MediaError(f"{call.label} cannot be reached now. Try again later.") from None
     if response.status_code == 200:
         data = json_of(response)
-        found = (counts or (lambda body: usage_of(call.provider, body)))(data)
+        found = usage_of(call.provider, data)
         await settle(found or call.estimate, estimated=found is None, status=200)
         return data
     # A refused call costs nothing, but it gets its row like in the model proxy.
@@ -247,3 +245,12 @@ def openai_text(data: Mapping[str, Any]) -> str:
     message = first.get("message") if isinstance(first, Mapping) else None
     content = message.get("content") if isinstance(message, Mapping) else None
     return content.strip() if isinstance(content, str) else ""
+
+
+def text_of(provider: Provider, data: Mapping[str, Any]) -> str:
+    """The answer text of a chat call of ``provider``."""
+    if provider is Provider.ANTHROPIC:
+        return anthropic_text(data)
+    if provider is Provider.GEMINI:
+        return gemini_text(data)
+    return openai_text(data)

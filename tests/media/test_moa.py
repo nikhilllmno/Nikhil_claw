@@ -284,3 +284,36 @@ def _keys() -> dict[Provider, Any]:
     from sama.vault.store import KeySource
 
     return {provider: ProviderKey("k", KeySource.SAMA) for provider in Provider}
+
+
+async def test_the_aggregator_call_is_checked_again() -> None:
+    """A fence or a lost authority while the references run stops the aggregator call."""
+    rig = build()
+    run_id = rig.claims().run_id
+    sent: list[str] = []
+    original = rig.api.__call__
+
+    async def revoke_after_references(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.host)
+        if len(sent) == 3:
+            rig.usage.authorities[run_id] = Authority(problem="the run was cancelled")
+        return await original(request)
+
+    rig.service._http = httpx.AsyncClient(transport=httpx.MockTransport(revoke_after_references))
+    with pytest.raises(MediaError, match="not allowed now"):
+        await rig.service.ask(rig.claims(), "q?")
+    assert len(sent) == 3  # no aggregator call
+    assert len(rig.usage.calls) == 3
+
+
+async def test_a_long_answer_is_cut_to_the_planned_size() -> None:
+    from sama.moa import MAX_REFERENCE_BYTES
+
+    rig = build()
+    rig.api.texts["openai.test"] = "é" * MAX_REFERENCE_BYTES
+    await rig.service.ask(rig.claims(), "q?")
+    aggregate = [b for b in rig.api.bodies("anthropic.test") if b["model"] == "claude-opus-5-5"]
+    prompt = aggregate[0]["messages"][0]["content"]
+    answer = prompt.split('<answer index="2">\n')[1].split("\n</answer>")[0]
+    assert len(answer.encode()) <= MAX_REFERENCE_BYTES
+    assert answer == "é" * (MAX_REFERENCE_BYTES // 2)

@@ -1698,7 +1698,12 @@ settings) or approves a `change_propose` of the target `profile`.
   is off. The facts are untrusted content.
 - **Delete.** A user delete and an org delete write a `data_purges` row of the kind `mem0`
   with the user ids (migration `0039`). The purge worker deletes the memories of each user at
-  Mem0. Without a key, there is nothing that sama can delete, and the row is done.
+  Mem0. Without a key, there is nothing that sama can delete, and the row is done. An org with
+  its own Mem0 key loses the key with the org (the vault rows cascade), so the cleanup before
+  an org delete deletes the memories of all its users first. When Mem0 fails, the org delete
+  stops with `409` and deletes nothing.
+- **Redaction.** The query of `memory_recall` goes through the redactor before it leaves. Each
+  fact is redacted whole and then cut to 500 characters, so a cut cannot keep part of a secret.
 - **Not in the prompt.** Recall is a tool, not a part of the frozen prefix, so D9 holds and the
   prompt cache stays valid.
 
@@ -2494,6 +2499,13 @@ process (`SAMA_MOA_MAX_COST_USD`, default USD 0.50, at most USD 5), and the mone
 can still spend. When it does not fit, sama drops the most expensive reference model, but it
 keeps two. When two do not fit, the call fails before it spends money. A secret in one answer
 does not reach the next provider: the redactor reads each answer before the aggregator gets it.
+Each answer is then cut to 3,000 bytes, so the aggregator prompt fits the estimate of the plan
+(the system text, the question, and at most 1,500 tokens and a tag for each answer). Before the
+aggregator call, sama does the budget checks again: a record that did not write, a lost
+authority, or a spent budget stops the call.
+
+**Redaction of `x_search`.** The query goes through the redactor before it goes in the URL.
+Each post is redacted whole and then cut to 600 characters.
 
 **Gate.** `x_search`, `video_analyze`, and `moa` are in the default allow list, like
 `web_search` and `vision_analyze`: they read, and the budget limits their cost. The toolset

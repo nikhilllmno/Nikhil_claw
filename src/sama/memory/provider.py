@@ -33,11 +33,10 @@ from sama.db.models import AgentProfile, Message, Run, Session
 from sama.gate.decide import DELEGATION_LINEAGE
 from sama.vault.crypto import VaultError
 from sama.vault.redact import Redactor, default_redactor
-from sama.vault.store import OrgKeys, SecretName
+from sama.vault.store import KeySource, OrgKeys, SecretName
 
 log = logging.getLogger("sama.memory.provider")
 
-BUILTIN: Final = "builtin"
 MEM0: Final = "mem0"
 MEM0_URL: Final = "https://api.mem0.ai"
 TIMEOUT_S: Final = 20.0
@@ -106,10 +105,21 @@ class Mem0Provider:
         *,
         base_url: str = MEM0_URL,
         http: httpx.AsyncClient | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self._keys = keys
         self._base_url = base_url.rstrip("/")
         self._http = http or httpx.AsyncClient(timeout=TIMEOUT_S, trust_env=False)
+        self._redactor = redactor or default_redactor()
+
+    async def own_key(self, org_id: str) -> bool:
+        """True if the org has its own Mem0 key in the vault. An org delete removes that key,
+        so the memories must go before the delete (``ServiceCleanup``)."""
+        try:
+            found = await self._keys.lookup(org_id, SecretName.MEM0_API_KEY)
+        except VaultError:
+            return True  # an own key that does not decrypt: refuse to guess
+        return found.value is not None and found.source is KeySource.ORG
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -154,7 +164,8 @@ class Mem0Provider:
 
     async def recall(self, org_id: str, user_id: str, query: str, limit: int) -> list[RecallHit]:
         body = {
-            "query": query,
+            # The query leaves the control plane: redact it first.
+            "query": self._redactor.text(query),
             "filters": {"user_id": mem0_user(org_id, user_id)},
             "top_k": limit,
         }
@@ -171,7 +182,8 @@ class Mem0Provider:
             if isinstance(item, dict) and isinstance(item.get("memory"), str):
                 hits.append(
                     RecallHit(
-                        text=item["memory"][:MAX_HIT_CHARS],
+                        # Redact the whole text first, so a cut cannot leave part of a secret.
+                        text=self._redactor.text(item["memory"])[:MAX_HIT_CHARS],
                         created_at=str(item.get("created_at") or "")[:10],
                     )
                 )

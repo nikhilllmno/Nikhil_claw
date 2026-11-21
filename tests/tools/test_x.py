@@ -141,3 +141,30 @@ async def test_bad_arguments_are_refused(query: str, limit: int) -> None:
 def test_no_posts() -> None:
     assert parse_posts({}) == []
     assert format_posts("q", []).startswith("No posts on X")
+
+
+async def test_the_query_and_the_posts_are_redacted_before_the_cut() -> None:
+    """A secret never leaves in the query URL, and a cut post keeps no part of a secret."""
+    from sama.tools.x import MAX_POST_CHARS
+    from sama.vault.redact import Redactor
+
+    secret = "-".join(("xs", "secret", "value", "0123456789abcdef"))
+    redactor = Redactor()
+    redactor.add(secret)
+    seen: list[httpx.Request] = []
+    text = "a" * (MAX_POST_CHARS - 10) + secret  # the secret crosses the cut
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [{"id": "1", "text": text}]})
+
+    search = XSearch(
+        OrgKeys(None, {SecretName.X_BEARER_TOKEN: SecretStr(TOKEN)}),
+        base_url="https://x.test",
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        redactor=redactor,
+    )
+    result = await search.search(claims(), f"find {secret}")
+    assert secret not in str(seen[0].url)
+    [post] = result.posts
+    assert secret[:10] not in post.text

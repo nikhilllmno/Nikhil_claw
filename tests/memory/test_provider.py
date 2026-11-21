@@ -235,3 +235,30 @@ async def test_the_session_of_a_run_keeps_its_owner(engine: AsyncEngine, tenant:
         ).one()
     assert row.audience == "private"
     assert row.owner_user_id == tenant.ids["mia"]
+
+
+async def test_recall_redacts_the_query_and_each_fact_before_the_cut() -> None:
+    from sama.memory.provider import MAX_HIT_CHARS
+
+    secret = "-".join(("m0", "secret", "value", "0123456789abcdef"))
+    redactor = Redactor()
+    redactor.add(secret)
+    api = Mem0(hits=[{"memory": "b" * (MAX_HIT_CHARS - 10) + secret}])
+    mem0 = Mem0Provider(
+        OrgKeys(None, {SecretName.MEM0_API_KEY: SecretStr(KEY)}),
+        base_url="https://mem0.test",
+        http=httpx.AsyncClient(transport=httpx.MockTransport(api)),
+        redactor=redactor,
+    )
+    [hit] = await mem0.recall("org-1", "user-1", f"is {secret} kept?", 5)
+    assert secret not in api.requests[0].content.decode()
+    assert secret[:10] not in hit.text
+
+
+async def test_own_key_is_true_only_for_a_key_of_the_org() -> None:
+    from tests.media.support import OwnKeys
+
+    sama_key = provider(Mem0())
+    assert not await sama_key.own_key("org-1")
+    own = Mem0Provider(OwnKeys(SecretName.MEM0_API_KEY, "own-key"), base_url="https://mem0.test")
+    assert await own.own_key("org-1")

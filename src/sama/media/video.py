@@ -191,7 +191,6 @@ class VideoService:
             model=self._model,
             endpoint=Endpoint.GENERATE_CONTENT,
             url=f"{self._base_url}/v1beta/models/{self._model}:generateContent",
-            headers={},
             body=body,
             estimate=estimate,
             label=LABEL,

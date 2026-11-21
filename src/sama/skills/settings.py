@@ -24,7 +24,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final, Literal, cast
 
 from sqlalchemy import func, insert, select
@@ -57,15 +57,6 @@ class SettingSpec:
     description: str = ""
     default: Value | None = None
     required: bool = False
-
-    def as_json(self) -> dict[str, Any]:
-        return {
-            "key": self.key,
-            "type": self.type,
-            "description": self.description,
-            "default": self.default,
-            "required": self.required,
-        }
 
 
 def _type_of(value: Any) -> SettingType | None:
@@ -151,13 +142,7 @@ def parse_config(raw: Any) -> tuple[SettingSpec, ...]:
             required=required,
         )
         if default is not None:
-            spec = SettingSpec(
-                key=spec.key,
-                type=spec.type,
-                description=spec.description,
-                default=check_value(spec, default, where=where),
-                required=spec.required,
-            )
+            spec = replace(spec, default=check_value(spec, default, where=where))
         specs.append(spec)
     return tuple(specs)
 

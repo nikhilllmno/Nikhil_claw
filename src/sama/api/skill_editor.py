@@ -10,6 +10,7 @@ use ``PostgresSkillStore.edit``, which writes as the table owner after ``authori
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Final, Literal
 
@@ -171,6 +172,11 @@ def _not_found(what: str = "the skill does not exist") -> HTTPException:
     return HTTPException(status_code=404, detail=what)
 
 
+def _can_edit_settings(grants: Grants, workspace_id: uuid.UUID) -> bool:
+    """A workspace admin or the org owner changes the skill settings (Section 9.8)."""
+    return grants.admins_workspace(workspace_id) or grants.org_owner
+
+
 def _status(doc: SkillDoc) -> str:
     return "stale" if doc.stale else "active"
 
@@ -202,10 +208,10 @@ class SkillEditor:
         return SkillSettingsOut(
             name=found.name,
             scope=found.scope,
-            specs=[spec.as_json() for spec in specs],
+            specs=[asdict(spec) for spec in specs],
             values=stored,
             effective=effective(specs, stored),
-            can_edit=grants.admins_workspace(workspace_id) or grants.org_owner,
+            can_edit=_can_edit_settings(grants, workspace_id),
             problem=problem,
         )
 
@@ -213,14 +219,13 @@ class SkillEditor:
         self, principal: Principal, workspace_id: uuid.UUID, name: str, body: SkillSettingsWrite
     ) -> SkillSettingsOut:
         """Replaces the values. Needs a workspace admin or the org owner."""
-        current = await self.settings(principal, workspace_id, name)
-        if not current.can_edit:
+        found = await self.detail(principal, workspace_id, name, None)
+        actor, grants = await self._actor(principal, workspace_id)
+        if not _can_edit_settings(grants, workspace_id):
             raise HTTPException(
                 status_code=403,
                 detail="only a workspace admin or the org owner can change skill settings",
             )
-        found = await self.detail(principal, workspace_id, name, None)
-        actor, grants = await self._actor(principal, workspace_id)
         try:
             values = check_values(skill_specs(found.skill_md), body.values)
         except SkillError as error:

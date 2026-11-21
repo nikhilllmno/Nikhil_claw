@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final
 
@@ -27,21 +27,20 @@ import httpx
 from sama.media.calls import (
     ANTHROPIC_URL,
     GEMINI_URL,
+    KEY_NAMES,
     OPENAI_URL,
     Call,
     ProviderKey,
-    anthropic_text,
-    gemini_text,
     metered_post,
-    openai_text,
     provider_key,
+    text_of,
 )
 from sama.media.meter import MediaError, MediaMeter
 from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
 from sama.modelproxy.usage import Endpoint
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import Redactor, default_redactor
-from sama.vault.store import OrgKeys, SecretName
+from sama.vault.store import OrgKeys
 
 log = logging.getLogger("sama.moa")
 
@@ -51,17 +50,18 @@ MAX_COST_CAP_USD: Final = Decimal(5)
 """The highest cap that ``SAMA_MOA_MAX_COST_USD`` can set."""
 MAX_QUESTION_CHARS: Final = 8_000
 MIN_REFERENCES: Final = 2
-MOA_KEYS: Final = (
-    SecretName.ANTHROPIC_API_KEY,
-    SecretName.OPENAI_API_KEY,
-    SecretName.GEMINI_API_KEY,
-)
+MOA_KEYS: Final = tuple(KEY_NAMES.values())
 """``moa`` needs keys of at least ``MIN_REFERENCES`` of these providers."""
 REFERENCE_MAX_TOKENS: Final = 1_500
 AGGREGATE_MAX_TOKENS: Final = 2_500
 MAX_ANSWER_CHARS: Final = 12_000
 TIMEOUT_S: Final = 120.0
 PROMPT_OVERHEAD_TOKENS: Final = 300
+ANSWER_WRAPPER_TOKENS: Final = 20
+"""The ``<answer index="n">`` tags around each answer in the aggregator prompt."""
+MAX_REFERENCE_BYTES: Final = 2 * REFERENCE_MAX_TOKENS
+"""A reference answer is cut to this many UTF-8 bytes before the aggregator gets it, so its
+estimate (one token for each 2 bytes) is at most ``REFERENCE_MAX_TOKENS``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,11 +122,10 @@ class _Plan:
     worst_usd: Decimal
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class _Reply:
     model: MoaModel
     text: str = ""
-    error: str = field(default="")
 
 
 def input_tokens(text: str) -> int:
@@ -204,6 +203,9 @@ class MixtureService:
         failed = tuple(reply.model.name for reply in replies if not reply.text)
         if not good:
             raise MediaError(f"{LABEL}: no model answered. Try again later.")
+        # Check again before the next paid call: a record that did not write fences the org, and
+        # the authority or the budget can change while the references run.
+        await self._meter.check(claims, LABEL)
         model, key = plan.aggregator
         text = await self._aggregate(claims, model, key, safe, good)
         return MoaAnswer(
@@ -234,13 +236,16 @@ class MixtureService:
         until the plan fits, but keeps ``MIN_REFERENCES``. Raises ``MediaError`` when it does
         not fit."""
         prices = self._meter.prices
-        asked = input_tokens(question)
+        asked = input_tokens(REFERENCE_SYSTEM + question)
         chosen = list(references)
         while True:
             worst = sum(
                 (_worst(prices, m, asked, REFERENCE_MAX_TOKENS) for m in chosen), Decimal(0)
             )
-            aggregate_in = asked + len(chosen) * REFERENCE_MAX_TOKENS
+            # Each answer is cut to ``MAX_REFERENCE_BYTES``, so this bounds the estimate of the
+            # aggregator prompt that ``_call`` makes.
+            aggregate_in = input_tokens(AGGREGATE_SYSTEM + "<question>\n\n</question>" + question)
+            aggregate_in += len(chosen) * (REFERENCE_MAX_TOKENS + ANSWER_WRAPPER_TOKENS)
             worst += _worst(prices, aggregator, aggregate_in, AGGREGATE_MAX_TOKENS)
             if worst <= cap:
                 return _Plan(
@@ -262,10 +267,11 @@ class MixtureService:
             text = await self._chat(
                 claims, model, key, REFERENCE_SYSTEM, question, REFERENCE_MAX_TOKENS
             )
-        except MediaError as error:
-            return _Reply(model, error=str(error))
-        # A secret in one answer must not reach the next provider.
-        return _Reply(model, text=self._redactor.text(text))
+        except MediaError:
+            return _Reply(model)
+        # A secret in one answer must not reach the next provider. Redact the whole answer,
+        # then cut it to the size that the plan counted.
+        return _Reply(model, text=_cut_bytes(self._redactor.text(text), MAX_REFERENCE_BYTES))
 
     async def _aggregate(
         self,
@@ -298,7 +304,7 @@ class MixtureService:
         data = await self._meter.shielded(
             metered_post(self._meter, self._http, claims, call, key, timeout_s=TIMEOUT_S)
         )
-        return _text(model.provider, data)
+        return text_of(model.provider, data)
 
     def _call(self, model: MoaModel, system: str, prompt: str, max_tokens: int) -> Call:
         estimate = TokenCounts(input=input_tokens(system + prompt), output=max_tokens)
@@ -339,25 +345,21 @@ class MixtureService:
             model=model.model,
             endpoint=endpoint,
             url=url,
-            headers={},
             body=body,
             estimate=estimate,
             label=f"{LABEL} ({model.name})",
         )
 
 
+def _cut_bytes(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` UTF-8 bytes, on a character boundary."""
+    return text.encode()[:limit].decode(errors="ignore")
+
+
 def _worst(prices: PriceTable, model: MoaModel, input_count: int, output_count: int) -> Decimal:
     return prices.cost(
         model.provider, model.model, TokenCounts(input=input_count, output=output_count)
     )
-
-
-def _text(provider: Provider, data: Mapping[str, Any]) -> str:
-    if provider is Provider.ANTHROPIC:
-        return anthropic_text(data)
-    if provider is Provider.GEMINI:
-        return gemini_text(data)
-    return openai_text(data)
 
 
 def render(answer: MoaAnswer) -> tuple[str, str]:

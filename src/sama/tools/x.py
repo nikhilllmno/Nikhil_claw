@@ -20,6 +20,7 @@ import httpx
 
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.crypto import VaultError
+from sama.vault.redact import Redactor, default_redactor
 from sama.vault.store import OrgKeys, SecretName
 
 log = logging.getLogger("sama.tools.x")
@@ -70,8 +71,10 @@ class XSearch:
         *,
         base_url: str = X_API_URL,
         http: httpx.AsyncClient | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self._keys = keys
+        self._redactor = redactor or default_redactor()
         self._base_url = base_url.rstrip("/")
         self._http = http or httpx.AsyncClient(timeout=TIMEOUT_S, trust_env=False)
 
@@ -105,7 +108,8 @@ class XSearch:
         if token is None:
             return XResult(available=False, text=NO_KEY)
         params = {
-            "query": query,
+            # The query leaves the control plane in the URL: redact it first.
+            "query": self._redactor.text(query),
             "max_results": str(max(API_MIN_RESULTS, limit)),
             "sort_order": sort,
             "tweet.fields": "created_at,author_id,public_metrics",
@@ -130,7 +134,7 @@ class XSearch:
             data = response.json()
         except ValueError:
             raise XSearchError("X search gave an answer that sama cannot read.") from None
-        posts = parse_posts(data if isinstance(data, dict) else {})
+        posts = parse_posts(data if isinstance(data, dict) else {}, self._redactor)
         return XResult(available=True, posts=tuple(posts[:limit]))
 
 
@@ -139,7 +143,9 @@ def _int(data: Mapping[str, Any] | None, key: str) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
 
 
-def parse_posts(data: Mapping[str, Any]) -> list[Post]:
+def parse_posts(data: Mapping[str, Any], redactor: Redactor | None = None) -> list[Post]:
+    """The posts of an answer. Each text is redacted whole, then cut."""
+    redactor = redactor or default_redactor()
     includes = data.get("includes")
     users = includes.get("users") if isinstance(includes, Mapping) else None
     names = {
@@ -156,7 +162,7 @@ def parse_posts(data: Mapping[str, Any]) -> list[Post]:
         posts.append(
             Post(
                 id=item["id"],
-                text=str(item.get("text", ""))[:MAX_POST_CHARS],
+                text=redactor.text(str(item.get("text", "")))[:MAX_POST_CHARS],
                 author=names.get(str(item.get("author_id")), ""),
                 created_at=str(item.get("created_at", "")),
                 likes=_int(metrics, "like_count"),
