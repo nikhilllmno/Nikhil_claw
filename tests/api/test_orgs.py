@@ -18,6 +18,7 @@ from sama.db.models import AgentProfile, AuditEntry, Membership, Org, OrgInvite,
 from sama.orgs import OrgService, SignupPolicy
 from sama.orgs import service as org_service
 from sama.orgs.plans import FREE, Plan
+from sama.tenancy.regions import Regions, set_home_regions
 from tests.api.conftest import ISSUER, SECRET, bearer
 
 
@@ -607,3 +608,28 @@ async def test_two_owners_cannot_both_step_down_at_once(
     assert sorted(a.status_code for a in answers) == [200, 409]
     roles = [m["role"] for m in (await members(web, ana, org_id)).values()]
     assert roles.count("owner") == 1
+
+
+# -- regions (Section 17.3) --------------------------------------------------------------------
+
+
+async def test_a_new_org_is_in_the_home_region_and_another_region_answers_421(
+    web: httpx.AsyncClient, engine: AsyncEngine, world: World
+) -> None:
+    set_home_regions(Regions.of("eu-central-1", None, {"ap-south-1": "https://in.sama.test"}))
+    ana = world.person("ana@example.test")
+    org = await new_org(web, ana)
+    [seen] = await me(web, ana)
+    assert (seen["region"], seen["region_here"]) == ("eu-central-1", True)
+    assert (await web.get(f"/orgs/{org['id']}/members", headers=bearer(ana))).status_code == 200
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Org).where(Org.id == uuid.UUID(org["id"])).values(region="ap-south-1")
+        )
+    for response in (
+        await web.get(f"/orgs/{org['id']}/members", headers=bearer(ana)),
+        await invite(web, ana, org["id"], "bo@example.test"),
+    ):
+        assert response.status_code == 421, response.text
+        assert response.json()["url"] == "https://in.sama.test"

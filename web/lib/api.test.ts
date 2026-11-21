@@ -534,3 +534,24 @@ describe("ApiClient M3.12 calls", () => {
     await expect(pending).rejects.toBeInstanceOf(ApiError);
   });
 });
+
+describe("model key calls", () => {
+  it("lists, sets, and removes the keys of an org", async () => {
+    const status = { provider: "openai", org_key: true, updated_at: "2026-11-21T00:00:00Z", default_key: false };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, [status]))
+      .mockResolvedValueOnce(json(200, status))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.modelKeys("o 1")).resolves.toEqual([status]);
+    await expect(client.setModelKey("o 1", "openai", "sk-key")).resolves.toEqual(status);
+    await expect(client.removeModelKey("o 1", "anthropic")).resolves.toBeNull();
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method, init.body])).toEqual([
+      ["https://api.test/orgs/o%201/model-keys", "GET", undefined],
+      ["https://api.test/orgs/o%201/model-keys/openai", "PUT", '{"api_key":"sk-key"}'],
+      ["https://api.test/orgs/o%201/model-keys/anthropic", "DELETE", undefined],
+    ]);
+  });
+});

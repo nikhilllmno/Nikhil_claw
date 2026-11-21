@@ -33,6 +33,9 @@ Optional environment:
   ``vision_analyze``, default ``claude-sonnet-5-5``).
 - ``SAMA_CONNECTOR_HOST_TEMPLATE``: the E2B template of the connector hosts of stdio MCP
   servers (default ``base``).
+- ``SAMA_REGION``: the home region of this deployment (default ``ap-south-1``).
+  ``SAMA_REGION_URLS``: the web addresses of the other regions, as ``region=url`` pairs with
+  commas (Section 17.3).
 """
 
 from __future__ import annotations

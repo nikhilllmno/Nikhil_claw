@@ -56,6 +56,7 @@ from sama.media.meter import MediaMeter
 from sama.media.store import AttachmentStore
 from sama.media.vision import VisionService
 from sama.memory import MemoryService, PostgresMemoryStore
+from sama.modelkeys import ModelKeys
 from sama.modelproxy.app import ModelProxy, ProxySettings
 from sama.modelproxy.ledger import UsageLedger
 from sama.modelproxy.prices import PriceTable
@@ -83,6 +84,7 @@ from sama.skills import BuiltinSkills, PostgresSkillStore, SessionSkillSource, S
 from sama.skills.importer import SkillImporter
 from sama.tasks.dispatcher import TaskDispatcher
 from sama.tasks.runs import TaskTools
+from sama.tenancy.regions import set_home_regions
 from sama.tenancy.run_token import RunTokenSigner
 from sama.tools.clarify import ClarifyBroker
 from sama.tools.code import CodeRunner
@@ -162,6 +164,8 @@ def build(
     ``exit_on_failure`` stops the process when a background loop ends with an error, so
     that the platform starts it again."""
     default_redactor().add(*settings.secret_values())
+    # The run queue and the API serve only the orgs of the home region (Section 17.3).
+    set_home_regions(settings.regions)
     engine = engine or create_engine(settings.database_url.get_secret_value())
     vault = Vault(engine, settings.vault_key) if settings.vault_key is not None else None
     keys = OrgKeys(
@@ -390,6 +394,8 @@ def build(
     handoffs = Handoffs(engine, web_url=settings.web_base)
     # /undo and /rollback restore the files of the session sandbox (Section 15.3).
     checkpoints = CheckpointService(engine, sandboxed.session_sandbox) if sandboxed else None
+    # The same vault as the proxy: a key that an admin sets applies at once here (M6.7).
+    model_keys = ModelKeys(vault, keys) if vault is not None else None
     hub = (
         TelegramHub(
             engine,
@@ -474,6 +480,7 @@ def build(
         workflows=workflows,
         handoffs=handoffs,
         checkpoints=checkpoints,
+        model_keys=model_keys,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -497,6 +504,8 @@ def build(
             await stack.enter_async_context(proxy_app.router.lifespan_context(proxy_app))
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
             stack.push_async_callback(connections.aclose)
+            if model_keys is not None:
+                stack.push_async_callback(model_keys.aclose)
             if hub is not None:
                 stack.push_async_callback(hub.aclose)
             if upstream is not None and github is not None:

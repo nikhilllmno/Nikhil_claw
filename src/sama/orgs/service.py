@@ -35,6 +35,7 @@ from sama.db.models import (
 from sama.orgs.emails import DISPOSABLE_DOMAINS, EmailCheck, blocked_domain, normalize_email
 from sama.orgs.plans import SIGNUP_PLAN, plan_of
 from sama.tenancy.access import Grants, load_grants
+from sama.tenancy.regions import home_regions, member_user_id
 
 SignupMode = Literal["open", "invite_only"]
 Role = Literal["owner", "admin", "member"]
@@ -123,9 +124,8 @@ async def _lock_org(connection: AsyncConnection, org_id: uuid.UUID) -> Any:
 async def _grants(
     connection: AsyncConnection, org_id: uuid.UUID, auth_user_id: uuid.UUID
 ) -> Grants | None:
-    user_id = await connection.scalar(
-        select(User.id).where(User.org_id == org_id, User.auth_user_id == auth_user_id)
-    )
+    # An org in another region raises ``OrgInOtherRegion`` (``421``, Section 17.3).
+    user_id = await member_user_id(connection, auth_user_id, org_id)
     if user_id is None:
         return None
     grants = await load_grants(connection, org_id, user_id)
@@ -253,6 +253,8 @@ class OrgService:
                         plan=plan.name,
                         limits=dict(plan.limits),
                         created_by_auth_user_id=auth_user_id,
+                        # A new org is in the home region of the deployment (Section 17.3).
+                        region=home_regions().home,
                     )
                     .returning(Org.id)
                 )

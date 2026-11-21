@@ -13,9 +13,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
-from sama.db.models import AgentProfile, Membership, Message, SkillVersion
+from sama.db.models import AgentProfile, Membership, Message, Org, SkillVersion
 from sama.orchestrator.queue import RunQueue
 from sama.skills import ManageRequest, PostgresSkillStore, SkillLibrary
+from sama.tenancy.regions import DEFAULT_REGION, Regions, set_home_regions
 from sama.tenancy.run_token import RunTokenClaims
 from tests.api.conftest import ISSUER, SECRET, bearer
 from tests.api.test_app import add_user, mia
@@ -286,3 +287,25 @@ async def test_a_workspace_admin_skill_shows_in_the_list_for_members(
     )
     skills = {s["name"]: s["scope"] for s in response.json()}
     assert skills["team-guide"] == "workspace"
+
+
+async def test_the_versions_of_a_skill_of_an_org_in_another_region_answer_421(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await write(engine, tenant, "mine", "my-notes")
+    listed = await client.get(
+        f"/orgs/{tenant.org}/skills",
+        headers=mia(tenant),
+        params={"workspace_id": str(tenant.ids["ws"])},
+    )
+    skill_id = next(s["id"] for s in listed.json() if s["name"] == "my-notes")
+    assert (await client.get(f"/skills/{skill_id}/versions/1", headers=mia(tenant))).is_success
+    set_home_regions(Regions.of(DEFAULT_REGION, None, {"eu-central-1": "https://eu.sama.test"}))
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Org).where(Org.id == tenant.org).values(region="eu-central-1")
+        )
+    for path in (f"/skills/{skill_id}/versions", f"/skills/{skill_id}/versions/1"):
+        response = await client.get(path, headers=mia(tenant))
+        assert response.status_code == 421, response.text
+        assert response.json()["url"] == "https://eu.sama.test"

@@ -9,6 +9,9 @@ again and ends the process after ``GRACE_S`` seconds.
 
 pytest's ``faulthandler_timeout`` (pyproject.toml) is the second guard: it prints the stacks of
 the threads also when the main thread is in a C call that does not give control to Python.
+
+The file also puts back the home regions of the process after each test (``home_regions``,
+Section 17.3): ``controlplane.build`` and the region tests change them.
 """
 
 from __future__ import annotations
@@ -20,10 +23,12 @@ import signal
 import sys
 import threading
 import traceback
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from types import FrameType
 
 import pytest
+
+from sama.tenancy.regions import home_regions, set_home_regions
 
 DEFAULT_TIMEOUT_S = 120.0
 LIVE_TIMEOUT_S = 900.0
@@ -100,3 +105,10 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+
+
+@pytest.fixture(autouse=True)
+def _home_regions() -> Iterator[None]:
+    before = home_regions()
+    yield
+    set_home_regions(before)

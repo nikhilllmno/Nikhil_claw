@@ -13,6 +13,7 @@ from sama.modelproxy.ledger import UsageLedger
 from sama.modelproxy.prices import Provider, TokenCounts
 from sama.modelproxy.store import CallRecord, MemoryUsageStore
 from sama.modelproxy.usage import Endpoint
+from sama.vault.store import KeySource
 
 
 class Store(MemoryUsageStore):
@@ -44,6 +45,7 @@ def call(org: str = "org-1") -> CallRecord:
         endpoint=Endpoint.MESSAGES,
         status_code=200,
         counts=TokenCounts(input=1, output=1),
+        key_source=KeySource.SAMA,
         cost_usd=Decimal("0.01"),
         duration_ms=1,
         created_at=datetime.now(UTC),

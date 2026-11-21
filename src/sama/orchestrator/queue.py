@@ -101,6 +101,7 @@ from sama.runtime.contract import (
     clip_subagent_text,
 )
 from sama.subagents import model_is_known
+from sama.tenancy.regions import home_regions
 from sama.vault.redact import default_redactor, redact
 
 DEFAULT_LEASE: Final = timedelta(seconds=30)
@@ -910,7 +911,9 @@ class RunQueue:
         for _ in range(CLAIM_TRIES):
             try:
                 async with self._engine.begin() as connection:
-                    row = (await connection.execute(self._candidate(full))).one_or_none()
+                    row = (
+                        await connection.execute(self._candidate(full, home_regions().home))
+                    ).one_or_none()
                     if row is None:
                         return None
                     if row.kind == "review" and not await self._review_on(connection, row.id):
@@ -934,9 +937,11 @@ class RunQueue:
         return None
 
     @staticmethod
-    def _candidate(full: set[uuid.UUID]) -> Any:
+    def _candidate(full: set[uuid.UUID], region: str) -> Any:
         """The oldest ready run: queued, its session has no active run and no older queued
-        run, and its org is not in ``full``.
+        run, its org is in ``region`` (the home region, Section 17.3), and its org is not in
+        ``full``. A run of an org in another region stays queued: the deployment of that region
+        runs it.
 
         A review run is ready only when no chat run of its session waits. A waiting review
         does not block a chat run. Chat runs go before review runs."""
@@ -944,6 +949,7 @@ class RunQueue:
         older = aliased(Run)
         conditions = [
             Run.status == "queued",
+            exists().where(Org.id == Run.org_id, Org.region == region),
             ~exists().where(other.session_id == Run.session_id, other.status.in_(ACTIVE_STATUSES)),
             ~exists().where(
                 older.session_id == Run.session_id,

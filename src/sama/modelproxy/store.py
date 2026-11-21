@@ -21,6 +21,7 @@ from sama.db.models import ModelCall, Org
 from sama.modelproxy.prices import Provider, TokenCounts
 from sama.modelproxy.usage import Endpoint
 from sama.tenancy.authority import Authority, RunSpend, load_authority, load_run_spend
+from sama.vault.store import KeySource
 
 
 class CallRecord(BaseModel):
@@ -42,6 +43,9 @@ class CallRecord(BaseModel):
     counts: TokenCounts
     usage_estimated: bool = False
     """True when the final usage was not known and the proxy recorded a high estimate."""
+    key_source: KeySource
+    """The key of the call: the key of the org (M6.7) or the key of sama. The cost is the same
+    for both, so the budgets and the limits count both."""
     cost_usd: Decimal = Field(ge=0)
     duration_ms: int = Field(ge=0)
     created_at: datetime
@@ -136,6 +140,7 @@ class PostgresUsageStore:
             "cache_write_long_tokens": call.counts.cache_write_long,
             "web_search_requests": call.counts.web_search_requests,
             "usage_estimated": call.usage_estimated,
+            "key_source": call.key_source.value,
             "cost_usd": call.cost_usd,
             "duration_ms": call.duration_ms,
             "created_at": call.created_at,

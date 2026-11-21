@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api.auth import Principal
 from sama.db.engine import as_user
-from sama.db.models import AuditEntry, Skill, SkillVersion, User, Workspace
+from sama.db.models import AuditEntry, Skill, SkillVersion, Workspace
 from sama.skills.errors import SkillError
 from sama.skills.library import Actor, ManageRequest, SkillDoc, authorize, resolve
 from sama.skills.lint import (
@@ -35,6 +35,7 @@ from sama.skills.service import SkillLibrary
 from sama.skills.sql import copy_version, load_docs, scope_filter
 from sama.skills.store import PostgresSkillStore
 from sama.tenancy.access import Grants, load_grants
+from sama.tenancy.regions import member_user_id
 
 WritableScope = Literal["user", "workspace", "org"]
 ReadScope = Literal["user", "workspace", "org", "builtin"]
@@ -163,13 +164,7 @@ class SkillEditor:
             user_id = (
                 None
                 if org_id is None
-                else (
-                    await connection.execute(
-                        select(User.id).where(
-                            User.org_id == org_id, User.auth_user_id == principal.auth_user_id
-                        )
-                    )
-                ).scalar_one_or_none()
+                else await member_user_id(connection, principal.auth_user_id, org_id)
             )
             grants = (
                 None
@@ -273,6 +268,7 @@ class SkillEditor:
             ).scalar_one_or_none()
             if org_id is None:
                 raise _not_found()
+            await member_user_id(connection, principal.auth_user_id, org_id)
             row = (
                 await connection.execute(
                     select(

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.api.auth import Principal
 from sama.db.engine import as_user
-from sama.db.models import MAX_TASK_DEPENDENCIES, User, Workspace
+from sama.db.models import MAX_TASK_DEPENDENCIES, Workspace
 from sama.orchestrator.queue import QueueError, RunQueue
 from sama.tasks.service import (
     LIST_LIMIT,
@@ -42,6 +42,7 @@ from sama.tasks.service import (
     load_task,
 )
 from sama.tenancy.access import load_grants
+from sama.tenancy.regions import member_user_id
 
 TaskStatus = Literal["todo", "running", "blocked", "done", "cancelled"]
 SetStatus = Literal["todo", "blocked", "done", "cancelled"]
@@ -160,13 +161,7 @@ class TaskBoard:
         user_id = (
             None
             if org_id is None
-            else (
-                await connection.execute(
-                    select(User.id).where(
-                        User.org_id == org_id, User.auth_user_id == principal.auth_user_id
-                    )
-                )
-            ).scalar_one_or_none()
+            else await member_user_id(connection, principal.auth_user_id, org_id)
         )
         if org_id is None or user_id is None:
             raise HTTPException(status_code=404, detail="the workspace does not exist")

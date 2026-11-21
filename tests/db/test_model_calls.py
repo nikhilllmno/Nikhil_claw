@@ -6,15 +6,16 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Org
+from sama.db.models import ModelCall, Org
 from sama.modelproxy import PostgresUsageStore, TokenCounts
 from sama.modelproxy.prices import Provider
 from sama.modelproxy.store import CallRecord, OrgLimits
 from sama.modelproxy.usage import Endpoint
+from sama.vault.store import KeySource
 from tests.db.world import World
 
 pytestmark = pytest.mark.usefixtures("world")
@@ -40,6 +41,7 @@ def call(world: World, session: str, *, cost: str, at: datetime = NOW, **ids: st
         endpoint=Endpoint.MESSAGES,
         status_code=200,
         counts=TokenCounts(input=100, output=20, cache_read=5, cache_write=3, cache_write_long=2),
+        key_source=KeySource.SAMA,
         cost_usd=Decimal(cost),
         duration_ms=50,
         created_at=at,
@@ -100,3 +102,42 @@ async def test_a_second_write_of_the_same_record_does_nothing(
     await store.record(record)
     after = await store.run_spend(org_b, run)
     assert after.cost_usd - before.cost_usd == Decimal("0.5")
+
+
+async def test_the_store_keeps_the_key_source_and_counts_both(
+    engine: AsyncEngine, world: World
+) -> None:
+    """M6.7: a call with the key of the org costs the same and counts in the same budgets."""
+    store = PostgresUsageStore(engine)
+    org_b, run = str(world.ids["org-b"]), str(world.ids["run:b1-bob"])
+    before = await store.run_spend(org_b, run)
+    own = call(world, "b1-bob", cost="0.2").model_copy(update={"key_source": KeySource.ORG})
+    await store.record(own)
+    await store.record(call(world, "b1-bob", cost="0.3"))
+    after = await store.run_spend(org_b, run)
+    assert after.cost_usd - before.cost_usd == Decimal("0.5")
+    async with engine.connect() as connection:
+        source = await connection.scalar(
+            select(ModelCall.key_source).where(ModelCall.call_id == own.call_id)
+        )
+    assert source == "org"
+
+
+async def test_a_key_source_outside_the_list_is_refused(engine: AsyncEngine, world: World) -> None:
+    async with engine.begin() as connection:
+        with pytest.raises(IntegrityError):
+            await connection.execute(
+                text("UPDATE model_calls SET key_source = 'other' WHERE org_id = :org"),
+                {"org": world.ids["org-a"]},
+            )
+
+
+@pytest.mark.parametrize("region", ["", "AP-SOUTH-1", "ap-south", "mars", "ap-south-1; x"])
+async def test_an_org_region_must_be_a_region_id(
+    engine: AsyncEngine, world: World, region: str
+) -> None:
+    async with engine.begin() as connection:
+        with pytest.raises(IntegrityError):
+            await connection.execute(
+                update(Org).where(Org.id == world.ids["org-a"]).values(region=region)
+            )

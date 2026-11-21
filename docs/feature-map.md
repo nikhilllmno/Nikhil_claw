@@ -30,7 +30,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
 | Agent loop | `run_agent.py`, `agent/` | The SDK runs the loop. Sama wraps it in the `AgentRuntime` contract (§5). | SDK | M1 |
-| Provider abstraction (many providers) | `agent/transports/`, `providers/` | Only Anthropic and OpenAI models. Claude adapter (default) and OpenAI Agents adapter (M3.6 done). An admin switches the runtime of a profile. | Adapt | M1, M3 (M3.6 done) |
+| Provider abstraction (many providers) | `agent/transports/`, `providers/` | Only Anthropic and OpenAI models. Claude adapter (default) and OpenAI Agents adapter (M3.6 done). An admin switches the runtime of a profile. An org can bring its own Anthropic and OpenAI keys (§17.3, M6.7 done). | Adapt | M1, M3 (M3.6 done), M6 (M6.7 done) |
 | Three-tier prompt (stable, context, volatile) | `agent/prompt_builder*.py` | Frozen prefix per session: SOUL, context files, memory snapshot, skill index. Volatile notes on the user message (§6.1, D9). | Adapt | M1 |
 | `SOUL.md` personality | `~/.hermes/SOUL.md` | SOUL per agent profile, versioned rows, changes through `change_propose` (§15.2). Since M3.2, `change_propose` proposes a new SOUL, and a workspace admin or the org owner approves it (§9.4.2). | Adapt | M1 |
 | Context files (`AGENTS.md`, `CLAUDE.md`, `.hermes.md`) | `agent/context_files*.py` | Loaded from the repo in the sandbox and from workspace settings, 20,000-char cap, injection scan (§6). | Adapt | M1 |
@@ -253,3 +253,4 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | GitHub App and git proxy: no token in the sandbox, `sama/*` branches only, no force-push or delete, pull requests by tool | §15.1 | M3 (M3.7 done) |
 | Self-modification through pull requests | §15.2 | M6 |
 | Customer sign-up, billing, quotas | §17 (sign-up, invites, and roles in §17.2) | M6 (M6.5 done) |
+| Org keys (own Anthropic and OpenAI keys) and a region per org, with a routing seam for more regions | §17.3 | M6 (M6.7 done) |

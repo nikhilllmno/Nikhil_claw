@@ -7,6 +7,9 @@
 - ``python -m sama.admin secret set|list|delete --org <id> [--name <name>]``: the vault
   entries of an org. ``set`` reads the value from stdin, so the value is not in the shell
   history or the process list.
+- ``python -m sama.admin region show|set --org <id> [--region <region>]``: the region of an org
+  (Section 17.3). ``set`` accepts only a known region: ``SAMA_REGION`` or a region of
+  ``SAMA_REGION_URLS``. Move the data of the org first.
 - ``python -m sama.admin github-app manifest [--public-url <url>] [--org <github org>]
   [--out <file>]`` and ``github-app convert <code> [--out-dir <dir>] [--fly-app <app>]``: the
   manifest flow of the sama GitHub App (Section 15.1). They need no database.
@@ -35,6 +38,7 @@ from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Ow
 from sama.db.engine import create_engine
 from sama.github.client import GitHubError
 from sama.subagents import SubagentError, parse_subagents, profile_subagents, set_profile_subagents
+from sama.tenancy.regions import RegionError, org_region, regions_from_env, set_org_region
 from sama.vault.crypto import VaultKey
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
 from sama.vault.store import SecretName, Vault
@@ -94,6 +98,23 @@ async def _secret(args: argparse.Namespace) -> dict[str, Any]:
             await vault.put(org_id, name, _read_value())
             return result | {"set": True}
         return result | {"deleted": await vault.delete(org_id, name)}
+    finally:
+        await engine.dispose()
+
+
+async def _region(args: argparse.Namespace) -> dict[str, Any]:
+    regions = regions_from_env(os.environ)
+    engine = create_engine(_database_url())
+    org_id: uuid.UUID = args.org
+    try:
+        result: dict[str, Any] = {"org_id": str(org_id), "home": regions.home}
+        if args.action == "set":
+            before = await set_org_region(engine, org_id, args.region, regions)
+            return result | {"region": args.region, "before": before}
+        region = await org_region(engine, org_id)
+        if region is None:
+            raise RegionError("the org does not exist")
+        return result | {"region": region, "here": regions.here(region)}
     finally:
         await engine.dispose()
 
@@ -180,6 +201,10 @@ def main(argv: list[str] | None = None) -> int:
     subagents.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
     subagents.add_argument("--profile", type=uuid.UUID, required=True, help="The profile id.")
     subagents.add_argument("--file", help="The JSON file of the specs. Without it, stdin.")
+    region = commands.add_parser("region", help="Show or change the region of an org.")
+    region.add_argument("action", choices=("show", "set"))
+    region.add_argument("--org", type=uuid.UUID, required=True, help="The org id.")
+    region.add_argument("--region", help="set: the new region, for example eu-central-1.")
     app = commands.add_parser(
         "github-app", help="Create the sama GitHub App with the manifest flow of GitHub."
     )
@@ -196,6 +221,15 @@ def main(argv: list[str] | None = None) -> int:
         return _github_app_command(args)
     if args.command == "subagents":
         return _subagents_command(args)
+    if args.command == "region":
+        if args.action == "set" and not args.region:
+            parser.error("region set needs --region")
+        try:
+            print(json.dumps(asyncio.run(_region(args))))
+        except RegionError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "secret":
         if args.action != "list" and args.name is None:
             parser.error(f"secret {args.action} needs --name")

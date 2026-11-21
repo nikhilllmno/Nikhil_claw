@@ -19,6 +19,8 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Final, NewType
 
@@ -198,6 +200,14 @@ class Vault:
             )
             return [_vault_name(name) for (name,) in rows]
 
+    async def updated(self, org_id: uuid.UUID) -> dict[VaultName, datetime]:
+        """The time of the last change of each secret of an org. It decrypts nothing."""
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(VaultSecret.name, VaultSecret.updated_at).where(VaultSecret.org_id == org_id)
+            )
+            return {_vault_name(name): at for name, at in rows}
+
     async def get(
         self, org_id: uuid.UUID, name: VaultName, *, fresh: bool = False
     ) -> SecretStr | None:
@@ -285,6 +295,24 @@ async def _audit(
     )
 
 
+class KeySource(StrEnum):
+    """Where a provider key came from (Section 16.6). The usage records keep it, so billing
+    (M6.6) can tell the calls on the key of the org from the calls on the key of sama."""
+
+    ORG = "org"
+    """The org brought its own key (the vault entry, M6.7)."""
+    SAMA = "sama"
+    """The default key of the process (the environment)."""
+
+
+@dataclass(frozen=True, slots=True)
+class OrgKey:
+    """A key and its source. ``value`` is None when the org has no key and no default exists."""
+
+    value: SecretStr | None
+    source: KeySource
+
+
 class OrgKeys:
     """The key of an org: the vault entry first, then the default of the process."""
 
@@ -300,8 +328,17 @@ class OrgKeys:
 
     async def get(self, org_id: str | uuid.UUID, name: SecretName) -> SecretStr | None:
         """Raises ``VaultError`` if the vault entry does not decrypt."""
+        return (await self.lookup(org_id, name)).value
+
+    async def lookup(self, org_id: str | uuid.UUID, name: SecretName) -> OrgKey:
+        """The key and its source. Raises ``VaultError`` if the vault entry does not decrypt:
+        the caller must not use the default key then, because the org chose its own key."""
         if self._vault is not None:
             value = await self._vault.get(uuid.UUID(str(org_id)), name)
             if value is not None:
-                return value
-        return self._defaults.get(name)
+                return OrgKey(value, KeySource.ORG)
+        return OrgKey(self._defaults.get(name), KeySource.SAMA)
+
+    def has_default(self, name: SecretName) -> bool:
+        """True if the process has a default key of this name."""
+        return self._defaults.get(name) is not None

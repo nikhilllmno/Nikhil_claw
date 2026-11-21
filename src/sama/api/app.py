@@ -137,6 +137,8 @@ from sama.memory import (
 )
 from sama.memory.core import MAX_ENTRY_CHARS, Target, used
 from sama.memory.store import MemoryState, read_revisions, read_state
+from sama.modelkeys import MAX_KEY_CHARS, ModelKeyError, ModelKeys
+from sama.modelproxy.prices import Provider
 from sama.orchestrator.checkpoints import (
     LIST_LIMIT,
     MAX_LIST_LIMIT,
@@ -170,6 +172,7 @@ from sama.skills.service import SkillLibrary
 from sama.skills.store import PostgresSkillStore
 from sama.subagents import SubagentError, parse_subagents
 from sama.tenancy.access import Grants, load_grants
+from sama.tenancy.regions import OrgInOtherRegion, home_regions, member_user_id, served_here
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.triggers import router as trigger_routes
 from sama.triggers import service as triggers
@@ -332,6 +335,11 @@ class NewPairingCode(_Body):
 class TelegramConnect(_Body):
     bot_token: SecretStr = Field(min_length=1, max_length=200)
     """The token of the bot from @BotFather."""
+
+
+class ModelKeyIn(_Body):
+    api_key: SecretStr = Field(min_length=1, max_length=MAX_KEY_CHARS)
+    """The API key of the provider. It goes to the vault; no answer has it."""
 
 
 class GitHubRepoAdd(_Body):
@@ -754,13 +762,9 @@ def _not_found(what: str = NOT_FOUND) -> HTTPException:
 async def _user_id(
     connection: AsyncConnection, principal: Principal, org_id: uuid.UUID
 ) -> uuid.UUID | None:
-    return (
-        await connection.execute(
-            select(User.id).where(
-                User.org_id == org_id, User.auth_user_id == principal.auth_user_id
-            )
-        )
-    ).scalar_one_or_none()
+    """The user of the person in the org. Raises ``OrgInOtherRegion`` (``421``) for an org in a
+    region that this deployment does not serve (Section 17.3)."""
+    return await member_user_id(connection, principal.auth_user_id, org_id)
 
 
 _SESSION_COLUMNS: Final = (
@@ -924,6 +928,7 @@ class SamaApi:
         handoffs: Handoffs | None = None,
         orgs: OrgService | None = None,
         checkpoints: CheckpointService | None = None,
+        model_keys: ModelKeys | None = None,
     ) -> None:
         """Without ``integrations`` the integration routes answer ``409``. Without ``github``,
         the GitHub routes answer ``409``. Without ``handoffs`` the handoff route answers
@@ -934,7 +939,8 @@ class SamaApi:
         the skill routes answer ``409`` and a message that starts with ``/`` is not a skill
         command. Without ``search``, the session search of the web app uses full-text search
         only. Without ``orgs``, sign-up reads the verified emails from ``auth.users`` and uses
-        ``settings.signup``."""
+        ``settings.signup``. Without ``model_keys`` (no vault), the model key
+        routes answer ``503``."""
         self._engine = engine
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
@@ -943,6 +949,7 @@ class SamaApi:
         self._triggers = triggers
         self._handoffs = handoffs
         self._checkpoints = checkpoints
+        self._model_keys = model_keys
         self._skills = skills
         self._reviews = reviews
         self._pins = pins or PinStore(engine)
@@ -1010,6 +1017,14 @@ class SamaApi:
         @app.exception_handler(ConnectorError)
         async def connector_error(request: Request, error: ConnectorError) -> JSONResponse:
             return JSONResponse({"detail": str(error)}, status_code=error.status_code)
+
+        @app.exception_handler(OrgInOtherRegion)
+        async def other_region(request: Request, error: OrgInOtherRegion) -> JSONResponse:
+            # 421 Misdirected Request: another deployment serves the org (Section 17.3).
+            return JSONResponse(
+                {"detail": str(error), "region": error.region, "url": error.url},
+                status_code=421,
+            )
 
         @app.middleware("http")
         async def security_headers(request: Request, call_next: Any) -> Response:
@@ -1255,6 +1270,35 @@ class SamaApi:
             except IntegrationError as error:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             return view.public()
+
+        @app.get("/orgs/{org_id}/model-keys")
+        async def model_keys(principal: Me, org_id: uuid.UUID) -> list[dict[str, Any]]:
+            await self._org_admin(principal, org_id)
+            return [s.public() for s in await self._require_model_keys().status(org_id)]
+
+        @app.put("/orgs/{org_id}/model-keys/{provider}")
+        async def set_model_key(
+            principal: Me, org_id: uuid.UUID, provider: Provider, body: ModelKeyIn
+        ) -> dict[str, Any]:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                status = await self._require_model_keys().set(
+                    org_id, provider, body.api_key, grants.user_id
+                )
+            except ModelKeyError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return status.public()
+
+        @app.delete("/orgs/{org_id}/model-keys/{provider}", status_code=204)
+        async def remove_model_key(
+            principal: Me, org_id: uuid.UUID, provider: Provider
+        ) -> Response:
+            grants = await self._org_admin(principal, org_id)
+            try:
+                await self._require_model_keys().remove(org_id, provider, grants.user_id)
+            except ModelKeyError as error:
+                raise HTTPException(status_code=error.status_code, detail=str(error)) from None
+            return Response(status_code=204)
 
         @app.post("/orgs/{org_id}/integrations/slack/setup")
         async def setup_slack(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
@@ -1814,11 +1858,14 @@ class SamaApi:
     # -- reads ------------------------------------------------------------------------------
 
     async def _orgs(self, principal: Principal) -> list[dict[str, Any]]:
-        """The orgs, workspaces, and agent profiles that the user can see."""
+        """The orgs, workspaces, and agent profiles that the user can see. An org in another
+        region shows only its name, its region, and the address of its deployment: the data of
+        the org is there (Section 17.3)."""
         result: list[dict[str, Any]] = []
+        regions = home_regions()
         async with as_user(self._engine, principal.auth_user_id) as connection:
             users = await connection.execute(
-                select(User.id, User.org_id, User.display_name, Org.name, Org.plan)
+                select(User.id, User.org_id, User.display_name, Org.name, Org.plan, Org.region)
                 .join(Org, Org.id == User.org_id)
                 .where(User.auth_user_id == principal.auth_user_id)
                 .order_by(Org.name, Org.id)
@@ -1826,6 +1873,24 @@ class SamaApi:
             for user in users.all():
                 grants = await load_grants(connection, user.org_id, user.id)
                 if not grants.org_member:
+                    continue
+                entry: dict[str, Any] = {
+                    "id": str(user.org_id),
+                    "name": user.name,
+                    "user_id": str(user.id),
+                    "display_name": user.display_name,
+                    "admin": grants.org_admin,
+                    "role": next(role for ws, role in grants.rows if ws is None),
+                    "plan": user.plan,
+                    "workspaces": [],
+                    "agent_profiles": [],
+                    "integrations": [],
+                    "region": user.region,
+                    "region_here": regions.here(user.region),
+                    "region_url": regions.url(user.region),
+                }
+                result.append(entry)
+                if not entry["region_here"]:
                     continue
                 workspaces = [
                     {"id": str(w.id), "name": w.name}
@@ -1865,19 +1930,8 @@ class SamaApi:
                         .order_by(Integration.kind)
                     )
                 ]
-                result.append(
-                    {
-                        "id": str(user.org_id),
-                        "name": user.name,
-                        "user_id": str(user.id),
-                        "display_name": user.display_name,
-                        "admin": grants.org_admin,
-                        "role": next(role for ws, role in grants.rows if ws is None),
-                        "plan": user.plan,
-                        "workspaces": workspaces,
-                        "agent_profiles": profiles,
-                        "integrations": integrations,
-                    }
+                entry.update(
+                    workspaces=workspaces, agent_profiles=profiles, integrations=integrations
                 )
         return result
 
@@ -1972,7 +2026,7 @@ class SamaApi:
             rows = (
                 await connection.execute(
                     select(*_SESSION_COLUMNS)
-                    .where(Session.status == "active")
+                    .where(Session.status == "active", served_here(Session.org_id))
                     .order_by(Session.created_at.desc(), Session.id)
                     .limit(limit)
                 )
@@ -2462,6 +2516,11 @@ class SamaApi:
             )
         return org_id, view, grants
 
+    def _require_model_keys(self) -> ModelKeys:
+        if self._model_keys is None:
+            raise HTTPException(status_code=503, detail="the vault is off in this process")
+        return self._model_keys
+
     def _require_integrations(self) -> Integrations:
         if self._integrations is None:
             raise HTTPException(status_code=409, detail="integrations are off in this process")
@@ -2687,7 +2746,7 @@ class SamaApi:
                     ChannelIdentity.integration_id,
                     ChannelIdentity.created_at,
                 )
-                .where(ChannelIdentity.channel == channel)
+                .where(ChannelIdentity.channel == channel, served_here(ChannelIdentity.org_id))
                 .order_by(ChannelIdentity.created_at)
             )
             return [
@@ -2715,6 +2774,9 @@ class SamaApi:
                     ).where(ChannelIdentity.id == identity_id, ChannelIdentity.channel == channel)
                 )
             ).one_or_none()
+            if row is not None:
+                # The account is in the data of its org: only the home region changes it.
+                await _user_id(connection, principal, row.org_id)
         if row is None:
             raise _not_found("the linked account does not exist")
         async with self._engine.begin() as connection:
@@ -2773,6 +2835,7 @@ class SamaApi:
             ).scalar_one_or_none()
             if org_id is None:
                 raise _not_found("the skill does not exist")
+            await _user_id(connection, principal, org_id)
             rows = (
                 await connection.execute(
                     select(

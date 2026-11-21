@@ -102,6 +102,10 @@ APPROVAL_STATUSES: Final = ("pending", "approved", "rejected", "expired")
 CHANNELS: Final = ("web", "slack", "telegram", "extension")
 ACTOR_KINDS: Final = ("user", "agent", "system")
 PROVIDERS: Final = ("anthropic", "openai")
+KEY_SOURCES: Final = ("org", "sama")
+"""The key of a model call: the key of the org or the key of sama (Section 16.6, M6.7)."""
+REGION_PATTERN: Final = "^[a-z]{2}-[a-z]+-[0-9]$"
+"""A region id in the form of a cloud region, for example ``ap-south-1`` (Section 17.3)."""
 MODEL_ENDPOINTS: Final = (
     "messages",
     "count_tokens",
@@ -241,6 +245,7 @@ class Org(Base):
     __table_args__ = (
         Index(None, "created_by_auth_user_id", "created_at"),
         Index(None, "created_at"),
+        CheckConstraint(f"region ~ '{REGION_PATTERN}'", name="region"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -776,6 +781,7 @@ class ModelCall(Base):
         ForeignKeyConstraint(["org_id", "user_id"], ["users.org_id", "users.id"]),
         CheckConstraint(_one_of("provider", PROVIDERS), name="provider"),
         CheckConstraint(_one_of("endpoint", MODEL_ENDPOINTS), name="endpoint"),
+        CheckConstraint(_one_of("key_source", KEY_SOURCES), name="key_source"),
         CheckConstraint(
             "input_tokens >= 0 AND output_tokens >= 0 AND cache_read_tokens >= 0"
             " AND cache_write_tokens >= 0 AND cache_write_long_tokens >= 0"
@@ -808,6 +814,7 @@ class ModelCall(Base):
     )
     web_search_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     usage_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    key_source: Mapped[str] = mapped_column(Text, nullable=False, server_default="sama")
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = _created_at()

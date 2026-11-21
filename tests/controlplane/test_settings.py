@@ -254,3 +254,31 @@ def test_sign_up_is_closed_unless_it_is_opened() -> None:
     opened = settings(SAMA_SIGNUP=" Open ", SAMA_SIGNUP_BLOCKED_DOMAINS="@Spam.test, ,x.test")
     assert opened.signup.mode == "open"
     assert opened.signup.blocked_domains == ("spam.test", "x.test")
+
+
+def test_the_region_has_a_default_and_can_be_set() -> None:
+    s = settings()
+    assert (s.regions.home, s.regions.known()) == ("ap-south-1", ["ap-south-1"])
+    assert s.regions.url("ap-south-1") == "https://sama-staging.fly.dev"
+    s = settings(
+        SAMA_REGION=" eu-central-1 ",
+        SAMA_WEB_ORIGINS="https://eu.sama-web.test",
+        SAMA_REGION_URLS="ap-south-1=https://sama-web.test/",
+    )
+    assert s.regions.home == "eu-central-1"
+    assert s.regions.known() == ["ap-south-1", "eu-central-1"]
+    assert s.regions.url("eu-central-1") == "https://eu.sama-web.test"
+    assert s.regions.url("ap-south-1") == "https://sama-web.test"
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"SAMA_REGION": "Mumbai"}, "SAMA_REGION: 'Mumbai' is not a region id"),
+        ({"SAMA_REGION_URLS": "eu-central-1"}, "region=url pairs"),
+        ({"SAMA_REGION_URLS": "ap-south-1=https://other.test"}, "not SAMA_PUBLIC_URL"),
+    ],
+)
+def test_a_bad_region_is_refused(changes: dict[str, str], message: str) -> None:
+    with pytest.raises(SettingsError, match=message):
+        settings(**changes)

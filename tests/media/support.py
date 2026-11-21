@@ -5,16 +5,31 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from pydantic import SecretStr
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import Attachment, Message
+from sama.vault.store import KeySource, OrgKey, OrgKeys, SecretName
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 24
 GIF = b"GIF89a" + b"\x00" * 24
 WEBP = b"RIFF\x1c\x00\x00\x00WEBPVP8 " + b"\x00" * 16
 NOT_AN_IMAGE = b"<html>sign in</html>"
+
+
+class OwnKeys(OrgKeys):
+    """Every org has its own key ``value`` for ``name`` (M6.7), without a vault."""
+
+    def __init__(self, name: SecretName, value: str) -> None:
+        super().__init__(None, {})
+        self._name, self._value = name, SecretStr(value)
+
+    async def lookup(self, org_id: str | uuid.UUID, name: SecretName) -> OrgKey:
+        if name is self._name:
+            return OrgKey(self._value, KeySource.ORG)
+        return OrgKey(None, KeySource.SAMA)
 
 
 async def add_image(

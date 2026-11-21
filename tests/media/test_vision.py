@@ -33,8 +33,8 @@ from sama.modelproxy.usage import Endpoint
 from sama.tenancy.authority import Authority
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import REDACTED, Redactor
-from sama.vault.store import OrgKeys, SecretName
-from tests.media.support import PNG, add_image
+from sama.vault.store import KeySource, OrgKeys, SecretName
+from tests.media.support import PNG, OwnKeys, add_image
 from tests.orchestrator.conftest import Tenant
 
 KEY = "sk-ant-vision-key-0001"
@@ -105,12 +105,15 @@ def build(
     key: str | None = KEY,
     redactor: Redactor | None = None,
     usage: MemoryUsageStore | None = None,
+    keys: OrgKeys | None = None,
     api: Anthropic | None = None,
     ledger: UsageLedger | None = None,
 ) -> Rig:
     api = api or Anthropic()
     usage = usage or MemoryUsageStore()
-    keys = OrgKeys(None, {SecretName.ANTHROPIC_API_KEY: None if key is None else SecretStr(key)})
+    keys = keys or OrgKeys(
+        None, {SecretName.ANTHROPIC_API_KEY: None if key is None else SecretStr(key)}
+    )
     service = VisionService(
         store=AttachmentStore(engine),
         keys=keys,
@@ -162,6 +165,23 @@ async def test_the_image_and_the_question_go_to_the_model(rig: Rig) -> None:
     }
     assert question == {"type": "text", "text": "What is the top bar?"}
     assert KEY not in json.dumps(body)
+
+
+@pytest.mark.parametrize("own", [False, True])
+async def test_the_call_uses_the_key_of_the_org_and_records_its_source(
+    engine: AsyncEngine, tenant: Tenant, own: bool
+) -> None:
+    """M6.7: the key of the org first. The cost is the same; only the source differs."""
+    own_key = "sk-ant-own-key-of-the-org"
+    keys = OwnKeys(SecretName.ANTHROPIC_API_KEY, own_key) if own else None
+    rig = build(engine, tenant, keys=keys)
+    image_id = await rig.image()
+    answer = await rig.service.analyze(rig.claims(), str(image_id), "what?")
+    assert answer.status is VisionStatus.OK
+    assert rig.api.requests[0].headers["x-api-key"] == (own_key if own else KEY)
+    (call,) = rig.usage.calls
+    assert call.key_source is (KeySource.ORG if own else KeySource.SAMA)
+    assert call.cost_usd > 0
 
 
 async def test_latest_is_the_newest_image_of_the_session(rig: Rig) -> None:
@@ -433,6 +453,7 @@ def record(cost: str, *, org_id: str) -> CallRecord:
         endpoint=Endpoint.MESSAGES,
         status_code=200,
         counts=TokenCounts(input=1, output=1),
+        key_source=KeySource.SAMA,
         cost_usd=Decimal(cost),
         duration_ms=1,
         created_at=datetime.now(UTC),

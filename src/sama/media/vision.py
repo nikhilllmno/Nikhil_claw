@@ -41,7 +41,7 @@ from sama.tenancy.authority import budget_problem, lower
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.crypto import VaultError
 from sama.vault.redact import Redactor, default_redactor
-from sama.vault.store import OrgKeys, SecretName
+from sama.vault.store import KeySource, OrgKeys, SecretName
 
 log = logging.getLogger("sama.media")
 
@@ -166,10 +166,11 @@ class VisionService:
         if image is None:
             raise VisionError(NOT_FOUND)
         try:
-            key = await self._keys.get(claims.org_id, SecretName.ANTHROPIC_API_KEY)
+            found = await self._keys.lookup(claims.org_id, SecretName.ANTHROPIC_API_KEY)
         except VaultError:
             log.warning("the Anthropic key of org=%s does not decrypt", claims.org_id)
-            key = None
+            return VisionResult(VisionStatus.UNAVAILABLE, NO_KEY)
+        key = found.value
         if key is None:
             return VisionResult(VisionStatus.UNAVAILABLE, NO_KEY)
         await self._check_budget(claims)
@@ -199,7 +200,9 @@ class VisionService:
         text_bytes = len(SYSTEM.encode()) + len(safe_question.encode())
         # The call and its record run in a task that a cancel of the caller does not stop: the
         # provider charges for a call that the caller no longer waits for.
-        task = asyncio.create_task(self._exchange(claims, key.get_secret_value(), body, text_bytes))
+        task = asyncio.create_task(
+            self._exchange(claims, key.get_secret_value(), found.source, body, text_bytes)
+        )
         self._tasks.add(task)
         task.add_done_callback(self._done)
         data = await asyncio.shield(task)
@@ -216,7 +219,12 @@ class VisionService:
             task.exception()  # read it, so that a cancelled caller leaves no warning
 
     async def _exchange(
-        self, claims: RunTokenClaims, key: str, body: dict[str, Any], text_bytes: int
+        self,
+        claims: RunTokenClaims,
+        key: str,
+        source: KeySource,
+        body: dict[str, Any],
+        text_bytes: int,
     ) -> dict[str, Any]:
         """Sends the request and settles the record of the call. A call that may have reached
         the provider always gets a record: the real usage, or a high estimate (a timeout, a
@@ -230,11 +238,13 @@ class VisionService:
                 json=body,
             )
         except asyncio.CancelledError:
-            await self._ledger.settle(self._estimate(claims, call_id, started, text_bytes))
+            await self._ledger.settle(self._estimate(claims, call_id, started, source, text_bytes))
             raise
         except httpx.HTTPError as error:
             if not isinstance(error, _NOT_SENT):
-                await self._ledger.settle(self._estimate(claims, call_id, started, text_bytes))
+                await self._ledger.settle(
+                    self._estimate(claims, call_id, started, source, text_bytes)
+                )
             if isinstance(error, httpx.TimeoutException):
                 raise VisionError("The vision model did not answer in time. Try again.") from None
             log.warning(
@@ -246,10 +256,10 @@ class VisionService:
         if response.status_code == 200:
             if isinstance(usage, dict) and "input_tokens" in usage and "output_tokens" in usage:
                 record = self._record(
-                    claims, call_id, started, anthropic_counts(usage), estimated=False
+                    claims, call_id, started, source, anthropic_counts(usage), estimated=False
                 )
             else:
-                record = self._estimate(claims, call_id, started, text_bytes, status=200)
+                record = self._estimate(claims, call_id, started, source, text_bytes, status=200)
             await self._ledger.settle(record)
             return data
         log.warning(
@@ -299,6 +309,7 @@ class VisionService:
         claims: RunTokenClaims,
         call_id: uuid.UUID,
         started: float,
+        source: KeySource,
         text_bytes: int,
         status: int = 0,
     ) -> CallRecord:
@@ -306,13 +317,14 @@ class VisionService:
         request, the input of the text, and ``IMAGE_TOKENS_ESTIMATE`` for the image."""
         counts = estimate_counts(text_bytes, {"max_tokens": MAX_ANSWER_TOKENS}, TokenCounts())
         counts = counts.model_copy(update={"input": counts.input + IMAGE_TOKENS_ESTIMATE})
-        return self._record(claims, call_id, started, counts, estimated=True, status=status)
+        return self._record(claims, call_id, started, source, counts, estimated=True, status=status)
 
     def _record(
         self,
         claims: RunTokenClaims,
         call_id: uuid.UUID,
         started: float,
+        source: KeySource,
         counts: TokenCounts,
         *,
         estimated: bool,
@@ -340,6 +352,7 @@ class VisionService:
             status_code=status,
             counts=counts,
             usage_estimated=estimated,
+            key_source=source,
             cost_usd=cost,
             duration_ms=int((time.monotonic() - started) * 1000),
             created_at=self._clock(),
