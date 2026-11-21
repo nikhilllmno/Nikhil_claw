@@ -137,3 +137,36 @@ test("the channel routes refuse what they must", async ({ ownerApi, memberApi, w
     expect(denied.status).toBe(403);
   }
 });
+
+test("the Settings page opens the WhatsApp form from a link and shows a refusal", async ({
+  ownerPage: page,
+  ownerApi,
+  world,
+}) => {
+  // The link that connection_request gives opens the form with the provider (Section 11.9).
+  await page.goto("/settings?connect=whatsapp&provider=twilio");
+  const form = page.getByRole("form", { name: "Connect WhatsApp" });
+  await expect(form).toBeVisible();
+  await expect(form.getByRole("combobox", { name: "Provider" })).toHaveValue("twilio");
+  const twilio = FAKE_WHATSAPP[1]!;
+  await form.getByRole("textbox", { name: /^Business number/ }).fill(twilio.number);
+  await form.getByLabel(/^Auth token/).fill(twilio.api_token);
+  await form.getByRole("textbox", { name: /^Account SID/ }).fill(twilio.account_sid!);
+  const answer = page.waitForResponse(
+    (r) => r.request().method() === "POST" && r.url().endsWith("/integrations/whatsapp"),
+  );
+  await form.getByRole("button", { name: "Connect", exact: true }).click();
+  expect((await answer).status()).toBeGreaterThanOrEqual(400);
+  const section = form.locator("xpath=..");
+  await expect(section.locator(".alert-error")).toBeVisible();
+  await expect(section.locator(".alert-error")).not.toContainText(twilio.api_token);
+
+  // The email form is there too, for an admin.
+  await page.goto("/settings?connect=email");
+  const mail = page.getByRole("form", { name: "Connect Email" });
+  await expect(mail.getByRole("textbox", { name: /^Inbound address/ })).toBeVisible();
+  await expect(mail.getByRole("textbox", { name: /^Public key of the parse security policy/ })).toBeVisible();
+
+  const rows = await ownerApi.get<{ kind: string }[]>(`/orgs/${world.org.id}/integrations`);
+  expect(rows.map((r) => r.kind)).not.toContain("whatsapp");
+});
