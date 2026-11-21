@@ -21,6 +21,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SAMA_BUILTIN_SKILLS_DIR=/opt/sama/skills \
     SAMA_CONNECTORS_DIR=/opt/sama/connectors/catalog
 
+# The Playwright driver of the cloud browser (M5.1) runs a bundled Node.js binary. It needs
+# libatomic1, which the slim image does not have.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir uv==0.13.8
 
 WORKDIR /opt/sama
@@ -36,7 +42,8 @@ COPY skills ./skills
 COPY connectors ./connectors
 RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --group databases --group browser --no-editable \
     && pip uninstall --yes uv \
-    && useradd --system --no-create-home sama
+    && useradd --system --no-create-home sama \
+    && "$(python -c 'import playwright, pathlib; print(pathlib.Path(playwright.__file__).parent / "driver" / "node")')" --version
 
 USER sama
 EXPOSE 8080
