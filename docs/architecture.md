@@ -6060,8 +6060,9 @@ log of the org, so the control plane logs it instead.
   its step to `before_user_delete` or `before_org_delete`, and the step must be safe to run
   again. Billing (M6.6) cancels the Stripe subscription of the org in `before_org_delete`.
 - In the same transaction the delete writes `data_purges` rows: the sandboxes of the deleted
-  sessions (or all sandboxes of a deleted org) and the Langfuse traces of the deleted runs
-  that the exporter sent (at most 1,000 trace ids in one row). A trace row waits one hour
+  sessions (or all sandboxes of a deleted org), with the checkpoints of M6.4 in the work
+  folder, and the Langfuse traces of the deleted runs that the exporter sent (at most 1,000
+  trace ids in one row). A trace row waits one hour
   first: the exporter marks a run as sent before it sends the trace, and Langfuse stores a
   trace some time after it gets it.
 - The Supabase Auth user is not deleted. A person can be a user in more than one org.
