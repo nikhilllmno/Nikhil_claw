@@ -242,7 +242,7 @@ flowchart LR
 |---|---|
 | **API** | Auth (Supabase JWT, org API keys for `/v1` and `/mcp` (Section 10.7)), REST and streaming endpoints, admin endpoints for profiles, skills, memory, jobs, workflows, and connections. The only holder of the database service key. |
 | **Channel gateway** | Receives Slack, Telegram, and extension events. Checks pairing and access. Maps each chat or thread to a user, an agent profile, and a session. Streams replies, renders approval cards, and handles slash commands. Also routes `my_chrome` browser actions to the right extension connection. |
-| **Run orchestrator** | Queues runs in Postgres with leases, one active run per session (Section 4.3). Enforces per-org concurrency, budgets, and rate limits. Creates or resumes the session sandbox, starts the runner, streams events, and handles cancel, timeout, crashed workers, and resume after approval. |
+| **Run orchestrator** | Queues runs in Postgres with leases, one main run per session and parallel side runs up to the limit of the profile (Section 4.3). Enforces per-org concurrency, budgets, and rate limits. Creates or resumes the session sandbox, starts the runner, streams events, and handles cancel, timeout, crashed workers, and resume after approval. |
 | **Scheduler** | Fires cron jobs and one-time jobs. Receives webhooks and Composio triggers. Creates runs or workflow instances. One leader at a time through a Postgres lease. |
 | **Workflow engine** | Runs workflow instances step by step as queue items. Stores each step result. Pauses on approval steps. |
 | **Sama MCP tool server** | The sama tools for both runtimes: memory, skills, session search, cron, workflows, delegation, browser, connectors (Composio and MCP proxy), todo, clarify, approvals, and change proposals. Each call carries the run token. |
@@ -291,8 +291,9 @@ the user message with the `run_id`.
 older queued run, with `FOR UPDATE SKIP LOCKED`. The run becomes `running` with a lease:
 `lease_owner` and `lease_expires_at` (30 seconds). `attempts` goes up by 1. Thus:
 
-- One session has at most one active run (`running` or `paused`). The partial unique index
-  `ix_runs_one_active_per_session` makes this a database rule too.
+- One session has at most one active main run (`running` or `paused`). The partial unique index
+  `ix_runs_one_main_per_session` makes this a database rule too. Since M7.1, side runs can run
+  next to it (see "Busy modes and parallel runs" below).
 - The messages of a session run in order. A new message during a run waits in the queue.
 - Sessions run in parallel, and two workers never take the same run.
 
@@ -363,6 +364,76 @@ with `requeued_run_id`). That message does not need the rate check, because each
 maintenance calls `sweep_steers()`: it sends the pending notes of completed runs (a note that
 came in after `complete`) as a new message, and it drops (status `dropped`) the pending notes of
 failed and cancelled runs. It handles at most 50 runs in one pass (`STEER_SWEEP_BATCH`).
+
+**Busy modes and parallel runs (M7.1, migration `0039`).** The busy mode of an agent profile
+(`agent_profiles.busy_mode`) says what a new message does while a run of its session is open.
+The modes follow Claude Code:
+
+| Mode | A new message while a run is open |
+|---|---|
+| `steer` (default) | Joins the running run at its next step, as a note of `/steer`. The model reads it at the next tool call, so one run handles both requests. If the run ends before its next step, the note becomes the next message at once (the rules of `/steer` above). |
+| `parallel` | Starts a second run at the same time, in the same session and the same sandbox. |
+| `queue` | Waits in the queue, as before M7.1. |
+
+In every mode, `/bg TASK` (Telegram, a Slack message, the web composer) and the "Run in
+parallel" button of the web chat start a parallel run, like a background agent of Claude Code.
+`agent_profiles.max_parallel_runs` (default 3, from 1 to 10) is the most open chat runs
+(`running` or `paused`) of one session.
+
+- **Join.** In the mode `steer`, the channels and `POST /sessions/{id}/messages` first call
+  `steer(..., busy_mode=True)`. It adds the text as a note only to a `running` chat run of a
+  profile in the mode `steer`, and only a plain text message: no image, no skill command, at
+  most `MAX_STEER_CHARS`. A run with `MAX_PENDING_STEERS` notes does not take more. When no run
+  takes the note, the message goes to `enqueue` as before. When the session has more than one
+  open chat run, the newest run gets the note. The API answers `steered: true`, and
+  `GET /sessions/{id}/steers` lists the notes with their status (`pending`, `delivered`,
+  `requeued`, `dropped`), so the web chat shows "Queued into the current run" and then
+  "Delivered to the run". The OpenAI runtime has no mid-run steer (Section 5.3), so there a note
+  always becomes the next message when the run completes.
+- **Enqueue.** `enqueue(..., parallel=True)` or the mode `parallel` sets
+  `runs.allow_parallel`.
+- **Claim.** `_ready` is the rule of a queued run. FIFO per session stays: no older chat run of
+  the session waits. A review run starts only when the session has no open run. A chat run never
+  starts next to an open review run or `/compact` run. A chat run starts when the session has no
+  open chat run, when it resumes after an approval (it was open before), or when it has
+  `allow_parallel`, is not a `/compact` run, and the session has fewer open chat runs than
+  `max_parallel_runs`. A chat run that starts while another chat run of its session is open is a
+  side run (`runs.side`). Each chat run that starts stores `runs.context_seq`, the newest
+  `messages.seq` of the session at its claim.
+- **Locks.** The candidate statement locks the run and its session row
+  (`FOR NO KEY UPDATE OF runs, sessions SKIP LOCKED`), so the claims of one session are in a
+  sequence and the count of open runs stays true until the claim commits. `complete` takes the
+  same session lock before it stores the reply. So the transcript that a run reads at its claim
+  has every reply that committed before the claim and no later reply. A message insert takes only
+  a key share lock, so the claim lock does not stop an enqueue.
+- **Side run.** A side run has no runtime state: it starts a new runtime session (a new Claude
+  SDK session, or a new OpenAI conversation), so it never writes the runtime files of another
+  run. Its input carries the transcript (`sama.orchestrator.parallel.side_block`): the newest 30
+  messages of the session up to its `context_seq` (each cut to 2,000 characters, at most 24,000
+  characters), and the requests of the other open runs, with the rule that it must not do their
+  work or change their files. It gets all pins and does not reserve them. It uses the frozen
+  `RunConfig` of the session, so the prefix and the prompt cache are the same (D9). Its runtime
+  state is stored but not used by later runs: `_session_state_query` skips side runs.
+- **Main run and catch-up.** A main run resumes the runtime state of the newest main run, as
+  before. The side runs that completed after that state was made (their reply is newer than the
+  `context_seq` of the run that made the state) are not in it. The input of the main run carries
+  them in a `<parallel_answers>` block, in the order of completion, at most the newest 10 turns
+  (`catch_up_block`). The claim reads the newest side reply in its one `UPDATE ... RETURNING`, so
+  a run with no catch-up uses no extra statement. The next main run resumes a state that has
+  the catch-up, so no turn is lost and no turn comes two times.
+- **Order.** Each reply is stored when its run completes, so the replies join the transcript and
+  the channel thread in the order of completion. Each channel follows each run, so each answer
+  comes in the same thread when its run ends.
+- **Stop.** `/stop` stops all open runs of the session. `/stop NUMBER` stops the run at that
+  place of `open_runs` (the open chat runs, oldest first). A wrong number lists the open runs.
+  The answer to a parallel run tells its number. `GET /sessions/{id}/open-runs` gives the list.
+- **Limits and quotas.** A side run counts like any run: one message for the message rates, one
+  run for `max_running_runs` of the org and the plan (Section 17.5), and its model cost for the
+  model quotas. A run that waits for the session limit stays `queued`.
+- **Sandbox.** Both runs use the session sandbox, as sub-agents of Claude Code share the work
+  folder. The side runner takes no runner lock (Section 16.2). Two runs can change the same
+  files. Each runner takes its checkpoints under the checkpoint lock, and `/undo` refuses when the
+  checkpoints of the last run mix with those of another run (Section 15.3).
 
 **Approvals.** `ApprovalRequired` pauses the run: the status is `paused`, `pending_approval_id`
 is the approval id, and the runtime state is stored. If the tool gate did not store the
@@ -509,7 +580,9 @@ RunEvent = (
 - `RunRequest` holds the `RunScope` (org, workspace, session, run, audience, and the user for
   a private session), the user input, the frozen `RunConfig`, the run `Budget`, and the
   runtime state from the previous run. `ResumeRequest` holds the approval id, the decision
-  (`approve` or `reject`), and the runtime state from `ApprovalRequired`.
+  (`approve` or `reject`), and the runtime state from `ApprovalRequired`. Since M7.1, both have
+  `parallel`: true for a side run (Section 4.3). A side run has no runtime state, and the runner
+  runs it next to the main runner of the session (Section 16.2).
 - `RunConfig` is frozen per session. It holds only what the model sees and what the cache
   needs: runtime, model, the sama system text, SOUL, context files, memory snapshot, skill
   index, the environment text, tool schemas, and MCP server configs. A context file path
@@ -1270,6 +1343,10 @@ for it.
 - A **session binding** maps a channel thread to a session: a Telegram chat, a Slack thread,
   a web chat, or an extension tab. `/new` starts a new session in the same binding.
 - **Resume** uses the runtime's resume (Section 5.3) and the session sandbox.
+- **Parallel runs (M7.1).** A session can have more than one open run (Section 4.3). Each run
+  sees the messages that were stored before it started. The reply that ends first is stored
+  first. A side run starts a new runtime session with the transcript in its input, and the next
+  main run gets the answers of the side runs in a catch-up block.
 - **Lineage**: compaction, `/branch`, `/retry`, and delegation create child sessions linked to
   the parent. Nothing is overwritten. Since M2.6 a compaction makes an archive session
   (`lineage = compaction`, the status `archived`) that holds the transcript from before the
@@ -1824,8 +1901,8 @@ and review runs do not count, so a review cannot start a review (recursion is of
 does not ask for a `memory` call, because each shared change is a proposal that a role decides.
 
 **Limits of the queue.** The partial unique index `ix_runs_one_queued_review_per_session` allows
-one queued review for each session. The index `ix_runs_one_active_per_session` allows one running
-review. If a review waits when the next trigger fires, sama extends the range of the waiting
+one queued review for each session. The claim starts a review only when the session has no open
+run, so at most one review runs. If a review waits when the next trigger fires, sama extends the range of the waiting
 review and does not make a second one.
 
 **Review run.** The run is unattended, has no user, and writes no message. Its input is a
@@ -3158,13 +3235,15 @@ One gateway service hosts all channel adapters. Each adapter does five things:
    `/skills`, `/memory`, `/cron`, `/approve`, `/deny`, `/<skill-name>`). A skill command changes the text of the
    message (Section 9.5).
 
-**Busy controls and handoff (M3.9).** The queue, `/stop`, and `/steer` are in Section 4.3. Each
-channel shows them in the same way:
+**Busy controls and handoff (M3.9, M7.1).** The busy modes, the queue, `/stop`, `/steer`, and
+`/bg` are in Section 4.3. Each channel shows them in the same way:
 
 | Control | Telegram | Slack | Web app |
 |---|---|---|---|
 | Queue | The reply to a message that waits says "Queued", with the steer and stop commands. When the run starts, the gateway follows it. | The same, in the direct message or the thread. | `POST /sessions/{id}/messages` answers `queued: true`, and the chat shows a notice. |
-| Stop | `/stop` | `/sama stop` | `/stop` in the composer, or the Stop button. |
+| Join (M7.1) | A plain message while a run works joins it, and the reply says so. | The same, in the direct message or the thread. | `POST /sessions/{id}/messages` answers `steered: true`. The chat shows the message with "Queued into the current run", then "Delivered to the run" (`GET /sessions/{id}/steers`). |
+| Parallel (M7.1) | `/bg TASK`. The reply gives the number of the run. | `/bg TASK` in the message. | `/bg TASK` in the composer or the "Run in parallel" button (`parallel: true`). With two or more open runs, the chat lists them, each with its live text and a Stop button. |
+| Stop | `/stop` stops all runs, `/stop NUMBER` one run | `/sama stop [NUMBER]` in a direct message. In a thread, a mention with `/stop [NUMBER]`. | `/stop [NUMBER]` in the composer, the Stop button (all runs), or the Stop button of one run. |
 | Steer | `/steer TEXT` | `/sama steer TEXT` in a direct message. In a thread, a mention with `/steer TEXT`, because a Slack command has no thread. | `/steer TEXT` in the composer (`POST /sessions/{id}/steer`). |
 | Handoff | `/handoff slack` or `/handoff web` in the direct chat | `/sama handoff telegram` or `/sama handoff web` in a direct message | `/handoff telegram` or `/handoff slack` in the composer (`POST /sessions/{id}/handoff`). |
 | Undo (M6.4) | `/undo` in the direct chat | `/sama undo` in a direct message | `/undo` in the composer (`POST /sessions/{id}/undo`). |
@@ -3628,7 +3707,7 @@ session (audit `session.created` with `channel: telegram`). Sessions that Telegr
 channel hint in the volatile prompt tier (Section 6.1).
 
 **Commands.** `/new` starts a new session with the same profile. `/stop` cancels the open runs
-of the session. `/model` lists the profiles of the workspace. `/model <name>` starts a child
+of the session, and `/stop NUMBER` cancels one (M7.1). `/bg TASK` starts a parallel run. `/model` lists the profiles of the workspace. `/model <name>` starts a child
 session (`lineage = branch`) with that profile and binds the chat to it. `/help` lists the
 commands. Since M2.6, `/compact [focus]` makes the context of the session shorter (it follows
 the busy rule of Section 6.3 and answers with the token counts), and `/pin <text>`, `/pins`,
@@ -5855,6 +5934,14 @@ and the counts of files (`files`, `deleted`, `kept`).
 - `/undo` restores the files to before the last run that changed them. A second `/undo`
   goes back one more run. A run that did not change the files is skipped. This is not the
   conversation undo of Hermes: the messages of the session do not change.
+- **Parallel runs (M7.1).** Two runs of one session can change files at the same time (Section
+  4.3). Their checkpoints are in one history, under the checkpoint lock. If another run has a
+  checkpoint between the checkpoints of the run that `/undo` chooses, the undo would also undo a
+  part of the work of the other run. Then `/undo` changes nothing and tells the user to choose a
+  checkpoint with `/rollback`. A restore still refuses while any run of the session is open, and
+  each restore first takes a `rollback` checkpoint, so no file of a run is lost without a way
+  back. Sama has no lock on single paths: like sub-agents of Claude Code in one work folder, the
+  runs share the files, and the side run is told which requests the other runs work on.
 
 The commands work in a Telegram direct chat, a Slack direct message, and the web composer
 (Section 11.1). The HTTP routes are in Section 11.4. The commands need the session sandbox,
@@ -6368,7 +6455,7 @@ each approval resumes once, and a cancelled run cannot resume. The runtime state
 adapter (for Claude, the session id and the transcript) goes back to the caller in the
 terminal event, as in Section 5.1, so the next runner continues the session. For now the
 session-to-sandbox map and these rules are in memory. The run queue (Section 4.3) enforces
-the same rules across processes: one active run per session, one resume per approval, and no
+the same rules across processes: one active main run per session, one resume per approval, and no
 resume after a cancel. With `PostgresSandboxDirectory`, the session-to-sandbox map is in
 `sessions.sandbox_id`.
 
@@ -6438,8 +6525,12 @@ not change.
   `runner timing mode=<cold|warm> job_s= lock_s= runtime_s= first_event_s= terminal_s= exit_s=`.
   The orchestrator logs this line with `run=<id>` (Section 18.1).
 
-**Runner lock.** A runner holds an exclusive `flock` on `.sama/runner.lock` in the work folder
-while it builds the runtime, streams, and closes it. The next runner of the session waits for
+**Runner lock.** A main runner holds an exclusive `flock` on `.sama/runner.lock` in the work
+folder while it builds the runtime, streams, and closes it. A side runner (M7.1,
+`RunRequest.parallel`) takes no runner lock: it has a new runtime session, so it never uses the
+runtime files of another run, and it runs at the same time as the main runner. The session
+sandbox, the warm runner, and the idle timeout are shared: the orchestrator counts the runs of
+the session and sets the idle timeout back only after the last one. The next runner of the session waits for
 the lock for at most 20 seconds. If the lock is still busy, the runner builds no runtime and
 sends `RunFailed` (`sandbox_error`, retryable). So the runner of a run that is still stopping
 (the Claude CLI writes its transcript at the stop) is never in the same session files as the
