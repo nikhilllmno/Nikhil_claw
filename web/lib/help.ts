@@ -181,7 +181,7 @@ export const HELP_TOPICS: HelpTopic[] = [
       {
         heading: "Custom tools",
         paragraphs: [
-          "On the Tools page you add your own tool: an HTTP request to an API, or a Python or Node script that runs in the sandbox of the session. Give it a description, the arguments as a JSON schema, and a policy: run without asking, ask before each call, or off. Test it on the page. Each change is a version that you can revert. A tool for you alone works at once. A tool for the workspace or the org waits until an admin approves it.",
+          "On the Tools page you add your own tool: an HTTP request to an API, or a Python or Node script that runs in the sandbox of the session. Give it a description, the arguments as a JSON schema, and a policy: run without asking, ask before each call, or off. Test it on the page. Each change is a version that you can revert. Any member adds tools for themselves. An admin adds the tools for the workspace and the org.",
         ],
       },
       {

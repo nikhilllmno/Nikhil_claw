@@ -179,11 +179,10 @@ export interface CustomTool {
   name: string;
   /** The name that the agent uses: `custom_<name>`. */
   tool_name: string;
-  /** The version that runs. Null until an admin approves a version. */
+  /** The version that runs. Null only for a tool from before M7.3 removed proposals. */
   current_version: number | null;
   current: CustomToolVersion | null;
   latest: CustomToolVersion | null;
-  pending: number;
   has_credential: boolean;
   can_manage: boolean;
   created_at: string;
@@ -2454,9 +2453,14 @@ export class ApiClient {
       method: "POST",
       body,
     });
-  /** A new version. For a member who cannot manage a shared tool, it waits for an admin. */
+  /** A new version. Only a person who manages the tool can write it. */
   editCustomTool = (toolId: string, body: CustomToolDefinition & { summary?: string }) =>
     this.json<CustomTool>(`/custom-tools/${encodeURIComponent(toolId)}`, { method: "PUT", body });
+  /** The scopes in which the user can add a tool: `user`, and the shared scopes for an admin. */
+  customToolScopes = (workspaceId: string) =>
+    this.json<{ scopes: CustomToolScope[] }>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/custom-tools/scopes`,
+    );
   customToolVersions = (toolId: string) =>
     this.json<CustomToolVersion[]>(`/custom-tools/${encodeURIComponent(toolId)}/versions`);
   revertCustomTool = (toolId: string, version: number) =>
@@ -2464,11 +2468,6 @@ export class ApiClient {
       method: "POST",
       body: { version },
     });
-  reviewCustomTool = (toolId: string, version: number, decision: "approve" | "reject") =>
-    this.json<CustomTool>(
-      `/custom-tools/${encodeURIComponent(toolId)}/versions/${version}/${decision}`,
-      { method: "POST" },
-    );
   setCustomToolCredential = (toolId: string, credential: CustomToolCredential) =>
     this.json<CustomTool>(`/custom-tools/${encodeURIComponent(toolId)}/credential`, {
       method: "PUT",

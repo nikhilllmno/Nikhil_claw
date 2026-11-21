@@ -3442,27 +3442,27 @@ agent. The gate on the tool server stays the boundary for every sama tool call.
 The sandbox image has Node.js 22 since M7.2 (Section 15.4). A failure gives the exit code and the
 end of the standard error.
 
-**Scopes and approval.** Scopes work like the scopes of the skills (Section 9.2).
+**Scopes.** Any member adds tools for themselves. Only an admin adds and changes the shared
+tools. This is the choice of the owner, and it is the rule of the sub-agent library (Section 13.3).
 
-| Scope | Who sees it | A write applies at once for | A write of another member |
-|---|---|---|---|
-| `user` | Its user only | Its user | Not possible |
-| `workspace` | The members who see the workspace | A workspace admin, an org admin, or the org owner | A `pending` version |
-| `org` | Every member of the org | An org admin or the org owner | A `pending` version |
+| Scope | Who sees it | Who writes it |
+|---|---|---|
+| `user` | Its user only | Its user |
+| `workspace` | The members who see the workspace | A workspace admin, an org admin, or the org owner |
+| `org` | Every member of the org | An org admin or the org owner |
 
-- Each write (create, edit, revert) is a new version (`custom_tool_versions`). A version never
-  changes, except its review: `approved`, `pending`, or `rejected`. The tool runs its
-  `current_version`. A new shared tool that a member proposes has no current version, so it
-  does not run.
-- A person who manages the tool approves or rejects a pending version
-  (`POST /custom-tools/{id}/versions/{n}/approve` or `/reject`). The checks run again at the
-  approval. A tool has at most 20 open proposals.
+- A create, an edit, or a revert of a `workspace` or `org` tool by another member gets `403`.
+  That member reads and uses the tool. `GET /workspaces/{id}/custom-tools/scopes` gives the
+  scopes in which the user can add a tool, and the web form offers only those scopes.
+- Each write (create, edit, revert) is a new version (`custom_tool_versions`) and applies at
+  once. A version never changes. The tool runs its `current_version`. Every version is
+  `approved`: the column `review` stays from the first design of M7.3, which let members propose
+  shared versions for an admin to approve. The owner did not choose that design, so it was
+  removed before production.
 - A revert copies an old version into a new version (`change = revert`).
-- Only a person who manages the tool sets its credential, tests it, and deletes it. A member who
-  proposes a version cannot set the credential, so a proposal cannot send a saved key to a new
-  host.
-- Each write is in the audit log: `custom_tool.created`, `edited`, `reverted`, `proposed`,
-  `approved`, `rejected`, `credential_set`, `tested`, and `deleted`.
+- Only a person who manages the tool sets its credential, tests it, and deletes it.
+- Each write is in the audit log: `custom_tool.created`, `edited`, `reverted`,
+  `credential_set`, `tested`, and `deleted`.
 
 **Checks of each write.** The description, the input schema (with the descriptions of the
 arguments), the headers, the body, the URL, and the summary get the prompt injection scan of
@@ -3506,7 +3506,7 @@ scratch sandbox that is not killed pauses after 5 minutes.
 
 **Routes.** `GET` and `POST /workspaces/{id}/custom-tools`, `GET`, `PUT`, and
 `DELETE /custom-tools/{id}`, `GET /custom-tools/{id}/versions`,
-`POST /custom-tools/{id}/revert`, `POST /custom-tools/{id}/versions/{n}/{approve|reject}`,
+`GET /workspaces/{id}/custom-tools/scopes`, `POST /custom-tools/{id}/revert`,
 `PUT /custom-tools/{id}/credential`, and `POST /custom-tools/{id}/test`. No answer has a
 credential. A validation error does not repeat the input.
 
@@ -3521,9 +3521,10 @@ A user delete removes the `user` tools of the user and their credentials.
 **Web app.** The Tools page lists the tools of the workspace with the scope, the kind, the
 running version, and the policy. It adds and edits a tool (a form for the request or the
 script), tests it, sets the credential, shows the versions with the whole definition of each
-version, tests one version (also a pending version, before an admin approves it), approves or
-rejects a pending version, reverts, and deletes. `CustomToolsPanel` holds the whole feature for one workspace, so
-the settings console (M7.10) can use it.
+version, tests one version, reverts, and deletes. The scope list of the form has only the
+scopes that the user can write, so a member sees "Only me". A member sees the shared tools
+without the edit, test, and delete controls. `CustomToolsPanel` holds the whole feature for one
+workspace, so the settings console (M7.10) can use it.
 
 **Assumptions.**
 

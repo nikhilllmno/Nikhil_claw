@@ -152,28 +152,40 @@ async def test_a_member_adds_tests_and_reverts_a_user_tool(
     assert (await http.get(f"/custom-tools/{tool_id}", headers=mia(tenant))).status_code == 404
 
 
-async def test_a_workspace_tool_of_a_member_waits_for_an_admin(
+async def test_a_member_gets_403_for_a_shared_tool_and_an_admin_adds_it(
     http: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:
     base = f"/workspaces/{tenant.ids['ws']}/custom-tools"
-    refused = await http.post(base, headers=mia(tenant), json=tool(scope="workspace"))
-    assert refused.status_code == 403  # a member cannot set a shared credential
-    proposed = await http.post(
-        base, headers=mia(tenant), json=tool(scope="workspace", credential=None)
-    )
-    assert proposed.status_code == 201
-    assert (proposed.json()["current_version"], proposed.json()["pending"]) == (None, 1)
-    tool_id = proposed.json()["id"]
-    approve = f"/custom-tools/{tool_id}/versions/1/approve"
-    assert (await http.post(approve, headers=mia(tenant))).status_code == 403
+    scopes = await http.get(f"{base}/scopes", headers=mia(tenant))
+    assert scopes.json() == {"scopes": ["user"]}
+    for scope in ("workspace", "org"):
+        for credential in (None, {"value": KEY}):
+            refused = await http.post(
+                base, headers=mia(tenant), json=tool(scope=scope, credential=credential)
+            )
+            assert refused.status_code == 403, refused.text
+            assert "only an admin" in refused.text
     admin = bearer(await add_user(engine, tenant, workspace_member=True, role="admin"))
-    approved = await http.post(approve, headers=admin)
-    assert approved.json()["current_version"] == 1
-    credential = await http.put(
-        f"/custom-tools/{tool_id}/credential", headers=admin, json={"value": KEY}
-    )
-    assert credential.json()["has_credential"] is True
-    assert KEY not in credential.text
+    assert (await http.get(f"{base}/scopes", headers=admin)).json() == {
+        "scopes": ["user", "workspace", "org"]
+    }
+    made = await http.post(base, headers=admin, json=tool(scope="workspace"))
+    assert made.status_code == 201
+    assert made.json()["current_version"] == 1
+    assert made.json()["has_credential"] is True
+    assert KEY not in made.text
+    tool_id = made.json()["id"]
+    edit = {k: v for k, v in tool(policy="ask").items() if k not in ("name", "scope", "credential")}
+    assert (
+        await http.put(f"/custom-tools/{tool_id}", headers=mia(tenant), json=edit)
+    ).status_code == 403
+    assert (
+        await http.post(f"/custom-tools/{tool_id}/revert", headers=mia(tenant), json={"version": 1})
+    ).status_code == 403
+    # The review route is gone: no member can propose a shared version.
+    assert (
+        await http.post(f"/custom-tools/{tool_id}/versions/1/approve", headers=admin)
+    ).status_code in (404, 405)
     # A user outside the workspace does not see it.
     stranger = bearer(await add_user(engine, tenant, workspace_member=False))
     assert (await http.get(f"/custom-tools/{tool_id}", headers=stranger)).status_code == 404

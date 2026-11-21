@@ -246,12 +246,12 @@ export function credentialOf(draft: Draft): CustomToolCredential | null {
 }
 
 /** The body of a new tool, or the first problem of the draft. */
-export function createBody(draft: Draft, canSetCredential: boolean): CustomToolCreate | string {
+export function createBody(draft: Draft): CustomToolCreate | string {
   if (!NAME_PATTERN.test(draft.name))
     return "The name must have 2 to 40 characters: lower-case letters, digits, and _, and start with a letter.";
   const definition = definitionOf(draft);
   if (typeof definition === "string") return definition;
-  const credential = canSetCredential ? credentialOf(draft) : null;
+  const credential = credentialOf(draft);
   return {
     ...definition,
     name: draft.name,
@@ -274,13 +274,12 @@ export function testArguments(text: string): Record<string, unknown> | string {
 
 /** A short state line of a tool for the list. */
 export function toolState(tool: CustomTool): string {
-  if (tool.current_version === null) return "Waiting for an admin";
-  const policy = tool.current ? POLICY_LABELS[tool.current.policy] : "";
-  const pending = tool.pending > 0 ? ` · ${tool.pending} change(s) wait for an admin` : "";
-  return `Version ${tool.current_version} · ${policy}${pending}`;
+  if (tool.current_version === null || tool.current === null) return "No version runs";
+  return `Version ${tool.current_version} · ${POLICY_LABELS[tool.current.policy]}`;
 }
 
-/** True when a member without the role makes a change that waits for an admin. */
-export function needsApproval(scope: CustomToolScope, canManage: boolean): boolean {
-  return scope !== "user" && !canManage;
+/** The scopes that the create form offers: the scopes that the API says the user can write. */
+export function scopeChoices(writable: CustomToolScope[] | null): CustomToolScope[] {
+  const order: CustomToolScope[] = ["user", "workspace", "org"];
+  return writable === null ? ["user"] : order.filter((scope) => writable.includes(scope));
 }

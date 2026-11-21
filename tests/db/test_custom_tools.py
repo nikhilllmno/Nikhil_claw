@@ -180,64 +180,57 @@ async def test_a_user_tool_applies_at_once_and_only_its_user_sees_it(
     assert listed == []
 
 
-async def test_a_member_proposes_a_workspace_tool_and_an_admin_approves_it(
+async def test_only_an_admin_writes_a_shared_tool(
     engine: AsyncEngine, org: Org1, service: CustomToolService
 ) -> None:
+    """The user chose: any member adds tools for themselves, admins add shared tools. A member
+    gets 403 for a create, an edit, or a revert of a workspace or org tool (Section 10.8)."""
     org_id = org.ids["org"]
     mia, admin = await grants(engine, org, "mia"), await grants(engine, org, "admin")
+    for scope in ("workspace", "org"):
+        with pytest.raises(CustomToolError, match="only an admin") as error:
+            await service.create(
+                org_id,
+                mia,
+                scope=scope,
+                workspace_id=org.ids["ws"],
+                name="weather",
+                definition=http_tool(),
+            )
+        assert error.value.status_code == 403
+    assert service.writable_scopes(mia, org.ids["ws"]) == ["user"]
+    assert service.writable_scopes(admin, org.ids["ws"]) == ["user", "workspace", "org"]
     view = await service.create(
         org_id,
-        mia,
+        admin,
         scope="workspace",
         workspace_id=org.ids["ws"],
         name="weather",
         definition=http_tool(),
     )
-    assert view.current_version is None
-    assert view.pending == 1
-    assert not view.can_manage
-    scope = await service.run_scope(org.claims("secret-run", session_id=str(org.ids["secret"])))
+    assert view.current_version == 1
+    # Mia sees and uses the tool, but cannot change, revert, test, or delete it.
+    seen = await service.get(org_id, view.id, mia)
+    assert not seen.can_manage
+    for call in (
+        service.edit(org_id, view.id, mia, http_tool(description="Get the weather now.")),
+        service.revert(org_id, view.id, mia, 1),
+        service.set_credential(org_id, view.id, mia, {"value": TOKEN}),
+        service.test(org_id, view.id, mia, {"city": "Pune"}),
+        service.delete(org_id, view.id, mia),
+    ):
+        with pytest.raises(CustomToolError) as error:
+            await call
+        assert error.value.status_code == 403
+    run = await service.run_scope(org.claims("secret-run", session_id=str(org.ids["secret"])))
     async with engine.connect() as connection:
-        assert await service.live(connection, scope) == []
-    with pytest.raises(CustomToolError, match="owner of the tool or an admin") as error:
-        await service.review(org_id, view.id, mia, 1, approve=True)
-    assert error.value.status_code == 403
-    # A member cannot set the credential of a shared tool or test it.
-    with pytest.raises(CustomToolError):
-        await service.set_credential(org_id, view.id, mia, {"value": TOKEN})
-    with pytest.raises(CustomToolError):
-        await service.test(org_id, view.id, mia, {"city": "Pune"})
-    approved = await service.review(org_id, view.id, admin, 1, approve=True)
-    assert approved.current_version == 1
-    async with engine.connect() as connection:
-        live = await service.live(connection, scope)
+        live = await service.live(connection, run)
     assert [tool.tool_name for tool in live] == ["custom_weather"]
-    # A new proposal does not change the running version.
-    await service.edit(org_id, view.id, mia, http_tool(description="Get the weather now."))
-    rejected = await service.review(org_id, view.id, admin, 2, approve=False)
-    assert rejected.current_version == 1
-    with pytest.raises(CustomToolError, match="rejected"):
-        await service.review(org_id, view.id, admin, 2, approve=True)
-    async with engine.connect() as connection:
-        actions = (
-            (
-                await connection.execute(
-                    text(
-                        "SELECT action FROM audit_log WHERE org_id = :org AND target_id = :id"
-                        " ORDER BY id"
-                    ),
-                    {"org": org_id, "id": str(view.id)},
-                )
-            )
-            .scalars()
-            .all()
-        )
-    assert actions == [
-        "custom_tool.proposed",
-        "custom_tool.approved",
-        "custom_tool.proposed",
-        "custom_tool.rejected",
-    ]
+    # The admin edits it at once.
+    edited = await service.edit(org_id, view.id, admin, http_tool(description="Weather now."))
+    assert edited.current_version == 2
+    versions = await service.versions(org_id, view.id, mia)
+    assert {v.review for v in versions} == {"approved"}
 
 
 async def test_an_org_tool_needs_an_org_admin(
@@ -254,11 +247,6 @@ async def test_an_org_tool_needs_an_org_admin(
             name="ww",
             definition=http_tool(),
         )
-    mia = await grants(engine, org, "mia")
-    proposed = await service.create(
-        org_id, mia, scope="org", workspace_id=org.ids["ws"], name="w1", definition=http_tool()
-    )
-    assert proposed.current_version is None
     admin = await grants(engine, org, "admin")
     made = await service.create(
         org_id, admin, scope="org", workspace_id=org.ids["ws"], name="w2", definition=http_tool()
