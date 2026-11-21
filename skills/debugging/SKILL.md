@@ -1,8 +1,8 @@
 ---
 name: debugging
 description: Find the cause of a bug before you change code
-version: 1.0.0
-tags: [code, debugging]
+version: 1.0.1
+tags: [software, code, debugging]
 requires_toolsets: [core]
 ---
 

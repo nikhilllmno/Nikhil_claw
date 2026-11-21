@@ -1,8 +1,8 @@
 ---
 name: summarize
 description: Summarize a document, page, or thread at set length
-version: 1.0.0
-tags: [summary, reading]
+version: 1.0.1
+tags: [writing, summary, reading]
 requires_toolsets: [web]
 ---
 
