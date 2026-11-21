@@ -188,7 +188,7 @@ def test_the_skill_names_only_tools_that_it_requires(name: str) -> None:
         ("Use `web_search`.", (), "web_search needs the toolset web"),
         ('Call `web_search(query="x")`.', (), "web_search needs the toolset web"),
         ('Call `web_search_typo(query="x")`.', ("web",), "web_search_typo is not a sama tool"),
-        ("Use `browser_task`.", ("browser",), "browser_task is not a sama tool"),
+        ("Use `browser_teleport`.", ("browser",), "browser_teleport is not a sama tool"),
         ('Run `Bash("ls")`.', ("core",), "Bash is a tool of one runtime"),
         ("Use `WebFetch`.", ("core",), "WebFetch is a tool of one runtime"),
     ],
