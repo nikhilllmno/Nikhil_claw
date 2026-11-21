@@ -19,7 +19,7 @@ from sama.api.origins import (
     parse_extension_ids,
     parse_origins,
 )
-from sama.db.models import AgentProfile, AuditEntry, Membership, Run, User
+from sama.db.models import AgentProfile, AuditEntry, Membership, ProfileChange, Run, User
 from sama.gate import GateStep
 from sama.gate.decide import TOOLSETS
 from sama.gate.service import GateService
@@ -989,16 +989,6 @@ async def test_a_missing_key_or_null_is_no_limit_and_null_effort_is_the_default(
         json={"budget": {"max_turns": 5, "max_cost_usd": "1"}, "reasoning_effort": "low"},
     )
 
-
-async def test_an_admin_sets_the_delegation_model_and_the_memory_provider(
-    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
-) -> None:
-    """M7.5: the cheaper model of the children (Section 13.2) and Mem0 (Section 8.2)."""
-    admin = await admin_headers(engine, tenant)
-    body = (await client.get(agent(tenant), headers=admin)).json()
-    assert (body["delegation_model"], body["memory_provider"]) == (None, "builtin")
-    assert body["options"]["memory_providers"] == ["builtin", "mem0"]
-
     response = await client.patch(
         agent(tenant),
         headers=admin,
@@ -1132,3 +1122,50 @@ async def test_a_revert_puts_the_budget_and_the_effort_back(
     assert response.status_code == 200, response.text
     row = await stored(engine, tenant)
     assert (row.budget, row.reasoning_effort) == ({}, None)
+
+
+async def test_an_admin_sets_the_delegation_model_and_the_memory_provider(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """M7.5: the cheaper model of the children (Section 13.2) and Mem0 (Section 8.2)."""
+    admin = await admin_headers(engine, tenant)
+    body = (await client.get(agent(tenant), headers=admin)).json()
+    assert (body["delegation_model"], body["memory_provider"]) == (None, "builtin")
+    assert body["options"]["memory_providers"] == ["builtin", "mem0"]
+
+    response = await client.patch(
+        agent(tenant),
+        headers=admin,
+        json={"delegation_model": "claude-haiku-5-5", "memory_provider": "mem0"},
+    )
+    assert response.status_code == 200
+    assert (response.json()["delegation_model"], response.json()["memory_provider"]) == (
+        "claude-haiku-5-5",
+        "mem0",
+    )
+    bad = await client.patch(agent(tenant), headers=admin, json={"delegation_model": "gpt-6-luna"})
+    assert bad.status_code == 422
+    assert "delegation model is not known" in bad.json()["detail"]
+    bad = await client.patch(agent(tenant), headers=admin, json={"memory_provider": "honcho"})
+    assert bad.status_code == 422
+
+    # A switch to a runtime that does not know the child model clears it.
+    response = await client.patch(
+        agent(tenant), headers=admin, json={"runtime": "openai_agents_sdk", "model": "gpt-6.2-sol"}
+    )
+    assert response.status_code == 200
+    assert response.json()["delegation_model"] is None
+    response = await client.patch(agent(tenant), headers=admin, json={"delegation_model": ""})
+    assert response.status_code == 200
+    row = await stored(engine, tenant)
+    assert (row.delegation_model, row.memory_provider) == (None, "mem0")
+    # The history has the change, so an admin can revert it.
+    async with engine.connect() as connection:
+        kinds = (
+            await connection.execute(
+                select(ProfileChange.after).where(
+                    ProfileChange.agent_profile_id == tenant.ids["profile"]
+                )
+            )
+        ).scalars()
+        assert any("memory_provider" in after for after in kinds)

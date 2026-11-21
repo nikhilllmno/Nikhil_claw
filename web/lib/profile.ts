@@ -145,14 +145,6 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
   }
   if (draft.delegationModel !== (profile.delegation_model ?? "")) patch.delegation_model = draft.delegationModel;
   if (draft.memoryProvider !== profile.memory_provider) patch.memory_provider = draft.memoryProvider;
-  if (Number.isInteger(limit) && limit !== (profile.max_parallel_runs ?? 3))
-    patch.max_parallel_runs = limit;
-  if (draft.delegationModel !== (profile.delegation_model ?? ""))
-    patch.delegation_model = draft.delegationModel;
-  if (draft.memoryProvider !== profile.memory_provider)
-    patch.memory_provider = draft.memoryProvider;
-  if (draft.delegationModel !== (profile.delegation_model ?? "")) patch.delegation_model = draft.delegationModel;
-  if (draft.memoryProvider !== profile.memory_provider) patch.memory_provider = draft.memoryProvider;
   return patch;
 }
 

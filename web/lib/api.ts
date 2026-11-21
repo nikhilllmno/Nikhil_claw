@@ -2178,16 +2178,6 @@ export class ApiClient {
       { method: "POST", body },
     );
   searchSessions = (orgId: string, q: string, workspaceId: string | null, limit = 10) =>
-    this.json<SkillVersionDetail>(
-      `/skills/${encodeURIComponent(skillId)}/versions/${version}`,
-    );
-  searchSessions = (
-    orgId: string,
-    q: string,
-    workspaceId: string | null,
-    limit = 10,
-  ) =>
-  searchSessions = (orgId: string, q: string, workspaceId: string | null, limit = 10) =>
     this.json<SearchHit[]>(
       `/orgs/${encodeURIComponent(orgId)}/session-search${query({ q, workspace_id: workspaceId, limit })}`,
     );
