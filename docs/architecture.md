@@ -671,7 +671,9 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
 
 - **Agent.** Each run builds one `SandboxAgent` with the sama prefix as `instructions`, the
   `Shell` and `Compaction` capabilities, and one `MCPServerStreamableHttp` for each MCP
-  server of the config, with the run token in an `Authorization` header. The SDK sandbox
+  server of the config, with the run token in an `Authorization` header. Each MCP call can
+  take 1,200 seconds (`MCP_CALL_TIMEOUT_S`). The SDK default is 5 seconds, which fails every
+  sama tool that takes longer (for example a new browser session or `clarify`). The SDK sandbox
   client is `UnixLocalSandboxClient` in the work folder, with no snapshot. The model is
   `OpenAIResponsesModel` over an `AsyncOpenAI` client with the proxy URL and the run token.
 - **Session items.** The SDK `Session` of the run is a sama store (`_Store`) over
@@ -4734,6 +4736,10 @@ point of it, as with computer use.
   (x, y) yet; use a ref from browser_snapshot". It also refuses `clicks` other than 1, so a
   target cannot ignore a double click. The target protocol does not change, so a
   target can add vision mode later. For `my_chrome`, see Section 14.2.2.
+- **Viewport.** The `cloud` target asks Browserbase for a 1280x720 viewport
+  (`browserSettings.viewport`, `sama.browser.browserbase.VIEWPORT`). Without it, a session of
+  the project had a 2560x1440 viewport. Claude Code scales an image wider than 2000 pixels down,
+  so the model had to convert each point, and each screenshot cost more tokens.
 - **Tests.** `tests/browser/canvas_app.py` is a canvas app with six steps (click three circles in
   order, double-click, hover, drag, type, and scroll the wheel). Its accessibility tree is empty.
   `tests/browser/test_vision.py` does the task at points with a local Chromium.

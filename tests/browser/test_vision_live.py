@@ -37,7 +37,7 @@ from sama.browser.browserbase import API_URL, BrowserbaseTarget
 from sama.browser.contexts import MemoryContextStore
 from sama.browser.guard import UrlGuard
 from sama.browser.service import BrowserService
-from sama.browser.target import Act
+from sama.browser.target import Act, BrowserError
 from sama.runtime import AgentRuntime, RunCompleted, RunRequest, RuntimeKind
 from sama.runtime.contract import McpServerConfig, RunConfig, RunScope
 from sama.runtime.gating import GateDecision
@@ -104,9 +104,13 @@ async def test_vision_mode_does_the_canvas_task_on_browserbase(service: BrowserS
     caption, shot = await service.screenshot(claims)
     assert shot.data[:3] == b"\xff\xd8\xff"
     # One pixel of the image is one CSS pixel of the viewport: the canvas app needs 800x540.
-    assert shot.width >= 800, caption
-    assert shot.height >= 540, caption
+    # The target asks for a 1280x720 viewport (browserbase.VIEWPORT).
+    assert (shot.width, shot.height) == (1280, 720), caption
     assert f"The image is {shot.width}x{shot.height} pixels. It is the viewport" in caption
+    # One pixel of the image is one CSS pixel: the viewport check of the session has the same
+    # size.
+    with pytest.raises(BrowserError, match=rf"outside the viewport \({shot.width}x{shot.height}\)"):
+        await service.act(claims, Act(action="hover", x=float(shot.width), y=10.0), snapshot=False)
 
     async def act(action: str, point: canvas_app.Point, **fields: Any) -> str:
         step = Act(action=action, x=float(point[0]), y=float(point[1]), **fields)  # type: ignore[arg-type]
