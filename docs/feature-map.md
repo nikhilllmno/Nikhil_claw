@@ -239,7 +239,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Setup wizard, doctor, update | `hermes setup`, `hermes doctor` | Web onboarding for customers (M6): sign-up, a first org, and invites (§17.2, M6.5), then a setup guide that connects a chat app, picks or creates an agent, and sends a first message (§17.6, M6.9). Health checks and alerts (§18). | Adapt | M6 (M6.5 and M6.9 done) |
 | Gateway service management | `hermes gateway install` | Fly.io process groups, deploys from CI (§19). | Adapt | M1 |
 | Batch runner and trajectories | `batch_runner.py`, `trajectory_compressor.py` | Not planned. Langfuse datasets cover evals. | Defer | — |
-| Evals | `evals/` | Conformance suite in CI and a nightly live suite (§5.5). | Adapt | M1 |
+| Evals | `evals/` | Conformance suite in CI and a nightly live suite (§5.5). A Playwright end-to-end suite runs the main flows in the web app against staging every night (§19.6, M7.11 done). | Adapt | M1, M7 |
 | Langfuse and telemetry | `agent/monitoring/` | Langfuse for both runtimes, proxy cost (D15). | Adapt | M1 |
 | Skins, pets, achievements, language packs | various | Not planned. | Skip | — |
 
@@ -257,3 +257,4 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Self-modification through pull requests | §15.2 | M6 |
 | Customer sign-up, billing, quotas | §17 (sign-up, invites, and roles in §17.2; billing and quotas in §17.5) | M6 (M6.5 and M6.6 done) |
 | Org keys (own Anthropic and OpenAI keys) and a region per org, with a routing seam for more regions | §17.3 | M6 (M6.7 done) |
+| End-to-end tests of the deployed system: a Playwright suite with its own test users and org on staging, each night and on demand | §19.6 | M7 (M7.11 done) |

@@ -7296,6 +7296,7 @@ src/sama/
 skills/           # builtin skills (SKILL.md folders)
 extension/        # Chrome extension (TypeScript)
 web/              # Next.js app
+e2e/              # Playwright end-to-end suite against staging (M7.11, Section 19.6)
 sandbox/          # Dockerfile of the sama image (Docker and the E2B template)
 deploy/           # Dockerfile of the control plane and the Fly.io configs (M1.15)
 migrations/       # Alembic
@@ -7479,6 +7480,59 @@ A person must do these steps. Sama cannot create a GitHub App or a ruleset by it
 The process turns the App on when `SAMA_GITHUB_APP_ID` is set (Section 19.2). Then the API
 has the routes `/orgs/{org_id}/github/...`, the pages `/github/app/created` and
 `/github/setup`, and the git proxy at `/git`.
+
+### 19.6 End-to-end tests on staging (M7.11)
+
+The Playwright suite in `e2e/` (TypeScript) tests the main flows on a deployed system. It
+drives the web app in Chromium, as a person does. It uses the API for flows that have no page
+yet (triggers, workflows) and to check results. A test of a tool also reads the run trace
+(`GET /runs/{run_id}/trace`) and checks that the tool ran without an error, because a model
+can give the expected words without the tool. `e2e/README.md` lists the flows and the rules
+for tests.
+
+- **When.** The workflow `.github/workflows/e2e.yml` runs it against staging each night at
+  21:30 UTC (03:00 IST), after the nightly live suite, and by hand (`workflow_dispatch`, with
+  an optional title pattern and other URLs). It is not a check of pull requests, because it
+  tests what staging runs now, and a run takes about 15 minutes and costs model tokens. The CI
+  job "Web" lints and typechecks the suite and runs the unit tests of its helpers, so a pull
+  request cannot break the code of the suite.
+- **Test data.** Each run makes its own data, so two runs do not share state:
+  - Two Supabase users with confirmed emails, `sama-e2e+<run>-owner@example.com` and
+    `sama-e2e+<run>-member@example.com`, with random passwords. The domain is reserved, so no
+    mail goes anywhere.
+  - One org `e2e-<run>-main` that the owner makes with self-serve sign-up (Section 17.2). It
+    is on the free plan, so the plan caps (2 runs at the same time, 10 messages a minute)
+    also apply to the suite. One worker runs the tests in order.
+  - The global teardown deletes each test org with `DELETE /orgs/{org_id}` (all its rows go,
+    Section 17.4), and then the users. It tries an org delete up to 5 times when the API
+    answers `409` (runs of the org still stop) or a server error. When an org does not go, its
+    owner stays, so the sweep can sign in as that user and try again. The sweep (`npm run sweep`) runs first in each nightly
+    run. It removes each user with the `sama-e2e+` prefix that is older than 3 hours, and the
+    `e2e-` orgs that the user owns. It gets a token of each user with an admin magic link
+    (no email) and deletes each org with the slug from `GET /me`.
+- **Credentials.** The repository secret `E2E_SUPABASE_SERVICE_ROLE_KEY` (the `service_role`
+  key of the staging Supabase project) makes and removes the test users. Only the setup, the
+  teardown, the sweep, and the sign-up test use it, and only in the Node process, never in the
+  browser. The key goes only to the expected project (`E2E_SUPABASE_URL`, default the staging
+  project): when `GET /config` of the API names another Supabase URL, the run stops before
+  the key leaves. No request follows a redirect. Without the secret, the workflow skips the
+  suite with a warning and does not fail. The tests use the tokens of the test users, as the web app
+  does (`sessionStorage` key `sama.auth`). The world file of a run (`e2e/.state/world.json`,
+  mode 0600, ignored by git) has the test passwords, and the teardown removes it.
+- **Sign-up.** The staging project sends email with the built-in mailer, which sends only to
+  the team. So the sign-up test sends the browser's `POST /auth/v1/signup` to the admin API
+  (`generate_link` with `type: signup` makes the same unconfirmed user and sends no email),
+  confirms the address with the admin API, and then signs in on the page. A retry of the test
+  uses a new email address and org name.
+- **Results.** The workflow keeps the HTML report, the JUnit file, and the screenshots,
+  videos, and traces of failed tests for 7 days. A trace can have the short-lived token of a
+  test user (it expires after 1 hour). After a clean teardown the user and the org are gone, so
+  the token gives access to nothing. When the teardown keeps an owner because its org did not
+  go, the token gives access to that test org until it expires or the sweep removes the org.
+- **Billing.** The billing test opens Stripe Checkout in test mode (`cs_test_`) and does not
+  pay.
+
+Add the flows of a new item to the suite in the pull request of the item, or in the next one.
 
 ---
 
