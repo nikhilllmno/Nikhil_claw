@@ -1,4 +1,4 @@
-"""Migration 0032: the cloud browser (docs/architecture.md, Section 14.1; roadmap M5.1)."""
+"""Migration 0034: the cloud browser (docs/architecture.md, Section 14.1; roadmap M5.1)."""
 
 from __future__ import annotations
 
@@ -102,17 +102,17 @@ def test_the_upgrade_adds_the_table_with_rls_and_the_toolset() -> None:
         assert _policies(url) == ["browser_contexts_select"]
         assert asyncio.run(_rejected(url)) == ["duplicate", "target", "empty id"]
         config = alembic_config(url)
-        command.downgrade(config, "0031")
+        command.downgrade(config, "0033")
         assert not _exists(url)
         _set(url, "profile-a", OLD)
         _set(url, "profile-a2", CUSTOM)
-        command.upgrade(config, "0032")
+        command.upgrade(config, "0034")
         assert _exists(url)
         assert _policies(url) == ["browser_contexts_select"]
         toolsets = _toolsets(url)
         assert toolsets["profile-a"] == [*OLD, "browser"]
         assert toolsets["profile-a2"] == CUSTOM  # a person changed it
-        command.downgrade(config, "0031")
+        command.downgrade(config, "0033")
         assert _toolsets(url)["profile-a"] == OLD
         assert _toolsets(url)["profile-a2"] == CUSTOM
         command.upgrade(config, "head")

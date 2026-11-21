@@ -2200,7 +2200,7 @@ default profile of the first org has `tool_search` since migration `0018` (M2.6)
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
 (M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
-(M4.5), and `browser` since migration `0032` (M5.1). The default group set has no
+(M4.5), and `browser` since migration `0034` (M5.1). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
 Migrations `0022`, `0023`, `0026`, `0027`, `0029`, and `0031` change only the lists that are
@@ -4500,7 +4500,7 @@ tools when the control plane has `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_
 | Target | `sama.browser.target` | The `BrowserTarget` and `BrowserSession` protocols. One target for each name: `cloud` now, `my_chrome` in M5.5. The tools do not know the target. |
 | Cloud target | `sama.browser.browserbase` | Creates a Browserbase session with the REST API and connects Playwright to it over CDP. The process has no browser binaries. |
 | CDP session | `sama.browser.cdp` | `PlaywrightSession`: snapshots, actions, tabs, dialogs, screenshots, and extracts on a Playwright browser. The `my_chrome` target can use other code with the same protocol. |
-| Contexts | `sama.browser.contexts` | The table `browser_contexts` (migration `0032`): one provider context for each org, user, and target. |
+| Contexts | `sama.browser.contexts` | The table `browser_contexts` (migration `0034`): one provider context for each org, user, and target. |
 | Guard | `sama.browser.guard` | The outbound URL policy for navigation (Section 16.4). |
 | Service | `sama.browser.service` | `BrowserService`: one session for each run, limits, idle close, and the text for the agent. |
 
