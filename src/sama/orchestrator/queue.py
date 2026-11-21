@@ -215,16 +215,44 @@ def _utc_start(unit: str) -> Any:
     return func.timezone("UTC", func.date_trunc(unit, func.timezone("UTC", func.now())))
 
 
-def steer_block(notes: Sequence[str]) -> str:
-    """The text that the runtime gets for the notes of ``/steer`` (Section 4.3). Empty if
-    there are no notes."""
+STEER_REQUEST_CHARS: Final = 2_000
+"""The most characters of the original request in the text of the notes. A longer one is cut."""
+_STEER_TAG: Final = "added_messages"
+
+
+def steer_block(notes: Sequence[str], *, request: str = "", earlier: Sequence[str] = ()) -> str:
+    """The text that the runtime gets for new notes of a running run (Section 4.3, M7.1). Empty
+    if there are no new notes.
+
+    A note is a ``/steer`` note or a message that joined the run (busy mode ``steer``). Each one
+    adds to the request of the run and does not replace it, so the text repeats ``request`` (the
+    first message of the run) and lists every open note: ``earlier`` (the notes that the run got
+    at an earlier step) and ``notes`` (the new ones), oldest first. A note cannot close its
+    block."""
     if not notes:
         return ""
-    body = "\n\n".join(notes)
-    return (
-        "The user sent new guidance while you work (/steer). Use it from now on, and keep"
-        f" the parts of the task that it does not change.\n\n{body}"
-    )
+
+    def safe(text: str) -> str:
+        return text.strip().replace(f"</{_STEER_TAG}", f"<\\/{_STEER_TAG}")
+
+    original = request.strip()
+    if len(original) > STEER_REQUEST_CHARS:
+        original = original[: STEER_REQUEST_CHARS - 3].rstrip() + "..."
+    items = [*(f"{text} (you got this one before)" for text in earlier), *notes]
+    lines = "\n".join(f"{number}. {safe(text)}" for number, text in enumerate(items, start=1))
+    parts = [
+        f"<{_STEER_TAG}>",
+        "The user added these messages while you work. They add to the original request. They"
+        " do not replace it. Keep doing the original request, and also handle each added"
+        " message. If an added message changes a part of the original request, follow the added"
+        " message for that part only. Your final reply must cover the original request and every"
+        " added message.",
+    ]
+    if original:
+        parts.append(f"\nThe original request:\n{safe(original)}")
+    parts.append(f"\nThe added messages, oldest first:\n{lines}")
+    parts.append(f"</{_STEER_TAG}>")
+    return "\n".join(parts)
 
 
 def _check_rate(row: Any) -> None:
@@ -1100,10 +1128,35 @@ class RunQueue:
                         ),
                     )
                     .values(status="delivered", delivered_at=func.now())
-                    .returning(RunSteer.created_at, RunSteer.text)
+                    .returning(RunSteer.id, RunSteer.created_at, RunSteer.text)
                 )
             ).all()
-        return steer_block([text for _created, text in sorted(rows)])
+            if not rows:
+                return ""
+            # The model must keep the original request and the notes of earlier steps (M7.1).
+            request = await connection.scalar(
+                select(Message.content["text"].astext)
+                .where(Message.org_id == org_id, Message.run_id == run_id, Message.role == "user")
+                .order_by(Message.seq)
+                .limit(1)
+            )
+            earlier = (
+                await connection.execute(
+                    select(RunSteer.text)
+                    .where(
+                        RunSteer.org_id == org_id,
+                        RunSteer.run_id == run_id,
+                        RunSteer.status == "delivered",
+                        RunSteer.id.not_in([row.id for row in rows]),
+                    )
+                    .order_by(RunSteer.created_at, RunSteer.id)
+                )
+            ).scalars()
+        return steer_block(
+            [row.text for row in sorted(rows, key=lambda row: (row.created_at, row.id))],
+            request=request or "",
+            earlier=list(earlier),
+        )
 
     async def requeued_run(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> uuid.UUID | None:
         """The run that answers the notes that a completed run did not read, if any."""
