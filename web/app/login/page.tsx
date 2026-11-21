@@ -1,14 +1,26 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
 import { AuthStatusScreen } from "@/components/ui";
 import { errorText } from "@/lib/api";
+import { pendingInvite } from "@/lib/orgs";
 import styles from "./login.module.css";
 
 /** The codes of sign-in links that this page already used (a code works once). */
 const usedCodes = new Set<string>();
+
+const noSubscribe = () => () => {};
+
+/** True when the browser keeps the token of an invite link (see `/invite`). */
+function useInvited(): boolean {
+  return useSyncExternalStore(
+    noSubscribe,
+    () => pendingInvite(window.localStorage, Date.now()) !== null,
+    () => false,
+  );
+}
 
 export default function LoginPage() {
   const { status, auth, retry } = useAuth();
@@ -16,12 +28,16 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [token, setToken] = useState("");
-  const [busy, setBusy] = useState<"password" | "link" | "code" | null>(null);
+  const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
+  const [busy, setBusy] = useState<"password" | "link" | "code" | "sign-up" | null>(null);
   const [notice, setNotice] = useState<{ kind: "error" | "success"; text: string } | null>(null);
   const checkedLink = useRef(false);
+  const invited = useInvited();
 
+  // After sign-in, an invite link that the user opened before goes first.
   useEffect(() => {
-    if (status.kind === "signed-in") router.replace("/");
+    if (status.kind !== "signed-in") return;
+    router.replace(pendingInvite(window.localStorage, Date.now()) ? "/invite" : "/");
   }, [status.kind, router]);
 
   // A sign-in link comes back here with `?code=`. Never use tokens from the URL fragment.
@@ -62,6 +78,33 @@ export default function LoginPage() {
     }
   };
 
+  const signUp = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!auth) return;
+    setBusy("sign-up");
+    setNotice(null);
+    try {
+      const result = await auth.signUp(email.trim(), password, `${window.location.origin}/login`);
+      setPassword("");
+      if (result === "confirm") {
+        setNotice({
+          kind: "success",
+          text: "Look in your email for the link that confirms your address. Open it in this browser.",
+        });
+      }
+    } catch (error) {
+      setNotice({ kind: "error", text: errorText(error, "Could not create the account.") });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const switchMode = () => {
+    setMode((m) => (m === "sign-in" ? "sign-up" : "sign-in"));
+    setNotice(null);
+    setPassword("");
+  };
+
   const sendLink = async () => {
     if (!auth) return;
     if (!email.trim()) {
@@ -93,8 +136,14 @@ export default function LoginPage() {
       <main className={styles.page}>
         <div className={styles.panel}>
           <h1 className={styles.brand}>sama</h1>
-          <p className={styles.tagline}>Sign in to your agents.</p>
-          <form className={styles.form} onSubmit={signIn}>
+          <p className={styles.tagline}>
+            {invited
+              ? "Sign in or create an account to join the org that invited you."
+              : mode === "sign-up"
+                ? "Create an account."
+                : "Sign in to your agents."}
+          </p>
+          <form className={styles.form} onSubmit={mode === "sign-up" ? signUp : signIn}>
             <label className="field">
               <span className="label">Email</span>
               <input
@@ -112,20 +161,38 @@ export default function LoginPage() {
               <input
                 className="input"
                 type="password"
-                autoComplete="current-password"
+                autoComplete={mode === "sign-up" ? "new-password" : "current-password"}
+                minLength={mode === "sign-up" ? 8 : undefined}
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 disabled={working}
               />
             </label>
-            <button type="submit" className="btn btn-primary" disabled={working}>
-              {busy === "password" || busy === "code" ? "Signing in…" : "Sign in"}
-            </button>
-            <button type="button" className="btn" onClick={sendLink} disabled={working}>
-              {busy === "link" ? "Sending…" : "Send a sign-in link"}
-            </button>
+            {mode === "sign-up" ? (
+              <>
+                <span className="hint">Use 8 characters or more.</span>
+                <button type="submit" className="btn btn-primary" disabled={working}>
+                  {busy === "sign-up" ? "Creating the account…" : "Create account"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button type="submit" className="btn btn-primary" disabled={working}>
+                  {busy === "password" || busy === "code" ? "Signing in…" : "Sign in"}
+                </button>
+                <button type="button" className="btn" onClick={sendLink} disabled={working}>
+                  {busy === "link" ? "Sending…" : "Send a sign-in link"}
+                </button>
+              </>
+            )}
           </form>
+          <p className={styles.switch}>
+            {mode === "sign-up" ? "You have an account?" : "New to sama?"}{" "}
+            <button type="button" className="btn btn-quiet btn-small" onClick={switchMode} disabled={working}>
+              {mode === "sign-up" ? "Sign in" : "Create an account"}
+            </button>
+          </p>
           <div aria-live="polite">
             {notice ? (
               <p className={`alert ${notice.kind === "error" ? "alert-error" : "alert-success"}`}>

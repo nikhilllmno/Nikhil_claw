@@ -52,8 +52,9 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 
 | Route | Screen |
 | --- | --- |
-| `/login` | Email and password, emailed sign-in link (PKCE), and a developer access-token box. |
-| `/` | New session: workspace, agent, audience, title. |
+| `/login` | Email and password, emailed sign-in link (PKCE), "Create an account" (Supabase sign-up with PKCE), and a developer access-token box. |
+| `/invite` | The page of an invite link (`/invite#<token>`). It keeps the token while you sign in, then joins the org. |
+| `/` | New session: workspace, agent, audience, title. A user without an org sees the open invites and, when sign-up is open, the form for a new org. |
 | `/s/[sessionId]` | Chat with live streaming, approvals, questions, Stop, and `/compact`. The header has Runs and the export buttons (Markdown and JSON). |
 | `/s/[sessionId]/runs` | The runs of the session with the token use and the cost. Each run opens its trace: steps, tool calls, and model calls. |
 | `/agents/[profileId]` | Agent settings. Read-only unless you are an admin of the org. |
@@ -62,6 +63,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/search` | Search the sessions that you can read, in the current workspace or in the whole org. |
 | `/memory` | Memory editor: agent notes, your profile, and workspace notes, with the revision history and revert. |
 | `/skills` | Skill editor: list, new skill, `SKILL.md`, files, versions, and archive. Built-in skills are read-only. |
+| `/members` | The members of an org and their roles. An owner or admin changes roles and workspaces, removes members, makes invite links, and revokes invites. |
 | `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot), linked chat accounts with link codes, and the agents. |
 
 ## Layout
@@ -70,13 +72,15 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 app/          routes, global CSS and design tokens (tokens.css)
 components/   UI: shell, sidebar, chat, composer, cards, agent settings, providers,
               memory editor, skill editor, session search, run traces, settings,
+              welcome (no org yet), members,
               the shared page frame (Page.module.css, PageHeader)
 lib/          framework-free logic with unit tests:
               api (client with one refresh and retry on 401), auth (Supabase, PKCE),
               sse (parser), stream (reconnecting event stream), chat (live state),
               profile (settings draft and validation), memory (entries and caps),
               skills (name and path checks), history (cost, tokens, trace steps, file
-              download), connections, tasks, time, config
+              download), connections, tasks, time, config, orgs (invite links,
+              the kept invite token, role rules)
 ```
 
 Tokens: all colours, spacing and type come from CSS custom properties in `app/tokens.css`. Light and dark follow `prefers-color-scheme`.

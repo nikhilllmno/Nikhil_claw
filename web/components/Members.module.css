@@ -1,0 +1,70 @@
+/* The members page. It adds only the parts that Page.module.css does not have. */
+
+.who {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.spaces {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.spaces legend {
+  padding: 0;
+  margin-bottom: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.check input {
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.member {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: var(--border-width) solid var(--border);
+}
+
+.member:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--field-basis), 1fr));
+  gap: var(--space-3);
+}
+
+.link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.link input {
+  flex: 1 1 var(--field-basis);
+  min-width: 0;
+  font-family: var(--font-mono);
+}

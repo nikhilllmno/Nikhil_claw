@@ -37,6 +37,15 @@
   gap: var(--space-3);
 }
 
+.switch {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 .dev {
   font-size: var(--text-sm);
   color: var(--text-muted);

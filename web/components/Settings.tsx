@@ -15,6 +15,7 @@ import {
   type PairingCode,
 } from "@/lib/api";
 import { integrationTone, toneBadge } from "@/lib/history";
+import { ROLE_LABELS, roleBadge } from "@/lib/orgs";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
 import { useData } from "./DataProvider";
@@ -41,14 +42,16 @@ export function Settings() {
           Account
         </h2>
         {me.orgs.length === 0 ? (
-          <p className={styles.meta}>You are not in an org yet. Ask an admin of your org to add you.</p>
+          <p className={styles.meta}>
+            You are not in an org yet. <Link href="/">Join or create an org</Link>.
+          </p>
         ) : (
           <ul className={styles.list}>
             {me.orgs.map((o) => (
               <li key={o.id} className={styles.row}>
                 <div className={styles.name}>
                   <span>{o.name}</span>
-                  <span className={o.admin ? "badge badge-accent" : "badge"}>{o.admin ? "Admin" : "Member"}</span>
+                  <span className={roleBadge(o.role)}>{ROLE_LABELS[o.role]}</span>
                 </div>
                 <span className={styles.meta}>
                   {o.display_name ? `${o.display_name} · ` : ""}

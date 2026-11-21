@@ -15,6 +15,7 @@ const SETTINGS_LINKS = [
   { href: "/memory", title: "Memory", meta: "The notes that the agents keep" },
   { href: "/skills", title: "Skills", meta: "The guides that the agents follow" },
   { href: "/connections", title: "Connections", meta: "The tools that the agent can use" },
+  { href: "/members", title: "Members", meta: "The people of your org and their roles" },
   { href: "/settings", title: "Settings", meta: "Account, chat apps, and agents" },
 ] as const;
 

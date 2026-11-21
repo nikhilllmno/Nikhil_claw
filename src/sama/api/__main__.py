@@ -13,6 +13,10 @@ Environment:
   a browser, comma-separated, for example
   ``https://sama-web.vercel.app,http://localhost:3000``. An origin has no path and no ``*``.
   Without it, the API sends no CORS headers.
+- ``SAMA_SIGNUP``: optional. ``open`` lets a user with a verified email make an org
+  (Section 17.2). The default, ``invite_only``, adds users only with an invite.
+- ``SAMA_SIGNUP_BLOCKED_DOMAINS``: optional. More email domains that cannot make an org,
+  comma-separated.
 - ``SAMA_PUBLIC_URL``: optional. With ``SAMA_VAULT_KEY`` it turns on the integrations
   (Section 11.6): org admins connect their own Telegram bot on the web page. The vault keeps the
   bot token. ``python -m sama.gateway`` takes the updates of the bots at ``SAMA_PUBLIC_URL``.
@@ -39,6 +43,7 @@ from sama.api.origins import parse_origins
 from sama.db.engine import create_engine
 from sama.integrations.service import Integrations
 from sama.observability.logs import configure_logging
+from sama.orgs import SignupPolicy
 from sama.skills import BuiltinSkills, SkillLibrary
 from sama.vault.redact import default_redactor, env_secrets
 from sama.vault.standalone import keep_redactor_current, vault_from_env
@@ -62,6 +67,10 @@ def build_app() -> FastAPI:
         web_origins = parse_origins(os.environ.get("SAMA_WEB_ORIGINS", ""))
     except ValueError as error:
         raise SystemExit(f"SAMA_WEB_ORIGINS: {error}") from None
+    try:
+        signup = SignupPolicy.from_env(os.environ)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
     secret = os.environ.get("SAMA_SUPABASE_JWT_SECRET", "")
     verifier = JwtVerifier(
         secret=SecretStr(secret) if secret else None,
@@ -89,6 +98,7 @@ def build_app() -> FastAPI:
             supabase_url=supabase_url,
             supabase_anon_key=_required("SAMA_SUPABASE_ANON_KEY"),
             web_origins=web_origins,
+            signup=signup,
         ),
         integrations=integrations,
         skills=SkillLibrary(engine, BuiltinSkills().all()),

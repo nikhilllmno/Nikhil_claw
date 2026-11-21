@@ -48,3 +48,17 @@ export function relativeTime(iso: string, now: number): string {
   if (days < 30) return `${days} d ago`;
   return new Date(then).toLocaleDateString();
 }
+
+/** For example "in 5 min" or "in 6 d". A time that passed gives "ended". */
+export function timeLeft(iso: string, now: number): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "";
+  const seconds = Math.round((then - now) / 1000);
+  if (seconds <= 0) return "ended";
+  if (seconds < 60) return "in less than 1 min";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `in ${hours} h`;
+  return `in ${Math.round(hours / 24)} d`;
+}

@@ -49,6 +49,8 @@ NAMING_CONVENTION: Final = {
 }
 
 ROLES: Final = ("owner", "admin", "member")
+INVITE_ROLES: Final = ("admin", "member")
+"""An invite never makes an owner. An owner gives the role ``owner`` to a member later."""
 RUNTIMES: Final = ("claude_agent_sdk", "openai_agents_sdk", "fake")
 AUDIENCES: Final = ("private", "shared")
 SESSION_STATUSES: Final = ("active", "archived")
@@ -222,13 +224,22 @@ class Base(DeclarativeBase):
 
 class Org(Base):
     __tablename__ = "orgs"
+    __table_args__ = (
+        Index(None, "created_by_auth_user_id", "created_at"),
+        Index(None, "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     name: Mapped[str] = mapped_column(Text, nullable=False)
     slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     plan: Mapped[str] = mapped_column(Text, nullable=False, server_default="team")
+    """The plan of the org (``sama.orgs.plans``). It sets the member cap and the default
+    limits."""
     region: Mapped[str] = mapped_column(Text, nullable=False, server_default="ap-south-1")
     limits: Mapped[dict[str, Any]] = _json()
+    created_by_auth_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The Supabase Auth user who made the org with self-serve sign-up (Section 17.2). Null for
+    an org of ``bootstrap``. The rate limits of org creation count these rows."""
     created_at: Mapped[datetime] = _created_at()
 
 
@@ -278,6 +289,54 @@ class Membership(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     role: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class OrgInvite(Base):
+    """An invite to an org (docs/architecture.md, Section 17.2).
+
+    The link of the invite holds a random token. Only its SHA-256 hash is here. Org admins
+    read the rows of their org, but not ``token_hash``. Only the control plane writes the
+    table."""
+
+    __tablename__ = "org_invites"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "invited_by_user_id"], ["users.org_id", "users.id"]),
+        ForeignKeyConstraint(["org_id", "accepted_user_id"], ["users.org_id", "users.id"]),
+        CheckConstraint(_one_of("role", INVITE_ROLES), name="role"),
+        CheckConstraint(
+            "email = lower(email) AND char_length(email) BETWEEN 3 AND 320", name="email"
+        ),
+        CheckConstraint("octet_length(token_hash) = 32", name="token_hash_length"),
+        CheckConstraint("(accepted_at IS NULL) = (accepted_user_id IS NULL)", name="accepted"),
+        CheckConstraint("accepted_at IS NULL OR revoked_at IS NULL", name="one_end"),
+        Index(None, "org_id", "created_at"),
+        Index(
+            None,
+            "org_id",
+            "email",
+            unique=True,
+            postgresql_where=text("accepted_at IS NULL AND revoked_at IS NULL"),
+        ),
+        Index(None, "email", postgresql_where=text("accepted_at IS NULL AND revoked_at IS NULL")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    """The invited email, in lower case. Only a user with this verified email can accept."""
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """A workspace that a ``member`` joins with the org. An admin sees every workspace."""
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, unique=True)
+    invited_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()
 
 

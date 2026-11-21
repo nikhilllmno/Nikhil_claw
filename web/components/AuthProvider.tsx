@@ -3,7 +3,7 @@
 // Holds the sign-in state and the API client for the whole app.
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { ApiClient, errorText, fetchConfig } from "@/lib/api";
+import { ApiClient, errorText, fetchConfig, type SignupMode } from "@/lib/api";
 import { AuthSession } from "@/lib/auth";
 import { apiUrl } from "@/lib/config";
 
@@ -21,6 +21,8 @@ interface AuthContext {
   /** The sign-in object. `null` until the config is loaded. */
   auth: AuthSession | null;
   api: ApiClient | null;
+  /** The sign-up mode of the API (`GET /config`). */
+  signup: SignupMode;
   signOut: () => void;
   retry: () => void;
 }
@@ -45,6 +47,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     apiUrl() === "" ? { kind: "unconfigured" } : { kind: "loading" },
   );
   const [auth, setAuth] = useState<AuthSession | null>(null);
+  const [signup, setSignup] = useState<SignupMode>("invite_only");
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
@@ -63,6 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           local: window.localStorage,
           onChange: (tokens) => setStatus({ kind: tokens ? "signed-in" : "signed-out" }),
         });
+        setSignup(loaded.signup === "open" ? "open" : "invite_only");
         setAuth(session);
         setStatus({ kind: session.load() ? "signed-in" : "signed-out" });
       })
@@ -86,8 +90,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ status, auth, api, signOut, retry }),
-    [status, auth, api, signOut, retry],
+    () => ({ status, auth, api, signup, signOut, retry }),
+    [status, auth, api, signup, signOut, retry],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }

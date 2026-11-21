@@ -65,6 +65,7 @@ def test_a_missing_required_variable_is_named(name: str) -> None:
         ({"SAMA_WORKER_CONCURRENCY": "0"}, "1 or more"),
         ({"SAMA_WORKER_CONCURRENCY": "two"}, "1 or more"),
         ({"LANGFUSE_PUBLIC_KEY": "pk"}, "set LANGFUSE_BASE_URL"),
+        ({"SAMA_SIGNUP": "maybe"}, "SAMA_SIGNUP must be open or invite_only"),
     ],
 )
 def test_a_bad_value_is_refused_without_its_value(changes: dict[str, str], message: str) -> None:
@@ -231,3 +232,10 @@ def test_the_self_repo_has_a_default_and_can_be_set() -> None:
 def test_a_bad_self_repo_is_refused(value: str) -> None:
     with pytest.raises(SettingsError, match="SAMA_SELF_REPO must be <owner>/<name>"):
         settings(SAMA_SELF_REPO=value)
+
+
+def test_sign_up_is_closed_unless_it_is_opened() -> None:
+    assert settings().signup.mode == "invite_only"
+    opened = settings(SAMA_SIGNUP=" Open ", SAMA_SIGNUP_BLOCKED_DOMAINS="@Spam.test, ,x.test")
+    assert opened.signup.mode == "open"
+    assert opened.signup.blocked_domains == ("spam.test", "x.test")

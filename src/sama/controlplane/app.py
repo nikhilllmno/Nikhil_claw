@@ -446,6 +446,7 @@ def build(
             supabase_url=settings.supabase_url,
             supabase_anon_key=settings.supabase_anon_key,
             web_origins=settings.web_origins,
+            signup=settings.signup,
         ),
         integrations=integrations,
         skills=library,
