@@ -45,11 +45,11 @@ from sama.connectors.dbcore import (
     MAX_MODEL_BYTES,
     MAX_ROWS,
     RowCollector,
+    Rows,
     SqlSession,
     Target,
     render_tables,
 )
-from sama.connectors.dbcore import Rows as _Rows
 from sama.connectors.dbforms import (
     MAX_EXECUTE_SQL_CHARS,
     MAX_PARAMS,
@@ -72,7 +72,6 @@ from sama.connectors.postgres import (
     SAMPLE_COLUMNS_SQL,
     coerce,
     mentions,
-    pinned_tls,
     quote_ident,
 )
 from sama.connectors.sql import Checked, Mode, SqlRejectedError, check
@@ -90,8 +89,6 @@ from sama.vault.redact import redact
 
 if TYPE_CHECKING:
     from sama.connectors.engines.mongo import MongoSession
-
-__all__ = ["MAX_MODEL_BYTES", "MAX_ROWS", "DatabaseGateway", "_Rows"]
 
 log: Final = logging.getLogger("sama.connectors.database")
 
@@ -156,7 +153,6 @@ class DatabaseGateway:
         self.timeout_s = timeout_s
         self._resolve = resolver
         self._allow_private = allow_private
-        self._require_tls = require_tls
         self._per_org = per_org
         self._clock = clock
         self._pools: dict[str, _Pool] = {}
@@ -306,7 +302,7 @@ class DatabaseGateway:
         write: bool = False,
         keep_csv: bool = False,
         show: int = MAX_ROWS,
-    ) -> _Rows:
+    ) -> Rows:
         """Runs one statement (or one MongoDB read) and collects the rows."""
         if isinstance(statement, MongoRead):
             sink = RowCollector(frozenset(), max_rows, max_bytes, keep_csv=keep_csv, show=show)
@@ -412,7 +408,7 @@ class DatabaseGateway:
         *,
         keep_csv: bool = False,
         show: int = MAX_ROWS,
-    ) -> _Rows:
+    ) -> Rows:
         sink = RowCollector(drop, max_rows, max_bytes, keep_csv=keep_csv, show=show)
         try:
             statement = await connection.prepare(sql)
@@ -739,19 +735,13 @@ class DatabaseGateway:
         write: bool,
     ) -> AsyncIterator[SqlSession]:
         """A session of an SQL engine (not PostgreSQL) for one call, with the limits."""
-        async with self._org_limit(claims), self._route(str(connection_id), settings) as target:
-            try:
-                async with (
-                    asyncio.timeout(CONNECT_TIMEOUT_S + self.timeout_s + 5),
-                    open_sql(settings, target, self._engine, write=write) as session,
-                ):
-                    yield session
-            except TimeoutError:
-                raise DriverError(
-                    f"the statement stopped after {self.timeout_s:g} seconds"
-                ) from None
-            except (OSError, ssl.SSLError) as error:
-                raise DriverUnavailableError(_network(error, settings)) from None
+        async with (
+            self._org_limit(claims),
+            self._route(str(connection_id), settings) as target,
+            self._time_limit(settings, "statement"),
+            open_sql(settings, target, self._engine, write=write) as session,
+        ):
+            yield session
 
     @contextlib.asynccontextmanager
     async def _mongo_call(
@@ -765,17 +755,24 @@ class DatabaseGateway:
 
     @contextlib.asynccontextmanager
     async def _mongo_session(self, key: str, settings: DbSettings) -> AsyncIterator[MongoSession]:
-        async with self._route(key, settings) as target:
-            try:
-                async with (
-                    asyncio.timeout(CONNECT_TIMEOUT_S + self.timeout_s + 5),
-                    open_mongo(settings, target, self._engine) as session,
-                ):
-                    yield session
-            except TimeoutError:
-                raise DriverError(f"the read stopped after {self.timeout_s:g} seconds") from None
-            except (OSError, ssl.SSLError) as error:
-                raise DriverUnavailableError(_network(error, settings)) from None
+        async with (
+            self._route(key, settings) as target,
+            self._time_limit(settings, "read"),
+            open_mongo(settings, target, self._engine) as session,
+        ):
+            yield session
+
+    @contextlib.asynccontextmanager
+    async def _time_limit(self, settings: DbSettings, what: str) -> AsyncIterator[None]:
+        """The time limit of one engine call. A timeout or a network error is a driver
+        error."""
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT_S + self.timeout_s + 5):
+                yield
+        except TimeoutError:
+            raise DriverError(f"the {what} stopped after {self.timeout_s:g} seconds") from None
+        except (OSError, ssl.SSLError) as error:
+            raise DriverUnavailableError(_network(error, settings)) from None
 
     @contextlib.asynccontextmanager
     async def _in_transaction(
@@ -910,16 +907,13 @@ class DatabaseGateway:
         return addresses[0]
 
     def _connect_args(self, settings: DbSettings, host: str, port: int) -> dict[str, Any]:
-        tls: ssl.SSLContext | bool = pinned_tls(settings.host, settings.sslmode)
-        if not self._require_tls or settings.sslmode == "disable":
-            tls = False
         return {
             "host": host,
             "port": port,
             "user": settings.user,
             "password": settings.password,
             "database": settings.database,
-            "ssl": tls,
+            "ssl": self._engine.tls(settings) or False,
             "timeout": CONNECT_TIMEOUT_S,
             # Transaction poolers (Supabase, Neon) do not keep named statements between
             # transactions. Each statement is prepared in its own transaction.
@@ -948,7 +942,7 @@ class DatabaseGateway:
 
 
 def _render(
-    rows: _Rows,
+    rows: Rows,
     *,
     path: str | None,
     conn: str,

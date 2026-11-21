@@ -34,6 +34,7 @@ from sama.connectors.dbcore import (
     RowCollector,
     TableInfo,
     Target,
+    locate_by_tables,
     pyformat,
     scalar,
 )
@@ -205,14 +206,10 @@ class MsSqlSession:
         return list(found.values())
 
     async def locate(self, parts: Sequence[str]) -> tuple[str, str, list[str]] | None:
-        schema, table = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
-        found = await self.tables(schema, table)
-        if not found:
-            return None
         # A name without a schema: dbo first, as SQL Server finds it for most users.
-        found.sort(key=lambda t: (t.schema.lower() != "dbo", t.schema))
-        info = found[0]
-        return info.schema, info.name, [c.name for c in info.columns]
+        return await locate_by_tables(
+            self, parts, order=lambda t: (t.schema.lower() != "dbo", t.schema)
+        )
 
     def sample_sql(self, schema: str, table: str, columns: Sequence[str], limit: int) -> str:
         names = ", ".join(quote(c) for c in columns)

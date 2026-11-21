@@ -13,26 +13,24 @@ from typing import Any, cast
 
 import pytest
 
-from sama.connectors import database
 from sama.connectors.database import (
     MAX_CARD_CHARS,
-    MAX_MODEL_BYTES,
-    MAX_ROWS,
     TIMEOUT_S,
     DatabaseGateway,
     _check_card,
     _render,
-    _Rows,
 )
+from sama.connectors.dbcore import MAX_MODEL_BYTES, MAX_ROWS, Rows
+from sama.connectors.dbforms import MAX_EXECUTE_SQL_CHARS
+from sama.connectors.dbsettings import DbSettings, writes_on
 from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import (
     DATABASE_OPERATIONS,
-    MAX_EXECUTE_SQL_CHARS,
     Catalog,
     ManifestError,
     parse,
 )
-from sama.connectors.postgres import DbSettings, coerce, model_cell, pinned_tls, to_csv, writes_on
+from sama.connectors.postgres import coerce, model_cell, pinned_tls, to_csv
 from sama.gate.decide import PolicyRule, RuleLevel, always_asks, policy_verdict
 from sama.gateway.sessions import MAX_ARGUMENT_CHARS
 from sama.tools.output import MAX_OUTPUT_BYTES, untrusted
@@ -207,7 +205,7 @@ def test_the_default_timeout_is_30_seconds() -> None:
     assert DatabaseGateway().timeout_s == 30.0
 
 
-def rows(count: int, width: int = 10) -> _Rows:
+def rows(count: int, width: int = 10) -> Rows:
     shown: list[str] = []
     used = 0
     for i in range(count):
@@ -216,7 +214,7 @@ def rows(count: int, width: int = 10) -> _Rows:
             break
         shown.append(line)
         used += len(line) + 1
-    return _Rows(["id", "name"], 0, shown, count, True, "csv", "")
+    return Rows(["id", "name"], 0, shown, count, True, "csv", "")
 
 
 @pytest.mark.parametrize(("count", "width"), [(5_000, 10), (400, 400), (2_000, 30)])
@@ -250,8 +248,8 @@ async def test_the_gateway_connects_only_to_public_addresses() -> None:
 
 
 def test_the_module_keeps_the_limits() -> None:
-    assert database.MAX_ROWS == 1_000
-    assert database.MAX_MODEL_BYTES + 1_500 < MAX_OUTPUT_BYTES
+    assert MAX_ROWS == 1_000
+    assert MAX_MODEL_BYTES + 1_500 < MAX_OUTPUT_BYTES
 
 
 def test_database_execute_always_asks() -> None:

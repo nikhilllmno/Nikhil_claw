@@ -30,12 +30,12 @@ from sama.connectors.dbcore import (
     TableInfo,
     Target,
     check_params,
+    locate_by_tables,
     scalar,
 )
 from sama.connectors.dbsettings import DbSettings
 from sama.connectors.engines import EngineContext
 from sama.connectors.http_api import DriverError, DriverUnavailableError
-from sama.connectors.postgres import pinned_tls
 
 FORMAT: Final = "JSONCompactEachRowWithNamesAndTypes"
 _TIMEOUT_CODES: Final = frozenset({"159", "160", "209"})
@@ -219,12 +219,7 @@ class ClickHouseSession:
         return list(found.values())
 
     async def locate(self, parts: Sequence[str]) -> tuple[str, str, list[str]] | None:
-        schema, table = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
-        found = await self.tables(schema, table)
-        if not found:
-            return None
-        info = found[0]
-        return info.schema, info.name, [c.name for c in info.columns]
+        return await locate_by_tables(self, parts)
 
     def sample_sql(self, schema: str, table: str, columns: Sequence[str], limit: int) -> str:
         names = ", ".join(quote(c) for c in columns)
@@ -266,11 +261,10 @@ def _error(code: str | None, body: str) -> DriverError:
 async def open_session(
     settings: DbSettings, target: Target, context: EngineContext, *, write: bool
 ) -> AsyncIterator[ClickHouseSession]:
-    tls = context.require_tls and settings.sslmode != "disable"
-    scheme = "https" if tls else "http"
+    tls = context.tls(settings)
+    scheme = "https" if tls is not None else "http"
     host = f"[{target.host}]" if ":" in target.host else target.host
     url = f"{scheme}://{host}:{target.port}/"
-    verify: Any = pinned_tls(settings.host, settings.sslmode) if tls else False
     headers = {
         "Host": settings.host if settings.port in (80, 443) else f"{settings.host}:{settings.port}",
         "X-ClickHouse-User": settings.user,
@@ -279,7 +273,7 @@ async def open_session(
         "User-Agent": "sama",
     }
     async with httpx.AsyncClient(
-        verify=verify,
+        verify=tls if tls is not None else False,
         headers=headers,
         timeout=httpx.Timeout(context.timeout_s + 5, connect=10),
         trust_env=False,

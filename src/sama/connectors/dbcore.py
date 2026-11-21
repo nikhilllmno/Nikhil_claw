@@ -13,7 +13,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
@@ -85,10 +85,6 @@ class RowCollector:
         self._cut = False
         self.count = 0
         self.complete = True
-
-    @property
-    def started(self) -> bool:
-        return self._keep is not None
 
     def start(self, names: Sequence[str]) -> None:
         self._names = [str(n) for n in names]
@@ -251,6 +247,22 @@ class SqlSession(Protocol):
         ...
 
 
+async def locate_by_tables(
+    session: SqlSession,
+    parts: Sequence[str],
+    *,
+    order: Callable[[TableInfo], Any] | None = None,
+) -> tuple[str, str, list[str]] | None:
+    """``SqlSession.locate`` with ``tables``: the first table found for ``[schema, ]table``
+    (the first in ``order``, a sort key, if given)."""
+    schema, table = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
+    found = await session.tables(schema, table)
+    if not found:
+        return None
+    info = min(found, key=order) if order is not None else found[0]
+    return info.schema, info.name, [c.name for c in info.columns]
+
+
 def bind_marks(sql: str, dialect: str) -> list[tuple[int, int]]:
     """The ``(start, end)`` of each ``?`` parameter mark, from the tokenizer of the engine. A
     ``?`` in a string or a comment is not a mark."""
@@ -297,7 +309,3 @@ def scalar(value: Any, index: int) -> Any:
 def message_of(error: BaseException, limit: int = 400) -> str:
     """A short message of a driver error, on one line."""
     return " ".join(str(error).split())[:limit] or type(error).__name__
-
-
-def jsonable(value: Mapping[str, Any]) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)

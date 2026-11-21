@@ -32,7 +32,6 @@ from sama.connectors.engines import EngineContext
 from sama.connectors.engines.relay import relay
 from sama.connectors.http_api import DriverError, DriverUnavailableError
 from sama.connectors.mongoquery import MongoRead, drop_hidden
-from sama.connectors.postgres import pinned_tls
 
 COLUMN: Final = "document"
 MAX_COLLECTIONS: Final = 100
@@ -155,10 +154,7 @@ def _error(error: PyMongoError) -> DriverError:
 async def open_session(
     settings: DbSettings, target: Target, context: EngineContext
 ) -> AsyncIterator[MongoSession]:
-    tls = None
-    if context.require_tls and settings.sslmode != "disable":
-        tls = pinned_tls(settings.host, settings.sslmode)
-    async with relay(target, tls, settings.host) as port:
+    async with relay(target, context.tls(settings), settings.host) as port:
         login: dict[str, Any] = {}
         if settings.user:
             login = {

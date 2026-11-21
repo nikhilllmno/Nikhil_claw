@@ -26,11 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.connectors import database
 from sama.connectors.composio import ComposioClient
-from sama.connectors.database import MAX_ROWS, POOL_IDLE_S, DatabaseGateway
-from sama.connectors.dbcore import Target
+from sama.connectors.database import POOL_IDLE_S, DatabaseGateway
+from sama.connectors.dbcore import MAX_ROWS, Target
+from sama.connectors.dbsettings import DbSettings
 from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import Catalog, Manifest
-from sama.connectors.postgres import DbSettings
 from sama.connectors.service import ConnectionService, ConnectorError
 from sama.gate import GateStep
 from sama.gate.service import GateService

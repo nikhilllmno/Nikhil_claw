@@ -47,6 +47,7 @@ from sama.connectors.composio import (
     ComposioError,
 )
 from sama.connectors.database import DatabaseGateway
+from sama.connectors.dbsettings import writes_on
 from sama.connectors.errors import ConnectorError, ConnectorUnknownError, short_error
 from sama.connectors.host import ConnectorHosts, HostedServer
 from sama.connectors.http_api import (
@@ -92,7 +93,6 @@ from sama.connectors.openapi import (
     parse_endpoints,
     parse_openapi,
 )
-from sama.connectors.postgres import writes_on
 from sama.db.models import AuditEntry, Connection, Run, Session
 from sama.gate.decide import ToolAccess
 from sama.tenancy.access import Grants

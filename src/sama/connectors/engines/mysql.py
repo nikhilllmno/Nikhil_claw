@@ -25,13 +25,13 @@ from sama.connectors.dbcore import (
     RowCollector,
     TableInfo,
     Target,
+    locate_by_tables,
     pyformat,
     scalar,
 )
 from sama.connectors.dbsettings import DbSettings
 from sama.connectors.engines import EngineContext
 from sama.connectors.http_api import DriverError, DriverUnavailableError
-from sama.connectors.postgres import pinned_tls
 
 FETCH: Final = 500
 _TIMEOUT_CODES: Final = frozenset({3024, 1969})
@@ -123,12 +123,7 @@ class MySqlSession:
         return list(found.values())
 
     async def locate(self, parts: Sequence[str]) -> tuple[str, str, list[str]] | None:
-        schema, table = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
-        found = await self.tables(schema, table)
-        if not found:
-            return None
-        info = found[0]
-        return info.schema, info.name, [c.name for c in info.columns]
+        return await locate_by_tables(self, parts)
 
     def sample_sql(self, schema: str, table: str, columns: Sequence[str], limit: int) -> str:
         names = ", ".join(quote(c) for c in columns)
@@ -158,9 +153,6 @@ def _error(error: pymysql.MySQLError, settings: DbSettings) -> DriverError:
 async def open_session(
     settings: DbSettings, target: Target, context: EngineContext, *, write: bool
 ) -> AsyncIterator[MySqlSession]:
-    tls = None
-    if context.require_tls and settings.sslmode != "disable":
-        tls = pinned_tls(settings.host, settings.sslmode)
     try:
         connection = await aiomysql.connect(
             host=target.host,
@@ -168,7 +160,7 @@ async def open_session(
             user=settings.user,
             password=settings.password,
             db=settings.database,
-            ssl=tls,
+            ssl=context.tls(settings),
             connect_timeout=10,
             autocommit=False,
             charset="utf8mb4",

@@ -24,7 +24,8 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
-from sama.connectors.database import MAX_ROWS, DatabaseGateway
+from sama.connectors.database import DatabaseGateway
+from sama.connectors.dbcore import MAX_ROWS
 from sama.connectors.http_api import DriverError
 from sama.connectors.manifest import Catalog, Manifest
 from sama.tenancy.run_token import RunTokenClaims

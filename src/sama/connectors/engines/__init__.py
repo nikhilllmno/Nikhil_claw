@@ -11,6 +11,7 @@ raises ``DriverUnavailableError``.
 from __future__ import annotations
 
 import contextlib
+import ssl
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -20,6 +21,7 @@ import httpx
 from sama.connectors.dbcore import SqlSession, Target
 from sama.connectors.dbsettings import DbSettings
 from sama.connectors.http_api import DriverUnavailableError
+from sama.connectors.postgres import pinned_tls
 from sama.tools.outbound import Resolver, system_resolver
 
 if TYPE_CHECKING:
@@ -40,6 +42,13 @@ class EngineContext:
     require_tls: bool = True
     resolver: Resolver = system_resolver
     transport: httpx.AsyncBaseTransport | None = None
+
+    def tls(self, settings: DbSettings) -> ssl.SSLContext | None:
+        """The TLS context for the database host (its real name for SNI and the
+        certificate), or ``None`` for no TLS."""
+        if not self.require_tls or settings.sslmode == "disable":
+            return None
+        return pinned_tls(settings.host, settings.sslmode)
 
 
 def _missing(engine: str) -> DriverUnavailableError:

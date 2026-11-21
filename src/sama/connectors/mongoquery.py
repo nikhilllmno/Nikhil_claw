@@ -27,8 +27,6 @@ from typing import Any, Final
 from sama.connectors.http_api import DriverError
 from sama.connectors.sql import Policy
 
-MAX_QUERY_LIMIT: Final = 100_000
-"""The most documents of one read (the file limits of the gateway also apply)."""
 DEFAULT_LIMIT: Final = 1_000
 MAX_ARGUMENT_CHARS: Final = 20_000
 MAX_DEPTH: Final = 30

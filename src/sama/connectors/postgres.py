@@ -1,6 +1,5 @@
 """The PostgreSQL side of the database gateway (docs/architecture.md, Section 10.4).
 
-- ``DbSettings`` (from ``sama.connectors.dbsettings``): the form values of a connection.
 - ``pinned_tls``: a TLS context that sends the real host name (SNI, certificate check) while
   the socket goes to the checked IP address.
 - ``to_json`` and ``to_csv``: the cell values for the model and for the files.
@@ -24,7 +23,7 @@ from typing import Any, Final
 
 import certifi
 
-from sama.connectors.dbsettings import DEFAULT_PORT, DbSettings, TlsMode, writes_on
+from sama.connectors.dbsettings import TlsMode
 from sama.connectors.http_api import DriverError
 
 MAX_CELL_CHARS: Final = 1_000
@@ -242,6 +241,3 @@ def mentions(text: str, names: frozenset[str]) -> bool:
     """Does an index or constraint definition name one of the columns?"""
     words = {w.strip('"').lower() for w in re.findall(r'"(?:[^"]|"")+"|[A-Za-z_][\w$]*', text)}
     return bool(words & names)
-
-
-__all__ = ["DEFAULT_PORT", "DbSettings", "writes_on"]
