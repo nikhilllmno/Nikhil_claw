@@ -50,9 +50,7 @@ export const MEMORY_PROVIDER_LABELS: Record<MemoryProvider, string> = {
 
 /** The label of a memory provider. An unknown provider shows its name. */
 export function memoryProviderLabel(provider: string): string {
-  return (
-    (MEMORY_PROVIDER_LABELS as Record<string, string>)[provider] ?? provider
-  );
+  return (MEMORY_PROVIDER_LABELS as Record<string, string>)[provider] ?? provider;
 }
 
 /** The busy modes, with their text for people (M7.1). */
@@ -67,11 +65,7 @@ export const BUSY_MODES: { value: BusyMode; label: string; hint: string }[] = [
     label: "Run in parallel",
     hint: "A new message starts a second run at the same time, in the same session.",
   },
-  {
-    value: "queue",
-    label: "Wait in a queue",
-    hint: "A new message waits until the current run ends.",
-  },
+  { value: "queue", label: "Wait in a queue", hint: "A new message waits until the current run ends." },
 ];
 
 let nextUid = 1;
@@ -125,14 +119,10 @@ export function toSubagent(draft: DraftSubagent): Subagent {
 }
 
 export const sameList = (a: readonly string[], b: readonly string[]) =>
-  a.length === b.length &&
-  [...a].sort().join("\n") === [...b].sort().join("\n");
+  a.length === b.length && [...a].sort().join("\n") === [...b].sort().join("\n");
 
 /** The fields of `draft` that differ from the saved profile. An empty object: no change. */
-export function diffDraft(
-  profile: AgentProfile,
-  draft: Draft,
-): AgentProfilePatch {
+export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatch {
   const patch: AgentProfilePatch = {};
   if (draft.name.trim() !== profile.name) patch.name = draft.name.trim();
   if (draft.soul !== profile.soul) patch.soul = draft.soul;
@@ -143,13 +133,10 @@ export function diffDraft(
   } else if (draft.model !== profile.model) {
     patch.model = draft.model;
   }
-  if (!sameList(draft.toolsets, profile.toolsets))
-    patch.toolsets = draft.toolsets;
+  if (!sameList(draft.toolsets, profile.toolsets)) patch.toolsets = draft.toolsets;
   const subagents = draft.subagents.map(toSubagent);
-  if (JSON.stringify(subagents) !== JSON.stringify(profile.subagents))
-    patch.subagents = subagents;
-  if (draft.busyMode !== (profile.busy_mode ?? "steer"))
-    patch.busy_mode = draft.busyMode;
+  if (JSON.stringify(subagents) !== JSON.stringify(profile.subagents)) patch.subagents = subagents;
+  if (draft.busyMode !== (profile.busy_mode ?? "steer")) patch.busy_mode = draft.busyMode;
   const limit = Number(draft.maxParallelRuns.trim());
   if (Number.isInteger(limit) && limit !== (profile.max_parallel_runs ?? 3)) patch.max_parallel_runs = limit;
   // The order of the library agents is part of the profile, so a move is a change.
@@ -164,6 +151,8 @@ export function diffDraft(
     patch.delegation_model = draft.delegationModel;
   if (draft.memoryProvider !== profile.memory_provider)
     patch.memory_provider = draft.memoryProvider;
+  if (draft.delegationModel !== (profile.delegation_model ?? "")) patch.delegation_model = draft.delegationModel;
+  if (draft.memoryProvider !== profile.memory_provider) patch.memory_provider = draft.memoryProvider;
   return patch;
 }
 
@@ -178,19 +167,10 @@ export function runtimeLabel(runtime: string): string {
 }
 
 /** The option of `runtime`. For the saved runtime, the options of the profile are the fallback. */
-export function runtimeOption(
-  options: AgentProfileOptions,
-  saved: string,
-  runtime: string,
-): RuntimeOption {
+export function runtimeOption(options: AgentProfileOptions, saved: string, runtime: string): RuntimeOption {
   const found = options.runtimes.find((r) => r.name === runtime);
   if (found) return found;
-  if (runtime === saved)
-    return {
-      name: runtime,
-      models: options.models,
-      subagents: options.subagents,
-    };
+  if (runtime === saved) return { name: runtime, models: options.models, subagents: options.subagents };
   return { name: runtime, models: [], subagents: false };
 }
 
@@ -198,9 +178,11 @@ export function runtimeOption(
  * The draft after the user chooses `runtime`. A model of another runtime cannot stay, so the
  * draft takes the saved model (back on the saved runtime) or the first model of the runtime.
  */
-export function withRuntime<
-  D extends { runtime: string; model: string; delegationModel?: string },
->(draft: D, profile: AgentProfile, runtime: string): D {
+export function withRuntime<D extends { runtime: string; model: string; delegationModel?: string }>(
+  draft: D,
+  profile: AgentProfile,
+  runtime: string,
+): D {
   const { models } = runtimeOption(profile.options, profile.runtime, runtime);
   let model = draft.model;
   if (runtime === profile.runtime) model = profile.model;
@@ -208,8 +190,7 @@ export function withRuntime<
   if (draft.delegationModel === undefined) return { ...draft, runtime, model };
   // A model for delegated tasks of another runtime cannot stay either.
   let delegationModel = draft.delegationModel;
-  if (runtime === profile.runtime)
-    delegationModel = profile.delegation_model ?? "";
+  if (runtime === profile.runtime) delegationModel = profile.delegation_model ?? "";
   else if (!models.includes(delegationModel)) delegationModel = "";
   return { ...draft, runtime, model, delegationModel };
 }
@@ -252,8 +233,7 @@ export function validateDraft(
     if (pattern && !pattern.test(sub.name.trim())) {
       return `${label}: use lowercase letters, digits, and single hyphens, and start with a letter.`;
     }
-    if (names.has(sub.name.trim()))
-      return `Two sub-agents have the name ${sub.name.trim()}.`;
+    if (names.has(sub.name.trim())) return `Two sub-agents have the name ${sub.name.trim()}.`;
     names.add(sub.name.trim());
     if (sub.description.trim() === "") return `${label} needs a description.`;
     if (sub.prompt.trim() === "") return `${label} needs a prompt.`;
