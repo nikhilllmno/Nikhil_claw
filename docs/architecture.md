@@ -7502,7 +7502,8 @@ for tests.
     (no email) and deletes each org with the slug from `GET /me`.
 - **Credentials.** The repository secret `E2E_SUPABASE_SERVICE_ROLE_KEY` (the `service_role`
   key of the staging Supabase project) makes and removes the test users. Only the setup, the
-  teardown, and the sweep use it. The tests use the tokens of the test users, as the web app
+  teardown, and the sweep use it. Without the secret, the workflow skips the suite with a
+  warning and does not fail. The tests use the tokens of the test users, as the web app
   does (`sessionStorage` key `sama.auth`). The world file of a run (`e2e/.state/world.json`,
   mode 0600, ignored by git) has the test passwords, and the teardown removes it.
 - **Sign-up.** The staging project sends email with the built-in mailer, which sends only to
