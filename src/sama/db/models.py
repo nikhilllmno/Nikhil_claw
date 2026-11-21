@@ -521,6 +521,9 @@ class AgentProfile(Base):
         CheckConstraint(
             f"max_parallel_runs BETWEEN 1 AND {MAX_PARALLEL_RUNS_CAP}", name="max_parallel_runs"
         ),
+        CheckConstraint(
+            "jsonb_typeof(library_subagents) = 'array'", name="library_subagents_is_array"
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -552,6 +555,11 @@ class AgentProfile(Base):
     )
     """The native sub-agents of the profile: a JSON array of ``SubagentSpec`` (Section 13.1).
     Write it only with ``sama.subagents.set_profile_subagents``."""
+    library_subagents: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    """The library agents that the profile uses: a JSON array of ``library_agents`` ids, in
+    order (Section 13.3, M7.4). A plain list, not a key: a session freezes the agents."""
     reasoning_effort: Mapped[str | None] = mapped_column(Text)
     """How much the model thinks (M7.10): ``low``, ``medium``, or ``high``. ``None``: the default
     of the model. A session freezes it in its run config."""
@@ -643,6 +651,10 @@ class Session(Base):
     """The toolsets and the profile policy rules when the session froze its config (Section
     11.4). The gate lets the session use only what the snapshot and the profile of now both
     allow, so a new permission applies from the next session and a removal applies at once."""
+    library_agent: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """The frozen spec of the library agent that the session runs as (Section 13.3, M7.4): a
+    child of ``delegate_task(agent=...)`` or a test run from the web app. ``None`` for a
+    session that runs as its agent profile."""
     review_user_turns: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     """The user turns that ended since the last background review (Section 9.4)."""
     review_tool_iterations: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -3075,3 +3087,102 @@ class ApiKey(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+
+LIBRARY_AGENT_SCOPES: Final = ("org", "workspace", "user")
+LIBRARY_AGENT_SOURCES: Final = ("create", "edit", "revert")
+
+
+class LibraryAgent(Base):
+    """A sub-agent of the library (docs/architecture.md, Section 13.3, M7.4).
+
+    An org agent is for every member of the org, a workspace agent for the members of one
+    workspace, and a ``user`` (personal) agent for one user. ``version`` is the current version
+    in ``library_agent_versions``. An agent profile names the agent in ``library_subagents``.
+    Members read the agents that they can see (RLS). Only the control plane writes the table.
+    """
+
+    __tablename__ = "library_agents"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id"], ["workspaces.org_id", "workspaces.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["org_id", "created_by_user_id"], ["users.org_id", "users.id"]),
+        ForeignKeyConstraint(["org_id", "updated_by_user_id"], ["users.org_id", "users.id"]),
+        UniqueConstraint("org_id", "id"),
+        UniqueConstraint(
+            "org_id", "scope", "workspace_id", "user_id", "name", postgresql_nulls_not_distinct=True
+        ),
+        CheckConstraint(_one_of("scope", LIBRARY_AGENT_SCOPES), name="scope"),
+        CheckConstraint(
+            "(scope = 'org' AND workspace_id IS NULL AND user_id IS NULL)"
+            " OR (scope = 'workspace' AND workspace_id IS NOT NULL AND user_id IS NULL)"
+            " OR (scope = 'user' AND workspace_id IS NULL AND user_id IS NOT NULL)",
+            name="scope_columns",
+        ),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 40", name="name_length"),
+        CheckConstraint("char_length(description) BETWEEN 1 AND 300", name="description_length"),
+        CheckConstraint("char_length(prompt) BETWEEN 1 AND 8000", name="prompt_length"),
+        CheckConstraint("jsonb_typeof(toolsets) = 'array'", name="toolsets_is_array"),
+        CheckConstraint("max_turns IS NULL OR max_turns BETWEEN 1 AND 50", name="max_turns"),
+        CheckConstraint(
+            "max_cost_usd IS NULL OR (max_cost_usd > 0 AND max_cost_usd <= 10)", name="max_cost"
+        ),
+        CheckConstraint("version >= 1", name="version"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    toolsets: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    model: Mapped[str | None] = mapped_column(Text)
+    """``None``: the model of the run."""
+    max_turns: Mapped[int | None] = mapped_column(Integer)
+    max_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    """The cost limit of a delegated run of the agent. A native sub-agent shares the budget of
+    its run."""
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class LibraryAgentVersion(Base):
+    """One version of a library agent. A version never changes (Section 13.3, M7.4).
+
+    ``spec`` has the fields of the agent at that version. ``author_user_id`` is not a key: the
+    history outlives a deleted user."""
+
+    __tablename__ = "library_agent_versions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "agent_id"],
+            ["library_agents.org_id", "library_agents.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("org_id", "agent_id", "version"),
+        CheckConstraint(_one_of("source", LIBRARY_AGENT_SOURCES), name="source"),
+        CheckConstraint("jsonb_typeof(spec) = 'object'", name="spec_is_object"),
+        CheckConstraint("version >= 1", name="version"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    reverts_version: Mapped[int | None] = mapped_column(Integer)
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _created_at()

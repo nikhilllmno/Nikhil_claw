@@ -29,6 +29,7 @@ function profile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     toolsets: [],
     group_toolsets: [],
     subagents: [],
+    library_subagents: [],
     updated_at: "2026-11-20T00:00:00+00:00",
     editable: true,
     options: {

@@ -17,6 +17,12 @@
   ``approve`` or ``reject``. The SDK asks ``needs_approval`` only for a call with no decision,
   so the approved call does not go to the gate again. A ``deny`` of the gate becomes a tool
   input guardrail that gives the model the reason in place of the tool result.
+- Sub-agents (Sections 13.1 and 13.3): each ``SubagentDefinition`` of the config is an agent
+  as a tool (``Agent.as_tool``) named ``subagent_<name>``. The gate sees the call as an
+  ``Agent`` call with ``subagent_type``, as in the Claude adapter. The sub-agent has only the
+  tools of its definition, it has no agent tool (no nested sub-agents), and each of its calls
+  asks the gate with ``child``: an ``ask`` is a ``deny``, because a sub-agent cannot pause the
+  run.
 - Compaction: the ``Compaction`` capability turns on the server-side compaction of the
   Responses API. A manual compaction (``RunRequest.compact`` or the input ``/compact``) calls
   ``POST /responses/compact`` and replaces the items. The adapter gives the items that a
@@ -27,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import uuid
@@ -36,6 +43,7 @@ from typing import Any, Final, Literal
 
 import httpx
 from agents import (
+    Agent,
     MaxTurnsExceeded,
     ModelSettings,
     Runner,
@@ -81,10 +89,13 @@ from sama.runtime.contract import (
     RunRequest,
     RunScope,
     RuntimeKind,
+    SubagentDefinition,
+    SubagentEvent,
     TextDelta,
     ToolCallFinished,
     ToolCallStarted,
     Usage,
+    bound_subagent_text,
     is_terminal,
 )
 from sama.runtime.gating import AllowAllGate, BoundedSet, GateDecision, ToolGate
@@ -116,6 +127,14 @@ waits up to 600 seconds, ``browser_task`` and ``repo_clone`` up to 600 and 300 s
 ``coding_agent_run`` up to 50 minutes (M7.2), so the limit is 1 hour, the longest run. The tool
 server has its own limit for each tool, so this is only the outer limit."""
 _NOT_RUN_OUTPUT: Final = "The call did not run: the run ended before it."
+SUBAGENT_TOOL_PREFIX: Final = "subagent_"
+"""The SDK name of the tool of a sub-agent is ``subagent_<name>``."""
+SAMA_SUBAGENT_TOOL: Final = "Agent"
+"""The gate and the events see the call of a sub-agent as a call of ``Agent``, as on Claude."""
+SAMA_MCP_PREFIX: Final = "mcp__sama__"
+DEFAULT_SUBAGENT_TURNS: Final = 20
+"""The turn limit of a sub-agent with no ``max_turns``."""
+_CHILD_ASK: Final = "a sub-agent cannot ask for an approval"
 
 # The SDK sends traces to OpenAI by default. Sama builds its traces from the stored rows.
 set_tracing_disabled(True)
@@ -289,33 +308,58 @@ class _RunGate:
     """Call id to the reason of the deny."""
     ask_reasons: dict[str, str] = field(default_factory=dict)
     rejected: set[str] = field(default_factory=set)
+    subagents: dict[str, str] = field(default_factory=dict)
+    """SDK tool name of a sub-agent to the name of the sub-agent."""
+    subagent_calls: dict[str, str] = field(default_factory=dict)
+    """Call id of a sub-agent call to the name of the sub-agent."""
+    shell: FunctionTool | None = None
+    """The shell tool of the main agent. A sub-agent with ``Bash`` gets a copy of it."""
 
     def sama_name(self, sdk_name: str) -> str:
+        if sdk_name in self.subagents:
+            return SAMA_SUBAGENT_TOOL
         return self.names.get(sdk_name, SAMA_SHELL_TOOL if sdk_name == SHELL_TOOL else sdk_name)
 
-    def wrap(self, tool: FunctionTool) -> None:
+    def sama_arguments(self, sdk_name: str, params: Mapping[str, Any]) -> dict[str, Any]:
+        """The arguments that sama sees. A sub-agent call has the ``subagent_type`` and the
+        ``prompt``, as the ``Agent`` call of the Claude CLI."""
+        subagent = self.subagents.get(sdk_name)
+        if subagent is not None:
+            return {"subagent_type": subagent, "prompt": str(params.get("input", ""))}
+        return sama_arguments(sdk_name, params)
+
+    def wrap(self, tool: FunctionTool, *, child: bool = False) -> None:
         sdk_name = tool.name
-        self.names[sdk_name] = _tool_name(tool)
+        if sdk_name not in self.subagents:
+            self.names[sdk_name] = _tool_name(tool)
 
         async def needs_approval(
             _context: RunContextWrapper[Any], params: dict[str, Any], call_id: str
         ) -> bool:
-            return await self.check(sdk_name, params, call_id)
+            return await self.check(sdk_name, params, call_id, child=child)
 
         tool.needs_approval = needs_approval
         tool.tool_input_guardrails = [
-            *(tool.tool_input_guardrails or []),
+            *(g for g in tool.tool_input_guardrails or [] if g.name != "sama_gate"),
             ToolInputGuardrail(guardrail_function=self.guardrail, name="sama_gate"),
         ]
         tool._sama_gated = True  # type: ignore[attr-defined]
 
-    async def check(self, sdk_name: str, params: Mapping[str, Any], call_id: str) -> bool:
+    async def check(
+        self, sdk_name: str, params: Mapping[str, Any], call_id: str, *, child: bool = False
+    ) -> bool:
         name = self.sama_name(sdk_name)
-        arguments = sama_arguments(sdk_name, params)
+        arguments = self.sama_arguments(sdk_name, params)
         try:
-            decision = await self.gate.check(self.scope, name, arguments, call_id=call_id)
+            decision = await self.gate.check(
+                self.scope, name, arguments, call_id=call_id, child=child
+            )
         except Exception as exc:
             decision = GateDecision("deny", f"the tool gate failed: {type(exc).__name__}")
+        if decision.action == "ask" and child:
+            # A sub-agent cannot pause the run. The gate maps ``ask`` to ``deny`` for a child
+            # call itself. This stays for a gate that does not.
+            decision = GateDecision("deny", decision.reason or _CHILD_ASK)
         if decision.action == "ask":
             self.ask_reasons[call_id] = decision.reason
             return True
@@ -348,7 +392,49 @@ class _GatedAgent(SandboxAgent[Any]):
             for tool in tools:
                 if isinstance(tool, FunctionTool) and not getattr(tool, "_sama_gated", False):
                     gate.wrap(tool)
+                if isinstance(tool, FunctionTool) and tool.name == SHELL_TOOL:
+                    gate.shell = tool
         return tools
+
+
+@dataclass
+class _SubAgent(Agent[Any]):
+    """A sub-agent of the run (Sections 13.1 and 13.3). It has only the tools of its
+    definition: the sama MCP tools that the definition names, and the shell tool when it names
+    ``Bash``. Each call asks the gate as a child call."""
+
+    sama_gate: _RunGate | None = None
+    allowed: frozenset[str] = frozenset()
+    """The sama names of the tools of the sub-agent."""
+
+    async def get_all_tools(self, run_context: RunContextWrapper[Any]) -> list[Tool]:
+        gate = self.sama_gate
+        if gate is None:
+            return []
+        found = await super().get_all_tools(run_context)
+        if SAMA_SHELL_TOOL in self.allowed and gate.shell is not None:
+            found.append(gate.shell)
+        tools: list[Tool] = []
+        for tool in found:
+            if not isinstance(tool, FunctionTool) or _tool_name(tool) not in self.allowed:
+                continue
+            # A copy: the main agent can hold the same object with its own gate hook.
+            own = copy.copy(tool)
+            gate.wrap(own, child=True)
+            tools.append(own)
+        return tools
+
+
+def subagent_tool_name(name: str) -> str:
+    """The SDK name of the tool of a sub-agent. A sub-agent name has letters, digits, and
+    hyphens, which a function name can have."""
+    return f"{SUBAGENT_TOOL_PREFIX}{name}"
+
+
+def _allowed(definition: SubagentDefinition) -> frozenset[str]:
+    return frozenset(
+        tool if tool == SAMA_SHELL_TOOL else f"{SAMA_MCP_PREFIX}{tool}" for tool in definition.tools
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -675,7 +761,7 @@ class OpenAIRuntime:
     def capabilities(self) -> Capabilities:
         return Capabilities(
             streaming=True,
-            native_subagents=False,
+            native_subagents=True,
             native_compaction=True,
             native_skills=False,
             native_file_checkpoints=False,
@@ -953,18 +1039,70 @@ class OpenAIRuntime:
             count += len(dangling)
         return count
 
-    def _agent(self, job: _Job, gate: _RunGate, servers: Sequence[MCPServer]) -> _GatedAgent:
+    def _agent(
+        self, job: _Job, gate: _RunGate, servers: Sequence[MCPServer], active: _ActiveRun
+    ) -> _GatedAgent:
         return _GatedAgent(
             name="sama",
             instructions=job.config.render_prefix() or None,
             model=OpenAIResponsesModel(model=job.config.model, openai_client=self._openai()),
             model_settings=_model_settings(job.config),
             mcp_servers=list(servers),
+            tools=[
+                self._subagent_tool(definition, job, gate, servers, active)
+                for definition in job.config.subagents
+            ],
             capabilities=[
                 Shell(configure_tools=_shell_tools),
                 _WindowCompaction(floor=job.window),
             ],
             sama_gate=gate,
+        )
+
+    def _subagent_tool(
+        self,
+        definition: SubagentDefinition,
+        job: _Job,
+        gate: _RunGate,
+        servers: Sequence[MCPServer],
+        active: _ActiveRun,
+    ) -> FunctionTool:
+        """One sub-agent as a tool of the main agent (agents as tools)."""
+        sdk_name = subagent_tool_name(definition.name)
+        gate.subagents[sdk_name] = definition.name
+        agent = _SubAgent(
+            name=definition.name,
+            instructions=definition.prompt,
+            model=OpenAIResponsesModel(
+                model=definition.model or job.config.model, openai_client=self._openai()
+            ),
+            model_settings=ModelSettings(parallel_tool_calls=False),
+            mcp_servers=list(servers),
+            sama_gate=gate,
+            allowed=_allowed(definition),
+        )
+
+        def on_stream(event: Any) -> None:
+            text = _subagent_text(event.get("event"))
+            if text is None:
+                return
+            call = event.get("tool_call")
+            call_id = _field(call, "call_id") if call is not None else None
+            active.send(
+                SubagentEvent(
+                    subagent=definition.name,
+                    text=bound_subagent_text(text),
+                    call_id=None if call_id is None else str(call_id),
+                    usage=job.usage,
+                )
+            )
+
+        return agent.as_tool(
+            tool_name=sdk_name,
+            tool_description=definition.description,
+            on_stream=on_stream,
+            run_config=SdkRunConfig(tracing_disabled=True),
+            max_turns=definition.max_turns or DEFAULT_SUBAGENT_TURNS,
         )
 
     async def _agent_run(self, active: _ActiveRun, store: _Store) -> None:
@@ -981,7 +1119,7 @@ class OpenAIRuntime:
             sandbox = await client.create(manifest=manifest, snapshot=NoopSnapshotSpec())
             stack.push_async_callback(_cleanup, _close_sandbox(client, sandbox))
             await sandbox.start()
-            agent = self._agent(job, gate, servers)
+            agent = self._agent(job, gate, servers, active)
             run_config = SdkRunConfig(
                 sandbox=SandboxRunConfig(session=sandbox), tracing_disabled=True
             )
@@ -1042,11 +1180,14 @@ class OpenAIRuntime:
                     sdk_name = _field(raw, "name")
                     if not call_id or not sdk_name:
                         continue
+                    subagent = gate.subagents.get(str(sdk_name))
+                    if subagent is not None:
+                        gate.subagent_calls[str(call_id)] = subagent
                     active.send(
                         ToolCallStarted(
                             call_id=str(call_id),
                             name=gate.sama_name(str(sdk_name)),
-                            arguments=sama_arguments(
+                            arguments=gate.sama_arguments(
                                 str(sdk_name), _arguments(_field(raw, "arguments"))
                             ),
                             usage=job.usage,
@@ -1057,6 +1198,21 @@ class OpenAIRuntime:
                     if not call_id:
                         continue
                     call_id = str(call_id)
+                    subagent = gate.subagent_calls.pop(call_id, None)
+                    if subagent is not None:
+                        active.send(
+                            SubagentEvent(
+                                subagent=subagent,
+                                # The whole output: the control plane redacts it and then
+                                # cuts it, so a cut never splits a secret (Section 13.1, A9).
+                                text=bound_subagent_text(
+                                    f"done: {_text_of(getattr(event.item, 'output', ''))}"
+                                ),
+                                call_id=call_id,
+                                done=True,
+                                usage=job.usage,
+                            )
+                        )
                     active.send(
                         ToolCallFinished(
                             call_id=call_id,
@@ -1077,7 +1233,7 @@ class OpenAIRuntime:
             call_id = str(_field(raw, "call_id") or "")
             sdk_name = str(item.tool_name or _field(raw, "name") or "")
             name = gate.sama_name(sdk_name)
-            arguments = sama_arguments(sdk_name, _arguments(_field(raw, "arguments")))
+            arguments = gate.sama_arguments(sdk_name, _arguments(_field(raw, "arguments")))
             pending = _PendingCall(call_id=call_id, tool_name=name)
             paused_count = await store.count()
             state = job.state(
@@ -1181,6 +1337,21 @@ class OpenAIRuntime:
             log.warning(
                 "the transcript archive failed run=%s: %s", scope.run_id, type(exc).__name__
             )
+
+
+def _subagent_text(event: Any) -> str | None:
+    """One line of progress of a sub-agent from a stream event of its run, or ``None``: a
+    tool call of the sub-agent, or its final message."""
+    if getattr(event, "type", None) != "run_item_stream_event":
+        return None
+    item = getattr(event, "item", None)
+    raw = getattr(item, "raw_item", None)
+    if event.name == "tool_called":
+        return f"calls {_field(raw, 'name') or 'a tool'}"
+    if event.name == "message_output_created":
+        text = _text_of(_field(raw, "content"))
+        return text or None
+    return None
 
 
 def _new_conversation(run_id: str) -> str:

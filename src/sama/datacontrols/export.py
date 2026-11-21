@@ -153,6 +153,11 @@ USER_ROWS: Final[Mapping[str, str | None]] = {
     ),
     # The keys that the user made or revoked (Section 10.7), without the hash.
     "api_keys": "user_id = :user OR revoked_by_user_id = :user",
+    "library_agents": "user_id = :user OR created_by_user_id = :user",
+    "library_agent_versions": (
+        "author_user_id = :user OR agent_id IN"
+        " (SELECT id FROM library_agents WHERE org_id = :org AND user_id = :user)"
+    ),
 }
 """The rows of a user export, as a filter in each table of the org. None: the table has no
 personal data, or the data is not for an export (secrets, the outbox, embeddings)."""

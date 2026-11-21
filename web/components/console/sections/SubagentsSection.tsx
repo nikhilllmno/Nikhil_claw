@@ -2,7 +2,8 @@
 
 // The Sub-agents section (M7.10): the sub-agents of an agent. A sub-agent is a helper with its own
 // prompt and tools that the agent can hand work to. The whole list is saved through
-// `PATCH /orgs/{org_id}/agent-profiles/{id}` (`subagents`).
+// `PATCH /orgs/{org_id}/agent-profiles/{id}` (`subagents`). Below it is the sub-agent library
+// (M7.4): personal, workspace, and org sub-agents with versions and a test run.
 
 import { useState } from "react";
 import { type AgentProfile, errorText } from "@/lib/api";
@@ -20,7 +21,8 @@ import { useApi } from "../../AuthProvider";
 import { ToneBadge } from "../../ui";
 import styles from "../../Page.module.css";
 import admin from "../../Admin.module.css";
-import { AgentProfileEditor, ComingCard, SectionHeader, useAgentChoice } from "../parts";
+import { SubagentLibrary } from "../../SubagentLibrary";
+import { AgentProfileEditor, SectionHeader, useAgentChoice } from "../parts";
 
 export function SubagentsSection() {
   const choice = useAgentChoice();
@@ -37,10 +39,7 @@ export function SubagentsSection() {
           <SubagentList orgId={choice.org.id} profile={profile} readOnly={readOnly} onSaved={onSaved} />
         )}
       </AgentProfileEditor>
-      <ComingCard title="Sub-agent library">
-        Personal, workspace, and org sub-agents will come with the sub-agent library. Today a sub-agent belongs to one
-        agent.
-      </ComingCard>
+      {choice.workspaceId ? <SubagentLibrary orgId={choice.org.id} workspaceId={choice.workspaceId} /> : null}
     </>
   );
 }

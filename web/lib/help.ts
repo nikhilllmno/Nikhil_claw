@@ -168,8 +168,8 @@ export const HELP_TOPICS: HelpTopic[] = [
   },
   {
     id: "tools",
-    title: "Connections, memory, and skills",
-    summary: "Give the agents tools, keep notes, and teach them how your team works.",
+    title: "Connections, memory, skills, and sub-agents",
+    summary: "Give the agents tools, keep notes, teach them how your team works, and share helpers.",
     audience: "everyone",
     sections: [
       {
@@ -196,11 +196,20 @@ export const HELP_TOPICS: HelpTopic[] = [
           "A skill is a guide that an agent follows for one kind of task. Agents can write skills. Each week the curator marks the skills that nobody uses as stale, and later archives them. It never deletes a skill. You can pin a skill to keep it.",
         ],
       },
+      {
+        heading: "Sub-agents",
+        paragraphs: [
+          "A sub-agent is a helper with its own prompt, tools, and limits. An agent hands a task to it and gets the answer back. The Sub-agents page is the library of the helpers. You make a helper once and many agents use it.",
+          "A sub-agent can be personal, for a workspace, or for the whole org. To use a sub-agent, open the settings of an agent and add it in the Library sub-agents part. The agent needs the tool group subagents and the tool groups of the sub-agent. A change to a sub-agent applies from the next session.",
+          "Each save is a new version. You can revert to an old version. Use Test run to try a sub-agent in a new private session. You cannot delete a sub-agent that an agent uses. Remove it from the agent first.",
+        ],
+      },
     ],
     links: [
       { href: "/connections", label: "Connections" },
       { href: "/memory", label: "Memory" },
       { href: "/skills", label: "Skills" },
+      { href: "/subagents", label: "Sub-agents" },
     ],
   },
   {

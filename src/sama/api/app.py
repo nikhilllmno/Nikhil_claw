@@ -91,6 +91,14 @@ from sama.api.skill_editor import (
     StateAction,
     WritableScope,
 )
+from sama.api.subagents import (
+    LIBRARY_ERRORS,
+    LibraryAgentChange,
+    LibraryAgentIn,
+    LibraryRoutes,
+    LibraryTestIn,
+    library_http_error,
+)
 from sama.api.tasks import (
     CommentOut,
     NewComment,
@@ -218,7 +226,8 @@ from sama.search.core import MAX_QUERY_CHARS
 from sama.search.service import SessionSearch
 from sama.skills.service import SkillLibrary
 from sama.skills.store import PostgresSkillStore
-from sama.subagents import SubagentError, parse_subagents
+from sama.subagent_library import SubagentLibrary
+from sama.subagents import SubagentError, parse_subagents, supports_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tenancy.regions import OrgInOtherRegion, home_regions, member_user_id, served_here
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -676,6 +685,10 @@ class ProfileEdit(_Edit):
     checks the values and the caps of the plan."""
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     """``null`` sets the default of the model. It is the only field that may be null."""
+    library_subagents: (
+        Annotated[list[Annotated[str, Field(max_length=36)]], Field(max_length=8)] | None
+    ) = None
+    """The ids of library agents (Section 13.3), in order."""
 
     nullable: ClassVar[frozenset[str]] = frozenset({"reasoning_effort"})
     busy_mode: Literal["steer", "parallel", "queue"] | None = None
@@ -1176,6 +1189,7 @@ class SamaApi:
         self._engine = engine
         self._browser = browser
         self._api_keys = ApiKeyStore(engine)
+        self._library = LibraryRoutes(SubagentLibrary(engine), self._can_manage_agents)
         self._memory = memory or MemoryService(PostgresMemoryStore(engine))
         self._integrations = integrations
         self._github = github
@@ -1716,6 +1730,66 @@ class SamaApi:
             except ModelKeyError as error:
                 raise HTTPException(status_code=error.status_code, detail=str(error)) from None
             return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/subagents")
+        async def library_agents(
+            principal: Me, org_id: uuid.UUID, workspace_id: uuid.UUID | None = None
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._library.catalog(org_id, grants, workspace_id)
+
+        @app.post("/orgs/{org_id}/subagents", status_code=201)
+        async def create_library_agent(
+            principal: Me, org_id: uuid.UUID, body: LibraryAgentIn
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            await self._know_secrets(org_id)
+            return await self._library.create(org_id, grants, body)
+
+        @app.get("/orgs/{org_id}/subagents/{agent_id}")
+        async def library_agent(
+            principal: Me, org_id: uuid.UUID, agent_id: uuid.UUID
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._library.get(org_id, grants, agent_id)
+
+        @app.patch("/orgs/{org_id}/subagents/{agent_id}")
+        async def edit_library_agent(
+            principal: Me, org_id: uuid.UUID, agent_id: uuid.UUID, body: LibraryAgentChange
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            if body.description is not None or body.prompt is not None:
+                await self._know_secrets(org_id)
+            return await self._library.update(org_id, grants, agent_id, body)
+
+        @app.delete("/orgs/{org_id}/subagents/{agent_id}", status_code=204)
+        async def delete_library_agent(
+            principal: Me, org_id: uuid.UUID, agent_id: uuid.UUID
+        ) -> Response:
+            grants = await self._org_grants(principal, org_id)
+            await self._library.delete(org_id, grants, agent_id)
+            return Response(status_code=204)
+
+        @app.get("/orgs/{org_id}/subagents/{agent_id}/versions")
+        async def library_agent_versions(
+            principal: Me, org_id: uuid.UUID, agent_id: uuid.UUID
+        ) -> list[dict[str, Any]]:
+            grants = await self._org_grants(principal, org_id)
+            return await self._library.versions(org_id, grants, agent_id)
+
+        @app.post("/orgs/{org_id}/subagents/{agent_id}/versions/{version}/revert")
+        async def revert_library_agent(
+            principal: Me, org_id: uuid.UUID, agent_id: uuid.UUID, version: int
+        ) -> dict[str, Any]:
+            grants = await self._org_grants(principal, org_id)
+            await self._know_secrets(org_id)
+            return await self._library.revert(org_id, grants, agent_id, version)
+
+        @app.post("/orgs/{org_id}/subagents/{agent_id}/test", status_code=201)
+        async def test_library_agent(
+            principal: Me, org_id: uuid.UUID, agent_id: uuid.UUID, body: LibraryTestIn
+        ) -> JSONResponse:
+            return await self._test_library_agent(principal, org_id, agent_id, body)
 
         @app.get("/orgs/{org_id}/browser/url-policy")
         async def browser_url_policy(principal: Me, org_id: uuid.UUID) -> dict[str, Any]:
@@ -2496,6 +2570,7 @@ class SamaApi:
                         AgentProfile.reasoning_effort,
                         AgentProfile.busy_mode,
                         AgentProfile.max_parallel_runs,
+                        AgentProfile.library_subagents,
                         AgentProfile.updated_at,
                         select(Org.plan)
                         .where(Org.id == AgentProfile.org_id)
@@ -2529,6 +2604,7 @@ class SamaApi:
             "reasoning_effort": row.reasoning_effort,
             "busy_mode": row.busy_mode,
             "max_parallel_runs": row.max_parallel_runs,
+            "library_subagents": [str(value) for value in row.library_subagents or []],
             "updated_at": row.updated_at.isoformat(),
             "editable": await self._can_manage_agents(org_id, grants),
             "options": profile_options(runtime, row.plan),
@@ -3179,6 +3255,84 @@ class SamaApi:
             if profile_workspace is None or profile_workspace[0] not in (None, workspace_id):
                 raise _not_found("the agent profile does not exist in this workspace")
         return org_id, grants
+
+    async def _know_secrets(self, org_id: uuid.UUID) -> None:
+        """The redactor must know every vault value before a text is checked. Fail closed."""
+        try:
+            await know_the_secrets(self._engine, org_id)
+        except VaultUnreadableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from None
+
+    async def _test_library_agent(
+        self, principal: Principal, org_id: uuid.UUID, agent_id: uuid.UUID, body: LibraryTestIn
+    ) -> JSONResponse:
+        """A test run of a library agent (Section 13.3): a new private session of the person
+        with the agent profile, that runs as the agent, and the first message. The agent must
+        apply to the workspace: a workspace agent of another workspace cannot run there."""
+        workspace_org, grants = await self._workspace_access(
+            principal, body.workspace_id, body.profile_id
+        )
+        if workspace_org != org_id:
+            raise _not_found("the workspace does not exist")
+        user_id = grants.user_id
+        try:
+            agent = await self._library.library.get(org_id, grants, agent_id)
+        except LIBRARY_ERRORS as error:
+            raise library_http_error(error) from None
+        if not agent.applies(
+            workspace_id=body.workspace_id, audience="private", owner_user_id=user_id
+        ):
+            raise HTTPException(status_code=422, detail="the sub-agent is of another workspace")
+        async with self._engine.connect() as connection:
+            runtime = (
+                await connection.execute(
+                    select(AgentProfile.runtime).where(
+                        AgentProfile.org_id == org_id, AgentProfile.id == body.profile_id
+                    )
+                )
+            ).scalar_one()
+        if not supports_subagents(RuntimeKind(runtime)):
+            raise HTTPException(
+                status_code=422, detail=f"the runtime {runtime} cannot run a library agent"
+            )
+        session_id = uuid.uuid4()
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                insert(Session).values(
+                    id=session_id,
+                    org_id=org_id,
+                    workspace_id=body.workspace_id,
+                    agent_profile_id=body.profile_id,
+                    audience="private",
+                    owner_user_id=user_id,
+                    title=f"Test: {agent.name}",
+                    library_agent=agent.frozen(),
+                )
+            )
+            await connection.execute(
+                insert(AuditEntry).values(
+                    org_id=org_id,
+                    workspace_id=body.workspace_id,
+                    actor_kind="user",
+                    actor_user_id=user_id,
+                    action="session.created",
+                    target_type="session",
+                    target_id=str(session_id),
+                    details={
+                        "audience": "private",
+                        "channel": "web",
+                        "library_agent": agent.name,
+                    },
+                )
+            )
+        try:
+            sent = await self.submit(principal, session_id, body.message)
+        except SendError as error:
+            return JSONResponse(status_code=error.status, content={"detail": error.detail})
+        return JSONResponse(
+            status_code=201,
+            content={"session_id": str(session_id), "run_id": str(sent.run_id)},
+        )
 
     async def _create_session(self, principal: Principal, body: NewSession) -> SessionOut:
         org_id, grants = await self._workspace_access(

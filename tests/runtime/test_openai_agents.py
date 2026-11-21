@@ -117,7 +117,7 @@ def test_the_capabilities_say_what_the_adapter_does() -> None:
     assert capabilities.resumable_sessions
     assert capabilities.manual_compaction
     assert capabilities.compaction_archive
-    assert not capabilities.native_subagents
+    assert capabilities.native_subagents
 
 
 class BrokenItems:

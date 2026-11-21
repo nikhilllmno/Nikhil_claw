@@ -372,7 +372,7 @@ maintenance calls `sweep_steers()`: it sends the pending notes of completed runs
 came in after `complete`) as a new message, and it drops (status `dropped`) the pending notes of
 failed and cancelled runs. It handles at most 50 runs in one pass (`STEER_SWEEP_BATCH`).
 
-**Busy modes and parallel runs (M7.1, migration `0043`).** The busy mode of an agent profile
+**Busy modes and parallel runs (M7.1, migration `0044`).** The busy mode of an agent profile
 (`agent_profiles.busy_mode`) says what a new message does while a run of its session is open.
 The modes follow Claude Code:
 
@@ -651,7 +651,7 @@ RunEvent = (
 | Sama tools | `mcp_servers` with the sama MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the sama tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
 | Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to sama. | Serialised `RunState` plus a sama `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
-| Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers). Sama sets it from the agent profile (Section 13.1). | None in M3.6 (`native_subagents` is false). Agents as tools and handoffs are later work. |
+| Sub-agents | `agents` option (`AgentDefinition`: prompt, tools, model, skills, MCP servers). Sama sets it from the agent profile (Section 13.1). | Agents as tools since M7.4: each sub-agent is a tool `subagent_<name>` (`Agent.as_tool`) of the main agent (Section 13.3). Handoffs are not used. |
 | Skills | Native: sama writes the session's skills to `.claude/skills/` and sets the `skills` option. | The sama `skill_view` tool over MCP (`native_skills` is false). |
 | Compaction | Native auto-compaction. The `PreCompact` hook gives the full transcript to the sama archive first. `/compact [focus]` is a CLI slash command that the adapter sends for a compact request (M2.6, Section 6.3). | The `Compaction` capability turns on server-side compaction. A manual compaction calls `POST /responses/compact` and replaces the items. The adapter archives the dropped items first, so it sets `manual_compaction` and `compaction_archive` (M3.6). |
 | Shell and files | Native `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep` | `SandboxAgent` with the `Shell` capability (`exec_command`). The runner is already inside the E2B sandbox, so it uses the local client (`UnixLocalSandboxClient`). The orchestrator owns the E2B lifecycle. The runner has no E2B API key. |
@@ -804,6 +804,19 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
   makes the SDK stop with an interruption: the adapter saves the SDK `RunState` in
   `runtime_state` and yields `ApprovalRequired`. The approval id is the call id. A `deny`
   becomes a tool input guardrail that gives the model the reason in place of the result.
+- **Sub-agents (M7.4).** The capability `native_subagents` is true. Each `SubagentDefinition`
+  of the config becomes one tool `subagent_<name>` of the main agent, made with
+  `Agent.as_tool`. The tool takes one `input` text. The gate and the events see the call as an
+  `Agent` call with `subagent_type` and `prompt`, as on Claude, so one policy fits both
+  runtimes. The sub-agent is a plain `Agent` with the prompt of the definition, the model of the
+  definition or of the run, and `max_turns` (20 when not set). Its tools are only the sama MCP
+  tools that the definition names, and a copy of the shell tool of the run when the definition
+  names `Bash`. It has no agent tool, so it cannot start a sub-agent. Each tool call of the
+  sub-agent asks the gate with `child`, and the adapter maps an `ask` to a `deny` (A3 of
+  Section 13.1.1). The nested run streams its tool calls and its final message as
+  `SubagentEvent`s with the id of the `Agent` call. The output of the call gives the last event,
+  with `done`. The cost of the nested model calls goes through the model proxy with the run
+  token, so the budgets of the run apply.
 - **Approve and reject.** A resume loads the `RunState` and calls `approve()` or
   `reject()` with a fixed text and the reason of the user. The SDK asks `needs_approval` only
   for a call with no decision, so the approved call does not go to the gate again. An approval
@@ -2338,7 +2351,7 @@ default profile of the first org has `tool_search` since migration `0018` (M2.6)
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
 (M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
-(M4.5), `browser` since migration `0036` (M5.1), and `coding_agents` since migration `0041`
+(M4.5), `browser` since migration `0036` (M5.1), and `coding_agents` since migration `0044`
 (M7.2). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
@@ -3526,8 +3539,9 @@ settings page of the web app uses two more routes:
   limits of the sub-agent spec).
 - `PATCH /orgs/{org_id}/agent-profiles/{profile_id}` changes the profile. Only an org owner or
   admin can do it (`403` for another member). The body has `name`, `soul`, `runtime`, `model`,
-  `toolsets`, and `subagents`. Each field is optional, an unknown field is an error, and the body has at
-  least one field. The answer has the same body as the `GET`.
+  `toolsets`, `subagents`, and `library_subagents` (M7.4, Section 13.3). Each field is optional, an unknown field is an error, and the body has at
+  least one field. The answer has the same body as the `GET`. The `GET` also has
+  `library_subagents`: the ids of the library agents of the profile, in order.
 
 The rules of an update:
 
@@ -3537,8 +3551,8 @@ The rules of an update:
 - `runtime` must be `claude_agent_sdk` or `openai_agents_sdk` (M3.6). On a switch, the model
   (the new `model`, or the stored model when the body has none) must be a model of the new
   runtime, else the API gives `422` ("choose a model of the new runtime"). The stored
-  sub-agents must fit the new runtime: the OpenAI runtime has no native sub-agents, so an admin
-  removes the sub-agents first. A review model that the new runtime does not know goes back to
+  sub-agents must fit the new runtime: a model of a sub-agent must be a model of the new
+  runtime (both runtimes have native sub-agents since M7.4). A review model that the new runtime does not know goes back to
   the default (null).
 - A switch applies to new sessions. A session keeps the runtime of its frozen config. A chat
   run of a session with no frozen config takes the runtime of the profile when the worker
@@ -4757,7 +4771,8 @@ and `POST /workspaces/{id}/tasks/{task_id}/comments`.
 
 | Kind | When | How |
 |---|---|---|
-| Native sub-agents | Short side tasks inside one run (search a codebase, review a diff) | Claude `agents` option. OpenAI agents as tools or handoffs. Same sandbox, same run. |
+| Native sub-agents | Short side tasks inside one run (search a codebase, review a diff) | Claude `agents` option. OpenAI agents as tools (M7.4). Same sandbox, same run. |
+| Sub-agent library | Reusable sub-agents of a user, a workspace, or the org | A profile names library agents, and `delegate_task(agent=...)` starts one as a child (Section 13.3, M7.4). |
 | `delegate_task` | Parallel or long tasks, a different runtime or model, or a clean context | Sama creates a child session and run, in its own sandbox, linked to the parent. Only the child's summary (and file paths) return to the parent. |
 | Task board | Multi-step projects with many agents and humans | Section 12.4. |
 
@@ -4770,7 +4785,9 @@ approval policy and can only narrow it. Section 13.2 has the design (M4.6).
 
 A native sub-agent is a short side task inside one run. It has its own prompt, its own tools,
 and an empty context. Only its final answer goes back to the main agent. Only a runtime with
-the capability `native_subagents` has them. This is Claude today (Section 5.3).
+the capability `native_subagents` has them. Claude has them since M2.7, and the OpenAI runtime
+since M7.4 (agents as tools, Section 5.3). The inline specs of this section are one source.
+The sub-agent library of Section 13.3 is the other.
 
 **Profile.** `agent_profiles.subagents` (migration `0019`) is a JSON list of at most 8 specs.
 It is empty by default. A spec has:
@@ -4857,7 +4874,8 @@ the root and not of the sub-agent span, because the gate does not receive the su
 ### 13.2 `delegate_task` (M4.6)
 
 `delegate_task` gives 1 to 10 independent tasks to child agents. Each task has a `goal`, an
-optional `context`, and an optional budget (`max_turns`, `max_cost_usd`). For each task, sama
+optional `context`, an optional budget (`max_turns`, `max_cost_usd`), and an optional `agent`:
+the name of a library agent that the child runs as (Section 13.3, M7.4). For each task, sama
 makes a child session and a queued child run in one transaction:
 
 - The child session has the lineage `delegation`, `parent_session_id`, and `parent_run_id`.
@@ -4889,12 +4907,121 @@ answer or error of each child. With `wait=false`, it returns the child ids at on
 | `status` | Shows the children of the run, or one child. |
 | `cancel` | Cancels the open run of a child. |
 | `steer` | Sends a new message to a child. The message runs as the next run of the child session, after the current run. A message during a run comes with M3.9. |
+| `agents` | Lists the library agents that `delegate_task` can start with `agent` (M7.4). |
 
 A run can control only the children of its own session. A cancel of the parent does not
 cancel its children: each child ends on its own budget.
 
 **Risk**: a parent that waits holds a worker slot. A child run counts toward the chat rate
 limits of the user and the org.
+
+### 13.3 Sub-agent library (M7.4)
+
+A library agent is a sub-agent that a person writes once and uses in many places. The package
+`sama.subagent_library` has the store and the rules. The tables are `library_agents` and
+`library_agent_versions` (migration `0044`).
+
+**Fields.** A library agent has the fields of an inline spec (Section 13.1) and one more limit:
+
+| Field | Rule |
+|---|---|
+| `name`, `description`, `prompt`, `toolsets`, `max_turns` | The rules of Section 13.1. |
+| `model` | Not set or `inherit`: the model of the run. Else a model id with a price for Claude or for OpenAI. A run of the other runtime uses its own model. |
+| `max_cost_usd` | Not set, or more than 0 and at most 10 USD. The cost limit of a run of the agent (a delegated child or a test run). A native sub-agent shares the budget of its run. |
+
+The checks at each write: a toolset must be a toolset of sama, and not `subagents`, `clarify`,
+`tool_search`, `connections`, or `integrations`; the model must have a price; and the description
+and the prompt cannot have a secret or a finding of the injection scan. The API first gives the
+redactor the vault of the org and fails closed, as for the soul. An error text has only the
+names of fields and fixed messages.
+
+**Scopes and rights.**
+
+| Scope | Who reads | Who writes |
+|---|---|---|
+| `user` (personal) | The owner | The owner. Any member writes their own agents, with no approval. |
+| `workspace` | The members who see the workspace | A workspace admin, or an org owner or admin |
+| `org` | Every member of the org | An org owner or admin |
+
+An org owner or admin also needs the permission `agents.manage` of the role (M7.10) to write a
+workspace or org agent. A personal agent needs no permission. The settings console (M7.10)
+shows the library in its Sub-agents section.
+
+RLS has the same read rule. Only the control plane writes the tables. A write locks the row and
+the memberships, so a change of a role cannot slip in before the write. Each create, edit, and
+revert makes a version. A revert makes a new version with the spec of an old version and checks
+the text again. The audit entries (`subagent_library.created`, `updated`, `reverted`, `deleted`)
+have the name and the version, never the prompt. A name is unique in its scope.
+
+**Use in a profile.** `agent_profiles.library_subagents` is a JSON list of agent ids, in order.
+An org owner or admin sets it with `PATCH /orgs/{org_id}/agent-profiles/{profile_id}`. The
+profile history records it with the kind `profile`, so a revert works. The checks: each agent
+exists in the org; a workspace agent is of the workspace of the profile (any workspace for a
+profile of the org); a personal agent that the change adds is of the editor; the inline and the
+library sub-agents together are at most 8 and have unique names; the profile has the toolset
+`subagents` and a runtime with native sub-agents. The toolsets of an agent are not checked
+against the profile: the build uses only the toolsets that the run has. An agent that a profile
+uses cannot be deleted (`409`).
+
+**Build.** The prompt assembler adds library agents after the inline specs: first the agents of
+the profile that apply to the session, then the personal agents of the owner of a private
+session. A workspace agent applies to its workspace. A personal agent applies only to the
+private sessions of its owner, so a member's own agents need no admin. A missing agent, an agent
+of another workspace or user, a name that is already used, and an agent after the eighth are left
+out with a log line. Each agent becomes a `SubagentDefinition` with the rules of Section 13.1, so
+it never has more tools than the run. The config is frozen with the session (D9): a change of
+an agent applies from the next session.
+
+**`delegate_task(agent=...)`.** A task of `delegate_task` (Section 13.2) can name a library
+agent. The name resolves to the narrowest agent that the parent session can use: the personal
+agent of the owner of a private session, then the workspace agent, then the org agent. An
+unknown name stops the whole call. `delegate_status(action="agents")` lists the names. The child
+session keeps the frozen spec in `sessions.library_agent`. For such a session:
+
+- The soul of the config is the name and the prompt of the agent, not the soul of the profile.
+  The config has no sub-agents, so there are no nested sub-agents.
+- `RunQueue.enqueue_in` caps each run of the session with the agent: the toolset limit of the run
+  is the toolsets of the agent (without the toolsets that a sub-agent never has), the budget is
+  at most `max_turns` and `max_cost_usd`, and the model is the model of the agent when the
+  runtime of the session knows it. A steer keeps these limits.
+- The toolset snapshot of the session (Section 11.4) has only the toolsets of the agent, so the
+  gate never gives the session more.
+- The limits of the agent are the defaults of the child, and a task cannot ask for more.
+
+**Test run.** `POST /orgs/{org_id}/subagents/{agent_id}/test` makes a new private session of the
+caller with an agent profile of the workspace and the first message. The session runs as the
+agent, with the same rules as a delegated child, but it is attended: a gate `ask` waits for the
+person. The web app opens the session.
+
+**Web API.**
+
+| Route | What it does |
+|---|---|
+| `GET /orgs/{org_id}/subagents?workspace_id=` | The agents that the caller sees, `writable_scopes`, and `options` (toolsets, models of each runtime, limits). |
+| `POST /orgs/{org_id}/subagents` | Creates an agent (`scope`, `workspace_id` for a workspace agent, and the fields). |
+| `GET`, `PATCH`, `DELETE /orgs/{org_id}/subagents/{agent_id}` | Reads, changes, or deletes one agent. Each answer has `can_edit`, `version`, and `used_by` (the profiles that use it). |
+| `GET /orgs/{org_id}/subagents/{agent_id}/versions` | The versions, newest first. |
+| `POST /orgs/{org_id}/subagents/{agent_id}/versions/{version}/revert` | A new version with an old spec. |
+| `POST /orgs/{org_id}/subagents/{agent_id}/test` | A test run (above). |
+
+The web app has the page `/subagents` (list, editor, history, revert, delete, and test run) and a
+"Library sub-agents" part in the profile editor. The components are self-contained, so the
+settings console (M7.10) can use them.
+
+**Data controls.** A user export has the personal agents of the user, the agents that the user
+made, and their versions. A user delete deletes the personal agents (the keys cascade) and
+removes them from `library_subagents` of each profile. An org delete deletes all rows.
+
+#### 13.3.1 Assumptions
+
+| # | Assumption |
+|---|---|
+| L1 | A profile names library agents by id. A session freezes the agent at its version of that time. A profile does not pin a version. |
+| L2 | The personal agents of a member apply to the private sessions of the member without a change of the profile, as the personal skills do. A shared session never gets a personal agent. |
+| L3 | The cost limit applies to a run that runs as the agent (a child or a test run). A native sub-agent uses the budget of its run, because the proxy does not know which sub-agent made a call (Section 13.1). |
+| L4 | A workspace agent can be written by an org admin too, so an org admin can manage every scope. |
+| L5 | The agent cannot propose library agents with `change_propose`. A person adds them in the web app. |
+| L6 | Only a runtime with native sub-agents runs library agents. On another runtime (for example a coding agent CLI runtime of M7.2), the profile write refuses library agents, the build gives none, and `delegate_task(agent=...)` and the test run refuse to start one, because such a runtime does not take the prompt and the tool limits of the agent. |
 
 ---
 
@@ -6089,7 +6216,7 @@ sandbox runner does not start it.
   `DEFAULT_ALLOW`, so the default is `ask`: in a run of the runtimes, the run ends with
   `ApprovalRequired`, and the resume after an approval starts the CLI. "Always allow" writes a
   user rule, as for other tools. An unattended run gets `deny`. A `deny` rule wins. The run needs
-  the toolset `coding_agents`; migration `0041` adds it to a profile with the default toolsets of
+  the toolset `coding_agents`; migration `0044` adds it to a profile with the default toolsets of
   migration `0036`, and it is in the default list of `bootstrap`. It is not in the default group
   set.
 - The approval covers the whole request, also the pull request when `open_pr` is set. The gate
@@ -6145,7 +6272,7 @@ The names `claude`, `codex`, and `sama` are reserved for the commands.
 | Runtimes `claude_code`, `codex` | `src/sama/coding/runtime.py` |
 | Tool body and progress | `src/sama/coding/tool.py`, `src/sama/coding/progress.py` |
 | Commands | `src/sama/coding/commands.py`, `src/sama/gateway/telegram.py`, `src/sama/gateway/slack.py`, `src/sama/api/app.py`, `web/` |
-| Columns | migration `0041`: `sessions.coding_agent`, `runs.coding_agent`, and the runtimes `claude_code` and `codex` in the checks of `agent_profiles` and `runs` |
+| Columns | migration `0044`: `sessions.coding_agent`, `runs.coding_agent`, and the runtimes `claude_code` and `codex` in the checks of `agent_profiles` and `runs` |
 
 #### 15.4.1 Assumptions
 

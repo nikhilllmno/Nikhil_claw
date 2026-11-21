@@ -25,6 +25,7 @@ const WORKSPACE_LINKS: NavLink[] = [
   { href: "/search", title: "Search", meta: "Find words in your past sessions" },
   { href: "/memory", title: "Memory", meta: "The notes that the agents keep" },
   { href: "/skills", title: "Skills", meta: "The guides that the agents follow" },
+  { href: "/subagents", title: "Sub-agents", meta: "Reusable helpers for your agents" },
   { href: "/connections", title: "Connections", meta: "The tools that the agents can use" },
 ];
 

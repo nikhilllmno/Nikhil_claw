@@ -22,6 +22,7 @@ const profile: AgentProfile = {
       max_turns: 8,
     },
   ],
+  library_subagents: [],
   updated_at: "2026-11-20T00:00:00Z",
   editable: true,
   options: {
@@ -72,6 +73,24 @@ describe("diffDraft", () => {
     expect(patch.subagents).toHaveLength(2);
     expect(patch.subagents?.[0]?.max_turns).toBe(12);
     expect(patch.subagents?.[1]).toMatchObject({ name: "writer", model: "m", max_turns: null });
+  });
+});
+
+describe("library sub-agents", () => {
+  it("sends the ids when the list changes, and checks the count with the inline agents", () => {
+    const draft = toDraft(profile);
+    draft.librarySubagents = ["a1"];
+    expect(diffDraft(profile, draft)).toEqual({ library_subagents: ["a1"] });
+    const saved = { ...profile, library_subagents: ["a1", "a2"] };
+    const same = toDraft(saved);
+    expect(diffDraft(saved, same)).toEqual({});
+    same.librarySubagents = ["a2", "a1"]; // the order is part of the profile
+    expect(diffDraft(saved, same)).toEqual({ library_subagents: ["a2", "a1"] });
+    const full = toDraft(profile);
+    full.librarySubagents = Array.from({ length: 10 }, (_, i) => `id${i}`); // 1 inline + 10
+    expect(validateDraft(full, profile.options.limits)).toMatch(/at most 10/);
+    full.librarySubagents = full.librarySubagents.slice(0, 9);
+    expect(validateDraft(full, profile.options.limits)).toBeNull();
   });
 });
 

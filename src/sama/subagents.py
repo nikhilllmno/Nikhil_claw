@@ -292,6 +292,8 @@ class LockedProfile(NamedTuple):
     """The plan of the org. A budget change must stay in the caps of the plan (M7.10)."""
     busy_mode: str = "steer"
     max_parallel_runs: int = 3
+    library_subagents: list[str] | None = None
+    """The ids of the library agents of the profile (Section 13.3)."""
 
 
 async def lock_profile(
@@ -321,6 +323,7 @@ async def lock_profile(
                 .label("plan"),
                 AgentProfile.busy_mode,
                 AgentProfile.max_parallel_runs,
+                AgentProfile.library_subagents,
             )
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)
             .with_for_update()
@@ -345,6 +348,11 @@ async def lock_profile(
         plan=row.plan,
         busy_mode=row.busy_mode,
         max_parallel_runs=row.max_parallel_runs,
+        library_subagents=(
+            [str(t) for t in row.library_subagents]
+            if isinstance(row.library_subagents, list)
+            else []
+        ),
     )
 
 
@@ -365,6 +373,24 @@ async def set_profile_subagents(
     async with engine.begin() as connection:
         profile = await lock_profile(connection, org_id, profile_id)
         validate_subagents(specs, toolsets=profile.toolsets, runtime=profile.runtime)
+        # Here, not at the top: the library imports this module.
+        from sama.subagent_library import LibraryError, check_profile_library
+
+        try:
+            # The library agents of the profile count, and their names must stay unique.
+            await check_profile_library(
+                connection,
+                org_id,
+                profile_workspace_id=profile.workspace_id,
+                before=profile.library_subagents or [],
+                after=profile.library_subagents or [],
+                inline_names=names,
+                toolsets=profile.toolsets,
+                runtime=profile.runtime,
+                actor_user_id=actor_user_id,
+            )
+        except LibraryError as error:
+            raise SubagentError(str(error)) from None
         await connection.execute(
             update(AgentProfile)
             .where(AgentProfile.org_id == org_id, AgentProfile.id == profile_id)

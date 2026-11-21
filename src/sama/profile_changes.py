@@ -31,6 +31,7 @@ from sama.db.models import AgentProfile, AuditEntry, ProfileChange, ToolPolicy, 
 from sama.profiles import (
     KIND_FIELDS,
     ProfileError,
+    check_library,
     lock_admin,
     planned_values,
     profile_value,
@@ -169,6 +170,7 @@ async def write_change(
             " of now"
         )
     values = planned_values(profile, {key: value for key, value in after.items() if key != "rules"})
+    await check_library(connection, org_id, profile, values, actor_user_id)
     if values:
         await connection.execute(
             update(AgentProfile)

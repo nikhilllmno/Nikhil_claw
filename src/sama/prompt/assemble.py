@@ -44,8 +44,10 @@ from sama.runtime.contract import (
     SkillIndexEntry,
     SubagentDefinition,
 )
+from sama.subagent_library import Agent as LibraryAgentRow
+from sama.subagent_library import personal_agents, session_agents
+from sama.subagents import MAX_SUBAGENTS, NOT_FOR_SUBAGENTS, SubagentError, parse_subagents
 from sama.subagents import TOOLSET as SUBAGENT_TOOLSET
-from sama.subagents import SubagentError, parse_subagents
 from sama.subagents import resolve as resolve_subagents
 from sama.tenancy.authority import run_user
 
@@ -187,7 +189,9 @@ class PromptAssembler:
             # The lock makes concurrent first runs of a session build one config.
             stored = (
                 await connection.execute(
-                    select(Session.run_config, Session.created_at).where(*session).with_for_update()
+                    select(Session.run_config, Session.created_at, Session.library_agent)
+                    .where(*session)
+                    .with_for_update()
                 )
             ).one_or_none()
             if stored is None:
@@ -195,7 +199,11 @@ class PromptAssembler:
             if stored.run_config is not None:
                 config = RunConfig.model_validate(stored.run_config)
             else:
-                config = await self._build(connection, run, stored.created_at)
+                agent = stored.library_agent if isinstance(stored.library_agent, dict) else None
+                config = await self._build(connection, run, stored.created_at, agent)
+                snapshot = await session_snapshot(connection, run.org_id, run.agent_profile_id)
+                if agent is not None and snapshot is not None:
+                    snapshot = library_snapshot(snapshot, agent)
                 # The snapshot keeps the toolsets and the profile policy rules of this session,
                 # so a looser change of the profile applies from the next session (Section 11.4).
                 await connection.execute(
@@ -204,9 +212,7 @@ class PromptAssembler:
                     .values(
                         run_config=config.model_dump(mode="json"),
                         config_fingerprint=config.fingerprint(),
-                        profile_snapshot=await session_snapshot(
-                            connection, run.org_id, run.agent_profile_id
-                        ),
+                        profile_snapshot=snapshot,
                     )
                 )
         return _checked(config, run)
@@ -232,7 +238,11 @@ class PromptAssembler:
             )
 
     async def _build(
-        self, connection: AsyncConnection, run: ClaimedRun, started: datetime
+        self,
+        connection: AsyncConnection,
+        run: ClaimedRun,
+        started: datetime,
+        agent: dict[str, Any] | None = None,
     ) -> RunConfig:
         files: list[ContextFile] = []
         taken: set[str] = set()
@@ -278,12 +288,13 @@ class PromptAssembler:
             runtime=runtime,
             model=run.model,
             system=self._system,
-            soul=run.soul,
+            soul=run.soul if agent is None else library_soul(agent),
             context_files=tuple(files),
             environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
             skill_index=await self._skill_index(connection, run),
-            subagents=await _subagents(connection, run, runtime),
+            # A library agent has no sub-agents: no nested sub-agents (Section 13.3).
+            subagents=() if agent is not None else await _subagents(connection, run, runtime),
             reasoning_effort=run.reasoning_effort,
         )
 
@@ -356,13 +367,70 @@ async def _subagents(
         )
     ).scalar_one_or_none()
     try:
-        specs = parse_subagents(raw if raw is not None else [])
+        specs = list(parse_subagents(raw if raw is not None else []))
     except SubagentError as error:
         log.warning(
             "the sub-agents of a profile are not valid profile=%s: %s", run.agent_profile_id, error
         )
-        return ()
+        specs = []
+    library = await _library(connection, run)
+    taken = {spec.name for spec in specs}
+    for agent in library:
+        if len(specs) >= MAX_SUBAGENTS:
+            log.warning("the session has too many sub-agents session=%s", run.session_id)
+            break
+        if agent.name in taken:
+            log.warning("two sub-agents have the name %s session=%s", agent.name, run.session_id)
+            continue
+        taken.add(agent.name)
+        specs.append(agent.native_spec(runtime))
     return resolve_subagents(specs, toolsets=toolsets, runtime=runtime)
+
+
+async def _library(connection: AsyncConnection, run: ClaimedRun) -> list[LibraryAgentRow]:
+    """The library agents of the run (Section 13.3): the agents that the profile names, then
+    the personal agents of the owner of a private session. A personal agent needs no admin, so
+    it applies to the sessions of its owner without a change of the profile."""
+    profile = (
+        await connection.execute(
+            select(AgentProfile.library_subagents).where(
+                AgentProfile.org_id == run.org_id, AgentProfile.id == run.agent_profile_id
+            )
+        )
+    ).scalar_one_or_none()
+    found = await session_agents(
+        connection,
+        run.org_id,
+        profile,
+        workspace_id=run.workspace_id,
+        audience=run.audience,
+        owner_user_id=run.owner_user_id,
+    )
+    if run.audience == "private" and run.owner_user_id is not None:
+        found += [
+            agent
+            for agent in await personal_agents(connection, run.org_id, run.owner_user_id)
+            if agent.id not in {a.id for a in found}
+        ]
+    return found
+
+
+def library_soul(agent: dict[str, Any]) -> str:
+    """The SOUL of a session that runs as a library agent: its name and its prompt."""
+    return f"You are the agent {agent.get('name', '')}.\n\n{agent.get('prompt', '')}".strip()
+
+
+def library_snapshot(snapshot: dict[str, Any], agent: dict[str, Any]) -> dict[str, Any]:
+    """The toolset snapshot of a session that runs as a library agent: only the toolsets of the
+    agent, so the gate never gives the session more (Section 13.3)."""
+    raw = agent.get("toolsets")
+    allowed = {str(name) for name in raw} if isinstance(raw, list) else set()
+    allowed -= NOT_FOR_SUBAGENTS
+    return {
+        **snapshot,
+        "toolsets": [t for t in snapshot.get("toolsets", []) if t in allowed],
+        "group_toolsets": [t for t in snapshot.get("group_toolsets", []) if t in allowed],
+    }
 
 
 async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:
