@@ -238,7 +238,9 @@ async def test_an_admin_adds_a_server_by_url_and_signs_in(
     assert connection["mcp"]["custom"]["url"] == URL
     code, state = remote.approve(redirect)
     callback = "/connections/oauth/callback"
-    for broken, status in (("not-a-uuid.x", 400), (state[:-1] + "x", 400)):
+    # Change the last character to a different one. The random state can already end in "x".
+    tampered = state[:-1] + ("y" if state.endswith("x") else "x")
+    for broken, status in (("not-a-uuid.x", 400), (tampered, 400)):
         answer = await mcp_web.post(
             callback, headers=mia(tenant), json={"state": broken, "code": code}
         )
