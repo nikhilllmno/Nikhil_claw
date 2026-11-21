@@ -8253,6 +8253,7 @@ The console reuses their screens. Each write goes to the API, and the API writes
 | Org | Setup | The steps of the setup guide (Section 17.6) as a list, with a link to the section that does each step |
 | Org | Slack | The chat apps of the org: Slack and Telegram (connect, disconnect, and a test), WhatsApp with the choice of its provider, and email (Section 11.9), and the linked chat accounts and pairing codes |
 | Org | Roles | The members, the invites, and an editor of the permissions of each role |
+| Org | API keys | The org API keys of Section 10.7 (M7.6) for the MCP server and the OpenAI-compatible endpoint: make (the key shows one time), list, and revoke. An org admin manages them |
 | Agents | Harness | The runtime, the model, the reasoning effort, the busy mode, and the run budget of each agent |
 | Agents | Tools | The toolsets of each agent, the policy of each tool for the agent, and the rules for every agent of the org |
 | Agents | Sub-agents | The native sub-agents of each agent (Section 13.1): list, create, edit, and delete |

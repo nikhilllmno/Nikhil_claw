@@ -7,6 +7,7 @@ export type SectionId =
   | "setup"
   | "slack"
   | "roles"
+  | "api-keys"
   | "harness"
   | "tools"
   | "subagents"
@@ -33,6 +34,7 @@ export const SECTIONS: readonly ConsoleSection[] = [
   { id: "setup", title: "Setup", group: "Org", description: "The steps that make the org ready to use." },
   { id: "slack", title: "Slack", group: "Org", description: "The Slack app, the other chat apps, and the linked chat accounts." },
   { id: "roles", title: "Roles", group: "Org", description: "The members, their roles, and what each role can do." },
+  { id: "api-keys", title: "API keys", group: "Org", description: "The keys that let other apps use sama through the MCP server and the OpenAI-compatible endpoint." },
   { id: "harness", title: "Harness", group: "Agents", description: "The runtime, the model, the reasoning effort, the busy mode, and the budget of each agent." },
   { id: "tools", title: "Tools", group: "Agents", description: "The toolsets of each agent and the policy of each tool." },
   { id: "subagents", title: "Sub-agents", group: "Agents", description: "The sub-agents that an agent can start." },

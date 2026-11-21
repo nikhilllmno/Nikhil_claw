@@ -79,6 +79,7 @@ describe("NEXT_STEPS", () => {
       "/console/mcp",
       "/console/schedules",
       "/console/webhooks",
+      "/console/api-keys",
     ]);
   });
 });
