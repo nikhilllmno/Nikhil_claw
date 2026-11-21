@@ -278,4 +278,15 @@ async def test_a_workflow_tool_step_cannot_call_a_database_tool() -> None:
     scope = RunScope(org_id=uuid.uuid4(), workspace_id=uuid.uuid4(), user_id=None, shared=False)
     with pytest.raises(ConnectorError, match="Use an agent step"):
         await service.call_as(scope, "db_postgres_query", {"sql": "select 1"})
+    # Every engine of M3.11 and M4.13: each tool of each database connector is refused.
+    engines = {m.name for m in catalog if m.kind == "database"}
+    assert {"mysql", "mariadb", "sqlserver", "clickhouse", "bigquery", "snowflake", "mongodb"} <= (
+        engines
+    )
+    for manifest in catalog:
+        if manifest.kind != "database":
+            continue
+        for tool in manifest.tools:
+            with pytest.raises(ConnectorError, match="Use an agent step"):
+                await service.call_as(scope, tool.name, {})
     await service.aclose()

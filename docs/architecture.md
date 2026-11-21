@@ -4016,8 +4016,8 @@ Execution (M4.5):
 - **Authority of a tool step.** A tool step runs as the owner, with the connections of a
   private session of the owner in the workspace of the workflow. A `deny` policy rule for the
   tool, or a profile without the `integrations` toolset, fails the step. A database tool
-  (M3.11) saves files in the session of its run, so a tool step cannot call it: use an agent
-  step. A remote MCP tool (M3.5), a hosted MCP tool (M4.11), and a tool of a custom HTTP API
+  (M3.11, and the engines of M4.13) saves files in the session of its run, so a tool step
+  cannot call it: use an agent step. A remote MCP tool (M3.5), a hosted MCP tool (M4.11), and a tool of a custom HTTP API
   connection (M4.12) are not in the connector catalog, so a tool step cannot call them
   either: use an agent step. The approval of the version stands in for the `ask` of a write
   tool. At each claim, the engine hashes the definition again and compares it with the
