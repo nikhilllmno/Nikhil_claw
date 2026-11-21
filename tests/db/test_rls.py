@@ -249,7 +249,7 @@ async def test_each_user_reads_only_the_rows_they_may_see(
         assert await count(connection, "audit_log") == AUDIT_ROWS[user]
         # Only org admins see which vault secrets exist, like the audit log.
         assert await count(connection, "vault_secrets") == AUDIT_ROWS[user]
-        # Only org admins see the purges of deleted data (Section 17.3).
+        # Only org admins see the purges of deleted data (Section 17.4).
         assert await count(connection, "data_purges") == AUDIT_ROWS[user]
         assert await labels(connection, world, "tool_policies", "id") == TOOL_POLICIES[user]
         # A task card follows the visibility of a session with the same audience and owner.

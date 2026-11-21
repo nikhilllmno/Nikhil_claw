@@ -1,4 +1,4 @@
-"""The trace delete of the Langfuse client (docs/architecture.md, Section 17.3)."""
+"""The trace delete of the Langfuse client (docs/architecture.md, Section 17.4)."""
 
 from __future__ import annotations
 

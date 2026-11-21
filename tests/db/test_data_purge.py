@@ -1,4 +1,4 @@
-"""The purge worker and the retention sweep of M6.8 (docs/architecture.md, Section 17.3)."""
+"""The purge worker and the retention sweep of M6.8 (docs/architecture.md, Section 17.4)."""
 
 from __future__ import annotations
 

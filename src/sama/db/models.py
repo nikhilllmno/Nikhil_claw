@@ -245,7 +245,7 @@ class Base(DeclarativeBase):
 
 
 MAX_RETENTION_DAYS: Final = 3650
-"""The upper limit of ``orgs.retention_days`` (docs/architecture.md, Section 17.3)."""
+"""The upper limit of ``orgs.retention_days`` (docs/architecture.md, Section 17.4)."""
 PURGE_KINDS: Final = ("sandboxes", "traces")
 
 
@@ -274,7 +274,7 @@ class Org(Base):
     an org of ``bootstrap``. The rate limits of org creation count these rows."""
     retention_days: Mapped[int | None] = mapped_column(Integer)
     """Sama deletes a session after this many days without activity. Null means the default
-    of the plan (Section 17.3)."""
+    of the plan (Section 17.4)."""
     created_at: Mapped[datetime] = _created_at()
 
 
@@ -2676,7 +2676,7 @@ class SessionHandoff(Base):
 
 
 class DataPurge(Base):
-    """One cleanup outside Postgres after a delete (docs/architecture.md, Section 17.3): the E2B
+    """One cleanup outside Postgres after a delete (docs/architecture.md, Section 17.4): the E2B
     sandboxes of deleted sessions, or the Langfuse traces of deleted runs. The delete writes the
     row in its own transaction, and the purge worker does the cleanup. No foreign key to
     ``orgs``: the row stays after an org delete."""

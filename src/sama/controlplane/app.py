@@ -640,7 +640,7 @@ def _monitor(
     sandboxes: SandboxBackend | None = None,
 ) -> list[_Loop]:
     """The trace export and the error rate alerts of Section 18, when they are set, and the
-    purge worker of Section 17.3. The purge worker deletes the Langfuse traces and kills the
+    purge worker of Section 17.4. The purge worker deletes the Langfuse traces and kills the
     sandboxes of deleted data."""
     loops: list[_Loop] = []
     langfuse: LangfuseClient | None = None

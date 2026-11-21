@@ -1,4 +1,4 @@
-"""The deletes and the exports of M6.8 (docs/architecture.md, Section 17.3) on a real
+"""The deletes and the exports of M6.8 (docs/architecture.md, Section 17.4) on a real
 database. Each test seeds its own two orgs, because a delete changes them."""
 
 from __future__ import annotations

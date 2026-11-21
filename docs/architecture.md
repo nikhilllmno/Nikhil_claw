@@ -1280,7 +1280,7 @@ for it.
   Summaries are not in M2.4: the review reads the transcript (Section 9.4).
 - **Retention**: per-org setting (`orgs.retention_days`) inside the limits of the plan.
   Default: keep everything. The retention sweep deletes the old sessions with their rows,
-  sandboxes, and Langfuse traces (M6.8, Section 17.3).
+  sandboxes, and Langfuse traces (M6.8, Section 17.4).
 - **Runtime state**: the canonical transcript is `messages`. The runtime keeps its own state
   as a blob: the Claude adapter keeps the SDK session id in `runs.runtime_state`. The OpenAI
   adapter keeps its conversation items in `runtime_session_items`, through
@@ -3834,7 +3834,7 @@ or not available.
 - A5. A Telegram album arrives as one update for each photo, so it makes one run for each
   photo. The limit of 4 images is for one message.
 - A6. Old attachments stay as long as the session does. The retention sweep deletes them
-  with their session (M6.8, Section 17.3).
+  with their session (M6.8, Section 17.4).
 - A7. The Anthropic key of the org pays for the call. An org with no key has no image analysis.
 - A8. The agent profile of an existing org keeps its own toolset list. Only the default list
   gets `media`. An admin adds `media` to a changed list. The group set (Section 11.3) is
@@ -5752,7 +5752,7 @@ migrated schema.
 
 | Table | Key columns |
 |---|---|
-| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0033`, Section 17.3) |
+| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0034`, Section 17.4) |
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
@@ -5783,7 +5783,7 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0033`, Section 17.3). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0034`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -5987,7 +5987,7 @@ region is not deployed. M6.7 adds the setting, the routing seam, and the operato
 
 Until step 4 is done on the new database, the runs of the org stay queued there.
 
-### 17.3 Data controls (M6.8)
+### 17.4 Data controls (M6.8)
 
 An org can export its data, delete a user, delete the org, and set a retention. The code is
 in `src/sama/datacontrols/`. The API checks the permission, and `DataControls` does the
@@ -6184,7 +6184,7 @@ runtimes.
   broken answer, other HTTP errors, or rejected spans) the trace is lost and an error is
   logged. If the monitor stops between the commit and the send, the trace is lost. An error
   never holds a key.
-- Delete: a data delete (Section 17.3) writes the trace ids of the deleted runs that the
+- Delete: a data delete (Section 17.4) writes the trace ids of the deleted runs that the
   exporter sent to `data_purges`. The purge worker sends them to
   `DELETE /api/public/traces`, at most 1,000 ids in one request.
 

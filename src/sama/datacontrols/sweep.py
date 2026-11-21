@@ -1,4 +1,4 @@
-"""The retention sweep (docs/architecture.md, Section 17.3).
+"""The retention sweep (docs/architecture.md, Section 17.4).
 
 For each org with a retention (``effective_days``), the sweep deletes the sessions with no
 activity in that time. The last activity of a session is the latest of its ``updated_at``,

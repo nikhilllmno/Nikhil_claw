@@ -1,5 +1,5 @@
 """The purge worker: the cleanups outside Postgres after a delete (docs/architecture.md,
-Section 17.3).
+Section 17.4).
 
 A delete writes ``data_purges`` rows in its own transaction. This loop does each cleanup and
 tries again with a backoff until it works:

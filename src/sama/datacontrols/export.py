@@ -1,4 +1,4 @@
-"""Exports per org and per user (docs/architecture.md, Section 17.3).
+"""Exports per org and per user (docs/architecture.md, Section 17.4).
 
 An export is a ZIP file:
 

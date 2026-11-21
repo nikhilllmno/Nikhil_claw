@@ -18,7 +18,7 @@ from pydantic import SecretStr
 
 TRACES_PATH: Final = "/api/public/otel/v1/traces"
 DELETE_PATH: Final = "/api/public/traces"
-"""The bulk delete of traces (docs/architecture.md, Section 17.3). Langfuse deletes them later,
+"""The bulk delete of traces (docs/architecture.md, Section 17.4). Langfuse deletes them later,
 in the background."""
 MAX_DELETE_IDS: Final = 1000
 """The most trace ids in one delete request."""

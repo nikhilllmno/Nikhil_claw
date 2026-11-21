@@ -1,4 +1,4 @@
-"""Retention per plan (docs/architecture.md, Section 17.3).
+"""Retention per plan (docs/architecture.md, Section 17.4).
 
 Each org has a retention setting, ``orgs.retention_days``. Null means the default of the plan.
 The plan can also set an upper limit. The plans of M6.6 fill ``PLAN_RETENTION``. Until then,

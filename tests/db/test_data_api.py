@@ -1,4 +1,4 @@
-"""The data control routes of M6.8 (docs/architecture.md, Section 17.3)."""
+"""The data control routes of M6.8 (docs/architecture.md, Section 17.4)."""
 
 from __future__ import annotations
 

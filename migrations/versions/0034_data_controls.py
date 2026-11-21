@@ -1,4 +1,4 @@
-"""Data controls: retention per org and the purge outbox (docs/architecture.md, Section 17.3).
+"""Data controls: retention per org and the purge outbox (docs/architecture.md, Section 17.4).
 
 ``orgs.retention_days`` is the retention setting of the org. Null means the default of the
 plan. The retention sweep deletes the sessions that had no activity for that many days.
@@ -9,8 +9,8 @@ Langfuse traces of the deleted runs. The purge worker does the cleanup and retri
 table has no foreign key to ``orgs``, so its rows stay after an org delete. Only org owners
 and admins read the rows. Only the control plane writes the table.
 
-Revision ID: 0033
-Revises: 0032
+Revision ID: 0034
+Revises: 0033
 Create Date: 2026-11-21
 """
 
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0033"
-down_revision: str | None = "0032"
+revision: str = "0034"
+down_revision: str | None = "0033"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

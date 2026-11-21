@@ -335,7 +335,7 @@ class Approve(Decision):
 class DataSettingsIn(_Body):
     retention_days: int | None = Field(ge=1, le=MAX_RETENTION_DAYS)
     """Sama deletes a session after this many days without activity. Null uses the default of
-    the plan (Section 17.3)."""
+    the plan (Section 17.4)."""
 
 
 class NewPairingCode(_Body):
@@ -2672,7 +2672,7 @@ class SamaApi:
         return org_id, grants
 
     def _data_routes(self, app: FastAPI) -> None:
-        """The data control routes of Section 17.3: export, delete, and retention."""
+        """The data control routes of Section 17.4: export, delete, and retention."""
         data = self._data
 
         @app.get("/orgs/{org_id}/export")

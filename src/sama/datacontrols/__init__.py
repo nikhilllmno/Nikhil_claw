@@ -1,5 +1,5 @@
 """Data controls: export, delete, and retention per org and per user (docs/architecture.md,
-Section 17.3).
+Section 17.4).
 
 - ``sama.datacontrols.export``: the ZIP export of an org or a user;
 - ``sama.datacontrols.delete``: the deletes, in one transaction each;

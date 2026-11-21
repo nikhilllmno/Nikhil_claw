@@ -1,4 +1,4 @@
-"""Deletes per session set, per user, and per org (docs/architecture.md, Section 17.3).
+"""Deletes per session set, per user, and per org (docs/architecture.md, Section 17.4).
 
 The control plane deletes as the table owner, in one transaction for each delete:
 

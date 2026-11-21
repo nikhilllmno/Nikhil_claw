@@ -1,5 +1,5 @@
 """The data controls service: export, delete, and the retention setting (docs/architecture.md,
-Section 17.3). The API calls it after its permission checks.
+Section 17.4). The API calls it after its permission checks.
 """
 
 from __future__ import annotations
