@@ -41,7 +41,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "subagents": SUBAGENT_TOOLS,
     "cron": frozenset({"cronjob_manage"}),
     "workflows": frozenset({"workflow_manage", "workflow_run"}),
-    "self": frozenset({"change_propose"}),
+    "self": frozenset({"change_propose", "sama_pr"}),
     "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
     "integrations": frozenset(),
     "delegation": frozenset({"delegate_task", "delegate_status"}),

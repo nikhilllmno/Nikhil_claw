@@ -219,3 +219,15 @@ def test_a_bad_github_value_is_refused_without_its_value(
     with pytest.raises(SettingsError, match=message) as error:
         settings(**{**GITHUB, **changes})
     assert "not-a-key" not in str(error.value)
+
+
+def test_the_self_repo_has_a_default_and_can_be_set() -> None:
+    assert settings().self_repo == "nikhilllmno/Nikhil_claw"
+    assert settings(SAMA_SELF_REPO=" acme/sama ").self_repo == "acme/sama"
+    assert settings(SAMA_SELF_REPO="https://github.com/acme/sama.git").self_repo == "acme/sama"
+
+
+@pytest.mark.parametrize("value", ["sama", "a/b/c", "-x/y", "acme/.."])
+def test_a_bad_self_repo_is_refused(value: str) -> None:
+    with pytest.raises(SettingsError, match="SAMA_SELF_REPO must be <owner>/<name>"):
+        settings(SAMA_SELF_REPO=value)

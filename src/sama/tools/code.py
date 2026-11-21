@@ -58,6 +58,7 @@ BLOCKED_TOOLS: Final = (
     "skill_manage",
     "skill_import",
     "change_propose",
+    "sama_pr",
     "tool_call",
 )
 """Tools that the stub refuses. They wait for a person, change shared state, or start another

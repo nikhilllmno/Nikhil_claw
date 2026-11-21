@@ -1,0 +1,33 @@
+# Code owners of sama (docs/architecture.md, Section 15.2).
+#
+# A pull request that changes one of these paths requests a review from the owner.
+# Turn on "Require review from Code Owners" in the ruleset of the default branch so that
+# GitHub blocks the merge until the owner approves. The sama agent cannot merge.
+#
+# The last matching line wins.
+
+# CI, the code owners file, and the deploy files.
+/.github/                     @nikhilllmno
+/deploy/                      @nikhilllmno
+
+# The database schema.
+/migrations/                  @nikhilllmno
+
+# Authentication and tenancy.
+/src/sama/api/auth.py         @nikhilllmno
+/src/sama/tenancy/            @nikhilllmno
+
+# Approvals (the tool gate).
+/src/sama/gate/               @nikhilllmno
+
+# The model proxy and the vault.
+/src/sama/modelproxy/         @nikhilllmno
+/src/sama/vault/              @nikhilllmno
+
+# The sandbox.
+/sandbox/                     @nikhilllmno
+/src/sama/sandbox/            @nikhilllmno
+
+# The GitHub App, the git proxy, and the self-change tools.
+/src/sama/github/             @nikhilllmno
+/src/sama/tools/sama_pr.py    @nikhilllmno

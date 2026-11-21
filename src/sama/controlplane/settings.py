@@ -14,6 +14,7 @@ from pydantic import SecretStr
 from sama.api.origins import parse_origins
 from sama.connectors.host import DEFAULT_HOST_TEMPLATE
 from sama.github.client import GitHubAppConfig
+from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
 from sama.media.vision import DEFAULT_VISION_MODEL
 from sama.sandbox.e2b import DEFAULT_TEMPLATE
 from sama.vault.crypto import VaultKey
@@ -72,6 +73,19 @@ def _github(env: Mapping[str, str]) -> GitHubAppConfig | None:
         private_key=SecretStr(key.strip() + "\n"),
         client_secret=SecretStr(_required(env, "SAMA_GITHUB_CLIENT_SECRET")),
     )
+
+
+def _self_repo(env: Mapping[str, str]) -> str:
+    value = env.get("SAMA_SELF_REPO", "").strip()
+    if not value:
+        return DEFAULT_SELF_REPO
+    try:
+        owner, name = split_repo(value)
+    except GitHubSetupError:
+        raise SettingsError(
+            "SAMA_SELF_REPO must be <owner>/<name> of a GitHub repository"
+        ) from None
+    return f"{owner}/{name}"
 
 
 def _hosts(value: str) -> tuple[str, ...]:
@@ -137,6 +151,9 @@ class ControlPlaneSettings:
     """The SendGrid key for the ``email:`` delivery of jobs (``SAMA_SENDGRID_API_KEY``)."""
     email_from: str | None = None
     """The sender address of job emails (``SAMA_EMAIL_FROM``)."""
+    self_repo: str = DEFAULT_SELF_REPO
+    """The sama repository that ``sama_pr`` changes (``SAMA_SELF_REPO``, ``<owner>/<name>``,
+    Section 15.2)."""
 
     def secret_values(self) -> list[str]:
         """Every secret of the settings, for the redactor (Section 16.3)."""
@@ -245,4 +262,5 @@ class ControlPlaneSettings:
             web_origins=web_origins,
             sendgrid_key=_secret(env, "SAMA_SENDGRID_API_KEY"),
             email_from=env.get("SAMA_EMAIL_FROM", "").strip() or None,
+            self_repo=_self_repo(env),
         )

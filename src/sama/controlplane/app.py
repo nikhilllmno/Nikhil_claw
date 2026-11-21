@@ -90,6 +90,7 @@ from sama.tools.github import GitHubTools
 from sama.tools.outbound import OutboundClient
 from sama.tools.output import EXPORT_DIR, SandboxSpill
 from sama.tools.repos import RepoCloner
+from sama.tools.sama_pr import SamaPr
 from sama.tools.server import MCP_PATH, ToolServer
 from sama.tools.todo import PostgresTodoStore
 from sama.tools.web import BraveSearch
@@ -296,6 +297,26 @@ def build(
     media = GeneratedMediaStore(engine)
     openai_media = keys.available(SecretName.OPENAI_API_KEY)
     meter = MediaMeter(usage=usage, prices=prices, ledger=ledger)
+    cloner = (
+        RepoCloner(
+            sandboxed.session_sandbox,
+            proxy=settings.git_url if github_tools is not None else None,
+            access=github_tools,
+        )
+        if sandboxed
+        else None
+    )
+    # ``sama_pr`` changes the code of sama through the GitHub App (Section 15.2).
+    sama_pr = (
+        SamaPr(
+            github,
+            cloner=cloner,
+            session_sandbox=sandboxed.session_sandbox if sandboxed else None,
+            repo=settings.self_repo,
+        )
+        if github is not None
+        else None
+    )
     tools = ToolServer(
         signer=signer,
         todos=PostgresTodoStore(engine),
@@ -306,16 +327,9 @@ def build(
         ),
         clarify=broker,
         spill=SandboxSpill(sandboxed.session_sandbox) if sandboxed else None,
-        repos=(
-            RepoCloner(
-                sandboxed.session_sandbox,
-                proxy=settings.git_url if github_tools is not None else None,
-                access=github_tools,
-            )
-            if sandboxed
-            else None
-        ),
+        repos=cloner,
         github=github_tools,
+        sama_pr=sama_pr,
         # The program reaches the tool server at the same URL as the agent runtime (M4.8).
         code=(
             CodeRunner(sandboxed.session_sandbox, f"{settings.tools_url}{MCP_PATH}")

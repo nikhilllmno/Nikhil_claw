@@ -143,6 +143,14 @@ from sama.tools.outbound import OutboundClient
 from sama.tools.output import Spill, cap, untrusted
 from sama.tools.repos import RepoCloner, RepoError
 from sama.tools.repos import render as render_clone
+from sama.tools.sama_pr import (
+    MAX_NAME_CHARS,
+    MAX_SUMMARY_CHARS,
+    MAX_TESTS_CHARS,
+    SAMA_PR,
+    SamaPr,
+    SamaPrError,
+)
 from sama.tools.sessions import format_page, format_sessions
 from sama.tools.todo import MAX_ITEMS, TodoChange, TodoError, TodoStore, apply, render
 from sama.tools.web import (
@@ -206,6 +214,7 @@ _EXPECTED = (
     MediaError,
     MemoryChangeError,
     RepoError,
+    SamaPrError,
     SearchError,
     SessionSearchError,
     SkillError,
@@ -357,6 +366,8 @@ class ToolServer:
       Without it, the tool is hidden.
     - ``souls``: proposes a new soul for the profile of the run (``change_propose``, toolset
       ``self``). Without it, the tool is hidden.
+    - ``sama_pr``: a code change to the sama repository as a pull request (``sama_pr``,
+      toolset ``self``, Section 15.2). Without it, the tool is hidden.
     - ``deferred``: the catalog of deferred tools. With at least one tool in it when the app
       is built, the server has ``tool_search``, ``tool_describe``, and ``tool_call``
       (Section 10.3). Without it, these tools are hidden.
@@ -408,6 +419,7 @@ class ToolServer:
         speech: SpeechService | None = None,
         importer: SkillImporter | None = None,
         steers: SteerBackend | None = None,
+        sama_pr: SamaPr | None = None,
     ) -> None:
         self.signer = signer
         self.importer = importer
@@ -415,6 +427,7 @@ class ToolServer:
         self.images = images
         self.speech = speech
         self.steers = steers
+        self.sama_pr = sama_pr
         self.souls = souls
         self.session_items = session_items
         self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
@@ -860,6 +873,8 @@ class ToolServer:
 
         if self.github is not None:
             self._github_tools(server, self.github)
+        if self.sama_pr is not None:
+            self._sama_pr_tool(server, self.sama_pr)
         if self.code is not None:
             runner = self.code
 
@@ -1197,6 +1212,63 @@ class ToolServer:
 
             arguments = {"repo": repo, "branch": branch, "commit": commit}
             return await self._call(ctx, REPO_PUSH_APPROVAL, arguments, run)
+
+    def _sama_pr_tool(self, server: MCPServer, sama_pr: SamaPr) -> None:
+        @server.tool(
+            name=SAMA_PR,
+            description=(
+                f"Change the code of sama itself ({sama_pr.repo}) with a pull request. Use it "
+                "only when the user asks for a change to sama. action start clones the sama "
+                "repository into your sandbox and makes the branch sama/<name>; give name. "
+                "Then change the code, run the tests, commit, and git push the branch. action "
+                "open opens the pull request; give branch, title, summary, and tests (the "
+                "tests that you ran and their results). Code owners of changed paths are asked "
+                "for a review. A person reviews and merges. You cannot merge."
+            ),
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            structured_output=False,
+        )
+        async def sama_pr_tool(
+            ctx: Context,
+            action: Literal["start", "open"],
+            name: Annotated[str | None, Field(min_length=1, max_length=MAX_NAME_CHARS)] = None,
+            folder: Annotated[str | None, Field(min_length=1, max_length=100)] = None,
+            branch: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+            title: Annotated[str | None, Field(min_length=1, max_length=256)] = None,
+            summary: Annotated[str | None, Field(max_length=MAX_SUMMARY_CHARS)] = None,
+            tests: Annotated[str | None, Field(max_length=MAX_TESTS_CHARS)] = None,
+            draft: bool | None = None,
+        ) -> str:
+            arguments = {
+                "action": action,
+                "name": name,
+                "folder": folder,
+                "branch": branch,
+                "title": title,
+                "summary": summary,
+                "tests": tests,
+                "draft": draft,
+            }
+
+            async def body(claims: RunTokenClaims) -> str:
+                if action == "start":
+                    if name is None:
+                        raise SamaPrError("give name, the short name of the branch sama/<name>")
+                    token = bearer_of(ctx.headers)
+                    return await sama_pr.start(claims, name=name, folder=folder, token=token)
+                if branch is None or title is None:
+                    raise SamaPrError("give branch and title, and also summary and tests")
+                return await sama_pr.open(
+                    claims,
+                    branch=branch,
+                    title=title,
+                    summary=summary or "",
+                    tests=tests or "",
+                    draft=bool(draft),
+                )
+
+            present = {key: value for key, value in arguments.items() if value is not None}
+            return await self._call(ctx, SAMA_PR, present, body)
 
     def _connection_tools(self, server: MCPServer, connections: ConnectionService) -> None:
         """``connections_list``, ``connection_request``, and ``connection_test``

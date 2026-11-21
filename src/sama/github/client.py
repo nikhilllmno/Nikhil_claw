@@ -9,8 +9,10 @@ a sandbox, a prompt, or a log.
 from __future__ import annotations
 
 import asyncio
+import base64
+import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 from urllib.parse import quote
@@ -287,6 +289,81 @@ class GitHubClient:
             raise
         return body.get("status") in {"ahead", "identical"}
 
+    async def compare(
+        self, installation_id: int, owner: str, name: str, base: str, head: str
+    ) -> dict[str, Any]:
+        """The comparison of two branches or commits: ``status``, ``ahead_by``, and ``files``.
+        GitHub gives at most 300 files."""
+        span = quote(f"{base}...{head}", safe="/.")
+        return await self._as(
+            installation_id,
+            "GET",
+            f"/repos/{_path(owner)}/{_path(name)}/compare/{span}?per_page=1",
+        )
+
+    async def file_text(
+        self,
+        installation_id: int,
+        owner: str,
+        name: str,
+        path: str,
+        ref: str,
+        *,
+        max_bytes: int,
+    ) -> str | None:
+        """The text of a file at ``ref``, or ``None`` if the file does not exist. Raises
+        ``GitHubError`` if the path is not a regular file, the file is larger than
+        ``max_bytes``, or GitHub does not give its content. The contents API gives no content
+        for a file larger than 1 MB, so the method then reads the blob of the file."""
+        repo = f"/repos/{_path(owner)}/{_path(name)}"
+        try:
+            body = await self._as(
+                installation_id,
+                "GET",
+                f"{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}",
+            )
+        except GitHubError as error:
+            if error.status_code == 404:
+                return None
+            raise
+        if body.get("type") != "file":
+            raise GitHubError(f"{path} is not a file")
+        size = body.get("size")
+        if isinstance(size, int) and size > max_bytes:
+            raise GitHubError(f"{path} has {size} bytes, more than {max_bytes}")
+        if body.get("encoding") != "base64" or not body.get("content"):
+            sha = body.get("sha")
+            if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                raise GitHubError(f"GitHub did not give the content of {path}")
+            body = await self._as(installation_id, "GET", f"{repo}/git/blobs/{sha}")
+        content = body.get("content")
+        if body.get("encoding") != "base64" or not isinstance(content, str):
+            raise GitHubError(f"GitHub did not give the content of {path}")
+        try:
+            data = base64.b64decode(content)
+        except ValueError:
+            raise GitHubError(f"GitHub gave content of {path} that is not base64") from None
+        if len(data) > max_bytes:
+            raise GitHubError(f"{path} has {len(data)} bytes, more than {max_bytes}")
+        return data.decode("utf-8", errors="replace")
+
+    async def request_reviewers(
+        self,
+        installation_id: int,
+        owner: str,
+        name: str,
+        number: int,
+        *,
+        users: Sequence[str],
+        teams: Sequence[str],
+    ) -> dict[str, Any]:
+        return await self._as(
+            installation_id,
+            "POST",
+            f"/repos/{_path(owner)}/{_path(name)}/pulls/{number}/requested_reviewers",
+            json={"reviewers": list(users), "team_reviewers": list(teams)},
+        )
+
     async def _as(
         self, installation_id: int, method: str, path: str, json: Any = None
     ) -> dict[str, Any]:
@@ -334,6 +411,9 @@ async def convert_manifest(
     if response.status_code >= 400:
         raise GitHubError(_problem(response.status_code, body), response.status_code)
     return body
+
+
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def _path(segment: str) -> str:
