@@ -10,10 +10,12 @@ from collections.abc import AsyncIterator
 import asyncpg
 import pytest
 from alembic import command
-from sqlalchemy import text
+from sqlalchemy import make_url, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.pool import NullPool
 
+from sama.db import create_engine
 from sama.orgs import AuthUsersEmails
 from tests.db.conftest import alembic_config, migrated_database
 from tests.db.world import World, seed
@@ -134,3 +136,35 @@ async def test_the_email_check_reads_auth_users(auth_users: AsyncEngine) -> None
     for name in ("unconfirmed", "deleted", "no_email"):
         assert await emails.verified_email(ids[name]) is None, name
     assert await emails.verified_email(uuid.uuid4()) is None
+
+
+async def test_the_email_check_fails_closed_when_it_cannot_read_auth_users(
+    auth_users: AsyncEngine, database_url: str
+) -> None:
+    """A role without the right to read ``auth.users`` gets ``None`` (a 403), not an error."""
+    user_id = uuid.uuid4()
+    role = f"signup_reader_{uuid.uuid4().hex[:8]}"
+    async with auth_users.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO auth.users (id, email, email_confirmed_at)"
+                " VALUES (:id, 'a@b.test', now())"
+            ),
+            {"id": user_id},
+        )
+        await connection.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD 'reader'"))
+    url = make_url(database_url).set(username=role, password="reader")
+    restricted = create_engine(url.render_as_string(hide_password=False), poolclass=NullPool)
+    try:
+        # No USAGE on the schema auth.
+        assert await AuthUsersEmails(restricted).verified_email(user_id) is None
+        async with auth_users.begin() as connection:
+            await connection.execute(text(f"GRANT USAGE ON SCHEMA auth TO {role}"))
+        # The table is visible, but SELECT is not granted.
+        assert await AuthUsersEmails(restricted).verified_email(user_id) is None
+    finally:
+        await restricted.dispose()
+        async with auth_users.begin() as connection:
+            await connection.execute(text(f"REVOKE ALL ON SCHEMA auth FROM {role}"))
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"DROP ROLE {role}"))

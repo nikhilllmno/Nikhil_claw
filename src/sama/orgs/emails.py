@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from typing import Final, Protocol
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 MAX_EMAIL_CHARS: Final = 320
@@ -69,6 +70,19 @@ def blocked_domain(email: str, blocked: Iterable[str]) -> bool:
     return any(".".join(labels[i:]) in names for i in range(len(labels) - 1))
 
 
+# insufficient_privilege, invalid_schema_name, undefined_table: the API cannot read the table.
+_UNREADABLE: Final = frozenset({"42501", "3F000", "42P01"})
+
+
+def _sqlstate(error: DBAPIError) -> str | None:
+    original = error.orig
+    code = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if code is None:
+        # asyncpg: SQLAlchemy wraps the driver error; the asyncpg error is the cause.
+        code = getattr(getattr(original, "__cause__", None), "sqlstate", None)
+    return code if isinstance(code, str) else None
+
+
 class EmailCheck(Protocol):
     async def verified_email(self, auth_user_id: uuid.UUID) -> str | None:
         """The confirmed email of the Supabase Auth user in lower case, or ``None``."""
@@ -82,18 +96,26 @@ class AuthUsersEmails:
         self._engine = engine
 
     async def verified_email(self, auth_user_id: uuid.UUID) -> str | None:
+        """``None`` also when the table is missing or the role cannot read it (fail closed)."""
         async with self._engine.connect() as connection:
-            if not await connection.scalar(text("SELECT to_regclass('auth.users') IS NOT NULL")):
-                return None
-            row = (
-                await connection.execute(
-                    text(
-                        "SELECT email, email_confirmed_at FROM auth.users"
-                        " WHERE id = :id AND deleted_at IS NULL"
-                    ),
-                    {"id": auth_user_id},
-                )
-            ).one_or_none()
+            try:
+                if not await connection.scalar(
+                    text("SELECT to_regclass('auth.users') IS NOT NULL")
+                ):
+                    return None
+                row = (
+                    await connection.execute(
+                        text(
+                            "SELECT email, email_confirmed_at FROM auth.users"
+                            " WHERE id = :id AND deleted_at IS NULL"
+                        ),
+                        {"id": auth_user_id},
+                    )
+                ).one_or_none()
+            except DBAPIError as error:
+                if _sqlstate(error) in _UNREADABLE:
+                    return None
+                raise
         if row is None or row.email is None or row.email_confirmed_at is None:
             return None
         return normalize_email(str(row.email))

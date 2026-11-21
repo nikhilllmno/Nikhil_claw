@@ -51,6 +51,28 @@ export function forgetPendingInvite(store: KeyValueStore): void {
   store.removeItem(PENDING_INVITE_KEY);
 }
 
+/**
+ * The token for the invite page. A link with a fragment uses only that fragment: a bad fragment
+ * gives `null`, and does not fall back to a kept token of another invite. A link without a
+ * fragment uses the kept token (the return after the sign-in).
+ */
+export function inviteToken(hash: string, kept: () => string | null): string | null {
+  const value = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (value !== "") return tokenFromFragment(value);
+  return kept();
+}
+
+/** The list with `updated` in place of the member with the same id. */
+export function replaceMember(members: readonly OrgMember[], updated: OrgMember): OrgMember[] {
+  return members.map((m) => (m.user_id === updated.user_id ? updated : m));
+}
+
+/** The workspace ids after one checkbox change. The order stays, and an id occurs once. */
+export function toggleWorkspace(ids: readonly string[], id: string, on: boolean): string[] {
+  const rest = ids.filter((w) => w !== id);
+  return on ? [...rest, id] : rest;
+}
+
 export const ROLE_LABELS: Record<OrgRole, string> = {
   owner: "Owner",
   admin: "Admin",

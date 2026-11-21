@@ -23,7 +23,9 @@ import {
   isAdmin,
   ROLE_LABELS,
   roleBadge,
+  replaceMember,
   roleChoices,
+  toggleWorkspace,
 } from "@/lib/orgs";
 import { relativeTime, timeLeft } from "@/lib/time";
 import { useApi } from "./AuthProvider";
@@ -99,7 +101,16 @@ function OrgMembers({ org }: { org: Org }) {
         ) : (
           <ul className={styles.list}>
             {members.data.map((m) => (
-              <MemberRow key={m.user_id} org={org} member={m} all={members.data ?? []} onChange={members.reload} />
+              <MemberRow
+                key={m.user_id}
+                org={org}
+                member={m}
+                all={members.data ?? []}
+                onChange={members.reload}
+                onUpdated={(updated) =>
+                  members.setData((list) => (list ? replaceMember(list, updated) : list))
+                }
+              />
             ))}
           </ul>
         )}
@@ -149,11 +160,13 @@ function MemberRow({
   member,
   all,
   onChange,
+  onUpdated,
 }: {
   org: Org;
   member: OrgMember;
   all: OrgMember[];
   onChange: () => void;
+  onUpdated: (member: OrgMember) => void;
 }) {
   const api = useApi();
   const router = useRouter();
@@ -167,12 +180,11 @@ function MemberRow({
   // An owner or admin sees every workspace. Only a member has a set of workspaces.
   const editSpaces = isAdmin(org.role) && member.role === "member";
 
-  const run = async (action: () => Promise<unknown>, fallback: string, after: () => void) => {
+  const run = async <T,>(action: () => Promise<T>, fallback: string, after: (result: T) => void) => {
     setBusy(true);
     setError(null);
     try {
-      await action();
-      after();
+      after(await action());
     } catch (e) {
       setError(errorText(e, fallback));
     } finally {
@@ -184,20 +196,23 @@ function MemberRow({
     run(
       () => api.changeMember(org.id, member.user_id, { role }),
       "Could not change the role.",
-      () => {
+      (updated) => {
+        onUpdated(updated);
         onChange();
         if (self) reloadMe();
       },
     );
 
+  // The row shows the member that the PATCH returns at once, so the next change starts from it
+  // and not from the old list (docs/architecture.md, Section 17.2).
   const toggleSpace = (id: string, on: boolean) => {
-    const next = on
-      ? [...member.workspace_ids, id]
-      : member.workspace_ids.filter((w) => w !== id);
     void run(
-      () => api.changeMember(org.id, member.user_id, { workspace_ids: next }),
+      () =>
+        api.changeMember(org.id, member.user_id, {
+          workspace_ids: toggleWorkspace(member.workspace_ids, id, on),
+        }),
       "Could not change the workspaces.",
-      onChange,
+      onUpdated,
     );
   };
 
@@ -304,15 +319,15 @@ function InviteForm({ org, onCreated }: { org: Org; onCreated: () => void }) {
     }
     setBusy(true);
     setError(null);
-    setCreated(null);
-    setCopied(false);
     try {
       const invite = await api.createInvite(org.id, {
         email: checked.email,
         role,
         workspace_id: role === "member" && space ? space : null,
       });
+      // The earlier link stays on the page until a new invite exists.
       setCreated(invite);
+      setCopied(false);
       setEmail("");
       onCreated();
     } catch (e) {

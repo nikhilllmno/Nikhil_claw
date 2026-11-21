@@ -577,11 +577,19 @@ class OrgService:
                 if token is not None
                 else and_(OrgInvite.id == invite_id, OrgInvite.email == email)
             )
+            found = (
+                await connection.execute(select(OrgInvite.id, OrgInvite.org_id).where(where))
+            ).one_or_none()
+            if found is None:
+                raise OrgError(404, gone)
+            org_id = found.org_id
+            # Lock the org first and the invite second, in the same order as the other invite
+            # and member changes, so that two transactions cannot wait for each other.
+            org = await _lock_org(connection, org_id)
             invite = (
                 await connection.execute(
                     select(
                         OrgInvite.id,
-                        OrgInvite.org_id,
                         OrgInvite.email,
                         OrgInvite.role,
                         OrgInvite.workspace_id,
@@ -589,20 +597,16 @@ class OrgService:
                         OrgInvite.revoked_at,
                         (OrgInvite.expires_at <= func.now()).label("expired"),
                     )
-                    .where(where)
+                    .where(OrgInvite.id == found.id)
                     .with_for_update()
                 )
-            ).one_or_none()
-            if invite is None:
-                raise OrgError(404, gone)
+            ).one()
             if invite.accepted_at is not None or invite.revoked_at is not None or invite.expired:
                 raise OrgError(410, gone)
             if invite.email != email:
                 raise OrgError(
                     403, "this invite is for another email address: sign in with that address"
                 )
-            org_id = invite.org_id
-            org = await _lock_org(connection, org_id)
             user_id = await connection.scalar(
                 select(User.id).where(User.org_id == org_id, User.auth_user_id == auth_user_id)
             )

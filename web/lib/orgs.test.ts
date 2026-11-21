@@ -6,12 +6,15 @@ import {
   checkOrgName,
   forgetPendingInvite,
   inviteLink,
+  inviteToken,
   keepPendingInvite,
   PENDING_INVITE_KEY,
   PENDING_INVITE_TTL_MS,
   pendingInvite,
+  replaceMember,
   roleChoices,
   tokenFromFragment,
+  toggleWorkspace,
 } from "./orgs";
 import type { KeyValueStore } from "./pkce";
 
@@ -112,5 +115,33 @@ describe("form checks", () => {
     expect(checkOrgName("  Acme ")).toEqual({ name: "Acme" });
     expect(checkOrgName("   ")).toHaveProperty("error");
     expect(checkOrgName("x".repeat(101))).toHaveProperty("error");
+  });
+});
+
+describe("review fixes", () => {
+  const token = "Cd_-".repeat(10);
+  const kept = "Ef_-".repeat(10);
+
+  it("uses the kept token only when the link has no fragment", () => {
+    expect(inviteToken(`#${token}`, () => kept)).toBe(token);
+    expect(inviteToken("", () => kept)).toBe(kept);
+    expect(inviteToken("#", () => kept)).toBe(kept);
+    expect(inviteToken("", () => null)).toBeNull();
+    // A bad fragment does not fall back to the kept invite.
+    expect(inviteToken("#short", () => kept)).toBeNull();
+  });
+
+  it("replaces one member and keeps the others", () => {
+    const a = member("a", "member");
+    const b = member("b", "admin");
+    const changed = { ...a, workspace_ids: ["w1"] };
+    expect(replaceMember([a, b], changed)).toEqual([changed, b]);
+    expect(replaceMember([b], changed)).toEqual([b]);
+  });
+
+  it("toggles one workspace", () => {
+    expect(toggleWorkspace(["w1"], "w2", true)).toEqual(["w1", "w2"]);
+    expect(toggleWorkspace(["w1", "w2"], "w1", false)).toEqual(["w2"]);
+    expect(toggleWorkspace(["w1"], "w1", true)).toEqual(["w1"]);
   });
 });

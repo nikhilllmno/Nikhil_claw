@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { AuthStatusScreen } from "@/components/ui";
 import { ApiError, errorText } from "@/lib/api";
-import { forgetPendingInvite, keepPendingInvite, pendingInvite, tokenFromFragment } from "@/lib/orgs";
+import { forgetPendingInvite, inviteToken, keepPendingInvite, pendingInvite } from "@/lib/orgs";
 import styles from "../login/login.module.css";
 
 export default function InvitePage() {
@@ -26,13 +26,14 @@ export default function InvitePage() {
     if (read.current) return;
     read.current = true;
     const store = window.localStorage;
-    const fromLink = tokenFromFragment(window.location.hash);
-    if (window.location.hash) {
+    const hash = window.location.hash;
+    const found = inviteToken(hash, () => pendingInvite(store, Date.now()));
+    if (hash) {
       history.replaceState(null, "", window.location.pathname + window.location.search);
+      if (found !== null) keepPendingInvite(store, found, Date.now());
     }
-    if (fromLink !== null) keepPendingInvite(store, fromLink, Date.now());
     // The fragment exists only in the browser, so the page reads it after the first render.
-    setToken(fromLink ?? pendingInvite(store, Date.now()));
+    setToken(found);
   }, []);
 
   const join = async () => {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -547,3 +548,62 @@ async def test_memberships_of_the_org_stay_consistent(
         user = await connection.scalar(select(User.id).where(User.id == uuid.UUID(bob_id)))
     assert rows == 0
     assert user == uuid.UUID(bob_id)
+
+
+# -- concurrency -----------------------------------------------------------------------------
+
+
+async def test_parallel_org_creation_keeps_the_rate_limit(
+    web: httpx.AsyncClient, world: World
+) -> None:
+    ana = world.person("ana@example.test")
+    answers = await asyncio.gather(
+        *(web.post("/orgs", json={"name": f"Acme {n}"}, headers=bearer(ana)) for n in range(5))
+    )
+    codes = sorted(a.status_code for a in answers)
+    assert codes == [201, 201, 201, 429, 429], [a.text for a in answers]
+
+
+async def test_parallel_accept_and_revoke_give_a_clear_answer(
+    web: httpx.AsyncClient, world: World
+) -> None:
+    """Accept locks the org before the invite, like revoke and reissue: no deadlock, no 500."""
+    ana = world.person("ana@example.test")
+    org_id = (await new_org(web, ana))["id"]
+    for round_ in range(4):
+        email = f"bob{round_}@example.test"
+        bob = world.person(email)
+        created = await invite(web, ana, org_id, email)
+        assert created.status_code == 201, created.text
+        accept, revoke, reissue = await asyncio.gather(
+            web.post(
+                "/invites/accept", json={"token": created.json()["token"]}, headers=bearer(bob)
+            ),
+            web.delete(f"/orgs/{org_id}/invites/{created.json()['id']}", headers=bearer(ana)),
+            invite(web, ana, org_id, email),
+        )
+        assert accept.status_code in (200, 410), accept.text
+        assert revoke.status_code in (204, 404), revoke.text
+        assert reissue.status_code in (201, 409), reissue.text
+        joined = email in await members(web, ana, org_id)
+        assert joined == (accept.status_code == 200)
+
+
+async def test_two_owners_cannot_both_step_down_at_once(
+    web: httpx.AsyncClient, world: World
+) -> None:
+    ana = world.person("ana@example.test")
+    org = await new_org(web, ana)
+    org_id, ana_id = org["id"], org["user_id"]
+    bob, bob_id = await join(web, ana, org_id, world, "bob@example.test")
+    promoted = await web.patch(
+        f"/orgs/{org_id}/members/{bob_id}", json={"role": "owner"}, headers=bearer(ana)
+    )
+    assert promoted.status_code == 200, promoted.text
+    answers = await asyncio.gather(
+        web.patch(f"/orgs/{org_id}/members/{ana_id}", json={"role": "admin"}, headers=bearer(ana)),
+        web.patch(f"/orgs/{org_id}/members/{bob_id}", json={"role": "admin"}, headers=bearer(bob)),
+    )
+    assert sorted(a.status_code for a in answers) == [200, 409]
+    roles = [m["role"] for m in (await members(web, ana, org_id)).values()]
+    assert roles.count("owner") == 1
