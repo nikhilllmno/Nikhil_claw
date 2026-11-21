@@ -29,7 +29,7 @@ from sama.browser.task import (
     ProxyModelClient,
 )
 from sama.gate.decide import GateStep, Verdict
-from sama.modelproxy import MemoryUsageStore
+from sama.modelproxy import MemoryUsageStore, OrgLimits
 from sama.modelproxy.prices import PriceTable
 from sama.runtime.contract import RunEvent, SubagentEvent
 from sama.tenancy.run_token import RunTokenClaims, RunTokenSigner
@@ -558,3 +558,23 @@ def test_the_runner_needs_the_cloud_target() -> None:
     service = BrowserService(ChromeOnly(), DenyHosts(frozenset()))
     with pytest.raises(ValueError, match="needs the cloud target"):
         BrowserTaskRunner(service, ScriptedModel([]), PriceTable.load(), model=MODEL)
+
+
+async def test_a_quota_block_of_the_proxy_ends_the_task_with_its_reason(world: World) -> None:
+    """The M6.6 quotas apply to the sub-agent: the proxy refuses the call, and the task ends
+    with a clean result that names the quota, not with a tool error."""
+    upstream, store, signer = Upstream(), MemoryUsageStore(), RunTokenSigner(KEY)
+    store.limits["org-1"] = OrgLimits(model_usd_per_month=Decimal(0))
+    proxy = make_proxy(upstream, store, signer)
+    client = ProxyModelClient(app=proxy.app())
+    runner = BrowserTaskRunner(world.service, client, PriceTable.load(), model=MODEL)
+    token = signer.issue(make_scope("run-1"), ttl_s=600)
+    try:
+        text = await runner.run(make_claims(), token, "Look")
+    finally:
+        await runner.aclose()
+        await proxy.aclose()
+    assert text.startswith(
+        "browser_task stopped: the model call failed: the org used its monthly model quota."
+    )
+    assert upstream.requests == []

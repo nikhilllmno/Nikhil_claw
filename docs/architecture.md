@@ -4819,7 +4819,9 @@ and the run cannot start a new `browser_task` until all work of the old task end
 server stops, it waits for the model calls that still run and never cancels them (the time
 limits of the proxy end them), and it waits up to 30 seconds for the browser actions. The tool
 server stops before the model proxy, so the proxy records these calls. The budgets of the run, the user, and the org in the proxy still
-apply, and a refused call (`402`) ends the task. To keep the prompt small, the sub-agent sees the
+apply, and so do the quotas of the plan (M6.6). A refused call (`402`) ends the task, and the
+result names the limit with the fixed text of the proxy, for example "the org used its monthly
+model quota". Other errors of the proxy become fixed texts of sama. To keep the prompt small, the sub-agent sees the
 results of the last 2 steps in full. Older results are cut to 600 characters, and older
 screenshots are removed. One result is at most 20,000 characters.
 

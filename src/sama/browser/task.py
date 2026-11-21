@@ -89,6 +89,8 @@ MODEL_TIMEOUT_S: Final = 120.0
 ANTHROPIC_VERSION: Final = "2023-06-01"
 MESSAGES_PATH: Final = "/anthropic/v1/messages"
 CLOSE_WAIT_S: Final = 30.0
+BUDGET_ERROR: Final = "budget_exceeded"
+"""The error type of the model proxy for a used-up budget or quota (Section 16.6)."""
 _T = TypeVar("_T")
 
 TOOL_NAMES: Final = {
@@ -186,11 +188,14 @@ class ProxyModelClient:
 
 
 def _proxy_error(response: httpx.Response) -> str:
-    """A fixed text for each status of the proxy. The body of the error is not used: it can
-    hold text of the provider."""
+    """A fixed text for each status of the proxy. The body of an error is not used, because it
+    can hold text of the provider. The one exception is a ``budget_exceeded`` error: the proxy
+    writes it itself (a run budget or an org or user quota, M6.6), so its message is fixed text
+    of sama, and it tells which limit is used up."""
     match response.status_code:
         case 402:
-            return "the model budget of the run, the user, or the org is used up"
+            budget = _budget_message(response)
+            return budget or "the model budget of the run, the user, or the org is used up"
         case 403:
             return "the run ended or lost its authority"
         case 401:
@@ -203,6 +208,17 @@ def _proxy_error(response: httpx.Response) -> str:
             return "the model proxy cannot check the budget now"
         case _:
             return f"the model call failed with status {response.status_code}"
+
+
+def _budget_message(response: httpx.Response) -> str | None:
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(error, dict) or error.get("type") != BUDGET_ERROR:
+        return None
+    message = error.get("message")
+    return message[:300] if isinstance(message, str) and message else None
 
 
 # -- the tools of the sub-agent --------------------------------------------------------------
