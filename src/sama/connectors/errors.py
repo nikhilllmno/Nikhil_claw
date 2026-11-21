@@ -19,6 +19,15 @@ class ConnectorError(Exception):
         self.status_code = status_code
 
 
+class ConnectorUnknownError(ConnectorError):
+    """A connector call with an unknown result: the provider did not answer, gave a time limit,
+    or answered 5xx, 408, or 429. The call can have had its effect. A workflow does not send a
+    write that is not idempotent again after this error (Section 12.3)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=502)
+
+
 def short_error(text: str) -> str:
     """A provider error message for a row, a log, or the agent: redacted, on one line, and at
     most ``MAX_ERROR_CHARS`` characters."""

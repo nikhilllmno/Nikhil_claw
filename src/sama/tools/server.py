@@ -147,7 +147,10 @@ from sama.tools.web import (
     extract,
     format_hits,
 )
+from sama.tools.workflow import register_workflows
 from sama.vault.redact import redact
+from sama.workflows.service import WorkflowService
+from sama.workflows.spec import WorkflowError
 
 if TYPE_CHECKING:
     from sama.connectors.service import ConnectionService
@@ -204,6 +207,7 @@ _EXPECTED = (
     TaskError,
     TodoError,
     VisionError,
+    WorkflowError,
 )
 _NOISY_LOGGERS: Final = ("httpx", "httpcore", "mcp")
 
@@ -386,6 +390,7 @@ class ToolServer:
         tasks: TaskTools | None = None,
         session_items: SessionItemsBackend | None = None,
         jobs: JobService | None = None,
+        workflows: WorkflowService | None = None,
         code: CodeRunner | None = None,
         images: ImageService | None = None,
         speech: SpeechService | None = None,
@@ -400,6 +405,7 @@ class ToolServer:
         self.session_items = session_items
         self._session_item_slots = asyncio.Semaphore(MAX_CONCURRENT_SESSION_ITEMS)
         self.jobs = jobs
+        self.workflows = workflows
         self.deferred = deferred
         self.connections = connections
         self.archive = archive
@@ -973,6 +979,8 @@ class ToolServer:
             register_tasks(server, self._call, self.tasks)
         if self.jobs is not None:
             self._cron_tool(server, self.jobs)
+        if self.workflows is not None:
+            register_workflows(server, self._call, self.workflows)
         if self.importer is not None:
             importer = self.importer
 

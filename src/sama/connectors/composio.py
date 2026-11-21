@@ -42,12 +42,21 @@ TRIGGER_EVENT: Final = "composio.trigger.message"
 """The webhook event type of a trigger event (V3 payload)."""
 
 
+UNKNOWN_CODES: Final = frozenset({408, 429})
+"""Client codes after which the result of a call is not known. Every 5xx code is the same."""
+
+
 class ComposioError(Exception):
     """A Composio call failed. The message is safe to show: it holds no secret."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, status_code: int | None = None, unknown: bool = False
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.unknown = unknown
+        """The call can have had its effect: Composio did not answer, or answered 5xx, 408,
+        or 429."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,18 +99,21 @@ class ComposioClient:
                 headers={"x-api-key": key.get_secret_value()},
             )
         except httpx.HTTPError as error:
-            raise ComposioError(f"Composio cannot be reached: {type(error).__name__}") from None
+            raise ComposioError(
+                f"Composio cannot be reached: {type(error).__name__}", unknown=True
+            ) from None
         if response.status_code >= 400:
             raise ComposioError(
                 f"Composio answered {response.status_code}: {_message(response)}",
                 status_code=response.status_code,
+                unknown=response.status_code in UNKNOWN_CODES or response.status_code >= 500,
             )
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError:
-            raise ComposioError("Composio gave an answer that is not JSON") from None
+            raise ComposioError("Composio gave an answer that is not JSON", unknown=True) from None
 
     async def auth_config(self, key: SecretStr, toolkit: str) -> str:
         """The id of the auth config of the toolkit. It uses the first Composio-managed config

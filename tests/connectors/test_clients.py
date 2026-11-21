@@ -261,3 +261,58 @@ async def test_a_refusal_is_not_unavailable(status: int) -> None:
         await http.test(manifest, {"token": "tok-1"})
     assert not isinstance(caught.value, DriverUnavailableError)
     await http.aclose()
+
+
+@pytest.mark.parametrize(
+    ("status", "unknown"),
+    [(400, False), (401, False), (408, True), (429, True), (500, True), (503, True)],
+)
+async def test_a_composio_error_says_when_the_result_is_not_known(
+    status: int, unknown: bool
+) -> None:
+    client, _ = composio(
+        {("POST", "/api/v3.1/tools/execute/SLACK_SEND"): httpx.Response(status, json={})}
+    )
+    with pytest.raises(ComposioError) as caught:
+        await client.execute(KEY, "SLACK_SEND", account_id="ca_1", user_id="u", arguments={})
+    assert caught.value.unknown is unknown
+    await client.aclose()
+
+
+async def test_a_composio_network_error_has_no_known_result() -> None:
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    client = ComposioClient(transport=httpx.MockTransport(broken))
+    with pytest.raises(ComposioError) as caught:
+        await client.execute(KEY, "SLACK_SEND", account_id="ca_1", user_id="u", arguments={})
+    assert caught.value.unknown
+    await client.aclose()
+
+
+async def test_the_driver_sends_the_idempotency_key_when_the_manifest_has_a_header() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    plain = parse(FORM)
+    keyed = parse(
+        FORM.replace(
+            "  test: {method: GET, path: /me}",
+            "  test: {method: GET, path: /me}\n  idempotency_header: Idem-Key",
+        )
+    )
+    assert keyed.http is not None
+    assert keyed.http.idempotency_header == "Idem-Key"
+    http = driver(handler)
+    await http.call(
+        keyed, keyed.tools[0], {"token": "tok-1"}, {"item_id": "a"}, idempotency_key="i-1:post"
+    )
+    await http.call(keyed, keyed.tools[0], {"token": "tok-1"}, {"item_id": "a"})
+    await http.call(
+        plain, plain.tools[0], {"token": "tok-1"}, {"item_id": "a"}, idempotency_key="i-1:post"
+    )
+    assert [request.headers.get("Idem-Key") for request in seen] == ["i-1:post", None, None]
+    await http.aclose()

@@ -40,6 +40,7 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
     "cron": frozenset({"cronjob_manage"}),
+    "workflows": frozenset({"workflow_manage", "workflow_run"}),
     "self": frozenset({"change_propose"}),
     "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
     "integrations": frozenset(),
@@ -106,6 +107,8 @@ DEFAULT_ALLOW: Final = frozenset(
         "task_block",
         "task_comment",
         "cronjob_manage",
+        "workflow_manage",
+        "workflow_run",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
@@ -117,19 +120,22 @@ only sends a link, and the agent cannot give credentials with it (Section 10.3).
 The ``delegation`` and ``tasks`` tools are here because they write only sama state of the same
 workspace and audience, and each child run or task run passes the gate again for every tool
 that it calls (Sections 12.4 and 13.2). ``cronjob_manage`` is here because a job that the
-agent creates or widens waits for the approval of its owner before it fires (Section 12.1)."""
+agent creates or widens waits for the approval of its owner before it fires (Section 12.1).
+``workflow_manage`` and ``workflow_run`` are here for the same reason: a workflow version that
+writes waits for the approval of its owner before it runs (Section 12.3)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"
 CHILD_BLOCKED_TOOLSETS: Final = frozenset(
-    {"delegation", "tasks", "memory", "clarify", "cron", "connections", "integrations"}
+    {"delegation", "tasks", "memory", "clarify", "cron", "workflows", "connections", "integrations"}
 )
 """The toolsets that a delegated child never has (Section 13.2). ``delegation`` keeps the depth
 at 1, and ``tasks`` stops a child that makes a task card that delegates again. ``memory``
 keeps the shared notes free of child writes. ``clarify`` waits for a person, and a child has
-none. ``cron`` stops a child that outlives its parent. ``connections`` and ``integrations`` are
-out for the reason of sub-agents (Section 13.1): a connection acts with the authority of the
-user, and only a run that the user watches asks the user to connect (Section 10.3)."""
+none. ``cron`` and ``workflows`` stop a child that outlives its parent. ``connections`` and
+``integrations`` are out for the reason of sub-agents (Section 13.1): a connection acts with the
+authority of the user, and only a run that the user watches asks the user to connect
+(Section 10.3)."""
 
 NEEDS_A_HUMAN: Final = frozenset({"clarify", "repo_push_approval"})
 """Tools that wait for a human. Unattended runs cannot use them."""
@@ -152,12 +158,17 @@ def always_asks(tool_name: str) -> bool:
     return name in ALWAYS_ASK or _DATABASE_EXECUTE.match(name) is not None
 
 
-SHARED_ASK: Final = frozenset({"memory", "cronjob_manage"})
+SHARED_ASK: Final = frozenset({"memory", "cronjob_manage", "workflow_manage", "workflow_run"})
 """Tools that are in ``DEFAULT_ALLOW`` but get ``ask`` in a shared session (Section 11.3). Every
 call of ``memory`` writes a note that all later sessions of the profile or workspace read, and
 every member of a group can steer the run. A job runs as its owner without a human, so a group
-member must not create one in the name of the owner. A policy rule still wins over this
+member must not create one in the name of the owner. A workflow is the same (Section 12.3).
+A policy rule still wins over this
 default."""
+
+WORKFLOW_TOOLSET: Final = "workflows"
+"""The toolset of ``workflow_manage`` and ``workflow_run``. The run of an agent step of a
+workflow has neither this toolset nor ``cron`` (Section 12.3)."""
 
 JOB_TOOLSET: Final = "cron"
 """The toolset of ``cronjob_manage``. A job run does not have it: a job run cannot create jobs

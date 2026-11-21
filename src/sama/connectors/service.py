@@ -47,7 +47,7 @@ from sama.connectors.composio import (
     ComposioError,
 )
 from sama.connectors.database import DatabaseGateway
-from sama.connectors.errors import ConnectorError, short_error
+from sama.connectors.errors import ConnectorError, ConnectorUnknownError, short_error
 from sama.connectors.host import ConnectorHosts, HostedServer
 from sama.connectors.http_api import (
     DriverError,
@@ -951,8 +951,32 @@ class ConnectionService:
         found = self.catalog.tool(name)
         if found is None:
             raise ConnectorError(f"no connector has the tool {name}")
+        text = await self.call_as(await self.run_scope(claims), name, arguments, claims=claims)
+        return untrusted(text, source=f"connector:{found[0].name}")
+
+    async def call_as(
+        self,
+        scope: RunScope,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        claims: RunTokenClaims | None = None,
+    ) -> str:
+        """Runs a connector tool for a scope, with the connection that the scope may use. The
+        answer is clipped and not marked: the caller marks it. Raises ``ConnectorUnknownError``
+        when the result is not known. A workflow tool step calls this without ``claims``
+        (Section 12.3). A database tool needs the claims of a run: it saves files in the
+        session of the run."""
+        found = self.catalog.tool(name)
+        if found is None:
+            raise ConnectorError(f"no connector has the tool {name}")
         manifest, tool = found
-        scope = await self.run_scope(claims)
+        if manifest.kind == "database" and claims is None:
+            raise ConnectorError(
+                f"{name} is a database tool, and a workflow tool step cannot call it. "
+                "Use an agent step."
+            )
         view = await self.usable(scope, manifest.name)
         if view is None:
             where = "workspace connection" if scope.shared else "connection"
@@ -962,13 +986,31 @@ class ConnectionService:
             )
         if manifest.kind == "composio":
             text = await self._composio_call(scope.org_id, view, tool, arguments)
-        elif manifest.kind == "database":
+        elif manifest.kind == "database" and claims is not None:
             text = await self._database_call(claims, scope, view, manifest, tool, arguments)
         else:
-            text = await self._form_call(scope.org_id, view, manifest, tool, arguments)
+            text = await self._form_call(
+                scope.org_id, view, manifest, tool, arguments, idempotency_key=idempotency_key
+            )
         if len(text) > MAX_ANSWER_CHARS:
             text = text[:MAX_ANSWER_CHARS] + "\n[cut]"
-        return untrusted(text, source=f"connector:{manifest.name}")
+        return text
+
+    def tool_access(self, name: str) -> str | None:
+        """The access of a connector tool (``read``, ``write``, ``destructive``), or ``None``
+        when no connector has the tool."""
+        found = self.catalog.tool(name)
+        return None if found is None else found[1].access
+
+    def idempotent(self, name: str) -> bool:
+        """The tool takes an idempotency key: an ``http_api`` connector with
+        ``http.idempotency_header``. A Composio tool has no key."""
+        found = self.catalog.tool(name)
+        if found is None:
+            return False
+        manifest = found[0]
+        # A Composio manifest has no ``http`` section.
+        return manifest.http is not None and manifest.http.idempotency_header is not None
 
     def register_tools(self, catalog: DeferredCatalog) -> None:
         """Puts the tools of every connector in the deferred catalog, in the toolset
@@ -1797,6 +1839,8 @@ class ConnectionService:
                 arguments=arguments,
             )
         except ComposioError as error:
+            if error.unknown:
+                raise ConnectorUnknownError(f"{tool.name} has no known result: {error}") from None
             raise ConnectorError(f"{tool.name} failed: {error}") from None
         return json.dumps(data, ensure_ascii=False, default=str, indent=1)
 
@@ -1807,13 +1851,19 @@ class ConnectionService:
         manifest: Manifest,
         tool: ToolSpec,
         arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
     ) -> str:
         values = await self._form_values(org_id, view)
         driver = self._drivers.get(manifest.kind)
         if values is None or driver is None:
             raise ConnectorError("the connection is not complete. Use connection_request")
         try:
-            return await driver.call(manifest, tool, values, arguments)
+            return await driver.call(
+                manifest, tool, values, arguments, idempotency_key=idempotency_key
+            )
+        except DriverUnavailableError as error:
+            raise ConnectorUnknownError(f"{tool.name} has no known result: {error}") from None
         except DriverError as error:
             raise ConnectorError(f"{tool.name} failed: {error}") from None
 

@@ -204,7 +204,13 @@ class DatabaseGateway:
             raise DriverUnavailableError(_network(error, settings)) from None
 
     async def call(
-        self, manifest: Manifest, tool: ToolSpec, values: Mapping[str, str], arguments: Any
+        self,
+        manifest: Manifest,
+        tool: ToolSpec,
+        values: Mapping[str, str],
+        arguments: Any,
+        *,
+        idempotency_key: str | None = None,
     ) -> str:
         raise DriverError("a database tool needs the run (use run)")
 

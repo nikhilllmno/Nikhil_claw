@@ -203,6 +203,24 @@ async def test_a_signed_delivery_starts_an_unattended_run_with_the_safe_toolsets
     assert "ignore your rules" in text
 
 
+async def test_a_run_trigger_needs_a_prompt_and_a_profile(
+    hooks: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    for missing in ("prompt", "agent_profile_id"):
+        body = new_hook(tenant)
+        del body[missing]
+        answer = await hooks.post(path(tenant), headers=mia(tenant), json=body)
+        assert answer.status_code == 422, answer.text
+
+
+async def test_a_workflow_trigger_needs_the_workflow_service(
+    hooks: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    body = new_hook(tenant, workflow_id=str(uuid.uuid4()))
+    answer = await hooks.post(path(tenant), headers=mia(tenant), json=body)
+    assert answer.status_code == 409, answer.text
+
+
 async def test_a_replayed_delivery_starts_nothing(
     hooks: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:

@@ -15,7 +15,8 @@ import pytest
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.connectors.service import ConnectionService, ConnectorError, entity_id
+from sama.connectors.errors import ConnectorUnknownError
+from sama.connectors.service import ConnectionService, ConnectorError, RunScope, entity_id
 from sama.db.models import AuditEntry, Connection, VaultSecret
 from sama.gate.decide import policy_verdict
 from sama.tenancy.access import Grants
@@ -353,3 +354,30 @@ def test_the_tools_are_deferred_with_their_access(world: Any) -> None:
         verdict = policy_verdict([], name, access=access)
         assert verdict.action == ("allow" if access[name] == "read" else "ask"), name
         assert policy_verdict([], name, shared=True, access=access).action == verdict.action
+
+
+async def test_a_workflow_call_uses_a_scope_and_says_when_the_result_is_unknown(
+    org: Org1, world: Any
+) -> None:
+    service, fake, form = world
+    mia = member(org, "mia")
+    await connect_gmail(service, fake, org, "personal", mia)
+    started = await service.start(org.ids["org"], org.ids["ws"], mia, "notion", "personal")
+    await service.submit_form(
+        org.ids["org"], started.connection.id, {"token": NOTION_TOKEN}, actor=mia.user_id
+    )
+    scope = RunScope(org.ids["org"], org.ids["ws"], org.ids["mia"], shared=False)
+    answer = await service.call_as(scope, "gmail_fetch_emails", {})
+    # The answer is not marked: the workflow engine keeps the data and marks it in a prompt.
+    assert "untrusted" not in answer
+    assert fake.executed[-1]["user_id"].endswith(f"-u-{org.ids['mia']}")
+    await service.call_as(scope, "notion_search", {"query": "x"}, idempotency_key="i:s")
+    assert form.keys[-1] == "i:s"
+    form.down = True
+    with pytest.raises(ConnectorUnknownError):
+        await service.call_as(scope, "notion_create_page", {})
+    assert service.tool_access("notion_create_page") == "write"
+    assert service.tool_access("no_such_tool") is None
+    # Neither Notion nor a Composio connector takes an idempotency key.
+    assert not service.idempotent("notion_create_page")
+    assert not service.idempotent("slack_send_message")

@@ -104,6 +104,7 @@ class FakeForm:
         self.during_test: Callable[[], Awaitable[object]] | None = None
         """Runs while the API "answers", to change the connection at the same time."""
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.keys: list[str | None] = []
 
     async def test(self, manifest: Manifest, values: Mapping[str, str]) -> None:
         if self.during_test is not None:
@@ -114,10 +115,17 @@ class FakeForm:
             raise DriverError("the API answered 401")
 
     async def call(
-        self, manifest: Manifest, tool: ToolSpec, values: Mapping[str, str], arguments: Any
+        self,
+        manifest: Manifest,
+        tool: ToolSpec,
+        values: Mapping[str, str],
+        arguments: Any,
+        *,
+        idempotency_key: str | None = None,
     ) -> str:
         await self.test(manifest, values)
         self.calls.append((tool.name, dict(arguments)))
+        self.keys.append(idempotency_key)
         return '{"results": []}'
 
 
