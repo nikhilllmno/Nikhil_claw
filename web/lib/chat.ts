@@ -6,6 +6,7 @@ import {
   OPEN_RUN_STATUSES,
   type RunEventPayload,
   type RunsEvent,
+  type SteerNote,
   type StreamRun,
 } from "./api";
 
@@ -211,7 +212,8 @@ export type ChatCommand =
   | { kind: "coding"; agent: CodingAgent | null }
   | { kind: "undo" }
   | { kind: "rollback"; number: number | null; valid: boolean }
-  | { kind: "stop" };
+  | { kind: "bg"; task: string }
+  | { kind: "stop"; number: number | null; valid: boolean };
 
 /**
  * The command in a composer text, or `null` for a normal message. `/handoff` with an unknown
@@ -246,7 +248,16 @@ export function parseCommand(text: string): ChatCommand | null {
     const valid = /^[1-9]\d{0,5}$/.test(value);
     return { kind: "rollback", number: valid ? Number(value) : null, valid };
   }
-  if (/^\/stop$/i.test(trimmed)) return { kind: "stop" };
+  const bg = /^\/bg(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  if (bg) return { kind: "bg", task: (bg[1] ?? "").trim() };
+  const stop = /^\/stop(?:\s+(all|\d+))?\s*$/i.exec(trimmed);
+  if (stop) {
+    // `/stop` stops all open runs, `/stop NUMBER` stops one (M7.1).
+    const value = stop[1] ?? "";
+    if (!value || value.toLowerCase() === "all") return { kind: "stop", number: null, valid: true };
+    const valid = /^[1-9]\d{0,2}$/.test(value);
+    return { kind: "stop", number: valid ? Number(value) : null, valid };
+  }
   return null;
 }
 
@@ -275,6 +286,34 @@ export const ROLLBACK_USAGE = "Write the number of a checkpoint, for example: /r
 /** The text that the chat shows when a message waits behind an open run. */
 export const QUEUED_NOTICE =
   "Queued. sama answers after the current run. Type /steer TEXT to add a note to the current run, or press Stop.";
+
+/** The text that the chat shows when a message joins the running run (busy mode `steer`, M7.1). */
+export const JOINED_NOTICE =
+  "sama adds the message to the current run. The run reads it at its next step. If the run ends first, the message starts the next run.";
+
+/** The usage text of `/bg` and of a wrong `/stop NUMBER`. */
+export const BG_USAGE = "Write the task after the command, for example: /bg summarise the logs";
+export const STOP_USAGE = "Write the number of a run, for example: /stop 2. /stop with no number stops all runs.";
+
+/** The label of a note that joined a run, by its status. `null`: do not show the note. */
+export function noteLabel(note: Pick<SteerNote, "status">): string | null {
+  switch (note.status) {
+    case "pending":
+      return "Queued into the current run";
+    case "delivered":
+      return "Delivered to the run";
+    case "dropped":
+      return "Not delivered: the run stopped";
+    default:
+      // A requeued note is a message of the session now: the message shows it.
+      return null;
+  }
+}
+
+/** True while a note waits for its run: the chat looks again until the run reads it. */
+export function hasPendingNote(notes: readonly Pick<SteerNote, "status">[]): boolean {
+  return notes.some((note) => note.status === "pending");
+}
 
 /** The text that the chat shows when a note goes to the open run. */
 export const STEERED_NOTICE = "sama adds the note to the current run. The run reads it at its next step.";

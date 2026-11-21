@@ -3,9 +3,11 @@ import {
   applyStreamEvent,
   checkpointListText,
   codingProgressLine,
+  hasPendingNote,
   initialLive,
   isPaused,
   NO_CHECKPOINTS,
+  noteLabel,
   openRunIds,
   parseCommand,
   parseCompact,
@@ -274,7 +276,12 @@ describe("parseCommand", () => {
     expect(parseCommand(" /steer use metric units ")).toEqual({ kind: "steer", note: "use metric units" });
     expect(parseCommand("/steer two\nlines")).toEqual({ kind: "steer", note: "two\nlines" });
     expect(parseCommand("/steer")).toEqual({ kind: "steer", note: "" });
-    expect(parseCommand("/stop")).toEqual({ kind: "stop" });
+    expect(parseCommand("/stop")).toEqual({ kind: "stop", number: null, valid: true });
+    expect(parseCommand("/stop all")).toEqual({ kind: "stop", number: null, valid: true });
+    expect(parseCommand("/stop 2")).toEqual({ kind: "stop", number: 2, valid: true });
+    expect(parseCommand("/stop 0")).toEqual({ kind: "stop", number: null, valid: false });
+    expect(parseCommand("/bg  check the logs ")).toEqual({ kind: "bg", task: "check the logs" });
+    expect(parseCommand("/bg")).toEqual({ kind: "bg", task: "" });
     expect(parseCommand("/handoff Telegram")).toEqual({ kind: "handoff", to: "telegram" });
     expect(parseCommand("/handoff slack")).toEqual({ kind: "handoff", to: "slack" });
     expect(parseCommand("/handoff web")).toEqual({ kind: "handoff", to: "web" });
@@ -317,6 +324,18 @@ describe("parseCommand", () => {
     expect(parseCommand("/steering wheel")).toBeNull();
     expect(parseCommand("/stop now")).toBeNull();
     expect(parseCommand("please /steer")).toBeNull();
+    expect(parseCommand("/bgcolor red")).toBeNull();
+  });
+});
+
+describe("noteLabel", () => {
+  it("names each state of a message that joined a run", () => {
+    expect(noteLabel({ status: "pending" })).toBe("Queued into the current run");
+    expect(noteLabel({ status: "delivered" })).toBe("Delivered to the run");
+    expect(noteLabel({ status: "dropped" })).toBe("Not delivered: the run stopped");
+    expect(noteLabel({ status: "requeued" })).toBeNull();
+    expect(hasPendingNote([{ status: "delivered" }, { status: "pending" }])).toBe(true);
+    expect(hasPendingNote([{ status: "delivered" }])).toBe(false);
   });
 });
 

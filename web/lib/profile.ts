@@ -5,6 +5,7 @@ import type {
   AgentProfileLimits,
   AgentProfileOptions,
   AgentProfilePatch,
+  BusyMode,
   RuntimeOption,
   Subagent,
 } from "./api";
@@ -29,7 +30,26 @@ export interface Draft {
   model: string;
   toolsets: string[];
   subagents: DraftSubagent[];
+  /** What a message does while a run is open (M7.1). */
+  busyMode: BusyMode;
+  /** Text of the field: the most open runs of one session. */
+  maxParallelRuns: string;
 }
+
+/** The busy modes, with their text for people (M7.1). */
+export const BUSY_MODES: { value: BusyMode; label: string; hint: string }[] = [
+  {
+    value: "steer",
+    label: "Join the current run",
+    hint: "A new message joins the run that works now. The run reads it at its next step.",
+  },
+  {
+    value: "parallel",
+    label: "Run in parallel",
+    hint: "A new message starts a second run at the same time, in the same session.",
+  },
+  { value: "queue", label: "Wait in a queue", hint: "A new message waits until the current run ends." },
+];
 
 let nextUid = 1;
 
@@ -52,6 +72,8 @@ export function toDraft(profile: AgentProfile): Draft {
     runtime: profile.runtime,
     model: profile.model,
     toolsets: [...profile.toolsets],
+    busyMode: profile.busy_mode ?? "steer",
+    maxParallelRuns: String(profile.max_parallel_runs ?? 3),
     subagents: profile.subagents.map((s) => ({
       uid: nextUid++,
       name: s.name,
@@ -94,6 +116,9 @@ export function diffDraft(profile: AgentProfile, draft: Draft): AgentProfilePatc
   if (!sameList(draft.toolsets, profile.toolsets)) patch.toolsets = draft.toolsets;
   const subagents = draft.subagents.map(toSubagent);
   if (JSON.stringify(subagents) !== JSON.stringify(profile.subagents)) patch.subagents = subagents;
+  if (draft.busyMode !== (profile.busy_mode ?? "steer")) patch.busy_mode = draft.busyMode;
+  const limit = Number(draft.maxParallelRuns.trim());
+  if (Number.isInteger(limit) && limit !== (profile.max_parallel_runs ?? 3)) patch.max_parallel_runs = limit;
   return patch;
 }
 
@@ -152,6 +177,11 @@ export function validateDraft(
   }
   if (draft.soul.length > limits.soul_max_chars) {
     return `The soul has at most ${limits.soul_max_chars.toLocaleString()} characters.`;
+  }
+  const maxRuns = limits.max_parallel_runs ?? 10;
+  const runs = Number(draft.maxParallelRuns.trim());
+  if (!Number.isInteger(runs) || runs < 1 || runs > maxRuns) {
+    return `Parallel runs is a whole number from 1 to ${maxRuns}.`;
   }
   const pattern = safeRegExp(limits.subagent_name_pattern);
   const names = new Set<string>();

@@ -63,6 +63,10 @@ RUN_STATUSES: Final = ("queued", "running", "paused", "completed", "failed", "ca
 ENDED_RUN_STATUSES: Final = ("completed", "failed", "cancelled")
 RESUME_DECISIONS: Final = ("approve", "reject")
 RUN_KINDS: Final = ("chat", "review")
+BUSY_MODES: Final = ("steer", "parallel", "queue")
+"""The busy modes of an agent profile (Section 4.3, M7.1). ``steer`` is the default."""
+MAX_PARALLEL_RUNS_CAP: Final = 10
+"""The highest value of ``agent_profiles.max_parallel_runs``."""
 """``chat`` answers a user message. ``review`` is the background review of a session
 (docs/architecture.md, Section 9.4)."""
 JOB_STATUSES: Final = ("active", "paused", "pending_approval", "removed")
@@ -513,6 +517,10 @@ class AgentProfile(Base):
             f"reasoning_effort IS NULL OR {_one_of('reasoning_effort', REASONING_EFFORTS)}",
             name="reasoning_effort",
         ),
+        CheckConstraint(_one_of("busy_mode", BUSY_MODES), name="busy_mode"),
+        CheckConstraint(
+            f"max_parallel_runs BETWEEN 1 AND {MAX_PARALLEL_RUNS_CAP}", name="max_parallel_runs"
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -547,6 +555,12 @@ class AgentProfile(Base):
     reasoning_effort: Mapped[str | None] = mapped_column(Text)
     """How much the model thinks (M7.10): ``low``, ``medium``, or ``high``. ``None``: the default
     of the model. A session freezes it in its run config."""
+    busy_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default="steer")
+    """What a new message does while a run of its session is open (Section 4.3, M7.1):
+    ``steer`` (it joins the open run at its next step), ``parallel`` (it starts a second run at
+    the same time), or ``queue`` (it waits)."""
+    max_parallel_runs: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
+    """The most open chat runs (running or paused) of one session of the profile (M7.1)."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -678,6 +692,7 @@ class Run(Base):
         # A compact run is a chat run of a person (Section 6.3).
         CheckConstraint("NOT compact OR kind = 'chat'", name="compact_is_chat"),
         CheckConstraint("compact OR compact_focus IS NULL", name="compact_focus"),
+        CheckConstraint("NOT side OR (kind = 'chat' AND NOT compact)", name="side_is_chat"),
         CheckConstraint(
             f"coding_agent IS NULL OR {_one_of('coding_agent', CODING_AGENTS)}",
             name="coding_agent",
@@ -694,11 +709,17 @@ class Run(Base):
             "org_id",
             postgresql_where=text("status = 'running'"),
         ),
-        # One active run per session (docs/architecture.md, Section 4.3).
+        # One open main run per session (migration 0039, Section 4.3). Side runs (M7.1) run
+        # next to it, up to the limit of the profile, which the claim checks.
         Index(
-            "ix_runs_one_active_per_session",
+            "ix_runs_one_main_per_session",
             "session_id",
             unique=True,
+            postgresql_where=text("status IN ('running', 'paused') AND NOT side"),
+        ),
+        Index(
+            "ix_runs_active_per_session",
+            "session_id",
             postgresql_where=text("status IN ('running', 'paused')"),
         ),
         # One waiting review per session (migration 0016, Section 9.4). The index above gives
@@ -773,6 +794,15 @@ class Run(Base):
     coding_agent: Mapped[str | None] = mapped_column(Text)
     """The coding agent of a ``/claude`` or ``/codex`` run with a task (Section 15.4). The run
     uses this runtime and not the runtime of the session."""
+    allow_parallel: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True when the run can start next to an open chat run of its session (M7.1): the profile
+    was in the busy mode ``parallel`` at the enqueue, or the person asked for it (``/bg``)."""
+    side: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True when the run started while another chat run of its session was open (M7.1). A side
+    run starts a new runtime session, and the next run of the session does not resume its
+    runtime state."""
+    context_seq: Mapped[int | None] = mapped_column(BigInteger)
+    """The newest ``messages.seq`` of the session when the chat run started (M7.1)."""
 
 
 class Message(Base):

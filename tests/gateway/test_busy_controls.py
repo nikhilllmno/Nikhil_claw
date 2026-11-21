@@ -26,7 +26,14 @@ from sama.db.models import (
     SessionHandoff,
 )
 from sama.gateway.handoff import USAGE, Handoffs, moved_away
-from sama.gateway.sessions import STEER_EMPTY, STEERED, FollowSettings, queued_text
+from sama.gateway.sessions import (
+    BG_EMPTY,
+    JOINED,
+    STEER_EMPTY,
+    STEERED,
+    FollowSettings,
+    queued_text,
+)
 from sama.gateway.slack import HELP as SLACK_HELP
 from sama.gateway.slack import SlackApp, SlackGateway
 from sama.gateway.telegram import HELP, TelegramBot, TelegramGateway, TelegramSettings
@@ -277,6 +284,65 @@ async def test_slack_steer_in_a_direct_message_and_in_a_thread(
     assert open_runs == 1
     assert "steer" in SLACK_HELP
     assert "handoff" in SLACK_HELP
+
+
+# -- busy modes and parallel runs (M7.1) --------------------------------------------------------
+
+
+async def test_telegram_a_message_joins_the_running_run_and_bg_runs_in_parallel(
+    channels: Channels,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+) -> None:
+    await pair_telegram(channels, engine, tenant)
+    telegram_tests.no_followers(channels.telegram)
+    await channels.telegram.handle_update(tg("write the long report"))
+    run = await claim(engine)
+    await channels.telegram.handle_update(tg("also add a chart"))
+    assert channels.tg_api.texts(TG)[-1] == JOINED
+    async with engine.connect() as connection:
+        notes = (await connection.execute(select(RunSteer.text, RunSteer.run_id))).all()
+    assert [tuple(note) for note in notes] == [("also add a chart", run.run_id)]
+
+    await channels.telegram.handle_update(tg("/bg"))
+    assert channels.tg_api.texts(TG)[-1] == BG_EMPTY.format(command="/bg")
+    await channels.telegram.handle_update(tg("/bg what time is it in Paris?"))
+    side = await claim(engine)
+    assert side.side
+    assert "/stop 2 stops only this run" in channels.tg_api.texts(TG)[-1]
+
+    await channels.telegram.handle_update(tg("/stop 2"))
+    assert channels.tg_api.texts(TG)[-1] == "Stopped run 2: what time is it in Paris?"
+    await channels.telegram.handle_update(tg("/stop"))
+    assert channels.tg_api.texts(TG)[-1] == "Stopped 2 runs."
+    assert "/bg" in HELP
+
+
+async def test_slack_a_message_joins_the_running_run_and_bg_runs_in_parallel(
+    channels: Channels,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+) -> None:
+    gateway = channels.slack
+    await pair_slack(channels, engine, tenant)
+    slack_tests.no_followers(gateway)
+    await gateway.handle_event(slack_tests.dm("write the long report"))
+    run = await claim(engine)
+    await gateway.handle_event(slack_tests.dm("also add a chart"))
+    assert channels.slack_api.texts(SDM)[-1] == JOINED
+    await gateway.handle_event(slack_tests.dm("/bg check the weather"))
+    side = await claim(engine)
+    assert side.side
+    assert "/sama stop 2 stops only this run" in channels.slack_api.texts(SDM)[-1]
+    answer = await gateway.command(slack_tests.command("stop 2"))
+    assert answer == "Stopped run 2: check the weather"
+    async with engine.connect() as connection:
+        cancelled = await connection.scalar(
+            select(Run.cancel_requested_at).where(Run.id == run.run_id)
+        )
+    assert cancelled is None
+    assert await gateway.command(slack_tests.command("stop")) == "Stopped 2 runs."
+    assert "/bg" in SLACK_HELP
 
 
 # -- /handoff -----------------------------------------------------------------------------------

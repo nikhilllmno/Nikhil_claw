@@ -167,6 +167,38 @@ def test_undo_skips_a_run_that_changed_no_files(work: Path) -> None:
     assert _files(work) == {"a.txt": "one"}
 
 
+def test_undo_refuses_when_parallel_runs_changed_files_at_the_same_time(work: Path) -> None:
+    """M7.1: an undo of one run must not silently drop the files of a parallel run."""
+    checkpoints = Checkpoints(str(work))
+    _write(work, "a.txt", "one")
+    checkpoints.snapshot("main", "Write")
+    _write(work, "a.txt", "two")
+    checkpoints.snapshot("side", "Write")
+    _write(work, "b.txt", "side file")
+    checkpoints.snapshot("main", "Write")
+    _write(work, "a.txt", "three")
+    checkpoints.snapshot("side", "Write")
+    _write(work, "b.txt", "side file 2")
+    before = _files(work)
+    with pytest.raises(CheckpointError, match="at the same time as another run"):
+        checkpoints.undo()
+    assert _files(work) == before
+    # /rollback still restores a chosen checkpoint.
+    checkpoints.restore(4)
+    assert _files(work) == {"a.txt": "one"}
+
+
+def test_undo_of_a_run_after_a_parallel_run_ended_works(work: Path) -> None:
+    checkpoints = Checkpoints(str(work))
+    _write(work, "a.txt", "one")
+    checkpoints.snapshot("side", "Write")
+    _write(work, "side.txt", "s")
+    checkpoints.snapshot("main", "Write")
+    _write(work, "a.txt", "two")
+    checkpoints.undo()
+    assert _files(work) == {"a.txt": "one", "side.txt": "s"}
+
+
 def test_rollback_restores_a_checkpoint_and_a_rollback_can_be_undone(work: Path) -> None:
     checkpoints = Checkpoints(str(work))
     _write(work, "a.txt", "one")

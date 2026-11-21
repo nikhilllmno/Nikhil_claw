@@ -12,15 +12,20 @@ import {
   type ExportFormat,
   OPEN_RUN_STATUSES,
   type SessionDetail,
+  type SteerNote,
 } from "@/lib/api";
 import {
   applyStreamEvent,
+  BG_USAGE,
   type Effect,
+  hasPendingNote,
   initialLive,
   isPaused,
   type LiveState,
   checkpointListText,
   HANDOFF_USAGE,
+  JOINED_NOTICE,
+  noteLabel,
   openRunIds,
   parseCommand,
   QUEUED_NOTICE,
@@ -28,6 +33,7 @@ import {
   sessionTitle,
   STEER_USAGE,
   STEERED_NOTICE,
+  STOP_USAGE,
 } from "@/lib/chat";
 import { isQuotaError } from "@/lib/billing";
 import { saveFile } from "@/lib/history";
@@ -43,6 +49,8 @@ import { ErrorState, LoadingState } from "./ui";
 import styles from "./Chat.module.css";
 
 const QUESTION_POLL_MS = 4_000;
+/** How often the chat looks again while a message waits to join its run (M7.1). */
+const NOTE_POLL_MS = 2_000;
 
 export function Chat({ sessionId }: { sessionId: string }) {
   const api = useApi();
@@ -54,6 +62,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [approvalsError, setApprovalsError] = useState<string | null>(null);
   const [questions, setQuestions] = useState<ClarifyRequest[]>([]);
+  // The messages that joined a running run (busy mode `steer`, M7.1).
+  const [notes, setNotes] = useState<SteerNote[]>([]);
   const [live, setLive] = useState<LiveState>(initialLive);
   const liveRef = useRef<LiveState>(initialLive);
   const [connection, setConnection] = useState<{ connected: boolean; error: string | null }>({
@@ -96,6 +106,13 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setApprovalsError(errorText(e, "Could not load the approvals."));
     }
   }, [api, sessionId]);
+  const loadNotes = useCallback(async () => {
+    try {
+      setNotes(await api.listSteers(sessionId));
+    } catch {
+      // The notes that are shown stay. The next poll or reload tries again.
+    }
+  }, [api, sessionId]);
   const loadQuestions = useCallback(async () => {
     try {
       setQuestions(await api.listQuestions(sessionId));
@@ -109,12 +126,13 @@ export function Chat({ sessionId }: { sessionId: string }) {
       for (const effect of new Set(effects)) {
         if (effect === "reload_messages") {
           void loadMessages();
+          void loadNotes();
           reloadSessions();
         } else if (effect === "reload_approvals") void loadApprovals();
         else void loadQuestions();
       }
     },
-    [loadMessages, loadApprovals, loadQuestions, reloadSessions],
+    [loadMessages, loadNotes, loadApprovals, loadQuestions, reloadSessions],
   );
 
   // Load the session, then follow its event stream.
@@ -141,6 +159,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       );
       setLiveState({ ...initialLive, runs });
       void loadMessages();
+      void loadNotes();
       void loadApprovals();
       void loadQuestions();
       let connectedBefore = false;
@@ -179,11 +198,19 @@ export function Chat({ sessionId }: { sessionId: string }) {
     return () => clearInterval(timer);
   }, [running, loadQuestions]);
 
-  // The queued and steered notices are about the open runs: hide them when no run is open.
-  const shownNotice =
-    notice !== null && (running || (notice !== QUEUED_NOTICE && notice !== STEERED_NOTICE)) ? notice : null;
+  // A message that joined a run is pending until the run reads it at its next step.
+  const notePending = hasPendingNote(notes);
+  useEffect(() => {
+    if (!notePending) return;
+    const timer = setInterval(() => void loadNotes(), NOTE_POLL_MS);
+    return () => clearInterval(timer);
+  }, [notePending, loadNotes]);
 
-  const send = async () => {
+  // The queued, steered, and joined notices are about the open runs: hide them when no run is open.
+  const runNotices = [QUEUED_NOTICE, STEERED_NOTICE, JOINED_NOTICE];
+  const shownNotice = notice !== null && (running || !runNotices.includes(notice)) ? notice : null;
+
+  const send = async (parallel = false) => {
     const submitted = draft;
     const text = submitted.trim();
     if (!text) return;
@@ -194,9 +221,18 @@ export function Chat({ sessionId }: { sessionId: string }) {
     setQuotaError(false);
     setNotice(null);
     if (command?.kind === "stop") {
+      if (!command.valid) {
+        setSendError(STOP_USAGE);
+        return;
+      }
       clearDraft();
-      if (running) await stop();
-      else setNotice("No run is open now.");
+      if (!running) setNotice("No run is open now.");
+      else if (command.number === null) await stop();
+      else await stopNumber(command.number);
+      return;
+    }
+    if (command?.kind === "bg" && !command.task) {
+      setSendError(BG_USAGE);
       return;
     }
     if (command?.kind === "steer" && !command.note) {
@@ -254,8 +290,33 @@ export function Chat({ sessionId }: { sessionId: string }) {
         // No run was open: the API sent the note as a message.
         ({ run_id: runId, queued } = answer);
         userText = command.note;
+      } else if (command?.kind === "bg") {
+        // `/bg TASK` starts a run at the same time as the open runs (M7.1).
+        ({ run_id: runId, queued } = await api.sendMessage(sessionId, command.task, true));
+        userText = command.task;
       } else {
-        ({ run_id: runId, queued } = await api.sendMessage(sessionId, text));
+        const answer = await api.sendMessage(sessionId, text, parallel);
+        if (answer.steered) {
+          // The message joined the running run (busy mode `steer`, M7.1). It shows as a note.
+          clearDraft();
+          setNotice(JOINED_NOTICE);
+          const now = new Date().toISOString();
+          localId.current += 1;
+          const note: SteerNote = {
+            id: `local-${localId.current}`,
+            run_id: answer.run_id,
+            text,
+            status: "pending",
+            created_at: now,
+            delivered_at: null,
+            requeued_run_id: null,
+          };
+          setNotes((current) => [...current, note]);
+          stick.current = true;
+          void loadNotes();
+          return;
+        }
+        ({ run_id: runId, queued } = answer);
       }
       clearDraft();
       if (queued) setNotice(QUEUED_NOTICE);
@@ -308,6 +369,32 @@ export function Chat({ sessionId }: { sessionId: string }) {
     }
   };
 
+  /** `/stop NUMBER`: stops the run at that place of the open runs, oldest first (M7.1). */
+  const stopNumber = async (number: number) => {
+    setSendError(null);
+    try {
+      const runs = await api.listOpenRuns(sessionId);
+      const chosen = runs.find((r) => r.number === number);
+      if (!chosen) {
+        setSendError(`There is no open run ${number}. ${STOP_USAGE}`);
+        return;
+      }
+      await api.cancelRun(chosen.run_id);
+      setNotice(`Stopping run ${number}.`);
+    } catch (e) {
+      setSendError(errorText(e, "The run was not stopped."));
+    }
+  };
+
+  const stopOne = async (runId: string) => {
+    setSendError(null);
+    try {
+      await api.cancelRun(runId);
+    } catch (e) {
+      setSendError(errorText(e, "The run was not stopped."));
+    }
+  };
+
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
@@ -316,7 +403,17 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const timeline = useMemo(() => {
     const items: React.ReactNode[] = [];
     const shown = new Set<string>();
+    // The notes that joined a run go between the messages, by time.
+    const pending = notes.filter((n) => noteLabel(n) !== null);
+    let next = 0;
+    const notesBefore = (time: string | null) => {
+      for (let note = pending[next]; note && (time === null || note.created_at < time); note = pending[next]) {
+        items.push(<NoteView key={`note-${note.id}`} note={note} />);
+        next += 1;
+      }
+    };
     for (const m of messages ?? []) {
+      notesBefore(m.created_at);
       if (m.role === "assistant" && m.run_id && !shown.has(m.run_id)) {
         shown.add(m.run_id);
         const calls = live.tools[m.run_id];
@@ -324,11 +421,24 @@ export function Chat({ sessionId }: { sessionId: string }) {
       }
       items.push(<MessageView key={m.id} message={m} />);
     }
+    notesBefore(null);
     for (const [runId, calls] of Object.entries(live.tools)) {
       if (!shown.has(runId)) items.push(<ToolGroup key={`tools-${runId}`} calls={calls} />);
     }
     return items;
-  }, [messages, live.tools]);
+  }, [messages, notes, live.tools]);
+
+  // The open runs, oldest request first, numbered as `/stop NUMBER` counts them (M7.1).
+  const runRows = useMemo(() => {
+    const requests = new Map<string, ChatMessage>();
+    for (const m of messages ?? []) {
+      if (m.role === "user" && m.run_id && !requests.has(m.run_id)) requests.set(m.run_id, m);
+    }
+    return openRuns
+      .map((id) => ({ id, status: live.runs[id]?.status ?? "queued", request: requests.get(id) }))
+      .sort((a, b) => (a.request?.seq ?? Number.MAX_SAFE_INTEGER) - (b.request?.seq ?? Number.MAX_SAFE_INTEGER));
+  }, [openRuns, live.runs, messages]);
+  const runNumber = new Map(runRows.map((row, index) => [row.id, index + 1]));
 
   if (loadError) {
     return (
@@ -371,7 +481,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
             <span className="badge badge-warning">Waiting for you</span>
           ) : running ? (
             <span className="badge badge-accent">
-              <span className="spinner" aria-hidden="true" /> Working
+              <span className="spinner" aria-hidden="true" />{" "}
+              {openRuns.length > 1 ? `${openRuns.length} runs working` : "Working"}
             </span>
           ) : null}
           <SessionTools sessionId={sessionId} />
@@ -410,7 +521,14 @@ export function Chat({ sessionId }: { sessionId: string }) {
           ) : null}
           {timeline}
           {liveText.map(([runId, text]) => (
-            <article key={`live-${runId}`} className={styles.assistant} aria-label="Assistant, writing">
+            <article
+              key={`live-${runId}`}
+              className={styles.assistant}
+              aria-label={runRows.length > 1 ? `Assistant, writing in run ${runNumber.get(runId) ?? ""}` : "Assistant, writing"}
+            >
+              {runRows.length > 1 && runNumber.has(runId) ? (
+                <p className={styles.runLabel}>Run {runNumber.get(runId)}</p>
+              ) : null}
               <Markdown text={text} />
               <span className={styles.caret} aria-hidden="true" />
             </article>
@@ -485,17 +603,55 @@ export function Chat({ sessionId }: { sessionId: string }) {
             {shownNotice}
           </p>
         ) : null}
+        {runRows.length > 1 ? (
+          <section className={styles.runs} aria-label="Runs that work at the same time">
+            <h2 className={styles.runsTitle}>{runRows.length} runs at the same time</h2>
+            <ol className={styles.runList}>
+              {runRows.map((row, index) => (
+                <li key={row.id} className={styles.runRow}>
+                  <span className={styles.runNumber}>Run {index + 1}</span>
+                  <span className={styles.runText} title={row.request?.text}>
+                    {row.request?.text ?? "Waiting for the request"}
+                  </span>
+                  <span className={`badge ${row.status === "paused" ? "badge-warning" : "badge-accent"}`}>
+                    {row.status === "paused" ? "Waiting for you" : row.status === "queued" ? "Waiting" : "Working"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-quiet btn-small"
+                    aria-label={`Stop run ${index + 1}`}
+                    onClick={() => void stopOne(row.id)}
+                  >
+                    Stop
+                  </button>
+                </li>
+              ))}
+            </ol>
+          </section>
+        ) : null}
         <Composer
           value={draft}
           onChange={setDraft}
           onSend={() => void send()}
+          onSendParallel={() => void send(true)}
           sending={sending}
           running={running}
           stopping={stoppingNow}
           onStop={() => void stop()}
+          stopLabel={openRuns.length > 1 ? "Stop all" : "Stop"}
         />
       </div>
     </div>
+  );
+}
+
+/** A message that joined a running run (busy mode `steer`, M7.1), with its state. */
+function NoteView({ note }: { note: SteerNote }) {
+  return (
+    <article className={styles.user} aria-label="You, added to the current run">
+      <p className={styles.userText}>{note.text}</p>
+      <p className={styles.noteStatus}>{noteLabel(note)}</p>
+    </article>
   );
 }
 

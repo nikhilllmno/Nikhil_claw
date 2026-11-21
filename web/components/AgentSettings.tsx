@@ -4,6 +4,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react
 import Link from "next/link";
 import { type AgentProfile, errorText } from "@/lib/api";
 import {
+  BUSY_MODES,
   type Draft,
   type DraftSubagent,
   diffDraft,
@@ -219,6 +220,41 @@ function SettingsForm({
             ))}
           </select>
         </label>
+      </section>
+
+      <section className={`card ${styles.section}`}>
+        <h2 className={styles.heading}>While the agent works</h2>
+        <label className="field">
+          <span className="label">A new message</span>
+          <select
+            className="input"
+            value={draft.busyMode}
+            disabled={readOnly}
+            onChange={(e) => edit({ busyMode: e.target.value as Draft["busyMode"] })}
+          >
+            {BUSY_MODES.map((mode) => (
+              <option key={mode.value} value={mode.value}>
+                {mode.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="hint">{BUSY_MODES.find((mode) => mode.value === draft.busyMode)?.hint}</p>
+        <label className="field">
+          <span className="label">Most runs at the same time in one session</span>
+          <input
+            className="input"
+            type="number"
+            min={1}
+            max={options.limits.max_parallel_runs ?? 10}
+            value={draft.maxParallelRuns}
+            readOnly={readOnly}
+            onChange={(e) => edit({ maxParallelRuns: e.target.value })}
+          />
+        </label>
+        <p className="hint">
+          Applies to the mode Run in parallel, to /bg, and to the Run in parallel button of the chat.
+        </p>
       </section>
 
       <section className={`card ${styles.section}`}>

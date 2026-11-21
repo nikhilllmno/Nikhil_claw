@@ -121,6 +121,7 @@ from sama.datacontrols.retention import RetentionError
 from sama.datacontrols.service import DataControls
 from sama.db.engine import as_user
 from sama.db.models import (
+    MAX_PARALLEL_RUNS_CAP,
     MAX_RETENTION_DAYS,
     MAX_STEER_CHARS,
     AgentProfile,
@@ -133,6 +134,7 @@ from sama.db.models import (
     ReviewProposal,
     Run,
     RunEvent,
+    RunSteer,
     Session,
     Skill,
     SkillVersion,
@@ -230,6 +232,8 @@ from sama.workflows.spec import WorkflowError, WorkflowNotFoundError
 log = logging.getLogger("sama.api")
 
 MAX_TITLE_CHARS: Final = 200
+STEERS_LISTED: Final = 50
+"""The most notes that `GET /sessions/{id}/steers` lists (M7.1)."""
 MAX_REASON_CHARS: Final = 500
 STREAM_BATCH: Final = 500
 RECENT_RUNS: Final = 20
@@ -313,6 +317,9 @@ class NewSession(_Body):
 
 class NewMessage(_Body):
     text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    parallel: bool = False
+    """Start a run next to the open runs of the session (``/bg``, M7.1). Without it, the busy
+    mode of the profile decides."""
 
 
 class Steer(_Body):
@@ -671,6 +678,8 @@ class ProfileEdit(_Edit):
     """``null`` sets the default of the model. It is the only field that may be null."""
 
     nullable: ClassVar[frozenset[str]] = frozenset({"reasoning_effort"})
+    busy_mode: Literal["steer", "parallel", "queue"] | None = None
+    max_parallel_runs: Annotated[int, Field(ge=1, le=MAX_PARALLEL_RUNS_CAP)] | None = None
 
 
 class ProfileCreate(_Body):
@@ -1340,6 +1349,25 @@ class SamaApi:
             principal: Me, session_id: uuid.UUID, body: NewMessage
         ) -> JSONResponse:
             return await self._send(principal, session_id, body)
+
+        @app.get("/sessions/{session_id}/steers")
+        async def list_steers(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
+            return await self._steers(principal, session_id)
+
+        @app.get("/sessions/{session_id}/open-runs")
+        async def list_open_runs(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
+            access = await self._access(principal, session_id)
+            runs = await self._queue.open_runs(org_id=access.org_id, session_id=session_id)
+            return [
+                {
+                    "number": run.number,
+                    "run_id": str(run.run_id),
+                    "status": run.status,
+                    "side": run.side,
+                    "text": run.text,
+                }
+                for run in runs
+            ]
 
         @app.post("/sessions/{session_id}/steer", status_code=202)
         async def steer(principal: Me, session_id: uuid.UUID, body: Steer) -> JSONResponse:
@@ -2461,6 +2489,8 @@ class SamaApi:
                         AgentProfile.subagents,
                         AgentProfile.budget,
                         AgentProfile.reasoning_effort,
+                        AgentProfile.busy_mode,
+                        AgentProfile.max_parallel_runs,
                         AgentProfile.updated_at,
                         select(Org.plan)
                         .where(Org.id == AgentProfile.org_id)
@@ -2492,6 +2522,8 @@ class SamaApi:
             "subagents": [s.model_dump(mode="json") for s in parse_subagents(row.subagents)],
             "budget": {key: budget.get(key) for key in BUDGET_KEYS},
             "reasoning_effort": row.reasoning_effort,
+            "busy_mode": row.busy_mode,
+            "max_parallel_runs": row.max_parallel_runs,
             "updated_at": row.updated_at.isoformat(),
             "editable": await self._can_manage_agents(org_id, grants),
             "options": profile_options(runtime, row.plan),
@@ -2809,6 +2841,45 @@ class SamaApi:
             )
         ).scalar_one()
         return int(value)
+
+    async def _steers(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
+        """``GET /sessions/{id}/steers`` (M7.1): the newest notes that joined a run of the
+        session, oldest first. A note is ``pending`` until the run reads it at its next step
+        (``delivered``). A note that the run did not read before it completed went to the
+        session as a new message (``requeued``), and a stopped run drops its notes
+        (``dropped``)."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            rows = (
+                await connection.execute(
+                    select(
+                        RunSteer.id,
+                        RunSteer.run_id,
+                        RunSteer.text,
+                        RunSteer.status,
+                        RunSteer.created_at,
+                        RunSteer.delivered_at,
+                        RunSteer.requeued_run_id,
+                    )
+                    .where(RunSteer.org_id == access.org_id, RunSteer.session_id == session_id)
+                    .order_by(RunSteer.created_at.desc(), RunSteer.id)
+                    .limit(STEERS_LISTED)
+                )
+            ).all()
+        return [
+            {
+                "id": str(row.id),
+                "run_id": str(row.run_id),
+                "text": row.text,
+                "status": row.status,
+                "created_at": row.created_at.isoformat(),
+                "delivered_at": None if row.delivered_at is None else row.delivered_at.isoformat(),
+                "requeued_run_id": None
+                if row.requeued_run_id is None
+                else str(row.requeued_run_id),
+            }
+            for row in reversed(rows)
+        ]
 
     async def _messages(
         self, principal: Principal, session_id: uuid.UUID, after: int, limit: int
@@ -3794,7 +3865,7 @@ class SamaApi:
         self, principal: Principal, session_id: uuid.UUID, body: NewMessage
     ) -> JSONResponse:
         try:
-            sent = await self.submit(principal, session_id, body.text)
+            sent = await self.submit(principal, session_id, body.text, parallel=body.parallel)
         except SendError as error:
             headers = {}
             if error.retry_after_s is not None:
@@ -3812,9 +3883,14 @@ class SamaApi:
         text: str,
         *,
         page: PageContext | None = None,
+        parallel: bool = False,
     ) -> Sent:
         """Queues a user message, as ``POST /sessions/{id}/messages`` does. Raises
         ``SendError``.
+
+        Busy modes (M7.1): in the mode ``steer`` (the default), a plain text message while a run
+        of the session is running joins that run as a note (``steered``). ``parallel`` starts
+        a run next to the open runs, whatever the mode.
 
         With ``page`` (the extension channel, M5.4), the message has the page of the tab as
         untrusted content, and a skill command is not expanded. Page content can hold private
@@ -3830,10 +3906,31 @@ class SamaApi:
         if page is None:
             command = parse_command(text)
             if command is not None and command.agent is not None and command.task:
-                # One message for a coding agent (Section 15.4): no skill.
+                # One message for a coding agent (Section 15.4): no skill, and it never joins
+                # a running run (M7.1).
                 coding_agent, text = command.agent, command.task
             else:
+                typed = text
                 text = await self._expand_skill(access, text)
+                if join and not parallel and text == typed:
+                    try:
+                        steered = await self._queue.steer(
+                            org_id=access.org_id,
+                            session_id=session_id,
+                            text=text,
+                            user_id=access.user_id,
+                            busy_mode=True,
+                        )
+                    except RateLimitedError as error:
+                        raise SendError(
+                            429, str(error), retry_after_s=error.retry_after_s
+                        ) from None
+                    except QuotaExceededError as error:
+                        raise SendError(402, str(error), quota=error.quota) from None
+                    except QueueError as error:
+                        raise SendError(409, str(error)) from None
+                    if steered is not None:
+                        return Sent(run_id=steered, queued=False, steered=True)
         else:
             session = access.session
             if session.audience != "private" or session.owner_user_id != access.user_id:
@@ -3851,6 +3948,7 @@ class SamaApi:
                 user_id=access.user_id,
                 attachments=attachments,
                 coding_agent=None if coding_agent is None else coding_agent.value,
+                parallel=parallel,
             )
         except RateLimitedError as error:
             raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None

@@ -209,7 +209,7 @@ async def test_concurrent_claims_take_each_run_once(engine: AsyncEngine, tenant:
     assert sorted(claimed) == sorted(ids)
 
 
-async def test_the_database_allows_one_active_run_per_session(
+async def test_the_database_allows_one_active_main_run_per_session(
     engine: AsyncEngine, tenant: Tenant
 ) -> None:
     queue = RunQueue(engine)
@@ -217,7 +217,7 @@ async def test_the_database_allows_one_active_run_per_session(
     second = await enqueue(queue, tenant, "s1")
     run = await claim(queue)
     await pause(queue, run)
-    with pytest.raises(IntegrityError, match="ix_runs_one_active_per_session"):
+    with pytest.raises(IntegrityError, match="ix_runs_one_main_per_session"):
         async with engine.begin() as connection:
             await connection.execute(
                 update(Run)

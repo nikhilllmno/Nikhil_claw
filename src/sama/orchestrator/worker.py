@@ -506,6 +506,7 @@ async def _stream(
                 reason=run.resume.reason,
                 budget=budget,
                 runtime_state=run.runtime_state,
+                parallel=run.side,
             )
         )
     else:
@@ -518,6 +519,7 @@ async def _stream(
                 budget=budget,
                 runtime_state=run.runtime_state,
                 compact=CompactRequest(focus=run.input) if run.compact else None,
+                parallel=run.side,
             )
         )
     try:

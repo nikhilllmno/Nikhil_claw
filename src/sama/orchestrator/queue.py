@@ -57,6 +57,7 @@ from sqlalchemy import (
     insert,
     literal,
     null,
+    or_,
     select,
     tuple_,
     update,
@@ -90,6 +91,14 @@ from sama.gate.decide import arguments_digest
 from sama.gate.service import APPROVAL_TTL, stored_arguments
 from sama.media.images import NewAttachment
 from sama.orchestrator.limits import ModelQuotas, QueueLimits
+from sama.orchestrator.parallel import (
+    CATCH_UP_TURNS,
+    SIDE_MESSAGES,
+    Line,
+    Turn,
+    catch_up_block,
+    side_block,
+)
 from sama.orgs.plans import plan_of
 from sama.review import policy as review_policy
 from sama.review.transcript import build_transcript
@@ -284,21 +293,79 @@ def narrow_budget(
     return out
 
 
-def _session_state_query(runs: Any, org_id: Any, session_id: Any, runtime: Any) -> Any:
+def _session_state_query(
+    runs: Any, org_id: Any, session_id: Any, runtime: Any, column: str = "runtime_state"
+) -> Any:
     """The runtime state of the newest chat run of a session that saved one (see
-    ``RunQueue._session_state``). ``runs`` is ``Run`` or an alias of it."""
+    ``RunQueue._session_state``), or another ``column`` of that run. ``runs`` is ``Run`` or an
+    alias of it. A side run (M7.1) does not count: its runtime session is its own."""
     return (
-        select(runs.runtime_state)
+        select(getattr(runs, column))
         .where(
             runs.org_id == org_id,
             runs.session_id == session_id,
             runs.runtime == runtime,
             runs.kind == "chat",
+            runs.side.is_(False),
             runs.status.in_(("completed", "failed", "cancelled")),
             runs.runtime_state.is_not(None),
         )
         .order_by(runs.finished_at.desc())
         .limit(1)
+    )
+
+
+def _resumes(runs: Any) -> Any:
+    """The run is queued again after its approval was decided (``release_decided``)."""
+    return and_(runs.resume_decision.is_not(None), runs.pending_approval_id.is_not(None))
+
+
+def _ready(runs: Any, limit: Any) -> Any:
+    """The rule that lets a queued run start now, for ``runs`` (``Run`` or an alias). ``limit``
+    is the ``max_parallel_runs`` of its profile. FIFO per session: no older chat run of the
+    session waits.
+
+    - A review run starts only when the session has no open run and no waiting chat run.
+    - A chat run never starts next to an open review run or ``/compact`` run.
+    - A chat run starts when the session has no open chat run, or when it resumes after an
+      approval (it was open before), or when it can run in parallel (M7.1): it is not a
+      ``/compact`` run, ``allow_parallel`` is set, and the session has fewer open chat runs
+      than ``limit``.
+    """
+    active = aliased(Run)
+    older = aliased(Run)
+    opened = (active.session_id == runs.session_id, active.status.in_(ACTIVE_STATUSES))
+    open_chat = (
+        select(func.count()).where(*opened, active.kind == "chat").correlate(runs).scalar_subquery()
+    )
+    waiting_chat = (
+        older.session_id == runs.session_id,
+        older.status == "queued",
+        older.kind == "chat",
+    )
+    return and_(
+        ~exists()
+        .where(*waiting_chat, tuple_(older.created_at, older.id) < tuple_(runs.created_at, runs.id))
+        .correlate(runs),
+        case(
+            (
+                runs.kind == "review",
+                and_(
+                    ~exists().where(*opened).correlate(runs),
+                    ~exists().where(*waiting_chat).correlate(runs),
+                ),
+            ),
+            else_=and_(
+                ~exists()
+                .where(*opened, or_(active.kind != "chat", active.compact))
+                .correlate(runs),
+                or_(
+                    ~exists().where(*opened).correlate(runs),
+                    _resumes(runs),
+                    and_(runs.allow_parallel, ~runs.compact, open_chat < limit),
+                ),
+            ),
+        ),
     )
 
 
@@ -316,6 +383,19 @@ class Lease(StrEnum):
 class RunRef:
     org_id: uuid.UUID
     run_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRun:
+    """An open chat run of a session, for ``/stop NUMBER`` and the busy notices (M7.1)."""
+
+    number: int
+    """The place of the run in the open runs of the session, from 1, oldest first."""
+    run_id: uuid.UUID
+    status: str
+    side: bool
+    text: str
+    """The start of the request of the run, on one line."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +442,10 @@ class ClaimedRun:
     gate and the prompt take away the toolsets in ``CHILD_BLOCKED_TOOLSETS``."""
     reasoning_effort: ReasoningEffort | None = None
     """The reasoning effort of the profile (M7.10). ``None``: the default of the model."""
+    side: bool = False
+    """True for a side run (M7.1): it started while another chat run of its session was open.
+    It has no runtime state of the session, its ``input`` carries the transcript, and the
+    runner runs it next to the other runner of the session."""
 
 
 def _stored_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -396,6 +480,92 @@ _REVIEW_OFF: Final = {
 CRASH_MESSAGE: Final = (
     "the worker stopped during the run; a tool can have run, so the run does not start again"
 )
+
+
+async def _side_context(
+    connection: AsyncConnection, row: Any, run_id: uuid.UUID
+) -> tuple[list[Line], list[str]]:
+    """The transcript of a side run (M7.1): the newest messages of the session up to its
+    ``context_seq``, oldest first, and the requests of the other open chat runs."""
+    rows = (
+        await connection.execute(
+            select(Message.role, Message.content["text"].astext.label("text"))
+            .where(
+                Message.org_id == row.org_id,
+                Message.session_id == row.session_id,
+                Message.seq <= row.context_seq,
+                Message.role.in_(("user", "assistant")),
+                Message.run_id.is_distinct_from(run_id),
+                # The request of an open run is in the list of open requests.
+                ~exists().where(
+                    Run.org_id == Message.org_id,
+                    Run.id == Message.run_id,
+                    Message.role == "user",
+                    Run.status.in_(ACTIVE_STATUSES),
+                ),
+            )
+            .order_by(Message.seq.desc())
+            .limit(SIDE_MESSAGES)
+        )
+    ).all()
+    lines = [Line(r.role, r.text or "") for r in reversed(rows) if r.text]
+    requests = (
+        await connection.execute(
+            select(Message.content["text"].astext)
+            .join(Run, and_(Run.org_id == Message.org_id, Run.id == Message.run_id))
+            .where(
+                Message.org_id == row.org_id,
+                Message.session_id == row.session_id,
+                Message.role == "user",
+                Run.id != run_id,
+                Run.kind == "chat",
+                Run.status.in_(ACTIVE_STATUSES),
+            )
+            .order_by(Message.seq)
+        )
+    ).scalars()
+    return lines, [text for text in requests if text]
+
+
+async def _catch_up(connection: AsyncConnection, row: Any, run_id: uuid.UUID) -> list[Turn]:
+    """The side runs that a main run must hear of (M7.1): they completed after the session
+    state was made (their reply is newer than ``state_seq``), in the order that they completed.
+    A session with no state yet counts every completed side run."""
+    base = -1 if row.state_seq is None else row.state_seq
+    if row.side_seq is None or row.side_seq <= base:
+        return []  # most runs: no side run answered after the state, so no extra statement
+    answer = aliased(Message)
+    request = aliased(Message)
+    rows = (
+        await connection.execute(
+            select(
+                answer.content["text"].astext.label("answer"),
+                select(request.content["text"].astext)
+                .where(
+                    request.org_id == answer.org_id,
+                    request.run_id == answer.run_id,
+                    request.role == "user",
+                )
+                .order_by(request.seq)
+                .limit(1)
+                .scalar_subquery()
+                .label("request"),
+            )
+            .join(Run, and_(Run.org_id == answer.org_id, Run.id == answer.run_id))
+            .where(
+                answer.org_id == row.org_id,
+                answer.session_id == row.session_id,
+                answer.role == "assistant",
+                answer.seq > base,
+                Run.side.is_(True),
+                Run.status == "completed",
+                Run.id != run_id,
+            )
+            .order_by(answer.seq.desc())
+            .limit(CATCH_UP_TURNS)
+        )
+    ).all()
+    return [Turn(r.request or "", r.answer or "") for r in reversed(rows)]
 
 
 class RunQueue:
@@ -440,6 +610,7 @@ class RunQueue:
         unattended: bool = False,
         attachments: Sequence[NewAttachment] = (),
         coding_agent: str | None = None,
+        parallel: bool = False,
     ) -> uuid.UUID:
         """Stores a user message and queues a run for it. Returns the run id.
 
@@ -451,7 +622,10 @@ class RunQueue:
 
         The run uses the budget of the session profile. It uses the runtime of the frozen
         session config, or the runtime of the profile before the first run builds the config
-        (Section 6.1). If the session has an active run, the new run waits in the queue.
+        (Section 6.1). If the session has an active run, the new run waits in the queue, unless
+        it can run in parallel (M7.1): ``parallel`` is true (``/bg``), or the busy mode of the
+        profile is ``parallel``. Then it starts next to the open runs, up to the limit of the
+        profile (``max_parallel_runs``).
 
         Raises ``RateLimitedError`` when the user or the org is over its message rate
         (``QueueLimits``), and ``QuotaExceededError`` when it used a model quota (Section
@@ -467,6 +641,7 @@ class RunQueue:
                 unattended=unattended,
                 attachments=attachments,
                 coding_agent=coding_agent,
+                parallel=parallel,
             )
 
     async def enqueue_in(
@@ -484,6 +659,7 @@ class RunQueue:
         check_rate: bool = True,
         toolsets: Sequence[str] | None = None,
         coding_agent: str | None = None,
+        parallel: bool = False,
     ) -> uuid.UUID:
         """``enqueue`` in the transaction of the caller. A caller that makes the session in
         the same transaction (delegation, the task dispatcher, an event trigger) gets the
@@ -493,7 +669,8 @@ class RunQueue:
         uses the model of the profile. ``check_rate=False`` keeps the lock order but does not
         apply the message rate: a job fire is not a message of a person, and the notes of
         ``/steer`` passed the rate check already. ``toolsets`` limits the toolsets of the run
-        (``runs.toolsets``, Section 12.2)."""
+        (``runs.toolsets``, Section 12.2). ``parallel`` lets the run start next to an open run of
+        the session (M7.1); the busy mode ``parallel`` of the profile does the same."""
         await self._rate_lock(connection, org_id)  # the lock order of all enqueues
         # One statement reads the session, the limits, and the rate counts. It comes
         # after the lock statement, so its snapshot has every enqueue before the lock.
@@ -508,6 +685,7 @@ class RunQueue:
                         AgentProfile.runtime,
                     ).label("runtime"),
                     AgentProfile.budget,
+                    AgentProfile.busy_mode,
                     *_rate_columns(org_id, user_id),
                 )
                 .join(
@@ -559,6 +737,7 @@ class RunQueue:
                         model=model,
                         coding_agent=coding_agent,
                         toolsets=list(toolsets) if toolsets is not None else null(),
+                        allow_parallel=parallel or session.busy_mode == "parallel",
                     )
                     .cte("new_run")
                 )
@@ -718,25 +897,73 @@ class RunQueue:
             return status
 
     async def waits(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> bool:
-        """True if an older open run of the same session comes before the run: the new message
-        waits in the queue (Section 4.3)."""
+        """True if the run is queued behind an open run of the same session and cannot start
+        now: the new message waits in the queue (Section 4.3). A run that can start in parallel
+        (M7.1) does not wait."""
         mine = aliased(Run)
         async with self._engine.connect() as connection:
             return bool(
                 (
                     await connection.execute(
                         select(
-                            exists().where(
-                                Run.org_id == mine.org_id,
-                                Run.session_id == mine.session_id,
-                                Run.id != mine.id,
-                                Run.status.in_(("queued", *ACTIVE_STATUSES)),
-                                Run.created_at <= mine.created_at,
+                            and_(
+                                mine.status == "queued",
+                                exists().where(
+                                    Run.org_id == mine.org_id,
+                                    Run.session_id == mine.session_id,
+                                    Run.id != mine.id,
+                                    Run.status.in_(("queued", *ACTIVE_STATUSES)),
+                                    Run.created_at <= mine.created_at,
+                                ),
+                                ~_ready(mine, AgentProfile.max_parallel_runs),
                             )
-                        ).where(mine.org_id == org_id, mine.id == run_id)
+                        )
+                        .join(
+                            AgentProfile,
+                            and_(
+                                AgentProfile.org_id == mine.org_id,
+                                AgentProfile.id == mine.agent_profile_id,
+                            ),
+                        )
+                        .where(mine.org_id == org_id, mine.id == run_id)
                     )
                 ).scalar_one_or_none()
             )
+
+    async def open_runs(self, *, org_id: uuid.UUID, session_id: uuid.UUID) -> list[OpenRun]:
+        """The open chat runs of a session (queued, running, or paused), oldest first, with the
+        start of their request. ``/stop NUMBER`` uses the place in this list (M7.1)."""
+        request = (
+            select(Message.content["text"].astext)
+            .where(Message.org_id == Run.org_id, Message.run_id == Run.id, Message.role == "user")
+            .order_by(Message.seq)
+            .limit(1)
+            .correlate(Run)
+            .scalar_subquery()
+        )
+        async with self._engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    select(Run.id, Run.status, Run.side, Run.compact, request.label("text"))
+                    .where(
+                        Run.org_id == org_id,
+                        Run.session_id == session_id,
+                        Run.kind == "chat",
+                        Run.status.not_in(ENDED_RUN_STATUSES),
+                    )
+                    .order_by(Run.created_at, Run.id)
+                )
+            ).all()
+        return [
+            OpenRun(
+                number=number,
+                run_id=row.id,
+                status=row.status,
+                side=row.side,
+                text="/compact" if row.compact else " ".join((row.text or "").split())[:120],
+            )
+            for number, row in enumerate(rows, start=1)
+        ]
 
     async def steer(
         self,
@@ -745,10 +972,16 @@ class RunQueue:
         session_id: uuid.UUID,
         text: str,
         user_id: uuid.UUID | None = None,
+        busy_mode: bool = False,
     ) -> uuid.UUID | None:
         """Adds a note of ``/steer`` to the active chat run of the session (Section 4.3).
         Returns the run id, or None if the session has no active chat run (a run that ``/stop``
-        cancels does not count): then the caller sends the text as a normal message.
+        cancels does not count): then the caller sends the text as a normal message. When the
+        session has more than one active chat run (M7.1), the newest one gets the note.
+
+        ``busy_mode=True`` is the busy mode ``steer`` of a normal message (M7.1): the note goes
+        only to a ``running`` run of a profile in the mode ``steer``, and a run with
+        ``MAX_PENDING_STEERS`` notes returns None, so the caller queues the message.
 
         The gate gives the note to the run at its next tool call. If the run completes before
         that, ``complete`` sends the notes as a new message. A user over the message rate
@@ -761,6 +994,8 @@ class RunQueue:
         text = text.strip()
         if not text:
             raise QueueError("the note is empty")
+        if len(text) > MAX_STEER_CHARS and busy_mode:
+            return None
         if len(text) > MAX_STEER_CHARS:
             raise QueueError(f"the note is longer than {MAX_STEER_CHARS} characters")
         async with self._engine.begin() as connection:
@@ -780,17 +1015,32 @@ class RunQueue:
                     .where(
                         Run.org_id == org_id,
                         Run.session_id == session_id,
-                        Run.status.in_(ACTIVE_STATUSES),
+                        Run.status.in_(("running",) if busy_mode else ACTIVE_STATUSES),
                         Run.kind == "chat",
                         Run.compact.is_(False),
                         Run.cancel_requested_at.is_(None),
+                        *(
+                            [
+                                exists().where(
+                                    AgentProfile.org_id == Run.org_id,
+                                    AgentProfile.id == Run.agent_profile_id,
+                                    AgentProfile.busy_mode == "steer",
+                                )
+                            ]
+                            if busy_mode
+                            else []
+                        ),
                     )
+                    .order_by(Run.created_at.desc(), Run.id.desc())
+                    .limit(1)
                     .with_for_update(of=Run, read=True)
                 )
             ).one_or_none()
             if row is None:
                 return None
             _check_rate(row)
+            if row.pending >= MAX_PENDING_STEERS and busy_mode:
+                return None
             if row.pending >= MAX_PENDING_STEERS:
                 raise QueueError(
                     f"the run has {MAX_PENDING_STEERS} notes that it did not read yet."
@@ -1006,40 +1256,33 @@ class RunQueue:
 
     @staticmethod
     def _candidate(full: set[uuid.UUID], region: str) -> Any:
-        """The oldest ready run: queued, its session has no active run and no older queued
-        run, its org is in ``region`` (the home region, Section 17.3), and its org is not in
-        ``full``. A run of an org in another region stays queued: the deployment of that region
-        runs it.
+        """The oldest ready run (``_ready``): its org is in ``region`` (the home region, Section
+        17.3), and its org is not in ``full``. A run of an org in another region stays queued:
+        the deployment of that region runs it. Chat runs go before review runs.
 
-        A review run is ready only when no chat run of its session waits. A waiting review
-        does not block a chat run. Chat runs go before review runs."""
-        other = aliased(Run)
-        older = aliased(Run)
+        The statement locks the run and its session row (``FOR NO KEY UPDATE ... SKIP LOCKED``).
+        The session lock puts the claims of one session in a sequence, so the count of open runs
+        stays true until the claim commits. ``complete`` takes the same lock before it stores a
+        reply, so the transcript that a run reads at its claim (M7.1) has every reply that
+        committed before, and none of a later reply."""
         conditions = [
             Run.status == "queued",
             exists().where(Org.id == Run.org_id, Org.region == region),
-            ~exists().where(other.session_id == Run.session_id, other.status.in_(ACTIVE_STATUSES)),
-            ~exists().where(
-                older.session_id == Run.session_id,
-                older.status == "queued",
-                older.kind == "chat",
-                tuple_(older.created_at, older.id) < tuple_(Run.created_at, Run.id),
-            ),
-            ~exists().where(
-                older.session_id == Run.session_id,
-                older.status == "queued",
-                older.kind == "chat",
-                Run.kind == "review",
-            ),
+            _ready(Run, AgentProfile.max_parallel_runs),
         ]
         if full:
             conditions.append(Run.org_id.not_in(full))
         return (
             select(Run.id, Run.org_id, Run.kind)
+            .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
+            .join(
+                AgentProfile,
+                and_(AgentProfile.org_id == Run.org_id, AgentProfile.id == Run.agent_profile_id),
+            )
             .where(*conditions)
             .order_by(case((Run.kind == "chat", 0), else_=1), Run.created_at, Run.id)
             .limit(1)
-            .with_for_update(of=Run, skip_locked=True)
+            .with_for_update(of=(Run, Session), skip_locked=True, key_share=True)
         )
 
     async def _full_orgs(self) -> set[uuid.UUID]:
@@ -1104,7 +1347,30 @@ class RunQueue:
         is a round trip to the database.
         """
         prior = aliased(Run)
-        resumes = and_(Run.resume_decision.is_not(None), Run.pending_approval_id.is_not(None))
+        other = aliased(Run)
+        resumes = _resumes(Run)
+        starts = and_(Run.kind == "chat", ~resumes)
+        # A chat run that starts while another chat run of the session is open is a side run
+        # (M7.1). The subquery reads the rows before this update, so the run itself is queued.
+        side = case(
+            (resumes, Run.side),
+            (
+                and_(Run.kind == "chat", Run.compact.is_(False)),
+                exists().where(
+                    other.session_id == Run.session_id,
+                    other.id != Run.id,
+                    other.kind == "chat",
+                    other.status.in_(ACTIVE_STATUSES),
+                ),
+            ),
+            else_=False,
+        )
+        newest_seq = (
+            select(func.max(Message.seq))
+            .where(Message.org_id == Run.org_id, Message.session_id == Run.session_id)
+            .correlate(Run)
+            .scalar_subquery()
+        )
         row = (
             await connection.execute(
                 update(Run)
@@ -1122,6 +1388,8 @@ class RunQueue:
                     attempts=Run.attempts + 1,
                     dispatched_at=None,
                     started_at=func.coalesce(Run.started_at, func.now()),
+                    side=side,
+                    context_seq=case((starts, func.coalesce(newest_seq, 0)), else_=Run.context_seq),
                     # A chat run that starts takes the runtime of the session now, as the
                     # model: the profile can switch runtime while the run waits (Section 11.4).
                     # A ``/claude`` or ``/codex`` run keeps its coding agent, and the direct mode
@@ -1157,6 +1425,8 @@ class RunQueue:
                     Run.compact_focus,
                     Run.review_from_seq,
                     Run.review_to_seq,
+                    Run.side,
+                    Run.context_seq,
                     Session.workspace_id,
                     Session.audience,
                     Session.owner_user_id,
@@ -1182,13 +1452,46 @@ class RunQueue:
                     # Only a chat run that starts (no resume) reads the session state.
                     case(
                         (
-                            and_(Run.kind == "chat", ~resumes),
+                            starts,
                             _session_state_query(prior, Run.org_id, Run.session_id, Run.runtime)
                             .scalar_subquery()
                             .correlate(Run),
                         ),
                         else_=None,
                     ).label("session_state"),
+                    # The newest message that the session state has seen (M7.1). The side runs
+                    # that answered after it are the catch-up of a main run.
+                    case(
+                        (
+                            starts,
+                            _session_state_query(
+                                prior, Run.org_id, Run.session_id, Run.runtime, "context_seq"
+                            )
+                            .scalar_subquery()
+                            .correlate(Run),
+                        ),
+                        else_=None,
+                    ).label("state_seq"),
+                    case(
+                        (
+                            starts,
+                            select(func.max(Message.seq))
+                            .join(
+                                other,
+                                and_(other.org_id == Message.org_id, other.id == Message.run_id),
+                            )
+                            .where(
+                                Message.org_id == Run.org_id,
+                                Message.session_id == Run.session_id,
+                                Message.role == "assistant",
+                                other.side.is_(True),
+                                other.status == "completed",
+                            )
+                            .correlate(Run)
+                            .scalar_subquery(),
+                        ),
+                        else_=None,
+                    ).label("side_seq"),
                 )
             )
         ).one()
@@ -1203,7 +1506,7 @@ class RunQueue:
             message = str((text or {}).get("text", ""))  # not used: a resume has no input
         else:
             resume = None
-            state = _decode_state(row.session_state)
+            state = None if row.side else _decode_state(row.session_state)
             message = await self._input(connection, row, run_id, text)
         return ClaimedRun(
             org_id=row.org_id,
@@ -1226,6 +1529,7 @@ class RunQueue:
             compact=bool(row.compact),
             lineage=row.lineage,
             reasoning_effort=row.reasoning_effort,
+            side=bool(row.side),
         )
 
     @staticmethod
@@ -1237,11 +1541,19 @@ class RunQueue:
         if row.compact:
             pins = await all_pin_texts(connection, row.org_id, row.session_id)
             return compact_focus(row.compact_focus or "", pins)
+        message = str((text or {}).get("text", ""))
+        if row.side:
+            # A side run starts a new runtime session (M7.1). It gets all pins, and it does not
+            # reserve them: the runtime state of the session does not keep its context.
+            pins = await all_pin_texts(connection, row.org_id, row.session_id)
+            lines, requests = await _side_context(connection, row, run_id)
+            return pin_block(pins) + side_block(lines, requests) + message
         # The pins that no run got, or that a compaction made the runtime forget, go in front
         # of the message. Only the transcript of the runtime has them: the stored message is
         # the text of the person. A run that resumes after an approval gets no pins here.
         pins = await pins_for_input(connection, row.org_id, row.session_id, run_id)
-        return pin_block(pins) + str((text or {}).get("text", ""))
+        turns = await _catch_up(connection, row, run_id)
+        return pin_block(pins) + catch_up_block(turns) + message
 
     def _review_model(self, row: Any) -> str:
         """The review model of the profile if the runtime of the run knows it (the fake runtime
@@ -1438,6 +1750,13 @@ class RunQueue:
             # A review run writes no message: nobody reads its reply (Section 9.4). A compact
             # run answers nobody, and it is no user turn.
             if ended and steerable:
+                # The claim of a run reads the transcript under the same lock (M7.1), so a run
+                # never sees a later reply and never misses an earlier one.
+                await connection.execute(
+                    select(Session.id)
+                    .where(Session.org_id == run.org_id, Session.id == run.session_id)
+                    .with_for_update(key_share=True)
+                )
                 await connection.execute(
                     insert(Message).values(
                         org_id=run.org_id,
