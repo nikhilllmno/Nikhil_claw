@@ -184,7 +184,7 @@ def test_the_migration_adds_and_removes_the_tables() -> None:
         asyncio.run(seed(url))
         assert policies(url) == ["browser_logins_select", "browser_url_policies_select"]
         config = alembic_config(url)
-        command.downgrade(config, "0036")
+        command.downgrade(config, "0037")
         assert policies(url) == []
         command.upgrade(config, "head")
         assert policies(url) == ["browser_logins_select", "browser_url_policies_select"]

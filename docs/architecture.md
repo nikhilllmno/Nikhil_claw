@@ -4595,7 +4595,7 @@ the password into the page. The agent never sees them.
 
 | Part | Module | Job |
 |---|---|---|
-| Logins | `sama.browser.logins` | `BrowserLogins`: add, change, remove, and list. The table `browser_logins` (migration `0037`) keeps the name and the site. The vault entry `browser_login:<id>` keeps the user name and the password, as JSON. One transaction writes both. |
+| Logins | `sama.browser.logins` | `BrowserLogins`: add, change, remove, and list. The table `browser_logins` (migration `0038`) keeps the name and the site. The vault entry `browser_login:<id>` keeps the user name and the password, as JSON. One transaction writes both. |
 | Fill | `sama.browser.cdp` | `PlaywrightSession.fill_login`: finds the fields and fills them. The protocol `LoginFiller` of `sama.browser.target` is separate from `BrowserSession`, so a target without it (for example `my_chrome`) gives a clear error. |
 | Tool | `sama.tools.browser` | `browser_vault(action, name, username_ref, password_ref, submit, snapshot)`. |
 | API and web | `sama.api.browser`, `web/components/BrowserSettings.tsx` | The settings routes and the "Browser" card of the settings page. |
@@ -4648,7 +4648,7 @@ the password into the page. The agent never sees them.
   does not fill logins yet.
 
 **URL policy of each org.** An org admin sets two lists of hosts on the settings page
-(`browser_url_policies`, migration `0037`, one row for each org):
+(`browser_url_policies`, migration `0038`, one row for each org):
 
 - `block_hosts`: the browser never opens these hosts and their subdomains.
 - `allow_hosts`: when the list is not empty, the browser opens only these hosts and their
@@ -6191,8 +6191,8 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
-| `browser_logins` | The saved logins of the browser: `org_id`, `user_id` (null for an org login), `name` (unique for each scope, case does not matter), `site`, `created_by_user_id`. The vault entry `browser_login:<id>` has the secret (migration `0037`, Section 14.1). A member reads the org logins and their own logins. An org admin reads all. Only the control plane writes. |
-| `browser_url_policies` | The URL policy of the browser of each org: `org_id` (the key), `allow_hosts`, `block_hosts` (at most 200 each), `updated_by_user_id` (migration `0037`, Section 16.4). An org admin reads the row. Only the control plane writes. |
+| `browser_logins` | The saved logins of the browser: `org_id`, `user_id` (null for an org login), `name` (unique for each scope, case does not matter), `site`, `created_by_user_id`. The vault entry `browser_login:<id>` has the secret (migration `0038`, Section 14.1). A member reads the org logins and their own logins. An org admin reads all. Only the control plane writes. |
+| `browser_url_policies` | The URL policy of the browser of each org: `org_id` (the key), `allow_hosts`, `block_hosts` (at most 200 each), `updated_by_user_id` (migration `0038`, Section 16.4). An org admin reads the row. Only the control plane writes. |
 | `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, or `browser_contexts` since migration `0036`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
