@@ -1,6 +1,6 @@
 // M7.3: custom tools. On the Tools page an owner adds an HTTP request tool (a public echo API)
 // and a Python script tool, runs the test button of each, and the agent calls each in a chat
-// (through tool_search). A member's write to an org tool only proposes a version.
+// (through tool_search). A member cannot make a shared (workspace or org) tool.
 
 import type { Page } from "@playwright/test";
 import { SamaApi } from "../lib/api.ts";
@@ -106,30 +106,26 @@ test("a Python script tool: add, test, and use in a chat", async ({ ownerPage: p
   await chatCalls(page, ownerApi, `custom_${name}`, other.toLowerCase(), other);
 });
 
-test("a member's org tool waits for an admin", async ({ memberApi, world }) => {
+test("a member cannot make a shared tool", async ({ memberApi, world }) => {
+  // Shared tools are for admins only (PR 97): a member makes only tools for themselves.
   const joined = (await memberApi.me()).orgs.some((o) => o.id === world.org.id);
   test.skip(!joined, "The member joins the org in 06-members.");
-  const answer = await memberApi.call<{ id?: string; current_version?: number | null; pending?: number }>(
-    `/workspaces/${world.org.workspaceId}/custom-tools`,
-    {
+  for (const scope of ["workspace", "org"]) {
+    const answer = await memberApi.call(`/workspaces/${world.org.workspaceId}/custom-tools`, {
       method: "POST",
       body: {
         name: `e2e_member_${marker("m").toLowerCase()}`,
-        scope: "org",
+        scope,
         kind: "script",
-        description: "A proposal of a member.",
+        description: "A shared tool of a member.",
         input_schema: { type: "object", properties: {} },
         policy: "allow",
         script: { language: "python", code: "print(1)", timeout_s: 30 },
       },
       allow: [403],
-    },
-  );
-  if (answer.status === 403) return;
-  // The write is a proposal: no version runs until an admin approves it.
-  expect(answer.data.current_version ?? null).toBeNull();
-  expect(answer.data.pending ?? 0).toBeGreaterThan(0);
-  if (answer.data.id) made.push(answer.data.id);
+    });
+    expect(answer.status, scope).toBe(403);
+  }
 });
 
 test.afterAll(async ({ world, tokenCache }) => {

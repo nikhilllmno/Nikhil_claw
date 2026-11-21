@@ -51,7 +51,8 @@ test("x_search searches recent posts on X", async ({ ownerPage: page, ownerApi }
     word,
     /x_search$/,
   );
-  expect(uses[0]!.output.length).toBeGreaterThan(0);
+  // The staging X account has no credits: the tool must say so cleanly, not fail.
+  expect(uses[0]!.output).toMatch(/credit|post/i);
 });
 
 test("video_analyze reads a YouTube video", async ({ ownerPage: page, ownerApi }) => {
@@ -72,6 +73,8 @@ test("a cheaper model for delegated tasks and the Mem0 memory", async ({ ownerPa
   try {
     await page.goto(`/agents/${world.org.profileId}`);
     const delegation = page.getByRole("combobox", { name: /^Model for delegated tasks/ });
+    // The models come with the options of the profile.
+    await expect.poll(async () => delegation.locator("option").count()).toBeGreaterThan(1);
     const models = await delegation.locator("option").evaluateAll((nodes) =>
       nodes.map((n) => (n as HTMLOptionElement).value).filter(Boolean),
     );
@@ -141,7 +144,11 @@ test("a workspace admin sets the settings of a skill", async ({ ownerPage: page,
     const city = form.getByRole("textbox", { name: /^default_city/ });
     await expect(city).toHaveAttribute("placeholder", "London");
     await city.fill("Kolkata");
+    const saved = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && r.url().endsWith(`/skills/${name}/settings`),
+    );
     await form.getByRole("button", { name: "Save", exact: true }).click();
+    expect((await saved).status()).toBe(200);
     const settings = await ownerApi.get<{ effective: Record<string, unknown> }>(
       `/workspaces/${world.org.workspaceId}/skills/${name}/settings`,
     );

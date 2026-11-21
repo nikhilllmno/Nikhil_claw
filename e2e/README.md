@@ -73,8 +73,9 @@ email) and confirms the address with the admin API, as the link in the email wou
 | `16-busy-modes` | A message during a run joins it (note queued, then delivered or requeued); two joined messages add to the first request, and the answer has all three words (PR 92); `/bg` and the Run in parallel button start a second run at the same time; `/stop 2` stops one of two runs (M7.1). |
 | `17-api-server` | An admin makes an API key on Admin > API keys; the official OpenAI Node SDK chats through `/v1` (also a stream that continues the session); the MCP TypeScript SDK lists the tools and sends a message through `/mcp`; a revoked key gets `401`; a member cannot make keys (M7.6). |
 | `18-subagents` | A personal sub-agent made in the console, its test run, added to the agent on the agent page, and `delegate_task(agent=...)` checked in the trace; a member cannot write an org sub-agent (M7.4). |
-| `19-custom-tools` | On the Tools page: an HTTP request tool (public echo API) and a Python script tool, each with its test button and a chat that calls it through `tool_search` (checked in the trace); a member's org tool only proposes a version (M7.3). |
+| `19-custom-tools` | On the Tools page: an HTTP request tool (public echo API) and a Python script tool, each with its test button and a chat that calls it through `tool_search` (checked in the trace); a member cannot make a workspace or org tool (`403`, PR 97) (M7.3). |
 | `20-hermes-parity` | `moa`, `x_search`, and `video_analyze` in a chat (checked in the trace); a cheaper model for delegated tasks and the Mem0 memory provider set on the agent page, with `memory_recall` finding a fact of an earlier session; the settings of a skill for the workspace (M7.5). |
+| `21-coding-mode` | Attach a public repository on the Code page, `/plan`, approve the plan, the changes as diffs, the commands, and Undo (M7.9). |
 
 Add a flow when its item lands on main. The staging web app deploys to Vercel by hand
 (`web/README.md`), not from CI. A flow of a new page fails while that deploy is behind `main`,
