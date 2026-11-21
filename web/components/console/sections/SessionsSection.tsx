@@ -313,7 +313,7 @@ function SessionRow({
           </button>
         </div>
       )}
-      {hasDirectMode(session) && !renaming ? (
+      {manage && hasDirectMode(session) && !renaming ? (
         <label className="field">
           <span className="label">Messages go to</span>
           <select

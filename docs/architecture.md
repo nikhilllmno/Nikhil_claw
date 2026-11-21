@@ -8354,7 +8354,7 @@ compaction archive (Section 6.3) and a session with a compaction child keep thei
 session with an open run cannot be archived (`409`). The audit rows are `session.renamed`,
 `session.archived`, and `session.restored`. Each session also gives `coding_agent` (`claude_code`,
 `codex`, or null; Section 15.4). The Sessions section sets it with `POST
-/sessions/{session_id}/coding-agent`, and a change from the web writes the audit row
+/sessions/{session_id}/coding-agent` for a user who can also rename the session, and a change from the web writes the audit row
 `session.coding_agent_changed` with the old and the new value.
 
 **Test of a chat app.** `POST /orgs/{org_id}/integrations/{kind}/check` (an admin with
