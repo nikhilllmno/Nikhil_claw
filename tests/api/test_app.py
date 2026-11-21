@@ -277,7 +277,8 @@ async def test_a_message_runs_and_streams(
     ids = [int(e[2] or 0) for e in run_events]
     assert ids == sorted(ids)
     assert ids[0] > start
-    assert ": ping" in stream.text
+    # The heartbeat has its own test: the 0.3 s stream can end before the first ping on a slow
+    # runner.
 
     # Last-Event-ID wins over ?after=, and a stream without a cursor starts at the end.
     resumed = await client.get(
@@ -290,6 +291,15 @@ async def test_a_message_runs_and_streams(
     assert [e for e in sse(fresh.text) if e[0] == "run_event"] == []
     bad = await client.get(f"/sessions/{s1}/events", headers={**mia(tenant), "Last-Event-ID": "x"})
     assert bad.status_code == 400
+
+
+async def test_an_open_stream_sends_the_heartbeat(stream_app: FastAPI, tenant: Tenant) -> None:
+    # The test reads the open stream until the ping comes, so the time of the ping does not
+    # matter. ``stream_app`` sends a ping every 0.05 s and lives longer than the wait.
+    s1 = tenant.ids["s1"]
+    async with open_stream(stream_app, f"/sessions/{s1}/events", mia(tenant)) as stream:
+        await async_wait_until(lambda: ": ping" in "".join(stream.chunks), what="the heartbeat")
+    assert stream.status == 200
 
 
 @pytest.mark.parametrize("run_delay_s", [0.0, 0.6])
