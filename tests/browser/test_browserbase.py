@@ -206,6 +206,7 @@ async def test_a_private_run_gets_the_persistent_context_of_its_user() -> None:
         "browserSettings": {
             "recordSession": False,
             "logSession": False,
+            "viewport": {"width": 1280, "height": 720},
             "context": {"id": "ctx-1", "persist": True},
         },
     }
@@ -300,12 +301,20 @@ async def test_recording_and_logs_are_off_unless_asked() -> None:
     api, connector, store = FakeApi(), FakeConnector(), MemoryContextStore()
     target = make_target(api, connector, store)
     await target.start(org_id="org-1", user_id=None, run_id="run-1", guard=AllowAll())
-    assert api.requests[0][2]["browserSettings"] == {"recordSession": False, "logSession": False}
+    assert api.requests[0][2]["browserSettings"] == {
+        "recordSession": False,
+        "logSession": False,
+        "viewport": {"width": 1280, "height": 720},
+    }
     await target.aclose()
     api, connector = FakeApi(), FakeConnector()
     target = make_target(api, connector, store, record=True)
     await target.start(org_id="org-1", user_id=None, run_id="run-2", guard=AllowAll())
-    assert api.requests[0][2]["browserSettings"] == {"recordSession": True, "logSession": True}
+    assert api.requests[0][2]["browserSettings"] == {
+        "recordSession": True,
+        "logSession": True,
+        "viewport": {"width": 1280, "height": 720},
+    }
     await target.aclose()
 
 
