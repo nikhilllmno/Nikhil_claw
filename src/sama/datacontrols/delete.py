@@ -15,6 +15,8 @@ The control plane deletes as the table owner, in one transaction for each delete
 - The delete writes the cleanups outside Postgres to ``data_purges`` in the same transaction:
   the sandboxes of the deleted sessions and the Langfuse traces of the deleted runs. A trace
   purge waits ``TRACE_DELAY``, so a trace that the exporter sends now is in Langfuse first.
+  A user delete and an org delete also write the Browserbase contexts of the deleted users
+  (``browser_contexts``), so the cookies and logins at Browserbase go too.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from sama.db.models import (
     Membership,
     Org,
     OrgInvite,
+    PersistentBrowserContext,
     Run,
     Session,
     Task,
@@ -284,6 +287,7 @@ async def write_purges(
     sessions: Sequence[uuid.UUID] = (),
     all_sandboxes: bool = False,
     trace_ids: Sequence[str] = (),
+    browser_contexts: Sequence[str] = (),
 ) -> None:
     """Writes the cleanups outside Postgres for the purge worker."""
     rows: list[dict[str, Any]] = []
@@ -294,6 +298,19 @@ async def write_purges(
         rows.append({"org_id": org_id, "kind": "sandboxes", "refs": refs})
     if rows:
         await connection.execute(insert(DataPurge), rows)
+    contexts = sorted(set(browser_contexts))
+    if contexts:
+        await connection.execute(
+            insert(DataPurge),
+            [
+                {
+                    "org_id": org_id,
+                    "kind": "browser_contexts",
+                    "refs": {"context_ids": contexts[start : start + MAX_DELETE_IDS]},
+                }
+                for start in range(0, len(contexts), MAX_DELETE_IDS)
+            ],
+        )
     ids = sorted(set(trace_ids))
     if ids:
         await connection.execute(
@@ -307,6 +324,19 @@ async def write_purges(
                 for start in range(0, len(ids), MAX_DELETE_IDS)
             ],
         )
+
+
+async def browser_contexts(
+    connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID | None = None
+) -> list[str]:
+    """The provider context ids of a user, or of every user of the org. Only the ``cloud``
+    target keeps a context at a provider."""
+    query = select(PersistentBrowserContext.provider_context_id).where(
+        PersistentBrowserContext.org_id == org_id, PersistentBrowserContext.target == "cloud"
+    )
+    if user_id is not None:
+        query = query.where(PersistentBrowserContext.user_id == user_id)
+    return list((await connection.execute(query)).scalars())
 
 
 async def owner_ids(
@@ -474,6 +504,13 @@ async def delete_user(
             ),
         )
     )
+    # The rows of ``browser_contexts`` cascade from the user. The contexts at Browserbase go
+    # through the purge worker.
+    await write_purges(
+        connection,
+        org_id,
+        browser_contexts=await browser_contexts(connection, org_id, user_id),
+    )
     await null_refs(connection, org_id, "users", [user_id])
     await connection.execute(delete(User).where(User.org_id == org_id, User.id == user_id))
     await connection.execute(
@@ -521,7 +558,13 @@ async def delete_org(connection: AsyncConnection, org_id: uuid.UUID) -> Removed:
     )
     removed.runs = len(runs)
     removed.trace_ids = [run.id.hex for run in runs if run.trace_exported_at is not None]
-    await write_purges(connection, org_id, all_sandboxes=True, trace_ids=removed.trace_ids)
+    await write_purges(
+        connection,
+        org_id,
+        all_sandboxes=True,
+        trace_ids=removed.trace_ids,
+        browser_contexts=await browser_contexts(connection, org_id),
+    )
     await connection.execute(text("SET LOCAL sama.audit_purge = 'on'"))
     await connection.execute(delete(Org).where(Org.id == org_id))
     return removed

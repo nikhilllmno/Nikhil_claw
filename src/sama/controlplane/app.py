@@ -33,6 +33,10 @@ from starlette.routing import Mount
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.api.auth import issuer, jwks_url
+from sama.browser.browserbase import BrowserbaseTarget
+from sama.browser.contexts import PostgresContextStore
+from sama.browser.guard import UrlGuard
+from sama.browser.service import BrowserService
 from sama.connectors.database import DatabaseGateway
 from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
@@ -251,6 +255,9 @@ def build(
     # One outbound client for ``web_extract`` and ``@url`` references: the same address rules
     # apply to both (Section 6.3). The tool server closes it.
     outbound = OutboundClient()
+    # The cloud browser (Section 14.1). The worker closes the browser session of a run when the
+    # run ends.
+    browser = _browser_service(settings, engine)
     worker = Worker(
         queue,
         registry,
@@ -269,6 +276,7 @@ def build(
             session_sandbox=sandboxed.session_sandbox if sandboxed else None,
         ),
         poll_s=worker_poll_s,
+        on_run_end=[browser.end_run] if browser is not None else [],
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
     # index alone (Section 7.1).
@@ -383,6 +391,7 @@ def build(
         tasks=TaskTools(engine),
         jobs=jobs,
         workflows=workflows,
+        browser=browser,
     )
     proxy = ModelProxy(
         signer=signer,
@@ -581,6 +590,18 @@ def build(
     return plane
 
 
+def _browser_service(settings: ControlPlaneSettings, engine: AsyncEngine) -> BrowserService | None:
+    """The cloud browser of Section 14.1, or ``None`` without a Browserbase key and project."""
+    if settings.browserbase_key is None or not settings.browserbase_project_id:
+        return None
+    target = BrowserbaseTarget(
+        api_key=settings.browserbase_key,
+        project_id=settings.browserbase_project_id,
+        contexts=PostgresContextStore(engine),
+    )
+    return BrowserService(target, UrlGuard())
+
+
 async def _close_sandboxes(sandboxed: SandboxedRuntime) -> None:
     try:
         async with asyncio.timeout(SANDBOX_CLOSE_S):
@@ -640,8 +661,8 @@ def _monitor(
     sandboxes: SandboxBackend | None = None,
 ) -> list[_Loop]:
     """The trace export and the error rate alerts of Section 18, when they are set, and the
-    purge worker of Section 17.4. The purge worker deletes the Langfuse traces and kills the
-    sandboxes of deleted data."""
+    purge worker of Section 17.4. The purge worker deletes the Langfuse traces, kills the
+    sandboxes, and deletes the Browserbase contexts of deleted data."""
     loops: list[_Loop] = []
     langfuse: LangfuseClient | None = None
     if settings.langfuse is not None:
@@ -664,6 +685,17 @@ def _monitor(
         slack = SlackWebhook(settings.slack_webhook_url)
         stack.push_async_callback(slack.aclose)
         loops.append(ErrorRateAlerter(engine, slack, environment=settings.environment))
-    if langfuse is not None or sandboxes is not None:
-        loops.append(PurgeWorker(engine, sandboxes=sandboxes, traces=langfuse))
+    browser: BrowserbaseTarget | None = None
+    if settings.browserbase_key is not None and settings.browserbase_project_id:
+        # Only for the purge: it deletes the Browserbase contexts of deleted users.
+        browser = BrowserbaseTarget(
+            api_key=settings.browserbase_key,
+            project_id=settings.browserbase_project_id,
+            contexts=PostgresContextStore(engine),
+        )
+        stack.push_async_callback(browser.aclose)
+    if langfuse is not None or sandboxes is not None or browser is not None:
+        loops.append(
+            PurgeWorker(engine, sandboxes=sandboxes, traces=langfuse, browser_contexts=browser)
+        )
     return loops

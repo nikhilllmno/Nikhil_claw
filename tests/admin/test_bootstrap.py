@@ -73,6 +73,7 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
             "cron",
             "code_exec",
             "workflows",
+            "browser",
         ],
         list(DEFAULT_GROUP_TOOLSETS),
     )

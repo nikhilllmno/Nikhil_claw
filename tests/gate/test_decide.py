@@ -825,3 +825,42 @@ def test_a_session_without_a_snapshot_uses_the_live_rules() -> None:
     assert frozen_toolsets(["core", "web"], {"toolsets": ["core"]}, "toolsets") == ["core"]
     assert frozen_toolsets(["core"], {"toolsets": ["core", "web"]}, "toolsets") == ["core"]
     assert frozen_toolsets(["core"], {"toolsets": ["web"]}, "group_toolsets") == ["core"]
+
+
+# -- browser (M5.1) ---------------------------------------------------------------------------
+
+BROWSER_READS = ("browser_open", "browser_snapshot", "browser_screenshot", "browser_extract")
+
+
+@pytest.mark.parametrize("tool", [*BROWSER_READS, "browser_tabs"])
+def test_the_browser_tools_need_the_browser_toolset_and_are_allowed(tool: str) -> None:
+    name = f"mcp__sama__{tool}"
+    without = decide(context(), name, {})
+    assert (without.action, without.step) == ("deny", GateStep.TOOLSET)
+    allowed = decide(context(toolsets=frozenset({"browser"})), name, {})
+    assert allowed.action == "allow"
+
+
+def test_browser_act_asks_by_default_and_a_rule_can_allow_it() -> None:
+    name = "mcp__sama__browser_act"
+    verdict = decide(context(toolsets=frozenset({"browser"})), name, {"action": "click"})
+    assert verdict.action == "ask"
+    allowed = decide(
+        context(toolsets=frozenset({"browser"}), rules=(rule("browser_act", "allow"),)),
+        name,
+        {"action": "click"},
+    )
+    assert allowed.action == "allow"
+
+
+def test_the_browser_toolset_is_for_private_runs_only() -> None:
+    assert "browser" in DEFAULT_TOOLSETS
+    assert "browser" not in DEFAULT_GROUP_TOOLSETS
+    assert "browser" in CHILD_BLOCKED_TOOLSETS
+    assert TOOLSETS["browser"] == frozenset({*BROWSER_READS, "browser_tabs", "browser_act"})
+    child = effective_toolsets(
+        DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="private", lineage="delegation"
+    )
+    assert "browser" not in child
+    shared = effective_toolsets(DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="shared")
+    assert "browser" not in shared

@@ -145,6 +145,8 @@ SAFE_TOOLSETS: Final = ("web", "media", "clarify")
 INTEGRATION_KINDS: Final = ("telegram", "slack")
 """The chat apps that an org can connect (docs/architecture.md, Section 11.6)."""
 INTEGRATION_STATUSES: Final = ("pending", "active", "failed")
+BROWSER_TARGETS: Final = ("cloud", "my_chrome")
+"""The browser targets (Section 14.1): Browserbase now, the Chrome extension in M5.5."""
 GITHUB_ACCOUNT_TYPES: Final = ("User", "Organization", "Enterprise")
 """The GitHub account types that can install the sama GitHub App (Section 15.1)."""
 SKILL_SCOPES: Final = ("org", "workspace", "user")
@@ -246,7 +248,7 @@ class Base(DeclarativeBase):
 
 MAX_RETENTION_DAYS: Final = 3650
 """The upper limit of ``orgs.retention_days`` (docs/architecture.md, Section 17.4)."""
-PURGE_KINDS: Final = ("sandboxes", "traces")
+PURGE_KINDS: Final = ("sandboxes", "traces", "browser_contexts")
 
 
 class Org(Base):
@@ -2693,9 +2695,39 @@ class DataPurge(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     refs: Mapped[dict[str, Any]] = _json()
     """``sandboxes``: ``{"session_ids": [...]}`` or ``{"all": true}``. ``traces``:
-    ``{"trace_ids": [...]}``."""
+    ``{"trace_ids": [...]}``. ``browser_contexts``: ``{"context_ids": [...]}`` (Browserbase
+    context ids, M5.1)."""
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     next_attempt_at: Mapped[datetime] = _created_at()
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PersistentBrowserContext(Base):
+    """The persistent browser context of one user for one browser target (docs/architecture.md,
+    Section 14.1). ``provider_context_id`` is the id of the context at the provider, for
+    example a Browserbase context. The provider keeps the cookies: the row has no secret. A
+    member reads only their own rows. Only the control plane writes the table."""
+
+    __tablename__ = "browser_contexts"
+    __table_args__ = (
+        UniqueConstraint("org_id", "user_id", "target"),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        CheckConstraint(_one_of("target", BROWSER_TARGETS), name="target"),
+        CheckConstraint(
+            "char_length(provider_context_id) BETWEEN 1 AND 200", name="provider_context_id_length"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_context_id: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    last_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

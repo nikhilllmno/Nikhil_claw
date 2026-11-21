@@ -80,6 +80,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workflow_instances": {"workflow-instance:alice"},
         "workflow_steps": {"workflow-step:alice"},
         "workflow_receipts": {"workflow-receipt:alice"},
+        "browser_contexts": {"browser:alice"},
     },
     "carol": {
         "orgs": {"org-a"},
@@ -110,6 +111,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workflow_instances": set(),
         "workflow_steps": set(),
         "workflow_receipts": set(),
+        "browser_contexts": set(),
     },
     "dave": {
         "orgs": {"org-a"},
@@ -140,6 +142,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workflow_instances": set(),
         "workflow_steps": set(),
         "workflow_receipts": set(),
+        "browser_contexts": set(),
     },
     "bob": {
         "orgs": {"org-b"},
@@ -170,6 +173,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workflow_instances": {"workflow-instance:bob"},
         "workflow_steps": {"workflow-step:bob"},
         "workflow_receipts": {"workflow-receipt:bob"},
+        "browser_contexts": {"browser:bob"},
     },
     "stranger": {
         "orgs": set(),
@@ -200,6 +204,7 @@ VISIBLE: dict[str, dict[str, set[str]]] = {
         "workflow_instances": set(),
         "workflow_steps": set(),
         "workflow_receipts": set(),
+        "browser_contexts": set(),
     },
 }
 # Org rules for every member; a personal rule for its user and the admins.

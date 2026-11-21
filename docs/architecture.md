@@ -2181,7 +2181,7 @@ Pin and unpin of an archived skill fail: restore it first. Each action writes th
 | `tasks` | `task_create`, `task_list`, `task_complete`, `task_block`, `task_comment` (since M4.7, Section 12.4) | Sama MCP |
 | `cron` | `cronjob_manage` (preview, create, list, get, update, pause, resume, remove, run, cancel; since M4.2, Section 12.1). Migration `0026` adds `cron` to a profile that has the old default toolsets. | Sama MCP |
 | `workflows` | `workflow_manage`, `workflow_run` | Sama MCP |
-| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs`, `browser_vault` (Section 14) | Sama MCP to Browserbase or the extension |
+| `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Later: `browser_vault` (M5.3), `browser_task` (M5.6). `browser_act` is `ask` by default. | Sama MCP to Browserbase (`cloud`). Later also the extension (`my_chrome`, M5.5). |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `transcribe` | Sama MCP |
 | `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
@@ -2199,13 +2199,14 @@ A profile also has a **group set**: the toolsets that a chat run in a shared ses
 default profile of the first org has `tool_search` since migration `0018` (M2.6), `subagents`
 since migration `0019` (M2.7), `connections` and `integrations` since migration `0022` (M3.4),
 `delegation` and `tasks` since migration `0023` (M4.6, M4.7), `cron` since migration `0026`
-(M4.2), `code_exec` since migration `0027` (M4.8), and `workflows` since migration `0029`
-(M4.5). The default group set has no
+(M4.2), `code_exec` since migration `0027` (M4.8), `workflows` since migration `0029`
+(M4.5), and `browser` since migration `0036` (M5.1). The default group set has no
 `subagents`, `delegation`, `connections`, or `integrations`. It has `tasks` because the run of
 a shared card is a run in a shared session, and that run ends its card with `task_complete`.
-Migrations `0022`, `0023`, `0026`, `0027`, and `0029` change only the lists that are equal to
-the old defaults.
-Sub-agents (Section 13.1) do not get `connections` or `integrations`.
+Migrations `0022`, `0023`, `0026`, `0027`, `0029`, and `0031` change only the lists that are
+equal to the old defaults.
+Sub-agents (Section 13.1) do not get `connections` or `integrations`. A child run of
+`delegate_task` (Section 13.2) does not get `browser`.
 
 ### 10.2.1 Code execution (M4.8)
 
@@ -4470,7 +4471,7 @@ limits of the user and the org.
 | `cloud` (default) | Browserbase session controlled with Playwright over CDP from the sama MCP server | Unattended work, research, forms, scraping. Each user has a Browserbase context, so logins persist. |
 | `my_chrome` | The sama Chrome extension in the user's own browser | Sites where the user is logged in, and tasks where the user wants to watch. Needs the extension to be online. |
 
-Tools:
+Tools (the plan; M5.1 has the first six, see "Cloud browser (M5.1)" below):
 
 - `browser_open(url, target)` and `browser_tabs` manage tabs.
 - `browser_snapshot` returns an accessibility-tree snapshot with element refs (`e12`), not raw
@@ -4485,6 +4486,100 @@ Tools:
   password.
 - Optional `browser_task(goal)` hands a whole goal to a browser sub-agent (for example the
   `browser-use` library on the cloud target) and returns the result.
+
+#### Cloud browser (M5.1)
+
+The package `sama.browser` has the browser. The sama MCP tool server (Section 16.7) has the
+tools when the control plane has `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID`
+(Section 19.2). Without them, the server does not list the browser tools.
+
+**Layers.**
+
+| Part | Module | Job |
+|---|---|---|
+| Target | `sama.browser.target` | The `BrowserTarget` and `BrowserSession` protocols. One target for each name: `cloud` now, `my_chrome` in M5.5. The tools do not know the target. |
+| Cloud target | `sama.browser.browserbase` | Creates a Browserbase session with the REST API and connects Playwright to it over CDP. The process has no browser binaries. |
+| CDP session | `sama.browser.cdp` | `PlaywrightSession`: snapshots, actions, tabs, dialogs, screenshots, and extracts on a Playwright browser. The `my_chrome` target can use other code with the same protocol. |
+| Contexts | `sama.browser.contexts` | The table `browser_contexts` (migration `0036`): one provider context for each org, user, and target. |
+| Guard | `sama.browser.guard` | The outbound URL policy for navigation (Section 16.4). |
+| Service | `sama.browser.service` | `BrowserService`: one session for each run, limits, idle close, and the text for the agent. |
+
+**Sessions.** The first browser tool of a run starts a session, and the other calls of the run
+use it. One call at a time uses a session. The service closes the session:
+
+- when the run ends (the run-end hook of the worker calls `end_run`),
+- when the session is idle for 10 minutes (a reaper checks every 30 seconds),
+- when the process stops.
+
+The Browserbase session also has a `timeout` of 15 minutes. This is the hard limit when sama
+does not close a session, for example when the process stops or a run waits for an approval.
+An org has at most 5 live sessions, and a process has at most 20. A start keeps its place in
+the limits before it calls Browserbase, so concurrent starts cannot pass the limits. A failed
+or cancelled start frees its place.
+
+**Persistent context.** A run of a user in a private session uses the Browserbase context of
+that user, with `persist: true`. Browserbase keeps the cookies and the local storage when the
+session ends, so logins stay from run to run. The table `browser_contexts` keeps only the
+context id, not a secret. When two runs of a user make a context at the same time, the first
+row wins, and the service deletes the other context. When Browserbase does not know a stored
+context, the service forgets it and makes a new one. A run in a shared session gets a new
+context that is not kept. A user export has the rows of the user in `browser_contexts`. A user
+or org delete deletes the rows and, through the purge worker, the contexts at Browserbase
+(Section 17.4).
+
+Browserbase says that two sessions must not write one context at the same time, and that the
+context needs some seconds to save after a session closes. So a process gives each context to
+one writer at a time:
+
+- The first run of a user gets the context with `persist: true`.
+- A second run of the same user at the same time gets the context with `persist: false`. It
+  reads the saved logins but does not save. Its first result has the note "another run of
+  this user uses the browser profile now, so the logins and cookies of this run are not kept".
+- When the writer closes, the next writer waits until 10 seconds after that close.
+- When Browserbase does not confirm the release of a writer, that session can live until its
+  hard timeout. Until then, a new run reads the context with `persist: false` and the same
+  note, and does not wait.
+- A failed or cancelled start ends its Browserbase session first, and then frees the context.
+  When the start is cancelled while Browserbase makes the session, a background task waits
+  for the answer and ends that session.
+- When a session closes, it stops taking paused requests, and it cancels and waits for the
+  checks that run.
+
+This coordination is for each process. Two processes can write one context, and then the last
+save wins.
+
+**Tools.**
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `browser_open` | `url`, `snapshot` | Opens the URL in the active tab and returns a snapshot. A URL without a scheme gets `https://`. Only `http` and `https` are allowed. |
+| `browser_snapshot` | none | The accessibility tree of the active tab, in YAML, with `[ref=eN]` on the elements that an action can use. A new snapshot makes the old refs invalid. |
+| `browser_act` | `action`, `ref`, `text`, `values`, `submit`, `target_ref`, `direction`, `amount`, `seconds`, `accept`, `prompt_text`, `snapshot` | `click`, `type`, `select`, `hover`, `drag` (these need a `ref`), `scroll`, `press`, `wait` (at most 10 s), `back`, `forward`, `reload`, `dialog`. Returns a new snapshot. After `click`, `press`, and `type` with `submit`, the session waits 0.5 s so that a popup or a navigation can start. |
+| `browser_screenshot` | `full_page` | A JPEG image of the active tab (a full page is at most 6,000 px high) and a caption. |
+| `browser_extract` | `kind`, `ref`, `fields` | `text` (at most 100,000 characters), `links` (at most 500), `tables` (at most 20, 200 rows each), or `fields` (the text of the elements with the given refs, as JSON). It does not call a model. |
+| `browser_tabs` | `action`, `index`, `url` | `list`, `new`, `select`, `close`. At most 10 tabs. A tab that the page opens (a popup) becomes the active tab. |
+
+All results except the image are text. Page text, titles, and URLs come from the web, so they
+are in an `<untrusted_content source="browser" url="...">` block (Section 16.5). The notes of
+sama (a blocked navigation, a new tab, an open dialog) are outside the block, and they are
+fixed text. An error message of sama is fixed text too. When the error has text from the page
+or from the browser (for example the message of a dialog or a Playwright error), that text is
+in a separate untrusted block after the message. A page cannot close the block early.
+
+**Dialogs.** When an action opens a JavaScript dialog (`alert`, `confirm`, `prompt`), the
+action returns at once with a note. The agent answers with `browser_act(action="dialog",
+accept=..., prompt_text=...)`. Then the first action finishes.
+
+**Gate.** The toolset is `browser` (Section 10.2). `browser_act` is `ask` by default, and the
+other browser tools are `allow`. A child run of `delegate_task` and a run in a shared session
+do not get the toolset.
+
+**URL policy.** Every navigation goes through the outbound URL policy of Section 16.4. See
+Section 16.4 for the limits.
+
+**Later items.** M5.2 adds coordinates and vision mode to `browser_act`. M5.3 adds the vault
+and the URL policy for each org. M5.5 adds the `my_chrome` target. M5.6 adds `browser_task`.
+The Browserbase key is a setting of the process. A key for each org comes later.
 
 ### 14.2 Chrome extension
 
@@ -5493,6 +5588,30 @@ policy for all of them:
   most 3 redirects, each checked, because it has no credential.
 - **Connector hosts (M4.11).** A stdio MCP server does not use the outbound client. It runs in
   its own E2B sandbox, and the E2B egress allowlist of the host limits it (Section 10.5).
+- **Browser (M5.1).** The browser runs in Browserbase, not in sama, but it acts for the org, so
+  `sama.browser.guard.UrlGuard` applies the same address rules (`http` is allowed). The
+  service checks the URL of `browser_open` and of a new tab with DNS (`OutboundClient.check`)
+  before the browser opens it. A host that does not resolve is refused. The session opens a
+  CDP session on the whole browser (not on one page) and enables `Fetch` for every URL. Chrome
+  then pauses every request before it goes out, also each redirect hop, the requests of
+  frames in other processes, workers, and popups. Playwright routes do not see redirect hops,
+  so sama does not use them for the policy.
+  - A document request (a tab, a frame, a redirect hop of a document) gets the full check with
+    DNS. A blocked request fails with `BlockedByClient` and does not reach the host. The tab
+    goes back to the last page. A blocked `browser_open` returns an error.
+  - Every other request (images, scripts, `fetch`) gets a quick check without DNS. It refuses
+    a private or loopback IP address, `localhost`, and the metadata hosts, and schemes other
+    than `http`, `https`, `data`, and `blob`.
+  - A WebSocket of a page goes through `route_web_socket` and gets the full check with DNS. A
+    blocked handshake closes with code 1008 and does not reach the host.
+  - The check fails closed: when the check raises an error, the request fails.
+  - The blocked URLs come from the page, so the result shows them in the untrusted block, with
+    a fixed note of sama outside the block.
+  - Limits: the browser resolves the host again when it connects, so DNS rebinding is not
+    fully stopped. A subresource with a host name that resolves to a private address passes
+    the quick check. A WebSocket of a worker is not checked. Browserbase runs outside our
+    network, so it cannot reach our private addresses. The guard stops the agent from asking
+    it to try. The per-org lists come in M5.3.
 
 ### 16.5 Untrusted content
 
@@ -5644,7 +5763,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
-**Tools since M4.8 to M4.10.** The table above has the tools of M1.8 and M2. These tools came
+**Tools since M4.8.** The table above has the tools of M1.8 and M2. These tools came
 later. Each tool is hidden when its service is missing.
 
 | Tool | Section | Needs | Gate default |
@@ -5653,6 +5772,14 @@ later. Each tool is hidden when its service is missing.
 | `image_generate(prompt, size)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `text_to_speech(text, voice)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `skill_import(url, path, ref, name, scope)` | 9.6 | The skill store | `ask` |
+| `browser_open`, `browser_snapshot`, `browser_screenshot`, `browser_extract`, `browser_tabs` (M5.1) | 14.1 | A `BrowserService` (the Browserbase key and project) | `allow` |
+| `browser_act` (M5.1) | 14.1 | A `BrowserService` | `ask` |
+
+`browser_screenshot` is the only tool that returns an image: a text caption and an MCP
+`ImageContent` (JPEG, base64). The browser tools put page text in an
+`<untrusted_content source="browser">` block. A `BrowserError` (for example a stale ref or a
+blocked URL) is an expected error: the agent gets its text, and the log has no stack trace.
+The tool server closes the browser sessions when it stops.
 
 **Untrusted content.** `web_search` and `web_extract` put their results in an
 `<untrusted_content source="web">` block (Section 16.5). The tool escapes a closing tag in the
@@ -5783,7 +5910,7 @@ migrated schema.
 | `attachments` | One row for each image of a message: `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data` (`bytea`) (migration `0015`, Section 11.7) |
 | `run_steers` | The notes of `/steer`: `org_id`, `session_id`, `run_id`, `user_id`, `text` (1 to 4,000 characters), `status` (`pending`, `delivered`, `requeued`, `dropped`), `delivered_at`, `requeued_run_id` (migration `0030`, Section 4.3). A member reads the rows of the sessions that the member can see. Only the control plane writes. |
 | `session_handoffs` | One row for each `/handoff`: `org_id`, `workspace_id`, `session_id`, `user_id`, `from_channel`, `from_key`, `to_channel`, `to_key`, `run_ids` (migration `0030`, Section 11.1). Same read rule as `run_steers`. |
-| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes` or `traces`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
+| `data_purges` | The cleanups outside Postgres after a delete: `org_id` (no foreign key, so the row stays after an org delete), `kind` (`sandboxes`, `traces`, or `browser_contexts` since migration `0036`), `refs`, `attempts`, `next_attempt_at`, `last_error`, `done_at` (migration `0035`, Section 17.4). An org owner or admin reads the rows of the org. Only the control plane writes. |
 
 Rules:
 
@@ -6065,6 +6192,9 @@ log of the org, so the control plane logs it instead.
   trace ids in one row). A trace row waits one hour
   first: the exporter marks a run as sent before it sends the trace, and Langfuse stores a
   trace some time after it gets it.
+- A user delete and an org delete also write a `browser_contexts` row with the Browserbase
+  context ids of the deleted users (Section 14.1, at most 1,000 ids in one row). The rows of
+  the table `browser_contexts` cascade from the user.
 - The Supabase Auth user is not deleted. A person can be a user in more than one org.
 
 **Purge worker.** `PurgeWorker` runs in the monitor of each control plane. It claims rows
@@ -6075,9 +6205,12 @@ with `FOR UPDATE SKIP LOCKED` and a lease of 5 minutes.
   pass.
 - `traces`: it calls `DELETE /api/public/traces` of Langfuse with the trace ids. Langfuse
   deletes them later.
+- `browser_contexts`: it calls `DELETE /v1/contexts/{id}` of Browserbase for each id, so the
+  cookies and logins of the user go. A context that Browserbase does not know counts as
+  deleted.
 - A failure waits 30 seconds times 2 to the power of the attempts, at most 6 hours. The row
   keeps the error type only. A full page waits 30 seconds. The worker forgets done rows after 30 days.
-- A kind without a backend (no E2B key or no Langfuse key) stays open.
+- A kind without a backend (no E2B key, no Langfuse key, or no Browserbase key) stays open.
 
 **Retention.** `orgs.retention_days` is the setting of the org. Null means the default of
 the plan. `PLAN_RETENTION` in `retention.py` is the seam for the plans of M6.6: each plan can
@@ -6302,6 +6435,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_VAULT_KEY` | No | The vault key, 32 bytes in base64 (Section 16.3). Without it, the vault and the integrations (Section 11.6) are off, and only the environment keys work. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | No | The provider keys of the model proxy. `OPENAI_API_KEY` is also the default key of the embed worker (Section 7.1). |
 | `BRAVE_API_KEY` | No | `web_search` |
+| `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | No | The cloud browser (Section 14.1). With both, the tool server has the browser tools. The key is a setting of the process; it is not in the vault yet. |
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
 | `SAMA_COMPOSIO_WEBHOOK_SECRET` | No | The signing secret of the Composio webhook subscription of the sama project (Section 12.2). An org secret in the vault (`composio_webhook_secret`) comes first. Without both, sama refuses Composio events. |
 | `SAMA_CONNECTORS_DIR` | No | The folder of the connector catalog. The image sets `/opt/sama/connectors/catalog`. |

@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sama.browser.target import BrowserError
 from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
 from sama.delegation import DelegationError, DelegationService
@@ -111,6 +112,7 @@ from sama.tasks.runs import TaskTools
 from sama.tasks.service import TaskError
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
 from sama.tools.board import register_delegation, register_tasks
+from sama.tools.browser import register_browser
 from sama.tools.clarify import (
     MAX_QUESTIONS,
     ClarifyBroker,
@@ -170,6 +172,7 @@ from sama.workflows.service import WorkflowService
 from sama.workflows.spec import WorkflowError
 
 if TYPE_CHECKING:
+    from sama.browser.service import BrowserService
     from sama.connectors.service import ConnectionService
     from sama.skills.importer import SkillImporter
 
@@ -207,6 +210,7 @@ MAX_ERROR_CHARS: Final = 2_000
 """An error result is cut to this length. Argument errors of the SDK can be long."""
 
 _EXPECTED = (
+    BrowserError,
     ClarifyError,
     ConnectorError,
     JobError,
@@ -388,6 +392,8 @@ class ToolServer:
     - ``delegation``: child agents (``delegate_task``, ``delegate_status``). Without it,
       these tools are hidden.
     - ``tasks``: the task board (``task_*``). Without it, these tools are hidden.
+    - ``browser``: the cloud browser (``browser_*``, Section 14.1). Without it, these tools
+      are hidden.
     - ``gate``: the tool gate. With it, the server answers ``POST /gate`` for the runner, and
       it refuses each tool call that the gate denies. Without it, ``/gate`` answers ``503``
       and the runner denies every call.
@@ -424,8 +430,10 @@ class ToolServer:
         importer: SkillImporter | None = None,
         steers: SteerBackend | None = None,
         sama_pr: SamaPr | None = None,
+        browser: BrowserService | None = None,
     ) -> None:
         self.signer = signer
+        self.browser = browser
         self.importer = importer
         self.code = code
         self.images = images
@@ -458,7 +466,7 @@ class ToolServer:
 
     async def aclose(self) -> None:
         await self.outbound.aclose()
-        for service in (self.vision, self.images, self.speech, self.importer):
+        for service in (self.vision, self.images, self.speech, self.importer, self.browser):
             if service is not None:
                 await service.aclose()
         close = getattr(self.search, "aclose", None)
@@ -1042,6 +1050,8 @@ class ToolServer:
             self._cron_tool(server, self.jobs)
         if self.workflows is not None:
             register_workflows(server, self._call, self.workflows)
+        if self.browser is not None:
+            register_browser(server, self._call, self.browser)
         if self.importer is not None:
             importer = self.importer
 
