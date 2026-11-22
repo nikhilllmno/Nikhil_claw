@@ -17,6 +17,7 @@ import {
   type SteerNote,
 } from "@/lib/api";
 import {
+  applyActivity,
   applyStreamEvent,
   BG_USAGE,
   type Effect,
@@ -30,6 +31,8 @@ import {
   noteLabel,
   openRunIds,
   parseCommand,
+  phaseLabel,
+  STARTERS,
   QUEUED_NOTICE,
   runNumbers,
   ROLLBACK_USAGE,
@@ -48,15 +51,19 @@ import {
   proposedPlan,
 } from "@/lib/coding";
 import { saveFile } from "@/lib/history";
+import { elapsedText, latestTodos } from "@/lib/toolView";
 import { runEventStream } from "@/lib/stream";
 import { runHasEnded } from "@/lib/subagentProgress";
 import { ApprovalCard } from "./ApprovalCard";
 import { useApi } from "./AuthProvider";
 import { Composer } from "./Composer";
 import { useData } from "./DataProvider";
+import { useNow } from "./usePolled";
+import { escapeTarget } from "@/lib/approvalKeys";
 import { Markdown } from "./Markdown";
 import { QuestionCard } from "./QuestionCard";
-import { ToolGroup } from "./ToolGroup";
+import { PlanCard } from "./PlanPanel";
+import { LiveRun, TodoList, ToolTrail } from "./ToolGroup";
 import { ConnectCard } from "./ConnectCard";
 import { cardsOfCalls } from "@/lib/connectCard";
 import { ErrorState, LoadingState } from "./ui";
@@ -69,6 +76,7 @@ const NOTE_POLL_MS = 2_000;
 export function Chat({ sessionId }: { sessionId: string }) {
   const api = useApi();
   const { me, setWorkspaceId, reloadSessions } = useData();
+  const now = useNow();
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
@@ -86,6 +94,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   });
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  // A message that is on its way to the API: it shows at once (optimistic).
+  const [pending, setPending] = useState<{ text: string; at: number } | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   /** The last send failed on a model quota of the plan (HTTP 402). */
   const [quotaError, setQuotaError] = useState(false);
@@ -100,9 +110,19 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
+  // When this view first saw each open run, for the time on the working line.
+  const [openedSince, setOpenedSince] = useState<Record<string, number>>({});
   const setLiveState = useCallback((next: LiveState) => {
     liveRef.current = next;
     setLive(next);
+    const ids = openRunIds(next);
+    setOpenedSince((before) => {
+      const added = ids.filter((id) => before[id] === undefined);
+      const gone = Object.keys(before).some((id) => !ids.includes(id));
+      if (added.length === 0 && !gone) return before;
+      const now = Date.now();
+      return Object.fromEntries(ids.map((id) => [id, before[id] ?? now]));
+    });
   }, []);
 
   const loadMessages = useCallback(async () => {
@@ -136,6 +156,17 @@ export function Chat({ sessionId }: { sessionId: string }) {
       // Same as for approvals.
     }
   }, [api, sessionId]);
+
+  // The tool calls of the runs that ended before the page opened.
+  const loadActivity = useCallback(async () => {
+    try {
+      const activity = await api.getActivity(sessionId);
+      const next = applyActivity(liveRef.current, activity.events);
+      if (next !== liveRef.current) setLiveState(next);
+    } catch {
+      // The tool trail is a help. The messages show without it.
+    }
+  }, [api, sessionId, setLiveState]);
 
   const loadPlan = useCallback(async () => {
     try {
@@ -184,6 +215,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       );
       setLiveState({ ...initialLive, runs });
       void loadMessages();
+      void loadActivity();
       void loadNotes();
       void loadPlan();
       void loadApprovals();
@@ -200,8 +232,10 @@ export function Chat({ sessionId }: { sessionId: string }) {
           if (connected && connectedBefore) void loadApprovals();
           connectedBefore ||= connected;
         },
-        onEvent: (name, data) => {
-          const result = applyStreamEvent(liveRef.current, name, data);
+        onEvent: (name, data, id) => {
+          // The event id orders the calls of all runs (for the to-do list of the session).
+          const event = name === "run_event" && id !== null && data !== null && typeof data === "object" ? { ...data, id } : data;
+          const result = applyStreamEvent(liveRef.current, name, event);
           if (result.state !== liveRef.current) setLiveState(result.state);
           run(result.effects);
         },
@@ -267,7 +301,10 @@ export function Chat({ sessionId }: { sessionId: string }) {
     const text = submitted.trim();
     if (!text) return;
     // Only the text that was sent goes: what the user typed meanwhile stays.
-    const clearDraft = () => setDraft((current) => (current === submitted ? "" : current));
+    let optimistic = false;
+    const clearDraft = () => {
+      if (!optimistic) setDraft((current) => (current === submitted ? "" : current));
+    };
     const command = parseCommand(text);
     setSendError(null);
     setQuotaError(false);
@@ -395,7 +432,19 @@ export function Chat({ sessionId }: { sessionId: string }) {
         ({ run_id: runId, queued } = await api.sendMessage(sessionId, command.task, true));
         userText = command.task;
       } else {
-        const answer = await api.sendMessage(sessionId, text, parallel);
+        // Show the message at once, as Claude Code does. The draft comes back if the send fails.
+        setPending({ text, at: new Date().getTime() });
+        setDraft((current) => (current === submitted ? "" : current));
+        // The box is clear now: what the person types while the send works must stay.
+        optimistic = true;
+        stick.current = true;
+        let answer: Awaited<ReturnType<typeof api.sendMessage>>;
+        try {
+          answer = await api.sendMessage(sessionId, text, parallel);
+        } catch (e) {
+          setDraft((current) => (current === "" ? submitted : current));
+          throw e;
+        }
         if (answer.steered) {
           // The message joined the running run (busy mode `steer`, M7.1). It shows as a note.
           clearDraft();
@@ -455,6 +504,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setSendError(message);
       setQuotaError(isQuotaError(e));
     } finally {
+      setPending(null);
       // A plan command can change the plan: show its state of now.
       if (command?.kind === "plan") void loadPlan();
       setSending(false);
@@ -487,6 +537,23 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setNotice(`Stopping run ${number}.`);
     } catch (e) {
       setSendError(errorText(e, "The run was not stopped."));
+    }
+  };
+
+  // A decision on the plan card of the chat (M7.9). The new run shows in the stream.
+  const [planBusy, setPlanBusy] = useState(false);
+  const decidePlan = async (call: () => Promise<string>) => {
+    setPlanBusy(true);
+    setSendError(null);
+    try {
+      setNotice(await call());
+      stick.current = true;
+    } catch (e) {
+      setSendError(errorText(e, "The plan decision was not saved."));
+    } finally {
+      setPlanBusy(false);
+      void loadPlan();
+      void loadMessages();
     }
   };
 
@@ -524,13 +591,18 @@ export function Chat({ sessionId }: { sessionId: string }) {
       const cards = cardsOfCalls(calls);
       return (
         <Fragment key={`tools-${runId}`}>
-          <ToolGroup calls={calls} subagents={subagents} runEnded={runHasEnded(live.runs[runId]?.status)} />
+          <ToolTrail
+            calls={calls}
+            subagents={subagents}
+            runEnded={runHasEnded(live.runs[runId]?.status) || live.runs[runId] === undefined}
+          />
           {cards.map((card, index) => (
             <ConnectCard key={`connect-${runId}-${card.connectionId || index}`} card={card} />
           ))}
         </Fragment>
       );
     };
+    const open = new Set(openRunIds({ runs: live.runs }));
     for (const m of messages ?? []) {
       notesBefore(m.created_at);
       if (m.role === "assistant" && m.run_id && !shown.has(m.run_id)) {
@@ -541,8 +613,9 @@ export function Chat({ sessionId }: { sessionId: string }) {
       items.push(<MessageView key={m.id} message={m} />);
     }
     notesBefore(null);
+    // Runs that ended without a reply (stopped or failed) keep their trail. Open runs show live.
     for (const runId of new Set([...Object.keys(live.tools), ...Object.keys(live.subagents)])) {
-      if (shown.has(runId)) continue;
+      if (shown.has(runId) || open.has(runId)) continue;
       const group = progress(runId);
       if (group) items.push(group);
     }
@@ -566,10 +639,32 @@ export function Chat({ sessionId }: { sessionId: string }) {
       }))
       .sort((a, b) => (a.number ?? Number.MAX_SAFE_INTEGER) - (b.number ?? Number.MAX_SAFE_INTEGER) || a.seq - b.seq);
   }, [openRuns, live.runs, messages, serverRuns]);
-  // A run that the server list does not have yet shows no number: `/stop NUMBER` uses the server list.
-  const runNumber = new Map(
-    runRows.filter((row) => row.number !== null).map((row) => [row.id, row.number as number]),
-  );
+  const openedAt = (id: string) => openedSince[id] ?? null;
+
+  // Esc stops the open runs, as in Claude Code and Codex. An open menu or dialog takes Esc first.
+  const stopRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    stopRef.current = () => {
+      if (openRunIds(liveRef.current).length > 0 && !stopping) void stop();
+    };
+  });
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+      if (escapeTarget(event.target, scroller.current) !== "stop") {
+        // An open menu of the chat closes first.
+        const menu = document.querySelector<HTMLDetailsElement>("details[data-menu][open]");
+        if (menu) {
+          menu.open = false;
+          event.preventDefault();
+        }
+        return;
+      }
+      stopRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   if (loadError) {
     return (
@@ -587,8 +682,9 @@ export function Chat({ sessionId }: { sessionId: string }) {
 
   const org = me?.orgs.find((o) => o.id === detail.org_id) ?? null;
   const profile = org?.agent_profiles.find((p) => p.id === detail.agent_profile_id) ?? null;
-  const liveText = Object.entries(live.text).filter(([, text]) => text !== "");
-  const working = running && !paused && liveText.length === 0;
+  // The to-do list of the session (the sama `todo` tool keeps one list per session) while a run works.
+  const todos =
+    runRows.length > 0 ? latestTodos(Object.values(live.tools).flat().sort((a, b) => a.order - b.order)) : null;
 
   return (
     <div className={styles.chat}>
@@ -645,24 +741,59 @@ export function Chat({ sessionId }: { sessionId: string }) {
             </div>
           ) : null}
           {messages !== null && messages.length === 0 && !running ? (
-            <div className="state">
-              <h2>No messages yet</h2>
-              <p>Say what you want done. The agent answers here as it works.</p>
+            <div className={`state ${styles.empty}`}>
+              <h2>What should the agent do?</h2>
+              <p>Say what you want done. The agent answers here as it works. Type / for the commands.</p>
+              <div className={styles.starters}>
+                {STARTERS.map((starter) => (
+                  <button
+                    key={starter.label}
+                    type="button"
+                    className="btn btn-small"
+                    onClick={() => {
+                      setDraft(starter.text);
+                      document.getElementById("message")?.focus();
+                    }}
+                  >
+                    {starter.label}
+                  </button>
+                ))}
+              </div>
             </div>
           ) : null}
           {timeline}
-          {liveText.map(([runId, text]) => (
-            <article
-              key={`live-${runId}`}
-              className={styles.assistant}
-              aria-label={runRows.length > 1 ? `Assistant, writing in run ${runNumber.get(runId) ?? ""}` : "Assistant, writing"}
-            >
-              {runRows.length > 1 && runNumber.has(runId) ? (
-                <p className={styles.runLabel}>Run {runNumber.get(runId)}</p>
-              ) : null}
-              <Markdown text={text} />
-              <span className={styles.caret} aria-hidden="true" />
-            </article>
+          {pending !== null ? (
+            <>
+              <article className={styles.user} aria-label="You, sending">
+                <p className={styles.userText}>{pending.text}</p>
+              </article>
+              {runRows.length === 0 ? <WorkingLine label="Sending" since={pending.at} paused={false} /> : null}
+            </>
+          ) : null}
+          {runRows.map((row) => (
+            <LiveRun
+              key={`live-${row.id}`}
+              segments={live.segments[row.id] ?? []}
+              calls={live.tools[row.id] ?? []}
+              subagents={live.subagents[row.id] ?? []}
+              afterCall={(call) =>
+                cardsOfCalls([call]).map((card, index) => (
+                  <ConnectCard key={`connect-${row.id}-${card.connectionId || index}`} card={card} />
+                ))
+              }
+              label={runRows.length > 1 ? (row.number === null ? "Run" : `Run ${row.number}`) : null}
+              footer={
+                <WorkingLine
+                  label={phaseLabel(
+                    row.status,
+                    live.phase[row.id],
+                    (live.segments[row.id] ?? []).length > 0 || (live.tools[row.id] ?? []).length > 0,
+                  )}
+                  since={openedAt(row.id)}
+                  paused={row.status === "paused"}
+                />
+              }
+            />
           ))}
           {Object.entries(live.stopped).map(([runId, text]) => (
             <article key={`stopped-${runId}`} className={styles.assistant} aria-label="Assistant, stopped">
@@ -670,11 +801,6 @@ export function Chat({ sessionId }: { sessionId: string }) {
               <p className={styles.stoppedNote}>Stopped. This partial reply is not saved.</p>
             </article>
           ))}
-          {working ? (
-            <p className={styles.working}>
-              <span className="spinner" aria-hidden="true" /> Working on it…
-            </p>
-          ) : null}
           {live.failure ? (
             <p className="alert alert-error" role="alert">
               {live.failure}
@@ -697,9 +823,10 @@ export function Chat({ sessionId }: { sessionId: string }) {
             </button>
           </p>
         ) : null}
-        {approvals.map((approval) => (
+        {approvals.map((approval, index) => (
           <ApprovalCard
             key={approval.id}
+            active={index === 0 && questions.length === 0}
             approval={approval}
             onDecided={() => {
               setApprovals((list) => list.filter((a) => a.id !== approval.id));
@@ -718,11 +845,22 @@ export function Chat({ sessionId }: { sessionId: string }) {
             }}
           />
         ))}
-        {proposedPlan(plan) !== null ? (
-          <p className={`alert alert-warning ${styles.banner}`} role="status">
-            The agent proposed plan {plan?.version}. Open the <Link href={`/s/${sessionId}/code`}>Code page</Link>{" "}
-            to approve, edit, or reject it. Or send /plan approve.
-          </p>
+        {plan !== null && proposedPlan(plan) !== null ? (
+          <div className={styles.planDock}>
+            <PlanCard
+              key={plan.id}
+              sessionId={sessionId}
+              plan={plan}
+              now={now}
+              busy={planBusy}
+              act={decidePlan}
+            />
+          </div>
+        ) : null}
+        {todos !== null && todos.length > 0 ? (
+          <div className={styles.todoDock}>
+            <TodoList items={todos} title="To-do list" />
+          </div>
         ) : null}
         {sendError ? (
           <p className={`alert alert-error ${styles.banner}`} role="alert">
@@ -779,6 +917,40 @@ export function Chat({ sessionId }: { sessionId: string }) {
         />
       </div>
     </div>
+  );
+}
+
+/**
+ * The working line of an open run, as Claude Code shows it: what the run does, the time since
+ * the view saw it start, and the key that stops it. It ticks each second on its own, so the
+ * chat does not render again.
+ */
+function WorkingLine({ label, since, paused }: { label: string; since: number | null; paused: boolean }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (paused) return;
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [paused]);
+  return (
+    <p className={styles.working}>
+      {paused ? <span className={styles.pausedDot} aria-hidden="true" /> : <span className="spinner" aria-hidden="true" />}
+      <span className={styles.workingLabel} role="status">
+        {label}…
+      </span>
+      {since !== null && !paused ? (
+        <span className={styles.workingMeta} aria-hidden="true">
+          {elapsedText(now - since)}
+        </span>
+      ) : null}
+      {paused ? (
+        <span className={styles.workingMeta}>Answer the card below</span>
+      ) : (
+        <span className={styles.workingMeta}>
+          <kbd className={styles.key}>Esc</kbd> to stop
+        </span>
+      )}
+    </p>
   );
 }
 
@@ -841,24 +1013,37 @@ function SessionTools({ sessionId }: { sessionId: string }) {
       <Link href={`/s/${sessionId}/runs`} className="btn btn-quiet btn-small">
         Runs
       </Link>
-      <button
-        type="button"
-        className="btn btn-quiet btn-small"
-        disabled={busy !== null}
-        aria-label="Export .md: the session as Markdown"
-        onClick={() => void download("markdown")}
-      >
-        {busy === "markdown" ? "Exporting" : "Export .md"}
-      </button>
-      <button
-        type="button"
-        className="btn btn-quiet btn-small"
-        disabled={busy !== null}
-        aria-label="Export .json: the session as JSON"
-        onClick={() => void download("json")}
-      >
-        {busy === "json" ? "Exporting" : "Export .json"}
-      </button>
+      <details className={styles.menu} data-menu="export">
+        <summary className="btn btn-quiet btn-small" aria-label="Export the session">
+          {busy !== null ? "Exporting…" : "Export"}
+        </summary>
+        <div className={styles.menuList}>
+          <button
+            type="button"
+            className="btn btn-quiet btn-small"
+            disabled={busy !== null}
+            aria-label="Export .md: the session as Markdown"
+            onClick={(event) => {
+              event.currentTarget.closest("details")?.removeAttribute("open");
+              void download("markdown");
+            }}
+          >
+            Markdown (.md)
+          </button>
+          <button
+            type="button"
+            className="btn btn-quiet btn-small"
+            disabled={busy !== null}
+            aria-label="Export .json: the session as JSON"
+            onClick={(event) => {
+              event.currentTarget.closest("details")?.removeAttribute("open");
+              void download("json");
+            }}
+          >
+            JSON (.json)
+          </button>
+        </div>
+      </details>
       {error ? (
         <span className={styles.toolsError} role="alert">
           {error}

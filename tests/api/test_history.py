@@ -420,3 +420,77 @@ async def test_a_shared_session_trace_is_open_to_a_workspace_member(
     assert response.status_code == 200
     outsider = bearer(await add_user(engine, tenant, workspace_member=False))
     assert (await client.get(f"/runs/{run_id}/trace", headers=outsider)).status_code == 404
+
+
+async def test_the_activity_gives_the_tool_trail_of_the_runs_of_a_session(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    first = await add_run(engine, tenant, "mine")
+    await add_trace(engine, tenant, "mine", first)
+    second = await add_run(engine, tenant, "mine")
+    keys = {"org_id": tenant.org, "session_id": tenant.ids["mine"], "run_id": second}
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(RunEvent).values(
+                seq=1,
+                type="tool_call_started",
+                payload={
+                    "call_id": "t2",
+                    "name": "Write",
+                    "arguments": {"content": "x" * 5_000, "token": FAKE_KEY},
+                },
+                **keys,
+            )
+        )
+    review = await add_run(
+        engine, tenant, "mine", kind="review", review_from_seq=1, review_to_seq=2, unattended=True
+    )
+    await add_trace(engine, tenant, "mine", review)
+    response = await client.get(f"/sessions/{tenant.ids['mine']}/activity", headers=mia(tenant))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["truncated"] is False
+    # Only the tool events of the chat runs, oldest first; no text and no review run.
+    assert [(e["run_id"], e["type"]) for e in body["events"]] == [
+        (str(first), "tool_call_started"),
+        (str(first), "tool_call_finished"),
+        (str(second), "tool_call_started"),
+    ]
+    arguments = body["events"][-1]["payload"]["arguments"]
+    assert len(arguments["content"]) == 2_001
+    assert FAKE_KEY not in json.dumps(body)
+
+
+async def test_the_activity_keeps_the_newest_events(
+    client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sama.api import app as api_app
+
+    monkeypatch.setattr(api_app, "ACTIVITY_EVENTS", 3)
+    run_id = await add_run(engine, tenant, "mine")
+    keys = {"org_id": tenant.org, "session_id": tenant.ids["mine"], "run_id": run_id}
+    async with engine.begin() as connection:
+        for seq in range(1, 6):
+            await connection.execute(
+                insert(RunEvent).values(
+                    seq=seq, type="tool_call_started", payload={"call_id": f"c{seq}"}, **keys
+                )
+            )
+    body = (
+        await client.get(f"/sessions/{tenant.ids['mine']}/activity", headers=mia(tenant))
+    ).json()
+    assert body["truncated"] is True
+    assert [e["payload"]["call_id"] for e in body["events"]] == ["c3", "c4", "c5"]
+
+
+async def test_the_activity_answers_404_for_a_session_that_the_user_cannot_read(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    zed = bearer(await add_user(engine, tenant, workspace_member=True))
+    path = f"/sessions/{tenant.ids['mine']}/activity"
+    assert (await client.get(path, headers=zed)).status_code == 404
+    shared = await client.get(f"/sessions/{tenant.ids['s1']}/activity", headers=zed)
+    assert shared.status_code == 200

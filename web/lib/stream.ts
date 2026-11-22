@@ -11,7 +11,8 @@ export interface StreamOptions {
   /** The `last_event_id` of the session detail. */
   after: number;
   signal: AbortSignal;
-  onEvent: (name: string, data: unknown) => void;
+  /** `id`: the SSE id (the `run_events.id` of a `run_event`), or `null`. */
+  onEvent: (name: string, data: unknown, id: number | null) => void;
   /** `true` while the stream is connected, `false` while it tries again. */
   onConnection?: (connected: boolean, error: string | null) => void;
   /** Delay before try number `attempt` (0 for the first retry), in milliseconds. */
@@ -69,7 +70,8 @@ export async function runEventStream(options: StreamOptions): Promise<void> {
             return;
           }
           const data = eventJson(event);
-          if (data !== null) onEvent(event.event, data);
+          const id = event.id !== null && /^\d+$/.test(event.id) ? Number(event.id) : null;
+          if (data !== null) onEvent(event.event, data, id);
         }
       }
       // The server closed the stream after its time limit: connect again at once from the

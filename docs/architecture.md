@@ -8541,6 +8541,59 @@ the user changed and the delivery rows of the triggers of the user.
 
 ---
 
+### 17.8 Web chat like Claude Code and Codex (M8.2)
+
+The web chat works like the chat of Claude Code and Codex. M8.2 has these parts. Each part has
+its own pull request.
+
+**Chat and tool calls (part A).**
+
+- Each tool call shows as one compact row: a status mark, a short verb, and the main input in
+  one line (the command, the file, the URL, or the query). The verb comes from the tool name
+  without the MCP prefix (`mcp__sama__web_search` shows as "Search the web"). Open, the row shows
+  the full input and the output preview.
+- While a run works, its text and its tool calls show in the order of the events. A working line
+  under the reply shows what the run does, the time since the chat saw the run start, and
+  "Esc to stop". When the API sends `run_phase` events, the line shows the phase (for example
+  "Starting the sandbox").
+- When a run ends, its tool calls fold into one line ("Worked: 4 steps"), as in Codex. The line
+  opens to the rows.
+- The Connect card of M8.1 (Section 10.3.4) shows under the row of its `connection_request` or
+  `connection_add_mcp` call while the run works, and under the folded line after the run ends,
+  so it stays visible.
+- The chat shows a message at once when the person sends it. The text goes back to the message
+  box if the send fails.
+- Esc stops the open runs, as the Stop button does. An open dialog takes Esc first.
+- The to-do list of the session (the sama `todo` tool, Claude `TodoWrite`, and Codex
+  `update_plan`) shows above the message box while a run works.
+- An approval card says what the agent wants to do in one line. The full input is behind "Show
+  the full input". The keys 1 (allow once), 2 (always allow), and 3 (deny) answer the first card
+  when the focus is not in a text field, or the message box is empty. After a click, the card
+  shows the decision at once, while the API call ends.
+- A proposed plan (M7.9) shows as a card above the message box with Approve, Edit and approve,
+  and Reject. The Code page is not necessary for the decision.
+- An empty session shows starter buttons that fill the message box.
+- The header has Code, Runs, and one Export menu (Markdown or JSON), so that it fits on one line
+  at a width of 390 px.
+
+**Tool trail of earlier runs.** `GET /sessions/{id}/activity` gives the stored
+`tool_call_started`, `tool_call_finished`, and `subagent_event` events of the newest 50 chat runs
+of a session, oldest first, in the shape of a `run_event` of the event stream:
+`{"events": [{"id", "run_id", "seq", "type", "payload"}], "truncated": bool}`. At most 3,000
+events come back (the newest). The payloads go through the redactor again, and each text value
+is cut after 2,000 characters. The read checks the access to the session as the event stream
+does (`404` for a session that the user cannot read). The chat reads it once when it opens, so
+the tool calls of runs that ended before the page opened show again. A call that the stream also
+gives shows once. A finish event that comes before its start event (the activity and the stream
+load at the same time) keeps its result. The partial index `ix_run_events_activity` (migration
+`0048`) on the tool events of a session keeps the read short on long sessions.
+
+**Keys.** Esc stops the open runs only when the focus is in the chat or in the message box. It
+first closes an open menu of the chat, and it does nothing behind a modal (for example the
+navigation drawer at a narrow width) or in another text field. The approval keys follow the same
+rules, and they do nothing while an input method composes text.
+
+
 ## 18. Observability and cost
 
 - **Traces**: Langfuse for both runtimes, one trace per run, with session and user ids.

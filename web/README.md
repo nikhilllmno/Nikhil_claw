@@ -55,7 +55,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/login` | Email and password, emailed sign-in link (PKCE), "Create an account" (Supabase sign-up with PKCE), and a developer access-token box. |
 | `/invite` | The page of an invite link (`/invite#<token>`). It keeps the token while you sign in, then joins the org. |
 | `/` | New session: workspace, agent, audience, title. A user without an org sees the open invites and, when sign-up is open, the form for a new org. |
-| `/s/[sessionId]` | Chat with live streaming, approvals, questions, Stop, and `/compact`. The header has Runs and the export buttons (Markdown and JSON). |
+| `/s/[sessionId]` | Chat with live streaming, one row per tool call, a working line, approvals (keys 1, 2, 3), questions, the plan card, Stop and Esc, and `/compact`. The header has Code, Runs, and the Export menu (Markdown and JSON). |
 | `/s/[sessionId]/runs` | The runs of the session with the token use and the cost. Each run opens its trace: steps, tool calls, and model calls. |
 | `/agents/[profileId]` | Agent settings. Read-only unless you are an admin of the org. |
 | `/tasks` | Task board of the current workspace: columns, new cards, status, assignee, and comments. |
@@ -94,4 +94,4 @@ Auth: tokens live in `sessionStorage` (cleared when the tab closes). A 401 trigg
 
 ## Not in this version
 
-Per-skill settings, and a skill revert (load an old version into the editor and save it). Tool calls that finished before the page was opened are not shown in the chat; only new ones stream in.
+Per-skill settings, and a skill revert (load an old version into the editor and save it).

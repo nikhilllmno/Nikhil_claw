@@ -906,6 +906,16 @@ class RunEvent(Base):
         ),
         UniqueConstraint("run_id", "seq"),
         Index(None, "org_id", "session_id"),
+        # The tool trail of a session (Section 17.8): migration 0048.
+        Index(
+            "ix_run_events_activity",
+            "org_id",
+            "session_id",
+            "id",
+            postgresql_where=text(
+                "type IN ('tool_call_started', 'tool_call_finished', 'subagent_event')"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)

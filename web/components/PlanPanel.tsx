@@ -148,7 +148,7 @@ export function PlanPanel({
   );
 }
 
-function PlanCard({
+export function PlanCard({
   sessionId,
   plan,
   now,
