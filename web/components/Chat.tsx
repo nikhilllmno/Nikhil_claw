@@ -112,6 +112,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [codeTab, setCodeTab] = useState<CodeTab | null>(null);
   const [repoCount, setRepoCount] = useState(0);
   const narrow = useMedia("(max-width: 75rem)");
+  const closeCode = useCallback(() => setCodeTab(null), []);
   const [tick, setTick] = useState(0);
   const localId = useRef(0);
   // Keep the view at the end while new text arrives, unless the user scrolled up.
@@ -1000,7 +1001,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
           sessionId={sessionId}
           tab={codeTab}
           onTab={setCodeTab}
-          onClose={() => setCodeTab(null)}
+          onClose={closeCode}
           modal={narrow}
           onRequested={() => {
             setNotice("The agent opens the pull request. Approve the pr_create card when it shows.");

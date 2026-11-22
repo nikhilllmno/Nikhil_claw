@@ -32,6 +32,9 @@ export function RepoAttach({
   // The repo that the person attached last, until the list shows it.
   const [attached, setAttached] = useState<RepoOut | null>(null);
   const full = repos.length >= MAX_REPOS;
+  // The new repo shows until the list of the parent has it.
+  const pendingAttach = attached !== null && !repos.some((r) => r.id === attached.id) ? attached : null;
+  if (attached !== null && pendingAttach === null) setAttached(null);
 
   const attach = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -62,6 +65,7 @@ export function RepoAttach({
     setError(null);
     try {
       await api.detachRepo(sessionId, item.id);
+      if (attached?.id === item.id) setAttached(null);
       onChanged();
     } catch (e) {
       setError(errorText(e, "The repo was not detached."));
@@ -82,12 +86,12 @@ export function RepoAttach({
           {error}
         </p>
       ) : null}
-      {attached !== null && !repos.some((r) => r.id === attached.id) ? (
+      {pendingAttach !== null ? (
         <p className="alert alert-success" role="status">
-          Attached {attached.repo}. It clones into the sandbox when the next run starts.
+          Attached {pendingAttach.repo}. It clones into the sandbox when the next run starts.
         </p>
       ) : null}
-      {repos.length === 0 && attached === null ? (
+      {repos.length === 0 && pendingAttach === null ? (
         <p className="alert">No repo is attached yet.</p>
       ) : (
         <ul className={page.list} aria-label="Attached repos">

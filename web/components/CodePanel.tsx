@@ -6,7 +6,7 @@
 // dialog. The full Code page stays at `/s/{id}/code`.
 
 import Link from "next/link";
-import { useCallback, useEffect, useId, useRef } from "react";
+import { useCallback, useId, useRef } from "react";
 import { useApi } from "./AuthProvider";
 import { Checkpoints } from "./Checkpoints";
 import styles from "./CodePanel.module.css";
@@ -14,6 +14,7 @@ import { DiffViewer } from "./DiffViewer";
 import { PullRequests } from "./PullRequests";
 import { RepoAttach } from "./RepoAttach";
 import { TestRuns } from "./TestRuns";
+import { useDrawerFocus } from "./useDrawerFocus";
 import { usePolled } from "./usePolled";
 
 export const CODE_TABS = [
@@ -50,18 +51,8 @@ export function CodePanel({
   const panel = useRef<HTMLElement>(null);
   const tabRefs = useRef<Partial<Record<CodeTab, HTMLButtonElement | null>>>({});
 
-  // The dialog takes the focus when it opens.
-  useEffect(() => {
-    if (modal) panel.current?.querySelector<HTMLElement>("button, a")?.focus();
-  }, [modal]);
-
-  const onKeyDown = (event: React.KeyboardEvent) => {
-    if (event.key === "Escape" && modal) {
-      // Esc closes the dialog. The chat does not stop the run for this key.
-      event.preventDefault();
-      onClose();
-    }
-  };
+  // As a dialog: the focus moves in, Tab stays in, Esc closes it, and the focus goes back.
+  useDrawerFocus(modal, panel, onClose);
 
   const onTabKey = (event: React.KeyboardEvent) => {
     const index = CODE_TABS.findIndex((t) => t.id === tab);
@@ -84,7 +75,6 @@ export function CodePanel({
       aria-label="Code of the session"
       role={modal ? "dialog" : undefined}
       aria-modal={modal ? true : undefined}
-      onKeyDown={onKeyDown}
     >
       <header className={styles.head}>
         <div className={styles.headText}>
