@@ -29,6 +29,8 @@ export function useDrawerFocus(
     const frame = requestAnimationFrame(() => focusable(panel)[0]?.focus());
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        // The key is used: the chat must not also stop the run for it.
+        event.preventDefault();
         onClose();
         return;
       }
