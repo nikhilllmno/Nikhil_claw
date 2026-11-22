@@ -53,5 +53,6 @@ describe("connect cards", () => {
     expect(cardStatus("form", "Notion")).toContain("Never paste");
     expect(cardStatus("initiated", "Gmail")).toContain("Sign in");
     expect(cardStatus("expired", "Gmail")).toContain("again");
+    expect(cardStatus("choice", "Supabase MCP")).toContain("the one you mean");
   });
 });

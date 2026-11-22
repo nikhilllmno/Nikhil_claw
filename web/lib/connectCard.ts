@@ -81,6 +81,8 @@ export function cardStatus(state: string, title: string): string {
       return `${title} is connected. sama continues your request.`;
     case "form":
       return `${title} needs a key. Fill the form on the Connections page. Never paste it in the chat.`;
+    case "choice":
+      return `Connect ${title} if this is the one you mean.`;
     case "failed":
     case "expired":
       return `${title} is not connected. Ask sama to connect it again.`;

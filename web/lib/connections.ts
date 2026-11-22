@@ -742,6 +742,9 @@ export function stuckHint(state: string, kind: string): string | null {
       : null;
   }
   if (state === "expired") return "The sign-in ended before it finished. Retry to connect.";
+  if (state === "pending" && kind !== "composio") {
+    return "Waiting for the form. Click Connect again to open it and save the values.";
+  }
   return null;
 }
 

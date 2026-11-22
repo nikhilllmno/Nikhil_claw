@@ -29,6 +29,7 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping
@@ -99,7 +100,7 @@ from sama.connectors.openapi import (
     parse_endpoints,
     parse_openapi,
 )
-from sama.db.models import AuditEntry, Connection, Membership, Run, Session, User
+from sama.db.models import AuditEntry, Connection, Membership, Message, Run, Session, User
 from sama.gate.decide import ToolAccess
 from sama.integrations.guide import channel_guide, channel_name
 from sama.tenancy.access import ADMIN_ROLES, Grants, load_grants
@@ -525,7 +526,7 @@ class ConnectionService:
             raise ConnectorError(problem, status_code=409)
         token = secrets.token_urlsafe(24)
         try:
-            row_id, old_account = await self._claim(
+            row_id, old_account, old_config = await self._claim(
                 org_id, workspace_id, grants.user_id, manifest, scope, owner, token
             )
         except IntegrityError:
@@ -535,6 +536,12 @@ class ConnectionService:
         extra: dict[str, Any] = {"via": via, "by": str(grants.user_id), "return_token": token}
         if origin:
             extra["origin"] = {**origin, "at": datetime.now(UTC).isoformat()}
+        else:
+            # A start from the page after a request in the chat (for example the card of a
+            # choice): the request of the chat still continues when this start connects.
+            kept = origin_of(old_config)
+            if kept is not None and _fresh(kept) and kept.get("user_id") == str(grants.user_id):
+                extra["origin"] = kept
         try:
             return await self._start_kind(
                 org_id,
@@ -591,7 +598,10 @@ class ConnectionService:
                 org_id, row_id, manifest, actor=actor, tool_cache=tool_cache
             )
         if manifest.kind != "composio":
-            view = await self._set(org_id, row_id, state="pending", error=None)
+            old = await self._config(org_id, row_id)
+            view = await self._set(
+                org_id, row_id, state="pending", error=None, config={**old, **extra}
+            )
             return Started(view, None)
         try:
             key = await self._composio_key(org_id)
@@ -669,13 +679,14 @@ class ConnectionService:
         scope: Scope,
         owner: uuid.UUID | None,
         token: str,
-    ) -> tuple[uuid.UUID, str | None]:
+    ) -> tuple[uuid.UUID, str | None, dict[str, Any]]:
         """The row of the connection (a new one if there is none), and its old Composio
         account. The row takes the return token of this start at once, so a later failure of
         an older start can see that a newer start owns the row (M8.1)."""
         async with self._engine.begin() as connection:
             row = await _find(connection, org_id, workspace_id, manifest.name, owner)
             old_account: str | None = None
+            old_config: dict[str, Any] = dict(row.config or {}) if row is not None else {}
             if row is None:
                 row_id: uuid.UUID = (
                     await connection.execute(
@@ -710,7 +721,7 @@ class ConnectionService:
                     .values(config={**stored, "return_token": token})
                 )
             await _audit(connection, org_id, actor, "connection.started", row_id, scope)
-        return row_id, old_account
+        return row_id, old_account, old_config
 
     async def get(self, org_id: uuid.UUID, connection_id: uuid.UUID) -> ConnectionView | None:
         async with self._engine.connect() as connection:
@@ -1224,7 +1235,12 @@ class ConnectionService:
         )
 
     async def request_for_agent(
-        self, claims: RunTokenClaims, connector: str, scope: Scope | None
+        self,
+        claims: RunTokenClaims,
+        connector: str,
+        scope: Scope | None,
+        *,
+        exact: bool = False,
     ) -> str:
         """``connection_request``: starts the connection and gives the sign-in link of the
         provider with a connect card (M8.1). A form connector gets the link of its form on the
@@ -1232,13 +1248,11 @@ class ConnectionService:
         run = await self.run_scope(claims)
         views = await self.for_run(run)
         manifest, choices = self._agent_resolve(connector, views)
+        if manifest is not None and not exact:
+            manifest, choices = await self._twin(claims, manifest)
         if manifest is None:
             if choices:
-                names = ", ".join(f"{m.title} ({m.name})" for m in choices)
-                return (
-                    f"'{connector}' can mean: {names}. Ask the user which one, then call "
-                    "connection_request again with that name."
-                )
+                return self._choices_reply(run, connector, choices, scope)
             names = ", ".join(m.name for m in self._manifests_for(views)) or "none"
             raise ConnectorError(
                 f"sama has no connector {connector.strip().lower()}. Connectors: {names}. To "
@@ -1284,14 +1298,27 @@ class ConnectionService:
                 f"{manifest.title} is already connected ({chosen} connection). Its tools are "
                 "in tool_search: use them now."
             )
-        if not _signs_in(manifest):
-            return self._form_reply(run, manifest, chosen, current)
         assert grants is not None  # noqa: S101 - run.user_id is set, so grants are loaded
         origin = {
             "session_id": claims.session_id,
             "run_id": claims.run_id,
             "user_id": str(run.user_id),
         }
+        if not _signs_in(manifest):
+            # The form row keeps the origin: when the saved form checks green, sama continues
+            # this request, as after a sign-in (M8.1).
+            formed = await self.start(
+                run.org_id,
+                run.workspace_id,
+                grants,
+                manifest.name,
+                chosen,
+                via="chat",
+                origin=origin,
+            )
+            if formed.connection.state == "connected":
+                return self._started_reply(manifest, chosen, formed)
+            return self._form_reply(run, manifest, chosen, formed.connection)
         started = await self.start(
             run.org_id,
             run.workspace_id,
@@ -1302,6 +1329,70 @@ class ConnectionService:
             origin=origin,
         )
         return self._started_reply(manifest, chosen, started)
+
+    async def _twin(
+        self, claims: RunTokenClaims, manifest: Manifest
+    ) -> tuple[Manifest | None, list[Manifest]]:
+        """A connector with an MCP twin (``supabase`` and ``supabase-mcp``): the words of the
+        request of the user choose (M8.1). "mcp" chooses the MCP server; database words choose
+        the database. Without a hint, the user chooses."""
+        base = manifest.name.removesuffix("-mcp")
+        twin = self.catalog.get(f"{base}-mcp")
+        plain = self.catalog.get(base)
+        if twin is None or plain is None:
+            return manifest, []
+        words = (await self._request_text(claims)).lower()
+        if MCP_WORD.search(words):
+            return twin, []
+        if DATABASE_WORDS.search(words):
+            return plain, []
+        return None, [plain, twin]
+
+    async def _request_text(self, claims: RunTokenClaims) -> str:
+        """The message of the user that started the run, or an empty text."""
+        try:
+            async with self._engine.connect() as connection:
+                text = await connection.scalar(
+                    select(Message.content["text"].astext)
+                    .where(
+                        Message.org_id == uuid.UUID(claims.org_id),
+                        Message.run_id == uuid.UUID(claims.run_id),
+                        Message.role == "user",
+                    )
+                    .order_by(Message.created_at.desc())
+                    .limit(1)
+                )
+        except (ValueError, TypeError):
+            return ""
+        return text if isinstance(text, str) else ""
+
+    def _choices_reply(
+        self, run: RunScope, connector: str, choices: list[Manifest], scope: Scope | None
+    ) -> str:
+        """Several connectors fit: the user picks one. Each choice has a card with the link
+        that starts it on the Connections page (M8.1)."""
+        lines = []
+        for choice in choices:
+            chosen = scope or _default_scope(choice, run.shared) or choice.scopes[0]
+            lines.append(
+                card(
+                    connector=choice.name,
+                    title=choice.title,
+                    url=self.connect_link(run.workspace_id, choice.name, chosen),
+                    connection_id="",
+                    state="choice",
+                    scope=chosen,
+                )
+            )
+        names = "; ".join(
+            f"{m.title} ({m.name}): {KIND_HINTS.get(m.kind, m.description)}" for m in choices
+        )
+        return (
+            "\n".join(lines)
+            + f"\n'{connector}' can mean: {names}. Ask the user which one (the user can also "
+            "tap one of the cards). Then call connection_request again with that name and "
+            "exact=true."
+        )
 
     def _form_reply(
         self,
@@ -1330,7 +1421,9 @@ class ConnectionService:
             + f"\n{manifest.title} needs a form with a key or a password. {who} fills it on the "
             f"sama web page. The user sees a Connect {manifest.title} button; also give this "
             f"link in one short line: {link_text(link, line)}\nDo not ask for passwords, API "
-            "keys, or tokens in the chat. After the user saves the form, call connection_test."
+            "keys, or tokens in the chat. When the saved form checks green, sama continues this "
+            "request by itself in a new turn. Do not ask the user to tell you when they are "
+            "done. Stop here and wait."
         )
 
     def _started_reply(self, manifest: Manifest, scope: Scope, started: Started) -> str:
@@ -2186,6 +2279,9 @@ class ConnectionService:
         # ``via`` and the token of the return page. The origin only matters for a sign-in:
         # a server without one connects in this call, and the agent sees the result at once.
         config.update({k: v for k, v in (extra or {}).items() if k != "origin"})
+        if spec.auth in ("bearer", "header") and extra and "origin" in extra:
+            # A server with a key waits for its form; the saved form continues the request.
+            config["origin"] = extra["origin"]
         if manifest.custom:
             config["mcp"] = {
                 "title": manifest.title,
@@ -2718,6 +2814,14 @@ def _server_name(url: str) -> str:
         base = f"mcp-{base}"
     return base[:40]
 
+
+MCP_WORD: Final = re.compile(r"\bmcp\b")
+DATABASE_WORDS: Final = re.compile(r"\b(database|db|sql|postgres(ql)?|tables?|rows?)\b")
+KIND_HINTS: Final[Mapping[str, str]] = {
+    "mcp_remote": "the MCP server of the service: manage it with a sign-in",
+    "database": "the database itself: read rows with SQL, with a connection string in a form",
+    "composio": "the app account: a sign-in",
+}
 
 INVALID_RETURN: Final = "This sign-in link is not valid or has ended. Connect again from sama."
 

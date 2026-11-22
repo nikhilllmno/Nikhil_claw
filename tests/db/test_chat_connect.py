@@ -15,18 +15,18 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.connectors.chat import cards, connection_escalation
 from sama.connectors.composio import ComposioClient
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
-from sama.db.models import AuditEntry, Connection, Membership
+from sama.db.models import AuditEntry, Connection, Membership, Message
 from sama.runtime.contract import output_preview
 from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import OrgKeys, Vault
 from tests.connectors.fake_mcp import URL, FakeMcp, driver
-from tests.connectors.support import FakeComposio, FakeForm
+from tests.connectors.support import NOTION_TOKEN, FakeComposio, FakeForm
 from tests.connectors.support import service as make_service
 from tests.db.test_connections import member, private
 from tests.db.test_tool_gate import Org1
@@ -472,3 +472,106 @@ async def test_a_server_by_url_falls_back_between_oauth_and_no_sign_in(
     [found] = cards(answer)
     assert found["state"] == "connected"
     assert "is connected now" in answer
+
+
+async def say(engine: AsyncEngine, org: Org1, text: str) -> None:
+    """The message of the user that started the private run ``secret-run``."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Message).values(
+                org_id=org.ids["org"],
+                session_id=org.ids["secret"],
+                run_id=org.ids["secret-run"],
+                role="user",
+                author_user_id=org.ids["mia"],
+                content={"text": text},
+            )
+        )
+
+
+def fake_oauth(service: ConnectionService, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The catalog OAuth servers are on other hosts than the fake: a fixed sign-in link."""
+
+    async def begin(*_: Any, **__: Any) -> tuple[dict[str, Any], str]:
+        return {"client_id": "c-1"}, "https://mcp.supabase.com/authorize?state=s"
+
+    monkeypatch.setattr(service._mcp, "begin_oauth", begin)
+
+
+async def test_mcp_in_the_request_picks_the_mcp_twin(
+    engine: AsyncEngine, org: Org1, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, _, _ = world
+    fake_oauth(service, monkeypatch)
+    await say(engine, org, "connect my supabase mcp")
+    answer = await service.request_for_agent(private(org), "supabase", None)
+    [found] = cards(answer)
+    assert found["connector"] == "supabase-mcp"
+    assert found["state"] == "initiated"
+
+
+async def test_database_words_pick_the_database_and_no_hint_asks(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    service, _, _, _ = world
+    await say(engine, org, "connect my supabase")
+    answer = await service.request_for_agent(private(org), "supabase", None)
+    assert [c["connector"] for c in cards(answer)] == ["supabase", "supabase-mcp"]
+    assert all(c["state"] == "choice" and c["url"] for c in cards(answer))
+    assert "exact=true" in answer
+    # After the choice of the user, the exact name wins.
+    chosen = await service.request_for_agent(private(org), "supabase", None, exact=True)
+    assert cards(chosen)[0]["connector"] == "supabase"
+    assert cards(chosen)[0]["state"] == "form"
+
+
+async def test_a_saved_form_continues_the_request(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    service, _, _, resumed = world
+    answer = await service.request_for_agent(private(org), "notion", None)
+    [found] = cards(answer)
+    assert found["state"] == "form"
+    assert "continues this request by itself" in answer
+    assert "tell you when they are done" in answer
+    connection_id = uuid.UUID(found["connection_id"])
+    row = await row_of(engine, connection_id)
+    assert row.state == "pending"
+    assert row.config["origin"]["session_id"] == str(org.ids["secret"])
+    # The user opens the card (a start on the page, without an origin): the origin stays.
+    await service.start(org.ids["org"], org.ids["ws"], member(org, "mia"), "notion", "personal")
+    assert "origin" in (await row_of(engine, connection_id)).config
+    saved = await service.submit_form(
+        org.ids["org"], connection_id, {"token": NOTION_TOKEN}, actor=org.ids["mia"]
+    )
+    assert saved.state == "connected"
+    assert len(resumed.calls) == 1
+    assert resumed.calls[0][1].connector == "notion"
+
+
+async def test_a_stuck_initiated_row_is_reused_by_a_new_start(
+    engine: AsyncEngine, org: Org1, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, _, _ = world
+    fake_oauth(service, monkeypatch)
+    first = await service.request_for_agent(private(org), "supabase-mcp", None, exact=True)
+    first_id = cards(first)[0]["connection_id"]
+    # An old row from before M8.1: initiated, no return token, web redirect.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Connection)
+            .where(Connection.id == uuid.UUID(first_id))
+            .values(config={"oauth": {"redirect_uri": "https://app.sama.test/connections"}})
+        )
+    second = await service.request_for_agent(private(org), "supabase-mcp", None, exact=True)
+    assert cards(second)[0]["connection_id"] == first_id
+    async with engine.connect() as connection:
+        count = await connection.scalar(
+            select(func.count())
+            .select_from(Connection)
+            .where(Connection.org_id == org.ids["org"], Connection.connector == "supabase-mcp")
+        )
+    assert count == 1
+    row = await row_of(engine, uuid.UUID(first_id))
+    assert row.state == "initiated"
+    assert row.config["origin"]["session_id"] == str(org.ids["secret"])
