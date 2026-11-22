@@ -112,3 +112,12 @@ describe("finish before start", () => {
     }
   });
 });
+
+it("puts overlapping calls back in start order after their finishes came first", () => {
+  const startA = { ...ev(1, "tool_call_started", { call_id: "a", name: "Read", arguments: {} }), id: 10 };
+  const startB = { ...ev(2, "tool_call_started", { call_id: "b", name: "Bash", arguments: {} }), id: 11 };
+  const finishB = { ...ev(3, "tool_call_finished", { call_id: "b", output_preview: "b" }), id: 12 };
+  const finishA = { ...ev(4, "tool_call_finished", { call_id: "a", output_preview: "a" }), id: 13 };
+  const state = applyActivity(apply(open, finishB, finishA), [startA, startB]);
+  expect(state.tools.r1?.map((c) => c.callId)).toEqual(["a", "b"]);
+});

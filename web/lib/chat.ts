@@ -193,9 +193,9 @@ export function applyStreamEvent(
       if (twin !== undefined) {
         if (!twin.placeholder) return { state, effects };
         // The finish came first: keep its result, add the name and the input.
-        const filled = known.map((c) =>
-          c === twin ? { ...call, status: twin.status, preview: twin.preview, placeholder: false } : c,
-        );
+        const filled = known
+          .map((c) => (c === twin ? { ...call, status: twin.status, preview: twin.preview, placeholder: false } : c))
+          .sort((a, b) => a.seq - b.seq);
         return { state: { ...state, tools: { ...state.tools, [event.run_id]: filled } }, effects };
       }
       if (/clarify/i.test(call.name)) effects.push("reload_questions");
