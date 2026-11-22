@@ -70,6 +70,7 @@ from sama.db.models import (
     SessionPlan,
     SessionRepo,
     SessionTodo,
+    SessionToolAllow,
     SkillSettings,
     StoredContextFile,
     Task,
@@ -435,6 +436,13 @@ def plan(
             version=1,
             body=f"plan of {session}",
             proposed_body=f"plan of {session}",
+        )
+        add(
+            SessionToolAllow,
+            org_id=org_id,
+            session_id=ids[session],
+            user_id=ids[owner or ("alice" if org == "org-a" else "bob")],
+            tool="web_search",
         )
     # One job for each owner, with a fire and a delivery. A job is private to its owner.
     for user, org, workspace, profile in (

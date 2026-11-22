@@ -423,6 +423,44 @@ describe("coding mode", () => {
   });
 });
 
+describe("approvals", () => {
+  it("sends the approval scope and the deny without a scope", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, { status: "approved", scope: "once", resumed: true }))
+      .mockResolvedValueOnce(json(200, { status: "approved", scope: "session", resumed: true }))
+      .mockResolvedValueOnce(json(200, { status: "approved", scope: "always", resumed: true }))
+      .mockResolvedValueOnce(json(200, { status: "approved", scope: "once", resumed: false }))
+      .mockResolvedValueOnce(json(200, { status: "rejected", scope: "once", resumed: true }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.approve("a1", "once");
+    await expect(client.approve("a1", "session")).resolves.toEqual({
+      status: "approved",
+      scope: "session",
+      resumed: true,
+    });
+    await client.approve("a1", "always");
+    await client.approve("a2");
+    await client.deny("a1");
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url.replace("https://api.test", ""), init.method, init.body])).toEqual([
+      ["/approvals/a1/approve", "POST", '{"scope":"once"}'],
+      ["/approvals/a1/approve", "POST", '{"scope":"session"}'],
+      ["/approvals/a1/approve", "POST", '{"scope":"always"}'],
+      ["/approvals/a2/approve", "POST", '{"scope":"once"}'],
+      ["/approvals/a1/deny", "POST", "{}"],
+    ]);
+  });
+
+  it("throws the detail when the server refuses a scope", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(422, { detail: "a proposal needs a decision each time" }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.approve("a1", "session")).rejects.toThrow("a proposal needs a decision each time");
+  });
+});
+
 describe("errorText", () => {
   it("uses the message of an Error and the fallback for anything else", () => {
     expect(errorText(new Error("boom"), "fallback")).toBe("boom");
