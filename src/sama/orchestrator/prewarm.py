@@ -120,7 +120,8 @@ class SessionWarmer:
         times.append(now)
         self._all.append(now)
         if len(self._orgs) > _MEMORY:
-            for org in [o for o, t in self._orgs.items() if not t]:
+            idle = [o for o, t in self._orgs.items() if not t or now - t[-1] >= self._window_s]
+            for org in idle:
                 del self._orgs[org]
         return True
 
