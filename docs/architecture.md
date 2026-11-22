@@ -6620,9 +6620,14 @@ service checks the values with the rules of `repo_clone` (Section 15.1). A sessi
   (with the reason). A failed clone does not stop the run.
 - A sandbox can be new after a pause, a crash, or a deploy, and then its work folder is empty.
   So before each chat run the step checks the folder of each `ready` repository
-  (`test -e PATH`, at most 30 seconds). A repository whose folder is gone goes back to
-  `pending` and clones again in the same run, and the note names it again. A failed check keeps
-  the repository as it is.
+  (`test -e PATH`, at most 30 seconds). Exit status 1 (the folder is gone) sets the repository
+  back to `pending` (only when the row did not change since the check), and it clones again in
+  the same run; the note names it again. Any other result keeps the repository as it is. This
+  repairs a missing folder only, not an empty or damaged one.
+- A run claims each clone with a lease (`updated_at` moves 360 seconds ahead). While the lease
+  runs, no other run clones the same repository, also with parallel runs in one session; only
+  the claim holder stores `ready` or `failed`. After a crash, the lease ends and the next run
+  clones it.
 - The step adds a note after the message of the run: the repositories that it cloned, their
   folders, and whether the agent can push them, or the reason of a failed clone. The stored
   message does not change. The instruction files of the repository are not in the note: the
@@ -6703,7 +6708,8 @@ runs tests (for example `pytest`, `npm test`, `go test`, `cargo test`, `make tes
 script in the place of a command: `sh test.sh`, `bash "scripts/run_tests.sh"`, `./test.sh`,
 `cd repo && ./test.sh`; a script name as an argument, as in `cat ./test.sh`, is not; nor is a
 command that only shows information (`pytest --version`, `npm test --help`) or installs a test
-tool (`pip install pytest`)) has `test`
+tool (`pip install pytest`); each command and pipe stage is read alone, and `-h`/`-V` count
+as information only for pytest, so `ctest -V` and `mvn -V test` are test runs) has `test`
 true and the last result line of the output as `summary`. `?tests=true` lists only these.
 
 - The exit status of a pipe is the status of its last command, so `pytest | tail` ends with 0

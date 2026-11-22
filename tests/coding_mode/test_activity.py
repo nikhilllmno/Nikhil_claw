@@ -43,6 +43,9 @@ from tests.orchestrator.conftest import Tenant
         "cd repo\nsh test.sh",
         "pip install pytest && pytest -q",
         "pytest --version; pytest -q",
+        "ctest -V",
+        "mvn -V test",
+        "pytest -q | grep -h failed",
         "  ./test.sh",
     ],
 )
@@ -66,6 +69,7 @@ def test_test_commands(command: str) -> None:
         "git diff -- ./test.sh",
         "python3 -m pytest --version 2>&1 || pip install pytest",
         "pytest -h",
+        "python3 -m pytest -V",
         "npm test --help",
         "pip install pytest",
         "uv add --dev pytest",

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.db.models import (
@@ -40,6 +40,8 @@ from sama.vault.redact import redact
 
 PLAN_OFF_NOTED: Final = "session.plan_mode_noted"
 """The audit entry of the run that told the agent that plan mode is off."""
+CLONE_LEASE_S: Final = 360.0
+"""How long a run holds the clone of a repository. Longer than the clone step (330 s)."""
 PLAN_LIST_LIMIT: Final = 10
 MAX_PLAN_LIST: Final = 50
 MAX_PR_TITLE_CHARS: Final = 200
@@ -67,6 +69,9 @@ class RepoView:
     branch: str | None
     error: str | None
     created_at: datetime
+    updated_at: datetime | None = None
+    """The generation of the row: each change of the status sets it. The coding step uses it to
+    claim a clone, so two runs never clone the same repository at once."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +115,7 @@ _REPO_COLUMNS: Final = (
     SessionRepo.branch,
     SessionRepo.error,
     SessionRepo.created_at,
+    SessionRepo.updated_at,
 )
 _PLAN_COLUMNS: Final = (
     SessionPlan.id,
@@ -139,6 +145,7 @@ def repo_view(row: Any) -> RepoView:
         branch=row.branch,
         error=row.error,
         created_at=row.created_at,
+        updated_at=getattr(row, "updated_at", None),
     )
 
 
@@ -702,19 +709,25 @@ class CodingService:
             ).all()
         return [repo_view(row) for row in rows]
 
-    async def reopen(self, *, org_id: uuid.UUID, repo_id: uuid.UUID) -> RepoView | None:
+    async def reopen(
+        self, *, org_id: uuid.UUID, repo_id: uuid.UUID, seen: datetime | None = None
+    ) -> RepoView | None:
         """Sets a ``ready`` repository back to ``pending``: its folder is gone, for example in
         a new sandbox after a pause, a crash, or a deploy. Returns the pending repository, or
-        None when another run changed it first."""
+        None when another run changed it first. With ``seen`` (the generation that the caller
+        read), a row that changed since, for example by another recovery, stays."""
+        conditions = [
+            SessionRepo.org_id == org_id,
+            SessionRepo.id == repo_id,
+            SessionRepo.status == "ready",
+        ]
+        if seen is not None:
+            conditions.append(SessionRepo.updated_at == seen)
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
                     update(SessionRepo)
-                    .where(
-                        SessionRepo.org_id == org_id,
-                        SessionRepo.id == repo_id,
-                        SessionRepo.status == "ready",
-                    )
+                    .where(*conditions)
                     .values(
                         status="pending",
                         path=None,
@@ -722,7 +735,7 @@ class CodingService:
                         branch=None,
                         proxied=None,
                         error=None,
-                        updated_at=func.now(),
+                        updated_at=func.clock_timestamp(),
                     )
                     .returning(*_REPO_COLUMNS)
                 )
@@ -801,6 +814,31 @@ class CodingService:
             ).scalar_one_or_none()
         return bool(value)
 
+    async def claim(self, *, org_id: uuid.UUID, repo_id: uuid.UUID) -> datetime | None:
+        """Claims the clone of a pending repository for one run with a lease: the generation
+        (``updated_at``) moves to the end of the lease, ``CLONE_LEASE_S`` from now. While the
+        lease runs, no other run can claim the row. Returns the claim, or None when another
+        run holds it. Only the claim holder stores the result (``cloned``, ``clone_failed``);
+        after a crash the lease ends and the next run claims it."""
+        async with self._engine.begin() as connection:
+            value = (
+                await connection.execute(
+                    update(SessionRepo)
+                    .where(
+                        SessionRepo.org_id == org_id,
+                        SessionRepo.id == repo_id,
+                        SessionRepo.status == "pending",
+                        SessionRepo.updated_at <= func.clock_timestamp(),
+                    )
+                    .values(
+                        updated_at=func.clock_timestamp()
+                        + text(f"interval '{int(CLONE_LEASE_S)} seconds'")
+                    )
+                    .returning(SessionRepo.updated_at)
+                )
+            ).scalar_one_or_none()
+        return value
+
     async def cloned(
         self,
         *,
@@ -810,15 +848,19 @@ class CodingService:
         commit: str,
         branch: str | None,
         proxied: bool,
+        claim: datetime | None = None,
     ) -> None:
+        conditions = [
+            SessionRepo.org_id == org_id,
+            SessionRepo.id == repo_id,
+            SessionRepo.status == "pending",
+        ]
+        if claim is not None:
+            conditions.append(SessionRepo.updated_at == claim)
         async with self._engine.begin() as connection:
             await connection.execute(
                 update(SessionRepo)
-                .where(
-                    SessionRepo.org_id == org_id,
-                    SessionRepo.id == repo_id,
-                    SessionRepo.status == "pending",
-                )
+                .where(*conditions)
                 .values(
                     status="ready",
                     path=path,
@@ -826,23 +868,33 @@ class CodingService:
                     branch=branch,
                     proxied=proxied,
                     error=None,
-                    updated_at=func.now(),
+                    updated_at=func.clock_timestamp(),
                 )
             )
 
-    async def clone_failed(self, *, org_id: uuid.UUID, repo_id: uuid.UUID, error: str) -> None:
+    async def clone_failed(
+        self,
+        *,
+        org_id: uuid.UUID,
+        repo_id: uuid.UUID,
+        error: str,
+        claim: datetime | None = None,
+    ) -> None:
+        conditions = [
+            SessionRepo.org_id == org_id,
+            SessionRepo.id == repo_id,
+            SessionRepo.status == "pending",
+        ]
+        if claim is not None:
+            conditions.append(SessionRepo.updated_at == claim)
         async with self._engine.begin() as connection:
             await connection.execute(
                 update(SessionRepo)
-                .where(
-                    SessionRepo.org_id == org_id,
-                    SessionRepo.id == repo_id,
-                    SessionRepo.status == "pending",
-                )
+                .where(*conditions)
                 .values(
                     status="failed",
                     error=redact(error)[:500] or "the clone failed",
-                    updated_at=func.now(),
+                    updated_at=func.clock_timestamp(),
                 )
             )
 

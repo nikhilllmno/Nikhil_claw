@@ -245,9 +245,10 @@ async def test_an_approval_does_not_give_the_off_note(
 class Folders:
     """A sandbox whose ``test -e`` finds only the given paths."""
 
-    def __init__(self, present: set[str], broken: bool = False) -> None:
+    def __init__(self, present: set[str], broken: bool = False, code: int = 1) -> None:
         self.present = present
         self.broken = broken
+        self.code = code
         self.looked: list[str] = []
 
     async def exec(self, argv: list[str], **kwargs: Any) -> Any:
@@ -257,7 +258,8 @@ class Folders:
             raise RuntimeError("the sandbox is busy")
         assert argv[:2] == ["test", "-e"]
         self.looked.append(argv[2])
-        return ExecResult(exit_code=0 if argv[2] in self.present else 1, stdout="", stderr="")
+        code = 0 if argv[2] in self.present else self.code
+        return ExecResult(exit_code=code, stdout="", stderr="")
 
 
 async def test_a_lost_folder_clones_again(coding: CodingService, tenant: Tenant) -> None:
@@ -314,3 +316,124 @@ async def test_a_failed_folder_check_keeps_the_repository(
     # A second reopen of the same repository does nothing.
     assert await coding.reopen(org_id=org, repo_id=repo.id) is not None
     assert await coding.reopen(org_id=org, repo_id=repo.id) is None
+    assert kept.updated_at is not None
+
+
+class SlowCloner(FakeCloner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.go = asyncio.Event()
+
+    async def clone(self, claims: RunTokenClaims, repo: str, **kwargs: Any) -> Cloned:
+        self.started.set()
+        await self.go.wait()
+        return await super().clone(claims, repo, **kwargs)
+
+
+async def _ready(coding: CodingService, tenant: Tenant, name: str) -> Any:
+    org, session = tenant.org, tenant.ids["mine"]
+    repo = await coding.attach(org_id=org, session_id=session, user_id=None, repo=name)
+    await coding.cloned(
+        org_id=org,
+        repo_id=repo.id,
+        path=f"/home/user/work/{repo.folder}",
+        commit="a" * 40,
+        branch="main",
+        proxied=True,
+    )
+    return repo
+
+
+async def test_two_runs_recover_a_lost_folder_once(coding: CodingService, tenant: Tenant) -> None:
+    """Two runs start at once in a new sandbox: one run clones the repository again; the
+    other does not clone it and does not mark it failed."""
+    await _ready(coding, tenant, "team/app")
+    cloner = SlowCloner()
+    preparer = CodingPreparer(coding, cloner, RunTokenSigner(KEY))  # type: ignore[arg-type]
+    first, first_token = await _run(coding, tenant)
+    second, second_token = await _run(coding, tenant)
+    one = asyncio.ensure_future(preparer.prepare(Folders(set()), first, first_token))  # type: ignore[arg-type]
+    await asyncio.wait_for(cloner.started.wait(), timeout=10)
+    other = await preparer.prepare(Folders(set()), second, second_token)  # type: ignore[arg-type]
+    cloner.go.set()
+    note = await asyncio.wait_for(one, timeout=10)
+    assert len(cloner.calls) == 1
+    assert "https://github.com/team/app" in note
+    assert "could not clone" not in other
+    (repo,) = (await coding.state(org_id=tenant.org, session_id=tenant.ids["mine"])).repos
+    assert (repo.status, repo.commit) == ("ready", "c" * 40)
+
+
+async def test_a_stale_check_does_not_reopen_a_recovered_repository(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    org = tenant.org
+    repo = await _ready(coding, tenant, "team/app")
+    (seen,) = await coding.ready_repos(org_id=org, session_id=tenant.ids["mine"])
+    reopened = await coding.reopen(org_id=org, repo_id=repo.id, seen=seen.updated_at)
+    assert reopened is not None
+    claim = await coding.claim(org_id=org, repo_id=repo.id)
+    assert claim is not None
+    # While the lease runs, a second claim loses.
+    assert await coding.claim(org_id=org, repo_id=repo.id) is None
+    # A failure stored with a lost claim changes nothing.
+    await coding.clone_failed(org_id=org, repo_id=repo.id, error="x", claim=seen.updated_at)
+    await coding.cloned(
+        org_id=org,
+        repo_id=repo.id,
+        path="/w/app",
+        commit="b" * 40,
+        branch="main",
+        proxied=True,
+        claim=claim,
+    )
+    # The old observation of the folder (before the recovery) does not reopen it.
+    assert await coding.reopen(org_id=org, repo_id=repo.id, seen=seen.updated_at) is None
+    (now,) = (await coding.state(org_id=org, session_id=tenant.ids["mine"])).repos
+    assert (now.status, now.commit) == ("ready", "b" * 40)
+
+
+async def test_a_check_that_cannot_run_keeps_the_repository(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    await _ready(coding, tenant, "team/app")
+    cloner = FakeCloner()
+    preparer = CodingPreparer(coding, cloner, RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    assert await preparer.prepare(Folders(set(), code=127), scope, token) == ""  # type: ignore[arg-type]
+    assert cloner.calls == []
+    (kept,) = (await coding.state(org_id=tenant.org, session_id=tenant.ids["mine"])).repos
+    assert kept.status == "ready"
+
+
+async def test_an_ended_lease_can_be_claimed_again(
+    coding: CodingService, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    from sqlalchemy import text as sql
+
+    org = tenant.org
+    repo = await coding.attach(
+        org_id=org, session_id=tenant.ids["mine"], user_id=None, repo="team/app"
+    )
+    first = await coding.claim(org_id=org, repo_id=repo.id)
+    assert first is not None
+    assert await coding.claim(org_id=org, repo_id=repo.id) is None
+    async with engine.begin() as connection:  # the run that held it crashed long ago
+        await connection.execute(
+            sql("UPDATE session_repos SET updated_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": repo.id},
+        )
+    assert await coding.claim(org_id=org, repo_id=repo.id) is not None
+    # The crashed run's late result changes nothing.
+    await coding.cloned(
+        org_id=org,
+        repo_id=repo.id,
+        path="/w",
+        commit="d" * 40,
+        branch=None,
+        proxied=False,
+        claim=first,
+    )
+    (still,) = (await coding.state(org_id=org, session_id=tenant.ids["mine"])).repos
+    assert still.status == "pending"

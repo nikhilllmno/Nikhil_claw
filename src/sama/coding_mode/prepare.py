@@ -144,9 +144,15 @@ class CodingPreparer:
             except Exception as error:
                 log.warning("the folder of %s was not checked: %r", repo.repo, error)
                 continue
-            if found.exit_code == 0:
-                continue
-            reopened = await self._coding.reopen(org_id=org_id, repo_id=repo.id)
+            if found.exit_code != 1:
+                if found.exit_code != 0:
+                    log.warning(
+                        "the folder of %s was not checked: exit %s", repo.repo, found.exit_code
+                    )
+                continue  # present, or the check itself failed
+            reopened = await self._coding.reopen(
+                org_id=org_id, repo_id=repo.id, seen=repo.updated_at
+            )
             if reopened is not None:
                 log.info("coding repo folder gone; cloning again repo=%s", repo.repo)
                 lost.append(reopened)
@@ -169,6 +175,11 @@ class CodingPreparer:
         """Clones one repository and stores the result. Returns the ready repository, or the
         reason of a failure (None when the result could not be stored)."""
         org_id = uuid.UUID(scope.org_id)
+        claim = await self._coding.claim(org_id=org_id, repo_id=repo.id)
+        if claim is None:
+            # Another run clones it now, or it changed. That run stores the result.
+            log.info("coding repo clone claimed by another run repo=%s", repo.repo)
+            return None, None
         try:
             async with asyncio.timeout(CLONE_STEP_TIMEOUT_S):
                 done = await self._cloner.clone(
@@ -198,6 +209,7 @@ class CodingPreparer:
                     commit=done.commit,
                     branch=done.branch,
                     proxied=done.proxied,
+                    claim=claim,
                 )
             except Exception as error:
                 log.warning("the clone result was not stored run=%s: %r", scope.run_id, error)
@@ -212,7 +224,9 @@ class CodingPreparer:
             )
             return ready, None
         try:
-            await self._coding.clone_failed(org_id=org_id, repo_id=repo.id, error=problem)
+            await self._coding.clone_failed(
+                org_id=org_id, repo_id=repo.id, error=problem, claim=claim
+            )
         except Exception as error:
             log.warning("the clone failure was not stored run=%s: %r", scope.run_id, error)
             return None, None

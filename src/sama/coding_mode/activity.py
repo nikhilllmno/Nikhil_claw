@@ -71,11 +71,13 @@ _SUMMARY: Final = re.compile(
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
     r"|^\s*not ok\b.*$"
 )
-_PARTS: Final = re.compile(r"&&|\|\||[;\n]")
-"""Splits a shell line into its commands. A pipe stays in one part: ``pytest | tail`` is one
-test run."""
-_INFO: Final = re.compile(r"(?:^|\s)(?:--version|--help|-h|-V)(?=$|\s)")
+_STAGES: Final = re.compile(r"&&|\|\|?|[;\n]")
+"""Splits a shell line into its commands and pipe stages, so the options of ``tail`` or
+``grep`` in ``pytest | grep -h x`` do not count for pytest."""
+_INFO: Final = re.compile(r"(?:^|\s)(?:--version|--help)(?=$|\s)")
 """``pytest --version`` and ``npm test --help`` only show information; they run no test."""
+_PYTEST: Final = re.compile(r"(?:^|[\s/])(?:pytest|py\.test)(?=$|\s)")
+_PYTEST_INFO: Final = re.compile(r"(?:^|\s)(?:-h|-V)(?=$|\s)")
 _INSTALL: Final = re.compile(
     r"(?:^|[\s(])(?:python3?\s+-m\s+)?(?:pip3?|uv\s+pip|uv|npm|pnpm|yarn|bun|poetry|conda"
     r"|apt(?:-get)?|brew|gem|cargo)\s+(?:install|add|i)\b"
@@ -117,12 +119,17 @@ class PullRequestView:
 def is_test_command(command: str) -> bool:
     """True when the command runs the tests of a project, for example ``pytest`` or
     ``npm test``, or a test script such as ``sh test.sh``."""
-    return any(
-        (_TEST_COMMAND.search(part) or _TEST_SCRIPT.search(part))
-        and not _INFO.search(part)
-        and not _INSTALL.search(part)
-        for part in _PARTS.split(command)
-    )
+    return any(_test_stage(stage) for stage in _STAGES.split(command))
+
+
+def _test_stage(stage: str) -> bool:
+    if not (_TEST_COMMAND.search(stage) or _TEST_SCRIPT.search(stage)):
+        return False
+    if _INSTALL.search(stage) or _INFO.search(stage):
+        return False
+    # ``-h`` and ``-V`` show the help or the version only for pytest; ``ctest -V`` and
+    # ``mvn -V test`` run tests.
+    return not (_PYTEST.search(stage) and _PYTEST_INFO.search(stage))
 
 
 def result_summary(output: str) -> str | None:
