@@ -642,10 +642,19 @@ export interface RunsEvent {
 }
 
 export interface RunEventPayload {
+  /** The `run_events.id`: one order for all runs of the session. Not on every event. */
+  id?: number;
   run_id: string;
   seq: number;
   type: string;
   payload: Record<string, unknown>;
+}
+
+/** The answer of `GET /sessions/{id}/activity`: the tool trail of the newest runs. */
+export interface SessionActivity {
+  events: RunEventPayload[];
+  /** True when older events were left out. */
+  truncated: boolean;
 }
 
 export interface Subagent {
@@ -2121,6 +2130,8 @@ export class ApiClient {
     });
   listSteers = (id: string) => this.json<SteerNote[]>(`/sessions/${id}/steers`);
   listOpenRuns = (id: string) => this.json<OpenRun[]>(`/sessions/${id}/open-runs`);
+  /** The tool calls and sub-agent progress of the newest runs, for runs that ended earlier. */
+  getActivity = (id: string) => this.json<SessionActivity>(`/sessions/${id}/activity`);
   /** A note for the open run. Without an open run the API sends the text as a message. */
   steer = (id: string, text: string) =>
     this.json<Steered>(`/sessions/${id}/steer`, { method: "POST", body: { text } });

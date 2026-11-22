@@ -262,6 +262,14 @@ STEERS_LISTED: Final = 50
 MAX_REASON_CHARS: Final = 500
 STREAM_BATCH: Final = 500
 RECENT_RUNS: Final = 20
+ACTIVITY_RUNS: Final = 50
+"""``GET /sessions/{id}/activity`` reads the tool events of at most this many newest chat runs."""
+ACTIVITY_EVENTS: Final = 3_000
+"""The most events in one answer of ``GET /sessions/{id}/activity``. The newest events stay."""
+ACTIVITY_TYPES: Final = ("tool_call_started", "tool_call_finished", "subagent_event")
+"""The run events that the chat shows for a run that ended (the tool trail)."""
+ACTIVITY_TEXT_CHARS: Final = 2_000
+"""A text value of an activity event is cut after this many characters."""
 STREAM_GRACE_S: Final = 1.0
 """The response of a stream stops this long after the end time of the stream at the latest."""
 OPEN_RUN_STATUSES: Final = frozenset({"queued", "running", "paused"})
@@ -1148,6 +1156,18 @@ Me = Annotated[Principal, Depends(_principal)]
 """The user of the request. A route with this parameter needs a valid access token."""
 
 
+def _cut_text(value: Any, limit: int) -> Any:
+    """``value`` with each string longer than ``limit`` cut to ``limit`` characters and an
+    ellipsis, in nested lists and objects too."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit] + "\u2026"
+    if isinstance(value, dict):
+        return {key: _cut_text(item, limit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cut_text(item, limit) for item in value]
+    return value
+
+
 def _chat_runs(session_id: uuid.UUID) -> Any:
     """The chat runs of a session. A background review run (Section 9.4) is not part of the
     chat: its runs and events stay out of the run list and the event stream."""
@@ -1450,6 +1470,10 @@ class SamaApi:
         @app.get("/sessions/{session_id}/steers")
         async def list_steers(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
             return await self._steers(principal, session_id)
+
+        @app.get("/sessions/{session_id}/activity")
+        async def session_activity(principal: Me, session_id: uuid.UUID) -> dict[str, Any]:
+            return await self._activity(principal, session_id)
 
         @app.get("/sessions/{session_id}/open-runs")
         async def list_open_runs(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -3085,6 +3109,62 @@ class SamaApi:
             )
         ).scalar_one()
         return int(value)
+
+    async def _activity(self, principal: Principal, session_id: uuid.UUID) -> dict[str, Any]:
+        """``GET /sessions/{id}/activity``: the tool trail of the newest chat runs of a session,
+        so that the chat shows the tool calls of runs that ended before the page opened.
+
+        The answer has the stored ``tool_call_started``, ``tool_call_finished``, and
+        ``subagent_event`` events of the newest ``ACTIVITY_RUNS`` chat runs, oldest first, in
+        the shape of a ``run_event`` of the event stream. At most ``ACTIVITY_EVENTS`` events
+        come back (the newest); ``truncated`` tells that older events were left out. The
+        payloads go through the redactor again, and long text values are cut, because the chat
+        shows only a preview."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            runs = (
+                select(Run.id)
+                .where(
+                    Run.org_id == access.org_id,
+                    Run.session_id == session_id,
+                    Run.kind == "chat",
+                )
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(ACTIVITY_RUNS)
+            )
+            rows = (
+                await connection.execute(
+                    select(
+                        RunEvent.id,
+                        RunEvent.run_id,
+                        RunEvent.seq,
+                        RunEvent.type,
+                        RunEvent.payload,
+                    )
+                    .where(
+                        RunEvent.org_id == access.org_id,
+                        RunEvent.session_id == session_id,
+                        RunEvent.run_id.in_(runs),
+                        RunEvent.type.in_(ACTIVITY_TYPES),
+                    )
+                    .order_by(RunEvent.id.desc())
+                    .limit(ACTIVITY_EVENTS + 1)
+                )
+            ).all()
+        truncated = len(rows) > ACTIVITY_EVENTS
+        # The redactor runs again: it may know more secrets now (as for the run trace).
+        redactor = default_redactor()
+        events = [
+            {
+                "id": row.id,
+                "run_id": str(row.run_id),
+                "seq": row.seq,
+                "type": row.type,
+                "payload": _cut_text(redactor.json(row.payload or {}), ACTIVITY_TEXT_CHARS),
+            }
+            for row in reversed(rows[:ACTIVITY_EVENTS])
+        ]
+        return {"events": events, "truncated": truncated}
 
     async def _steers(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
         """``GET /sessions/{id}/steers`` (M7.1): the newest notes that joined a run of the
