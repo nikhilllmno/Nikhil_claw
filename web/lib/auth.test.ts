@@ -137,3 +137,79 @@ describe("AuthSession", () => {
     );
   });
 });
+
+/** A fake BroadcastChannel bus: each tab gets the messages of the other tabs, at once. */
+function bus() {
+  const tabs: { onmessage: ((event: { data: unknown }) => void) | null; postMessage: (m: unknown) => void }[] = [];
+  const open = () => {
+    const tab = {
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+      postMessage(message: unknown) {
+        for (const other of tabs) if (other !== tab) other.onmessage?.({ data: structuredClone(message) });
+      },
+    };
+    tabs.push(tab);
+    return tab;
+  };
+  return { open };
+}
+
+function tab(channel: ReturnType<ReturnType<typeof bus>["open"]>, fetcher = vi.fn()) {
+  const session = store();
+  const auth = new AuthSession({
+    config: { url: "https://x.supabase.co", anonKey: "anon" },
+    session,
+    local: store(),
+    fetcher: fetcher as never,
+    now: () => 1_000_000,
+    tabs: channel,
+  });
+  return { auth, session };
+}
+
+describe("AuthSession across tabs (M8.1)", () => {
+  it("a new tab opens signed in with the tokens of an open tab", async () => {
+    const tabs = bus();
+    const fetcher = vi.fn(async () => reply({ access_token: "a1", refresh_token: "r1", expires_in: 3600 }));
+    const first = tab(tabs.open(), fetcher);
+    await first.auth.signInWithPassword("a@b.c", "pw");
+    const second = tab(tabs.open());
+    expect(second.auth.load()).toBeNull();
+    const adopted = await second.auth.adoptFromTabs(50);
+    expect(adopted?.access_token).toBe("a1");
+    expect(JSON.parse(second.session.getItem(AUTH_KEY) ?? "null").refresh_token).toBe("r1");
+    expect(await second.auth.getToken()).toBe("a1");
+  });
+
+  it("a tab alone waits and stays signed out", async () => {
+    const tabs = bus();
+    const lone = tab(tabs.open());
+    expect(await lone.auth.adoptFromTabs(10)).toBeNull();
+  });
+
+  it("a refresh and a sign-out reach the other tabs", async () => {
+    const tabs = bus();
+    let n = 0;
+    const fetcher = vi.fn(async () => {
+      n += 1;
+      return reply({ access_token: `a${n}`, refresh_token: `r${n}`, expires_in: 3600 });
+    });
+    const first = tab(tabs.open(), fetcher);
+    await first.auth.signInWithPassword("a@b.c", "pw");
+    const second = tab(tabs.open());
+    await second.auth.adoptFromTabs(50);
+    await first.auth.refresh(first.auth.generation);
+    expect(second.auth.current?.refresh_token).toBe("r2");
+    first.auth.signOut();
+    expect(second.auth.current).toBeNull();
+    expect(second.session.getItem(AUTH_KEY)).toBeNull();
+  });
+
+  it("ignores a message that is not a sign-in message", async () => {
+    const channel = { onmessage: null as ((event: { data: unknown }) => void) | null, postMessage: vi.fn() };
+    const lone = tab(channel);
+    channel.onmessage?.({ data: { type: "signin", tokens: { access_token: 3 } } });
+    channel.onmessage?.({ data: "junk" });
+    expect(lone.auth.current).toBeNull();
+  });
+});

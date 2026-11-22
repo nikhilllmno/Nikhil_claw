@@ -35,6 +35,9 @@ import {
   withConnection,
   withoutConnection,
   withoutEntryParams,
+  connectLabel,
+  orderConnectors,
+  stuckHint,
 } from "./connections";
 
 const WS = "11111111-2222-4333-8444-555555555555";
@@ -585,3 +588,25 @@ describe("HTTP APIs (M4.12)", () => {
 function tokens(): TokenSource {
   return { generation: 1, getToken: async () => "t", refresh: async () => "t", signOut: () => undefined };
 }
+
+describe("connector order and stuck rows (M8.1)", () => {
+  const c = (name: string, kind: string, title = name) => ({ name, title, kind, description: `${title} tools` });
+
+  it("shows the apps of a user first and filters by words", () => {
+    const list = [c("bigquery", "database", "BigQuery"), c("gmail", "composio", "Gmail"), c("deepwiki", "mcp_remote", "DeepWiki")];
+    expect(orderConnectors(list).map((x) => x.name)).toEqual(["gmail", "deepwiki", "bigquery"]);
+    expect(orderConnectors(list, "  GMAIL ").map((x) => x.name)).toEqual(["gmail"]);
+    expect(orderConnectors(list, "tools")).toHaveLength(3);
+  });
+
+  it("gives a reason and a retry for a row that is not connected", () => {
+    expect(stuckHint("initiated", "composio")).toContain("sign-in is open");
+    expect(stuckHint("initiated", "http_api")).toBeNull();
+    expect(stuckHint("expired", "composio")).toContain("Retry");
+    expect(stuckHint("connected", "composio")).toBeNull();
+    expect(connectLabel(null)).toBe("Connect");
+    expect(connectLabel("initiated")).toBe("Retry");
+    expect(connectLabel("failed")).toBe("Retry");
+    expect(connectLabel("pending")).toBe("Connect again");
+  });
+});

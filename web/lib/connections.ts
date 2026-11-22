@@ -709,3 +709,44 @@ export function apiBody(draft: ApiDraft): ApiAdd {
   }
   return body;
 }
+
+
+/** The order of the kinds on the Connections page: the apps of a user first (M8.1). */
+const KIND_ORDER: Record<string, number> = { composio: 0, mcp_remote: 1, mcp_hosted: 2, http_api: 3, database: 4 };
+
+/** The connectors in page order: by kind, then by title. `query` keeps the ones that match. */
+export function orderConnectors<T extends { name: string; title: string; kind: string; description: string }>(
+  connectors: T[],
+  query = "",
+): T[] {
+  const words = query.trim().toLowerCase();
+  return connectors
+    .filter(
+      (c) =>
+        words === "" ||
+        c.name.toLowerCase().includes(words) ||
+        c.title.toLowerCase().includes(words) ||
+        c.description.toLowerCase().includes(words),
+    )
+    .sort(
+      (a, b) =>
+        (KIND_ORDER[a.kind] ?? 9) - (KIND_ORDER[b.kind] ?? 9) || a.title.localeCompare(b.title),
+    );
+}
+
+/** The text under a connection that is not connected, so no row stays without a reason. */
+export function stuckHint(state: string, kind: string): string | null {
+  if (state === "initiated") {
+    return kind === "composio" || kind === "mcp_remote"
+      ? "The sign-in is open. Finish it in the tab of the provider, or retry."
+      : null;
+  }
+  if (state === "expired") return "The sign-in ended before it finished. Retry to connect.";
+  return null;
+}
+
+/** The label of the connect button of a row. */
+export function connectLabel(state: string | null): string {
+  if (state === null) return "Connect";
+  return state === "initiated" || state === "failed" || state === "expired" ? "Retry" : "Connect again";
+}

@@ -151,3 +151,13 @@
 .addCard {
   flex-basis: 100%;
 }
+
+.search {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: 24rem;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}

@@ -2212,6 +2212,9 @@ export class ApiClient {
       { method: "POST", body: {} },
     );
   listConnectors = () => this.json<Connector[]>("/connectors");
+  /** Why a connector cannot connect in the org of the workspace now (M8.1): name to reason. */
+  connectorAvailability = (workspaceId: string) =>
+    this.json<Record<string, string>>(`/workspaces/${workspaceId}/connectors/availability`);
   listConnections = (workspaceId: string) =>
     this.json<Connection[]>(`/workspaces/${workspaceId}/connections`);
   startConnection = (workspaceId: string, connector: string, scope: ConnectionScope) =>

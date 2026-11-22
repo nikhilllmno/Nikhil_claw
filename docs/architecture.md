@@ -8300,6 +8300,29 @@ an owner or admin of an org sees Admin and Billing. A user without an org sees o
 Help. While the setup guide has open steps, an admin sees "Finish the setup" in the sidebar and
 a card on the home page.
 
+**Sign-in across tabs and deep links (M8.1).** The tokens stay in `sessionStorage` (the
+choice of the minimal page, Section 11.4): they are not on disk after the last tab closes. A
+link that opens a new tab (a link from the chat opens with `target="_blank"` and `noopener`,
+so the new tab gets no copy of `sessionStorage`) asks the open tabs of the browser for the
+tokens over the `BroadcastChannel` `sama.auth`, and waits at most 400 ms. A signed-in tab
+answers. A sign-in, a token refresh, and a sign-out in one tab go to the other tabs, so no tab
+keeps a refresh token that Supabase rotated. A failed refresh signs out only its own tab.
+Trade-off: the channel is same-origin, as `sessionStorage` is, so a script of another site
+cannot read it, but a tab of the same browser that sama itself runs gets the tokens; a browser
+without a signed-in tab still shows the sign-in page. A signed-out tab keeps the address that
+the user opened (`localStorage` `sama.returnTo`, at most one hour, only a path of the app that
+is not `/login`), and the sign-in page opens it after the sign-in, so a link to the
+Connections page with `?connect=gmail` still starts the connection.
+
+**Connect card (M8.1).** A `connection_request` or `connection_add_mcp` answer of a run that
+the chat streams shows a card with a **Connect** button under the tool calls (Section
+10.3.4). The button opens the sign-in page of the provider in a new tab. After the click, the
+card checks the connection every 4 seconds (and when the tab gets the focus) for at most 15
+minutes, and shows "connected". The Connections page lists the app connectors first, has a
+search field, shows "Not available now" with the reason of
+`GET /workspaces/{id}/connectors/availability`, and shows **Retry** and a reason for a row
+that is `initiated`, `failed`, or `expired`.
+
 **Setup guide (`/onboarding`).** After a person creates an org, the web app opens the guide.
 It has five steps: create the org (done), choose a plan, connect a chat app, pick or create an
 agent, and send a first message.

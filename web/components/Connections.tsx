@@ -50,6 +50,9 @@ import {
   withConnection,
   withoutConnection,
   withoutEntryParams,
+  connectLabel,
+  orderConnectors,
+  stuckHint,
 } from "@/lib/connections";
 import { toneBadge } from "@/lib/history";
 import { useApi } from "./AuthProvider";
@@ -111,6 +114,27 @@ export function Connections() {
 
   const loadCatalog = useCallback(() => api.listConnectors(), [api]);
   const catalog = useLoad(loadCatalog, "Could not load the connectors.");
+  const [query, setQuery] = useState("");
+  // Why a connector cannot connect now (no Composio key, ...): the rows say so (M8.1).
+  const [availability, setAvailability] = useState<{ workspaceId: string; reasons: Record<string, string> } | null>(
+    null,
+  );
+  useEffect(() => {
+    if (workspaceId === null) return;
+    let live = true;
+    api.connectorAvailability(workspaceId).then(
+      (reasons) => {
+        if (live) setAvailability({ workspaceId, reasons });
+      },
+      () => {
+        // An older API has no availability route: every connector looks available.
+        if (live) setAvailability({ workspaceId, reasons: {} });
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [api, workspaceId]);
 
   // The connections of the workspace. The list keeps its workspace, so the page never shows
   // (or acts on) the rows of the workspace before. `changes` counts the changes of the page: a
@@ -233,7 +257,11 @@ export function Connections() {
   if (me === null) return <LoadingState label="Loading the connections" />;
   const workspace = workspaces.find((w) => w.id === workspaceId) ?? null;
   const rows = workspace === null ? null : listFor(list, workspace.id);
-  const cards = catalog.data === null || rows === null ? [] : [...catalog.data, ...customServers(rows, catalog.data)];
+  const cards =
+    catalog.data === null || rows === null
+      ? []
+      : orderConnectors([...catalog.data, ...customServers(rows, catalog.data)], query);
+  const reasons = availability !== null && availability.workspaceId === workspaceId ? availability.reasons : {};
 
   return (
     <div className={styles.page}>
@@ -267,12 +295,25 @@ export function Connections() {
         <LoadingState label="Loading the connections" />
       ) : (
         <>
-        {cards.length === 0 ? <p className="alert">This sama has no connectors.</p> : null}
+        <label className={styles.search}>
+          <span>Find a connector</span>
+          <input
+            type="search"
+            className="input"
+            value={query}
+            placeholder="Gmail, calendar, database"
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        {cards.length === 0 ? (
+          <p className="alert">{query ? "No connector matches." : "This sama has no connectors."}</p>
+        ) : null}
         <ul className={styles.list}>
           {cards.map((connector) => (
             <li key={connector.name}>
               <ConnectorCard
                 connector={connector}
+                unavailable={reasons[connector.name] ?? null}
                 connections={rows}
                 formFor={formFor}
                 onStart={(scope) => start(workspace.id, connector.name, scope)}
@@ -859,6 +900,7 @@ function AddApi({ onAdd }: { onAdd: (draft: ApiDraft) => Promise<void> }) {
 
 function ConnectorCard({
   connector,
+  unavailable,
   connections,
   formFor,
   onStart,
@@ -867,6 +909,7 @@ function ConnectorCard({
   onRemoved,
 }: {
   connector: Connector;
+  unavailable: string | null;
   connections: Connection[];
   formFor: string | null;
   onStart: (scope: ConnectionScope) => Promise<void>;
@@ -881,9 +924,15 @@ function ConnectorCard({
         <span className={styles.meta}>{toolSummary(connector)}</span>
       </div>
       <p className={styles.description}>{connector.description}</p>
+      {unavailable ? (
+        <p className="alert" role="note">
+          Not available now. {unavailable}
+        </p>
+      ) : null}
       {connector.scopes.map((scope) => (
         <ScopeRow
           key={scope}
+          unavailable={unavailable !== null}
           connector={connector}
           scope={scope}
           connection={connectionOf(connections, connector.name, scope)}
@@ -899,6 +948,7 @@ function ConnectorCard({
 }
 
 function ScopeRow({
+  unavailable,
   connector,
   scope,
   connection,
@@ -908,6 +958,7 @@ function ScopeRow({
   onCloseForm,
   onRemoved,
 }: {
+  unavailable: boolean;
   connector: Connector;
   scope: ConnectionScope;
   connection: Connection | null;
@@ -949,10 +1000,10 @@ function ScopeRow({
             <button
               type="button"
               className="btn btn-primary btn-small"
-              disabled={busy !== null}
+              disabled={busy !== null || unavailable}
               onClick={() => act("connect", onStart)}
             >
-              {busy === "connect" ? "Connecting" : connection === null ? "Connect" : "Connect again"}
+              {busy === "connect" ? "Connecting" : connectLabel(connection?.state ?? null)}
             </button>
           ) : null}
           {connection !== null && canCheck(connector, connection) ? (
@@ -994,6 +1045,9 @@ function ScopeRow({
         </div>
       </div>
       {connection?.last_error ? <p className={styles.error}>{connection.last_error}</p> : null}
+      {connection && !connection.last_error && stuckHint(connection.state, connector.kind) ? (
+        <p className={styles.description}>{stuckHint(connection.state, connector.kind)}</p>
+      ) : null}
       {connection?.kind === "mcp_hosted" && connection.mcp?.custom ? (
         <HostedInfo hosted={connection.mcp.custom as HostedCustom} />
       ) : null}
