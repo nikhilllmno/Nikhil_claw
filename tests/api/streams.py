@@ -64,7 +64,8 @@ class EventStream:
         assert predicate(self.events), f"the stream ended before {what}"
         return self.events
 
-    async def _run(self, app: FastAPI, path: str, headers: dict[str, str]) -> None:
+    async def _run(self, app: FastAPI, target: str, headers: dict[str, str]) -> None:
+        path, _, query = target.partition("?")
         scope = {
             "type": "http",
             "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -74,7 +75,7 @@ class EventStream:
             "path": path,
             "raw_path": path.encode(),
             "root_path": "",
-            "query_string": b"",
+            "query_string": query.encode(),
             "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
             "server": ("sama.test", 80),
             "client": ("127.0.0.1", 1),

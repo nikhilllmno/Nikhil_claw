@@ -246,8 +246,12 @@ async def test_a_user_creates_a_session(
 # -- messages, runs, and the event stream ------------------------------------------------------
 
 
+def _has_run_completed(events: list[tuple[str, dict[str, Any], str | None]]) -> bool:
+    return any(e[0] == "run_event" and e[1].get("type") == "run_completed" for e in events)
+
+
 async def test_a_message_runs_and_streams(
-    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+    client: httpx.AsyncClient, stream_app: FastAPI, engine: AsyncEngine, tenant: Tenant
 ) -> None:
     harness = Harness(engine)
     harness.runtime.add_script(
@@ -271,11 +275,14 @@ async def test_a_message_runs_and_streams(
     )
     assert [m["text"] for m in later.json()] == ["hello"]
 
-    stream = await client.get(
-        f"/sessions/{s1}/events", headers=mia(tenant), params={"after": start}
-    )
-    assert stream.headers["content-type"].startswith("text/event-stream")
-    events = sse(stream.text)
+    # The short stream of ``client`` (0.3 s) can end before its first poll on a slow runner, so
+    # the test reads the events from a long stream and waits for them with a bounded wait.
+    head = await client.get(f"/sessions/{s1}/events", headers=mia(tenant))
+    assert head.headers["content-type"].startswith("text/event-stream")
+    path = f"/sessions/{s1}/events"
+    cursor = {**mia(tenant), "Last-Event-ID": str(start)}
+    async with open_stream(stream_app, path, cursor) as stream:
+        events = await stream.wait_for(_has_run_completed, what="the run_completed event")
     run_events = [e for e in events if e[0] == "run_event"]
     assert [e[1]["type"] for e in run_events] == ["text_delta", "text_delta", "run_completed"]
     assert {e[1]["run_id"] for e in run_events} == {str(run_id)}
@@ -286,12 +293,10 @@ async def test_a_message_runs_and_streams(
     # runner.
 
     # Last-Event-ID wins over ?after=, and a stream without a cursor starts at the end.
-    resumed = await client.get(
-        f"/sessions/{s1}/events",
-        headers={**mia(tenant), "Last-Event-ID": str(ids[1])},
-        params={"after": 0},
-    )
-    assert [e[1]["type"] for e in sse(resumed.text) if e[0] == "run_event"] == ["run_completed"]
+    resume = {**mia(tenant), "Last-Event-ID": str(ids[1])}
+    async with open_stream(stream_app, f"{path}?after=0", resume) as resumed:
+        later_events = await resumed.wait_for(_has_run_completed, what="the resumed event")
+    assert [e[1]["type"] for e in later_events if e[0] == "run_event"] == ["run_completed"]
     fresh = await client.get(f"/sessions/{s1}/events", headers=mia(tenant))
     assert [e for e in sse(fresh.text) if e[0] == "run_event"] == []
     bad = await client.get(f"/sessions/{s1}/events", headers={**mia(tenant), "Last-Event-ID": "x"})
