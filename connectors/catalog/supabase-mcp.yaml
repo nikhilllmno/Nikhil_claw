@@ -4,6 +4,9 @@ name: supabase-mcp
 title: Supabase MCP
 description: Manage Supabase projects, run SQL, and read logs and docs.
 kind: mcp_remote
+aliases:
+- supabase project
+- supabase management
 scopes:
 - personal
 - workspace

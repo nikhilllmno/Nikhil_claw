@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.coding.agents import CodingAgent, label
+from sama.connectors.chat import cards as connect_cards
 from sama.context import Pin, PinError, PinStore
 from sama.db.models import (
     ENDED_RUN_STATUSES,
@@ -658,6 +659,16 @@ def coding_progress(payload: dict[str, Any]) -> str | None:
     return f"> {label(agent)}: {text}" if text else None
 
 
+SAMA_TOOL_PREFIX: Final = "mcp__sama__"
+CONNECT_TOOLS: Final = frozenset({"connection_request", "connection_add_mcp"})
+
+
+def connect_button_text(found: Mapping[str, Any]) -> str:
+    """The text above a connect button in a chat (M8.1)."""
+    title = str(found.get("title") or "the app")
+    return f"Sign in to connect {title}. sama continues your request when you finish."
+
+
 async def follow_run(
     engine: AsyncEngine,
     org_id: uuid.UUID,
@@ -665,13 +676,17 @@ async def follow_run(
     reply: Reply,
     settings: FollowSettings,
     send_card: Callable[[Any], Awaitable[None]],
+    send_connect: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> str:
     """Shows the text of the run in ``reply`` and gives each new open approval to
-    ``send_card``, until the run ends or ``max_follow_s`` passes. Returns the last status."""
+    ``send_card``, until the run ends or ``max_follow_s`` passes. Returns the last status.
+    ``send_connect`` gets each connect card of a ``connection_request`` or
+    ``connection_add_mcp`` answer, after the text so far (M8.1)."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + settings.max_follow_s
     seq = -1
     carded: set[uuid.UUID] = set()
+    connect_calls: set[str] = set()
     status = "queued"
     while loop.time() < deadline:
         read = await read_run(engine, org_id, run_id, seq)
@@ -684,6 +699,20 @@ async def follow_run(
                 line = coding_progress(event.payload)
                 if line is not None:
                     await reply.add_line(line)
+            elif send_connect is not None and event.type == "tool_call_started":
+                name = str(event.payload.get("name", "")).removeprefix(SAMA_TOOL_PREFIX)
+                if name in CONNECT_TOOLS:
+                    connect_calls.add(str(event.payload.get("call_id", "")))
+            elif (
+                send_connect is not None
+                and event.type == "tool_call_finished"
+                and str(event.payload.get("call_id", "")) in connect_calls
+            ):
+                for found in connect_cards(str(event.payload.get("output_preview", ""))):
+                    if found.get("url"):
+                        await reply.flush(final=True)
+                        reply.restart()
+                        await send_connect(found)
         new = [row for row in read.pending if row.id not in carded]
         if new:
             await reply.flush(final=True)

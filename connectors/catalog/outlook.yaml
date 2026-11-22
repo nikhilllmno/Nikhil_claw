@@ -1,0 +1,407 @@
+# The Outlook connector (docs/architecture.md, Section 10.3). Composio holds the
+# credential. The tool schemas are a trimmed copy of the Composio tool schemas.
+name: outlook
+title: Outlook
+description: Read, search, draft, and send email in Outlook (Microsoft 365), and read the calendar.
+kind: composio
+aliases:
+- email
+- mail
+- inbox
+- e-mail
+- microsoft mail
+- office 365
+- microsoft 365
+- hotmail
+scopes:
+- personal
+- workspace
+composio:
+  toolkit: outlook
+tools:
+- name: outlook_list_messages
+  slug: OUTLOOK_OUTLOOK_LIST_MESSAGES
+  access: read
+  description: Retrieves a list of email messages from a specified mail folder in an outlook mailbox,
+    with options for filtering (including by conversationid to get all messages in a thread), pagination,
+    and sorting; ensure 'user id' and 'folder' are valid, and all date/time strings are in iso 8601 format.
+  input_schema:
+    type: object
+    properties:
+      top:
+        type: integer
+        default: 10
+        description: Maximum number of messages to return (1-1000).
+      skip:
+        type: integer
+        default: 0
+        description: Number of messages to skip from the beginning of the result set, for pagination.
+      folder:
+        type: string
+        default: inbox
+        description: ID or well-known name of the mail folder (e.g., 'Inbox', 'SentItems', 'Drafts', 'DeletedItems').
+      select:
+        type: array
+        items:
+          type: string
+          properties: {}
+        description: List of message properties to include. Each item is a property name like 'subject',
+          'from', or 'receivedDateTime'. MUST be provided as a list. Reduces data transfer.
+      is_read:
+        type: boolean
+        description: 'Filter by read status: ''true'' for read, ''false'' for unread. Unspecified means
+          no filter by read status.'
+      orderby:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default:
+        - receivedDateTime desc
+        description: List of properties to sort results by, with direction. Each item is a string like
+          'receivedDateTime desc' or 'subject asc'. MUST be provided as a list, even for single sort criteria.
+      subject:
+        type: string
+        description: Filter by exact match of the subject line.
+      user_id:
+        type: string
+        default: me
+        description: Target user's email or 'me' for authenticated user. For delegated access, use shared
+          mailbox or delegated user's email.
+      categories:
+        type: array
+        items:
+          type: string
+          properties: {}
+        description: Filter by categories (case-sensitive); matches if tagged with any specified category.
+      importance:
+        type: string
+        description: 'Filter by importance: ''low'', ''normal'', or ''high''.'
+      from_address:
+        type: string
+        description: Filter by the sender's exact email address.
+      conversationId:
+        type: string
+        description: Filter messages by conversation ID to retrieve all messages in a specific email thread.
+      has_attachments:
+        type: boolean
+        description: 'Filter by attachment presence: ''true'' for messages with attachments, ''false''
+          for those without.'
+      subject_contains:
+        type: string
+        description: Filter messages where the subject contains the specified case-insensitive substring.
+      subject_endswith:
+        type: string
+        description: Filter messages where the subject ends with the specified case-insensitive string.
+      sent_date_time_gt:
+        type: string
+        description: Filter messages sent after this ISO 8601 timestamp.
+      sent_date_time_lt:
+        type: string
+        description: Filter messages sent before this ISO 8601 timestamp.
+      subject_startswith:
+        type: string
+        description: Filter messages where the subject starts with the specified case-insensitive string.
+      received_date_time_ge:
+        type: string
+        description: Filter messages received on or after this ISO 8601 timestamp.
+      received_date_time_gt:
+        type: string
+        description: Filter messages received after this ISO 8601 timestamp (e.g., '2023-01-01T00:00:00Z').
+      received_date_time_le:
+        type: string
+        description: Filter messages received on or before this ISO 8601 timestamp.
+      received_date_time_lt:
+        type: string
+        description: Filter messages received before this ISO 8601 timestamp.
+- name: outlook_search_messages
+  slug: OUTLOOK_OUTLOOK_SEARCH_MESSAGES
+  access: read
+  description: Searches messages in a microsoft 365 or enterprise outlook account mailbox, supporting
+    filters for sender, subject, attachments, pagination, and sorting by relevance or date.
+  input_schema:
+    type: object
+    required:
+    - query
+    properties:
+      size:
+        type: integer
+        default: 25
+        description: The maximum number of search results to return in a single response for pagination.
+      query:
+        type: string
+        description: The free-text search string. Can include terms from the message body, attachments,
+          sender, subject, or other properties.
+      subject:
+        type: string
+        description: Text to search for within the message subject line.
+      fromEmail:
+        type: string
+        description: The sender's email address to filter messages; only Microsoft 365/Enterprise domains
+          are supported.
+      from_index:
+        type: integer
+        default: 0
+        description: The 0-based starting index for the returned search results for pagination.
+      hasAttachments:
+        type: boolean
+        description: Filters messages based on the presence of attachments.
+      enable_top_results:
+        type: boolean
+        default: false
+        description: If `true`, sorts results by relevance; otherwise, sorts by date in descending order
+          (newest first).
+    description: Searches Outlook messages for Microsoft 365/Enterprise accounts using the Microsoft Search
+      API.
+- name: outlook_get_message
+  slug: OUTLOOK_OUTLOOK_GET_MESSAGE
+  access: read
+  description: Retrieves a specific email message by its id from the specified user's outlook mailbox.
+    use the 'select' parameter to include specific fields like 'internetmessageheaders' for filtering
+    automated emails.
+  input_schema:
+    type: object
+    required:
+    - message_id
+    properties:
+      select:
+        type: string
+        description: Comma-separated list of properties to include. Use 'internetMessageHeaders' to get
+          email headers for filtering automated messages.
+      user_id:
+        type: string
+        default: me
+        description: User's email address, UPN, or 'me' for the currently authenticated user.
+      message_id:
+        type: string
+        description: Unique ID of the Outlook email message to retrieve.
+- name: outlook_get_profile
+  slug: OUTLOOK_OUTLOOK_GET_PROFILE
+  access: read
+  description: Retrieves the microsoft outlook profile for a specified user.
+  input_schema:
+    type: object
+    properties:
+      user_id:
+        type: string
+        default: me
+        description: The user's unique identifier or principal name. Use 'me' to get the profile of the
+          authenticated user.
+- name: outlook_list_events
+  slug: OUTLOOK_OUTLOOK_LIST_EVENTS
+  access: read
+  description: Retrieves events from a user's outlook calendar via microsoft graph api, supporting pagination,
+    filtering, property selection, sorting, and timezone specification.
+  input_schema:
+    type: object
+    properties:
+      top:
+        type: integer
+        default: 10
+        description: Maximum number of events to retrieve per page for pagination.
+      skip:
+        type: integer
+        default: 0
+        description: Number of initial events to bypass, used for pagination.
+      filter:
+        type: string
+        default: ''
+        description: OData query string to filter events (e.g., "start/dateTime ge 'YYYY-MM-DDTHH:MM:SSZ'");
+          string literals use single quotes.
+      select:
+        type: array
+        items:
+          type: string
+          properties: {}
+        description: List of specific event property names to return. Each item is a property name like
+          'subject' or 'start'. MUST be provided as a list. If omitted, a default set of properties is
+          returned.
+      orderby:
+        type: array
+        items:
+          type: string
+          properties: {}
+        description: List of properties to sort results by. Each item is a string like 'start/dateTime
+          desc' or 'subject asc'. MUST be provided as a list, even for single sort criteria. Use 'asc'
+          (default) or 'desc' for order.
+      user_id:
+        type: string
+        default: me
+        description: Email address of the target user (or 'me' for authenticated user), identifying the
+          calendar for event listing.
+      timezone:
+        type: string
+        default: UTC
+        description: Preferred IANA or Windows timezone for event start/end times (e.g., 'America/New_York');
+          defaults to UTC if unspecified/invalid.
+      expand_recurring_events:
+        type: boolean
+        default: false
+        description: When true, automatically expands recurring events to show actual occurrences within
+          the filtered date range instead of series masters. When false (default), returns series masters
+          as before.
+- name: outlook_create_draft
+  slug: OUTLOOK_OUTLOOK_CREATE_DRAFT
+  access: write
+  description: Creates an outlook email draft with subject, body, recipients, and an optional attachment.
+    supports creating drafts as part of existing conversation threads by specifying a conversationid;
+    attachments require a name, mimetype, and content.
+  input_schema:
+    type: object
+    required:
+    - subject
+    - body
+    - to_recipients
+    properties:
+      body:
+        type: string
+        description: Content of the email draft; use `is_html` to specify if HTML or plain text.
+      is_html:
+        type: boolean
+        default: false
+        description: Specifies if the `body` is HTML. If `False`, `body` is plain text.
+      subject:
+        type: string
+        description: Subject line for the email draft.
+      attachment:
+        type: object
+        required:
+        - name
+        - mimetype
+        - s3key
+        properties:
+          name:
+            type: string
+          s3key:
+            type: string
+          mimetype:
+            type: string
+        description: Optional file to attach. If provided, must include the file's content, name, and
+          mimetype.
+      cc_recipients:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default: []
+        description: Optional list of CC (carbon copy) recipient email addresses.
+      to_recipients:
+        type: array
+        items:
+          type: string
+          properties: {}
+        description: List of primary 'To' recipient email addresses.
+      bcc_recipients:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default: []
+        description: Optional list of BCC (blind carbon copy) recipient email addresses.
+      conversation_id:
+        type: string
+        description: Optional conversation ID to create the draft as part of an existing email conversation
+          thread. If provided, the draft will be part of the specified conversation instead of starting
+          a new one.
+- name: outlook_send_email
+  slug: OUTLOOK_OUTLOOK_SEND_EMAIL
+  access: write
+  description: Sends an email with subject, body, recipients, and an optional attachment via microsoft
+    graph api; attachments require a non-empty file with valid name and mimetype.
+  input_schema:
+    type: object
+    required:
+    - subject
+    - body
+    - to_email
+    properties:
+      body:
+        type: string
+        description: The content of the email body, plain text or HTML based on `is_html`.
+      is_html:
+        type: boolean
+        default: false
+        description: Specifies if the email body is HTML; `True` for HTML, `False` for plain text.
+      subject:
+        type: string
+        description: The subject line of the email.
+      to_name:
+        type: string
+        description: The display name of the primary recipient.
+      user_id:
+        type: string
+        default: me
+        description: The user's email address or the alias 'me' to represent the authenticated user.
+      to_email:
+        type: string
+        description: The primary recipient's email address.
+      cc_emails:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default: []
+        description: List of email addresses for CC recipients.
+      attachment:
+        type: object
+        required:
+        - name
+        - mimetype
+        - s3key
+        properties:
+          name:
+            type: string
+          s3key:
+            type: string
+          mimetype:
+            type: string
+        description: Optional file to attach. If provided, its name, mimetype, and content must be valid
+          and non-empty.
+      bcc_emails:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default: []
+        description: List of email addresses for BCC recipients.
+      save_to_sent_items:
+        type: boolean
+        default: true
+        description: Indicates if the email should be saved in 'Sent Items'.
+- name: outlook_reply_email
+  slug: OUTLOOK_OUTLOOK_REPLY_EMAIL
+  access: write
+  description: Sends a plain text reply to an outlook email message, identified by `message id`, allowing
+    optional cc and bcc recipients.
+  input_schema:
+    type: object
+    required:
+    - message_id
+    - comment
+    properties:
+      comment:
+        type: string
+        description: The plain text body of the reply email.
+      user_id:
+        type: string
+        default: me
+        description: The user's email address or 'me' to indicate the authenticated user. This specifies
+          the mailbox from which the reply will be sent.
+      cc_emails:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default: []
+        description: List of email addresses for CC recipients.
+      bcc_emails:
+        type: array
+        items:
+          type: string
+          properties: {}
+        default: []
+        description: List of email addresses for BCC recipients.
+      message_id:
+        type: string
+        description: The unique ID of the message to reply to. This ID can be obtained from the `OUTLOOK_LIST_MESSAGES`
+          action.

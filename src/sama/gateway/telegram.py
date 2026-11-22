@@ -67,6 +67,7 @@ from sama.gateway.sessions import (
     Target,
     approval_text,
     busy_text,
+    connect_button_text,
     decide,
     find_session,
     follow_run,
@@ -1160,12 +1161,20 @@ class TelegramGateway:
             text, buttons = _approval_card(row)
             await outbox.send_message(text, buttons=buttons)
 
+        async def send_connect(found: dict[str, Any]) -> None:
+            # A URL button opens the sign-in page of the provider (M8.1).
+            title = str(found.get("title") or "the app")
+            button = {"text": f"Connect {title}", "url": str(found["url"])}
+            await outbox.send_message(connect_button_text(found), buttons=[[button]])
+
         try:
             with contextlib.suppress(TelegramError):
                 await self._client.typing(chat_id)
             while True:
                 reply = Reply(outbox, reply_to, settings.edit_interval_s)
-                status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
+                status = await follow_run(
+                    self._engine, org_id, run_id, reply, settings, send_card, send_connect
+                )
                 await send_ending(self._engine, outbox, org_id, run_id, status, reply)
                 await send_media(self._engine, outbox, org_id, run_id, reply_to=reply_to)
                 after = await self._queue.requeued_run(org_id=org_id, run_id=run_id)

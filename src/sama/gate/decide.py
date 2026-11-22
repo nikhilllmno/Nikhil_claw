@@ -45,7 +45,9 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "cron": frozenset({"cronjob_manage"}),
     "workflows": frozenset({"workflow_manage", "workflow_run"}),
     "self": frozenset({"change_propose", "sama_pr"}),
-    "connections": frozenset({"connections_list", "connection_request", "connection_test"}),
+    "connections": frozenset(
+        {"connections_list", "connection_request", "connection_test", "connection_add_mcp"}
+    ),
     "integrations": frozenset(),
     "custom_tools": frozenset(),
     "delegation": frozenset({"delegate_task", "delegate_status"}),
@@ -145,7 +147,9 @@ skill store checks the role of the user for the scope of each write (Section 9.2
 write is a version that can be reverted. ``change_propose`` is here because it only stores a
 proposal: a person with the role decides it on an approval card (M3.2). ``plan_propose`` only
 stores a plan that a person approves, edits, or rejects (Section 15.5). ``connection_request``
-only sends a link, and the agent cannot give credentials with it (Section 10.3).
+starts a sign-in on the page of the provider, and the agent cannot give credentials with it
+(Section 10.3); a workspace connection asks a person first through the escalation of the control
+plane (M8.1). ``connection_add_mcp`` is not here: a new server gets the calls of the agents.
 The ``delegation`` and ``tasks`` tools are here because they write only sama state of the same
 workspace and audience, and each child run or task run passes the gate again for every tool
 that it calls (Sections 12.4 and 13.2). ``cronjob_manage`` is here because a job that the

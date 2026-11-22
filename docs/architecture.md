@@ -164,7 +164,7 @@ Five rules shape the design:
 | D7 | **Supabase** is the system of record: Postgres with RLS, Auth, Storage, and pgvector. | Already in the owner's stack. RLS is a second tenant guard under the API. pgvector covers session search and memory recall. |
 | D8 | **Postgres is the job queue** (`FOR UPDATE SKIP LOCKED` with leases) for runs, cron fires, workflow steps, and deliveries. No separate workflow engine in v1. | Fewer moving parts. vorflux made the same choice. The queue sits behind an interface. |
 | D9 | The **prompt prefix is frozen per session**: SOUL, context files, tool list, memory snapshot, skill index. New memory and skills apply from the next session. A short note on the next user message tells the agent about new skills. | Hermes rule. It keeps prompt caching valid on both SDKs and makes runs reproducible (`RunConfig.fingerprint()`). |
-| D10 | **Connectors use one model for all kinds**: Composio toolkits, remote MCP servers, hosted stdio MCP servers, databases, HTTP APIs, and plugins. Connections are per user or per workspace, with credentials in the sama vault. Rare tools sit behind `tool_search`. | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
+| D10 | **Connectors use one model for all kinds**: Composio toolkits, remote MCP servers, hosted stdio MCP servers, databases, HTTP APIs, and plugins. Connections are per user or per workspace, with credentials in the sama vault. Rare tools sit behind `tool_search`. Since M8.1 a sign-in connector connects from the chat in one click and the request continues after the sign-in; secrets still go only into the forms of the web app (Section 10.3.4). | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
 | D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Events API over HTTP, Web API with `httpx`), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
 | D13 | **Approvals fail closed.** Each tool call gets `allow`, `ask`, or `deny` from a policy. `ask` pauses the run and sends an approval card to the user's channel. Unattended runs (cron, workflows, webhooks) turn `ask` into `deny`, unless a human approved a pre-approval for that tool in that job version. A hardline deny list cannot be overridden. | Hermes three-layer model. A human is not present for unattended runs. |
@@ -2413,7 +2413,7 @@ config:
 | `browser` | `browser_open`, `browser_snapshot`, `browser_act`, `browser_screenshot`, `browser_extract`, `browser_tabs` (since M5.1, Section 14.1). Each has an optional `target` (since M5.5). `browser_vault` (since M5.3, when the process has the vault). `browser_task` (since M5.6, `cloud` target only). `browser_act`, `browser_vault`, and `browser_task` are `ask` by default, and a sensitive action in the user's Chrome is always `ask` (Section 14.2.2). | Sama MCP to Browserbase (`cloud`) and to the extension of the user (`my_chrome`, since M5.5). |
 | `media` | `vision_analyze` (M2.8, Section 11.7), `image_generate` and `text_to_speech` (M4.9, Section 11.8), `video_analyze` (M7.5, Section 10.2.2), `transcribe` | Sama MCP |
 | `moa` | `moa`: mixture of agents (M7.5, Section 10.2.2) | Sama MCP (model keys on the control plane) |
-| `connections` | `connections_list`, `connection_request` (gives the user a link to the Connections page), `connection_test` (since M3.4, Section 10.3) | Sama MCP |
+| `connections` | `connections_list`, `connection_request` (starts the sign-in and gives a Connect card; M8.1), `connection_test` (since M3.4, Section 10.3), `connection_add_mcp` (a server by URL, with an approval; M8.1) | Sama MCP |
 | `integrations` | Connector tools, behind `tool_search` (Section 10.3). Since M3.4: Composio and HTTP API. Since M3.5: remote MCP servers (`mcp_<connection>_<tool>`). Since M3.11: database (PostgreSQL, Supabase, Neon). Since M4.13: MySQL, MariaDB, SQL Server, BigQuery, Snowflake, ClickHouse, MongoDB. Since M4.11: hosted stdio MCP servers (`mcp_<connection>_<tool>`). Since M4.12: HTTP APIs from OpenAPI (`api_<connection>_<tool>`). Later: plugin. | Sama MCP (Composio, HTTP client, MCP proxy, database gateway) |
 | `github` | `repo_clone`, `pr_create`, `pr_comment`, `repo_push_approval` through the sama GitHub App and the sama git proxy (M3.7). Without the App: `repo_clone` of public repos only (Section 15.1). | Sama MCP plus sandbox git |
 | `plan` | `plan_propose` (since M7.9): the agent proposes a plan in coding mode, and a person approves, edits, or rejects it (Section 15.5). | Sama MCP |
@@ -2597,13 +2597,18 @@ gets one notice per change.
 
 **How a user connects something**
 
-1. The user opens the Connections page in the web app, or types `/connect supabase` in any
-   channel, or the agent calls `connection_request` when it needs a connector.
-2. Sama shows a card with a link. OAuth connectors open the provider's consent page. Form
+1. The user says "connect my Gmail" in any channel, or types `/connect gmail`, or the agent
+   calls `connection_request` when a task needs a connector, or the user opens the
+   Connections page in the web app.
+2. For a sign-in connector (Composio, or a remote MCP server with OAuth), sama starts the
+   connection at once and shows a **Connect Gmail** card with the sign-in page of the provider
+   (since M8.1, Section 10.3.4). A server without sign-in connects in the same step. Form
    connectors (databases, API keys, stdio servers) open a form in the web app. **Secrets are
    never typed in chat**, so they never enter a transcript.
-3. Sama stores the secret in the vault, tests the connection, discovers the tools, and sets
-   `connected`.
+3. The sign-in comes back to a page of the control plane. Sama stores the secret in the vault,
+   tests the connection, discovers the tools, and sets `connected`. Then sama writes a note into
+   the session that asked, and a short run continues the request of the user. The user does not
+   say "done".
 4. The tools are available at once in new and running sessions through `tool_search`, so the
    frozen prompt prefix does not change (D9). Hermes needs `/reload-mcp`, which breaks the
    prompt cache. Sama does not.
@@ -2612,9 +2617,10 @@ gets one notice per change.
 
 | Tool | Purpose |
 |---|---|
-| `connections_list` | Lists the connections that this session can use, with state and a short description |
-| `connection_request` | Asks the user to connect a connector. Sends a card with the link or form. The agent cannot supply credentials. |
+| `connections_list` | Lists the connections that this session can use, with state and a short description, the role of the user, and why a connector is not available now |
+| `connection_request` | Starts the connection of a connector and sends a card with the sign-in page of the provider, or the link to the form. It takes a name, a title, or the words of the user (`email`, `calendar`). The agent cannot supply credentials. |
 | `connection_test` | Runs the health check for one connection and returns the state |
+| `connection_add_mcp` | Adds a remote MCP server by its URL (M8.1). A person approves it first, and only a workspace admin or the org owner can add one. |
 
 **Tool naming and exposure**
 
@@ -2691,11 +2697,12 @@ gets one notice per change.
   `SAMA_WEB_ORIGINS`, else `SAMA_PUBLIC_URL`. A user who is not signed in signs in and opens
   the link again.
 - **Channels.** `/connect <name>` in Telegram and `/sama connect <name>` in Slack answer with a
-  link to the Connections page and a warning not to send secrets in chat. In a private chat
+  link to the Connections page and a warning not to send secrets in chat. Since M8.1 the agent
+  starts the sign-in from the chat (Section 10.3.4). In a private chat
   the link is for a personal connection. In a group chat or a linked channel it is for a
   workspace connection. They never take a secret.
 - **Agent tools.** `connections_list`, `connection_request`, and `connection_test` are in the
-  default `allow` list. `connection_request` gives a link only. The connector tools are
+  default `allow` list. `connection_request` gave a link only until M8.1 (Section 10.3.4). The connector tools are
   deferred tools in the toolset `integrations`. `tool_search` shows a connector tool only when
   the run has a connected connection that it can use. A private session uses the personal
   connection of its user first, then the workspace connection. A shared session uses only the
@@ -2896,6 +2903,77 @@ gets one notice per change.
   address, or write one endpoint on each line (`GET /items?limit,cursor list_items`). For
   `oauth2`, the form asks how the client sends its id and secret (basic auth or the body). The tool
   list shows the method and the path of each tool.
+
+#### 10.3.4 What M8.1 builds: connect from the chat
+
+The goal: connecting an app from the chat is as short as in Hermes Agent, Claude Code, and Codex:
+ask, sign in at the provider, and go on. Before M8.1, `connection_request` gave only a link to
+the Connections page. That page needed a sama session in the tab, so a link from the chat (a new
+tab) or from a phone ended on the sign-in page of sama, and the deep link was lost. The agent
+could not see the end of a sign-in, so it said "tell me when you are done".
+
+- **Start in the chat.** `connection_request` starts the connection (`ConnectionService.start`
+  with `via = chat` and the origin: the session, the run, and the user) and gives the sign-in
+  link of the provider: the Composio link, or the OAuth authorization URL of a remote MCP server.
+  A server without sign-in connects in the same call, and the answer has its tool count. A form
+  connector (an API key, a database, a bearer MCP server) gets the link to its form in the web
+  app, because secrets never go in chat.
+- **Connect card.** The answer ends with one line `<sama-connect>{json}</sama-connect>` with
+  the connector, the title, the link (`https` only), the connection id, the state, and the scope
+  (`sama.connectors.chat`). The web app shows it as a **Connect** button that follows the state
+  of the connection. The Telegram gateway sends an inline URL button, and the Slack gateway
+  sends a link button, after the text so far (`follow_run`, `send_connect`). WhatsApp and email
+  show the link in the text of the agent. The model reads the same line, so both runtimes work
+  the same.
+- **Return pages on the control plane.** The Composio callback is
+  `<SAMA_PUBLIC_URL>/connections/return?connection=<id>&t=<token>`, and the OAuth redirect URI
+  of a remote MCP server is `<SAMA_PUBLIC_URL>/connections/oauth/return`. Both need no sama
+  session. The Composio page compares `t` with the random token of the last start
+  (`config.return_token`, constant-time compare) and then checks the connection, which only
+  reads the state from Composio. The OAuth page gives the `code` and the `state` to
+  `finish_oauth`: the state check, the single use of the state and the PKCE verifier, and the
+  claim of the row stay as in Section 10.3.1. A sign-in from the Connections page then goes back
+  to that page (`303`). A sign-in from the chat shows a small page: "Gmail is connected. Go back
+  to the chat." Without `SAMA_PUBLIC_URL`, the old web callbacks stay. A sign-in that is open
+  when this change deploys keeps the redirect URI that it registered.
+- **Continue the request.** When a backend check sets `connected` on a row with an origin,
+  sama removes the origin in one locked update (so it continues once) and calls
+  `ConnectionResumer`. It queues a message in the session that asked, "(sama) Gmail is connected
+  now (personal connection). Continue the request that needed Gmail.", without the message
+  rate (a quota still applies), and writes the audit entry `connection.resumed`. The web app
+  shows the run at once. A private session that is bound to the direct chat of the user in
+  Telegram or Slack gets the answer there too (`Handoffs.follow`, through the door of the
+  gateway). A shared group chat sees the answer in the web app only. A sign-in that ends more
+  than 2 hours after the request does not continue the session.
+- **Poll.** `SigninPoller` (a loop of the control plane) checks the open Composio sign-ins of
+  the chats every 5 seconds, at most 50 at a time, so a sign-in connects also when the browser
+  never reaches the return page.
+- **Intent.** A manifest has `aliases`. `Catalog.resolve` maps the words of the user to a
+  connector: `email`, `mail`, and `inbox` give Gmail and Outlook (the agent asks which one),
+  `calendar` gives Google Calendar, and `drive` gives Google Drive. The catalog has `outlook`
+  and `googledrive` (Composio) since M8.1. `slack` and `email` are the connectors of the user.
+  The chat channels have their own names: `slack_app`, `telegram`, `whatsapp`, `whatsapp_meta`,
+  `whatsapp_twilio`, `whatsapp_gupshup`, and `email_channel` (Section 11.9).
+- **Role.** `connections_list` says the role of the user. A workspace connection needs a
+  workspace admin or the org owner, and the call must say `scope: workspace`, so that the tool
+  gate asks a person first (an escalation of the control plane). A chat channel needs an org
+  owner or admin. A member gets the names of the admins to ask, and sama writes the audit entry
+  `connection.requested`.
+- **Fail fast.** `ConnectionService.availability` says in plain words why a connector cannot
+  connect now: no Composio key for the org, no E2B for a hosted server, no vault, or no web
+  address. `connections_list` and `connection_request` show it, and `start` answers `409`
+  before it writes a row. A start that fails after the row exists sets `failed` with the
+  reason, and a Composio row without an account (a start that stopped) checks as `failed`, so
+  no row stays `pending` without a reason. The Connections page shows **Connect again** for a
+  row that is not connected.
+- **Servers by URL from the chat.** `connection_add_mcp(url, auth, name, title, scope)` adds a
+  remote MCP server. It is not in the default allow list, so the gate asks a person. Only a
+  workspace admin or the org owner can add one (a member gets the admins to ask). A URL of a
+  catalog server connects the catalog connector. `auth: oauth` starts the sign-in with a card,
+  `none` connects and lists the tools, and `bearer` gives the link to the form. The name comes
+  from the host (`mcp.linear.app` gives `linear-mcp` when `linear` is a catalog name).
+- **Same session.** The tools of a new connection are in the next `tool_search` of the same
+  session (Section 10.3.1), so the resumed run uses them at once.
 
 **Triggers**: Composio triggers (for example "new email", "new GitHub issue") and webhooks can
 start runs or workflows (Section 12).
@@ -4619,9 +4697,11 @@ MIME message (`send_raw`).
 (`sama.vault.redact`) replaces them with `[REDACTED]` in every log line (Section 16.3).
 
 **Setup through the agent.** `connection_request` accepts the channel names `whatsapp`,
-`whatsapp_meta`, `whatsapp_twilio`, `whatsapp_gupshup`, `email`, `telegram`, and `slack`. For
-`whatsapp` it asks the agent to find the provider first. For the other names it gives the steps
-for a person and a link to the Settings page (`/settings?connect=whatsapp&provider=twilio`), which
+`whatsapp_meta`, `whatsapp_twilio`, `whatsapp_gupshup`, `email_channel`, `telegram`, and
+`slack_app` (since M8.1; before, `email` and `slack`, which now mean the inbox and the Slack
+connectors of the user, Section 10.3.4). For `whatsapp` it asks the agent to find the provider
+first. For the other names it gives an org owner or admin the steps and a link to the Settings
+page; a member gets the names of the admins to ask (`/settings?connect=whatsapp&provider=twilio`), which
 opens the form of the provider. The builtin skill `channel-setup` tells the agent to give the
 steps one at a time and never to ask for a secret in the chat. The secrets go only into the
 web app.
@@ -7562,7 +7642,7 @@ the tool call. So a `clarify` call that nobody waits for ends.
 | `session_read(session_id, offset, limit)` | Returns up to 50 messages of one session that the run may see (Section 7.1). Gives `session not found` for any other id. | Same as `session_search`. |
 | `vision_analyze(attachment_id, question)` | Asks a vision model a question about one image that a user sent in a channel (Section 11.7). `attachment_id` is the id in the `[image attached: ...]` line of the message, or `latest` (the default). The tool reads only the images of the session of the run. Any other id gives `The image was not found`. | A database and an Anthropic key. Without a service the tool is hidden. An org without a key gets the text `Image analysis is not available: no vision model key is configured.` |
 | `tool_search(query, limit)`, `tool_describe(name)`, `tool_call(name, arguments)` | Find, describe, and run the deferred tools that products and connectors register (Section 6.3). The gate judges `tool_call` as a call of the tool that it names (Section 16.1). | A `DeferredCatalog` with at least one tool at the start, or the connection service (M3.5: the tools of remote MCP servers come for each run), or the custom tool service (M7.3, Section 10.8). Otherwise the three tools are hidden. |
-| `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)` | List the connectors and the connections that the run can use, give the user a link to connect one, and check one (Section 10.3). `connection_request` never takes a credential. | The connection service of the control plane (M3.4). |
+| `connections_list()`, `connection_request(connector, scope)`, `connection_test(connector)`, `connection_add_mcp(url, auth, name, title, scope)` | List the connectors and the connections that the run can use, start the sign-in of one with a Connect card, check one, and add a remote MCP server by URL (Sections 10.3 and 10.3.4). No tool takes a credential. | The connection service of the control plane (M3.4, M8.1). |
 | `todo(todos, merge)` | Reads or writes the task list of the session. With no `todos` it reads. `merge=false` replaces the list. `merge=true` changes items by `id` and adds new items. Items have `id`, `content`, and `status` (`pending`, `in_progress`, `completed`, `cancelled`). At most 100 items. | Nothing. |
 
 **Tools since M4.8.** The table above has the tools of M1.8 and M2. These tools came

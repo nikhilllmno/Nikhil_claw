@@ -430,3 +430,81 @@ async def test_each_connection_answer_says_if_the_caller_can_manage_it(
     assert disabled.json()["can_manage"] is True
     enabled = await web.post(f"/connections/{mine['connection']['id']}/enable", headers=mia(tenant))
     assert enabled.json()["can_manage"] is True
+
+
+async def test_the_return_page_needs_no_session_and_goes_back_to_the_page(
+    engine: AsyncEngine, web: httpx.AsyncClient, tenant: Tenant, fake: FakeComposio
+) -> None:
+    """The Composio sign-in comes back to the control plane (M8.1). The token of the start is
+    the proof. A sign-in from the Connections page goes back to it."""
+    started = await web.post(
+        path(tenant), headers=mia(tenant), json={"connector": "gmail", "scope": "personal"}
+    )
+    connection_id = started.json()["connection"]["id"]
+    async with engine.connect() as connection:
+        config = (
+            await connection.execute(
+                select(Connection.config).where(Connection.id == connection_id)
+            )
+        ).scalar_one()
+    # A wrong token: a page that says so, and the row does not change.
+    wrong = await web.get(
+        "/connections/return", params={"connection": connection_id, "t": "x" * 20}
+    )
+    assert wrong.status_code == 400
+    assert "not valid" in wrong.text
+    assert "<script" not in wrong.text
+    fake.status = "ACTIVE"
+    back = await web.get(
+        "/connections/return", params={"connection": connection_id, "t": config["return_token"]}
+    )
+    assert back.status_code == 303
+    assert back.headers["location"].startswith("https://app.sama.test/connections?workspace=")
+    assert f"connection={connection_id}" in back.headers["location"]
+    async with engine.connect() as connection:
+        state = (
+            await connection.execute(select(Connection.state).where(Connection.id == connection_id))
+        ).scalar_one()
+    assert state == "connected"
+
+
+async def test_a_chat_sign_in_gets_a_page_and_a_bad_oauth_return_changes_nothing(
+    engine: AsyncEngine, web: httpx.AsyncClient, tenant: Tenant, fake: FakeComposio
+) -> None:
+    started = await web.post(
+        path(tenant), headers=mia(tenant), json={"connector": "gmail", "scope": "personal"}
+    )
+    connection_id = started.json()["connection"]["id"]
+    async with engine.begin() as connection:
+        config = (
+            await connection.execute(
+                select(Connection.config).where(Connection.id == connection_id)
+            )
+        ).scalar_one()
+        await connection.execute(
+            update(Connection)
+            .where(Connection.id == connection_id)
+            .values(config={**config, "via": "chat"})
+        )
+    fake.status = "ACTIVE"
+    page = await web.get(
+        "/connections/return", params={"connection": connection_id, "t": config["return_token"]}
+    )
+    assert page.status_code == 200
+    assert "Gmail is connected" in page.text
+    assert "go back to the chat" in page.text
+    assert page.headers["cache-control"] == "no-store"
+    bad = await web.get(
+        "/connections/oauth/return", params={"state": f"{connection_id}.nope", "code": "c"}
+    )
+    assert bad.status_code == 400
+    assert "OAuth" in bad.text or "not" in bad.text
+
+
+async def test_the_availability_says_why_a_connector_cannot_connect(
+    web: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    url = f"/workspaces/{tenant.ids['ws']}/connectors/availability"
+    assert (await web.get(url)).status_code == 401
+    # The service of the tests has a Composio key: every catalog connector is available.
+    assert (await web.get(url, headers=mia(tenant))).json() == {}

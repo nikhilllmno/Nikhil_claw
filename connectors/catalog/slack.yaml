@@ -4,6 +4,9 @@ name: slack
 title: Slack
 description: Read channels and messages in Slack, and send messages as the connected user.
 kind: composio
+aliases:
+- slack account
+- slack messages
 scopes:
 - personal
 - workspace

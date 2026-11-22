@@ -24,9 +24,9 @@ import logging
 import os
 import signal
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -54,9 +54,11 @@ from sama.coding_mode.harness import HarnessHooks
 from sama.coding_mode.prepare import CodingPreparer
 from sama.coding_mode.service import CodingService as CodingModeService
 from sama.coding_mode.tool import PlanTool
+from sama.connectors.chat import connection_escalation
 from sama.connectors.database import DatabaseGateway
 from sama.connectors.host import ConnectorHosts, E2BHostBackend
 from sama.connectors.manifest import Catalog
+from sama.connectors.resume import ConnectionResumer, SigninPoller
 from sama.connectors.service import ConnectionService
 from sama.context import ContextArchive
 from sama.context.session_items import PostgresSessionItems
@@ -67,7 +69,7 @@ from sama.datacontrols.service import DataControls, ServiceCleanup
 from sama.datacontrols.sweep import RetentionSweep
 from sama.db.engine import create_engine
 from sama.delegation import DelegationService
-from sama.gate.service import GateService
+from sama.gate.service import Escalation, GateService
 from sama.gate.wire import GATE_PATH
 from sama.gateway.chrome import ChromeHub
 from sama.gateway.handoff import Handoffs
@@ -241,6 +243,8 @@ def build(
         hosts=hosts,
         web_base=settings.web_base,
         database=database,
+        # The sign-in return pages are on the control plane: they need no web session (M8.1).
+        return_base=settings.public_url or None,
     )
     connections.register_tools(deferred)
     # The custom tools of users, workspaces, and orgs (Section 10.8). The sandboxes are set
@@ -306,7 +310,7 @@ def build(
     # run ends. The gate asks the user before a sensitive action in the user's Chrome.
     chrome = ChromeHub()
     browser = _browser_service(settings, engine, chrome, vault)
-    gate.escalation = browser.sensitive_reason
+    gate.escalation = _escalation(browser.sensitive_reason)
     worker = Worker(
         queue,
         registry,
@@ -598,6 +602,8 @@ def build(
         handoffs.register("telegram", hub.door)
     if slack is not None:
         handoffs.register("slack", slack.door)
+    # A finished sign-in from the chat continues its session, also in Telegram and Slack (M8.1).
+    connections.on_connected = ConnectionResumer(engine, queue, connections, handoffs)
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack, whatsapp, email):
@@ -739,6 +745,7 @@ def build(
                 stack.push_async_callback(memory_sync.wait)
             loops = _monitor(settings, engine, stack, sandboxes=e2b, memories=mem0)
             loops.append(RetentionSweep(engine))
+            loops.append(SigninPoller(connections))
             loops.append(TaskDispatcher(engine, queue))
             if embedder is not None:
                 stack.push_async_callback(embedder.aclose)
@@ -874,6 +881,16 @@ def _scheduler(
 
 class _Loop(Protocol):
     async def serve(self, stop: asyncio.Event) -> None: ...
+
+
+def _escalation(browser: Escalation) -> Escalation:
+    """The sensitive browser actions (Section 14.2.2), then a workspace connection that the
+    agent asks for (M8.1)."""
+
+    def escalate(org_id: str, run_id: str, name: str, arguments: Mapping[str, Any]) -> str | None:
+        return browser(org_id, run_id, name, arguments) or connection_escalation(name, arguments)
+
+    return escalate
 
 
 def _monitor(

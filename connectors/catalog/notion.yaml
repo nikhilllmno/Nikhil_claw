@@ -5,6 +5,10 @@ name: notion
 title: Notion
 description: Search and read the Notion pages that you share with your integration, and add pages.
 kind: http_api
+aliases:
+- notes
+- wiki
+- notion pages
 scopes:
 - personal
 - workspace

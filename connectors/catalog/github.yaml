@@ -4,6 +4,11 @@ name: github
 title: GitHub
 description: Read repositories, issues, and pull requests in GitHub, and write issues and comments.
 kind: composio
+aliases:
+- gh
+- git
+- repos
+- repositories
 scopes:
 - personal
 - workspace

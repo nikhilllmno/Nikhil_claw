@@ -6,6 +6,11 @@ title: PostgreSQL
 description: Read the schema and the rows of a PostgreSQL database with read-only SQL. Change
   rows with SQL that a person approves.
 kind: database
+aliases:
+- postgresql
+- database
+- db
+- sql
 scopes:
 - workspace
 - personal

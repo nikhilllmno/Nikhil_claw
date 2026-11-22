@@ -49,7 +49,6 @@ from sama.gate.wire import (
     GateAnswer,
     GateRequest,
 )
-from sama.integrations.guide import channel_guide
 from sama.media.generate import (
     DEFAULT_IMAGE_SIZE,
     DEFAULT_VOICE,
@@ -232,6 +231,7 @@ VISION_ANALYZE: Final = "vision_analyze"
 CONNECTIONS_LIST: Final = "connections_list"
 CONNECTION_REQUEST: Final = "connection_request"
 CONNECTION_TEST: Final = "connection_test"
+CONNECTION_ADD_MCP: Final = "connection_add_mcp"
 EXECUTE_CODE: Final = "execute_code"
 IMAGE_GENERATE: Final = "image_generate"
 TEXT_TO_SPEECH: Final = "text_to_speech"
@@ -1646,9 +1646,11 @@ class ToolServer:
         @server.tool(
             name=CONNECTIONS_LIST,
             description=(
-                "List the connectors (Gmail, GitHub, Notion, and more) and the state of their "
-                "connections for this session. A connected connector has tools: find them "
-                "with tool_search."
+                "List the connectors (Gmail, Outlook, Google Calendar, Google Drive, GitHub, "
+                "Linear, Slack, Notion, databases, remote MCP servers) and the state of their "
+                "connections for this session, the role of the user, and why a connector is "
+                "not available. Composio runs the sign-in of the app connectors. A connected "
+                "connector has tools: find them with tool_search."
             ),
             annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
             structured_output=False,
@@ -1662,13 +1664,21 @@ class ToolServer:
         @server.tool(
             name=CONNECTION_REQUEST,
             description=(
-                "Get a link that the user opens to connect a connector. Give the connector "
-                "name from connections_list, or a chat channel (whatsapp, whatsapp_meta, "
-                "whatsapp_twilio, whatsapp_gupshup, email, telegram, slack) for its setup "
-                "steps. scope is personal (for the user only) or "
-                "workspace (for all members; a workspace admin connects it). The default is "
-                "personal in a private session and workspace in a shared session. Give the "
-                "link to the user. Never ask for passwords, API keys, or tokens in the chat."
+                "Connect an app or a server for the user. Use it when the user says 'connect "
+                "my X' or a task needs a connector that is not connected. Give the connector "
+                "name from connections_list, or the words of the user: 'email', 'inbox', or "
+                "'mail' mean the inbox of the user (gmail or outlook), 'calendar' means "
+                "googlecalendar, 'drive' means googledrive, 'slack' means the Slack account of "
+                "the user. It starts the sign-in and the user gets a Connect button with the "
+                "sign-in page of the provider. When the sign-in finishes, sama continues the "
+                "request by itself: do not ask the user to tell you when they are done. A "
+                "chat channel, where people talk to sama, is slack_app, telegram, whatsapp, "
+                "whatsapp_meta, whatsapp_twilio, whatsapp_gupshup, or email_channel: use these "
+                "only when the user wants to talk to sama in that app. scope is personal (for "
+                "the user only) or workspace (for all members; only a workspace admin or the "
+                "org owner, and a person approves it first). The default is personal in a "
+                "private session and workspace in a shared session. Never ask for passwords, "
+                "API keys, or tokens in the chat."
             ),
             annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
             structured_output=False,
@@ -1680,13 +1690,46 @@ class ToolServer:
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
                 # A chat channel is an integration of the org, not a connection (Section 11.9).
-                guide = channel_guide(connector, getattr(connections, "web_base", None))
+                guide = await connections.channel_for_agent(claims, connector)
                 if guide is not None:
                     return guide
                 return await connections.request_for_agent(claims, connector, scope)
 
             arguments = {"connector": connector, "scope": scope}
             return await self._call(ctx, CONNECTION_REQUEST, arguments, body)
+
+        @server.tool(
+            name=CONNECTION_ADD_MCP,
+            description=(
+                "Add a remote MCP server by its URL (streamable HTTP, https) when the user "
+                "gives a URL. A person approves it first, and only a workspace admin or the "
+                "org owner can add one. auth is 'oauth' (the server has a sign-in; the user "
+                "gets a Connect button), 'none' (it connects at once and lists its tools), or "
+                "'bearer' (a key; the user types it on the sama web page, never in the chat). "
+                "If you do not know, use 'oauth' when the server answers 401, else 'none'. name "
+                "is optional (from the host). scope as for connection_request."
+            ),
+            annotations=ToolAnnotations(
+                read_only_hint=False, destructive_hint=False, open_world_hint=True
+            ),
+            structured_output=False,
+        )
+        async def connection_add_mcp(
+            url: Annotated[str, Field(min_length=9, max_length=500)],
+            ctx: Context,
+            auth: Literal["oauth", "none", "bearer"] = "oauth",
+            name: Annotated[str | None, Field(max_length=40)] = None,
+            title: Annotated[str | None, Field(max_length=60)] = None,
+            scope: Literal["personal", "workspace"] | None = None,
+        ) -> str:
+            async def body(claims: RunTokenClaims) -> str:
+                return await connections.add_mcp_for_agent(
+                    claims, url=url, name=name, title=title, auth=auth, scope=scope
+                )
+
+            arguments = {"url": url, "auth": auth, "name": name, "title": title, "scope": scope}
+            present = {key: value for key, value in arguments.items() if value is not None}
+            return await self._call(ctx, CONNECTION_ADD_MCP, present, body)
 
         @server.tool(
             name=CONNECTION_TEST,

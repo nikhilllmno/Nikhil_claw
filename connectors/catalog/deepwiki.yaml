@@ -4,6 +4,9 @@ name: deepwiki
 title: DeepWiki
 description: Read and ask about the documentation of public GitHub repositories.
 kind: mcp_remote
+aliases:
+- github docs
+- repo docs
 scopes:
 - personal
 - workspace
