@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import history
@@ -509,7 +509,7 @@ async def test_the_session_list_has_the_run_state_of_each_session(
     assert sessions[str(tenant.ids["s1"])]["run_state"] == "waiting"
     async with engine.begin() as connection:
         await connection.execute(
-            Run.__table__.update().where(Run.id == newest).values(status="queued")
+            update(Run).where(Run.id == newest).values(status="queued")
         )
     sessions = {s["id"]: s for s in (await client.get("/sessions", headers=mia(tenant))).json()}
     assert sessions[str(tenant.ids["mine"])]["run_state"] == "running"
