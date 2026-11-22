@@ -508,9 +508,7 @@ async def test_the_session_list_has_the_run_state_of_each_session(
     assert sessions[str(tenant.ids["mine"])]["last_activity_at"] is not None
     assert sessions[str(tenant.ids["s1"])]["run_state"] == "waiting"
     async with engine.begin() as connection:
-        await connection.execute(
-            update(Run).where(Run.id == newest).values(status="queued")
-        )
+        await connection.execute(update(Run).where(Run.id == newest).values(status="queued"))
     sessions = {s["id"]: s for s in (await client.get("/sessions", headers=mia(tenant))).json()}
     assert sessions[str(tenant.ids["mine"])]["run_state"] == "running"
     no_runs = [
