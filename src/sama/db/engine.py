@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -17,6 +18,9 @@ from sama.db.pool import PoolSettings, configure
 from sama.db.trips import instrument
 
 ASYNC_DRIVER = "postgresql+asyncpg"
+TRANSACTION_POOLER_PORT = 6543
+
+log = logging.getLogger("sama.db")
 
 
 def async_url(url: str) -> str:
@@ -38,6 +42,12 @@ def create_engine(url: str, *, pool: PoolSettings | None = None, **kwargs: Any) 
     the settings of the environment, Section 4.4). The engine counts its round trips for
     ``sama.db.trips.count_trips``.
     """
+    if urlsplit(url).port == TRANSACTION_POOLER_PORT:
+        log.warning(
+            "the database URL has port %d, the Supabase transaction pooler: it is not supported"
+            " (no LISTEN, no prepared statements); use port 5432",
+            TRANSACTION_POOLER_PORT,
+        )
     if "poolclass" not in kwargs:
         pool = pool or PoolSettings.from_env(os.environ)
         kwargs = {**pool.engine_options(), **kwargs}

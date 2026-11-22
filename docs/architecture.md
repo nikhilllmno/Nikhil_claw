@@ -669,16 +669,27 @@ The steps that were removed:
   region as before.
 - **One transaction for a message.** `RunQueue.submit` takes the rate lock once and makes the
   note for the running run, or the queued run, and checks whether the run waits, in one
-  transaction. Before, these were three transactions with the lock taken twice. When the
-  access statement found no open run in the session, the steer query and the wait query are
-  skipped: no note is possible and the run waits for nobody. A run that starts between the
-  read and the `submit` only makes the message a queued run and not a note.
-- **One transaction for an approval.** `GateService.decide` reads the approval, the memberships,
-  and the review proposal in one statement. It writes the audit entry in the statement of the
-  update (a CTE), and it queues the run again in the same transaction (`release_decided_in`).
-  The decision and the release cannot part: when the release fails, the approval stays
-  `pending`. `decide_approval` keeps its old behaviour for the other callers. The API applies
-  review proposals only for an approval of a proposal.
+  transaction. Before, these were three transactions with the lock taken twice. The access
+  statement tells whether the session has an open run, and `submit` uses it only as a hint. With
+  `open_run=True` it tries the note first. With `False` it skips that try, and the enqueue reads
+  the open runs again, after the rate lock and in the same statement as the session and the
+  limits. That read decides whether the message is a note (a run is `running`), whether it
+  waits (`queued`), or neither. So a message that another send overtakes between the access read
+  and the write still waits behind it, and a run that started in between still gets the note.
+  `submit` forwards `human=True` like the other sends of a person (`runs.human_origin`,
+  Section 15.4).
+- **One transaction for an approval.** `GateService.decide_with_scope` is the one implementation
+  of a human decision. It keeps the rules of the approval scope (Section 16.1): `once`,
+  `session`, `always`, the old `always_allow`, a proposal that has only `once`, a tool that
+  always asks, the direct mode of a coding agent, and the applied scope in the answer. It reads
+  the approval, the memberships, and the review proposal in one statement, writes the audit
+  entry in the statement of the update (a CTE), writes the `always` or `session` rule, and
+  queues the run again in the same transaction (`release`, from `RunQueue.release_decided_in`).
+  The decision, the rule, and the release cannot part: when the release fails, the approval
+  stays `pending` and no rule exists. An expired approval is released in the same transaction
+  and then raises `ApprovalExpiredError`. The one result type is `ApprovalDecision` (`status`,
+  `scope`, `proposal`, `released`). The API applies review proposals only for an approval of a
+  proposal, and after an expiry.
 - **Idle claim.** `RunQueue.claim` first runs one read without a transaction and without a lock
   that tells whether a run is ready. A worker slot that a notification woke, or that just ended
   a run, skips it (`peek=False`).
@@ -709,10 +720,13 @@ connections, and the next send or approval waited for a connection. The change h
 
 - `sama.db.pool.TimedQueuePool` measures the wait of each checkout, without the time to open a
   new connection. A wait of more than `SAMA_DB_POOL_WARN_MS` (100 ms) logs one warning:
-  `database pool wait 340 ms component=POST /approvals/{id}/approve pool size=10 in_use=10 idle=0
-  overflow=3 checkouts=... slow=... connects=... wait_max_ms=... wait_avg_ms=...`. The component is
-  the route of the request (ids replaced by `{id}`), or the name of a loop (`worker`, the class of
-  a background loop). The line has numbers only: no host, no user, no secret. At the level
+  `database pool wait 340 ms component=POST /approvals/{approval_id}/approve pool size=5 in_use=5
+  idle=0 overflow=2 checkouts=... slow=... connects=... wait_max_ms=... wait_avg_ms=...`. The
+  component is `METHOD` and the route template that matched (`RequestMonitor` follows the
+  mounted apps), or the name of a loop (`worker`, the class of a background loop). It is never
+  the raw path, because a path can hold a secret (the token of `/email/{integration_id}/approvals/{token}`
+  and of `/whatsapp/{integration_id}/webhook/{token}`). A path that matches no route is
+  `unmatched`. The line has numbers only: no host, no user, no secret. At the level
   `DEBUG`, `PoolMonitor` logs the same state every 30 seconds.
 - The event stream polls share `stream_db_slots` slots in the process (`ApiSettings`, half of the
   pool size). A poll that finds no slot waits in memory and not in the pool, so a send and an
@@ -720,17 +734,26 @@ connections, and the next send or approval waited for a connection. The change h
 - The process opens `SAMA_DB_POOL_PREWARM` connections (4) when it starts, so the first requests
   do not wait for a connect (about 4 round trips). The pool gives the most recent connection
   first (`pool_use_lifo`), so the others close by themselves when they are old.
-- The size comes from the environment: `SAMA_DB_POOL_SIZE` (default 10), `SAMA_DB_POOL_OVERFLOW`
-  (5), `SAMA_DB_POOL_TIMEOUT_S` (30), `SAMA_DB_POOL_RECYCLE_S` (1800).
+- The size comes from the environment: `SAMA_DB_POOL_SIZE` (default 5), `SAMA_DB_POOL_OVERFLOW`
+  (2), `SAMA_DB_POOL_TIMEOUT_S` (30), `SAMA_DB_POOL_RECYCLE_S` (1800).
 
-The default of 10 + 5 = 15 fits one Fly machine and the Supabase pooler in session mode (port
-5432, the mode that the staging `SAMA_DATABASE_URL` uses): the pooler gives 15 server
-connections to one database user by default, and a 16th client gets an error. The queue
-listener (`QueueWakeup`) keeps one connection for ever, so requests have 14. Change the size only
-together with the pooler limit. The transaction mode of the pooler (port 6543) has no such
-limit, but it cannot carry `LISTEN` (the queue wake-up falls back to the poll of 1 second) and it
-needs `SAMA_DB_PREPARED_STATEMENTS=off`. A release deploy runs two machines for a short time, so
-a size of more than 7 + 7 needs a higher pooler limit.
+**Pool size and the pooler limit.** The staging `SAMA_DATABASE_URL` uses the Supabase pooler in
+session mode (port 5432). It gives 15 server connections to one database user, and a 16th
+client gets an error. A rolling deploy starts the new machine before it stops the old one, so
+two processes hold connections at the same time. The queue listener (`QueueWakeup`) takes one
+connection of the pool for ever. The default is therefore 5 + 2 = 7 connections for each process,
+the listener included: 2 x 7 = 14 of 15, and one connection stays free for the release command
+(`alembic upgrade head`) and for a person with `psql`. `deploy/fly.staging.toml` and
+`deploy/fly.production.toml` set these two values. A process has 4 connections for requests,
+the worker, and the gate when two event stream polls (`stream_db_slots` = size / 2) and the
+listener use theirs; the log line above tells when this is too small. To raise the numbers, raise
+the pool size of the Supabase pooler first (Management API or dashboard), then the two variables.
+The sum for two processes must stay at or below the pooler limit.
+
+Only the session pooler and a direct connection are supported. The transaction pooler (port 6543)
+cannot carry `LISTEN` for the queue wake-up, and it does not keep the prepared statements of the
+driver. `SAMA_DB_PREPARED_STATEMENTS=off` is refused at the start, and a database URL with the port
+6543 logs a warning.
 
 ---
 
@@ -9134,7 +9157,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_REGION`, `SAMA_REGION_URLS` | No | The home region of the deployment (default `ap-south-1`) and the `region=url` pairs of the other regions (Section 17.3) |
 | `SAMA_STRIPE_SECRET_KEY`, `SAMA_STRIPE_WEBHOOK_SECRET` | No | Billing (Section 17.5). Without both, or when Stripe refuses the key at start, billing is off and the plans add no model quota. |
 | `SAMA_STRIPE_ALLOW_LIVE` | No | `true` accepts a live Stripe key. Without it, a live key turns billing off. |
-| `SAMA_DB_POOL_SIZE`, `SAMA_DB_POOL_OVERFLOW`, `SAMA_DB_POOL_TIMEOUT_S`, `SAMA_DB_POOL_RECYCLE_S`, `SAMA_DB_POOL_PREWARM`, `SAMA_DB_POOL_WARN_MS`, `SAMA_DB_PREPARED_STATEMENTS` | No | The database pool of the process (Section 4.4). Defaults: 10, 5, 30, 1800, 4, 100, `on`. |
+| `SAMA_DB_POOL_SIZE`, `SAMA_DB_POOL_OVERFLOW`, `SAMA_DB_POOL_TIMEOUT_S`, `SAMA_DB_POOL_RECYCLE_S`, `SAMA_DB_POOL_PREWARM`, `SAMA_DB_POOL_WARN_MS` | No | The database pool of the process (Section 4.4). Defaults: 5, 2, 30, 1800, 4, 100. Two processes must fit the 15 connections of the Supabase session pooler. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first

@@ -11,10 +11,15 @@ session 11, approve 17, claim of a run 8, an idle claim 4, and 32 for the first 
 
 from __future__ import annotations
 
+import asyncio
+import uuid
+
 import httpx
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.db.models import Run
 from sama.db.trips import count_trips
 from tests.api.conftest import bearer
 from tests.orchestrator.conftest import Tenant
@@ -85,6 +90,76 @@ async def test_a_queued_message_behind_a_run_says_so(
     assert body["queued"] is True
 
 
+async def test_a_web_message_has_a_human_origin(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    response = await client.post(
+        f"/sessions/{tenant.ids['s1']}/messages", headers=mia(tenant), json={"text": "hi"}
+    )
+    run_id = response.json()["run_id"]
+    async with engine.connect() as connection:
+        origin = (
+            await connection.execute(select(Run.human_origin).where(Run.id == uuid.UUID(run_id)))
+        ).scalar_one()
+    assert origin is True
+
+
+async def test_concurrent_messages_to_an_idle_session_queue_in_order(
+    client: httpx.AsyncClient, tenant: Tenant
+) -> None:
+    """Both requests read an idle session before either writes. The rate lock puts them in a
+    sequence, and the second one must see the first run: it queues behind it, and it says so.
+    A busy mode ``steer`` note is not possible, because no run is ``running`` yet."""
+    path = f"/sessions/{tenant.ids['s2']}/messages"
+    answers = await asyncio.gather(
+        *(client.post(path, headers=mia(tenant), json={"text": f"m{n}"}) for n in range(4))
+    )
+    bodies = [answer.json() for answer in answers]
+    assert [answer.status_code for answer in answers] == [202] * 4
+    assert sum(1 for body in bodies if body["queued"] is False) == 1, bodies
+    assert sum(1 for body in bodies if body["queued"] is True) == 3, bodies
+    assert not any(body["steered"] for body in bodies)
+
+
+async def test_a_message_that_slips_in_after_the_access_read_still_waits(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The caller read ``open_run=False``, then another message was queued. The hint is only a
+    hint: ``submit`` reads the open runs again after the rate lock."""
+    harness = Harness(engine)
+    first = await harness.send(tenant, "s1", "first")
+    second = await harness.queue.submit(
+        org_id=tenant.org,
+        session_id=tenant.ids["s1"],
+        text="second",
+        user_id=tenant.ids["mia"],
+        steer=True,
+        open_run=False,
+    )
+    assert second.run_id != first
+    assert second.queued is True
+    assert second.steered is False
+
+
+async def test_a_message_that_slips_in_after_a_run_started_becomes_a_note(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness = Harness(engine)
+    await harness.send(tenant, "s1", "first")
+    claimed = await harness.queue.claim("w9")
+    assert claimed is not None
+    sent = await harness.queue.submit(
+        org_id=tenant.org,
+        session_id=tenant.ids["s1"],
+        text="more",
+        user_id=tenant.ids["mia"],
+        steer=True,
+        open_run=False,
+    )
+    assert sent.steered is True
+    assert sent.run_id == claimed.run_id
+
+
 async def test_an_approval_makes_few_round_trips(
     client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
 ) -> None:
@@ -100,7 +175,7 @@ async def test_an_approval_makes_few_round_trips(
             f"/approvals/{pending[0]['id']}/approve", headers=mia(tenant), json={}
         )
     assert decided.status_code == 200
-    assert decided.json() == {"status": "approved", "resumed": True}
+    assert decided.json() == {"status": "approved", "scope": "once", "resumed": True}
     assert trips.total <= APPROVE, trips.show()
 
 

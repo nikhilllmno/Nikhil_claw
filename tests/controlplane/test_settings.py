@@ -313,7 +313,7 @@ def test_a_live_stripe_key_turns_billing_off_unless_it_is_allowed() -> None:
 
 
 def test_the_database_pool_comes_from_the_environment() -> None:
-    assert settings().db_pool.size == 10
+    assert settings().db_pool.size == 5
     s = settings(SAMA_DB_POOL_SIZE="12", SAMA_DB_POOL_OVERFLOW="3", SAMA_DB_POOL_WARN_MS="50")
     assert (s.db_pool.size, s.db_pool.overflow, s.db_pool.warn_ms) == (12, 3, 50.0)
 

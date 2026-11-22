@@ -7,9 +7,16 @@ import logging
 import os
 import uuid
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.routing import Mount, Route
 
 from sama.db import create_engine
 from sama.db.monitor import PoolMonitor, RequestMonitor
@@ -21,7 +28,6 @@ from sama.db.pool import (
     describe,
     named,
     prewarm,
-    route_name,
 )
 from sama.db.trips import count_trips
 
@@ -33,10 +39,10 @@ def url(database_url: str) -> str:
 
 def test_the_default_settings_fit_one_machine() -> None:
     settings = PoolSettings.from_env({})
-    assert (settings.size, settings.overflow, settings.timeout_s) == (10, 5, 30.0)
-    assert settings.size + settings.overflow <= 15, "the Supabase session mode gives 15"
+    assert (settings.size, settings.overflow, settings.timeout_s) == (5, 2, 30.0)
+    # A rolling deploy runs two processes at the same time, and the session pooler gives 15.
+    assert 2 * (settings.size + settings.overflow) <= 15
     assert settings.warn_ms == 100.0
-    assert settings.prepared_statements is True
 
 
 def test_the_settings_come_from_the_environment() -> None:
@@ -48,15 +54,13 @@ def test_the_settings_come_from_the_environment() -> None:
             "SAMA_DB_POOL_RECYCLE_S": "600",
             "SAMA_DB_POOL_PREWARM": "50",
             "SAMA_DB_POOL_WARN_MS": "250",
-            "SAMA_DB_PREPARED_STATEMENTS": "off",
         }
     )
     assert (settings.size, settings.overflow, settings.timeout_s) == (20, 0, 5.0)
     assert settings.recycle_s == 600.0
     assert settings.prewarm == 20, "the prewarm never goes over the size"
     assert settings.warn_ms == 250.0
-    assert settings.prepared_statements is False
-    assert "connect_args" in settings.engine_options()
+    assert settings.engine_options()["poolclass"] is TimedQueuePool
 
 
 @pytest.mark.parametrize(
@@ -66,7 +70,6 @@ def test_the_settings_come_from_the_environment() -> None:
         ("SAMA_DB_POOL_SIZE", "many"),
         ("SAMA_DB_POOL_OVERFLOW", "-1"),
         ("SAMA_DB_POOL_TIMEOUT_S", "0"),
-        ("SAMA_DB_PREPARED_STATEMENTS", "maybe"),
     ],
 )
 def test_a_bad_setting_names_the_variable(name: str, value: str) -> None:
@@ -82,11 +85,6 @@ def test_the_stats_count_slow_checkouts_by_component() -> None:
     assert (stats.checkouts, stats.slow, stats.connects) == (3, 2, 1)
     assert stats.by_component == {"GET /x": 2}
     assert stats.wait_max_s == 0.5
-
-
-def test_a_route_name_has_no_id() -> None:
-    path = f"/sessions/{uuid.uuid4()}/messages"
-    assert route_name("POST", path) == "POST /sessions/{id}/messages"
 
 
 def test_the_component_name_is_scoped() -> None:
@@ -197,28 +195,131 @@ async def test_count_trips_counts_statements_and_transactions(url: str) -> None:
         await engine.dispose()
 
 
-async def test_the_request_monitor_names_the_request_and_logs_the_count(
+SECRET = "SECRET-TOKEN-123"
+
+
+def monitored_app(engine: AsyncEngine, seen: list[str]) -> Starlette:
+    """An app with the routes of the email and WhatsApp hubs (a secret token in the path), a
+    mounted app, and the request monitor, built like the control plane."""
+
+    async def work() -> JSONResponse:
+        seen.append(component())
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        return JSONResponse({})
+
+    api = FastAPI()
+    for method in ("GET", "POST"):
+        api.add_api_route("/email/{integration_id}/approvals/{token}", work, methods=[method])
+        api.add_api_route("/whatsapp/{integration_id}/webhook/{token}", work, methods=[method])
+    api.add_api_route("/sessions/{session_id}/messages", work, methods=["POST"])
+
+    async def plain(request: Request) -> JSONResponse:
+        return await work()
+
+    inner = Starlette(routes=[Route("/{ticket}/pack", plain, methods=["POST"])])
+    return Starlette(
+        routes=[Mount("/git", app=inner), Mount("", app=api)],
+        middleware=[Middleware(RequestMonitor)],
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "template"),
+    [
+        (
+            "GET",
+            f"/email/{uuid.uuid4()}/approvals/{SECRET}",
+            "/email/{integration_id}/approvals/{token}",
+        ),
+        (
+            "POST",
+            f"/email/{uuid.uuid4()}/approvals/{SECRET}",
+            "/email/{integration_id}/approvals/{token}",
+        ),
+        (
+            "GET",
+            f"/whatsapp/{uuid.uuid4()}/webhook/{SECRET}",
+            "/whatsapp/{integration_id}/webhook/{token}",
+        ),
+        (
+            "POST",
+            f"/whatsapp/{uuid.uuid4()}/webhook/{SECRET}",
+            "/whatsapp/{integration_id}/webhook/{token}",
+        ),
+        ("POST", f"/sessions/{uuid.uuid4()}/messages", "/sessions/{session_id}/messages"),
+        ("POST", f"/git/{SECRET}/pack", "/git/{ticket}/pack"),
+    ],
+)
+async def test_the_request_name_is_the_route_template_and_no_log_line_has_the_path(
+    url: str,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    path: str,
+    template: str,
+) -> None:
+    engine = create_engine(url, pool=PoolSettings(size=1, overflow=0, warn_ms=50.0, prewarm=0))
+    seen: list[str] = []
+    app = monitored_app(engine, seen)
+    try:
+        holder = await engine.connect()
+
+        async def release_later() -> None:
+            await asyncio.sleep(0.2)
+            await holder.close()
+
+        task = asyncio.create_task(release_later())
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://sama.test"
+            ) as client:
+                response = await client.request(method, path)
+        await task
+        assert response.status_code == 200
+        assert seen == [f"{method} {template}"]
+        assert component() == "unknown", "the name does not leak out of the request"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(f"component={method} {template} " in m for m in messages), messages
+        assert any(f"request {method} {template} db_round_trips=" in m for m in messages)
+        ours = "\n".join(r.getMessage() for r in caplog.records if r.name.startswith("sama"))
+        assert "database pool wait" in ours
+        assert SECRET not in ours, "a secret in the path reached a log line of sama"
+        assert path not in ours
+    finally:
+        await engine.dispose()
+
+
+async def test_a_path_that_matches_no_route_is_named_unmatched(
     url: str, caplog: pytest.LogCaptureFixture
 ) -> None:
+    engine = create_engine(url, pool=PoolSettings(size=1, overflow=0))
+    app = monitored_app(engine, [])
+    try:
+        with caplog.at_level(logging.DEBUG, logger="sama.db.monitor"):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://sama.test"
+            ) as client:
+                response = await client.get(f"/nothing/{SECRET}")
+        assert response.status_code == 404
+        assert any(
+            "request GET unmatched db_round_trips=0" in r.getMessage() for r in caplog.records
+        )
+        ours = "\n".join(r.getMessage() for r in caplog.records if r.name.startswith("sama"))
+        assert SECRET not in ours
+    finally:
+        await engine.dispose()
+
+
+async def test_the_request_monitor_ignores_other_scopes(url: str) -> None:
     engine = create_engine(url, pool=PoolSettings(size=1, overflow=0))
     seen: list[str] = []
 
     async def app(scope: dict, receive: object, send: object) -> None:  # type: ignore[type-arg]
         seen.append(component())
-        async with engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
 
-    scope = {"type": "http", "method": "GET", "path": f"/sessions/{uuid.uuid4()}"}
     try:
-        with caplog.at_level(logging.DEBUG, logger="sama.db.monitor"):
-            await RequestMonitor(app)(scope, None, None)  # type: ignore[arg-type]
-        assert seen == ["GET /sessions/{id}"]
-        assert component() == "unknown", "the name does not leak out of the request"
-        lines = [r.getMessage() for r in caplog.records]
-        assert any("request GET /sessions/{id} db_round_trips=3" in line for line in lines)
-        websocket = {"type": "websocket", "path": "/x"}
-        await RequestMonitor(app)(websocket, None, None)  # type: ignore[arg-type]
-        assert seen[-1] == "unknown"
+        await RequestMonitor(app)({"type": "websocket", "path": "/x"}, None, None)  # type: ignore[arg-type]
+        assert seen == ["unknown"]
     finally:
         await engine.dispose()
 
@@ -256,3 +357,21 @@ async def test_describe_and_prewarm_accept_a_pool_without_stats(url: str) -> Non
         assert await prewarm(engine, 1) == 1
     finally:
         await engine.dispose()
+
+
+def test_the_transaction_pooler_mode_is_refused() -> None:
+    with pytest.raises(ValueError, match="SAMA_DB_PREPARED_STATEMENTS=off is not supported"):
+        PoolSettings.from_env({"SAMA_DB_PREPARED_STATEMENTS": "off"})
+    PoolSettings.from_env({"SAMA_DB_PREPARED_STATEMENTS": "on"})
+
+
+def test_a_url_with_the_transaction_pooler_port_logs_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="sama.db"):
+        create_engine("postgresql://u:p@pooler.example.test:6543/db")
+        create_engine("postgresql://u:p@pooler.example.test:5432/db")
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert "transaction pooler" in messages[0]
+    assert "p@" not in messages[0]

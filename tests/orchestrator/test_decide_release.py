@@ -1,4 +1,4 @@
-"""``GateService.decide`` stores the decision and queues the run again in one transaction
+"""``GateService.decide_with_scope`` stores the decision and queues the run again in one transaction
 (docs/architecture.md, Section 4.4)."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from sama.db.models import Approval
+from sama.db.models import Approval, SessionToolAllow
 from sama.gate.service import ApprovalError, GateService
 from tests.orchestrator.conftest import Tenant
 from tests.orchestrator.test_worker import Harness, approval_script
@@ -43,7 +43,7 @@ async def test_the_decision_and_the_release_are_one_transaction(
     async def release(connection: AsyncConnection) -> list[uuid.UUID]:
         return await harness.queue.release_decided_in(connection, org_id=tenant.org, run_id=run_id)
 
-    decision = await gate.decide(
+    decision = await gate.decide_with_scope(
         org_id=tenant.org,
         run_id=run_id,
         call_id="call-9",
@@ -52,6 +52,7 @@ async def test_the_decision_and_the_release_are_one_transaction(
         release=release,
     )
     assert decision.status == "approved"
+    assert decision.scope == "once"
     assert decision.released == (run_id,)
     assert decision.proposal is False
     assert await harness.status_is(run_id, "queued")
@@ -65,7 +66,7 @@ async def test_a_failed_release_undoes_the_decision(engine: AsyncEngine, tenant:
         raise RuntimeError("the release failed")
 
     with pytest.raises(RuntimeError):
-        await gate.decide(
+        await gate.decide_with_scope(
             org_id=tenant.org,
             run_id=run_id,
             call_id="call-9",
@@ -82,7 +83,7 @@ async def test_a_user_outside_the_workspace_cannot_decide(
 ) -> None:
     _harness, run_id = await paused(engine, tenant)
     with pytest.raises(ApprovalError, match="cannot decide"):
-        await GateService(engine).decide(
+        await GateService(engine).decide_with_scope(
             org_id=tenant.org,
             run_id=run_id,
             call_id="call-9",
@@ -102,6 +103,68 @@ async def test_deciding_twice_fails(engine: AsyncEngine, tenant: Tenant) -> None
         "user_id": tenant.ids["mia"],
         "approve": False,
     }
-    assert (await gate.decide(**args)).status == "rejected"  # type: ignore[arg-type]
+    assert (await gate.decide_with_scope(**args)).status == "rejected"  # type: ignore[arg-type]
     with pytest.raises(ApprovalError, match="already rejected"):
-        await gate.decide(**args)  # type: ignore[arg-type]
+        await gate.decide_with_scope(**args)  # type: ignore[arg-type]
+
+
+async def test_a_session_scope_and_the_release_are_one_transaction(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness, run_id = await paused(engine, tenant)
+
+    async def release(connection: AsyncConnection) -> list[uuid.UUID]:
+        return await harness.queue.release_decided_in(connection, org_id=tenant.org, run_id=run_id)
+
+    decision = await GateService(engine).decide_with_scope(
+        org_id=tenant.org,
+        run_id=run_id,
+        call_id="call-9",
+        user_id=tenant.ids["mia"],
+        approve=True,
+        scope="session",
+        release=release,
+    )
+    assert (decision.status, decision.scope) == ("approved", "session")
+    assert decision.released == (run_id,)
+    async with engine.connect() as connection:
+        allowed = (
+            (
+                await connection.execute(
+                    select(SessionToolAllow.tool).where(SessionToolAllow.org_id == tenant.org)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert allowed == ["Bash"]
+
+
+async def test_a_failed_release_leaves_no_session_rule(engine: AsyncEngine, tenant: Tenant) -> None:
+    _harness, run_id = await paused(engine, tenant)
+
+    async def release(connection: AsyncConnection) -> list[uuid.UUID]:
+        raise RuntimeError("the release failed")
+
+    with pytest.raises(RuntimeError):
+        await GateService(engine).decide_with_scope(
+            org_id=tenant.org,
+            run_id=run_id,
+            call_id="call-9",
+            user_id=tenant.ids["mia"],
+            approve=True,
+            scope="session",
+            release=release,
+        )
+    async with engine.connect() as connection:
+        allowed = (
+            (
+                await connection.execute(
+                    select(SessionToolAllow.tool).where(SessionToolAllow.org_id == tenant.org)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert allowed == []
+    assert await status(engine, run_id) == "pending"

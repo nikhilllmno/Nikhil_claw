@@ -11,10 +11,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-import re
 import time
-import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Final
@@ -26,23 +24,28 @@ log = logging.getLogger("sama.db.pool")
 
 UNKNOWN_COMPONENT: Final = "unknown"
 
-_component: contextvars.ContextVar[str] = contextvars.ContextVar(
+_component: contextvars.ContextVar[str | Callable[[], str]] = contextvars.ContextVar(
     "sama_db_component", default=UNKNOWN_COMPONENT
 )
-_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def component() -> str:
-    """The name of the component that runs now, for the pool log lines."""
-    return _component.get()
+    """The name of the component that runs now, for the pool log lines. A request names itself
+    with a function that finds the route template, and the function runs only here: a request
+    that logs nothing pays nothing."""
+    name = _component.get()
+    return name if isinstance(name, str) else name()
 
 
-def set_component(name: str) -> contextvars.Token[str]:
-    """Names the component of the current task. A loop sets it once at its start."""
+def set_component(
+    name: str | Callable[[], str],
+) -> contextvars.Token[str | Callable[[], str]]:
+    """Names the component of the current task. A loop sets it once at its start. The name is
+    a text, or a function that gives the text when a log line needs it."""
     return _component.set(name)
 
 
-def reset_component(token: contextvars.Token[str]) -> None:
+def reset_component(token: contextvars.Token[str | Callable[[], str]]) -> None:
     """Puts back the name from before ``set_component``."""
     _component.reset(token)
 
@@ -57,24 +60,22 @@ def named(name: str) -> Iterator[None]:
         _component.reset(token)
 
 
-def route_name(method: str, path: str) -> str:
-    """A name for a request, with each id in the path replaced by ``{id}``."""
-    return f"{method} {_UUID.sub('{id}', path)}"
-
-
 @dataclass(frozen=True, slots=True)
 class PoolSettings:
     """The size of the pool of one process, from the environment.
 
-    The default fits one Fly machine and the session mode of the Supabase pooler (port 5432),
-    which gives 15 server connections to one database user by default: ``size`` plus
-    ``overflow`` stays at or below this number. With the transaction mode (port 6543), set
-    ``SAMA_DB_PREPARED_STATEMENTS=off`` and use a larger size.
+    The default fits the Supabase pooler in session mode (port 5432), which gives 15 server
+    connections to one database user by default, with two processes at the same time: a rolling
+    deploy starts the new machine before it stops the old one. ``size`` plus ``overflow`` is 7
+    for each process, and the queue listener (``QueueWakeup``) is one of them: 2 x 7 = 14 of 15.
+    Only the session pooler and a direct connection are supported: the listener needs
+    ``LISTEN``, and the pool and the code use prepared statements, which the transaction mode
+    (port 6543) does not keep.
     """
 
-    size: int = 10
+    size: int = 5
     """Connections that the pool keeps open (``SAMA_DB_POOL_SIZE``)."""
-    overflow: int = 5
+    overflow: int = 2
     """Extra connections for a burst, closed again at once (``SAMA_DB_POOL_OVERFLOW``)."""
     timeout_s: float = 30.0
     """Seconds that a checkout waits before it fails (``SAMA_DB_POOL_TIMEOUT_S``)."""
@@ -85,8 +86,6 @@ class PoolSettings:
     the connect (about 4 round trips) (``SAMA_DB_POOL_PREWARM``)."""
     warn_ms: float = 100.0
     """A checkout that waits longer logs a warning (``SAMA_DB_POOL_WARN_MS``)."""
-    prepared_statements: bool = True
-    """``off`` is for the transaction mode of a pooler (``SAMA_DB_PREPARED_STATEMENTS``)."""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> PoolSettings:
@@ -105,9 +104,11 @@ class PoolSettings:
                 raise ValueError(f"{name} must be at least {minimum:g}")
             return value
 
-        flag = env.get("SAMA_DB_PREPARED_STATEMENTS", "on").strip().lower()
-        if flag not in {"on", "off"}:
-            raise ValueError("SAMA_DB_PREPARED_STATEMENTS must be on or off")
+        if env.get("SAMA_DB_PREPARED_STATEMENTS", "").strip().lower() == "off":
+            raise ValueError(
+                "SAMA_DB_PREPARED_STATEMENTS=off is not supported: use the session pooler"
+                " (port 5432) or a direct connection, not the transaction pooler (port 6543)"
+            )
         size = int(number("SAMA_DB_POOL_SIZE", default.size, 1))
         return cls(
             size=size,
@@ -116,7 +117,6 @@ class PoolSettings:
             recycle_s=number("SAMA_DB_POOL_RECYCLE_S", default.recycle_s, 30),
             prewarm=min(size, int(number("SAMA_DB_POOL_PREWARM", default.prewarm, 0))),
             warn_ms=number("SAMA_DB_POOL_WARN_MS", default.warn_ms, 0),
-            prepared_statements=flag == "on",
         )
 
     def engine_options(self) -> dict[str, Any]:
@@ -130,13 +130,6 @@ class PoolSettings:
             # The last connection that came back is the most likely to be open and warm.
             "pool_use_lifo": True,
         }
-        if not self.prepared_statements:
-            # The recipe of SQLAlchemy for a pooler in transaction mode.
-            options["connect_args"] = {
-                "statement_cache_size": 0,
-                "prepared_statement_cache_size": 0,
-                "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
-            }
         return options
 
 
