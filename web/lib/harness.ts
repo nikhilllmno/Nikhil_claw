@@ -29,8 +29,13 @@ export interface HarnessDraft {
   /** Empty: the default of the model. */
   reasoning: ReasoningEffort | "";
   busyMode: BusyMode;
+  /** Text of the field: the most open runs of one session in the busy mode `parallel`. */
+  maxParallelRuns: string;
   budget: BudgetDraft;
 }
+
+/** The parallel run limit of a profile that has none yet (the default of the API, M7.1). */
+export const DEFAULT_PARALLEL_RUNS = 3;
 
 export const EMPTY_BUDGET: ProfileBudget = {
   max_turns: null,
@@ -59,6 +64,7 @@ export function toHarnessDraft(profile: AgentProfile): HarnessDraft {
     model: profile.model,
     reasoning: profile.reasoning_effort ?? "",
     busyMode: profile.busy_mode ?? "steer",
+    maxParallelRuns: String(profile.max_parallel_runs ?? DEFAULT_PARALLEL_RUNS),
     budget: toBudgetDraft(profile.budget),
   };
 }
@@ -150,8 +156,16 @@ export function validateBudget(draft: BudgetDraft, caps: BudgetCaps | undefined)
 }
 
 /** The first problem of the draft, or `null`. */
-export function validateHarness(draft: HarnessDraft, caps: BudgetCaps | undefined): string | null {
+export function validateHarness(
+  draft: HarnessDraft,
+  caps: BudgetCaps | undefined,
+  maxParallelRuns = 10,
+): string | null {
   if (draft.model === "") return "Choose a model.";
+  const runs = draft.maxParallelRuns.trim();
+  if (!WHOLE.test(runs) || Number(runs) < 1 || Number(runs) > maxParallelRuns) {
+    return `Parallel runs is a whole number from 1 to ${maxParallelRuns}.`;
+  }
   return validateBudget(draft.budget, caps);
 }
 
@@ -169,6 +183,14 @@ export function harnessPatch(profile: AgentProfile, draft: HarnessDraft): AgentP
   if (effort !== profile.reasoning_effort) patch.reasoning_effort = effort;
   if (profile.options.busy_modes !== undefined && draft.busyMode !== (profile.busy_mode ?? "steer")) {
     patch.busy_mode = draft.busyMode;
+  }
+  const runs = Number(draft.maxParallelRuns.trim());
+  if (
+    profile.options.busy_modes !== undefined &&
+    WHOLE.test(draft.maxParallelRuns.trim()) &&
+    runs !== (profile.max_parallel_runs ?? DEFAULT_PARALLEL_RUNS)
+  ) {
+    patch.max_parallel_runs = runs;
   }
   if (budgetChanged(draft.budget, profile.budget)) {
     patch.budget = budgetFromDraft(draft.budget, profile.budget);
@@ -188,28 +210,6 @@ export function reasoningLabel(effort: ReasoningEffort | ""): string {
       return "High";
     default:
       return "Model default";
-  }
-}
-
-export function busyModeLabel(mode: BusyMode): string {
-  switch (mode) {
-    case "steer":
-      return "Steer";
-    case "parallel":
-      return "Parallel";
-    case "queue":
-      return "Queue";
-  }
-}
-
-export function busyModeHelp(mode: BusyMode): string {
-  switch (mode) {
-    case "steer":
-      return "A new message joins the open run. This is the default.";
-    case "parallel":
-      return "A new message starts a second run in the same sandbox.";
-    case "queue":
-      return "A new message waits until the open run ends.";
   }
 }
 

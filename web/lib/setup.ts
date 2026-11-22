@@ -96,4 +96,10 @@ export const NEXT_STEPS: readonly NextStep[] = [
     href: "/console/webhooks",
     linkLabel: "Open Webhooks",
   },
+  {
+    title: "API keys",
+    text: "Let another app use sama through the MCP server or the OpenAI-compatible endpoint.",
+    href: "/console/api-keys",
+    linkLabel: "Open API keys",
+  },
 ];

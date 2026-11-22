@@ -2,8 +2,8 @@
 
 // The Sessions section: the sessions of the workspace in an Active and an Archived list, a search
 // of the words in them, and the actions on one session: open, rename, archive or restore, and
-// export. The retention of the org is at the end. The owner of a session changes it. For a shared
-// session an admin changes it too.
+// export, and the direct mode of a coding agent (M7.2). The retention of the org is at the end.
+// The owner of a session renames or archives it. For a shared session an admin does it too.
 
 import Link from "next/link";
 import { useCallback, useRef, useState } from "react";
@@ -13,6 +13,12 @@ import { sessionTitle } from "@/lib/chat";
 import {
   archiveConfirmText,
   canManageSession,
+  DIRECT_CHOICES,
+  type DirectChoice,
+  directAgent,
+  directBadge,
+  directChoice,
+  hasDirectMode,
   checkTitle,
   emptyText,
   LIST_LIMIT,
@@ -206,6 +212,17 @@ function SessionRow({
     );
   };
 
+  const switchDirect = (choice: DirectChoice) =>
+    run(
+      "direct",
+      async () => {
+        const agent = directAgent(choice);
+        const answer = await api.codingAgent(session.id, agent);
+        onChanged({ ...session, coding_agent: agent }, answer.text);
+      },
+      "The messages of the session still go to the same place.",
+    );
+
   const download = (format: ExportFormat) =>
     run(
       format,
@@ -225,6 +242,7 @@ function SessionRow({
             {session.audience === "shared" ? "Shared" : "Private"}
           </span>
           {archived ? <span className="badge badge-warning">Archived</span> : null}
+          {directBadge(session) ? <span className="badge badge-accent">{directBadge(session)}</span> : null}
           <span className={styles.meta}>Made {relativeTime(session.created_at, now)}</span>
         </div>
       </div>
@@ -295,6 +313,28 @@ function SessionRow({
           </button>
         </div>
       )}
+      {manage && hasDirectMode(session) && !renaming ? (
+        <label className="field">
+          <span className="label">Messages go to</span>
+          <select
+            className="input"
+            value={directChoice(session)}
+            disabled={busy !== null}
+            onChange={(e) => void switchDirect(e.target.value as DirectChoice)}
+          >
+            {DIRECT_CHOICES.map((c) => (
+              <option key={c.value} value={c.value}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+          <span className="hint">
+            {busy === "direct"
+              ? "Saving…"
+              : "The direct mode sends each message to Claude Code or Codex, like /claude and /codex in a chat."}
+          </span>
+        </label>
+      ) : null}
       {error ? (
         <p className="alert alert-error" role="alert">
           {error}

@@ -8253,6 +8253,7 @@ The console reuses their screens. Each write goes to the API, and the API writes
 | Org | Setup | The steps of the setup guide (Section 17.6) as a list, with a link to the section that does each step |
 | Org | Slack | The chat apps of the org: Slack and Telegram (connect, disconnect, and a test), WhatsApp with the choice of its provider, and email (Section 11.9), and the linked chat accounts and pairing codes |
 | Org | Roles | The members, the invites, and an editor of the permissions of each role |
+| Org | API keys | The org API keys of Section 10.7 (M7.6) for the MCP server and the OpenAI-compatible endpoint: make (the key shows one time), list, and revoke. An org admin manages them |
 | Agents | Harness | The runtime, the model, the reasoning effort, the busy mode, and the run budget of each agent |
 | Agents | Tools | The toolsets of each agent, the policy of each tool for the agent, and the rules for every agent of the org |
 | Agents | Sub-agents | The native sub-agents of each agent (Section 13.1): list, create, edit, and delete |
@@ -8262,13 +8263,15 @@ The console reuses their screens. Each write goes to the API, and the API writes
 | Automation | Triggers | The `composio` triggers, with the same screens as the webhooks |
 | Automation | Schedules | The jobs of Section 12.1, with "Run now" |
 | Automation | Workflows | The workflows of Section 12.3: a YAML editor with a check, approve, start, pause, resume, delete, and the recent instances |
-| Activity | Sessions | Search, rename, archive, restore, export, and the retention of the org |
+| Activity | Sessions | Search, rename, archive, restore, export, the direct mode of a coding agent (M7.2), and the retention of the org |
 
 Each section has a list, a detail view, a create form, and a delete with a confirm. A section
 shows its fields as read-only when the role of the user cannot change them, and says who can.
-A part that another M7 item adds (the busy mode of M7.1, the sub-agent library of M7.4) shows
-a card "Not available yet" until the API gives it. Since M7.3, the Tools section shows the custom
-tools of the workspace (`CustomToolsPanel`, Section 10.8). The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
+The Tools section shows the custom tools of the workspace (M7.3, `CustomToolsPanel`, Section
+10.8), and the Sub-agents section shows the sub-agent library (M7.4) in its own card, with the
+button "New library sub-agent" apart from "New sub-agent for <agent>". The Harness section sets the
+busy mode of M7.1 (`steer`, the default, `parallel`, or `queue`) and the most parallel runs of
+one session. The Harness section reads the runtimes from `options.runtimes`, so the runtimes of M7.2 show
 without a change of the web app.
 
 **Role permissions.** Migration `0040` adds the table `org_role_permissions` (`org_id`, `role`,
@@ -8351,7 +8354,10 @@ without a change of the web app.
 private session changes it. An admin of the workspace or the org changes a shared session. A
 compaction archive (Section 6.3) and a session with a compaction child keep their status, and a
 session with an open run cannot be archived (`409`). The audit rows are `session.renamed`,
-`session.archived`, and `session.restored`.
+`session.archived`, and `session.restored`. Each session also gives `coding_agent` (`claude_code`,
+`codex`, or null; Section 15.4). The Sessions section sets it with `POST
+/sessions/{session_id}/coding-agent` for a user who can switch it (the owner, or an admin for a shared session, Section 15.4), and a change from the web writes the audit row
+`session.coding_agent_changed` with the old and the new value.
 
 **Test of a chat app.** `POST /orgs/{org_id}/integrations/{kind}/check` (an admin with
 `chat_apps.manage`) calls Telegram `getMe` or Slack `auth.test` with the stored token and gives

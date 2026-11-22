@@ -29,6 +29,7 @@ const PAGES: [string, string][] = [
   ["/console/schedules", "Schedules"],
   ["/console/workflows", "Workflows"],
   ["/console/sessions", "Sessions"],
+  ["/console/api-keys", "API keys"],
 ];
 
 test("the API and the web app are up", async ({ request, world }) => {

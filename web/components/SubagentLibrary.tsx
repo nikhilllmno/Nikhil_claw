@@ -27,7 +27,16 @@ import styles from "./Page.module.css";
 
 type Open = { kind: "agent"; id: string } | { kind: "new" } | null;
 
-export function SubagentLibrary({ orgId, workspaceId }: { orgId: string; workspaceId: string }) {
+export function SubagentLibrary({
+  orgId,
+  workspaceId,
+  newLabel = "New sub-agent",
+}: {
+  orgId: string;
+  workspaceId: string;
+  /** The label of the button that makes a sub-agent. The console names the library in it. */
+  newLabel?: string;
+}) {
   const api = useApi();
   const [open, setOpen] = useState<Open>(null);
   // The control that the list gives the focus to when it shows again: "new" or an agent id.
@@ -119,6 +128,7 @@ export function SubagentLibrary({ orgId, workspaceId }: { orgId: string; workspa
           text={text}
           onText={setText}
           focusKey={focusKey}
+          newLabel={newLabel}
           onNew={() => {
             setNotice(null);
             setFocusKey("new");
@@ -142,6 +152,7 @@ function Home({
   text,
   onText,
   focusKey,
+  newLabel,
   onNew,
   onOpen,
 }: {
@@ -151,6 +162,7 @@ function Home({
   text: string;
   onText: (text: string) => void;
   focusKey: string | null;
+  newLabel: string;
   onNew: () => void;
   onOpen: (agent: LibraryAgent) => void;
 }) {
@@ -202,7 +214,7 @@ function Home({
         </label>
         {catalog.writable_scopes.length > 0 ? (
           <button ref={newButton} type="button" className="btn btn-primary" onClick={onNew}>
-            New sub-agent
+            {newLabel}
           </button>
         ) : null}
       </div>
@@ -210,7 +222,7 @@ function Home({
         <p className="alert">
           This workspace has no sub-agents yet.{" "}
           {catalog.writable_scopes.length > 0
-            ? "Make one with New sub-agent."
+            ? `Make one with ${newLabel}.`
             : "Ask an admin to make one."}
         </p>
       ) : shown.length === 0 ? (

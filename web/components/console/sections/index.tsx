@@ -3,6 +3,7 @@
 // The screen of each section of the console.
 
 import type { SectionId } from "@/lib/console";
+import { ApiKeysSection } from "./ApiKeysSection";
 import { HarnessSection } from "./HarnessSection";
 import { McpServersSection } from "./McpServersSection";
 import { RolesSection } from "./RolesSection";
@@ -21,6 +22,7 @@ export const SECTION_SCREENS: Record<SectionId, () => React.ReactNode> = {
   setup: SetupSection,
   slack: SlackSection,
   roles: RolesSection,
+  "api-keys": ApiKeysSection,
   harness: HarnessSection,
   tools: ToolsSection,
   subagents: SubagentsSection,

@@ -326,7 +326,11 @@ export interface SessionOut {
   parent_session_id: string | null;
   /** True when the user can rename or archive the session (M7.10). An old API has none. */
   can_manage?: boolean;
+  /** The coding agent of the direct mode (M7.2), or `null` for sama. An old API has none. */
+  coding_agent?: CodingAgentName | null;
 }
+
+export type CodingAgentName = "claude_code" | "codex";
 
 export type RunStatus =
   | "queued"
@@ -2123,7 +2127,7 @@ export class ApiClient {
   handoff = (id: string, to: string) =>
     this.json<Handoff>(`/sessions/${id}/handoff`, { method: "POST", body: { to } });
   /** Starts (`claude_code` or `codex`) or ends (`null`) the direct mode of a session (M7.2). */
-  codingAgent = (id: string, agent: "claude_code" | "codex" | null) =>
+  codingAgent = (id: string, agent: CodingAgentName | null) =>
     this.json<CodingAgentAnswer>(`/sessions/${id}/coding-agent`, { method: "POST", body: { agent } });
   listCheckpoints = (id: string) => this.json<CheckpointItem[]>(`/sessions/${id}/checkpoints`);
   undo = (id: string) => this.json<Restored>(`/sessions/${id}/undo`, { method: "POST" });

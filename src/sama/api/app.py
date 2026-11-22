@@ -784,6 +784,9 @@ class SessionOut(BaseModel):
     lineage: str | None = None
     """``compaction`` for the archive of a transcript, else ``None`` (Section 6.3)."""
     parent_session_id: uuid.UUID | None = None
+    coding_agent: str | None = None
+    """``claude_code`` or ``codex`` when the session is in the direct mode of a coding agent
+    (Section 15.4, M7.2), else ``None``."""
     can_manage: bool = False
     """True when ``PATCH /sessions/{id}`` lets the caller rename, archive, or restore the
     session: the owner of a private session, or the owner or an admin of a shared session."""
@@ -997,6 +1000,7 @@ _SESSION_COLUMNS: Final = (
     Session.created_at,
     Session.lineage,
     Session.parent_session_id,
+    Session.coding_agent,
 )
 
 
@@ -1449,7 +1453,12 @@ class SamaApi:
             access = await self._access(principal, session_id)
             try:
                 text = await set_direct(
-                    self._engine, access.org_id, session_id, body.agent, user_id=access.user_id
+                    self._engine,
+                    access.org_id,
+                    session_id,
+                    body.agent,
+                    user_id=access.user_id,
+                    audit=True,
                 )
             except SwitchNotAllowedError as error:
                 raise HTTPException(status_code=403, detail=str(error)) from None

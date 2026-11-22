@@ -9,21 +9,19 @@ import { type AgentProfile, errorText } from "@/lib/api";
 import { canManageAgents } from "@/lib/console";
 import {
   type HarnessDraft,
-  busyModeHelp,
-  busyModeLabel,
   capHint,
   harnessPatch,
   reasoningLabel,
   toHarnessDraft,
   validateHarness,
 } from "@/lib/harness";
-import { runtimeLabel, runtimeOption, withCurrent, withRuntime } from "@/lib/profile";
+import { BUSY_MODES, runtimeLabel, runtimeOption, withCurrent, withRuntime } from "@/lib/profile";
 import { useApi } from "../../AuthProvider";
 import { useData } from "../../DataProvider";
 import { NewAgentForm } from "../../NewAgentForm";
 import admin from "../../Admin.module.css";
 import styles from "../../Page.module.css";
-import { AgentProfileEditor, ComingCard, SectionHeader, useAgentChoice } from "../parts";
+import { AgentProfileEditor, SectionHeader, useAgentChoice } from "../parts";
 
 export function HarnessSection() {
   const choice = useAgentChoice();
@@ -98,7 +96,7 @@ function HarnessForm({
 
   const patch = useMemo(() => harnessPatch(profile, draft), [profile, draft]);
   const dirty = Object.keys(patch).length > 0;
-  const problem = useMemo(() => validateHarness(draft, options.budget_caps), [draft, options.budget_caps]);
+  const problem = useMemo(() => validateHarness(draft, options.budget_caps, options.limits.max_parallel_runs), [draft, options.budget_caps, options.limits.max_parallel_runs]);
   const runtime = runtimeOption(options, profile.runtime, draft.runtime);
   const runtimes = withCurrent(
     options.runtimes.map((r) => r.name),
@@ -209,28 +207,42 @@ function HarnessForm({
           <p className="hint">What happens when a message comes while the agent works on a run.</p>
           <fieldset className={admin.choices} disabled={readOnly}>
             <legend className="sr-only">Busy mode</legend>
-            {options.busy_modes.map((mode) => (
-              <label key={mode} className={admin.choice}>
+            {BUSY_MODES.filter((m) => options.busy_modes?.includes(m.value)).map((mode) => (
+              <label key={mode.value} className={admin.choice}>
                 <input
                   type="radio"
                   name="busy-mode"
-                  checked={draft.busyMode === mode}
-                  onChange={() => edit({ busyMode: mode })}
+                  checked={draft.busyMode === mode.value}
+                  onChange={() => edit({ busyMode: mode.value })}
                 />
                 <span className={admin.choiceText}>
-                  <strong>{busyModeLabel(mode)}</strong>
-                  <span className="hint">{busyModeHelp(mode)}</span>
+                  <strong>
+                    {mode.label}
+                    {mode.value === "steer" ? " (default)" : ""}
+                  </strong>
+                  <span className="hint">{mode.hint}</span>
                 </span>
               </label>
             ))}
           </fieldset>
+          <label className="field">
+            <span className="label">Most runs at the same time in one session</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={options.limits.max_parallel_runs ?? 10}
+              value={draft.maxParallelRuns}
+              readOnly={readOnly}
+              onChange={(e) => edit({ maxParallelRuns: e.target.value })}
+            />
+            <span className="hint">
+              Applies to the mode Run in parallel, to /bg, and to the Run in parallel button of the chat.
+            </span>
+          </label>
         </section>
-      ) : (
-        <ComingCard title="Busy mode">
-          You choose the busy mode here when sama can run requests in parallel. Until then, a new message joins the
-          open run.
-        </ComingCard>
-      )}
+      ) : null}
 
       <section className={`card ${styles.card}`} aria-labelledby="harness-budget">
         <h2 id="harness-budget" className={styles.heading}>

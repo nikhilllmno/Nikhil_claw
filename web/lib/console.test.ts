@@ -23,10 +23,11 @@ function org(overrides: Partial<Org> = {}): Org {
 }
 
 describe("sections", () => {
-  it("has the thirteen sections of the roadmap, each one time", () => {
+  it("has the thirteen sections of the roadmap and API keys (M7.6), each one time", () => {
     const ids = SECTIONS.map((s) => s.id);
-    expect(ids).toHaveLength(13);
-    expect(new Set(ids).size).toBe(13);
+    expect(ids).toHaveLength(14);
+    expect(new Set(ids).size).toBe(14);
+    expect(ids).toContain("api-keys");
     expect(sectionById(DEFAULT_SECTION)?.title).toBe("Setup");
   });
 
