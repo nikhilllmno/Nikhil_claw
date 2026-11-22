@@ -8305,8 +8305,14 @@ choice of the minimal page, Section 11.4): they are not on disk after the last t
 link that opens a new tab (a link from the chat opens with `target="_blank"` and `noopener`,
 so the new tab gets no copy of `sessionStorage`) asks the open tabs of the browser for the
 tokens over the `BroadcastChannel` `sama.auth`, and waits at most 400 ms. A signed-in tab
-answers. A sign-in, a token refresh, and a sign-out in one tab go to the other tabs, so no tab
-keeps a refresh token that Supabase rotated. A failed refresh signs out only its own tab.
+answers with the tokens and the lineage of its sign-in (a random id that the tabs of one
+sign-in share, kept in `sessionStorage` `sama.auth.tab`). A token refresh goes to the tabs of
+the same lineage with a revision number, and only a higher revision replaces the tokens, so no
+tab keeps a refresh token that Supabase rotated and a late message never brings old tokens
+back. A sign-out ends the lineage in every tab, and a tab that waits for tokens does not take a
+late answer of an ended lineage. A sign-in in one tab never changes the account of another tab
+that is signed in. A failed refresh signs out only its own tab. The web app shows no signed-in
+page before the API client of the tab exists.
 Trade-off: the channel is same-origin, as `sessionStorage` is, so a script of another site
 cannot read it, but a tab of the same browser that sama itself runs gets the tokens; a browser
 without a signed-in tab still shows the sign-in page. A signed-out tab keeps the address that

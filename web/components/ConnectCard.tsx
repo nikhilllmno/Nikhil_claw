@@ -4,9 +4,10 @@
 // the provider in a new tab. After the click, the card checks the connection every few seconds,
 // so it shows "connected" when the sign-in finishes. The agent continues the request by itself.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useApi } from "./AuthProvider";
 import { cardStatus, type ConnectCardData } from "@/lib/connectCard";
+import { createPoller } from "@/lib/poller";
 import styles from "./ConnectCard.module.css";
 
 const POLL_MS = 4000;
@@ -16,27 +17,25 @@ export function ConnectCard({ card }: { card: ConnectCardData }) {
   const api = useApi();
   const [state, setState] = useState(card.state);
   const [opened, setOpened] = useState(false);
-  const started = useRef<number | null>(null);
 
   useEffect(() => {
     if (!opened || !card.connectionId || state === "connected") return;
-    let stopped = false;
-    const tick = async () => {
-      if (stopped) return;
-      if (started.current !== null && Date.now() - started.current > POLL_FOR_MS) return;
-      try {
-        const checked = await api.checkConnection(card.connectionId);
-        if (!stopped) setState(checked.state);
-      } catch {
-        // The next tick tries again. A connection that the user cannot see stays as it is.
-      }
-    };
-    const timer = window.setInterval(() => void tick(), POLL_MS);
-    const onFocus = () => void tick();
+    // One request at a time (the poller of the Code page), also for the focus refresh.
+    const poller = createPoller({
+      load: () => api.checkConnection(card.connectionId),
+      onData: (checked) => setState(checked.state),
+      onError: () => {
+        // The next poll tries again. A connection that the user cannot see stays as it is.
+      },
+      intervalMs: POLL_MS,
+    });
+    const deadline = window.setTimeout(() => poller.stop(), POLL_FOR_MS);
+    const onFocus = () => poller.refresh();
     window.addEventListener("focus", onFocus);
+    poller.start();
     return () => {
-      stopped = true;
-      window.clearInterval(timer);
+      poller.stop();
+      window.clearTimeout(deadline);
       window.removeEventListener("focus", onFocus);
     };
   }, [api, card.connectionId, opened, state]);
@@ -61,10 +60,7 @@ export function ConnectCard({ card }: { card: ConnectCardData }) {
             href={card.url}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={() => {
-              started.current = Date.now();
-              setOpened(true);
-            }}
+            onClick={() => setOpened(true)}
           >
             {opened ? `Open the ${card.title} sign-in again` : label}
           </a>

@@ -138,20 +138,35 @@ describe("AuthSession", () => {
   });
 });
 
-/** A fake BroadcastChannel bus: each tab gets the messages of the other tabs, at once. */
+/**
+ * A fake BroadcastChannel bus. Messages wait in a queue until `flush` (or `deliver` for one), so
+ * a test can put them in any order, as a real browser can.
+ */
 function bus() {
-  const tabs: { onmessage: ((event: { data: unknown }) => void) | null; postMessage: (m: unknown) => void }[] = [];
-  const open = () => {
-    const tab = {
-      onmessage: null as ((event: { data: unknown }) => void) | null,
+  type Tab = { onmessage: ((event: { data: unknown }) => void) | null; postMessage: (m: unknown) => void };
+  const tabs: Tab[] = [];
+  const queue: { to: Tab; data: unknown }[] = [];
+  const open = (): Tab => {
+    const tab: Tab = {
+      onmessage: null,
       postMessage(message: unknown) {
-        for (const other of tabs) if (other !== tab) other.onmessage?.({ data: structuredClone(message) });
+        for (const other of tabs) if (other !== tab) queue.push({ to: other, data: structuredClone(message) });
       },
     };
     tabs.push(tab);
     return tab;
   };
-  return { open };
+  const deliver = (index = 0) => {
+    const [item] = queue.splice(index, 1);
+    item?.to.onmessage?.({ data: item.data });
+  };
+  const flush = async () => {
+    while (queue.length > 0) {
+      deliver();
+      await Promise.resolve();
+    }
+  };
+  return { open, queue, deliver, flush };
 }
 
 function tab(channel: ReturnType<ReturnType<typeof bus>["open"]>, fetcher = vi.fn()) {
@@ -167,15 +182,29 @@ function tab(channel: ReturnType<ReturnType<typeof bus>["open"]>, fetcher = vi.f
   return { auth, session };
 }
 
+function counter() {
+  let n = 0;
+  return vi.fn(async () => {
+    n += 1;
+    return reply({ access_token: `a${n}`, refresh_token: `r${n}`, expires_in: 3600 });
+  });
+}
+
+/** Asks the open tabs and delivers the messages while the new tab waits. */
+async function adopt(tabs: ReturnType<typeof bus>, newTab: ReturnType<typeof tab>) {
+  const asked = newTab.auth.adoptFromTabs(1000);
+  await tabs.flush();
+  return asked;
+}
+
 describe("AuthSession across tabs (M8.1)", () => {
   it("a new tab opens signed in with the tokens of an open tab", async () => {
     const tabs = bus();
-    const fetcher = vi.fn(async () => reply({ access_token: "a1", refresh_token: "r1", expires_in: 3600 }));
-    const first = tab(tabs.open(), fetcher);
+    const first = tab(tabs.open(), counter());
     await first.auth.signInWithPassword("a@b.c", "pw");
     const second = tab(tabs.open());
     expect(second.auth.load()).toBeNull();
-    const adopted = await second.auth.adoptFromTabs(50);
+    const adopted = await adopt(tabs, second);
     expect(adopted?.access_token).toBe("a1");
     expect(JSON.parse(second.session.getItem(AUTH_KEY) ?? "null").refresh_token).toBe("r1");
     expect(await second.auth.getToken()).toBe("a1");
@@ -187,28 +216,67 @@ describe("AuthSession across tabs (M8.1)", () => {
     expect(await lone.auth.adoptFromTabs(10)).toBeNull();
   });
 
-  it("a refresh and a sign-out reach the other tabs", async () => {
+  it("a refresh and a sign-out reach the tabs of the same sign-in", async () => {
     const tabs = bus();
-    let n = 0;
-    const fetcher = vi.fn(async () => {
-      n += 1;
-      return reply({ access_token: `a${n}`, refresh_token: `r${n}`, expires_in: 3600 });
-    });
-    const first = tab(tabs.open(), fetcher);
+    const first = tab(tabs.open(), counter());
     await first.auth.signInWithPassword("a@b.c", "pw");
     const second = tab(tabs.open());
-    await second.auth.adoptFromTabs(50);
+    await adopt(tabs, second);
     await first.auth.refresh(first.auth.generation);
+    await tabs.flush();
     expect(second.auth.current?.refresh_token).toBe("r2");
     first.auth.signOut();
+    await tabs.flush();
     expect(second.auth.current).toBeNull();
     expect(second.session.getItem(AUTH_KEY)).toBeNull();
+  });
+
+  it("a late refresh never brings old tokens back", async () => {
+    const tabs = bus();
+    const first = tab(tabs.open(), counter());
+    await first.auth.signInWithPassword("a@b.c", "pw");
+    const second = tab(tabs.open());
+    await adopt(tabs, second);
+    await first.auth.refresh(first.auth.generation); // rev 1, r2
+    await first.auth.refresh(first.auth.generation); // rev 2, r3
+    tabs.deliver(1); // the newer refresh first
+    tabs.deliver(0); // then the older one
+    expect(second.auth.current?.refresh_token).toBe("r3");
+  });
+
+  it("a sign-in in one tab does not change the account of another tab", async () => {
+    const tabs = bus();
+    const first = tab(tabs.open(), counter());
+    const second = tab(tabs.open(), counter());
+    await first.auth.signInWithPassword("a@b.c", "pw");
+    await second.auth.signInWithPassword("other@b.c", "pw");
+    const generation = first.auth.generation;
+    await second.auth.refresh(second.auth.generation);
+    second.auth.signOut();
+    await tabs.flush();
+    expect(first.auth.current?.access_token).toBe("a1");
+    expect(first.auth.generation).toBe(generation);
+  });
+
+  it("a token reply that comes after a sign-out is not taken", async () => {
+    const tabs = bus();
+    const first = tab(tabs.open(), counter());
+    await first.auth.signInWithPassword("a@b.c", "pw");
+    const third = tab(tabs.open());
+    const asked = third.auth.adoptFromTabs(50);
+    tabs.deliver(0); // the ask reaches the first tab, which queues its reply
+    first.auth.signOut(); // queues the sign-out after the reply
+    tabs.deliver(tabs.queue.length - 1); // the sign-out arrives first
+    await tabs.flush(); // then the old reply
+    expect(await asked).toBeNull();
+    expect(third.auth.current).toBeNull();
   });
 
   it("ignores a message that is not a sign-in message", async () => {
     const channel = { onmessage: null as ((event: { data: unknown }) => void) | null, postMessage: vi.fn() };
     const lone = tab(channel);
-    channel.onmessage?.({ data: { type: "signin", tokens: { access_token: 3 } } });
+    channel.onmessage?.({ data: { type: "tokens", ask: "x", lineage: "l", rev: 1, tokens: { access_token: 3 } } });
+    channel.onmessage?.({ data: { type: "refresh", lineage: "l", rev: 1, tokens: { access_token: "a", expires_at: 2e9 } } });
     channel.onmessage?.({ data: "junk" });
     expect(lone.auth.current).toBeNull();
   });

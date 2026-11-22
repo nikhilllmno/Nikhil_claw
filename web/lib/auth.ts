@@ -40,13 +40,22 @@ export interface TabChannel {
 }
 
 export const TAB_CHANNEL = "sama.auth";
+/** sessionStorage: the lineage of the sign-in of this tab and its revision (M8.1). */
+export const TAB_KEY = "sama.auth.tab";
 /** How long a new tab waits for an open tab to give the tokens. */
 export const ADOPT_WAIT_MS = 400;
 
+/**
+ * A sign-in has a lineage: a random id that the tabs which share it keep. Only the tabs of the
+ * same lineage take a refresh or a sign-out of each other, and a higher revision wins, so a late
+ * message never brings old tokens back. A sign-in in one tab never changes the account of
+ * another tab that is signed in: only a tab without tokens takes a sign-in (`adoptFromTabs`).
+ */
 type TabMessage =
-  | { type: "ask" }
-  | { type: "tokens" | "signin" | "refresh"; tokens: Tokens }
-  | { type: "signout" };
+  | { type: "ask"; ask: string }
+  | { type: "tokens"; ask: string; lineage: string; rev: number; tokens: Tokens }
+  | { type: "refresh"; lineage: string; rev: number; tokens: Tokens }
+  | { type: "signout"; lineage: string };
 
 function tokensOf(value: unknown): Tokens | null {
   if (typeof value !== "object" || value === null) return null;
@@ -63,12 +72,29 @@ function tokensOf(value: unknown): Tokens | null {
 function messageOf(value: unknown): TabMessage | null {
   if (typeof value !== "object" || value === null) return null;
   const raw = value as Record<string, unknown>;
-  if (raw.type === "ask" || raw.type === "signout") return { type: raw.type };
-  if (raw.type === "tokens" || raw.type === "signin" || raw.type === "refresh") {
-    const tokens = tokensOf(raw.tokens);
-    return tokens === null ? null : { type: raw.type, tokens };
+  const text = (key: string) => (typeof raw[key] === "string" && raw[key] !== "" ? (raw[key] as string) : null);
+  const rev = typeof raw.rev === "number" && Number.isFinite(raw.rev) ? raw.rev : null;
+  if (raw.type === "ask") {
+    const ask = text("ask");
+    return ask === null ? null : { type: "ask", ask };
+  }
+  const lineage = text("lineage");
+  if (lineage === null) return null;
+  if (raw.type === "signout") return { type: "signout", lineage };
+  const tokens = tokensOf(raw.tokens);
+  if (tokens === null || rev === null) return null;
+  if (raw.type === "refresh") return { type: "refresh", lineage, rev, tokens };
+  if (raw.type === "tokens") {
+    const ask = text("ask");
+    return ask === null ? null : { type: "tokens", ask, lineage, rev, tokens };
   }
   return null;
+}
+
+function randomId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 export interface AuthDeps {
@@ -99,7 +125,12 @@ export class AuthSession implements TokenSource {
   private readonly fetcher: FetchLike;
   private readonly now: () => number;
 
-  private waiting: ((tokens: Tokens) => void) | null = null;
+  /** The sign-in lineage of this tab and the revision of its tokens (see `TabMessage`). */
+  private lineage: string | null = null;
+  private rev = 0;
+  /** The lineages that signed out: a late token reply of one of them is not taken. */
+  private readonly ended = new Set<string>();
+  private asking: { id: string; done: (taken: boolean) => void } | null = null;
 
   constructor(private readonly deps: AuthDeps) {
     this.fetcher = deps.fetcher ?? ((input, init) => fetch(input, init));
@@ -115,62 +146,70 @@ export class AuthSession implements TokenSource {
     }
   }
 
+  private saveTab() {
+    if (this.lineage === null) this.deps.session.removeItem(TAB_KEY);
+    else this.deps.session.setItem(TAB_KEY, JSON.stringify({ lineage: this.lineage, rev: this.rev }));
+  }
+
   /** A message of another tab of this browser. */
   private fromTab(data: unknown) {
     const message = messageOf(data);
     if (message === null) return;
     switch (message.type) {
       case "ask":
-        if (this.tokens !== null && this.tokens.expires_at > this.now()) {
-          this.tell({ type: "tokens", tokens: this.tokens });
+        if (this.tokens !== null && this.lineage !== null && this.tokens.expires_at > this.now()) {
+          this.tell({ type: "tokens", ask: message.ask, lineage: this.lineage, rev: this.rev, tokens: this.tokens });
         }
         return;
       case "tokens":
-        if (this.waiting !== null) this.waiting(message.tokens);
-        return;
-      case "signin":
-        // Another tab signed in, maybe as another account: a new generation.
+        if (this.asking === null || message.ask !== this.asking.id) return;
+        if (this.tokens !== null || this.ended.has(message.lineage)) return;
+        if (message.tokens.expires_at <= this.now()) return;
         this.epoch += 1;
         this.inflight = null;
+        this.lineage = message.lineage;
+        this.rev = message.rev;
         this.keep(message.tokens);
+        this.asking.done(true);
         return;
       case "refresh":
-        if (this.tokens !== null) this.keep(message.tokens);
+        // Only the same sign-in, and only newer tokens.
+        if (this.tokens === null || message.lineage !== this.lineage || message.rev <= this.rev) return;
+        this.rev = message.rev;
+        this.keep(message.tokens, false);
         return;
       case "signout":
-        if (this.tokens !== null) this.signOut(undefined, { fromTab: true });
+        this.ended.add(message.lineage);
+        if (this.tokens !== null && message.lineage === this.lineage) {
+          this.signOut(undefined, { fromTab: true });
+        }
         return;
     }
   }
 
-  private keep(tokens: Tokens) {
+  private keep(tokens: Tokens, announce = true) {
     this.tokens = tokens;
     this.deps.session.setItem(AUTH_KEY, JSON.stringify(tokens));
-    this.deps.onChange?.(tokens);
+    this.saveTab();
+    if (announce) this.deps.onChange?.(tokens);
   }
 
   /**
    * A tab without tokens asks the open tabs of this browser for them (M8.1). Resolves with the
-   * tokens, or `null` after `waitMs` when no tab has them.
+   * tokens, or `null` after `waitMs` when no tab gives them.
    */
   adoptFromTabs(waitMs: number = ADOPT_WAIT_MS): Promise<Tokens | null> {
     if (this.tokens !== null || !this.deps.tabs) return Promise.resolve(this.tokens);
+    const id = randomId();
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.waiting = null;
-        resolve(null);
-      }, waitMs);
-      this.waiting = (tokens) => {
+      const finish = () => {
         clearTimeout(timer);
-        this.waiting = null;
-        if (this.tokens === null && tokens.expires_at > this.now()) {
-          this.epoch += 1;
-          this.inflight = null;
-          this.keep(tokens);
-        }
+        if (this.asking?.id === id) this.asking = null;
         resolve(this.tokens);
       };
-      this.tell({ type: "ask" });
+      const timer = setTimeout(finish, waitMs);
+      this.asking = { id, done: finish };
+      this.tell({ type: "ask", ask: id });
     });
   }
 
@@ -192,6 +231,20 @@ export class AuthSession implements TokenSource {
         this.tokens = null;
       }
     }
+    this.lineage = null;
+    this.rev = 0;
+    const tab = this.deps.session.getItem(TAB_KEY);
+    if (this.tokens !== null && tab !== null) {
+      try {
+        const saved = JSON.parse(tab) as { lineage?: unknown; rev?: unknown };
+        if (typeof saved.lineage === "string" && typeof saved.rev === "number") {
+          this.lineage = saved.lineage;
+          this.rev = saved.rev;
+        }
+      } catch {
+        // A tab without a lineage shares nothing until its next sign-in.
+      }
+    }
     return this.tokens;
   }
 
@@ -208,10 +261,13 @@ export class AuthSession implements TokenSource {
   private signedIn(data: TokenData) {
     this.epoch += 1;
     this.inflight = null;
-    this.store(data, "signin");
+    // A new sign-in is a new lineage: no other tab changes its account because of it.
+    this.lineage = randomId();
+    this.rev = 0;
+    this.store(data, false);
   }
 
-  private store(data: TokenData, kind: "signin" | "refresh" = "refresh") {
+  private store(data: TokenData, refreshed = true) {
     if (typeof data.access_token !== "string" || data.access_token === "") {
       throw new AuthError("Sign-in failed.");
     }
@@ -221,9 +277,13 @@ export class AuthSession implements TokenSource {
       refresh_token: typeof data.refresh_token === "string" ? data.refresh_token : null,
       expires_at: this.now() + (Number.isFinite(expiresIn) ? expiresIn : 3600) * 1000,
     };
+    if (refreshed) this.rev += 1;
     this.deps.session.setItem(AUTH_KEY, JSON.stringify(this.tokens));
+    this.saveTab();
     this.deps.onChange?.(this.tokens);
-    this.tell({ type: kind, tokens: this.tokens });
+    if (refreshed && this.lineage !== null) {
+      this.tell({ type: "refresh", lineage: this.lineage, rev: this.rev, tokens: this.tokens });
+    }
   }
 
   private async auth(path: string, body: unknown): Promise<Record<string, unknown>> {
@@ -341,8 +401,15 @@ export class AuthSession implements TokenSource {
     this.epoch += 1;
     this.inflight = null;
     this.tokens = null;
+    const lineage = this.lineage;
+    this.lineage = null;
+    this.rev = 0;
     this.deps.session.removeItem(AUTH_KEY);
+    this.saveTab();
     this.deps.onChange?.(null);
-    if (!options.fromTab) this.tell({ type: "signout" });
+    if (lineage !== null) {
+      this.ended.add(lineage);
+      if (!options.fromTab) this.tell({ type: "signout", lineage });
+    }
   }
 }

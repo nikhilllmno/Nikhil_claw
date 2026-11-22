@@ -55,6 +55,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const base = apiUrl();
     if (base === "") return;
     let cancelled = false;
+    let ready = false;
     // The other tabs of this browser give a new tab their sign-in (M8.1), for example a tab that
     // a link of the chat opened.
     const channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(TAB_CHANNEL);
@@ -76,14 +77,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               : null,
           session: window.sessionStorage,
           local: window.localStorage,
-          onChange: (tokens) => (tokens ? setStatus({ kind: "signed-in" }) : signedOut()),
+          // No status before the API client exists: the first status comes below.
+          onChange: (tokens) => {
+            if (!ready) return;
+            if (tokens) setStatus({ kind: "signed-in" });
+            else signedOut();
+          },
           tabs,
         });
         setSignup(loaded.signup === "open" ? "open" : "invite_only");
-        const signedIn = session.load() !== null || (await session.adoptFromTabs()) !== null;
+        if (session.load() === null) await session.adoptFromTabs();
         if (cancelled) return;
+        ready = true;
         setAuth(session);
-        if (signedIn) setStatus({ kind: "signed-in" });
+        // The state of the session now, not a value from before the wait.
+        if (session.current !== null) setStatus({ kind: "signed-in" });
         else signedOut();
       })
       .catch((error: unknown) => {
