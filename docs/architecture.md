@@ -6627,7 +6627,9 @@ service checks the values with the rules of `repo_clone` (Section 15.1). A sessi
 - A run claims each clone with a lease (`updated_at` moves 360 seconds ahead). While the lease
   runs, no other run clones the same repository, also with parallel runs in one session; only
   the claim holder stores `ready` or `failed`. After a crash, the lease ends and the next run
-  clones it.
+  can claim it. When the crashed run left the folder behind, that clone fails with "PATH
+  exists", as for any used folder, and the person detaches the repository and attaches it with
+  another folder name. sama does not delete a folder by itself.
 - The step adds a note after the message of the run: the repositories that it cloned, their
   folders, and whether the agent can push them, or the reason of a failed clone. The stored
   message does not change. The instruction files of the repository are not in the note: the
@@ -6709,7 +6711,8 @@ script in the place of a command: `sh test.sh`, `bash "scripts/run_tests.sh"`, `
 `cd repo && ./test.sh`; a script name as an argument, as in `cat ./test.sh`, is not; nor is a
 command that only shows information (`pytest --version`, `npm test --help`) or installs a test
 tool (`pip install pytest`); each command and pipe stage is read alone, and `-h`/`-V` count
-as information only for pytest, so `ctest -V` and `mvn -V test` are test runs) has `test`
+as information only for pytest, so `ctest -V` and `mvn -V test` are test runs; a `|` in quotes
+does not split) has `test`
 true and the last result line of the output as `summary`. `?tests=true` lists only these.
 
 - The exit status of a pipe is the status of its last command, so `pytest | tail` ends with 0

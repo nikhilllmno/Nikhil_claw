@@ -70,6 +70,8 @@ def test_test_commands(command: str) -> None:
         "python3 -m pytest --version 2>&1 || pip install pytest",
         "pytest -h",
         "python3 -m pytest -V",
+        "pytest -o 'filterwarnings=ignore:foo|bar' --help",
+        "pytest -k a\\|b --help",
         "npm test --help",
         "pip install pytest",
         "uv add --dev pytest",

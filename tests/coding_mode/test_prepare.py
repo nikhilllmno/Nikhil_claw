@@ -437,3 +437,31 @@ async def test_an_ended_lease_can_be_claimed_again(
     )
     (still,) = (await coding.state(org_id=org, session_id=tenant.ids["mine"])).repos
     assert still.status == "pending"
+
+
+async def test_a_failed_claim_skips_only_that_repository(
+    coding: CodingService, tenant: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sama.coding_mode.prepare import PLAN_MODE_NOTE
+
+    org, session = tenant.org, tenant.ids["mine"]
+    broken = await coding.attach(org_id=org, session_id=session, user_id=None, repo="team/one")
+    await coding.attach(org_id=org, session_id=session, user_id=None, repo="team/two")
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=None, on=True)
+    claim = coding.claim
+
+    async def flaky(*, org_id: uuid.UUID, repo_id: uuid.UUID) -> Any:
+        if repo_id == broken.id:
+            raise RuntimeError("the database went away")
+        return await claim(org_id=org_id, repo_id=repo_id)
+
+    monkeypatch.setattr(coding, "claim", flaky)
+    cloner = FakeCloner()
+    preparer = CodingPreparer(coding, cloner, RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    note = await preparer.prepare(object(), scope, token)  # type: ignore[arg-type]
+    assert [call["repo"] for call in cloner.calls] == ["team/two"]
+    assert "https://github.com/team/two" in note
+    assert note.endswith(PLAN_MODE_NOTE)
+    one, two = (await coding.state(org_id=org, session_id=session)).repos
+    assert (one.status, two.status) == ("pending", "ready")

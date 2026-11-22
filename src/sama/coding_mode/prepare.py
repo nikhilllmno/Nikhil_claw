@@ -175,7 +175,13 @@ class CodingPreparer:
         """Clones one repository and stores the result. Returns the ready repository, or the
         reason of a failure (None when the result could not be stored)."""
         org_id = uuid.UUID(scope.org_id)
-        claim = await self._coding.claim(org_id=org_id, repo_id=repo.id)
+        try:
+            claim = await self._coding.claim(org_id=org_id, repo_id=repo.id)
+        except Exception as error:
+            log.warning(
+                "the clone was not claimed run=%s repo=%s: %r", scope.run_id, repo.repo, error
+            )
+            return None, None
         if claim is None:
             # Another run clones it now, or it changed. That run stores the result.
             log.info("coding repo clone claimed by another run repo=%s", repo.repo)

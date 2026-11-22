@@ -71,9 +71,6 @@ _SUMMARY: Final = re.compile(
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
     r"|^\s*not ok\b.*$"
 )
-_STAGES: Final = re.compile(r"&&|\|\|?|[;\n]")
-"""Splits a shell line into its commands and pipe stages, so the options of ``tail`` or
-``grep`` in ``pytest | grep -h x`` do not count for pytest."""
 _INFO: Final = re.compile(r"(?:^|\s)(?:--version|--help)(?=$|\s)")
 """``pytest --version`` and ``npm test --help`` only show information; they run no test."""
 _PYTEST: Final = re.compile(r"(?:^|[\s/])(?:pytest|py\.test)(?=$|\s)")
@@ -119,7 +116,42 @@ class PullRequestView:
 def is_test_command(command: str) -> bool:
     """True when the command runs the tests of a project, for example ``pytest`` or
     ``npm test``, or a test script such as ``sh test.sh``."""
-    return any(_test_stage(stage) for stage in _STAGES.split(command))
+    return any(_test_stage(stage) for stage in _stages(command))
+
+
+def _stages(command: str) -> list[str]:
+    """Splits a shell line at ``&&``, ``||``, ``|``, ``;``, and new lines outside quotes, so
+    the options of ``grep`` in ``pytest | grep -h x`` do not count for pytest, and a ``|`` in
+    a quoted argument does not split."""
+    stages: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote:
+            current.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(command):
+                current.append(command[index + 1])
+                index += 1
+            elif char == quote:
+                quote = ""
+        elif char == "\\" and index + 1 < len(command):
+            current.append(char + command[index + 1])
+            index += 1
+        elif char in "'\"":
+            quote = char
+            current.append(char)
+        elif char in "|&;\n":
+            stages.append("".join(current))
+            current = []
+            if char in "|&" and command[index + 1 : index + 2] == char:
+                index += 1
+        else:
+            current.append(char)
+        index += 1
+    stages.append("".join(current))
+    return stages
 
 
 def _test_stage(stage: str) -> bool:
