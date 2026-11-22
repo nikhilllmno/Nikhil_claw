@@ -8624,7 +8624,8 @@ its own pull request.
   "Waiting for you" (a run waits for an approval), or "The last run failed". The time is the
   start of the newest run. `GET /sessions` gives `run_state` (`running`, `waiting`, `failed`,
   `done`, or `null` without a run) and `last_activity_at` for each session. The sidebar reads the
-  list again every 8 seconds while a session works or waits.
+  list again every 8 seconds while a session works or waits, else every 30 seconds, with one
+  request at a time.
 - A menu on each session (the owner of a private session, or the owner or an admin of a shared
   session, as `can_manage` says) renames it in place or archives it after a confirmation
   (`PATCH /sessions/{id}`).

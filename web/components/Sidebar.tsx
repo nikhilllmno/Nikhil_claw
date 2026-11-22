@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { sessionTitle } from "@/lib/chat";
 import { loadProgress, showSetupCard } from "@/lib/onboarding";
 import { errorText, type SessionOut } from "@/lib/api";
-import { anyOpen, archiveConfirmText, canManageSession, checkTitle, filterSessions, runStateLabel } from "@/lib/sessionList";
+import { archiveConfirmText, canManageSession, checkTitle, filterSessions, runStateLabel } from "@/lib/sessionList";
 import { groupByAge, relativeTime } from "@/lib/time";
 import { useApi, useAuth } from "./AuthProvider";
 import { useData } from "./DataProvider";
@@ -86,15 +86,6 @@ export function Sidebar({
   const inWorkspace = (sessions ?? []).filter((s) => workspaceId === null || s.workspace_id === workspaceId);
   const visible = filterSessions(inWorkspace, query);
   const groups = groupByAge(visible, now);
-  // While a session works or waits, read the list again, so that the dots stay right.
-  const working = anyOpen(inWorkspace);
-  useEffect(() => {
-    if (!working) return;
-    const timer = setInterval(() => {
-      if (!document.hidden) reloadSessions();
-    }, 8_000);
-    return () => clearInterval(timer);
-  }, [working, reloadSessions]);
   // The navigation under the sessions: closed, so that the sessions get the room, unless the
   // page is one of its links.
   const navCurrent = [...WORKSPACE_LINKS, ...ORG_LINKS].some((l) => isCurrent(l.href, pathname)) || pathname.startsWith("/agents/");
