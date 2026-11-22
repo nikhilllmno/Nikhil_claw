@@ -1424,24 +1424,38 @@ class ConnectionService:
             if manifest.mcp is not None and manifest.mcp.url.rstrip("/") == url.strip().rstrip("/"):
                 # A catalog server: connect it from the catalog, with its tested settings.
                 return await self.request_for_agent(claims, manifest.name, chosen)
-        started = await self.add_mcp(
-            run.org_id,
-            run.workspace_id,
-            grants,
-            name=server,
-            url=url,
-            auth=auth,
-            header=None,
-            oauth_scope=None,
-            title=title,
-            scope=chosen,
-            via="chat",
-            origin={
-                "session_id": claims.session_id,
-                "run_id": claims.run_id,
-                "user_id": str(run.user_id),
-            },
-        )
+        origin = {
+            "session_id": claims.session_id,
+            "run_id": claims.run_id,
+            "user_id": str(run.user_id),
+        }
+
+        async def add(kind: McpAuth) -> Started:
+            return await self.add_mcp(
+                run.org_id,
+                run.workspace_id,
+                grants,
+                name=server,
+                url=url,
+                auth=kind,
+                header=None,
+                oauth_scope=None,
+                title=title,
+                scope=chosen,
+                via="chat",
+                origin=origin,
+            )
+
+        # The agent cannot know if a server has a sign-in. sama tries the server without a
+        # credential first; a server that refuses gets the OAuth sign-in. The person approves
+        # once (M8.1). A ``bearer`` server gets its form.
+        if auth == "bearer":
+            started = await add("bearer")
+        else:
+            started = await add("none")
+            refused = (started.connection.last_error or "").startswith("The server refused")
+            if started.connection.state == "failed" and refused:
+                started = await add("oauth")
         manifest = self._manifest_of(started.connection)
         return self._started_reply(manifest, chosen, started)
 
@@ -2206,7 +2220,20 @@ class ConnectionService:
                 org_id, row_id, spec, redirect_uri=redirect, actor=actor
             )
         except McpError as error:
-            # ``start`` sets ``failed`` only if this start still owns the row.
+            # Keep the server of a custom connection, so a retry finds it; ``start`` then sets
+            # ``failed``. Both change the row only if this start still owns it.
+            token = config.get("return_token")
+            if isinstance(token, str):
+                async with self._engine.begin() as connection:
+                    await connection.execute(
+                        update(Connection)
+                        .where(
+                            Connection.org_id == org_id,
+                            Connection.id == row_id,
+                            Connection.config["return_token"].astext == token,
+                        )
+                        .values(config=config)
+                    )
             raise ConnectorError(str(error), status_code=502) from None
         config["sign_in_url"] = link
         view = await self._set(

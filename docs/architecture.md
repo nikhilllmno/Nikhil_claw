@@ -2928,7 +2928,8 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   of the connection. The Telegram gateway sends an inline URL button, and the Slack gateway
   sends a link button, after the text so far (`follow_run`, `send_connect`). WhatsApp and email
   show the link in the text of the agent. The model reads the same line, so both runtimes work
-  the same.
+  the same. The OpenAI runtime stores the tool output as JSON text blocks, so the readers also
+  take a card whose quotes are escaped.
 - **Return pages on the control plane.** The Composio callback is
   `<SAMA_PUBLIC_URL>/connections/return?connection=<id>&t=<token>`, and the OAuth redirect URI
   of a remote MCP server is `<SAMA_PUBLIC_URL>/connections/oauth/return`. Both need no sama
@@ -2985,7 +2986,10 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   remote MCP server. It is not in the default allow list, so the gate asks a person. Only a
   workspace admin or the org owner can add one (a member gets the admins to ask). A URL of a
   catalog server connects the catalog connector. `auth: oauth` starts the sign-in with a card,
-  `none` connects and lists the tools, and `bearer` gives the link to the form. The name comes
+  `none` connects and lists the tools, and `bearer` gives the link to the form. The agent cannot
+  know if a server has a sign-in, so for `oauth` and `none` sama tries the server without a
+  credential first and starts the OAuth sign-in only when the server refuses; the person
+  approves once. The name comes
   from the host (`mcp.linear.app` gives `linear-mcp` when `linear` is a catalog name).
 - **Same session.** The tools of a new connection are in the next `tool_search` of the same
   session (Section 10.3.1), so the resumed run uses them at once.

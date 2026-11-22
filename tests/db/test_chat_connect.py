@@ -450,3 +450,25 @@ async def test_a_long_sign_in_link_keeps_its_card_in_the_runtime_preview(
         await service.sign_in_link(connection_id, "wrong-token-here")
     with pytest.raises(ConnectorError):
         await service.sign_in_link(connection_id, "é" * 20)
+
+
+async def test_a_server_by_url_falls_back_between_oauth_and_no_sign_in(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    service, _, mcp, _ = world
+    await make_admin(engine, org, "mia")
+    # The server needs a sign-in, and the agent said none: sama starts the OAuth sign-in.
+    answer = await service.add_mcp_for_agent(
+        private(org), url=URL, name="tracker", title=None, auth="none", scope=None
+    )
+    [found] = cards(answer)
+    assert found["state"] == "initiated"
+    assert found["url"] is not None
+    # A server without a sign-in and the agent said oauth: sama connects without one.
+    mcp.auth = "none"
+    answer = await service.add_mcp_for_agent(
+        private(org), url=URL, name="open", title=None, auth="oauth", scope=None
+    )
+    [found] = cards(answer)
+    assert found["state"] == "connected"
+    assert "is connected now" in answer

@@ -1706,7 +1706,8 @@ class ToolServer:
                 "org owner can add one. auth is 'oauth' (the server has a sign-in; the user "
                 "gets a Connect button), 'none' (it connects at once and lists its tools), or "
                 "'bearer' (a key; the user types it on the sama web page, never in the chat). "
-                "If you do not know, use 'oauth' when the server answers 401, else 'none'. name "
+                "If you do not know, use 'oauth': sama tries without a sign-in when the server has "
+                "no OAuth, and starts the sign-in when a server without a credential refuses. name "
                 "is optional (from the host). scope as for connection_request."
             ),
             annotations=ToolAnnotations(
