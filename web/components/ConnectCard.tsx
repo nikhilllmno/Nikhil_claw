@@ -16,14 +16,18 @@ const POLL_FOR_MS = 15 * 60 * 1000;
 export function ConnectCard({ card }: { card: ConnectCardData }) {
   const api = useApi();
   const [state, setState] = useState(card.state);
-  const [opened, setOpened] = useState(false);
+  // Each click starts a new 15-minute window of checks.
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
-    if (!opened || !card.connectionId || state === "connected") return;
+    if (attempt === 0 || !card.connectionId) return;
     // One request at a time (the poller of the Code page), also for the focus refresh.
     const poller = createPoller({
       load: () => api.checkConnection(card.connectionId),
-      onData: (checked) => setState(checked.state),
+      onData: (checked) => {
+        setState(checked.state);
+        if (checked.state === "connected") poller.stop();
+      },
       onError: () => {
         // The next poll tries again. A connection that the user cannot see stays as it is.
       },
@@ -38,7 +42,7 @@ export function ConnectCard({ card }: { card: ConnectCardData }) {
       window.clearTimeout(deadline);
       window.removeEventListener("focus", onFocus);
     };
-  }, [api, card.connectionId, opened, state]);
+  }, [api, card.connectionId, attempt]);
 
   const connected = state === "connected";
   const label = card.state === "form" ? `Open the ${card.title} form` : `Connect ${card.title}`;
@@ -60,9 +64,9 @@ export function ConnectCard({ card }: { card: ConnectCardData }) {
             href={card.url}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={() => setOpened(true)}
+            onClick={() => setAttempt((n) => n + 1)}
           >
-            {opened ? `Open the ${card.title} sign-in again` : label}
+            {attempt > 0 ? `Open the ${card.title} sign-in again` : label}
           </a>
         </div>
       ) : null}

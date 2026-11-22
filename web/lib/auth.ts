@@ -242,8 +242,14 @@ export class AuthSession implements TokenSource {
           this.rev = saved.rev;
         }
       } catch {
-        // A tab without a lineage shares nothing until its next sign-in.
+        // A broken record: a new lineage below.
       }
+    }
+    if (this.tokens !== null && this.lineage === null) {
+      // A sign-in from before M8.1 has no lineage: it gets one, so it shares like a new one.
+      this.lineage = randomId();
+      this.rev = 0;
+      this.saveTab();
     }
     return this.tokens;
   }
@@ -375,17 +381,25 @@ export class AuthSession implements TokenSource {
       return Promise.resolve(null);
     }
     const epoch = this.epoch;
+    const startRev = this.rev;
+    // Another tab of the same sign-in refreshed while this request was open: its tokens are
+    // newer, so this answer is dropped and is not sent to the other tabs (M8.1).
+    const superseded = () => this.rev !== startRev || this.tokens?.refresh_token !== refreshToken;
     const run = async (): Promise<string | null> => {
       try {
         const data = await this.auth("token?grant_type=refresh_token", {
           refresh_token: refreshToken,
         });
         if (epoch !== this.epoch) return null;
+        if (superseded()) return this.tokens?.access_token ?? null;
         this.store(data);
         return this.tokens?.access_token ?? null;
       } catch {
+        if (epoch !== this.epoch) return null;
+        // The refresh token of this request was rotated by another tab: use the newer tokens.
+        if (superseded() && this.tokens !== null) return this.tokens.access_token;
         // Only this tab: a network error here must not sign out the other tabs.
-        if (epoch === this.epoch) this.signOut(undefined, { fromTab: true });
+        this.signOut(undefined, { fromTab: true });
         return null;
       } finally {
         if (epoch === this.epoch) this.inflight = null;

@@ -281,3 +281,40 @@ describe("AuthSession across tabs (M8.1)", () => {
     expect(lone.auth.current).toBeNull();
   });
 });
+
+describe("AuthSession refresh across tabs (M8.1, round 2)", () => {
+  it("drops a late refresh answer after another tab refreshed", async () => {
+    const tabs = bus();
+    let release: (() => void) | null = null;
+    let n = 0;
+    const slow = vi.fn(async () => {
+      n += 1;
+      const mine = n;
+      if (mine === 2) await new Promise<void>((resolve) => (release = resolve));
+      return reply({ access_token: `a${mine}`, refresh_token: `r${mine}`, expires_in: 3600 });
+    });
+    const first = tab(tabs.open(), slow);
+    await first.auth.signInWithPassword("a@b.c", "pw"); // r1
+    const second = tab(tabs.open(), counter());
+    await adopt(tabs, second);
+    const late = first.auth.refresh(first.auth.generation); // waits for its answer (r2)
+    await second.auth.refresh(second.auth.generation); // the second tab refreshes (a1 -> its own r1)
+    await tabs.flush();
+    const newer = first.auth.current?.refresh_token;
+    expect(newer).toBe(second.auth.current?.refresh_token);
+    (release as unknown as () => void)();
+    await late;
+    await tabs.flush();
+    expect(first.auth.current?.refresh_token).toBe(newer);
+    expect(second.auth.current?.refresh_token).toBe(newer);
+  });
+
+  it("gives a sign-in from before M8.1 a lineage, so it shares", async () => {
+    const tabs = bus();
+    const old = tab(tabs.open());
+    old.session.setItem(AUTH_KEY, JSON.stringify({ access_token: "a0", refresh_token: "r0", expires_at: 2e9 }));
+    expect(old.auth.load()?.access_token).toBe("a0");
+    const fresh = tab(tabs.open());
+    expect((await adopt(tabs, fresh))?.access_token).toBe("a0");
+  });
+});
