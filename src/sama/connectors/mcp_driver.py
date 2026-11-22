@@ -189,6 +189,19 @@ class McpDriver:
         url = authorization_url(server, client, redirect_uri=redirect_uri, state=state, pkce=pkce)
         return config, url
 
+    async def state_matches(self, org_id: uuid.UUID, connection_id: uuid.UUID, state: str) -> bool:
+        """True when ``state`` is the open OAuth state of the connection. It changes nothing:
+        the return page of the control plane checks the proof before it tells or does anything
+        (M8.1). ``finish_oauth`` checks the state again and uses it once."""
+        if self._vault is None:
+            return False
+        try:
+            secret = await self._secret(org_id, connection_id, fresh=True)
+        except Exception:
+            return False
+        expected = secret.get("state")
+        return isinstance(expected, str) and hmac.compare_digest(expected.encode(), state.encode())
+
     async def finish_oauth(
         self,
         org_id: uuid.UUID,

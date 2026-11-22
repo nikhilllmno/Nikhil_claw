@@ -192,6 +192,66 @@ class Handoffs:
             " starts a new session.",
         )
 
+    async def follow(
+        self, *, org_id: uuid.UUID, session_id: uuid.UUID, run_id: uuid.UUID, text: str
+    ) -> int:
+        """Sends the answer of ``run_id`` to the direct chats (Telegram, Slack) that the private
+        session is bound to, after ``text``. A run that sama starts by itself (a finished
+        sign-in, M8.1) has no chat follower otherwise. Returns how many chats follow it. The
+        followers use the handoff id ``0``: no handoff took the run, so ``moved_away`` lets
+        them send until a real handoff moves the session."""
+        async with self._engine.connect() as connection:
+            session = (
+                await connection.execute(
+                    select(
+                        Session.workspace_id,
+                        Session.audience,
+                        Session.owner_user_id,
+                        Session.worker_bot_id,
+                    ).where(Session.org_id == org_id, Session.id == session_id)
+                )
+            ).one_or_none()
+            if (
+                session is None
+                or session.audience != "private"
+                or session.owner_user_id is None
+                or session.worker_bot_id is not None
+            ):
+                return 0
+            bindings = (
+                await connection.execute(
+                    select(SessionBinding.channel, SessionBinding.external_key).where(
+                        SessionBinding.org_id == org_id, SessionBinding.session_id == session_id
+                    )
+                )
+            ).all()
+            found: list[tuple[Any, str]] = []
+            for binding in bindings:
+                if binding.channel not in self._doors:
+                    continue
+                try:
+                    identity = await self._identity(
+                        connection,
+                        org_id,
+                        session.owner_user_id,
+                        binding.channel,
+                        session.workspace_id,
+                    )
+                except HandoffError:
+                    continue
+                found.append((identity, binding.external_key))
+        count = 0
+        for identity, key in found:
+            door = await self._doors[identity.channel](identity.integration_id)
+            if door is None:
+                continue
+            chat = await door.open_chat(identity)
+            if chat.key != key:
+                continue  # The session is bound to another chat of the user, not the direct one.
+            await door.adopt(chat, Target.private(identity), [run_id], text, handoff_id=0)
+            count += 1
+        return count
+
     @staticmethod
     async def _session(
         connection: AsyncConnection, org_id: uuid.UUID, user_id: uuid.UUID, session_id: uuid.UUID

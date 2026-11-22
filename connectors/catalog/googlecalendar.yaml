@@ -4,6 +4,12 @@ name: googlecalendar
 title: Google Calendar
 description: Read and change events in Google Calendar.
 kind: composio
+aliases:
+- calendar
+- gcal
+- google cal
+- events
+- schedule
 scopes:
 - personal
 - workspace

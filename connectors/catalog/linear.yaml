@@ -4,6 +4,10 @@ name: linear
 title: Linear
 description: Read and write issues and comments in Linear.
 kind: composio
+aliases:
+- linear issues
+- issues
+- tickets
 scopes:
 - personal
 - workspace

@@ -70,6 +70,7 @@ from sama.gateway.sessions import (
     Target,
     approval_text,
     busy_text,
+    connect_button_text,
     decide,
     find_session,
     follow_run,
@@ -298,6 +299,29 @@ class _Outbox:
                     raise
                 await asyncio.sleep(wait)
         raise AssertionError("unreachable")
+
+
+def connect_blocks(found: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """The fallback text and the blocks of a connect card (M8.1): a link button to the sign-in
+    page of the provider. A click on a link button sends no value that sama acts on."""
+    title = str(found.get("title") or "the app")[:60]
+    text = connect_button_text(found)
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": escape(text)}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "sama_connect",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": f"Connect {title}"},
+                    "url": str(found["url"])[:3000],
+                }
+            ],
+        },
+    ]
+    return text, blocks
 
 
 def approval_blocks(row: Any) -> tuple[str, list[dict[str, Any]]]:
@@ -1312,10 +1336,16 @@ class SlackGateway:
             text, blocks = approval_blocks(row)
             await outbox.send_message(text, blocks=blocks)
 
+        async def send_connect(found: dict[str, Any]) -> None:
+            text, blocks = connect_blocks(found)
+            await outbox.send_message(text, blocks=blocks)
+
         try:
             while True:
                 reply = Reply(outbox, None, settings.edit_interval_s)
-                status = await follow_run(self._engine, org_id, run_id, reply, settings, send_card)
+                status = await follow_run(
+                    self._engine, org_id, run_id, reply, settings, send_card, send_connect
+                )
                 await send_ending(self._engine, outbox, org_id, run_id, status, reply)
                 await send_media(self._engine, outbox, org_id, run_id)
                 after = await self._queue.requeued_run(org_id=org_id, run_id=run_id)

@@ -25,12 +25,19 @@ from datetime import datetime
 from decimal import Decimal
 from importlib import resources
 from typing import Annotated, Any, ClassVar, Final, Literal, Self
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import (
     BaseModel,
@@ -119,6 +126,7 @@ from sama.billing import BillingService
 from sama.coding.agents import CodingAgent
 from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
 from sama.coding_mode.service import CodingService
+from sama.connectors.chat import return_page
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.context import (
     MAX_PIN_CHARS,
@@ -241,7 +249,7 @@ from sama.tenancy.regions import OrgInOtherRegion, home_regions, member_user_id,
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.triggers import router as trigger_routes
 from sama.triggers import service as triggers
-from sama.vault.redact import default_redactor
+from sama.vault.redact import default_redactor, redact
 from sama.vault.standalone import VaultUnreadableError, know_the_secrets
 from sama.workflows.service import WorkflowService
 from sama.workflows.spec import WorkflowError, WorkflowNotFoundError
@@ -974,6 +982,38 @@ class _CorsApp(FastAPI):
             expose_headers=["Content-Disposition"],
             max_age=600,
         )
+
+
+def _return_page(
+    service: ConnectionService, view: ConnectionView | None, via: str, problem: str | None
+) -> Response:
+    """The end of a sign-in (M8.1). A sign-in from the Connections page goes back there. A
+    sign-in from a chat gets a small page: the chat continues by itself."""
+    web = service.web_base
+    if view is not None and via == "web" and web is not None:
+        query = urlencode({"workspace": str(view.workspace_id), "connection": str(view.id)})
+        return RedirectResponse(f"{web}/connections?{query}", status_code=303)
+    manifest = None if view is None else service.catalog.get(view.connector)
+    title = (manifest.title if manifest else None) or (view.connector if view else "The app")
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if view is not None and view.state == "connected":
+        page = return_page(
+            f"{title} is connected",
+            f"{title} is connected",
+            "You can close this page and go back to the chat. sama continues your request.",
+            link=web,
+        )
+        return HTMLResponse(page, headers=headers)
+    reason = (
+        problem or (view.last_error if view is not None else None) or "The sign-in did not finish."
+    )
+    page = return_page(
+        "The sign-in did not finish",
+        f"{title} is not connected",
+        f"{redact(reason)} Go back to the chat and ask sama to connect it again.",
+        link=web,
+    )
+    return HTMLResponse(page, status_code=400 if view is None else 200, headers=headers)
 
 
 def _not_found(what: str = NOT_FOUND) -> HTTPException:
@@ -1976,6 +2016,19 @@ class SamaApi:
         async def connectors(principal: Me) -> list[dict[str, Any]]:
             return [m.public() for m in self._require_connections().catalog]
 
+        @app.get("/workspaces/{workspace_id}/connectors/availability")
+        async def connector_availability(principal: Me, workspace_id: uuid.UUID) -> dict[str, str]:
+            # Why a connector cannot connect in this org now, in plain words (M8.1). The
+            # Connections page shows it instead of a row that stays "pending".
+            org_id, _ = await self._workspace_grants(principal, workspace_id)
+            service = self._require_connections()
+            out: dict[str, str] = {}
+            for manifest in service.catalog:
+                problem = await service.availability(org_id, manifest)
+                if problem is not None:
+                    out[manifest.name] = problem
+            return out
+
         @app.get("/workspaces/{workspace_id}/connections")
         async def list_connections(principal: Me, workspace_id: uuid.UUID) -> list[dict[str, Any]]:
             org_id, grants = await self._workspace_grants(principal, workspace_id)
@@ -2085,6 +2138,52 @@ class SamaApi:
                 actor=grants.user_id,
             )
             return done.public(self._require_connections().can_manage(done, grants))
+
+        @app.get("/connections/return", include_in_schema=False)
+        async def connection_return(
+            connection: Annotated[uuid.UUID, Query()],
+            t: Annotated[str, Query(min_length=8, max_length=200)],
+        ) -> Response:
+            # The Composio sign-in comes back here (M8.1). No sama session: the token of the
+            # start is the proof, and the check only reads the state from Composio.
+            service = self._require_connections()
+            try:
+                view, via = await service.finish_return(connection, t)
+            except ConnectorError as error:
+                return _return_page(service, None, "web", str(error))
+            return _return_page(service, view, via, None)
+
+        @app.get("/connections/go", include_in_schema=False)
+        async def connection_go(
+            connection: Annotated[uuid.UUID, Query()],
+            t: Annotated[str, Query(min_length=8, max_length=200)],
+        ) -> Response:
+            # The short link of a long sign-in link (M8.1): the token of the start is the proof.
+            service = self._require_connections()
+            try:
+                url = await service.sign_in_link(connection, t)
+            except ConnectorError as error:
+                return _return_page(service, None, "chat", str(error))
+            return RedirectResponse(
+                url,
+                status_code=302,
+                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+            )
+
+        @app.get("/connections/oauth/return", include_in_schema=False)
+        async def connection_oauth_return(
+            state: Annotated[str, Query(min_length=3, max_length=500)],
+            code: Annotated[str | None, Query(max_length=4000)] = None,
+            error: Annotated[str | None, Query(max_length=200)] = None,
+        ) -> Response:
+            # The OAuth redirect URI of a remote MCP server (M8.1). The state and the PKCE
+            # verifier are checked and used once, as in ``POST /connections/oauth/callback``.
+            service = self._require_connections()
+            try:
+                view, via = await service.finish_oauth_return(state=state, code=code, error=error)
+            except ConnectorError as problem:
+                return _return_page(service, None, "web", str(problem))
+            return _return_page(service, view, via, None)
 
         @app.put("/connections/{connection_id}/tools")
         async def connection_tools(

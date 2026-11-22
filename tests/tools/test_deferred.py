@@ -538,13 +538,16 @@ class FakeConnections:
 
     async def list_for_agent(self, claims: RunTokenClaims) -> str:
         self.calls.append(("list", claims.run_id))
-        return "Connectors:\n- gmail (Gmail): connected (personal)."
+        return "Connectors:\n- gmail (Gmail, via Composio): connected (personal)."
 
     async def request_for_agent(
         self, claims: RunTokenClaims, connector: str, scope: str | None
     ) -> str:
         self.calls.append(("request", (connector, scope)))
         return f"Give the user this link: https://app.test/connections?connect={connector}"
+
+    async def channel_for_agent(self, claims: RunTokenClaims, connector: str) -> str | None:
+        return "the steps of telegram" if connector == "telegram" else None
 
     async def test_for_agent(self, claims: RunTokenClaims, connector: str) -> str:
         if connector == "boom":

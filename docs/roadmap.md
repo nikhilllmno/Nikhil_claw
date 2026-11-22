@@ -21,6 +21,7 @@ An item is done when its acceptance criteria pass in CI or in a recorded demo.
 | M5 | Browser | Cloud browser tools and the Chrome extension with click, type, and cursor. |
 | M6 | Self-change and customers | `change_propose`, `sama_pr`, curator, checkpoints, customer sign-up and billing. |
 | M7 | Parity and power use | Parallel requests, coding agent connectors, custom tools and sub-agents, Hermes parity, settings console, end-to-end tests. |
+| M8 | Seamless use | Connect apps from the chat in one click, and continue the request after the sign-in. |
 
 ```mermaid
 flowchart LR
@@ -33,6 +34,7 @@ flowchart LR
   M4 --> M6["M6 Self-change and customers"]
   M5 --> M6
   M6 --> M7["M7 Parity and power use"]
+  M7 --> M8["M8 Seamless use"]
 ```
 
 M2 and M3 can run in parallel after M1.
@@ -509,6 +511,16 @@ own sub-agents, skills, tools, and MCP servers. Admins edit all settings in one 
 | M7.9 | Coding mode | A session can attach a repo. Plan mode: the agent proposes a plan, a person approves it, then the agent works. The web app shows the file changes of the sandbox as diffs, the test runs, and the checkpoints, and opens a pull request. Done (architecture §15.5): attach a repo (git proxy or public URL) that clones before the next run, plan mode in the gate with `plan_propose` and `/plan` (approve, edit, reject) in the web, Telegram, and Slack, the Code page (diffs from the checkpoints, commands and test runs, checkpoints with undo, pull requests), sub-agent progress in the chat, and the same clone, checkpoint, and plan mode for the `claude_code` and `codex` runtimes of M7.2, also in their direct mode. |
 | M7.10 | Settings console | One editable console in the web app with these sections: Setup, Slack, Roles, Tools, Webhooks, Triggers, Sessions, Schedules, Workflows, MCP servers, Sub-agents, Skills, and Harness (runtime, model, reasoning, busy mode, budgets). Each section reads and writes the API, with audit entries. Done (architecture §17.7): `/console/<section>` with a left navigation; role permissions per org (10 keys, checked in the API and in the agent tools); a policy per tool for each agent and for the org; the budget and the reasoning effort of an agent; a trigger delivery log and a signed test send; rename, archive, and restore of sessions; a test of a chat app; and the enable of a connection. The Slack section also has the WhatsApp and email apps of M7.8. The busy mode (M7.1), custom tools (M7.3), and the sub-agent library (M7.4) show a "Not available yet" card until they land. |
 | M7.11 | End-to-end tests | A Playwright suite runs the main flows of M1 to M7 against staging every night and on demand. A full manual pass on staging has a test report. Done (architecture §19.6): `e2e/` and the workflow `End-to-end (staging)`. Each run makes and removes its own test users and org, and a sweep removes what an old run left. The suite covers the flows of M1 to M6 and the M7 items on main; each later M7 item adds its flows. |
+
+---
+
+## M8 — Seamless use
+
+Goal: the daily use of sama is as short as in Hermes Agent, Claude Code, and Codex.
+
+| # | Item | Acceptance criteria |
+|---|---|---|
+| M8.1 | Seamless connections | "Connect my X" in any channel gives a one-click sign-in: `connection_request` starts the connection and shows a Connect card with the sign-in page of the provider (web button, Telegram and Slack buttons, the link in WhatsApp). The sign-in comes back to a page that needs no sama session. When the backend sets `connected`, sama posts a note into the session and a short run continues the request; the agent never says "tell me when you are done". "My email", "inbox", "calendar", and "drive" map to the connectors of the user; the chat channels have their own names. The agent knows the role of the user: an admin gets a direct path, a member gets the admins to ask. A missing backend (no Composio key) shows in plain words, and no row stays `pending`. The chat adds a remote MCP server by URL with an approval. A link from the chat opens the web app signed in, and the sign-in keeps the deep link. Done (architecture §10.3.4): the return pages, `ConnectionResumer` and `SigninPoller`, the connect card, `connection_add_mcp`, manifest aliases with `outlook` and `googledrive`, role-aware channel guides, and the availability check. Steps for Gmail from the web chat: about 10 actions and a dead end before, 2 clicks after (Connect, then the consent of Google). |
 
 ---
 

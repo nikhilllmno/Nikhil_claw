@@ -302,7 +302,7 @@ async def test_the_oauth_sign_in_connects_and_a_wrong_state_changes_nothing(
         await service.finish_oauth(
             org.ids["org"],
             view.id,
-            state=state[:-1] + "x",
+            state=state[:-1] + ("y" if state.endswith("x") else "x"),
             code=code,
             error=None,
             actor=mia.user_id,

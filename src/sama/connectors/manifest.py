@@ -107,6 +107,9 @@ class HttpApi(_Strict):
     (docs/architecture.md, Section 12.3)."""
 
 
+ALIAS: Final = re.compile(r"[a-z0-9][a-z0-9 ._-]{0,39}")
+"""An alias of a connector: lower case, at most 40 characters."""
+
 McpAuth = Literal["oauth", "bearer", "header", "none"]
 TOOL_PATTERN: Final = re.compile(r"[A-Za-z0-9_.*?/:-]{1,100}")
 """A tool filter: a shell-style pattern (``fnmatch``) of the remote tool name."""
@@ -468,6 +471,12 @@ class Manifest(_Strict):
     api: ApiSpec | None = None
     fields: tuple[FormField, ...] = ()
     tools: tuple[ToolSpec, ...] = ()
+    aliases: Annotated[
+        tuple[Annotated[str, Field(pattern=ALIAS.pattern)], ...], Field(max_length=12)
+    ] = ()
+    """Words that a user says for this connector, for example ``email`` and ``inbox`` for
+    Gmail (M8.1). ``Catalog.resolve`` uses them. Two connectors can share an alias: then the
+    agent asks the user which one."""
     custom: bool = False
     """A connection that a workspace admin added (a server by URL, a stdio server, or an API).
     It is not in the catalog."""
@@ -733,6 +742,31 @@ class Catalog:
 
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._tools)
+
+    def resolve(self, text: str) -> list[Manifest]:
+        """The connectors that a user means with ``text`` (M8.1): the connector with that name
+        or title, else every connector with that alias. ``my email`` gives the connectors with
+        the alias ``email`` (Gmail and Outlook). An empty list: no connector matches."""
+        words = normalize_alias(text)
+        if not words:
+            return []
+        for manifest in self._manifests.values():
+            if words in (manifest.name, normalize_alias(manifest.title)):
+                return [manifest]
+        squashed = words.replace(" ", "")
+        for manifest in self._manifests.values():
+            if squashed == manifest.name.replace("-", ""):
+                return [manifest]
+        return [m for m in self._manifests.values() if words in m.aliases]
+
+
+_FILLER: Final = re.compile(r"^(?:(?:my|our|the|a|an|connect|to)\s+)+")
+
+
+def normalize_alias(text: str) -> str:
+    """Lower case, single spaces, and without a leading ``my``, ``our``, or ``the``."""
+    words = " ".join(text.strip().lower().replace("_", " ").split())
+    return _FILLER.sub("", words).strip()
 
 
 def parse(text: str, *, source: str = "manifest") -> Manifest:

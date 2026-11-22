@@ -4,6 +4,13 @@ name: gmail
 title: Gmail
 description: Read, search, draft, and send email in Gmail.
 kind: composio
+aliases:
+- email
+- mail
+- inbox
+- e-mail
+- google mail
+- gmail account
 scopes:
 - personal
 - workspace

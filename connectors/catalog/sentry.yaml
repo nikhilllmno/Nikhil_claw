@@ -4,6 +4,9 @@ name: sentry
 title: Sentry
 description: Read and manage Sentry issues, events, projects, and releases.
 kind: mcp_remote
+aliases:
+- errors
+- error tracking
 scopes:
 - personal
 - workspace

@@ -275,7 +275,7 @@ async def test_a_personal_connection_is_not_usable_in_a_shared_session(
     # The shared session, where mia starts the run, does not see it.
     assert await service.usable_tools(shared, [read, "todo_write"]) == {"todo_write"}
     listed = await service.list_for_agent(shared)
-    assert "gmail (Gmail): not connected" in listed
+    assert "gmail (Gmail, via Composio): not connected" in listed
     with pytest.raises(ConnectorError, match="no workspace connection"):
         await service.call(shared, read, {})
     with pytest.raises(ConnectorError, match="shared session cannot use a personal"):
@@ -317,9 +317,11 @@ async def test_the_agent_gets_a_link_and_never_a_secret(org: Org1, world: Any) -
     service, _, _ = world
     answer = await service.request_for_agent(private(org), "notion", None)
     assert f"{WEB}/connections?workspace={org.ids['ws']}&connect=notion&scope=personal" in answer
+    # A workspace sign-in must say ``scope: workspace``, so the gate asks a person (M8.1).
     shared = await service.request_for_agent(org.claims(), "gmail", None)
-    assert "scope=workspace" in shared
-    assert "workspace admin" in shared
+    assert "scope 'workspace'" in shared
+    member_answer = await service.request_for_agent(org.claims(), "gmail", "workspace")
+    assert "workspace admin" in member_answer
     with pytest.raises(ConnectorError, match="no connector"):
         await service.request_for_agent(org.claims(), "nope", None)
 

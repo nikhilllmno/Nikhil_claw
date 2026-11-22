@@ -4,6 +4,9 @@ name: stripe
 title: Stripe
 description: Read and manage Stripe customers, products, prices, invoices, and payments.
 kind: mcp_remote
+aliases:
+- payments
+- billing
 scopes:
 - personal
 - workspace
