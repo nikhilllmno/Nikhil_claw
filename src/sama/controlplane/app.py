@@ -603,7 +603,7 @@ def build(
     if slack is not None:
         handoffs.register("slack", slack.door)
     # A finished sign-in from the chat continues its session, also in Telegram and Slack (M8.1).
-    connections.on_connected = ConnectionResumer(engine, queue, connections, handoffs)
+    connections.on_connected = ConnectionResumer(queue, connections, handoffs)
 
     def forget(integration_id: uuid.UUID) -> None:
         for cache in (hub, slack, whatsapp, email):

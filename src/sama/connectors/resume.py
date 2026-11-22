@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final, Protocol
 
 from sqlalchemy import insert
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sama.connectors.chat import resume_text
 from sama.db.models import AuditEntry
@@ -48,63 +48,70 @@ class ConnectionResumer:
 
     def __init__(
         self,
-        engine: AsyncEngine,
         queue: RunQueue,
         connections: ConnectionService,
         follower: Follower | None = None,
     ) -> None:
-        self._engine = engine
         self._queue = queue
         self._connections = connections
         self._follower = follower
 
-    async def __call__(
-        self, org_id: uuid.UUID, view: ConnectionView, origin: Mapping[str, str]
-    ) -> None:
+    async def queue(
+        self,
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        view: ConnectionView,
+        origin: Mapping[str, str],
+    ) -> uuid.UUID | None:
+        """Queues the note in the transaction of the caller (it removes the origin). A session
+        that cannot take a run gives ``None``; the origin goes anyway."""
         try:
             session_id = uuid.UUID(origin["session_id"])
             user_id = uuid.UUID(origin["user_id"]) if origin.get("user_id") else None
         except (KeyError, ValueError):
             log.warning("connection=%s has a broken origin", view.id)
-            return
-        title = self._title(view)
-        text = resume_text(title, view.scope)
+            return None
         try:
-            async with self._engine.begin() as connection:
+            # A savepoint: a refused run does not undo the removal of the origin.
+            async with connection.begin_nested():
                 # The note is not a message of a person: it does not count for the message rate.
                 run_id = await self._queue.enqueue_in(
                     connection,
                     org_id=org_id,
                     session_id=session_id,
-                    text=text,
+                    text=resume_text(self._title(view), view.scope),
                     user_id=user_id,
                     check_rate=False,
                 )
-                await connection.execute(
-                    insert(AuditEntry).values(
-                        org_id=org_id,
-                        workspace_id=view.workspace_id,
-                        actor_kind="system",
-                        action="connection.resumed",
-                        target_type="connection",
-                        target_id=str(view.id),
-                        details={"session_id": str(session_id), "run_id": str(run_id)},
-                    )
-                )
         except QueueError as error:
-            # An archived session, a quota, or a rate limit: the connection stays connected.
+            # An archived session or a quota: the connection stays connected.
             log.info("connection=%s did not continue session=%s: %s", view.id, session_id, error)
+            return None
+        await connection.execute(
+            insert(AuditEntry).values(
+                org_id=org_id,
+                workspace_id=view.workspace_id,
+                actor_kind="system",
+                action="connection.resumed",
+                target_type="connection",
+                target_id=str(view.id),
+                details={"session_id": str(session_id), "run_id": str(run_id)},
+            )
+        )
+        return run_id
+
+    async def deliver(
+        self, org_id: uuid.UUID, view: ConnectionView, origin: Mapping[str, str], run_id: uuid.UUID
+    ) -> None:
+        """After the commit: the chat of the session follows the run (Telegram, Slack)."""
+        if self._follower is None:
             return
-        if self._follower is not None:
-            try:
-                await self._follower.follow(
-                    org_id=org_id,
-                    session_id=session_id,
-                    run_id=run_id,
-                    text=f"{title} is connected. sama continues your request.",
-                )
-            except Exception:
-                log.exception("the chat of session=%s does not follow run=%s", session_id, run_id)
+        await self._follower.follow(
+            org_id=org_id,
+            session_id=uuid.UUID(origin["session_id"]),
+            run_id=run_id,
+            text=f"{self._title(view)} is connected. sama continues your request.",
+        )
 
     def _title(self, view: ConnectionView) -> str:
         manifest = self._connections.catalog.get(view.connector)

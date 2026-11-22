@@ -139,13 +139,15 @@ async def test_the_resumer_queues_a_note_and_the_chat_follows_it(
         has_secret=False,
     )
     resumer = ConnectionResumer(
-        engine,
         RunQueue(engine),
         cast("ConnectionService", SimpleNamespace(catalog=Catalog.load(CATALOG))),
         channels.handoffs,
     )
     origin = {"session_id": str(session.id), "user_id": str(tenant.ids["mia"])}
-    await resumer(tenant.org, view, origin)
+    async with engine.begin() as connection:
+        run_id = await resumer.queue(connection, tenant.org, view, origin)
+    assert run_id is not None
+    await resumer.deliver(tenant.org, view, origin, run_id)
     async with engine.connect() as connection:
         texts = list(
             (
@@ -167,5 +169,8 @@ async def test_the_resumer_queues_a_note_and_the_chat_follows_it(
     shown = channels.tg_api.shown(TG)
     assert "Gmail is connected. sama continues your request." in shown
     assert "You have 3 emails." in shown
-    # A broken origin does nothing.
-    await resumer(tenant.org, view, {"session_id": "nope"})
+    # A broken origin, or a session that cannot take a run, gives no run.
+    async with engine.begin() as connection:
+        assert await resumer.queue(connection, tenant.org, view, {"session_id": "nope"}) is None
+        missing = {"session_id": str(uuid.uuid4())}
+        assert await resumer.queue(connection, tenant.org, view, missing) is None

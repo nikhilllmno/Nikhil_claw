@@ -16,12 +16,13 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.connectors.chat import cards, connection_escalation
 from sama.connectors.composio import ComposioClient
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
 from sama.db.models import AuditEntry, Connection, Membership
+from sama.runtime.contract import output_preview
 from sama.vault.crypto import KEY_BYTES, VaultKey
 from sama.vault.store import OrgKeys, Vault
 from tests.connectors.fake_mcp import URL, FakeMcp, driver
@@ -37,15 +38,30 @@ RETURN = "https://api.sama.test"
 
 
 class Resumed:
-    """``on_connected``: records each continued session."""
+    """``on_connected``: records each continued session. ``fail`` makes the next queue fail."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[uuid.UUID, ConnectionView, dict[str, str]]] = []
+        self.delivered: list[uuid.UUID] = []
+        self.fail = 0
 
-    async def __call__(
-        self, org_id: uuid.UUID, view: ConnectionView, origin: Mapping[str, str]
-    ) -> None:
+    async def queue(
+        self,
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        view: ConnectionView,
+        origin: Mapping[str, str],
+    ) -> uuid.UUID | None:
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("the queue is down")
         self.calls.append((org_id, view, dict(origin)))
+        return uuid.uuid4()
+
+    async def deliver(
+        self, org_id: uuid.UUID, view: ConnectionView, origin: Mapping[str, str], run_id: uuid.UUID
+    ) -> None:
+        self.delivered.append(run_id)
 
 
 World = tuple[ConnectionService, FakeComposio, FakeMcp, Resumed]
@@ -309,3 +325,107 @@ async def test_a_server_by_url_from_the_chat_signs_in_on_the_return_page(
     with pytest.raises(ConnectorError):
         await service.finish_oauth_return(state=state, code=code, error=None)
     assert len(resumed.calls) == 1
+
+
+async def test_a_failed_resume_keeps_the_origin_and_the_poll_tries_again(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    service, fake, _, resumed = world
+    answer = await service.request_for_agent(private(org), "gmail", None)
+    connection_id = uuid.UUID(cards(answer)[0]["connection_id"])
+    fake.status = "ACTIVE"
+    resumed.fail = 1
+    checked = await service.check(org.ids["org"], connection_id, actor=None)
+    assert checked.state == "connected"
+    row = await row_of(engine, connection_id)
+    assert row.state == "connected"
+    assert "origin" in row.config, "the removal rolled back with the failed queue"
+    assert await service.poll_signins() == 1
+    assert len(resumed.calls) == 1
+    assert len(resumed.delivered) == 1
+    assert "origin" not in (await row_of(engine, connection_id)).config
+
+
+async def test_an_old_answer_does_not_take_the_origin_of_a_newer_start(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    service, _, _, resumed = world
+    first = await service.request_for_agent(private(org), "gmail", None)
+    connection_id = uuid.UUID(cards(first)[0]["connection_id"])
+    old = await service.get(org.ids["org"], connection_id)
+    assert old is not None
+    # A newer start of the same connection: a new token, a new origin, and ``initiated``.
+    await service.request_for_agent(private(org), "gmail", None)
+    await service._continue(org.ids["org"], old)
+    assert resumed.calls == []
+    assert "origin" in (await row_of(engine, connection_id)).config
+
+
+async def test_an_older_failed_start_does_not_fail_a_newer_one(
+    engine: AsyncEngine, org: Org1, world: World
+) -> None:
+    service, _, _, _ = world
+    started = await service.start(
+        org.ids["org"], org.ids["ws"], member(org, "mia"), "gmail", "personal"
+    )
+    await service._fail_start(
+        org.ids["org"], started.connection.id, "boom", "token-of-an-older-attempt"
+    )
+    assert (await row_of(engine, started.connection.id)).state == "initiated"
+
+
+async def test_the_poll_rotates_through_open_sign_ins(
+    engine: AsyncEngine, org: Org1, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, _, _ = world
+    monkeypatch.setattr("sama.connectors.service.POLL_LIMIT", 1)
+    a = await service.request_for_agent(private(org), "gmail", None)
+    b = await service.request_for_agent(private(org), "github", None)
+    first = uuid.UUID(cards(a)[0]["connection_id"])
+    second = uuid.UUID(cards(b)[0]["connection_id"])
+    assert await service.poll_signins() == 1
+    assert await service.poll_signins() == 1
+    rows = [await row_of(engine, first), await row_of(engine, second)]
+    assert all(row.last_health_at is not None for row in rows), "both rows had a turn"
+
+
+async def test_a_forged_return_says_nothing_about_the_connection(org: Org1, world: World) -> None:
+    service, _, _, _ = world
+    answer = await service.request_for_agent(private(org), "github", None)
+    connection_id = cards(answer)[0]["connection_id"]
+    with pytest.raises(ConnectorError) as forged:
+        await service.finish_oauth_return(state=f"{connection_id}.forged", code="c", error=None)
+    with pytest.raises(ConnectorError) as unknown:
+        await service.finish_oauth_return(state=f"{uuid.uuid4()}.forged", code="c", error=None)
+    assert str(forged.value) == str(unknown.value)
+    assert "GitHub" not in str(forged.value)
+    with pytest.raises(ConnectorError) as missing:
+        await service.finish_return(uuid.uuid4(), "x" * 20)
+    with pytest.raises(ConnectorError) as wrong:
+        await service.finish_return(uuid.UUID(connection_id), "x" * 20)
+    assert (missing.value.status_code, str(missing.value)) == (
+        wrong.value.status_code,
+        str(wrong.value),
+    )
+
+
+async def test_a_long_sign_in_link_keeps_its_card_in_the_runtime_preview(
+    org: Org1, world: World
+) -> None:
+    service, fake, _, _ = world
+    long_link = "https://connect.composio.dev/link/" + "x" * 600
+    original = fake.__call__
+
+    def long(request: Any) -> Any:
+        answer = original(request)
+        if request.url.path.endswith("/connected_accounts/link"):
+            return httpx.Response(
+                200, json={"connected_account_id": "ca_long", "redirect_url": long_link}
+            )
+        return answer
+
+    service._composio = ComposioClient(transport=httpx.MockTransport(long))
+    answer = await service.request_for_agent(private(org), "gmail", None)
+    preview = output_preview(answer + "\n" + "y" * 3000)
+    [found] = cards(preview)
+    assert found["url"] == long_link

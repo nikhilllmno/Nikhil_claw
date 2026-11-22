@@ -34,7 +34,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, Protocol, cast
 from urllib.parse import urlencode, urlsplit
 
 from pydantic import SecretStr, ValidationError
@@ -43,7 +43,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.connectors.api import TEST_METHODS, ApiDriver
-from sama.connectors.chat import card, origin_of
+from sama.connectors.chat import card, link_text, origin_of
 from sama.connectors.composio import (
     ACTIVE,
     EXPIRED_STATUSES,
@@ -129,8 +129,29 @@ OAUTH_RETURN_PATH: Final = "/connections/oauth/return"
 SIGN_IN_KINDS: Final = frozenset({"composio"})
 """Connector kinds whose sign-in is on a provider page (with ``mcp_remote`` and OAuth)."""
 
-OnConnected = Callable[[uuid.UUID, "ConnectionView", Mapping[str, str]], Awaitable[None]]
-"""``(org_id, connection, origin)``: called once when a sign-in from a chat connects."""
+
+class Resumer(Protocol):
+    """Continues the session that asked for a connection, once its sign-in connects (M8.1).
+
+    ``queue`` runs in the transaction that removes the origin of the connection, so the note and
+    its run exist exactly when the origin is gone: a crash between them loses nothing. It
+    returns the run, or ``None`` when the session cannot take one (archived, over a quota).
+    ``deliver`` runs after the commit and sends the run to the chat of the session (best
+    effort: the web app shows the run anyway)."""
+
+    async def queue(
+        self,
+        connection: AsyncConnection,
+        org_id: uuid.UUID,
+        view: ConnectionView,
+        origin: Mapping[str, str],
+    ) -> uuid.UUID | None: ...
+
+    async def deliver(
+        self, org_id: uuid.UUID, view: ConnectionView, origin: Mapping[str, str], run_id: uuid.UUID
+    ) -> None: ...
+
+
 MCP_STALE: Final = timedelta(hours=6)
 """A remote MCP connection reads its tool list again in the background after this time."""
 MAX_ERROR_CHARS: Final = 500
@@ -398,7 +419,7 @@ class ConnectionService:
         self.return_base = return_base.rstrip("/") if return_base else None
         """The public address of the control plane, for the sign-in return pages (M8.1).
         Without it, a sign-in comes back to the Connections page of the web app."""
-        self.on_connected: OnConnected | None = None
+        self.on_connected: Resumer | None = None
         """Continues the session that asked for a connection, when its sign-in connects."""
         self._refreshing: set[uuid.UUID] = set()
         self._background: set[asyncio.Task[None]] = set()
@@ -529,18 +550,26 @@ class ConnectionService:
                 extra=extra,
             )
         except ConnectorError as error:
-            await self._fail_start(org_id, row_id, str(error))
+            await self._fail_start(org_id, row_id, str(error), extra["return_token"])
             raise
         except Exception:
-            await self._fail_start(org_id, row_id, "The connection did not start. Try again.")
+            await self._fail_start(
+                org_id, row_id, "The connection did not start. Try again.", extra["return_token"]
+            )
             raise
 
-    async def _fail_start(self, org_id: uuid.UUID, row_id: uuid.UUID, text: str) -> None:
+    async def _fail_start(
+        self, org_id: uuid.UUID, row_id: uuid.UUID, text: str, token: str
+    ) -> None:
         """A start that failed leaves ``failed`` with the reason, never a ``pending`` row that
-        the page cannot explain. A row that a form waits for or that connected stays."""
+        the page cannot explain. Only the row of this start changes: a row whose config has the
+        token of another start (a newer start that won) stays as it is."""
         current = await self.get(org_id, row_id)
-        if current is not None and current.state in ("pending", "initiated"):
-            await self._write(org_id, row_id, state="failed", error=text, expect=current)
+        if current is None or current.state not in ("pending", "initiated"):
+            return
+        if current.config.get("return_token") not in (None, token):
+            return
+        await self._write(org_id, row_id, state="failed", error=text, expect=current)
 
     async def _start_kind(
         self,
@@ -738,36 +767,55 @@ class ConnectionService:
 
     async def _continue(self, org_id: uuid.UUID, view: ConnectionView) -> None:
         """Takes the origin of a connection that connected and continues its session once
-        (M8.1). One statement removes the origin, so two checks at the same time cannot both
-        continue the session. A failure is logged: the connection is connected anyway."""
+        (M8.1). Under a lock of the row, the row must still be ``connected`` and belong to the
+        start of ``view`` (the same return token), so an old answer cannot take the origin of a
+        newer sign-in. The note and its run go in the same transaction as the removal of the
+        origin. A failure keeps the origin, and the next check or poll tries again."""
+        resumer = self.on_connected
+        if resumer is None:
+            return
+        token = view.config.get("return_token")
+        try:
+            run_id, current, origin = await self._take_origin(org_id, view, token, resumer)
+        except Exception:
+            # The transaction rolled back: the origin stays, and the next check or poll retries.
+            log.exception("the session of connection=%s did not continue", view.id)
+            return
+        if run_id is not None and origin is not None and current is not None:
+            try:
+                await resumer.deliver(org_id, current, origin, run_id)
+            except Exception:
+                log.exception("the chat of connection=%s does not follow run=%s", view.id, run_id)
+
+    async def _take_origin(
+        self, org_id: uuid.UUID, view: ConnectionView, token: object, resumer: Resumer
+    ) -> tuple[uuid.UUID | None, ConnectionView | None, dict[str, str] | None]:
+        """Removes the origin and queues the note in one transaction (``_continue``)."""
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
-                    select(Connection.config)
+                    select(Connection.config, Connection.state)
                     .where(Connection.org_id == org_id, Connection.id == view.id)
                     .with_for_update()
                 )
             ).one_or_none()
-            origin = None if row is None else origin_of(row.config or {})
-            if row is None or origin is None:
-                return
-            config = {k: v for k, v in (row.config or {}).items() if k != "origin"}
+            stored = (row.config or {}) if row is not None else {}
+            origin = origin_of(stored)
+            if row is None or origin is None or row.state != "connected":
+                return None, None, None
+            if stored.get("return_token") != token:
+                return None, None, None  # Another start owns the row now.
+            config = {k: v for k, v in stored.items() if k != "origin"}
             await connection.execute(
                 update(Connection)
                 .where(Connection.org_id == org_id, Connection.id == view.id)
                 .values(config=config)
             )
-        started = origin.get("at")
-        try:
-            at = datetime.fromisoformat(started) if started else None
-        except ValueError:
-            at = None
-        if at is None or datetime.now(UTC) - at > RESUME_TTL or self.on_connected is None:
-            return
-        try:
-            await self.on_connected(org_id, replace_config(view, config), origin)
-        except Exception:
-            log.exception("the session of connection=%s did not continue", view.id)
+            current = replace_config(view, config)
+            run_id = None
+            if _fresh(origin):
+                run_id = await resumer.queue(connection, org_id, current, origin)
+        return run_id, current, origin
 
     async def finish_return(
         self, connection_id: uuid.UUID, token: str
@@ -777,12 +825,15 @@ class ConnectionService:
         is the proof, and a check only reads the state from Composio. Returns the connection and
         where the sign-in started (``web`` or ``chat``)."""
         found = await self._by_id(connection_id)
-        if found is None:
-            raise ConnectorError("the connection does not exist", status_code=404)
+        expected = None if found is None else found[1].config.get("return_token")
+        if (
+            found is None
+            or not isinstance(expected, str)
+            or not hmac.compare_digest(expected, token)
+        ):
+            # One answer for an unknown connection and a wrong token: the page tells nothing.
+            raise ConnectorError(INVALID_RETURN, status_code=403)
         org_id, view = found
-        expected = view.config.get("return_token")
-        if not isinstance(expected, str) or not hmac.compare_digest(expected, token):
-            raise ConnectorError("this sign-in link is not valid", status_code=403)
         checked = await self.check(org_id, view.id, actor=_starter(view))
         return checked, _via(view)
 
@@ -796,17 +847,21 @@ class ConnectionService:
         try:
             connection_id = uuid.UUID(state.split(".", 1)[0])
         except ValueError:
-            raise ConnectorError("the state is not valid", status_code=400) from None
+            raise ConnectorError(INVALID_RETURN, status_code=400) from None
         found = await self._by_id(connection_id)
-        if found is None:
-            raise ConnectorError("the connection does not exist", status_code=404)
+        actor = None if found is None else _starter(found[1])
+        if found is None or actor is None:
+            raise ConnectorError(INVALID_RETURN, status_code=400)
         org_id, view = found
-        actor = _starter(view)
-        if actor is None:
-            raise ConnectorError("the connection has no owner", status_code=400)
-        done = await self.finish_oauth(
-            org_id, view.id, state=state, code=code, error=error, actor=actor
-        )
+        try:
+            done = await self.finish_oauth(
+                org_id, view.id, state=state, code=code, error=error, actor=actor
+            )
+        except ConnectorError as problem:
+            if problem.status_code == 502:
+                raise  # The state matched: the provider refused the code.
+            # Before the state proof, the page says nothing about the connection.
+            raise ConnectorError(INVALID_RETURN, status_code=400) from None
         return done, _via(view)
 
     async def _by_id(self, connection_id: uuid.UUID) -> tuple[uuid.UUID, ConnectionView] | None:
@@ -826,12 +881,23 @@ class ConnectionService:
                 await connection.execute(
                     select(Connection.org_id, Connection.id)
                     .where(
-                        Connection.state == "initiated",
-                        Connection.kind.in_(SIGN_IN_KINDS),
                         Connection.config.has_key("origin"),
-                        Connection.updated_at > func.now() - INITIATED_TTL,
+                        or_(
+                            and_(
+                                Connection.state == "initiated",
+                                Connection.kind.in_(SIGN_IN_KINDS),
+                                Connection.updated_at > func.now() - INITIATED_TTL,
+                            ),
+                            # A connected row that still has its origin: its resume failed.
+                            and_(
+                                Connection.state == "connected",
+                                Connection.updated_at > func.now() - RESUME_TTL,
+                            ),
+                        ),
                     )
-                    .order_by(Connection.updated_at)
+                    # The row checked longest ago first: a check sets ``last_health_at``, so
+                    # open sign-ins that nobody finishes do not hold the batch.
+                    .order_by(Connection.last_health_at.asc().nulls_first(), Connection.id)
                     .limit(POLL_LIMIT)
                 )
             ).all()
@@ -1222,32 +1288,45 @@ class ConnectionService:
             raise ConnectorError("the sama web app address is not set. Ask an admin")
         who = "A workspace admin" if scope == "workspace" else "The user"
         connection_id = "" if current is None else str(current.id)
+        # The card goes first: the preview of a long answer keeps its start (M8.1).
+        line = card(
+            connector=manifest.name,
+            title=manifest.title,
+            url=link,
+            connection_id=connection_id,
+            state="form",
+            scope=scope,
+        )
         return (
-            f"{manifest.title} needs a form with a key or a password. {who} fills it on the "
+            line
+            + f"\n{manifest.title} needs a form with a key or a password. {who} fills it on the "
             f"sama web page. The user sees a Connect {manifest.title} button; also give this "
-            f"link in one short line: {link}\nDo not ask for passwords, API keys, or tokens in "
-            "the chat. After the user saves the form, call connection_test.\n"
-            + card(
-                connector=manifest.name,
-                title=manifest.title,
-                url=link,
-                connection_id=connection_id,
-                state="form",
-                scope=scope,
-            )
+            f"link in one short line: {link_text(link, line)}\nDo not ask for passwords, API "
+            "keys, or tokens in the chat. After the user saves the form, call connection_test."
         )
 
     def _started_reply(self, manifest: Manifest, scope: Scope, started: Started) -> str:
         view = started.connection
         title = manifest.title
         url = started.redirect_url
-        if url is not None:
+        if url is None and view.state == "pending" and manifest.fields:
+            url = self.connect_link(view.workspace_id, manifest.name, scope)
+        # The card goes first: the preview of a long answer keeps its start (M8.1).
+        line = card(
+            connector=manifest.name,
+            title=title,
+            url=url if view.state != "connected" else None,
+            connection_id=str(view.id),
+            state="initiated" if started.redirect_url is not None else view.state,
+            scope=scope,
+        )
+        if started.redirect_url is not None:
             text = (
                 f"The sign-in of {title} ({scope} connection) is open. The user sees a Connect "
-                f"{title} button; also give this link in one short line: {url}\nWhen the user "
-                f"finishes the sign-in, sama connects {title} and continues this request by "
-                "itself in a new turn. Do not ask the user to tell you when they are done. Stop "
-                "here and wait."
+                f"{title} button; also give this link in one short line: "
+                f"{link_text(started.redirect_url, line)}\nWhen the user finishes the sign-in, "
+                f"sama connects {title} and continues this request by itself in a new turn. Do "
+                "not ask the user to tell you when they are done. Stop here and wait."
             )
         elif view.state == "connected":
             tools = [t for t in view.mcp_tools() if t.enabled]
@@ -1257,29 +1336,16 @@ class ConnectionService:
                 "tool_search and continue the request."
             )
         elif view.state == "pending" and manifest.fields:
-            link = self.connect_link(view.workspace_id, manifest.name, scope)
             text = (
                 f"{title} needs a form with a key. The user fills it on the sama web page: "
-                f"{link}\nDo not ask for secrets in the chat."
+                f"{link_text(url or '', line)}\nDo not ask for secrets in the chat."
             )
-            url = link
         else:
             text = (
                 f"{title} did not connect: {view.last_error or view.state}. Tell the user, and "
                 "do not try again in a loop."
             )
-        return (
-            text
-            + "\n"
-            + card(
-                connector=manifest.name,
-                title=title,
-                url=url,
-                connection_id=str(view.id),
-                state=view.state if started.redirect_url is None else "initiated",
-                scope=scope,
-            )
-        )
+        return line + "\n" + text
 
     async def add_mcp_for_agent(
         self,
@@ -2583,6 +2649,18 @@ def _server_name(url: str) -> str:
     if not base[0].isalpha():
         base = f"mcp-{base}"
     return base[:40]
+
+
+INVALID_RETURN: Final = "This sign-in link is not valid or has ended. Connect again from sama."
+
+
+def _fresh(origin: Mapping[str, str]) -> bool:
+    """The request is recent enough to continue (``RESUME_TTL``)."""
+    try:
+        at = datetime.fromisoformat(origin.get("at") or "")
+    except ValueError:
+        return False
+    return datetime.now(UTC) - at <= RESUME_TTL
 
 
 def replace_config(view: ConnectionView, config: Mapping[str, Any]) -> ConnectionView:

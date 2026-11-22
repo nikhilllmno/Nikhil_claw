@@ -24,8 +24,20 @@ from typing import Any, Final
 CARD_TAG: Final = "sama-connect"
 CARD_PATTERN: Final = re.compile(rf"<{CARD_TAG}>(\{{.*?\}})</{CARD_TAG}>")
 """The connect card in a tool answer. The gateways and the web app read it."""
-MAX_CARD_CHARS: Final = 1_500
-"""A card fits in the tool output preview of 2,000 characters with the text before it."""
+MAX_CARD_CHARS: Final = 900
+"""A card fits in the head of the tool output preview (``output_preview`` keeps about the first
+970 characters of a long answer), so the card goes first in the answer."""
+MAX_LINK_IN_TEXT: Final = 300
+"""A longer sign-in link is only in the card, so the answer stays short."""
+
+
+def link_text(url: str, line: str = "") -> str:
+    """The link for the prose of an answer: the link, or a pointer to the card ``line`` when the
+    card has the link and the link is long."""
+    found = cards(line)
+    if len(url) <= MAX_LINK_IN_TEXT or not found or found[0].get("url") != url:
+        return url
+    return "the url in the sama-connect line above (give it to the user as a link)"
 
 
 def card(
