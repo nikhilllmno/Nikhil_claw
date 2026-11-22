@@ -44,6 +44,18 @@ _TEST_COMMAND: Final = re.compile(
     r")(?=$|[\s;&|)])",
     re.IGNORECASE,
 )
+_TEST_SCRIPT: Final = re.compile(
+    r"(?:^|[\s;&|(])(?:(?:ba|z|da)?sh\s+(?:-\S+\s+)*(?:\S+/)?|\.?/(?:\S+/)?)"
+    r"(?:[\w.-]*[_.-])?(?:run[_-]?)?tests?(?:[_.-][\w.-]*)?\.(?:sh|bash)(?=$|[\s;&|)])",
+    re.IGNORECASE,
+)
+"""A test script that a shell runs: ``sh test.sh``, ``bash scripts/run_tests.sh``,
+``./test.sh``. Reading or editing the script (``cat test.sh``) is not a test run."""
+_FAILED_SUMMARY: Final = re.compile(
+    r"\b[1-9]\d*\s+(?:failed|failures?|errors?|errored)\b|\bFAIL(?:ED|URES?)?\b"
+    r"|test result:\s*FAILED|\bnot ok\b"
+)
+"""A result line that reports at least one failure or error."""
 _SUMMARY: Final = re.compile(
     r"(?im)^.*\b(?:\d+\s+(?:passed|failed|errors?|skipped|tests?|examples?|failures?)\b"
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
@@ -83,8 +95,8 @@ class PullRequestView:
 
 def is_test_command(command: str) -> bool:
     """True when the command runs the tests of a project, for example ``pytest`` or
-    ``npm test``."""
-    return _TEST_COMMAND.search(command) is not None
+    ``npm test``, or a test script such as ``sh test.sh``."""
+    return _TEST_COMMAND.search(command) is not None or _TEST_SCRIPT.search(command) is not None
 
 
 def result_summary(output: str) -> str | None:
@@ -94,6 +106,11 @@ def result_summary(output: str) -> str | None:
         return None
     line: str = found[-1].strip().strip("=").strip()
     return line[:300] or None
+
+
+def failed_summary(summary: str) -> bool:
+    """True when a result line reports at least one failed test or error."""
+    return _FAILED_SUMMARY.search(summary) is not None
 
 
 def _command_of(tool: str, arguments: Mapping[str, Any]) -> str:
@@ -193,7 +210,12 @@ async def list_commands(
         end = done.get((row.run_id, call_id))
         output = "" if end is None else redact(str(end.payload.get("output_preview") or ""))
         test = is_test_command(command)
+        summary = result_summary(output) if test else None
         status = _status(end)
+        if test and status == "ok" and summary is not None and failed_summary(summary):
+            # The exit status of a pipe is the one of its last command, so ``pytest | tail``
+            # ends with 0 after a failed test. A failed result line wins (Section 15.5).
+            status = "failed"
         out.append(
             CommandView(
                 run_id=row.run_id,
@@ -203,7 +225,7 @@ async def list_commands(
                 test=test,
                 status=status,
                 output=_tail(output, MAX_OUTPUT_CHARS),
-                summary=result_summary(output) if test else None,
+                summary=summary,
                 started_at=row.created_at,
                 finished_at=None if end is None else end.created_at,
             )

@@ -154,3 +154,45 @@ async def test_a_slow_or_broken_clone_fails_only_its_repository(
     assert note.endswith(PLAN_MODE_NOTE)
     state = await coding.state(org_id=org, session_id=session)
     assert [r.status for r in state.repos] == ["failed", "failed", "ready"]
+
+
+async def test_a_run_after_plan_mode_off_gets_one_note(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    from sama.coding_mode.prepare import PLAN_OFF_NOTE
+
+    org, session, mia = tenant.org, tenant.ids["mine"], tenant.ids["mia"]
+    preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    assert await preparer.prepare(object(), scope, token) == ""  # type: ignore[arg-type]
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=True)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=False)
+    scope, token = await _run(coding, tenant)
+    assert await preparer.prepare(object(), scope, token) == PLAN_OFF_NOTE  # type: ignore[arg-type]
+    # The same run again (a retry) still gets it; the next run does not.
+    assert await preparer.prepare(object(), scope, token) == PLAN_OFF_NOTE  # type: ignore[arg-type]
+    later, later_token = await _run(coding, tenant)
+    assert await preparer.prepare(object(), later, later_token) == ""  # type: ignore[arg-type]
+    # A harness run that the gate judged as a plan run gets no off note.
+    off, off_token = await _run(coding, tenant)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=True)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=False)
+    off, off_token = await _run(coding, tenant)
+    assert PLAN_OFF_NOTE not in await preparer.prepare(
+        object(),  # type: ignore[arg-type]
+        off,
+        off_token,
+        plan=False,
+        off_note=False,
+    )
+
+
+async def test_an_approval_does_not_give_the_off_note(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    org, session = tenant.org, tenant.ids["mine"]
+    plan = await coding.propose(org_id=org, session_id=session, run_id=None, body="1. a")
+    await coding.approve(org_id=org, session_id=session, user_id=None, plan_id=plan.id)
+    preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    assert await preparer.prepare(object(), scope, token) == ""  # type: ignore[arg-type]

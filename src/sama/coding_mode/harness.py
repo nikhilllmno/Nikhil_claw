@@ -82,6 +82,7 @@ class _Preparer(Protocol):
         token: str,
         harness: str | None = None,
         plan: bool | None = None,
+        off_note: bool = True,
     ) -> str: ...
 
 
@@ -126,7 +127,9 @@ class HarnessHooks:
         approval cannot start a planned run without its rules."""
         # The repository note comes from the preparer; the plan rules come from ``plan`` here,
         # so a failed read in the preparer cannot drop them.
-        note = await self._preparer.prepare(sandbox, scope, token, harness=agent, plan=False)
+        note = await self._preparer.prepare(
+            sandbox, scope, token, harness=agent, plan=False, off_note=not plan
+        )
         if plan:
             rules = f"[sama coding mode] {plan_mode_for(agent).prompt}"
             note = f"{note}\n\n{rules}" if note else rules

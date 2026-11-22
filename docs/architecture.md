@@ -6654,6 +6654,11 @@ service checks the values with the rules of `repo_clone` (Section 15.1). A sessi
   `plan.decision_undone`. The person sees the queue error and can try again.
 - `/plan` shows plan mode and the newest plan. `/plan on` and `/plan off` turn plan mode on or
   off without a plan.
+- When a person turns plan mode off by hand (`/plan off`, the switch on the Code page, or
+  `PUT /sessions/{id}/plan-mode`), the next chat run of the session gets a one-time note that
+  plan mode is off and the agent can change files again. Without it, the agent can act on the
+  plan mode rules in its history. An approval sends the plan as a message, so it gets no note.
+  The note comes from the audit entry `session.plan_mode` (no extra column).
 - Any user who can read the session decides a plan, as for `/undo`. The work after the
   approval still passes the gate: each tool call that asks still needs its approval.
 - The chat commands work in a Telegram direct chat, a Slack direct message (`/sama plan`), and
@@ -6686,8 +6691,18 @@ so `base=N&head=N-1` is what that call changed, and `base=oldest` is all changes
 `tool_call_finished` events of the session as the user (row-level security). It lists the calls
 of `Bash` (also the shell of the second runtime) and `execute_code`, newest first, with the
 command, the status (`running`, `ok`, or `failed`), and the end of the output. A command that
-runs tests (for example `pytest`, `npm test`, `go test`, `cargo test`, `make test`) has `test`
+runs tests (for example `pytest`, `npm test`, `go test`, `cargo test`, `make test`, or a test
+script that a shell runs: `sh test.sh`, `bash scripts/run_tests.sh`, `./test.sh`) has `test`
 true and the last result line of the output as `summary`. `?tests=true` lists only these.
+
+- The exit status of a pipe is the status of its last command, so `pytest | tail` ends with 0
+  after a failed test. A test run whose result line reports a failure or an error (for example
+  `1 failed`, `2 errors`, `FAILED`, `not ok`) is `failed`, also when the tool call ended
+  without an error. A test run that ended with an error is `failed`, also when its result line
+  reports only passes. So a failed result never shows "passed".
+- The repository note asks the agent to start a piped test command with `set -o pipefail;`,
+  so the exit status of the test itself counts. sama does not turn on `pipefail` for every
+  shell of the sandbox, because that changes the result of other scripts.
 
 - Since M7.9 the output preview of a tool call keeps its start and its end (2,000 characters
   with a marker in the middle), so the result line of a long test run is in the preview. The
@@ -6788,7 +6803,9 @@ in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding
 - The read-only command check of plan mode is strict and simple: no redirect, no substitution,
   no variable, no background job, only known read commands, and an allow list of the options
   of `git` (`status`, `log`, `diff`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `blame`,
-  `describe`, `shortlog`, `branch`, `remote`). Commands with an option that writes or runs a
+  `describe`, `shortlog`, `branch`, `remote`; also after `git -C DIR`). `cd DIR` with one plain
+  folder is allowed, so `cd repo && git log` works; the commands after it still pass the same
+  check. Commands with an option that writes or runs a
   program (for example `sort -o`, `uniq IN OUT`, `git grep -O`, `find -exec`, `rg --pre`) are
   not allowed. It refuses many safe commands. It is a guard for the plan step, not a security
   boundary: for example a git configuration that the agent wrote before plan mode can still
@@ -6797,8 +6814,8 @@ in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding
   Section 16.1). The tool server check honors the ticket of such a call once.
 - Codex in plan mode has no technical guard: the CLI runs with all permissions and only the
   note asks it not to change files. The checkpoint before the run lets a person undo a change.
-- The test detection reads the command text. A test that runs through a script with another
-  name is a normal command.
+- The test detection reads the command text. A test that runs through a script whose name has
+  no `test` in it (for example `sh check.sh`) is a normal command.
 - A diff of a session with a very large work folder (more than 50,000 files) fails, as a
   checkpoint does.
 

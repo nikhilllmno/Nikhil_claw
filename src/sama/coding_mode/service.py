@@ -700,6 +700,44 @@ class CodingService:
             return None
         return str(row.runtime or "")
 
+    async def turned_off(
+        self, *, org_id: uuid.UUID, session_id: uuid.UUID, run_id: uuid.UUID
+    ) -> bool:
+        """True when a person turned plan mode off (``/plan off``, the switch, the API) and no
+        chat run of the session started after that before ``run_id``. That run gets a note, so
+        the agent does not act on the plan mode rules of its history. An approval sends its own
+        message, so it does not count."""
+        async with self._engine.connect() as connection:
+            last = (
+                await connection.execute(
+                    select(AuditEntry.details, AuditEntry.created_at)
+                    .where(
+                        AuditEntry.org_id == org_id,
+                        AuditEntry.target_type == "session",
+                        AuditEntry.target_id == str(session_id),
+                        AuditEntry.action.in_(("session.plan_mode", "plan.approved")),
+                    )
+                    .order_by(AuditEntry.id.desc())
+                    .limit(1)
+                )
+            ).one_or_none()
+            if last is None or (last.details or {}).get("on") is not False:
+                return False
+            between = (
+                await connection.execute(
+                    select(func.count())
+                    .select_from(Run)
+                    .where(
+                        Run.org_id == org_id,
+                        Run.session_id == session_id,
+                        Run.kind == "chat",
+                        Run.id != run_id,
+                        Run.created_at > last.created_at,
+                    )
+                )
+            ).scalar_one()
+        return not between
+
     async def plan_mode(self, *, org_id: uuid.UUID, session_id: uuid.UUID) -> bool:
         async with self._engine.connect() as connection:
             value = (

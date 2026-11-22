@@ -10,6 +10,7 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.coding_mode.activity import (
+    failed_summary,
     is_test_command,
     list_commands,
     list_pull_requests,
@@ -32,13 +33,31 @@ from tests.orchestrator.conftest import Tenant
         "python -m pytest",
         "make test",
         "npx vitest run",
+        "sh test.sh",
+        "bash scripts/run_tests.sh",
+        "./test.sh",
+        "cd repo && sh -e tests.sh",
+        "./scripts/test-unit.sh",
     ],
 )
 def test_test_commands(command: str) -> None:
     assert is_test_command(command)
 
 
-@pytest.mark.parametrize("command", ["ls", "cat pytest.ini", "npm install", "git status"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls",
+        "cat pytest.ini",
+        "npm install",
+        "git status",
+        "cat test.sh",
+        "vi test.sh",
+        "sh build.sh",
+        "sh latest.sh",
+        "bash deploy.sh",
+    ],
+)
 def test_other_commands(command: str) -> None:
     assert not is_test_command(command)
 
@@ -139,4 +158,61 @@ async def test_the_commands_and_pull_requests_come_from_the_run_events(
     assert [(p.call_id, p.status, p.url, p.head) for p in prs] == [
         ("c6", "failed", None, "sama/y"),
         ("c5", "opened", "https://github.com/o/n/pull/7", "sama/x"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("line", "failed"),
+    [
+        ("1 failed, 1 passed in 0.01s", True),
+        ("2 errors in 0.3s", True),
+        ("Tests: 1 failed, 3 passed", True),
+        ("test result: FAILED. 1 passed; 1 failed", True),
+        ("not ok 2 - adds", True),
+        ("3 passed in 0.1s", False),
+        ("0 failed, 2 passed", False),
+        ("Tests  12 passed (12)", False),
+        ("PASS src/a.test.ts", False),
+    ],
+)
+def test_a_failed_summary(line: str, failed: bool) -> None:
+    assert failed_summary(line) is failed
+
+
+async def test_a_piped_test_with_a_failed_summary_is_failed(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    run_id = await RunQueue(engine).enqueue(
+        org_id=tenant.org, session_id=tenant.ids["mine"], text="go", user_id=None
+    )
+    started, finished = "tool_call_started", "tool_call_finished"
+    piped = {"command": "pytest -q 2>&1 | tail -15"}
+    await _events(
+        engine,
+        tenant,
+        run_id,
+        [
+            (started, {"call_id": "p1", "name": "Bash", "arguments": piped}),
+            (
+                finished,
+                {
+                    "call_id": "p1",
+                    "is_error": False,
+                    "output_preview": "1 failed, 1 passed in 0.01s",
+                },
+            ),
+            (started, {"call_id": "p2", "name": "Bash", "arguments": {"summary": "sh test.sh"}}),
+            (finished, {"call_id": "p2", "is_error": False, "output_preview": "2 passed"}),
+            (started, {"call_id": "p3", "name": "Bash", "arguments": {"command": "pytest"}}),
+            (finished, {"call_id": "p3", "is_error": True, "output_preview": "3 passed"}),
+        ],
+    )
+    async with engine.connect() as connection:
+        listed = await list_commands(
+            connection, org_id=tenant.org, session_id=tenant.ids["mine"], tests_only=True
+        )
+    assert [(c.call_id, c.status) for c in listed] == [
+        ("p3", "failed"),
+        ("p2", "ok"),
+        ("p1", "failed"),
     ]
