@@ -8417,9 +8417,9 @@ the user changed and the delivery rows of the triggers of the user.
 
 ---
 
-### 17.8 Web chat like Claude Code and Codex (M7.12)
+### 17.8 Web chat like Claude Code and Codex (M8.2)
 
-The web chat works like the chat of Claude Code and Codex. M7.12 has these parts. Each part has
+The web chat works like the chat of Claude Code and Codex. M8.2 has these parts. Each part has
 its own pull request.
 
 **Chat and tool calls (part A).**
