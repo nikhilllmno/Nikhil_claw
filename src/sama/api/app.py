@@ -4296,6 +4296,7 @@ class SamaApi:
                 attachments=attachments,
                 coding_agent=None if coding_agent is None else coding_agent.value,
                 parallel=parallel,
+                human=True,
             )
         except RateLimitedError as error:
             raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None
@@ -4320,7 +4321,11 @@ class SamaApi:
                     content={"steered": True, "run_id": str(steer_id), "queued": False},
                 )
             run_id = await self._queue.enqueue(
-                org_id=access.org_id, session_id=session_id, text=text, user_id=access.user_id
+                org_id=access.org_id,
+                session_id=session_id,
+                text=text,
+                user_id=access.user_id,
+                human=True,
             )
         except RateLimitedError as error:
             return JSONResponse(

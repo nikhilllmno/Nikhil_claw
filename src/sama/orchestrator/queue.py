@@ -680,8 +680,13 @@ class RunQueue:
         attachments: Sequence[NewAttachment] = (),
         coding_agent: str | None = None,
         parallel: bool = False,
+        human: bool = False,
     ) -> uuid.UUID:
         """Stores a user message and queues a run for it. Returns the run id.
+
+        ``human`` is true when a person sent the message through a human channel (the web app,
+        Telegram, Slack, WhatsApp, or email), not an org API key or other automation. It sets
+        ``runs.human_origin``, which the direct mode of a coding agent needs (Section 15.4).
 
         ``coding_agent`` (``claude_code`` or ``codex``) sends this one message to that coding
         agent (``/claude <task>``, Section 15.4).
@@ -711,6 +716,7 @@ class RunQueue:
                 attachments=attachments,
                 coding_agent=coding_agent,
                 parallel=parallel,
+                human=human,
             )
 
     async def enqueue_in(
@@ -729,6 +735,7 @@ class RunQueue:
         toolsets: Sequence[str] | None = None,
         coding_agent: str | None = None,
         parallel: bool = False,
+        human: bool = False,
     ) -> uuid.UUID:
         """``enqueue`` in the transaction of the caller. A caller that makes the session in
         the same transaction (delegation, the task dispatcher, an event trigger) gets the
@@ -821,6 +828,7 @@ class RunQueue:
                         coding_agent=coding_agent,
                         toolsets=list(toolsets) if toolsets is not None else null(),
                         allow_parallel=parallel or session.busy_mode == "parallel",
+                        human_origin=human,
                     )
                     .cte("new_run")
                 )

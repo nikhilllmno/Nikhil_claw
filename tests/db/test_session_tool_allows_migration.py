@@ -34,12 +34,26 @@ def _policies(url: str) -> list[str]:
     return sorted(row["policyname"] for row in rows)
 
 
+def _human_origin(url: str) -> list[tuple[str, str, str]]:
+    rows = asyncio.run(
+        _fetch(
+            url,
+            "SELECT data_type, is_nullable, column_default FROM information_schema.columns"
+            " WHERE table_schema = 'public' AND table_name = 'runs'"
+            " AND column_name = 'human_origin'",
+        )
+    )
+    return [(row["data_type"], row["is_nullable"], row["column_default"]) for row in rows]
+
+
 def test_the_upgrade_adds_the_table_with_rls_and_the_downgrade_removes_it() -> None:
     with migrated_database() as url:
         asyncio.run(seed(url))
         assert _policies(url) == [f"{TABLE}_select"]
+        assert _human_origin(url) == [("boolean", "NO", "false")]
         config = alembic_config(url)
         command.downgrade(config, "0048")
+        assert _human_origin(url) == []
         assert (
             asyncio.run(_fetch(url, "SELECT to_regclass('public.session_tool_allows')"))[0][0]
             is None

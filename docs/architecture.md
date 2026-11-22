@@ -6516,9 +6516,13 @@ sandbox runner does not start it.
   runtime and `runs.coding_agent` is empty: the session or the profile has the CLI, and the
   message is not a `/claude <task>` message (`sama.gate.decide.is_direct_coding_run`). The person
   chose the CLI, so the gate does not ask for each message:
-  (a) In a private session, when the run user is the owner of the session, the gate gives
-  `coding_agent_run` and `coding_agent_plan` an `allow` rule of the level `session`. There is no
-  approval card. (b) In every other session (a shared session, or a member who is not the owner),
+  (a) In a private session, when the run user is the owner of the session and a person sent the
+  message through a human channel (`runs.human_origin`, set for the web app, Telegram, Slack,
+  WhatsApp, and email), the gate gives `coding_agent_run` and `coding_agent_plan` an `allow` rule
+  of the level `session`. There is no approval card. A run of an org API key (also a key with
+  approvals `pending`), a job, a trigger, a workflow, a delegated run, and the notes of a run
+  that ended has no `human_origin`, so it keeps the normal gate, also in a private session of the
+  key user. (b) In every other session (a shared session, or a member who is not the owner),
   the first message asks, and the approval of `coding_agent_run` or `coding_agent_plan` is stored
   with the scope `session` also when the person chose `once`. Later direct mode messages of the
   same person in the session do not ask again. Another member asks once for himself. `/sama` does not
@@ -6912,11 +6916,13 @@ A denial has no scope. The old flag `always_allow: true` of the API is the same 
 
 - A `session` approval writes one row to `session_tool_allows` (`org_id`, `session_id`,
   `user_id`, `tool`, migration `0049`, RLS: a member reads the rows of the sessions that the member
-  can see, only the control plane writes). The gate reads the rows of the session and of the run
+  can see, only the control plane writes). The same migration adds `runs.human_origin` (Section 15.4). The gate reads the rows of the session and of the run
   user as rules of the level `session`. This level ranks above the user rules. The row ends with
-  the session, and it covers no other session and no other person. An unattended run of the same
-  session (for example a delegated run) uses it, because it has the same session. An unattended
-  run of another session never does.
+  the session, and it covers no other session and no other person. An unattended run never uses
+  it: an org API key with approvals `deny`, a job (also a job that attaches to the session), and a
+  delegated run keep `ask` as `deny`, and only the pre-approval of the approved job version
+  (Section 12.1) can allow a tool in them. So the grant of a person cannot widen a run that has
+  no person.
 - A `session` rule is a user rule. A `deny` rule at any level wins over it. An `ask` rule of the
   org or the profile wins over it. It does not remove the ask of a tool in `ALWAYS_ASK`, of
   `db_<conn>_execute`, or of an escalation. The hardline list (step 2) and plan mode (step 4a) come

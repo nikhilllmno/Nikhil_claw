@@ -1300,8 +1300,10 @@ async def test_a_session_approval_lets_the_tool_run_for_the_rest_of_the_session(
     verdict = await gate.check(org.claims(), "c2", "Bash", {"command": "make lint"})
     assert (verdict.action, verdict.step) == ("allow", GateStep.POLICY)
     assert "session" in verdict.reason
-    # A new run of the session and an unattended run of the session do not ask either.
-    assert (await gate.check(org.claims("night"), "c3", "Bash", ARGS)).action == "allow"
+    # A new attended run of the session does not ask either.
+    assert (await gate.check(org.claims(), "c3", "Bash", {"command": "make docs"})).action == (
+        "allow"
+    )
     entries = await audit(engine, org)
     approved = [d for a, _, d in entries if a == "approval.approved"]
     assert [d["scope"] for d in approved] == ["session"]
@@ -1465,6 +1467,7 @@ async def direct_run(
     coding_agent: str | None = None,
     user: str | None = "mia",
     unattended: bool = False,
+    human: bool = True,
 ) -> None:
     async with engine.begin() as connection:
         await connection.execute(
@@ -1475,6 +1478,7 @@ async def direct_run(
                 coding_agent=coding_agent,
                 triggered_by_user_id=org.ids[user] if user else None,
                 unattended=unattended,
+                human_origin=human,
             )
         )
 
@@ -1517,19 +1521,31 @@ async def test_direct_mode_keeps_deny_and_ask_rules(engine: AsyncEngine, org: Or
 
 
 @pytest.mark.parametrize(
-    ("runtime", "coding_agent", "unattended"),
+    ("runtime", "coding_agent", "unattended", "human"),
     [
-        ("claude_agent_sdk", None, False),  # an explicit call of the sama agent
-        ("claude_code", "claude_code", False),  # one message of "/claude <task>"
-        ("claude_code", None, True),  # a job or a delegated run
+        ("claude_agent_sdk", None, False, True),  # an explicit call of the sama agent
+        ("claude_code", "claude_code", False, True),  # one message of "/claude <task>"
+        ("claude_code", None, True, True),  # a job or a delegated run
+        ("claude_code", None, False, False),  # an org API key that waits for approvals
     ],
 )
 async def test_other_runs_of_a_private_session_keep_the_normal_policy(
-    engine: AsyncEngine, org: Org1, runtime: str, coding_agent: str | None, unattended: bool
+    engine: AsyncEngine,
+    org: Org1,
+    runtime: str,
+    coding_agent: str | None,
+    unattended: bool,
+    human: bool,
 ) -> None:
     await coding_profile(engine, org)
     await direct_run(
-        engine, org, "secret-run", runtime=runtime, coding_agent=coding_agent, unattended=unattended
+        engine,
+        org,
+        "secret-run",
+        runtime=runtime,
+        coding_agent=coding_agent,
+        unattended=unattended,
+        human=human,
     )
     gate = GateService(engine)
     verdict = await gate.check(private_claims(org), "c1", "coding_agent_run", CODING_ARGS)
@@ -1570,3 +1586,31 @@ async def test_an_explicit_call_of_the_sama_agent_keeps_the_scope_once(
     assert decision.scope == "once"
     assert await session_allows(engine, org) == []
     assert (await gate.check(org.claims(), "c2", "coding_agent_run", CODING_ARGS)).action == "ask"
+
+
+async def test_a_session_grant_does_not_reach_an_unattended_run(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """An unattended run (an API key with approvals ``deny``, a job, a delegated run) gets no
+    session grant: ``ask`` stays ``deny``, and only a pre-approval of a job version allows."""
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == "allow"
+    verdict = await gate.check(org.claims("night"), "c3", "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.CONTEXT)
+    assert await approval(engine, org, "c3") is None
+
+
+async def test_the_direct_mode_rule_of_a_session_grant_does_not_reach_an_unattended_run(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await coding_profile(engine, org)
+    await direct_run(engine, org, "run")
+    gate = GateService(engine)
+    assert (await gate.check(org.claims(), "c1", "coding_agent_run", CODING_ARGS)).action == "ask"
+    await decide_scope(gate, org, scope="once")
+    assert (await gate.check(org.claims(), "c2", "coding_agent_run", CODING_ARGS)).action == "allow"
+    await direct_run(engine, org, "run", unattended=True)
+    verdict = await gate.check(org.claims(), "c3", "coding_agent_run", CODING_ARGS)
+    assert verdict.action == "deny"

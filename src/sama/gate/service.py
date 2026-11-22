@@ -554,6 +554,7 @@ class GateService:
                     Run.kind,
                     Run.runtime,
                     Run.coding_agent,
+                    Run.human_origin,
                     Run.toolsets.label("run_toolsets"),
                     AgentProfile.toolsets,
                     AgentProfile.group_toolsets,
@@ -632,17 +633,22 @@ class GateService:
         # A fixed tool keeps its own access.
         access = {**access, **fixed_access}
         rules = await self._rules(connection, org_id, row.agent_profile_id, user_id)
-        rules = (*rules, *await self._session_rules(connection, ref, user_id))
+        if not row.unattended:
+            # An unattended run has no person to ask, and a pre-approval of the job version
+            # limits what it may do (Section 12.1). A session grant is for a run with a person.
+            rules = (*rules, *await self._session_rules(connection, ref, user_id))
         if (
             not row.unattended
+            and row.human_origin
             and row.audience == "private"
             and row.owner_user_id is not None
             and user_id == row.owner_user_id
             and is_direct_coding_run(row.runtime, row.coding_agent)
         ):
-            # The owner sent /claude or /codex in a private session: the owner chose the CLI,
-            # so the call of the CLI needs no approval (Section 15.4). A deny rule and an
-            # admin ask rule still win.
+            # The owner sent the message in a private session through a human channel: the
+            # owner chose the CLI, so the call of the CLI needs no approval (Section 15.4). A
+            # run of an org API key or of other automation has no ``human_origin`` and keeps
+            # the normal gate. A deny rule and an admin ask rule still win.
             rules = (
                 *rules,
                 *(

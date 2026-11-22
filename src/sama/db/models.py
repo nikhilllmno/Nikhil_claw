@@ -831,6 +831,11 @@ class Run(Base):
     """The coding agent of a ``/claude`` or ``/codex`` run with a task (Section 15.4). The run
     uses this runtime and not the runtime of the session."""
     allow_parallel: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    human_origin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True when a person sent the message of the run through a human channel (the web app,
+    Telegram, Slack, WhatsApp, or email). It is false for an org API key, a job, a trigger, a
+    workflow, a delegated run, and the notes of a run that ended. The direct mode of a coding
+    agent asks no approval only for a run with this flag (Section 15.4)."""
     """True when the run can start next to an open chat run of its session (M7.1): the profile
     was in the busy mode ``parallel`` at the enqueue, or the person asked for it (``/bg``)."""
     side: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())

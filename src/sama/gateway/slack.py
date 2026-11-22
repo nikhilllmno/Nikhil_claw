@@ -624,6 +624,7 @@ class SlackGateway:
                 attachments=images,
                 coding_agent=None if coding_agent is None else coding_agent.value,
                 parallel=parallel,
+                human=True,
             )
         except QueueError as error:
             self._followers.discard(holder)
