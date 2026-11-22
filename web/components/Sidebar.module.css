@@ -98,7 +98,7 @@
 
 .foot {
   flex: none;
-  max-height: 55%;
+  max-height: var(--dock-max-height);
   overflow-y: auto;
   border-top: var(--border-width) solid var(--border);
   padding-bottom: var(--space-2);
@@ -155,5 +155,132 @@
 
   .close {
     display: inline-flex;
+  }
+}
+
+.search {
+  padding: var(--space-1) var(--space-4) var(--space-1);
+}
+
+.row {
+  position: relative;
+}
+
+.row > .item {
+  padding-right: var(--touch-target);
+}
+
+.dot {
+  display: inline-block;
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  margin-right: var(--space-2);
+  border-radius: var(--radius-full);
+  vertical-align: middle;
+  background: var(--accent);
+}
+
+.dot[data-state="running"] {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.dot[data-state="waiting"] {
+  background: var(--warning);
+}
+
+.dot[data-state="failed"] {
+  background: var(--danger);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.rowMenu {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-3);
+}
+
+.rowMenuButton {
+  display: grid;
+  place-items: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-sm);
+  color: var(--text-subtle);
+  cursor: pointer;
+  list-style: none;
+  opacity: 0;
+}
+
+.rowMenuButton::-webkit-details-marker {
+  display: none;
+}
+
+.row:hover .rowMenuButton,
+.row:focus-within .rowMenuButton,
+.rowMenu[open] .rowMenuButton {
+  opacity: 1;
+}
+
+.rowMenuButton:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.rowMenuList {
+  position: absolute;
+  right: 0;
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  min-width: var(--menu-min-width);
+  padding: var(--space-1);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+}
+
+.rowMenuList > button {
+  justify-content: flex-start;
+}
+
+.rename {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+}
+
+.rowError {
+  padding: 0 var(--space-3);
+  color: var(--danger);
+  font-size: var(--text-xs);
+}
+
+.more {
+  border-bottom: 0;
+}
+
+.moreSummary {
+  padding: var(--space-3) var(--space-4) var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+@media (hover: none) {
+  .rowMenuButton {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot[data-state="running"] {
+    animation: none;
   }
 }

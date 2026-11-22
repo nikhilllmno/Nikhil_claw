@@ -328,7 +328,13 @@ export interface SessionOut {
   can_manage?: boolean;
   /** The coding agent of the direct mode (M7.2), or `null` for sama. An old API has none. */
   coding_agent?: CodingAgentName | null;
+  /** The state of the chat runs (only in the list, M8.2). `null`: no run yet. */
+  run_state?: SessionRunState | null;
+  /** The start of the newest chat run (only in the list, M8.2). */
+  last_activity_at?: string | null;
 }
+
+export type SessionRunState = "running" | "waiting" | "failed" | "done";
 
 export type CodingAgentName = "claude_code" | "codex";
 

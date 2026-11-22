@@ -5,8 +5,10 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { sessionTitle } from "@/lib/chat";
 import { loadProgress, showSetupCard } from "@/lib/onboarding";
+import { errorText, type SessionOut } from "@/lib/api";
+import { anyOpen, archiveConfirmText, canManageSession, checkTitle, filterSessions, runStateLabel } from "@/lib/sessionList";
 import { groupByAge, relativeTime } from "@/lib/time";
-import { useAuth } from "./AuthProvider";
+import { useApi, useAuth } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import styles from "./Sidebar.module.css";
 
@@ -80,8 +82,23 @@ export function Sidebar({
     return () => clearInterval(timer);
   }, []);
 
-  const visible = (sessions ?? []).filter((s) => workspaceId === null || s.workspace_id === workspaceId);
+  const [query, setQuery] = useState("");
+  const inWorkspace = (sessions ?? []).filter((s) => workspaceId === null || s.workspace_id === workspaceId);
+  const visible = filterSessions(inWorkspace, query);
   const groups = groupByAge(visible, now);
+  // While a session works or waits, read the list again, so that the dots stay right.
+  const working = anyOpen(inWorkspace);
+  useEffect(() => {
+    if (!working) return;
+    const timer = setInterval(() => {
+      if (!document.hidden) reloadSessions();
+    }, 8_000);
+    return () => clearInterval(timer);
+  }, [working, reloadSessions]);
+  // The navigation under the sessions: closed, so that the sessions get the room, unless the
+  // page is one of its links.
+  const navCurrent = [...WORKSPACE_LINKS, ...ORG_LINKS].some((l) => isCurrent(l.href, pathname)) || pathname.startsWith("/agents/");
+  const [navOpen, setNavOpen] = useState<boolean | null>(null);
   const profiles = profilesFor(workspaceId);
   const org = orgOfWorkspace(workspaceId);
   // A signed-in user without an org has only the welcome page, the settings, and the help.
@@ -160,6 +177,19 @@ export function Sidebar({
             </Link>
           </div>
 
+          <div className={styles.search}>
+            <label className="sr-only" htmlFor="session-filter">
+              Find a session
+            </label>
+            <input
+              id="session-filter"
+              className="input"
+              type="search"
+              placeholder="Find a session"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
           <nav className={styles.sessions} aria-label="Sessions">
             {sessionsError && sessions === null ? (
               <div className={styles.block}>
@@ -175,27 +205,27 @@ export function Sidebar({
                 ))}
               </div>
             ) : visible.length === 0 ? (
-              <p className={styles.empty}>No sessions yet. Start one with New session.</p>
+              query.trim() ? (
+                <p className={styles.empty}>
+                  No title has “{query.trim()}”.{" "}
+                  <Link href={`/search?q=${encodeURIComponent(query.trim())}`}>Search the messages</Link>
+                </p>
+              ) : (
+                <p className={styles.empty}>No sessions yet. Start one with New session.</p>
+              )
             ) : (
               groups.map(({ group, items }) => (
                 <section key={group}>
                   <h2 className={styles.group}>{group}</h2>
                   <ul className={styles.list}>
                     {items.map((s) => (
-                      <li key={s.id}>
-                        <Link
-                          href={`/s/${s.id}`}
-                          className={styles.item}
-                          aria-current={s.id === activeSession ? "page" : undefined}
-                          title={sessionTitle(s)}
-                        >
-                          <span className={styles.itemTitle}>{sessionTitle(s)}</span>
-                          <span className={styles.itemMeta}>
-                            {s.audience === "shared" ? "Shared · " : ""}
-                            {relativeTime(s.created_at, now)}
-                          </span>
-                        </Link>
-                      </li>
+                      <SessionRow
+                        key={s.id}
+                        session={s}
+                        current={s.id === activeSession}
+                        now={now}
+                        onChanged={reloadSessions}
+                      />
                     ))}
                   </ul>
                 </section>
@@ -217,6 +247,12 @@ export function Sidebar({
             </Link>
           </div>
         ) : null}
+        <details
+          className={styles.more}
+          open={navOpen ?? navCurrent}
+          onToggle={(e) => setNavOpen(e.currentTarget.open)}
+        >
+          <summary className={styles.moreSummary}>Workspace, agents, and settings</summary>
         {noOrg ? null : <NavGroup label="Workspace" links={WORKSPACE_LINKS} pathname={pathname} admin={false} />}
         {profiles.length > 0 ? (
           <nav aria-label="Agents">
@@ -243,6 +279,7 @@ export function Sidebar({
           pathname={pathname}
           admin={isOrgAdmin}
         />
+        </details>
         <div className={styles.user}>
           <span className={styles.userName} title={org?.name}>
             {org ? org.display_name || org.name : ""}
@@ -253,6 +290,150 @@ export function Sidebar({
         </div>
       </div>
     </aside>
+  );
+}
+
+/** One session of the list: the title, the state, the time, and a menu with Rename and Archive. */
+function SessionRow({
+  session: s,
+  current,
+  now,
+  onChanged,
+}: {
+  session: SessionOut;
+  current: boolean;
+  now: number;
+  onChanged: () => void;
+}) {
+  const api = useApi();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const state = runStateLabel(s.run_state);
+  const title = sessionTitle(s);
+
+  const save = async () => {
+    const checked = checkTitle(draft);
+    if ("error" in checked) {
+      setError(checked.error);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.updateSession(s.id, { title: checked.title });
+      setEditing(false);
+      onChanged();
+    } catch (e) {
+      setError(errorText(e, "The title was not saved."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const archive = async () => {
+    if (!window.confirm(archiveConfirmText(title))) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.updateSession(s.id, { status: "archived" });
+      onChanged();
+    } catch (e) {
+      setError(errorText(e, "The session was not archived."));
+      setBusy(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <li className={styles.row}>
+        <form
+          className={styles.rename}
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          <label className="sr-only" htmlFor={`rename-${s.id}`}>
+            New title
+          </label>
+          <input
+            id={`rename-${s.id}`}
+            className="input"
+            value={draft}
+            maxLength={200}
+            autoFocus
+            disabled={busy}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setEditing(false);
+              }
+            }}
+          />
+          <button type="submit" className="btn btn-small btn-primary" disabled={busy}>
+            Save
+          </button>
+        </form>
+        {error ? <p className={styles.rowError} role="alert">{error}</p> : null}
+      </li>
+    );
+  }
+
+  return (
+    <li className={styles.row}>
+      <Link href={`/s/${s.id}`} className={styles.item} aria-current={current ? "page" : undefined} title={title}>
+        <span className={styles.itemTitle}>
+          {state !== null ? (
+            <span className={styles.dot} data-state={s.run_state ?? undefined} aria-hidden="true" />
+          ) : null}
+          {title}
+        </span>
+        <span className={styles.itemMeta}>
+          {state !== null ? `${state} · ` : ""}
+          {s.audience === "shared" ? "Shared · " : ""}
+          {relativeTime(s.last_activity_at ?? s.created_at, now)}
+        </span>
+      </Link>
+      {canManageSession(s) ? (
+        <details className={styles.rowMenu} data-menu="session">
+          <summary className={styles.rowMenuButton} aria-label={`Actions for ${title}`}>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="3" cy="8" r="1.4" fill="currentColor" />
+              <circle cx="8" cy="8" r="1.4" fill="currentColor" />
+              <circle cx="13" cy="8" r="1.4" fill="currentColor" />
+            </svg>
+          </summary>
+          <div className={styles.rowMenuList}>
+            <button
+              type="button"
+              className="btn btn-quiet btn-small"
+              onClick={(e) => {
+                e.currentTarget.closest("details")?.removeAttribute("open");
+                setDraft(s.title ?? "");
+                setEditing(true);
+              }}
+            >
+              Rename
+            </button>
+            <button
+              type="button"
+              className="btn btn-quiet btn-small"
+              disabled={busy}
+              onClick={(e) => {
+                e.currentTarget.closest("details")?.removeAttribute("open");
+                void archive();
+              }}
+            >
+              Archive
+            </button>
+          </div>
+        </details>
+      ) : null}
+      {error ? <p className={styles.rowError} role="alert">{error}</p> : null}
+    </li>
   );
 }
 

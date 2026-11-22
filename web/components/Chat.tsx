@@ -778,7 +778,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
             </span>
           ) : null}
           {repoCount > 0 && codeTab === null ? (
-            <button type="button" className="btn btn-small" onClick={() => setCodeTab("prs")}>
+            <button type="button" className={`btn btn-small ${styles.createPr}`} onClick={() => setCodeTab("prs")}>
               Create PR
             </button>
           ) : null}
