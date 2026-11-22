@@ -1,4 +1,4 @@
-"""Migration 0048: the approval scope ``session`` (docs/architecture.md, Section 16.1)."""
+"""Migration 0049: the approval scope ``session`` (docs/architecture.md, Section 16.1)."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def test_the_upgrade_adds_the_table_with_rls_and_the_downgrade_removes_it() -> N
         asyncio.run(seed(url))
         assert _policies(url) == [f"{TABLE}_select"]
         config = alembic_config(url)
-        command.downgrade(config, "0047")
+        command.downgrade(config, "0048")
         assert (
             asyncio.run(_fetch(url, "SELECT to_regclass('public.session_tool_allows')"))[0][0]
             is None

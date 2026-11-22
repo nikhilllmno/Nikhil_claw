@@ -6911,7 +6911,7 @@ the permission prompt of Claude Code ("Yes", "Yes, and do not ask again this ses
 A denial has no scope. The old flag `always_allow: true` of the API is the same as `always`.
 
 - A `session` approval writes one row to `session_tool_allows` (`org_id`, `session_id`,
-  `user_id`, `tool`, migration `0048`, RLS: a member reads the rows of the sessions that the member
+  `user_id`, `tool`, migration `0049`, RLS: a member reads the rows of the sessions that the member
   can see, only the control plane writes). The gate reads the rows of the session and of the run
   user as rules of the level `session`. This level ranks above the user rules. The row ends with
   the session, and it covers no other session and no other person. An unattended run of the same
@@ -8514,6 +8514,11 @@ load at the same time) keeps its result. The partial index `ix_run_events_activi
 first closes an open menu of the chat, and it does nothing behind a modal (for example the
 navigation drawer at a narrow width) or in another text field. The approval keys follow the same
 rules, and they do nothing while an input method composes text.
+
+**Approval scopes in the card.** As in the permission prompt of Claude Code, the card has "Allow
+once" (key 1), "Allow for this session" (key 2, scope `session` of Section 16.1), and "Deny"
+(key 3), and a quiet "Always allow" button without a key. The card shows only the scopes in
+`scopes` of the approval: a proposal and a tool that always asks have only "Allow once".
 
 
 ## 18. Observability and cost

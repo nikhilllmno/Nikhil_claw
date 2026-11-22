@@ -1,4 +1,4 @@
-"""Migration 0048: the approval scope ``session`` (docs/architecture.md, Section 16.1).
+"""Migration 0049: the approval scope ``session`` (docs/architecture.md, Section 16.1).
 
 ``session_tool_allows`` holds the tools that one user allowed for the rest of one session
 ("Yes, and do not ask again this session"). The tool gate reads each row as a policy rule of the
@@ -8,8 +8,8 @@ mode all win over it. The rule ends with the session.
 A member reads the rows of the sessions that the member can see, like ``session_plans``. Only
 the control plane writes the table.
 
-Revision ID: 0048
-Revises: 0047
+Revision ID: 0049
+Revises: 0048
 Create Date: 2026-11-23
 """
 
@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0048"
-down_revision: str | None = "0047"
+revision: str = "0049"
+down_revision: str | None = "0048"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
