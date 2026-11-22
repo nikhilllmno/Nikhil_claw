@@ -43,7 +43,7 @@ export function DiffViewer({ sessionId }: { sessionId: string }) {
     if (view.kind === "error" && checkpoints.error) {
       return <ErrorState title="The checkpoints did not load" message={checkpoints.error} onRetry={checkpoints.reload} />;
     }
-    return <LoadingState label="Loading the changes" />;
+    return <LoadingState label="Reading the changes from the sandbox. It can take a few seconds while the sandbox wakes up" />;
   }
   const warning = view.warning ? (
     <p className="alert alert-warning" role="status">
@@ -103,7 +103,7 @@ function DiffResult({ sessionId, choice }: { sessionId: string; choice: DiffChoi
 
   if (diff.data === null) {
     if (diff.error) return <ErrorState title="The changes did not load" message={diff.error} onRetry={diff.reload} />;
-    return <LoadingState label="Loading the changes" />;
+    return <LoadingState label="Reading the changes from the sandbox. It can take a few seconds while the sandbox wakes up" />;
   }
   const { files, truncated, base, head } = diff.data;
   const totals = diffTotals(files);

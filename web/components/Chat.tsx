@@ -64,7 +64,9 @@ import { useNow } from "./usePolled";
 import { escapeTarget } from "@/lib/approvalKeys";
 import { Markdown } from "./Markdown";
 import { QuestionCard } from "./QuestionCard";
+import { CodePanel, type CodeTab } from "./CodePanel";
 import { PlanCard } from "./PlanPanel";
+import { useMedia } from "./useMedia";
 import { LiveRun, TodoList, ToolTrail } from "./ToolGroup";
 import { ConnectCard } from "./ConnectCard";
 import { cardsOfCalls } from "@/lib/connectCard";
@@ -106,6 +108,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [stopping, setStopping] = useState(false);
   // The newest plan of the session, for the plan card (M7.9). `null`: none, or not loaded.
   const [plan, setPlan] = useState<PlanOut | null>(null);
+  // The code panel next to the chat (M8.2 part C): its tab, or `null` when it is closed.
+  const [codeTab, setCodeTab] = useState<CodeTab | null>(null);
+  const [repoCount, setRepoCount] = useState(0);
+  const narrow = useMedia("(max-width: 75rem)");
+  const closeCode = useCallback(() => setCodeTab(null), []);
   const [tick, setTick] = useState(0);
   const localId = useRef(0);
   // Keep the view at the end while new text arrives, unless the user scrolled up.
@@ -207,7 +214,9 @@ export function Chat({ sessionId }: { sessionId: string }) {
 
   const loadPlan = useCallback(async () => {
     try {
-      setPlan((await api.getCoding(sessionId)).plan);
+      const coding = await api.getCoding(sessionId);
+      setPlan(coding.plan);
+      setRepoCount(coding.repos.length);
     } catch {
       // The plan card is a help. The Code page shows the error.
     }
@@ -585,7 +594,9 @@ export function Chat({ sessionId }: { sessionId: string }) {
     setPlanBusy(true);
     setSendError(null);
     try {
-      setNotice(await call());
+      const text = await call();
+      // An approve starts a run, and the run shows in the chat: no note is needed.
+      setNotice(/approved/i.test(text) ? null : text);
       stick.current = true;
     } catch (e) {
       setSendError(errorText(e, "The plan decision was not saved."));
@@ -740,6 +751,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
     runRows.length > 0 ? latestTodos(Object.values(live.tools).flat().sort((a, b) => a.order - b.order)) : null;
 
   return (
+    <div className={styles.layout}>
     <div className={styles.chat}>
       <header className={styles.header}>
         <div className={styles.headerText}>
@@ -765,7 +777,16 @@ export function Chat({ sessionId }: { sessionId: string }) {
               {openRuns.length > 1 ? `${openRuns.length} runs working` : "Working"}
             </span>
           ) : null}
-          <SessionTools sessionId={sessionId} />
+          {repoCount > 0 && codeTab === null ? (
+            <button type="button" className="btn btn-small" onClick={() => setCodeTab("prs")}>
+              Create PR
+            </button>
+          ) : null}
+          <SessionTools
+            sessionId={sessionId}
+            codeOpen={codeTab !== null}
+            onCode={() => setCodeTab((current) => (current === null ? "changes" : null))}
+          />
         </div>
       </header>
 
@@ -975,6 +996,20 @@ export function Chat({ sessionId }: { sessionId: string }) {
         />
       </div>
     </div>
+      {codeTab !== null ? (
+        <CodePanel
+          sessionId={sessionId}
+          tab={codeTab}
+          onTab={setCodeTab}
+          onClose={closeCode}
+          modal={narrow}
+          onRequested={() => {
+            setNotice("The agent opens the pull request. Approve the pr_create card when it shows.");
+            if (narrow) setCodeTab(null);
+          }}
+        />
+      ) : null}
+    </div>
   );
 }
 
@@ -1045,7 +1080,15 @@ function MessageView({ message: m }: { message: ChatMessage }) {
 }
 
 /** The links to the run traces and the export of the session. */
-function SessionTools({ sessionId }: { sessionId: string }) {
+function SessionTools({
+  sessionId,
+  codeOpen,
+  onCode,
+}: {
+  sessionId: string;
+  codeOpen: boolean;
+  onCode: () => void;
+}) {
   const api = useApi();
   const [busy, setBusy] = useState<ExportFormat | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1065,9 +1108,9 @@ function SessionTools({ sessionId }: { sessionId: string }) {
 
   return (
     <div className={styles.tools}>
-      <Link href={`/s/${sessionId}/code`} className="btn btn-quiet btn-small">
+      <button type="button" className="btn btn-quiet btn-small" aria-pressed={codeOpen} onClick={onCode}>
         Code
-      </Link>
+      </button>
       <Link href={`/s/${sessionId}/runs`} className="btn btn-quiet btn-small">
         Runs
       </Link>

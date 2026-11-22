@@ -8600,6 +8600,22 @@ its own pull request.
   to it.
 - One line of help shows the keys. At a width of 390 px it does not show.
 
+**Coding flow (part C).**
+
+- The home page starts a task in one step, as Codex web does: the task text, an optional repo
+  (`owner/name` or a GitHub URL) and branch, the workspace, the agent, the audience, and "Plan
+  first". The web app makes the session (its title is the first line of the task), attaches the
+  repo (`POST /sessions/{id}/repos`), and sends the task as a plan (`POST /sessions/{id}/plan`)
+  or as a message. Then it opens the chat. If a step after the session fails, the error has a
+  link to the session. An empty task starts an empty session, as before.
+- The Code button of the chat header opens the code panel next to the chat: Changes (the diffs of
+  each step), Tests (the commands and the test runs), Repos, Pull request, and Checkpoints. Below
+  a width of 75rem the panel covers the chat as a dialog, and Esc closes it. The full Code page
+  stays at `/s/{id}/code`.
+- When the session has a repo, the header has a "Create PR" button that opens the Pull request
+  tab of the panel.
+- After an attach, the repo list shows the new repo at once, also before the next poll.
+
 **Tool trail of earlier runs.** `GET /sessions/{id}/activity` gives the stored
 `tool_call_started`, `tool_call_finished`, and `subagent_event` events of the newest 50 chat runs
 of a session, oldest first, in the shape of a `run_event` of the event stream:

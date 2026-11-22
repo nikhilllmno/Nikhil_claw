@@ -7,7 +7,7 @@
 
 .panel {
   width: 100%;
-  max-width: 28rem;
+  max-width: var(--content-max);
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
@@ -42,4 +42,77 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
+}
+
+.taskBox {
+  display: flex;
+  flex-direction: column;
+  border: var(--border-width) solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
+}
+
+.taskBox:focus-within {
+  border-color: var(--focus-ring);
+}
+
+.taskBox .task {
+  min-height: var(--chart-height);
+  resize: vertical;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.taskBox .task:focus,
+.taskBox .task:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.repoRow {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-top: var(--border-width) solid var(--border);
+}
+
+.inline {
+  flex: 1;
+  min-width: 0;
+}
+
+.branch {
+  flex: 0 1 var(--preview-basis);
+  min-width: 0;
+}
+
+.options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--preview-basis), 1fr));
+  gap: var(--space-2);
+}
+
+.option {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.submitRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
 }
