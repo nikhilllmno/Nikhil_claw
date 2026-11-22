@@ -804,7 +804,7 @@ class SessionOut(BaseModel):
     session: the owner of a private session, or the owner or an admin of a shared session."""
     runtime: str | None = None
     """The runtime of the session. ``GET /sessions/{id}`` and ``PATCH`` fill this field and the
-    next three. ``GET /sessions`` leaves them empty."""
+    next three. ``GET /sessions`` and ``POST /sessions`` leave them empty."""
     model: str | None = None
     """The model that the next run of the session uses (M8.2)."""
     default_model: str | None = None
