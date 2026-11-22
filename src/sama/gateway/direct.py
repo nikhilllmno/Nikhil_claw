@@ -420,6 +420,7 @@ class DirectGateway[C: Conversation](abc.ABC):
                 attachments=images,
                 coding_agent=coding_agent,
                 parallel=parallel,
+                human=True,
             )
         except QueueError as error:
             self._followers.discard(place)

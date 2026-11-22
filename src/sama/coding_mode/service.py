@@ -411,7 +411,7 @@ class CodingService:
         on."""
         await self.set_plan_mode(org_id=org_id, session_id=session_id, user_id=user_id, on=True)
         return await self._queue.enqueue(
-            org_id=org_id, session_id=session_id, text=task, user_id=user_id
+            org_id=org_id, session_id=session_id, text=task, user_id=user_id, human=True
         )
 
     async def propose(
@@ -674,7 +674,7 @@ class CodingService:
     ) -> uuid.UUID:
         """Queues ``text`` as a message of the user. The queue errors go to the caller."""
         return await self._queue.enqueue(
-            org_id=org_id, session_id=session_id, text=text, user_id=user_id
+            org_id=org_id, session_id=session_id, text=text, user_id=user_id, human=True
         )
 
     # -- the sandbox side -------------------------------------------------------------------

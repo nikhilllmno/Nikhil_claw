@@ -8,6 +8,11 @@ mode all win over it. The rule ends with the session.
 A member reads the rows of the sessions that the member can see, like ``session_plans``. Only
 the control plane writes the table.
 
+``runs.human_origin`` is true when a person sent the message of the run through a human channel
+(the web app, Telegram, Slack, WhatsApp, or email). An org API key, a job, a trigger, a workflow,
+and a delegated run leave it false. The direct mode of a coding agent asks no approval only for
+such a run (Section 15.4). Old runs get false, so they keep the normal gate.
+
 Revision ID: 0049
 Revises: 0048
 Create Date: 2026-11-23
@@ -31,6 +36,10 @@ def _now() -> sa.TextClause:
 
 
 def upgrade() -> None:
+    op.add_column(
+        "runs",
+        sa.Column("human_origin", sa.Boolean(), server_default=sa.false(), nullable=False),
+    )
     op.create_table(
         TABLE,
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
@@ -86,3 +95,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index(op.f("ix_session_tool_allows_org_id_session_id"), table_name=TABLE)
     op.drop_table(TABLE)
+    op.drop_column("runs", "human_origin")
