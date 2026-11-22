@@ -27,7 +27,7 @@ npx playwright show-report                 # the HTML report
 | `E2E_API_URL` | no | The API. Default `https://sama-staging.fly.dev`. |
 | `E2E_SUPABASE_URL` | no | The Supabase project of the service key. Default the staging project. The run stops when `GET /config` of the API names another project, so the key never goes to another server. |
 | `E2E_RUN_ID` | no | The id of the run in the test emails and org names. Default: the time and 4 random characters. |
-| `E2E_WORKERS` | no | Parallel workers. Default 1, because the free plan allows 2 runs at the same time. |
+| `E2E_WORKERS` | no | Parallel workers, 1 or 2. Default 1: the free plan allows 2 runs at the same time, and the E2B account 20 sandboxes. The sandbox-heavy files (`SANDBOX_HEAVY` in `playwright.config.ts`) always run one at a time in the project `sandbox-heavy`. |
 | `E2E_KEEP_DATA` | no | `1` keeps the test org and users after the run, for a look at a failure. |
 | `E2E_REUSE_WORLD` | no | `1` uses the kept test org and users again, so the setup does not make new ones. For work on a test, with `E2E_KEEP_DATA=1`. |
 | `E2E_SWEEP_MIN_AGE_HOURS` | no | The sweep removes test users older than this. Default 3. |
@@ -68,7 +68,7 @@ email) and confirms the address with the admin API, as the link in the email wou
 | `11-billing-data` | Billing page and a Stripe Checkout in test mode (no payment); the export API of the org and of a user (M6.6, M6.8). |
 | `12-admin-help` | Each admin page for the owner; download the org export and my data; a member gets no admin area; help pages without sign-in (M6.8, M6.9). |
 | `13-m7-skills-channels` | The builtin skill library (at least 68 skills) and `/decision-memo` loads its skill; WhatsApp (Meta, Twilio, Gupshup) and email connects refuse fake credentials and leave no row; pairing codes, webhooks, and admin rules of the channels; the Settings link `?connect=whatsapp&provider=twilio` opens the form and shows the refusal (M7.7, M7.8). |
-| `14-console` | Each of the 13 console sections opens; a webhook is made, gets a signed test, is edited, and is deleted; the harness sets the reasoning effort (M7.10). |
+| `14-console` | Each of the 14 console sections opens (API keys since PR 90); a webhook is made, gets a signed test, is edited, and is deleted; the harness sets the reasoning effort (M7.10). |
 | `15-coding-agents` | Direct mode with `/claude` until `/sama`; `/codex <task>`; the approval card of `coding_agent_run` when the agent calls it (M7.2). |
 | `16-busy-modes` | A message during a run joins it (note queued, then delivered or requeued); two joined messages add to the first request, and the answer has all three words (PR 92); `/bg` and the Run in parallel button start a second run at the same time; `/stop 2` stops one of two runs (M7.1). |
 | `17-api-server` | An admin makes an API key on Admin > API keys; the official OpenAI Node SDK chats through `/v1` (also a stream that continues the session); the MCP TypeScript SDK lists the tools and sends a message through `/mcp`; a revoked key gets `401`; a member cannot make keys (M7.6). |

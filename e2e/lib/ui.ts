@@ -76,6 +76,19 @@ export async function decide(
 }
 
 /**
+ * Approves the first approval card and waits until that card is gone. A next card can come at
+ * once, so the wait follows the element of this card, not the locator. Returns the tool name.
+ */
+async function approveFirstCard(page: Page): Promise<string> {
+  const card = page.getByRole("region", { name: /^Approval for / }).first();
+  const tool = ((await card.getAttribute("aria-label")) ?? "").replace("Approval for ", "");
+  const element = await card.elementHandle();
+  await card.getByRole("button", { name: "Approve", exact: true }).click();
+  await element?.waitForElementState("hidden", { timeout: 20_000 });
+  return tool;
+}
+
+/**
  * Waits for an answer with `text`, and approves each tool call that asks on the way. Use it
  * when the policy of a tool can be `ask` or `allow`, for example the tools of a new connection.
  */
@@ -91,9 +104,7 @@ export async function waitForReplyApproving(
   while (Date.now() < deadline) {
     if (await answer.isVisible()) return approved;
     if (await card.isVisible()) {
-      approved.push(((await card.getAttribute("aria-label")) ?? "").replace("Approval for ", ""));
-      await card.getByRole("button", { name: "Approve", exact: true }).click();
-      await expect(card).toHaveCount(0);
+      approved.push(await approveFirstCard(page));
       continue;
     }
     await answer.or(card).waitFor({ state: "visible", timeout: 5_000 }).catch(() => undefined);
@@ -114,9 +125,7 @@ export async function approveUntilIdle(page: Page, timeout = REPLY_TIMEOUT_MS * 
   let quiet = 0;
   while (Date.now() < deadline) {
     if (await card.isVisible()) {
-      approved.push(((await card.getAttribute("aria-label")) ?? "").replace("Approval for ", ""));
-      await card.getByRole("button", { name: "Approve", exact: true }).click();
-      await expect(card).toHaveCount(0);
+      approved.push(await approveFirstCard(page));
       quiet = 0;
       continue;
     }
