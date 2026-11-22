@@ -41,6 +41,8 @@ from tests.orchestrator.conftest import Tenant
         'bash "scripts/run_tests.sh"',
         "cd repo && ./test.sh",
         "cd repo\nsh test.sh",
+        "pip install pytest && pytest -q",
+        "pytest --version; pytest -q",
         "  ./test.sh",
     ],
 )
@@ -62,6 +64,13 @@ def test_test_commands(command: str) -> None:
         "bash deploy.sh",
         "cat ./test.sh",
         "git diff -- ./test.sh",
+        "python3 -m pytest --version 2>&1 || pip install pytest",
+        "pytest -h",
+        "npm test --help",
+        "pip install pytest",
+        "uv add --dev pytest",
+        "npm i -D vitest",
+        "cargo install cargo-nextest",
     ],
 )
 def test_other_commands(command: str) -> None:

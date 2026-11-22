@@ -71,6 +71,16 @@ _SUMMARY: Final = re.compile(
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
     r"|^\s*not ok\b.*$"
 )
+_PARTS: Final = re.compile(r"&&|\|\||[;\n]")
+"""Splits a shell line into its commands. A pipe stays in one part: ``pytest | tail`` is one
+test run."""
+_INFO: Final = re.compile(r"(?:^|\s)(?:--version|--help|-h|-V)(?=$|\s)")
+"""``pytest --version`` and ``npm test --help`` only show information; they run no test."""
+_INSTALL: Final = re.compile(
+    r"(?:^|[\s(])(?:python3?\s+-m\s+)?(?:pip3?|uv\s+pip|uv|npm|pnpm|yarn|bun|poetry|conda"
+    r"|apt(?:-get)?|brew|gem|cargo)\s+(?:install|add|i)\b"
+)
+"""``pip install pytest`` installs a test tool; it runs no test."""
 _PR_URL: Final = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
 
@@ -107,7 +117,12 @@ class PullRequestView:
 def is_test_command(command: str) -> bool:
     """True when the command runs the tests of a project, for example ``pytest`` or
     ``npm test``, or a test script such as ``sh test.sh``."""
-    return _TEST_COMMAND.search(command) is not None or _TEST_SCRIPT.search(command) is not None
+    return any(
+        (_TEST_COMMAND.search(part) or _TEST_SCRIPT.search(part))
+        and not _INFO.search(part)
+        and not _INSTALL.search(part)
+        for part in _PARTS.split(command)
+    )
 
 
 def result_summary(output: str) -> str | None:

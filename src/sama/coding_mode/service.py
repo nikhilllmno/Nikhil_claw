@@ -687,6 +687,48 @@ class CodingService:
             ).all()
         return [repo_view(row) for row in rows]
 
+    async def ready_repos(self, *, org_id: uuid.UUID, session_id: uuid.UUID) -> list[RepoView]:
+        async with self._engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    select(*_REPO_COLUMNS)
+                    .where(
+                        SessionRepo.org_id == org_id,
+                        SessionRepo.session_id == session_id,
+                        SessionRepo.status == "ready",
+                    )
+                    .order_by(SessionRepo.created_at, SessionRepo.id)
+                )
+            ).all()
+        return [repo_view(row) for row in rows]
+
+    async def reopen(self, *, org_id: uuid.UUID, repo_id: uuid.UUID) -> RepoView | None:
+        """Sets a ``ready`` repository back to ``pending``: its folder is gone, for example in
+        a new sandbox after a pause, a crash, or a deploy. Returns the pending repository, or
+        None when another run changed it first."""
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    update(SessionRepo)
+                    .where(
+                        SessionRepo.org_id == org_id,
+                        SessionRepo.id == repo_id,
+                        SessionRepo.status == "ready",
+                    )
+                    .values(
+                        status="pending",
+                        path=None,
+                        commit=None,
+                        branch=None,
+                        proxied=None,
+                        error=None,
+                        updated_at=func.now(),
+                    )
+                    .returning(*_REPO_COLUMNS)
+                )
+            ).one_or_none()
+        return None if row is None else repo_view(row)
+
     async def chat_run(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
         """The runtime of a chat run that answers a message, or None for another run (a
         review, a ``/compact``, or an unknown run)."""

@@ -240,3 +240,77 @@ async def test_an_approval_does_not_give_the_off_note(
     preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
     scope, token = await _run(coding, tenant)
     assert await preparer.prepare(object(), scope, token) == ""  # type: ignore[arg-type]
+
+
+class Folders:
+    """A sandbox whose ``test -e`` finds only the given paths."""
+
+    def __init__(self, present: set[str], broken: bool = False) -> None:
+        self.present = present
+        self.broken = broken
+        self.looked: list[str] = []
+
+    async def exec(self, argv: list[str], **kwargs: Any) -> Any:
+        from sama.sandbox.base import ExecResult
+
+        if self.broken:
+            raise RuntimeError("the sandbox is busy")
+        assert argv[:2] == ["test", "-e"]
+        self.looked.append(argv[2])
+        return ExecResult(exit_code=0 if argv[2] in self.present else 1, stdout="", stderr="")
+
+
+async def test_a_lost_folder_clones_again(coding: CodingService, tenant: Tenant) -> None:
+    """A new sandbox (after a pause, a crash, or a deploy) has an empty work folder. The run
+    clones each ready repository whose folder is gone, and leaves the others."""
+    org, session = tenant.org, tenant.ids["mine"]
+    gone = await coding.attach(org_id=org, session_id=session, user_id=None, repo="team/gone")
+    kept = await coding.attach(org_id=org, session_id=session, user_id=None, repo="team/kept")
+    for repo in (gone, kept):
+        await coding.cloned(
+            org_id=org,
+            repo_id=repo.id,
+            path=f"/home/user/work/{repo.folder}",
+            commit="a" * 40,
+            branch="main",
+            proxied=True,
+        )
+    cloner = FakeCloner()
+    preparer = CodingPreparer(coding, cloner, RunTokenSigner(KEY))  # type: ignore[arg-type]
+    sandbox = Folders({"/home/user/work/kept"})
+    scope, token = await _run(coding, tenant)
+    note = await preparer.prepare(sandbox, scope, token)  # type: ignore[arg-type]
+    assert [call["repo"] for call in cloner.calls] == ["team/gone"]
+    assert "https://github.com/team/gone" in note
+    assert "team/kept" not in note
+    state = await coding.state(org_id=org, session_id=session)
+    assert [(r.folder, r.status, r.commit) for r in state.repos] == [
+        ("gone", "ready", "c" * 40),
+        ("kept", "ready", "a" * 40),
+    ]
+    assert set(sandbox.looked) == {"/home/user/work/gone", "/home/user/work/kept"}
+
+
+async def test_a_failed_folder_check_keeps_the_repository(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    org, session = tenant.org, tenant.ids["mine"]
+    repo = await coding.attach(org_id=org, session_id=session, user_id=None, repo="team/app")
+    await coding.cloned(
+        org_id=org,
+        repo_id=repo.id,
+        path="/home/user/work/app",
+        commit="a" * 40,
+        branch="main",
+        proxied=True,
+    )
+    cloner = FakeCloner()
+    preparer = CodingPreparer(coding, cloner, RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    assert await preparer.prepare(Folders(set(), broken=True), scope, token) == ""  # type: ignore[arg-type]
+    assert cloner.calls == []
+    (kept,) = (await coding.state(org_id=org, session_id=session)).repos
+    assert (kept.status, kept.commit) == ("ready", "a" * 40)
+    # A second reopen of the same repository does nothing.
+    assert await coding.reopen(org_id=org, repo_id=repo.id) is not None
+    assert await coding.reopen(org_id=org, repo_id=repo.id) is None
