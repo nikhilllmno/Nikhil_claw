@@ -2986,7 +2986,10 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   remote MCP server. It is not in the default allow list, so the gate asks a person. Only a
   workspace admin or the org owner can add one (a member gets the admins to ask). A URL of a
   catalog server connects the catalog connector. `auth: oauth` starts the sign-in with a card,
-  `none` connects and lists the tools, and `bearer` gives the link to the form. The name comes
+  `none` connects and lists the tools, and `bearer` gives the link to the form. The agent cannot
+  know if a server has a sign-in, so for `oauth` and `none` sama tries the server without a
+  credential first and starts the OAuth sign-in only when the server refuses; the person
+  approves once. The name comes
   from the host (`mcp.linear.app` gives `linear-mcp` when `linear` is a catalog name).
 - **Same session.** The tools of a new connection are in the next `tool_search` of the same
   session (Section 10.3.1), so the resumed run uses them at once.
