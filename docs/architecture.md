@@ -2918,9 +2918,11 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   A server without sign-in connects in the same call, and the answer has its tool count. A form
   connector (an API key, a database, a bearer MCP server) gets the link to its form in the web
   app, because secrets never go in chat.
-- **Connect card.** The answer ends with one line `<sama-connect>{json}</sama-connect>` with
+- **Connect card.** The answer starts with one line `<sama-connect>{json}</sama-connect>` with
   the connector, the title, the link (`https` only), the connection id, the state, and the scope
-  (`sama.connectors.chat`). The web app shows it as a **Connect** button that follows the state
+  (`sama.connectors.chat`). The card is first and at most 900 characters, because the tool
+  output preview of a long answer keeps its start; a link longer than 300 characters is only in
+  the card. The web app shows it as a **Connect** button that follows the state
   of the connection. The Telegram gateway sends an inline URL button, and the Slack gateway
   sends a link button, after the text so far (`follow_run`, `send_connect`). WhatsApp and email
   show the link in the text of the agent. The model reads the same line, so both runtimes work
@@ -2934,20 +2936,28 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   `finish_oauth`: the state check, the single use of the state and the PKCE verifier, and the
   claim of the row stay as in Section 10.3.1. A sign-in from the Connections page then goes back
   to that page (`303`). A sign-in from the chat shows a small page: "Gmail is connected. Go back
-  to the chat." Without `SAMA_PUBLIC_URL`, the old web callbacks stay. A sign-in that is open
+  to the chat." Before the token or the state is proven, both pages give the same short error
+  for every connection, so the pages tell nothing about a connection. Without
+  `SAMA_PUBLIC_URL`, the old web callbacks stay. A sign-in that is open
   when this change deploys keeps the redirect URI that it registered.
 - **Continue the request.** When a backend check sets `connected` on a row with an origin,
-  sama removes the origin in one locked update (so it continues once) and calls
-  `ConnectionResumer`. It queues a message in the session that asked, "(sama) Gmail is connected
-  now (personal connection). Continue the request that needed Gmail.", without the message
-  rate (a quota still applies), and writes the audit entry `connection.resumed`. The web app
+  sama locks the row. The row must still be `connected` and have the return token of the start
+  that connected, so an old answer cannot take the origin of a newer start. In one transaction,
+  sama removes the origin and `ConnectionResumer` queues a message in the session that asked,
+  "(sama) Gmail is connected now (personal connection). Continue the request that needed
+  Gmail.", without the message rate (a quota still applies), with the audit entry
+  `connection.resumed`. A failure rolls back both, so the origin stays and the next check or
+  poll tries again. A session that cannot take a run (archived, over a quota) loses only the
+  note. A start that fails sets `failed` only when the row still has its own token. The web app
   shows the run at once. A private session that is bound to the direct chat of the user in
   Telegram or Slack gets the answer there too (`Handoffs.follow`, through the door of the
   gateway). A shared group chat sees the answer in the web app only. A sign-in that ends more
   than 2 hours after the request does not continue the session.
 - **Poll.** `SigninPoller` (a loop of the control plane) checks the open Composio sign-ins of
-  the chats every 5 seconds, at most 50 at a time, so a sign-in connects also when the browser
-  never reaches the return page.
+  the chats and the connected rows that still have an origin every 5 seconds, at most 50 at a
+  time, the row checked longest ago first (`last_health_at`), so a sign-in connects and
+  continues also when the browser never reaches the return page, and open sign-ins that nobody
+  finishes do not hold the batch.
 - **Intent.** A manifest has `aliases`. `Catalog.resolve` maps the words of the user to a
   connector: `email`, `mail`, and `inbox` give Gmail and Outlook (the agent asks which one),
   `calendar` gives Google Calendar, and `drive` gives Google Drive. The catalog has `outlook`
