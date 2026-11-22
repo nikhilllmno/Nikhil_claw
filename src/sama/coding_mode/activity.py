@@ -45,18 +45,25 @@ _TEST_COMMAND: Final = re.compile(
     re.IGNORECASE,
 )
 _TEST_SCRIPT: Final = re.compile(
-    r"(?:^|[;&|(]\s*)(?:(?:ba|z|da)?sh\s+(?:-\S+\s+)*)?[\"']?"
+    r"(?:^[ \t]*|[;&|(]\s*)(?:(?:ba|z|da)?sh\s+(?:-\S+\s+)*)?[\"']?"
     r"(?:\.?/)?(?:[\w.-]+/)*(?:[\w.-]*[_.-])?(?:run[_-]?)?tests?(?:[_.-][\w.-]*)?\.(?:sh|bash)"
     r"[\"']?(?=$|[\s;&|)])",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 """A test script in the place of a command: ``sh test.sh``, ``bash "scripts/run_tests.sh"``,
 ``./test.sh``, ``cd repo && ./test.sh``. A script name as an argument (``cat ./test.sh``,
 ``git diff -- test.sh``) is not a test run."""
 _FAILED_LINE: Final = re.compile(
-    r"(?im)^.*(?:\b[1-9]\d*\s+(?:failed|failures?|errors?|errored)\b|\btests?\s+failed\b"
-    r"|test result:\s*failed|^\s*not ok\b).*$"
-    r"|^.*\b(?-i:FAIL|FAILED|FAILURES?)\b.*$"
+    # A positive count: ``1 failed``, ``2 errors``, ``3 tests failed`` (not ``0 tests failed``).
+    r"(?im)^.*(?:\b[1-9]\d*\s+(?:tests?\s+)?(?:failed|failures?|errors?|errored)\b"
+    r"|test result:\s*failed).*$"
+    # A status word in a status place only: at the start of the line (pytest ``FAILED x``,
+    # ``ERROR x``, jest ``FAIL src/a.test.ts``, go ``--- FAIL:``), at the end of a verbose
+    # pytest line (``tests/a.py::t FAILED [ 50%]``), or a TAP ``not ok``. A parameter id such
+    # as ``test_x[FAIL] PASSED`` does not count.
+    r"|^[ \t]*(?:---[ \t]+)?(?-i:FAIL|FAILED|ERROR)\b.*$"
+    r"|^.*[ \t](?-i:FAILED|ERROR)(?:[ \t]+\[[ \t]*\d+%\])?[ \t]*$"
+    r"|^[ \t]*not ok\b.*$"
 )
 """A line that reports at least one failed test or error. ``0 failed`` does not count."""
 _SUMMARY: Final = re.compile(

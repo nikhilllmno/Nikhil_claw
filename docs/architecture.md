@@ -6701,9 +6701,12 @@ true and the last result line of the output as `summary`. `?tests=true` lists on
 
 - The exit status of a pipe is the status of its last command, so `pytest | tail` ends with 0
   after a failed test. A test run whose output has a line that reports a failure or an error
-  (for example `1 failed`, `2 errors`, `2 tests failed`, an uppercase `FAILED`, or a TAP
-  `not ok`) is `failed`, also when the tool call ended without an error; that line becomes the
-  summary when the summary line does not show the failure. A test run that ended with an error is `failed`, also when its result line
+  is `failed`, also when the tool call ended without an error; that line becomes the summary
+  when the summary line does not show the failure. Such a line has a positive count (`1 failed`,
+  `2 errors`, `3 tests failed`; not `0 tests failed`), or a status word in a status place:
+  `FAIL`, `FAILED`, or `ERROR` at the start of the line (pytest, jest, `--- FAIL:` of go), at the
+  end of a verbose pytest line (`tests/a.py::t FAILED [ 50%]`), or a TAP `not ok`. The same word
+  in a test id, as in `test_x[FAIL] PASSED`, does not count. A test run that ended with an error is `failed`, also when its result line
   reports only passes. So a failed result never shows "passed".
 - The repository note asks the agent to start a piped test command with `set -o pipefail;`,
   so the exit status of the test itself counts. sama does not turn on `pipefail` for every
