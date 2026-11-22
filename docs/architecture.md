@@ -673,9 +673,12 @@ The steps that were removed:
   statement tells whether the session has an open run, and `submit` uses it only as a hint. With
   `open_run=True` it tries the note first. With `False` it skips that try, and the enqueue reads
   the open runs again, after the rate lock and in the same statement as the session and the
-  limits. That read decides whether the message is a note (a run is `running`), whether it
-  waits (`queued`), or neither. So a message that another send overtakes between the access read
-  and the write still waits behind it, and a run that started in between still gets the note.
+  limits. When that read finds an open run, the hint was stale: `submit` ends the transaction
+  and starts again with the note first. The lock order is always the rate lock, then the run
+  row, then the session row, the order of `complete`. Going on in the same transaction would
+  lock the session row first and then the run row, and it would deadlock with `complete`.
+  So a message that another send overtakes between the access read and the write still waits
+  behind it, and a run that started in between still gets the note.
   `submit` forwards `human=True` like the other sends of a person (`runs.human_origin`,
   Section 15.4).
 - **One transaction for an approval.** `GateService.decide_with_scope` is the one implementation

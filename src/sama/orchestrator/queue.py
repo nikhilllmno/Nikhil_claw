@@ -131,6 +131,12 @@ CLAIM_TRIES: Final = 5
 """How many candidate runs one ``claim`` tries before it gives up for this call."""
 
 
+class _StaleOpenRun(Exception):
+    """``RunQueue.submit`` read an open run of the session after it locked the session row. The
+    transaction ends, and ``submit`` starts again with the note first (run row before session
+    row, the lock order of ``complete``)."""
+
+
 class QueueError(Exception):
     """The queue cannot do the operation. The message is safe to show to the user."""
 
@@ -802,9 +808,9 @@ class RunQueue:
         steer_note: str | None = None,
     ) -> Submitted:
         """The body of ``enqueue_in``. With ``steer_note``, a session that has an open run (read
-        after the rate lock) first tries to take the text as a note for the running run, and then
-        the result has ``steered=True`` and no run is queued. The result has ``queued`` for a new
-        run that waits behind an open run."""
+        after the rate lock) raises ``_StaleOpenRun``: the caller ends the transaction and takes
+        the note first, so the run row is locked before the session row (the order of
+        ``complete``)."""
         if not locked:
             await self._rate_lock(connection, org_id)  # the lock order of all enqueues
         # One statement reads the session, the limits, and the rate counts. It comes
@@ -853,16 +859,10 @@ class RunQueue:
         if session.status != "active":
             raise QueueError("the session is not active")
         if steer_note is not None and session.open_run:
-            steered = await self._steer_in(
-                connection,
-                org_id=org_id,
-                session_id=session_id,
-                text=steer_note,
-                user_id=user_id,
-                busy_mode=True,
-            )
-            if steered is not None:
-                return Submitted(steered, queued=False, steered=True)
+            # The session row has the share lock now, and a note locks the run row. ``complete``
+            # locks them in the other order (the run, then the session), so going on would be a
+            # deadlock. The caller rolls back, which frees the lock, and tries the note first.
+            raise _StaleOpenRun
         if check_rate:
             _check_rate(session)
         if isinstance(session.library_agent, dict):
@@ -966,6 +966,50 @@ class RunQueue:
         """
         note = self._note_text(text, True) if steer else None
         try_first = note is not None and open_run is not False
+        try:
+            return await self._submit_once(
+                org_id=org_id,
+                session_id=session_id,
+                text=text,
+                user_id=user_id,
+                attachments=attachments,
+                coding_agent=coding_agent,
+                parallel=parallel,
+                human=human,
+                note=note,
+                try_first=try_first,
+            )
+        except _StaleOpenRun:
+            # The hint said ``False``, but a run is open. Every lock order is run before session.
+            return await self._submit_once(
+                org_id=org_id,
+                session_id=session_id,
+                text=text,
+                user_id=user_id,
+                attachments=attachments,
+                coding_agent=coding_agent,
+                parallel=parallel,
+                human=human,
+                note=note,
+                try_first=True,
+            )
+
+    async def _submit_once(
+        self,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None,
+        attachments: Sequence[NewAttachment],
+        coding_agent: str | None,
+        parallel: bool,
+        human: bool,
+        note: str | None,
+        try_first: bool,
+    ) -> Submitted:
+        """One transaction of ``submit``. With ``try_first``, the note comes before the session
+        row is locked. Without it, an open run found after the lock raises ``_StaleOpenRun``."""
         async with self._engine.begin() as connection:
             if try_first:
                 await self._rate_lock(connection, org_id)

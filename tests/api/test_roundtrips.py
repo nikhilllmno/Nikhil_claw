@@ -16,10 +16,10 @@ import uuid
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Run
+from sama.db.models import Run, Session
 from sama.db.trips import count_trips
 from tests.api.conftest import bearer
 from tests.orchestrator.conftest import Tenant
@@ -206,3 +206,80 @@ async def test_the_first_run_of_a_session_makes_few_round_trips(
     with count_trips() as trips:
         assert await harness.worker.run_once()
     assert trips.total <= FIRST_RUN_TO_PAUSE, trips.show()
+
+
+async def wait_until_blocked(engine: AsyncEngine, task: asyncio.Task[object]) -> None:
+    """Waits until a backend of this database waits for a lock, or until the task ends."""
+    for _ in range(200):
+        if task.done():
+            return
+        async with engine.connect() as connection:
+            waiting = (
+                await connection.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                        " AND datname = current_database()"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the send never waited for the lock")
+
+
+async def test_a_stale_hint_does_not_deadlock_with_the_end_of_a_run(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """``complete`` locks the run row and then the session row. A send must never lock them in
+    the other order. The test holds the run row like ``complete`` does, starts a send with a
+    stale ``open_run=False`` hint (it finds the open run after its first read), waits until the
+    send waits for a lock, and then takes the session row like ``complete`` does. A send that
+    holds the session row while it waits for the run row deadlocks here: PostgreSQL aborts one
+    transaction after ``deadlock_timeout``."""
+    harness = Harness(engine)
+    await harness.send(tenant, "s1", "first")
+    claimed = await harness.queue.claim("w9")
+    assert claimed is not None
+    ender = await engine.connect()
+    trans = await ender.begin()
+    try:
+        # The first step of ``complete``: the run row.
+        await ender.execute(select(Run.id).where(Run.id == claimed.run_id).with_for_update())
+        send = asyncio.create_task(
+            harness.queue.submit(
+                org_id=tenant.org,
+                session_id=tenant.ids["s1"],
+                text="more",
+                user_id=tenant.ids["mia"],
+                steer=True,
+                open_run=False,
+            )
+        )
+        await wait_until_blocked(engine, send)
+        # The second step of ``complete``: the session row. A deadlock raises here or in the send.
+        await asyncio.wait_for(
+            ender.execute(
+                select(Session.id)
+                .where(Session.id == tenant.ids["s1"])
+                .with_for_update(key_share=True)
+            ),
+            timeout=10,
+        )
+        await ender.execute(
+            update(Run)
+            .where(Run.id == claimed.run_id)
+            .values(
+                status="completed", finished_at=func.now(), lease_owner=None, lease_expires_at=None
+            )
+        )
+        await trans.commit()
+    except BaseException:
+        await trans.rollback()
+        raise
+    finally:
+        await ender.close()
+    sent = await asyncio.wait_for(send, timeout=20)
+    # The run ended while the send waited for its row, so the message is a new run.
+    assert sent.steered is False
+    assert sent.run_id != claimed.run_id
