@@ -44,9 +44,32 @@ _TEST_COMMAND: Final = re.compile(
     r")(?=$|[\s;&|)])",
     re.IGNORECASE,
 )
+_TEST_SCRIPT: Final = re.compile(
+    r"(?:^[ \t]*|[;&|(]\s*)(?:(?:ba|z|da)?sh\s+(?:-\S+\s+)*)?[\"']?"
+    r"(?:\.?/)?(?:[\w.-]+/)*(?:[\w.-]*[_.-])?(?:run[_-]?)?tests?(?:[_.-][\w.-]*)?\.(?:sh|bash)"
+    r"[\"']?(?=$|[\s;&|)])",
+    re.IGNORECASE | re.MULTILINE,
+)
+"""A test script in the place of a command: ``sh test.sh``, ``bash "scripts/run_tests.sh"``,
+``./test.sh``, ``cd repo && ./test.sh``. A script name as an argument (``cat ./test.sh``,
+``git diff -- test.sh``) is not a test run."""
+_FAILED_LINE: Final = re.compile(
+    # A positive count: ``1 failed``, ``2 errors``, ``3 tests failed`` (not ``0 tests failed``).
+    r"(?im)^.*(?:\b[1-9]\d*\s+(?:tests?\s+)?(?:failed|failures?|errors?|errored)\b"
+    r"|test result:\s*failed).*$"
+    # A status word in a status place only: at the start of the line (pytest ``FAILED x``,
+    # ``ERROR x``, jest ``FAIL src/a.test.ts``, go ``--- FAIL:``), at the end of a verbose
+    # pytest line (``tests/a.py::t FAILED [ 50%]``), or a TAP ``not ok``. A parameter id such
+    # as ``test_x[FAIL] PASSED`` does not count.
+    r"|^[ \t]*(?:---[ \t]+)?(?-i:FAIL|FAILED|ERROR)\b.*$"
+    r"|^.*[ \t](?-i:FAILED|ERROR)(?:[ \t]+\[[ \t]*\d+%\])?[ \t]*$"
+    r"|^[ \t]*not ok\b.*$"
+)
+"""A line that reports at least one failed test or error. ``0 failed`` does not count."""
 _SUMMARY: Final = re.compile(
     r"(?im)^.*\b(?:\d+\s+(?:passed|failed|errors?|skipped|tests?|examples?|failures?)\b"
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
+    r"|^\s*not ok\b.*$"
 )
 _PR_URL: Final = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
@@ -83,8 +106,8 @@ class PullRequestView:
 
 def is_test_command(command: str) -> bool:
     """True when the command runs the tests of a project, for example ``pytest`` or
-    ``npm test``."""
-    return _TEST_COMMAND.search(command) is not None
+    ``npm test``, or a test script such as ``sh test.sh``."""
+    return _TEST_COMMAND.search(command) is not None or _TEST_SCRIPT.search(command) is not None
 
 
 def result_summary(output: str) -> str | None:
@@ -94,6 +117,18 @@ def result_summary(output: str) -> str | None:
         return None
     line: str = found[-1].strip().strip("=").strip()
     return line[:300] or None
+
+
+def failed_summary(text: str) -> bool:
+    """True when the text has a line that reports at least one failed test or error, for
+    example ``1 failed``, ``2 errors``, ``FAILED``, or ``not ok``. It reads the whole text,
+    not only the summary line."""
+    return _FAILED_LINE.search(text) is not None
+
+
+def _failed_line(text: str) -> str | None:
+    found = [match.group(0) for match in _FAILED_LINE.finditer(text)]
+    return found[-1].strip()[:300] if found else None
 
 
 def _command_of(tool: str, arguments: Mapping[str, Any]) -> str:
@@ -193,7 +228,15 @@ async def list_commands(
         end = done.get((row.run_id, call_id))
         output = "" if end is None else redact(str(end.payload.get("output_preview") or ""))
         test = is_test_command(command)
+        summary = result_summary(output) if test else None
         status = _status(end)
+        if test and status == "ok" and failed_summary(output):
+            # The exit status of a pipe is the one of its last command, so ``pytest | tail``
+            # ends with 0 after a failed test. A line that reports a failure wins
+            # (Section 15.5).
+            status = "failed"
+            if summary is None or not failed_summary(summary):
+                summary = _failed_line(output)
         out.append(
             CommandView(
                 run_id=row.run_id,
@@ -203,7 +246,7 @@ async def list_commands(
                 test=test,
                 status=status,
                 output=_tail(output, MAX_OUTPUT_CHARS),
-                summary=result_summary(output) if test else None,
+                summary=summary,
                 started_at=row.created_at,
                 finished_at=None if end is None else end.created_at,
             )

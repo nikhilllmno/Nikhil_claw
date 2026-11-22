@@ -38,6 +38,8 @@ from sama.orchestrator.queue import QueueError, RunQueue
 from sama.tools.repos import GITHUB_URL, RepoError, parse_repo, valid_folder, valid_ref
 from sama.vault.redact import redact
 
+PLAN_OFF_NOTED: Final = "session.plan_mode_noted"
+"""The audit entry of the run that told the agent that plan mode is off."""
 PLAN_LIST_LIMIT: Final = 10
 MAX_PLAN_LIST: Final = 50
 MAX_PR_TITLE_CHARS: Final = 200
@@ -699,6 +701,52 @@ class CodingService:
         if row is None or row.kind != "chat" or row.compact:
             return None
         return str(row.runtime or "")
+
+    async def turned_off(
+        self, *, org_id: uuid.UUID, session_id: uuid.UUID, run_id: uuid.UUID
+    ) -> bool:
+        """True for the one run that tells the agent that a person turned plan mode off
+        (``/plan off``, the switch, the API). The first chat run that prepares after the change
+        claims it with the audit entry ``session.plan_mode_noted`` under the session lock; a
+        retry of that run gets it again, and no other run gets it. An approval sends its own
+        message, so it does not count. The caller skips reviews and ``/compact`` runs."""
+        async with self._engine.begin() as connection:
+            workspace_id = await _lock_session(connection, org_id, session_id)
+            last = (
+                await connection.execute(
+                    select(AuditEntry.action, AuditEntry.details, AuditEntry.run_id)
+                    .where(
+                        AuditEntry.org_id == org_id,
+                        AuditEntry.target_type == "session",
+                        AuditEntry.target_id == str(session_id),
+                        AuditEntry.action.in_(
+                            ("session.plan_mode", "plan.approved", PLAN_OFF_NOTED)
+                        ),
+                    )
+                    .order_by(AuditEntry.id.desc())
+                    .limit(1)
+                )
+            ).one_or_none()
+            if last is None:
+                return False
+            if last.action == PLAN_OFF_NOTED:
+                return bool(last.run_id == run_id)
+            if last.action != "session.plan_mode" or (last.details or {}).get("on") is not False:
+                return False
+            await connection.execute(
+                insert(AuditEntry).values(
+                    org_id=org_id,
+                    workspace_id=workspace_id,
+                    actor_kind="system",
+                    actor_user_id=None,
+                    action=PLAN_OFF_NOTED,
+                    target_type="session",
+                    target_id=str(session_id),
+                    run_id=run_id,
+                    details={},
+                )
+            )
+        return True
 
     async def plan_mode(self, *, org_id: uuid.UUID, session_id: uuid.UUID) -> bool:
         async with self._engine.connect() as connection:

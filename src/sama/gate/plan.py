@@ -241,6 +241,10 @@ def read_only_command(command: str) -> bool:
 
 def _segment_ok(words: list[str]) -> bool:
     program, args = words[0], words[1:]
+    if program == "cd":
+        # ``cd DIR`` only changes the folder of the next commands, for example
+        # ``cd repo && git log``. One plain folder name; no option and no ``-``.
+        return len(args) <= 1 and not any(arg.startswith("-") for arg in args)
     if program not in _READ_COMMANDS:
         return False
     if program == "find":
@@ -260,8 +264,10 @@ def _segment_ok(words: list[str]) -> bool:
 
 
 def _git_ok(args: list[str]) -> bool:
-    """A git subcommand that only reads, and only the options in an allow list. An option
-    before the subcommand (for example ``-c``) is refused."""
+    """A git subcommand that only reads, and only the options in an allow list. Before the
+    subcommand only ``-C DIR`` is allowed; any other option (for example ``-c``) is refused."""
+    if len(args) >= 2 and args[0] == "-C" and not args[1].startswith("-"):
+        args = args[2:]  # ``git -C DIR`` reads in another folder
     if not args or args[0] not in _GIT_READ:
         return False
     sub, rest = args[0], args[1:]
