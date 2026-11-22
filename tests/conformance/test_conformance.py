@@ -26,8 +26,11 @@ from sama.runtime import (
     RunCompleted,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
+    RuntimeKind,
     TextDelta,
     ToolCallFinished,
     ToolCallStarted,
@@ -145,6 +148,25 @@ async def test_streams_text_and_ends_with_one_terminal_event(target: Target) -> 
     assert word in done.output
     assert word in text_of(events)
     assert done.usage.output_tokens > 0
+
+
+async def test_a_model_runtime_sends_the_thinking_phase_before_the_first_text(
+    target: Target,
+) -> None:
+    """Both model runtimes send ``run_phase`` ``thinking`` when a model turn starts, so a
+    client shows an activity before the first text (Section 4.4)."""
+    if target.runtime.kind not in (RuntimeKind.CLAUDE_AGENT_SDK, RuntimeKind.OPENAI_AGENTS_SDK):
+        pytest.skip("only a model runtime starts model turns")
+    events = await run(target, target.prompt(Scenario.TEXT, new_word()))
+    thinking = [
+        i for i, e in enumerate(events) if isinstance(e, RunPhase) and e.phase == "thinking"
+    ]
+    first_text = next(i for i, e in enumerate(events) if isinstance(e, TextDelta))
+    assert thinking
+    assert thinking[0] < first_text
+    # A sandboxed target also sends the start phases of the sandbox, before the model turn.
+    names = [e.phase for e in events if isinstance(e, RunPhase)]
+    assert set(names) <= set(RunPhaseName) - {RunPhaseName.STARTING}
 
 
 async def test_resumes_the_session_from_runtime_state(target: Target) -> None:

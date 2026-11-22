@@ -17,6 +17,7 @@ from sama.orchestrator.sandboxed import CAPABILITIES, SandboxedRuntime, SandboxS
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
+    Budget,
     Compacted,
     FailureCode,
     ResumeRequest,
@@ -24,6 +25,8 @@ from sama.runtime import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -35,6 +38,7 @@ from sama.runtime.contract import CompactRequest
 from sama.runtime.fake import FakeRuntime, FakeScript
 from sama.runtime.runner import RunnerJob
 from sama.sandbox import ExecResult, SandboxError, SandboxProcess, SandboxSpec
+from sama.sandbox.base import DEFAULT_IDLE_TIMEOUT_S
 from sama.sandbox.local import LocalProvider, LocalSandbox
 from sama.sandbox.process import SubprocessProcess
 from sama.tenancy import RunTokenSigner
@@ -867,6 +871,7 @@ async def test_a_compact_request_reaches_the_runner(runtime: SandboxedRuntime) -
     )
     events = await collect(runtime.run(compact))
     validate_event_stream(events)
+    events = [event for event in events if not isinstance(event, RunPhase)]
     assert [type(event) for event in events] == [Compacted, RunCompleted]
     assert isinstance(events[0], Compacted)
     assert (events[0].tokens_before, events[0].tokens_after, events[0].trigger) == (
@@ -987,3 +992,92 @@ async def test_the_coding_step_adds_its_note_to_the_input(
     job = RunnerJob(op="run", run=compact)
     assert await runtime._prepare(job, cast(Any, None), compact.scope, "token") is job
     assert len(preparer.calls) == 2
+
+
+# -- run phases and the session warm (Section 4.4) ----------------------------------------------
+
+
+async def test_a_run_sends_the_start_phases_before_the_runner_events(
+    runtime: SandboxedRuntime,
+) -> None:
+    runtime.fake_scripts.append(_reply("hello"))
+    events = await collect(runtime.run(_request(make_scope("run-1"))))
+    validate_event_stream(events)
+    phases = [e.phase for e in events if isinstance(e, RunPhase)]
+    assert phases == [RunPhaseName.STARTING_SANDBOX, RunPhaseName.STARTING_RUNTIME]
+    assert all(isinstance(e, RunPhase) for e in events[:2])
+    assert isinstance(events[2], TextDelta)
+
+
+async def test_a_resume_also_sends_the_start_phases(runtime: SandboxedRuntime) -> None:
+    usage = Usage(input_tokens=5)
+    paused = ApprovalRequired(approval_id="a1", call_id="c1", tool_name="Bash", usage=usage)
+    done = (RunCompleted(output="ok", usage=usage),)
+    runtime.fake_scripts.append(FakeScript(events=(paused,), on_approve=done, on_reject=done))
+    scope = make_scope("run-1")
+    await collect(runtime.run(_request(scope)))
+    resume = ResumeRequest(
+        scope=scope, config=CONFIG, approval_id="a1", decision=ApprovalDecision.APPROVE
+    )
+    # The fake runner keeps paused runs in memory, so it refuses the resume. The phases of
+    # the start come first all the same.
+    events = await collect(runtime.resume(resume))
+    assert [e.phase for e in events if isinstance(e, RunPhase)] == [
+        RunPhaseName.STARTING_SANDBOX,
+        RunPhaseName.STARTING_RUNTIME,
+    ]
+    assert isinstance(events[-1], RunFailed)
+
+
+async def test_a_warm_starts_the_session_sandbox_and_the_next_run_uses_it(
+    runtime: SandboxedRuntime, provider: CountingProvider
+) -> None:
+    assert await runtime.warm("org-1", "sess-1") == "ready"
+    assert provider.creates == 1
+    # The warm uses the idle timeout, and it sets the idle timeout back at the end.
+    assert provider.spec_timeouts == [DEFAULT_IDLE_TIMEOUT_S]
+    assert provider.keep_alives == [DEFAULT_IDLE_TIMEOUT_S]
+    # The runner is not a warm runner here, so the warm starts no process.
+    assert "exec" not in provider.calls
+    runtime.fake_scripts.append(_reply("ok"))
+    await collect(runtime.run(_request(make_scope("run-1"))))
+    assert (provider.creates, provider.resumes) == (1, 1)
+
+
+async def test_a_warm_with_the_warm_runner_starts_the_warm_server(
+    provider: CountingProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _sandboxed(provider, argv=(sys.executable, "-m", "sama.warm"))
+    started: list[Sequence[str]] = []
+
+    async def fake_exec(_self: RecordingSandbox, argv: Sequence[str], **_: Any) -> ExecResult:
+        started.append(list(argv))
+        return ExecResult(exit_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(RecordingSandbox, "exec", fake_exec)
+    try:
+        assert await runtime.warm("org-1", "sess-1") == "ready"
+    finally:
+        await runtime.close_sandboxes(kill=True)
+    assert started == [[sys.executable, "-m", "sama.warm", "--start"]]
+
+
+async def test_a_warm_during_a_run_does_not_touch_the_sandbox(
+    runtime: SandboxedRuntime, provider: CountingProvider
+) -> None:
+    scope = make_scope("run-1")
+    sandbox = await runtime.acquire(scope, Budget())
+    try:
+        resumes = provider.resumes
+        assert await runtime.warm(scope.org_id, scope.session_id) == "busy"
+        assert provider.resumes == resumes
+    finally:
+        await runtime.release(scope, sandbox)
+
+
+async def test_a_failed_warm_reports_failed_and_does_not_raise(
+    runtime: SandboxedRuntime, provider: CountingProvider
+) -> None:
+    assert await runtime.warm("org-1", "sess-1") == "ready"
+    provider.fail_resumes = 1
+    assert await runtime.warm("org-1", "sess-1") == "failed"

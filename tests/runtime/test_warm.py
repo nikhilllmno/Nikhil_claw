@@ -122,6 +122,20 @@ async def test_the_first_run_is_cold_and_the_next_runs_are_warm(
     assert len(warm_servers(socket_path)) == 1
 
 
+async def test_a_session_warm_makes_the_first_run_warm(
+    runtime: SandboxedRuntime, socket_path: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="sama.orchestrator")
+    assert await runtime.warm("org-1", "sess-1") == "ready"
+    await asyncio.to_thread(_wait_until, lambda: Path(socket_path).exists())
+    # A second warm is safe: the second server exits, and one server stays.
+    assert await runtime.warm("org-1", "sess-1") == "ready"
+    events = await _run(runtime, _reply("one"), "run-1")
+    assert isinstance(events[-1], RunCompleted)
+    assert _modes(caplog) == ["mode=warm"]
+    await asyncio.to_thread(_wait_until, lambda: len(warm_servers(socket_path)) == 1)
+
+
 async def test_a_cancel_stops_a_warm_runner(runtime: SandboxedRuntime, socket_path: str) -> None:
     await _run(runtime, _reply("one"), "run-1")
     await asyncio.to_thread(_wait_until, lambda: Path(socket_path).exists())

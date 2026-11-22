@@ -23,6 +23,8 @@ from sama.runtime import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -453,3 +455,37 @@ def test_a_subagent_text_is_bounded_without_a_cut() -> None:
     assert clip_subagent_text("a" * 5_000) == "a" * SUBAGENT_STORED_MAX_CHARS
     with pytest.raises(ValidationError):
         SubagentEvent(subagent="r", text="a" * (SUBAGENT_WIRE_MAX_CHARS + 1))
+
+
+# --- RunPhase (Section 4.4) --------------------------------------------------------------------
+
+
+def test_a_run_phase_is_an_event_with_its_name() -> None:
+    event = run_event_adapter.validate_json('{"type": "run_phase", "phase": "thinking"}')
+    assert isinstance(event, RunPhase)
+    assert event.phase is RunPhaseName.THINKING
+    assert not is_terminal(event)
+    assert {name.value for name in RunPhaseName} == {
+        "starting",
+        "starting_sandbox",
+        "starting_runtime",
+        "thinking",
+    }
+    with pytest.raises(ValidationError):
+        run_event_adapter.validate_json('{"type": "run_phase", "phase": "nap"}')
+
+
+def test_the_usage_rule_does_not_apply_to_a_run_phase() -> None:
+    paused = Usage(input_tokens=5)
+    events: list[RunEvent] = [
+        RunPhase(phase=RunPhaseName.STARTING_SANDBOX),  # zero usage after the pause
+        TextDelta(text="a", usage=Usage(input_tokens=6)),
+        RunPhase(phase=RunPhaseName.THINKING),
+        RunCompleted(output="a", usage=Usage(input_tokens=7)),
+    ]
+    assert isinstance(validate_event_stream(events, start=paused), RunCompleted)
+    with pytest.raises(ContractViolation, match="usage went down"):
+        validate_event_stream(
+            [TextDelta(text="a", usage=Usage()), RunCompleted(output="a", usage=Usage())],
+            start=paused,
+        )

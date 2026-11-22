@@ -9,7 +9,12 @@
    credential, and sends the job on stdin,
 4. streams the runner events from stdout.
 
-It measures and logs the sandbox start and the time to the first event (roadmap M1.6).
+It measures and logs the sandbox start and the time to the first event (roadmap M1.6). It
+sends ``run_phase`` events (``starting_sandbox``, ``starting_runtime``) before the runner
+events, so a client sees the progress of the start (Section 4.3).
+
+``warm`` gets the session sandbox ready before a run: it starts or resumes the sandbox and
+starts the warm runner server (``sama.warm``). It creates no run and issues no run token.
 
 Before a run it makes the idle timeout of the sandbox long enough for the run. After the last
 run of the session it sets the timeout back, so an idle sandbox pauses on time.
@@ -47,6 +52,8 @@ from sama.runtime.contract import (
     ResumeRequest,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -103,9 +110,14 @@ CANCEL_DEADLINE_S: Final = 9.0
 EXIT_WAIT_S: Final = 5.0
 """After the terminal event, the orchestrator waits this long for the runner to exit."""
 PROVIDER_CALL_S: Final = 10.0
+"""The longest wait for a provider call that has no other limit, for example a stdin write."""
 SCRATCH_IDLE_S: Final = 5 * 60
 """A scratch sandbox (``scratch_sandbox``) pauses after this time if nobody kills it."""
-"""The longest wait for a provider call that has no other limit, for example a stdin write."""
+WARM_START_ARGS: Final = ("-m", "sama.warm", "--start")
+"""Starts the warm runner server and exits (``sama.warm``). The interpreter is the first item
+of ``runner_argv``."""
+WARM_EXEC_S: Final = 15.0
+"""The longest wait for the start of the warm runner server."""
 _MEMORY: Final = 10_000
 
 CAPABILITIES: Final[Mapping[RuntimeKind, Capabilities]] = {
@@ -389,6 +401,51 @@ class SandboxedRuntime:
             # this time (``acquire``). The next run kills it; E2B pauses it when it is idle.
             return None
 
+    async def warm(self, org_id: str, session_id: str) -> str:
+        """Gets the sandbox of a session ready for the next run (Section 4.3): it resumes the
+        sandbox or creates one, and starts the warm runner server in it. It creates no run,
+        issues no run token, and passes no secret to the sandbox. Returns what it did:
+        ``busy`` (a run of the session uses the sandbox now, so it is warm), ``ready``, or
+        ``failed``. It never raises, except for a cancel."""
+        key = (org_id, session_id)
+        sandbox: Sandbox | None = None
+        started = time.monotonic()
+        try:
+            async with self._session_locks.setdefault(key, asyncio.Lock()):
+                if self._session_runs.get(key, 0) > 0:
+                    # A run holds the sandbox with the timeout of the run. A resume with the
+                    # idle timeout would make that timeout shorter.
+                    return "busy"
+                sandbox = await self._get_sandbox(key, self._spec(*key))
+            argv = self._settings.runner_argv
+            if tuple(argv[1:]) == WARM_RUNNER_ARGV[1:]:
+                # ``extra_env`` has no secret (``SandboxSettings``). It can set the socket.
+                result = await sandbox.exec(
+                    [argv[0], *WARM_START_ARGS],
+                    env=dict(self._settings.extra_env),
+                    cwd=sandbox.workdir,
+                    timeout_s=WARM_EXEC_S,
+                )
+                if result.exit_code != 0:
+                    log.warning(
+                        "the warm runner did not start sandbox=%s code=%s",
+                        sandbox.id,
+                        result.exit_code,
+                    )
+            log.info(
+                "session sandbox warm session=%s sandbox=%s duration_s=%.3f",
+                session_id,
+                sandbox.id,
+                time.monotonic() - started,
+            )
+            return "ready"
+        except Exception as error:
+            log.warning("the session sandbox did not warm session=%s: %r", session_id, error)
+            return "failed"
+        finally:
+            if sandbox is not None:
+                await self._end_session_run(key, sandbox)
+
     async def exec_script(self, scope: RunScope, script: str, *, timeout_s: float) -> ExecResult:
         """Runs a job script with ``bash -c`` in the session sandbox (Section 12.1). The script
         gets no run token and no secret: the sandbox environment has none."""
@@ -454,40 +511,44 @@ class SandboxedRuntime:
         key = (scope.org_id, scope.session_id)
         async with self._session_locks.setdefault(key, asyncio.Lock()):
             spec = self._spec(*key, idle_timeout_s=int(_wall_time_s(budget) + TOKEN_MARGIN_S))
-            sandbox: Sandbox | None = None
-            outdated: Sandbox | None = None
-            known = await self._known_sandbox(key)
-            if known is not None:
+            return await self._get_sandbox(key, spec)
+
+    async def _get_sandbox(self, key: tuple[str, str], spec: SandboxSpec) -> Sandbox:
+        """Resumes the session sandbox or creates one with ``spec``, and counts one use of it
+        (``_session_runs``). The caller holds the session lock."""
+        sandbox: Sandbox | None = None
+        outdated: Sandbox | None = None
+        known = await self._known_sandbox(key)
+        if known is not None:
+            try:
+                sandbox = await self._provider.resume(known, spec)
+            except SandboxOutdatedError as error:
+                log.warning(
+                    "the session sandbox is from another template; creating a new one sandbox=%s",
+                    known,
+                )
+                outdated = error.sandbox
+            except SandboxNotFoundError:
+                log.warning("the session sandbox is gone; creating a new one sandbox=%s", known)
+        if sandbox is None:
+            try:
+                sandbox = await self._provider.create(spec)
+                if outdated is not None:
+                    await self._carry(outdated, sandbox)
+            finally:
+                if outdated is not None:
+                    with contextlib.suppress(Exception):
+                        await outdated.kill()
+            self._sandbox_ids[key] = sandbox.id
+            if self._directory is not None:
                 try:
-                    sandbox = await self._provider.resume(known, spec)
-                except SandboxOutdatedError as error:
-                    log.warning(
-                        "the session sandbox is from another template; creating a new one"
-                        " sandbox=%s",
-                        known,
-                    )
-                    outdated = error.sandbox
-                except SandboxNotFoundError:
-                    log.warning("the session sandbox is gone; creating a new one sandbox=%s", known)
-            if sandbox is None:
-                try:
-                    sandbox = await self._provider.create(spec)
-                    if outdated is not None:
-                        await self._carry(outdated, sandbox)
-                finally:
-                    if outdated is not None:
-                        with contextlib.suppress(Exception):
-                            await outdated.kill()
-                self._sandbox_ids[key] = sandbox.id
-                if self._directory is not None:
-                    try:
-                        await self._directory.put(*key, sandbox.id)
-                    except Exception:
-                        # This process still knows the sandbox. Another process creates a
-                        # new one, so the run goes on.
-                        log.exception("could not store the session sandbox=%s", sandbox.id)
-            self._session_runs[key] = self._session_runs.get(key, 0) + 1
-            return sandbox
+                    await self._directory.put(*key, sandbox.id)
+                except Exception:
+                    # This process still knows the sandbox. Another process creates a
+                    # new one, so the run goes on.
+                    log.exception("could not store the session sandbox=%s", sandbox.id)
+        self._session_runs[key] = self._session_runs.get(key, 0) + 1
+        return sandbox
 
     async def release(self, scope: RunScope, sandbox: Sandbox) -> None:
         """Ends the use of a sandbox from ``acquire``: after the last run of the session, it
@@ -586,6 +647,9 @@ class SandboxedRuntime:
         ended = False
         try:
             while (event := await _next_event(events, active)) is not None:
+                if isinstance(event, RunPhase):
+                    yield event  # progress only: no usage, not the first runner event
+                    continue
                 if first:
                     first = False
                     elapsed = time.monotonic() - started
@@ -639,13 +703,12 @@ class SandboxedRuntime:
         files = asyncio.create_task(self._skill_files(scope))
         try:
             try:
+                events.put_nowait(RunPhase(phase=RunPhaseName.STARTING_SANDBOX))
                 sandbox = await self.acquire(scope, budget)
                 steps.mark("acquire")
                 if active.cancelled.is_set():
                     events.put_nowait(_cancelled(usage))
                     return
-                wanted = await files
-                steps.mark("files")
                 ttl = min(_wall_time_s(budget) + TOKEN_MARGIN_S, RUN_TOKEN_MAX_TTL_S)
                 token = self._signer.issue(scope, ttl_s=ttl, budget=budget)
                 env = {
@@ -653,11 +716,15 @@ class SandboxedRuntime:
                     **self._settings.extra_env,
                     RUN_TOKEN_ENV: token,
                 }
+                # The skill files come from the database during the prepare step.
                 job = await self._prepare(job, sandbox, scope, token)
                 steps.mark("prepare")
+                wanted = await files
+                steps.mark("files")
                 if active.cancelled.is_set():
                     events.put_nowait(_cancelled(usage))
                     return
+                events.put_nowait(RunPhase(phase=RunPhaseName.STARTING_RUNTIME))
                 if self._settings.model_url:
                     env[MODEL_URL_ENV] = self._settings.model_url
                 argv = list(self._settings.runner_argv)
@@ -720,8 +787,11 @@ class SandboxedRuntime:
                     event = _parse(line)
                     if event is None:
                         continue
-                    usage = event.usage
                     events.put_nowait(event)
+                    if isinstance(event, RunPhase):
+                        steps.mark("thinking", once=True)
+                        continue
+                    usage = event.usage
                     steps.mark("first_event", once=True)
                     if is_terminal(event):
                         terminal = True
