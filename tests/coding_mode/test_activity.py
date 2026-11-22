@@ -38,6 +38,8 @@ from tests.orchestrator.conftest import Tenant
         "./test.sh",
         "cd repo && sh -e tests.sh",
         "./scripts/test-unit.sh",
+        'bash "scripts/run_tests.sh"',
+        "cd repo && ./test.sh",
     ],
 )
 def test_test_commands(command: str) -> None:
@@ -56,6 +58,8 @@ def test_test_commands(command: str) -> None:
         "sh build.sh",
         "sh latest.sh",
         "bash deploy.sh",
+        "cat ./test.sh",
+        "git diff -- ./test.sh",
     ],
 )
 def test_other_commands(command: str) -> None:
@@ -169,6 +173,11 @@ async def test_the_commands_and_pull_requests_come_from_the_run_events(
         ("Tests: 1 failed, 3 passed", True),
         ("test result: FAILED. 1 passed; 1 failed", True),
         ("not ok 2 - adds", True),
+        ("FAILED tests/test_a.py::test_x - assert 1 == 2", True),
+        ("1 Failed", True),
+        ("2 tests failed", True),
+        ("collected 3 items\n...\nFAILED tests/a.py::t\n== 1 passed ==", True),
+        ("test_errors.py PASSED", False),
         ("3 passed in 0.1s", False),
         ("0 failed, 2 passed", False),
         ("Tests  12 passed (12)", False),
@@ -205,14 +214,30 @@ async def test_a_piped_test_with_a_failed_summary_is_failed(
             (finished, {"call_id": "p2", "is_error": False, "output_preview": "2 passed"}),
             (started, {"call_id": "p3", "name": "Bash", "arguments": {"command": "pytest"}}),
             (finished, {"call_id": "p3", "is_error": True, "output_preview": "3 passed"}),
+            (started, {"call_id": "p4", "name": "Bash", "arguments": {"summary": "prove | cat"}}),
+            (
+                started,
+                {"call_id": "p5", "name": "Bash", "arguments": {"command": "sh test.sh | tail"}},
+            ),
+            (
+                finished,
+                {"call_id": "p5", "is_error": False, "output_preview": "ok 1 - a\nnot ok 2 - b"},
+            ),
+            (started, {"call_id": "p6", "name": "Bash", "arguments": {"command": "pytest | tail"}}),
+            (
+                finished,
+                {"call_id": "p6", "is_error": False, "output_preview": "FAILED tests/a.py::t"},
+            ),
         ],
     )
     async with engine.connect() as connection:
         listed = await list_commands(
             connection, org_id=tenant.org, session_id=tenant.ids["mine"], tests_only=True
         )
-    assert [(c.call_id, c.status) for c in listed] == [
-        ("p3", "failed"),
-        ("p2", "ok"),
-        ("p1", "failed"),
+    assert [(c.call_id, c.status, c.summary) for c in listed] == [
+        ("p6", "failed", "FAILED tests/a.py::t"),
+        ("p5", "failed", "not ok 2 - b"),
+        ("p3", "failed", "3 passed"),
+        ("p2", "ok", "2 passed"),
+        ("p1", "failed", "1 failed, 1 passed in 0.01s"),
     ]

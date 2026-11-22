@@ -45,20 +45,24 @@ _TEST_COMMAND: Final = re.compile(
     re.IGNORECASE,
 )
 _TEST_SCRIPT: Final = re.compile(
-    r"(?:^|[\s;&|(])(?:(?:ba|z|da)?sh\s+(?:-\S+\s+)*(?:\S+/)?|\.?/(?:\S+/)?)"
-    r"(?:[\w.-]*[_.-])?(?:run[_-]?)?tests?(?:[_.-][\w.-]*)?\.(?:sh|bash)(?=$|[\s;&|)])",
+    r"(?:^|[;&|(]\s*)(?:(?:ba|z|da)?sh\s+(?:-\S+\s+)*)?[\"']?"
+    r"(?:\.?/)?(?:[\w.-]+/)*(?:[\w.-]*[_.-])?(?:run[_-]?)?tests?(?:[_.-][\w.-]*)?\.(?:sh|bash)"
+    r"[\"']?(?=$|[\s;&|)])",
     re.IGNORECASE,
 )
-"""A test script that a shell runs: ``sh test.sh``, ``bash scripts/run_tests.sh``,
-``./test.sh``. Reading or editing the script (``cat test.sh``) is not a test run."""
-_FAILED_SUMMARY: Final = re.compile(
-    r"\b[1-9]\d*\s+(?:failed|failures?|errors?|errored)\b|\bFAIL(?:ED|URES?)?\b"
-    r"|test result:\s*FAILED|\bnot ok\b"
+"""A test script in the place of a command: ``sh test.sh``, ``bash "scripts/run_tests.sh"``,
+``./test.sh``, ``cd repo && ./test.sh``. A script name as an argument (``cat ./test.sh``,
+``git diff -- test.sh``) is not a test run."""
+_FAILED_LINE: Final = re.compile(
+    r"(?im)^.*(?:\b[1-9]\d*\s+(?:failed|failures?|errors?|errored)\b|\btests?\s+failed\b"
+    r"|test result:\s*failed|^\s*not ok\b).*$"
+    r"|^.*\b(?-i:FAIL|FAILED|FAILURES?)\b.*$"
 )
-"""A result line that reports at least one failure or error."""
+"""A line that reports at least one failed test or error. ``0 failed`` does not count."""
 _SUMMARY: Final = re.compile(
     r"(?im)^.*\b(?:\d+\s+(?:passed|failed|errors?|skipped|tests?|examples?|failures?)\b"
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
+    r"|^\s*not ok\b.*$"
 )
 _PR_URL: Final = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
@@ -108,9 +112,16 @@ def result_summary(output: str) -> str | None:
     return line[:300] or None
 
 
-def failed_summary(summary: str) -> bool:
-    """True when a result line reports at least one failed test or error."""
-    return _FAILED_SUMMARY.search(summary) is not None
+def failed_summary(text: str) -> bool:
+    """True when the text has a line that reports at least one failed test or error, for
+    example ``1 failed``, ``2 errors``, ``FAILED``, or ``not ok``. It reads the whole text,
+    not only the summary line."""
+    return _FAILED_LINE.search(text) is not None
+
+
+def _failed_line(text: str) -> str | None:
+    found = [match.group(0) for match in _FAILED_LINE.finditer(text)]
+    return found[-1].strip()[:300] if found else None
 
 
 def _command_of(tool: str, arguments: Mapping[str, Any]) -> str:
@@ -212,10 +223,13 @@ async def list_commands(
         test = is_test_command(command)
         summary = result_summary(output) if test else None
         status = _status(end)
-        if test and status == "ok" and summary is not None and failed_summary(summary):
+        if test and status == "ok" and failed_summary(output):
             # The exit status of a pipe is the one of its last command, so ``pytest | tail``
-            # ends with 0 after a failed test. A failed result line wins (Section 15.5).
+            # ends with 0 after a failed test. A line that reports a failure wins
+            # (Section 15.5).
             status = "failed"
+            if summary is None or not failed_summary(summary):
+                summary = _failed_line(output)
         out.append(
             CommandView(
                 run_id=row.run_id,

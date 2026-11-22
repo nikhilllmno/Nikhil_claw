@@ -6657,8 +6657,11 @@ service checks the values with the rules of `repo_clone` (Section 15.1). A sessi
 - When a person turns plan mode off by hand (`/plan off`, the switch on the Code page, or
   `PUT /sessions/{id}/plan-mode`), the next chat run of the session gets a one-time note that
   plan mode is off and the agent can change files again. Without it, the agent can act on the
-  plan mode rules in its history. An approval sends the plan as a message, so it gets no note.
-  The note comes from the audit entry `session.plan_mode` (no extra column).
+  plan mode rules in its history. The first chat run that starts after the change claims the
+  note with the audit entry `session.plan_mode_noted` (with its run id) under the session lock,
+  so exactly one run gets it, also when runs start at the same time; a retry of that run gets it
+  again. A `/compact` run and a review run do not take it. An approval sends the plan as a
+  message, so it gives no note. No extra column.
 - Any user who can read the session decides a plan, as for `/undo`. The work after the
   approval still passes the gate: each tool call that asks still needs its approval.
 - The chat commands work in a Telegram direct chat, a Slack direct message (`/sama plan`), and
@@ -6692,13 +6695,15 @@ so `base=N&head=N-1` is what that call changed, and `base=oldest` is all changes
 of `Bash` (also the shell of the second runtime) and `execute_code`, newest first, with the
 command, the status (`running`, `ok`, or `failed`), and the end of the output. A command that
 runs tests (for example `pytest`, `npm test`, `go test`, `cargo test`, `make test`, or a test
-script that a shell runs: `sh test.sh`, `bash scripts/run_tests.sh`, `./test.sh`) has `test`
+script in the place of a command: `sh test.sh`, `bash "scripts/run_tests.sh"`, `./test.sh`,
+`cd repo && ./test.sh`; a script name as an argument, as in `cat ./test.sh`, is not) has `test`
 true and the last result line of the output as `summary`. `?tests=true` lists only these.
 
 - The exit status of a pipe is the status of its last command, so `pytest | tail` ends with 0
-  after a failed test. A test run whose result line reports a failure or an error (for example
-  `1 failed`, `2 errors`, `FAILED`, `not ok`) is `failed`, also when the tool call ended
-  without an error. A test run that ended with an error is `failed`, also when its result line
+  after a failed test. A test run whose output has a line that reports a failure or an error
+  (for example `1 failed`, `2 errors`, `2 tests failed`, an uppercase `FAILED`, or a TAP
+  `not ok`) is `failed`, also when the tool call ended without an error; that line becomes the
+  summary when the summary line does not show the failure. A test run that ended with an error is `failed`, also when its result line
   reports only passes. So a failed result never shows "passed".
 - The repository note asks the agent to start a piped test command with `set -o pipefail;`,
   so the exit status of the test itself counts. sama does not turn on `pipefail` for every

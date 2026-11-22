@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.coding_mode.prepare import PLAN_MODE_NOTE, CodingPreparer
 from sama.coding_mode.service import CodingService
@@ -163,28 +164,71 @@ async def test_a_run_after_plan_mode_off_gets_one_note(
 
     org, session, mia = tenant.org, tenant.ids["mine"], tenant.ids["mia"]
     preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
-    scope, token = await _run(coding, tenant)
-    assert await preparer.prepare(object(), scope, token) == ""  # type: ignore[arg-type]
+
+    async def note(scope: Any, token: str, **kwargs: Any) -> str:
+        return await preparer.prepare(object(), scope, token, **kwargs)  # type: ignore[arg-type]
+
+    # A run queued before the change, and two runs queued after it.
+    early, early_token = await _run(coding, tenant)
+    assert await note(early, early_token) == ""
     await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=True)
     await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=False)
-    scope, token = await _run(coding, tenant)
-    assert await preparer.prepare(object(), scope, token) == PLAN_OFF_NOTE  # type: ignore[arg-type]
-    # The same run again (a retry) still gets it; the next run does not.
-    assert await preparer.prepare(object(), scope, token) == PLAN_OFF_NOTE  # type: ignore[arg-type]
-    later, later_token = await _run(coding, tenant)
-    assert await preparer.prepare(object(), later, later_token) == ""  # type: ignore[arg-type]
-    # A harness run that the gate judged as a plan run gets no off note.
-    off, off_token = await _run(coding, tenant)
+    first, first_token = await _run(coding, tenant)
+    second, second_token = await _run(coding, tenant)
+    # The first run that prepares gets the note, even when it was queued earlier.
+    assert await note(early, early_token) == PLAN_OFF_NOTE
+    assert await note(second, second_token) == ""
+    assert await note(first, first_token) == ""
+    # A retry of the run that got it gets it again.
+    assert await note(early, early_token) == PLAN_OFF_NOTE
+
+    # A harness run that the gate judged as a plan run does not claim the note.
     await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=True)
     await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=False)
-    off, off_token = await _run(coding, tenant)
-    assert PLAN_OFF_NOTE not in await preparer.prepare(
-        object(),  # type: ignore[arg-type]
-        off,
-        off_token,
-        plan=False,
-        off_note=False,
+    planned, planned_token = await _run(coding, tenant)
+    assert PLAN_OFF_NOTE not in await note(planned, planned_token, plan=False, off_note=False)
+    after, after_token = await _run(coding, tenant)
+    assert await note(after, after_token) == PLAN_OFF_NOTE
+
+
+async def test_two_runs_that_prepare_at_once_give_one_note(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    import asyncio
+
+    from sama.coding_mode.prepare import PLAN_OFF_NOTE
+
+    org, session, mia = tenant.org, tenant.ids["mine"], tenant.ids["mia"]
+    preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=True)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=False)
+    runs = [await _run(coding, tenant) for _ in range(3)]
+    notes = await asyncio.gather(
+        *(preparer.prepare(object(), scope, token) for scope, token in runs)  # type: ignore[arg-type]
     )
+    assert notes.count(PLAN_OFF_NOTE) == 1
+
+
+async def test_a_compact_run_does_not_take_the_off_note(
+    coding: CodingService, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    from sqlalchemy import update
+
+    from sama.coding_mode.prepare import PLAN_OFF_NOTE
+    from sama.db.models import Run
+
+    org, session, mia = tenant.org, tenant.ids["mine"], tenant.ids["mia"]
+    preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=True)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=mia, on=False)
+    compact, compact_token = await _run(coding, tenant)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == uuid.UUID(compact.run_id)).values(compact=True)
+        )
+    assert await preparer.prepare(object(), compact, compact_token) == ""  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    assert await preparer.prepare(object(), scope, token) == PLAN_OFF_NOTE  # type: ignore[arg-type]
 
 
 async def test_an_approval_does_not_give_the_off_note(
