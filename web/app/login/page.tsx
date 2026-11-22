@@ -7,6 +7,7 @@ import { useAuth } from "@/components/AuthProvider";
 import { AuthStatusScreen } from "@/components/ui";
 import { errorText } from "@/lib/api";
 import { pendingInvite } from "@/lib/orgs";
+import { takeReturnTo } from "@/lib/returnTo";
 import styles from "./login.module.css";
 
 /** The codes of sign-in links that this page already used (a code works once). */
@@ -35,10 +36,12 @@ export default function LoginPage() {
   const checkedLink = useRef(false);
   const invited = useInvited();
 
-  // After sign-in, an invite link that the user opened before goes first.
+  // After sign-in, an invite link that the user opened before goes first, then the page that the
+  // user opened before the sign-in (for example a link from the chat, M8.1).
   useEffect(() => {
     if (status.kind !== "signed-in") return;
-    router.replace(pendingInvite(window.localStorage, Date.now()) ? "/invite" : "/");
+    if (pendingInvite(window.localStorage, Date.now())) router.replace("/invite");
+    else router.replace(takeReturnTo(window.localStorage) ?? "/");
   }, [status.kind, router]);
 
   // A sign-in link comes back here with `?code=`. Never use tokens from the URL fragment.

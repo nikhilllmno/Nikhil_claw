@@ -3,7 +3,7 @@
 // One chat session: history, live stream, approvals, questions, and the composer.
 
 import Link from "next/link";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   type Approval,
   errorText,
@@ -57,6 +57,8 @@ import { useData } from "./DataProvider";
 import { Markdown } from "./Markdown";
 import { QuestionCard } from "./QuestionCard";
 import { ToolGroup } from "./ToolGroup";
+import { ConnectCard } from "./ConnectCard";
+import { cardsOfCalls } from "@/lib/connectCard";
 import { ErrorState, LoadingState } from "./ui";
 import styles from "./Chat.module.css";
 
@@ -518,13 +520,15 @@ export function Chat({ sessionId }: { sessionId: string }) {
       const calls = live.tools[runId] ?? [];
       const subagents = live.subagents[runId] ?? [];
       if (calls.length === 0 && subagents.length === 0) return null;
+      // The Connect cards of `connection_request` (M8.1) go under the tool calls of the run.
+      const cards = cardsOfCalls(calls);
       return (
-        <ToolGroup
-          key={`tools-${runId}`}
-          calls={calls}
-          subagents={subagents}
-          runEnded={runHasEnded(live.runs[runId]?.status)}
-        />
+        <Fragment key={`tools-${runId}`}>
+          <ToolGroup calls={calls} subagents={subagents} runEnded={runHasEnded(live.runs[runId]?.status)} />
+          {cards.map((card, index) => (
+            <ConnectCard key={`connect-${runId}-${card.connectionId || index}`} card={card} />
+          ))}
+        </Fragment>
       );
     };
     for (const m of messages ?? []) {
