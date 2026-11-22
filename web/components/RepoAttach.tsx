@@ -29,6 +29,8 @@ export function RepoAttach({
   const [busy, setBusy] = useState(false);
   const [detaching, setDetaching] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The repo that the person attached last, until the list shows it.
+  const [attached, setAttached] = useState<RepoOut | null>(null);
   const full = repos.length >= MAX_REPOS;
 
   const attach = async (event: React.FormEvent) => {
@@ -37,11 +39,12 @@ export function RepoAttach({
     setBusy(true);
     setError(null);
     try {
-      await api.attachRepo(sessionId, {
+      const added = await api.attachRepo(sessionId, {
         repo: repo.trim(),
         ref: optionalText(ref),
         folder: optionalText(folder),
       });
+      setAttached(added);
       setRepo("");
       setRef("");
       setFolder("");
@@ -79,7 +82,12 @@ export function RepoAttach({
           {error}
         </p>
       ) : null}
-      {repos.length === 0 ? (
+      {attached !== null && !repos.some((r) => r.id === attached.id) ? (
+        <p className="alert alert-success" role="status">
+          Attached {attached.repo}. It clones into the sandbox when the next run starts.
+        </p>
+      ) : null}
+      {repos.length === 0 && attached === null ? (
         <p className="alert">No repo is attached yet.</p>
       ) : (
         <ul className={page.list} aria-label="Attached repos">
