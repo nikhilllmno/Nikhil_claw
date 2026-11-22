@@ -206,3 +206,94 @@
     padding: var(--space-2) var(--space-4);
   }
 }
+
+.workingLabel {
+  color: var(--text);
+}
+
+.workingMeta {
+  color: var(--text-subtle);
+  font-size: var(--text-xs);
+}
+
+.pausedDot {
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--warning);
+}
+
+.key {
+  padding: 0 var(--space-1);
+  border: var(--border-width) solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.empty {
+  gap: var(--space-3);
+}
+
+.starters {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.planDock {
+  max-height: 45vh;
+  overflow-y: auto;
+  border-radius: var(--radius-lg);
+}
+
+.todoDock {
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.menu {
+  position: relative;
+}
+
+.menu > summary {
+  list-style: none;
+}
+
+.menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.menuList {
+  position: absolute;
+  right: 0;
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 10rem;
+  margin-top: var(--space-1);
+  padding: var(--space-1);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+}
+
+.menuList > button {
+  justify-content: flex-start;
+}
+
+@media (max-width: 52rem) {
+  .headerActions {
+    flex-wrap: nowrap;
+  }
+
+  .tools {
+    flex-wrap: nowrap;
+  }
+}

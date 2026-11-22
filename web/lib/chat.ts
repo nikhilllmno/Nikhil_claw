@@ -24,6 +24,9 @@ export interface ToolCall {
   preview: string;
 }
 
+/** One part of the live reply of a run, in the order of the events: text or a tool call. */
+export type Segment = { kind: "text"; seq: number; text: string } | { kind: "tool"; seq: number; callId: string };
+
 export interface LiveState {
   /** The status of each run that the stream told about. */
   runs: Record<string, StreamRun>;
@@ -31,6 +34,10 @@ export interface LiveState {
   text: Record<string, string>;
   /** The tool calls of each run, in order. */
   tools: Record<string, ToolCall[]>;
+  /** The text and the tool calls of each open run, in the order of the events. */
+  segments: Record<string, Segment[]>;
+  /** The newest `run_phase` of each open run, for example `starting_sandbox`. */
+  phase: Record<string, string>;
   /** The `subagent_event` events of each run, in order. See `groupSubagents`. */
   subagents: Record<string, SubagentEvent[]>;
   /** Failure text of a run that ended in this view and failed. */
@@ -44,15 +51,29 @@ export interface LiveState {
 
 export type Effect = "reload_messages" | "reload_approvals" | "reload_questions";
 
-export const initialLive: LiveState = { runs: {}, text: {}, tools: {}, subagents: {}, failure: null, stopped: {} };
+export const initialLive: LiveState = {
+  runs: {},
+  text: {},
+  tools: {},
+  segments: {},
+  phase: {},
+  subagents: {},
+  failure: null,
+  stopped: {},
+};
 
-export function openRunIds(state: LiveState): string[] {
+function without<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in record)) return record;
+  return Object.fromEntries(Object.entries(record).filter(([id]) => id !== key));
+}
+
+export function openRunIds(state: Pick<LiveState, "runs">): string[] {
   return Object.values(state.runs)
     .filter((run) => OPEN_RUN_STATUSES.has(run.status))
     .map((run) => run.run_id);
 }
 
-export function isPaused(state: LiveState): boolean {
+export function isPaused(state: Pick<LiveState, "runs">): boolean {
   return Object.values(state.runs).some((run) => run.status === "paused");
 }
 
@@ -65,9 +86,14 @@ function failureText(run: StreamRun): string | null {
 
 /** Ends the live text of a run. The text of a stopped run moves to `stopped`. */
 function endRunText(state: LiveState, runId: string, stopped: boolean): LiveState {
-  const text = Object.fromEntries(Object.entries(state.text).filter(([id]) => id !== runId));
-  if (!stopped || state.stopped[runId] !== undefined) return { ...state, text };
-  return { ...state, text, stopped: { ...state.stopped, [runId]: state.text[runId] ?? "" } };
+  const ended = {
+    ...state,
+    text: without(state.text, runId),
+    segments: without(state.segments, runId),
+    phase: without(state.phase, runId),
+  };
+  if (!stopped || state.stopped[runId] !== undefined) return ended;
+  return { ...ended, stopped: { ...state.stopped, [runId]: state.text[runId] ?? "" } };
 }
 
 /** A run changed its status. `wasOpen`: this view showed the run as open before. */
@@ -122,10 +148,27 @@ export function applyStreamEvent(
       const known = state.runs[event.run_id];
       if (known !== undefined && !OPEN_RUN_STATUSES.has(known.status)) return { state, effects };
       const text = typeof payload.text === "string" ? payload.text : "";
+      if (!text) return { state, effects };
+      const parts = state.segments[event.run_id] ?? [];
+      const last = parts[parts.length - 1];
+      const segments =
+        last?.kind === "text"
+          ? [...parts.slice(0, -1), { ...last, text: last.text + text }]
+          : [...parts, { kind: "text" as const, seq: event.seq, text }];
       return {
-        state: { ...state, text: { ...state.text, [event.run_id]: (state.text[event.run_id] ?? "") + text } },
+        state: {
+          ...state,
+          text: { ...state.text, [event.run_id]: (state.text[event.run_id] ?? "") + text },
+          segments: { ...state.segments, [event.run_id]: segments },
+        },
         effects,
       };
+    }
+    case "run_phase": {
+      const phase = typeof payload.phase === "string" ? payload.phase : "";
+      const known = state.runs[event.run_id];
+      if (!phase || (known !== undefined && !OPEN_RUN_STATUSES.has(known.status))) return { state, effects };
+      return { state: { ...state, phase: { ...state.phase, [event.run_id]: phase } }, effects };
     }
     case "tool_call_started": {
       const call: ToolCall = {
@@ -136,9 +179,23 @@ export function applyStreamEvent(
         status: "running",
         preview: "",
       };
+      const known = state.tools[event.run_id] ?? [];
+      // A call can come twice: from the stored activity and from the stream.
+      if (known.some((c) => c.callId === call.callId)) return { state, effects };
       if (/clarify/i.test(call.name)) effects.push("reload_questions");
-      const tools = [...(state.tools[event.run_id] ?? []), call];
-      return { state: { ...state, tools: { ...state.tools, [event.run_id]: tools } }, effects };
+      const tools = [...known, call].sort((a, b) => a.seq - b.seq);
+      const run = state.runs[event.run_id];
+      const open = run === undefined || OPEN_RUN_STATUSES.has(run.status);
+      const segments = open
+        ? {
+            ...state.segments,
+            [event.run_id]: [
+              ...(state.segments[event.run_id] ?? []),
+              { kind: "tool" as const, seq: event.seq, callId: call.callId },
+            ],
+          }
+        : state.segments;
+      return { state: { ...state, tools: { ...state.tools, [event.run_id]: tools }, segments }, effects };
     }
     case "tool_call_finished": {
       const callId = String(payload.call_id ?? "");
@@ -177,6 +234,26 @@ export function applyStreamEvent(
     default:
       return { state, effects };
   }
+}
+
+/** The run events that `GET /sessions/{id}/activity` gives. */
+const ACTIVITY_TYPES = new Set(["tool_call_started", "tool_call_finished", "subagent_event"]);
+
+/**
+ * Adds the stored tool trail of the session (`GET /sessions/{id}/activity`) to the state, so
+ * that the chat shows the tool calls of runs that ended before the page opened. A call that the
+ * stream already gave stays once. The trail of an open run does not go into its live segments:
+ * the order against the live text is not known.
+ */
+export function applyActivity(state: LiveState, events: readonly RunEventPayload[]): LiveState {
+  let next = state;
+  for (const event of events) {
+    if (!ACTIVITY_TYPES.has(event.type)) continue;
+    const before = next.segments;
+    next = applyStreamEvent(next, "run_event", event).state;
+    if (next.segments !== before) next = { ...next, segments: before };
+  }
+  return next;
 }
 
 /** `/compact` or `/compact <focus>`: the focus text, or `null` if the text is not the command. */
@@ -331,3 +408,38 @@ export const STEERED_NOTICE = "sama adds the note to the current run. The run re
 /** The usage text of `/steer` and `/handoff`. */
 export const STEER_USAGE = "Write the note after the command, for example: /steer use metric units";
 export const HANDOFF_USAGE = "Write where the session goes: /handoff telegram or /handoff slack";
+
+const PHASE_LABELS: Record<string, string> = {
+  queued: "Waiting to start",
+  starting: "Starting",
+  starting_sandbox: "Starting the sandbox",
+  resuming_sandbox: "Waking the sandbox",
+  sandbox_ready: "Starting the agent",
+  cloning: "Cloning the repo",
+  preparing: "Preparing",
+  starting_runtime: "Starting the agent",
+  runtime_ready: "Thinking",
+  thinking: "Thinking",
+  model: "Thinking",
+  tool: "Using a tool",
+  compacting: "Shortening the context",
+};
+
+/**
+ * The text of the working line of an open run: the newest `run_phase`, else the run status.
+ * A run with text or tool calls is "Working".
+ */
+export function phaseLabel(status: string | undefined, phase: string | undefined, active: boolean): string {
+  if (status === "paused") return "Waiting for you";
+  if (phase && !active) return PHASE_LABELS[phase] ?? phase.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+  if (status === "queued") return "Waiting to start";
+  return active ? "Working" : "Starting";
+}
+
+/** Starter ideas of an empty session. Each fills the message box. */
+export const STARTERS: readonly { label: string; text: string }[] = [
+  { label: "Research a topic", text: "Search the web and summarise, with sources: " },
+  { label: "Plan a code change", text: "/plan " },
+  { label: "Ask Claude Code", text: "/claude " },
+  { label: "Ask Codex", text: "/codex " },
+];
