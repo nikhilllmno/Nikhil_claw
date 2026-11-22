@@ -558,6 +558,11 @@ when it dispatches the run.
 
 ### 4.4 Run start latency (M8.2)
 
+**Warm limits.** A warm is a guess, so it has limits that keep the sandbox capacity for real
+runs: at most 10 new warms of one org and 30 of the process in 60 seconds, at most 4 warms at
+the same time, and a short idle timeout (3 minutes) for a sandbox that a warm started. Above a
+limit the answer is `limited`, and the run starts the sandbox as before.
+
 The web chat must show an activity soon after the user sends a message, as Claude Code and
 Codex do (M8.2, Section 17.8). The targets are: the first visible activity in less than 3
 seconds, and the first token of a follow-up message in less than 5 seconds.
@@ -3825,7 +3830,7 @@ cross-org check of Section 17.1 through the API.
 | `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `402` with `detail` and `quota` when the org or the user used a model quota of the plan (Section 17.5). `409` for an archived session. |
-| `POST /sessions/{id}/warm` | Start or resume the session sandbox and the warm runner before a run (Section 4.4). It creates no run. `202` with `status` (`warming`, `recent`, or `off`). `429` with `Retry-After` after 30 requests of one user in 60 seconds. |
+| `POST /sessions/{id}/warm` | Start or resume the session sandbox and the warm runner before a run (Section 4.4). It creates no run. `202` with `status` (`warming`, `recent`, `limited`, or `off`). `limited`: the org started 10 warms, or the process 30 warms, in the last 60 seconds, or 4 warms run now; nothing starts. `429` with `Retry-After` after 30 requests of one user in 60 seconds. A sandbox that a warm started pauses after 3 minutes without a run. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |

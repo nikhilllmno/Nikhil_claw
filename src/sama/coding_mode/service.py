@@ -24,6 +24,7 @@ from typing import Any, Final
 from sqlalchemy import and_, delete, exists, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.db.engine import autocommit
 from sama.db.models import (
     MAX_PLAN_CHARS,
     MAX_PLAN_FEEDBACK_CHARS,
@@ -775,7 +776,7 @@ class CodingService:
             AuditEntry.target_id == str(session_id),
             AuditEntry.action.in_(("session.plan_mode", "plan.approved", PLAN_OFF_NOTED)),
         )
-        async with self._engine.connect() as connection:
+        async with autocommit(self._engine) as connection:
             row = (
                 await connection.execute(
                     select(

@@ -13,7 +13,12 @@ from typing import Any, cast
 import pytest
 
 import sama.orchestrator.sandboxed as sandboxed_module
-from sama.orchestrator.sandboxed import CAPABILITIES, SandboxedRuntime, SandboxSettings
+from sama.orchestrator.sandboxed import (
+    CAPABILITIES,
+    WARM_IDLE_S,
+    SandboxedRuntime,
+    SandboxSettings,
+)
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
@@ -38,7 +43,6 @@ from sama.runtime.contract import CompactRequest
 from sama.runtime.fake import FakeRuntime, FakeScript
 from sama.runtime.runner import RunnerJob
 from sama.sandbox import ExecResult, SandboxError, SandboxProcess, SandboxSpec
-from sama.sandbox.base import DEFAULT_IDLE_TIMEOUT_S
 from sama.sandbox.local import LocalProvider, LocalSandbox
 from sama.sandbox.process import SubprocessProcess
 from sama.tenancy import RunTokenSigner
@@ -1035,8 +1039,8 @@ async def test_a_warm_starts_the_session_sandbox_and_the_next_run_uses_it(
     assert await runtime.warm("org-1", "sess-1") == "ready"
     assert provider.creates == 1
     # The warm uses the idle timeout, and it sets the idle timeout back at the end.
-    assert provider.spec_timeouts == [DEFAULT_IDLE_TIMEOUT_S]
-    assert provider.keep_alives == [DEFAULT_IDLE_TIMEOUT_S]
+    assert provider.spec_timeouts == [WARM_IDLE_S], "a warm uses the short idle timeout"
+    assert provider.keep_alives == [WARM_IDLE_S]
     # The runner is not a warm runner here, so the warm starts no process.
     assert "exec" not in provider.calls
     runtime.fake_scripts.append(_reply("ok"))

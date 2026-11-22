@@ -3466,8 +3466,8 @@ class SamaApi:
     async def _warm(self, principal: Principal, session_id: uuid.UUID) -> JSONResponse:
         """``POST /sessions/{id}/warm`` (Section 4.4): starts or resumes the session sandbox and
         the warm runner in the background. It creates no run. It answers ``202`` at once with
-        the status ``warming``, ``recent``, or ``off``; ``429`` when the user asked too often;
-        ``404`` when the user cannot read the session."""
+        the status ``warming``, ``recent``, ``limited``, or ``off``; ``429`` when the user asked
+        too often; ``404`` when the user cannot read the session."""
         async with as_user(self._engine, principal.auth_user_id) as connection:
             access = await session_access(connection, principal, session_id)
         try:
