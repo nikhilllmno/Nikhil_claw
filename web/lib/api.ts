@@ -642,6 +642,8 @@ export interface RunsEvent {
 }
 
 export interface RunEventPayload {
+  /** The `run_events.id`: one order for all runs of the session. Not on every event. */
+  id?: number;
   run_id: string;
   seq: number;
   type: string;

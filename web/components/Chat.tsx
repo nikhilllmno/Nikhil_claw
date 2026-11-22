@@ -59,6 +59,7 @@ import { useApi } from "./AuthProvider";
 import { Composer } from "./Composer";
 import { useData } from "./DataProvider";
 import { useNow } from "./usePolled";
+import { escapeTarget } from "@/lib/approvalKeys";
 import { Markdown } from "./Markdown";
 import { QuestionCard } from "./QuestionCard";
 import { PlanCard } from "./PlanPanel";
@@ -229,8 +230,10 @@ export function Chat({ sessionId }: { sessionId: string }) {
           if (connected && connectedBefore) void loadApprovals();
           connectedBefore ||= connected;
         },
-        onEvent: (name, data) => {
-          const result = applyStreamEvent(liveRef.current, name, data);
+        onEvent: (name, data, id) => {
+          // The event id orders the calls of all runs (for the to-do list of the session).
+          const event = name === "run_event" && id !== null && data !== null && typeof data === "object" ? { ...data, id } : data;
+          const result = applyStreamEvent(liveRef.current, name, event);
           if (result.state !== liveRef.current) setLiveState(result.state);
           run(result.effects);
         },
@@ -296,7 +299,10 @@ export function Chat({ sessionId }: { sessionId: string }) {
     const text = submitted.trim();
     if (!text) return;
     // Only the text that was sent goes: what the user typed meanwhile stays.
-    const clearDraft = () => setDraft((current) => (current === submitted ? "" : current));
+    let optimistic = false;
+    const clearDraft = () => {
+      if (!optimistic) setDraft((current) => (current === submitted ? "" : current));
+    };
     const command = parseCommand(text);
     setSendError(null);
     setQuotaError(false);
@@ -427,6 +433,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
         // Show the message at once, as Claude Code does. The draft comes back if the send fails.
         setPending({ text, at: new Date().getTime() });
         setDraft((current) => (current === submitted ? "" : current));
+        // The box is clear now: what the person types while the send works must stay.
+        optimistic = true;
         stick.current = true;
         let answer: Awaited<ReturnType<typeof api.sendMessage>>;
         try {
@@ -635,7 +643,15 @@ export function Chat({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
-      if (document.querySelector("dialog[open], [aria-modal='true']")) return;
+      if (escapeTarget(event.target, scroller.current) !== "stop") {
+        // An open menu of the chat closes first.
+        const menu = document.querySelector<HTMLDetailsElement>("details[data-menu][open]");
+        if (menu) {
+          menu.open = false;
+          event.preventDefault();
+        }
+        return;
+      }
       stopRef.current();
     };
     window.addEventListener("keydown", onKey);
@@ -659,7 +675,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const org = me?.orgs.find((o) => o.id === detail.org_id) ?? null;
   const profile = org?.agent_profiles.find((p) => p.id === detail.agent_profile_id) ?? null;
   // The to-do list of the session (the sama `todo` tool keeps one list per session) while a run works.
-  const todos = runRows.length > 0 ? latestTodos(Object.values(live.tools).flat()) : null;
+  const todos =
+    runRows.length > 0 ? latestTodos(Object.values(live.tools).flat().sort((a, b) => a.order - b.order)) : null;
 
   return (
     <div className={styles.chat}>
@@ -903,10 +920,16 @@ function WorkingLine({ label, since, paused }: { label: string; since: number | 
     return () => clearInterval(timer);
   }, [paused]);
   return (
-    <p className={styles.working} role="status">
+    <p className={styles.working}>
       {paused ? <span className={styles.pausedDot} aria-hidden="true" /> : <span className="spinner" aria-hidden="true" />}
-      <span className={styles.workingLabel}>{label}…</span>
-      {since !== null && !paused ? <span className={styles.workingMeta}>{elapsedText(now - since)}</span> : null}
+      <span className={styles.workingLabel} role="status">
+        {label}…
+      </span>
+      {since !== null && !paused ? (
+        <span className={styles.workingMeta} aria-hidden="true">
+          {elapsedText(now - since)}
+        </span>
+      ) : null}
       {paused ? (
         <span className={styles.workingMeta}>Answer the card below</span>
       ) : (
@@ -977,7 +1000,7 @@ function SessionTools({ sessionId }: { sessionId: string }) {
       <Link href={`/s/${sessionId}/runs`} className="btn btn-quiet btn-small">
         Runs
       </Link>
-      <details className={styles.menu}>
+      <details className={styles.menu} data-menu="export">
         <summary className="btn btn-quiet btn-small" aria-label="Export the session">
           {busy !== null ? "Exporting…" : "Export"}
         </summary>

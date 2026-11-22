@@ -92,3 +92,23 @@ describe("phaseLabel", () => {
     expect(phaseLabel("running", undefined, false)).toBe("Starting");
   });
 });
+
+describe("finish before start", () => {
+  it("keeps a finish that comes before its start, in both orders", () => {
+    const start = { ...ev(3, "tool_call_started", { call_id: "c1", name: "Bash", arguments: { command: "ls" } }), id: 30 };
+    const finish = { ...ev(4, "tool_call_finished", { call_id: "c1", output_preview: "a.txt" }), id: 31 };
+    const late = applyActivity(apply(open, finish), [start]);
+    const normal = applyActivity(open, [start, finish]);
+    for (const state of [late, normal]) {
+      expect(state.tools.r1).toHaveLength(1);
+      expect(state.tools.r1?.[0]).toMatchObject({
+        name: "Bash",
+        status: "done",
+        preview: "a.txt",
+        order: 30,
+        arguments: { command: "ls" },
+      });
+      expect(state.tools.r1?.[0]?.placeholder).toBeFalsy();
+    }
+  });
+});

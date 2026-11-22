@@ -22,7 +22,14 @@ export interface ToolCall {
   /** `running` until the finish event arrives. */
   status: "running" | "done" | "error";
   preview: string;
+  /** The `run_events.id` of the start event: one order for the calls of all runs. */
+  order: number;
+  /** True while only the finish event is known (it came before the start). */
+  placeholder?: boolean;
 }
+
+/** The order of a call without an event id: after every stored event. */
+const NO_ORDER = Number.MAX_SAFE_INTEGER;
 
 /** One part of the live reply of a run, in the order of the events: text or a tool call. */
 export type Segment = { kind: "text"; seq: number; text: string } | { kind: "tool"; seq: number; callId: string };
@@ -178,10 +185,19 @@ export function applyStreamEvent(
         arguments: (payload.arguments as Record<string, unknown> | undefined) ?? {},
         status: "running",
         preview: "",
+        order: event.id ?? NO_ORDER,
       };
       const known = state.tools[event.run_id] ?? [];
       // A call can come twice: from the stored activity and from the stream.
-      if (known.some((c) => c.callId === call.callId)) return { state, effects };
+      const twin = known.find((c) => c.callId === call.callId);
+      if (twin !== undefined) {
+        if (!twin.placeholder) return { state, effects };
+        // The finish came first: keep its result, add the name and the input.
+        const filled = known.map((c) =>
+          c === twin ? { ...call, status: twin.status, preview: twin.preview, placeholder: false } : c,
+        );
+        return { state: { ...state, tools: { ...state.tools, [event.run_id]: filled } }, effects };
+      }
       if (/clarify/i.test(call.name)) effects.push("reload_questions");
       const tools = [...known, call].sort((a, b) => a.seq - b.seq);
       const run = state.runs[event.run_id];
@@ -199,13 +215,27 @@ export function applyStreamEvent(
     }
     case "tool_call_finished": {
       const callId = String(payload.call_id ?? "");
-      const tools = (state.tools[event.run_id] ?? []).map((call) =>
+      const status = payload.is_error === true ? ("error" as const) : ("done" as const);
+      const preview = typeof payload.output_preview === "string" ? payload.output_preview : "";
+      const known = state.tools[event.run_id] ?? [];
+      if (callId && !known.some((call) => call.callId === callId)) {
+        // The finish came before its start (the activity and the stream load at the same time).
+        const early: ToolCall = {
+          callId,
+          seq: event.seq - 1,
+          name: "tool",
+          arguments: {},
+          status,
+          preview,
+          order: event.id ?? NO_ORDER,
+          placeholder: true,
+        };
+        const tools = [...known, early].sort((a, b) => a.seq - b.seq);
+        return { state: { ...state, tools: { ...state.tools, [event.run_id]: tools } }, effects };
+      }
+      const tools = known.map((call) =>
         call.callId === callId
-          ? {
-              ...call,
-              status: payload.is_error === true ? ("error" as const) : ("done" as const),
-              preview: typeof payload.output_preview === "string" ? payload.output_preview : "",
-            }
+          ? { ...call, status, preview }
           : call,
       );
       if (tools.some((call) => call.callId === callId && /clarify/i.test(call.name))) {

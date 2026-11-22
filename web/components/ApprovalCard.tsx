@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useApi } from "./AuthProvider";
 import { type Approval, errorText } from "@/lib/api";
-import { approvalKey, type ApprovalAction } from "@/lib/approvalKeys";
+import { approvalKey, type ApprovalAction, behindModal } from "@/lib/approvalKeys";
 import { toolLabel, toolSubject } from "@/lib/toolView";
 import styles from "./Cards.module.css";
 
@@ -50,6 +50,7 @@ export function ApprovalCard({
       setBusy(null);
     }
   };
+  const card = useRef<HTMLElement>(null);
   const decideRef = useRef(decide);
   useEffect(() => {
     decideRef.current = decide;
@@ -59,7 +60,7 @@ export function ApprovalCard({
     if (!active) return;
     const onKey = (event: KeyboardEvent) => {
       const action = approvalKey(event, document.activeElement, !proposal);
-      if (action === null) return;
+      if (action === null || behindModal(card.current, document)) return;
       event.preventDefault();
       void decideRef.current(action);
     };
@@ -82,7 +83,7 @@ export function ApprovalCard({
   }
 
   return (
-    <section className={`card ${styles.card}`} aria-label={`Approval for ${approval.tool_name}`}>
+    <section ref={card} className={`card ${styles.card}`} aria-label={`Approval for ${approval.tool_name}`}>
       <div className={styles.ask}>
         <h2 className={styles.title}>
           {proposal ? "The agent proposes a change" : "Allow this step?"}

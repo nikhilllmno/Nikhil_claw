@@ -8457,7 +8457,14 @@ events come back (the newest). The payloads go through the redactor again, and e
 is cut after 2,000 characters. The read checks the access to the session as the event stream
 does (`404` for a session that the user cannot read). The chat reads it once when it opens, so
 the tool calls of runs that ended before the page opened show again. A call that the stream also
-gives shows once.
+gives shows once. A finish event that comes before its start event (the activity and the stream
+load at the same time) keeps its result. The partial index `ix_run_events_activity` (migration
+`0048`) on the tool events of a session keeps the read short on long sessions.
+
+**Keys.** Esc stops the open runs only when the focus is in the chat or in the message box. It
+first closes an open menu of the chat, and it does nothing behind a modal (for example the
+navigation drawer at a narrow width) or in another text field. The approval keys follow the same
+rules, and they do nothing while an input method composes text.
 
 
 ## 18. Observability and cost
