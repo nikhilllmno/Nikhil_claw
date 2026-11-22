@@ -13,12 +13,12 @@ const key = (k: string, extra: Partial<KeyboardEvent> = {}) => ({
 describe("approvalKey", () => {
   it("maps 1, 2, and 3", () => {
     expect(approvalKey(key("1"), null, true)).toBe("approve");
-    expect(approvalKey(key("2"), null, true)).toBe("always");
+    expect(approvalKey(key("2"), null, true)).toBe("session");
     expect(approvalKey(key("3"), null, true)).toBe("deny");
     expect(approvalKey(key("4"), null, true)).toBeNull();
   });
 
-  it("has no always for a proposal", () => {
+  it("has no session scope for a proposal", () => {
     expect(approvalKey(key("2"), null, false)).toBeNull();
   });
 
