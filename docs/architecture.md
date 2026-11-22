@@ -6618,6 +6618,18 @@ service checks the values with the rules of `repo_clone` (Section 15.1). A sessi
   repository clones, and it is read-only.
 - The row becomes `ready` (with the path, the commit, the branch, and `proxied`) or `failed`
   (with the reason). A failed clone does not stop the run.
+- A sandbox can be new after a pause, a crash, or a deploy, and then its work folder is empty.
+  So before each chat run the step checks the folder of each `ready` repository
+  (`test -e PATH`, at most 30 seconds). Exit status 1 (the folder is gone) sets the repository
+  back to `pending` (only when the row did not change since the check), and it clones again in
+  the same run; the note names it again. Any other result keeps the repository as it is. This
+  repairs a missing folder only, not an empty or damaged one.
+- A run claims each clone with a lease (`updated_at` moves 360 seconds ahead). While the lease
+  runs, no other run clones the same repository, also with parallel runs in one session; only
+  the claim holder stores `ready` or `failed`. After a crash, the lease ends and the next run
+  can claim it. When the crashed run left the folder behind, that clone fails with "PATH
+  exists", as for any used folder, and the person detaches the repository and attaches it with
+  another folder name. sama does not delete a folder by itself.
 - The step adds a note after the message of the run: the repositories that it cloned, their
   folders, and whether the agent can push them, or the reason of a failed clone. The stored
   message does not change. The instruction files of the repository are not in the note: the
@@ -6696,7 +6708,11 @@ of `Bash` (also the shell of the second runtime) and `execute_code`, newest firs
 command, the status (`running`, `ok`, or `failed`), and the end of the output. A command that
 runs tests (for example `pytest`, `npm test`, `go test`, `cargo test`, `make test`, or a test
 script in the place of a command: `sh test.sh`, `bash "scripts/run_tests.sh"`, `./test.sh`,
-`cd repo && ./test.sh`; a script name as an argument, as in `cat ./test.sh`, is not) has `test`
+`cd repo && ./test.sh`; a script name as an argument, as in `cat ./test.sh`, is not; nor is a
+command that only shows information (`pytest --version`, `npm test --help`) or installs a test
+tool (`pip install pytest`); each command and pipe stage is read alone, and `-h`/`-V` count
+as information only for pytest, so `ctest -V` and `mvn -V test` are test runs; a `|` in quotes
+does not split) has `test`
 true and the last result line of the output as `summary`. `?tests=true` lists only these.
 
 - The exit status of a pipe is the status of its last command, so `pytest | tail` ends with 0
@@ -6811,7 +6827,8 @@ in the direct mode (`sessions.coding_agent`) and for a one-off run (`runs.coding
 - The read-only command check of plan mode is strict and simple: no redirect, no substitution,
   no variable, no background job, only known read commands, and an allow list of the options
   of `git` (`status`, `log`, `diff`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `blame`,
-  `describe`, `shortlog`, `branch`, `remote`; also after `git -C DIR`). `cd DIR` with one plain
+  `describe`, `shortlog`, `branch`, `remote`; also after `git -C DIR`; read options such as
+  `--date=`, `--since=`, `--no-merges`, `--reverse`, `--follow` are allowed). `cd DIR` with one plain
   folder is allowed, so `cd repo && git log` works; the commands after it still pass the same
   check. Commands with an option that writes or runs a
   program (for example `sort -o`, `uniq IN OUT`, `git grep -O`, `find -exec`, `rg --pre`) are

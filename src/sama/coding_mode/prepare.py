@@ -30,6 +30,8 @@ from sama.tools.repos import RepoCloner, RepoError
 
 log: Final = logging.getLogger("sama.coding_mode.prepare")
 
+LOOK_TIMEOUT_S: Final = 30.0
+"""The longest time to check that the folder of a ready repository exists."""
 CLONE_STEP_TIMEOUT_S: Final = 330.0
 """The longest time for one clone with its checks. ``git clone`` itself stops after 300
 seconds (``sama.tools.repos.CLONE_TIMEOUT_S``)."""
@@ -104,12 +106,15 @@ class CodingPreparer:
                 return ""  # a background review or a /compact run has no coding step
             if plan is None:
                 plan = await self._coding.plan_mode(org_id=org_id, session_id=session_id)
+            lost = await self._lost(sandbox, org_id, session_id)
             pending = await self._coding.pending_repos(org_id=org_id, session_id=session_id)
         except Exception as error:
             log.warning("the coding step failed run=%s: %r", scope.run_id, error)
             return ""
         cloned: list[RepoView] = []
         failed: list[RepoView] = []
+        known = {repo.id for repo in pending}
+        pending += [repo for repo in lost if repo.id not in known]
         for repo in pending:
             done, problem = await self._clone(sandbox, scope, token, repo)
             if done is not None:
@@ -122,6 +127,36 @@ class CodingPreparer:
         elif off_note and await self._turned_off(scope):
             notes.append(PLAN_OFF_NOTE)
         return "\n\n".join(note for note in notes if note)
+
+    async def _lost(
+        self, sandbox: Sandbox, org_id: uuid.UUID, session_id: uuid.UUID
+    ) -> list[RepoView]:
+        """The ``ready`` repositories whose folder is not in the sandbox. A sandbox can be new
+        after a pause, a crash, or a deploy, and then the work folder is empty. Each such
+        repository goes back to ``pending``, so this run clones it again. A failed check keeps
+        the repository as it is."""
+        lost: list[RepoView] = []
+        for repo in await self._coding.ready_repos(org_id=org_id, session_id=session_id):
+            if not repo.path:
+                continue
+            try:
+                found = await sandbox.exec(["test", "-e", repo.path], timeout_s=LOOK_TIMEOUT_S)
+            except Exception as error:
+                log.warning("the folder of %s was not checked: %r", repo.repo, error)
+                continue
+            if found.exit_code != 1:
+                if found.exit_code != 0:
+                    log.warning(
+                        "the folder of %s was not checked: exit %s", repo.repo, found.exit_code
+                    )
+                continue  # present, or the check itself failed
+            reopened = await self._coding.reopen(
+                org_id=org_id, repo_id=repo.id, seen=repo.updated_at
+            )
+            if reopened is not None:
+                log.info("coding repo folder gone; cloning again repo=%s", repo.repo)
+                lost.append(reopened)
+        return lost
 
     async def _turned_off(self, scope: RunScope) -> bool:
         try:
@@ -140,6 +175,17 @@ class CodingPreparer:
         """Clones one repository and stores the result. Returns the ready repository, or the
         reason of a failure (None when the result could not be stored)."""
         org_id = uuid.UUID(scope.org_id)
+        try:
+            claim = await self._coding.claim(org_id=org_id, repo_id=repo.id)
+        except Exception as error:
+            log.warning(
+                "the clone was not claimed run=%s repo=%s: %r", scope.run_id, repo.repo, error
+            )
+            return None, None
+        if claim is None:
+            # Another run clones it now, or it changed. That run stores the result.
+            log.info("coding repo clone claimed by another run repo=%s", repo.repo)
+            return None, None
         try:
             async with asyncio.timeout(CLONE_STEP_TIMEOUT_S):
                 done = await self._cloner.clone(
@@ -169,6 +215,7 @@ class CodingPreparer:
                     commit=done.commit,
                     branch=done.branch,
                     proxied=done.proxied,
+                    claim=claim,
                 )
             except Exception as error:
                 log.warning("the clone result was not stored run=%s: %r", scope.run_id, error)
@@ -183,7 +230,9 @@ class CodingPreparer:
             )
             return ready, None
         try:
-            await self._coding.clone_failed(org_id=org_id, repo_id=repo.id, error=problem)
+            await self._coding.clone_failed(
+                org_id=org_id, repo_id=repo.id, error=problem, claim=claim
+            )
         except Exception as error:
             log.warning("the clone failure was not stored run=%s: %r", scope.run_id, error)
             return None, None

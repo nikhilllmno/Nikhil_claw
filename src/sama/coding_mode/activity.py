@@ -71,6 +71,15 @@ _SUMMARY: Final = re.compile(
     r"|tests?\s+(?:passed|failed)|ok\s+\S+\s+\d|FAIL\b|PASS\b|test result:).*$"
     r"|^\s*not ok\b.*$"
 )
+_INFO: Final = re.compile(r"(?:^|\s)(?:--version|--help)(?=$|\s)")
+"""``pytest --version`` and ``npm test --help`` only show information; they run no test."""
+_PYTEST: Final = re.compile(r"(?:^|[\s/])(?:pytest|py\.test)(?=$|\s)")
+_PYTEST_INFO: Final = re.compile(r"(?:^|\s)(?:-h|-V)(?=$|\s)")
+_INSTALL: Final = re.compile(
+    r"(?:^|[\s(])(?:python3?\s+-m\s+)?(?:pip3?|uv\s+pip|uv|npm|pnpm|yarn|bun|poetry|conda"
+    r"|apt(?:-get)?|brew|gem|cargo)\s+(?:install|add|i)\b"
+)
+"""``pip install pytest`` installs a test tool; it runs no test."""
 _PR_URL: Final = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
 
@@ -107,7 +116,52 @@ class PullRequestView:
 def is_test_command(command: str) -> bool:
     """True when the command runs the tests of a project, for example ``pytest`` or
     ``npm test``, or a test script such as ``sh test.sh``."""
-    return _TEST_COMMAND.search(command) is not None or _TEST_SCRIPT.search(command) is not None
+    return any(_test_stage(stage) for stage in _stages(command))
+
+
+def _stages(command: str) -> list[str]:
+    """Splits a shell line at ``&&``, ``||``, ``|``, ``;``, and new lines outside quotes, so
+    the options of ``grep`` in ``pytest | grep -h x`` do not count for pytest, and a ``|`` in
+    a quoted argument does not split."""
+    stages: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote:
+            current.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(command):
+                current.append(command[index + 1])
+                index += 1
+            elif char == quote:
+                quote = ""
+        elif char == "\\" and index + 1 < len(command):
+            current.append(char + command[index + 1])
+            index += 1
+        elif char in "'\"":
+            quote = char
+            current.append(char)
+        elif char in "|&;\n":
+            stages.append("".join(current))
+            current = []
+            if char in "|&" and command[index + 1 : index + 2] == char:
+                index += 1
+        else:
+            current.append(char)
+        index += 1
+    stages.append("".join(current))
+    return stages
+
+
+def _test_stage(stage: str) -> bool:
+    if not (_TEST_COMMAND.search(stage) or _TEST_SCRIPT.search(stage)):
+        return False
+    if _INSTALL.search(stage) or _INFO.search(stage):
+        return False
+    # ``-h`` and ``-V`` show the help or the version only for pytest; ``ctest -V`` and
+    # ``mvn -V test`` run tests.
+    return not (_PYTEST.search(stage) and _PYTEST_INFO.search(stage))
 
 
 def result_summary(output: str) -> str | None:

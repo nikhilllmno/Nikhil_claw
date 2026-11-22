@@ -157,6 +157,13 @@ _GIT_FLAGS: Final = frozenset(
         "--abbrev-ref",
         "--cached",
         "--decorate",
+        "--date-order",
+        "--first-parent",
+        "--follow",
+        "--no-merges",
+        "--merges",
+        "--reverse",
+        "--topo-order",
         "--graph",
         "--list",
         "--name-only",
@@ -176,6 +183,12 @@ _GIT_FLAGS: Final = frozenset(
     }
 )
 _GIT_VALUE_FLAGS: Final = (
+    "--date=",
+    "--before=",
+    "--after=",
+    "--committer=",
+    "--diff-filter=",
+    "--stat=",
     "--format=",
     "--pretty=",
     "--max-count=",
