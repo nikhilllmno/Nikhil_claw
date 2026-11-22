@@ -2153,6 +2153,23 @@ class SamaApi:
                 return _return_page(service, None, "web", str(error))
             return _return_page(service, view, via, None)
 
+        @app.get("/connections/go", include_in_schema=False)
+        async def connection_go(
+            connection: Annotated[uuid.UUID, Query()],
+            t: Annotated[str, Query(min_length=8, max_length=200)],
+        ) -> Response:
+            # The short link of a long sign-in link (M8.1): the token of the start is the proof.
+            service = self._require_connections()
+            try:
+                url = await service.sign_in_link(connection, t)
+            except ConnectorError as error:
+                return _return_page(service, None, "chat", str(error))
+            return RedirectResponse(
+                url,
+                status_code=302,
+                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+            )
+
         @app.get("/connections/oauth/return", include_in_schema=False)
         async def connection_oauth_return(
             state: Annotated[str, Query(min_length=3, max_length=500)],

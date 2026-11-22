@@ -2921,8 +2921,10 @@ could not see the end of a sign-in, so it said "tell me when you are done".
 - **Connect card.** The answer starts with one line `<sama-connect>{json}</sama-connect>` with
   the connector, the title, the link (`https` only), the connection id, the state, and the scope
   (`sama.connectors.chat`). The card is first and at most 900 characters, because the tool
-  output preview of a long answer keeps its start; a link longer than 300 characters is only in
-  the card. The web app shows it as a **Connect** button that follows the state
+  output preview of a long answer keeps its start. A provider link longer than 300 characters
+  goes through the short link `GET /connections/go?connection=<id>&t=<token>` of the control
+  plane, which checks the token and the open sign-in and sends the browser to the provider link
+  (`config.sign_in_url`). The web app shows it as a **Connect** button that follows the state
   of the connection. The Telegram gateway sends an inline URL button, and the Slack gateway
   sends a link button, after the text so far (`follow_run`, `send_connect`). WhatsApp and email
   show the link in the text of the agent. The model reads the same line, so both runtimes work
@@ -2937,7 +2939,10 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   claim of the row stay as in Section 10.3.1. A sign-in from the Connections page then goes back
   to that page (`303`). A sign-in from the chat shows a small page: "Gmail is connected. Go back
   to the chat." Before the token or the state is proven, both pages give the same short error
-  for every connection, so the pages tell nothing about a connection. Without
+  for every connection, so the pages tell nothing about a connection. The OAuth page checks the
+  state against the vault first (`McpDriver.state_matches`) and changes nothing before it
+  matches. Each start writes its return token into the row when it claims the row, so a late
+  failure of an older start does not change the row of a newer start. Without
   `SAMA_PUBLIC_URL`, the old web callbacks stay. A sign-in that is open
   when this change deploys keeps the redirect URI that it registered.
 - **Continue the request.** When a backend check sets `connected` on a row with an origin,

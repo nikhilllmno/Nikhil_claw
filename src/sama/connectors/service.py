@@ -43,7 +43,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from sama.connectors.api import TEST_METHODS, ApiDriver
-from sama.connectors.chat import card, link_text, origin_of
+from sama.connectors.chat import MAX_LINK_IN_TEXT, card, link_text, origin_of
 from sama.connectors.composio import (
     ACTIVE,
     EXPIRED_STATUSES,
@@ -122,6 +122,8 @@ RESUME_TTL: Final = timedelta(hours=2)
 session: the note would come too late to make sense."""
 POLL_LIMIT: Final = 50
 """The most open chat sign-ins that one poll checks."""
+GO_PATH: Final = "/connections/go"
+"""A short link of the control plane to a long sign-in link (M8.1)."""
 RETURN_PATH: Final = "/connections/return"
 """The page of the control plane where Composio sends the user after a sign-in (M8.1)."""
 OAUTH_RETURN_PATH: Final = "/connections/oauth/return"
@@ -521,19 +523,16 @@ class ConnectionService:
             )
         if problem := await self.availability(org_id, manifest):
             raise ConnectorError(problem, status_code=409)
+        token = secrets.token_urlsafe(24)
         try:
             row_id, old_account = await self._claim(
-                org_id, workspace_id, grants.user_id, manifest, scope, owner
+                org_id, workspace_id, grants.user_id, manifest, scope, owner, token
             )
         except IntegrityError:
             raise ConnectorError(
                 "another change of this connection is running. Try again", status_code=409
             ) from None
-        extra: dict[str, Any] = {
-            "via": via,
-            "by": str(grants.user_id),
-            "return_token": secrets.token_urlsafe(24),
-        }
+        extra: dict[str, Any] = {"via": via, "by": str(grants.user_id), "return_token": token}
         if origin:
             extra["origin"] = {**origin, "at": datetime.now(UTC).isoformat()}
         try:
@@ -567,7 +566,7 @@ class ConnectionService:
         current = await self.get(org_id, row_id)
         if current is None or current.state not in ("pending", "initiated"):
             return
-        if current.config.get("return_token") not in (None, token):
+        if current.config.get("return_token") != token:
             return
         await self._write(org_id, row_id, state="failed", error=text, expect=current)
 
@@ -608,7 +607,12 @@ class ConnectionService:
             )
         except ComposioError as error:
             raise ConnectorError(str(error), status_code=502) from None
-        config = {"account_id": link.account_id, "entity": entity, **extra}
+        config = {
+            "account_id": link.account_id,
+            "entity": entity,
+            **extra,
+            "sign_in_url": link.redirect_url,
+        }
         view = await self._set(org_id, row_id, state="initiated", error=None, config=config)
         if old_account and old_account != link.account_id:
             await self._forget_account(org_id, old_account)
@@ -664,9 +668,11 @@ class ConnectionService:
         manifest: Manifest,
         scope: Scope,
         owner: uuid.UUID | None,
+        token: str,
     ) -> tuple[uuid.UUID, str | None]:
         """The row of the connection (a new one if there is none), and its old Composio
-        account."""
+        account. The row takes the return token of this start at once, so a later failure of
+        an older start can see that a newer start owns the row (M8.1)."""
         async with self._engine.begin() as connection:
             row = await _find(connection, org_id, workspace_id, manifest.name, owner)
             old_account: str | None = None
@@ -682,6 +688,7 @@ class ConnectionService:
                             connector=manifest.name,
                             kind=manifest.kind,
                             created_by_user_id=actor,
+                            config={"return_token": token},
                         )
                         .returning(Connection.id)
                     )
@@ -697,6 +704,11 @@ class ConnectionService:
                 row_id = row.id
                 account = (row.config or {}).get("account_id")
                 old_account = account if isinstance(account, str) else None
+                await connection.execute(
+                    update(Connection)
+                    .where(Connection.org_id == org_id, Connection.id == row_id)
+                    .values(config={**stored, "return_token": token})
+                )
             await _audit(connection, org_id, actor, "connection.started", row_id, scope)
         return row_id, old_account
 
@@ -817,6 +829,24 @@ class ConnectionService:
                 run_id = await resumer.queue(connection, org_id, current, origin)
         return run_id, current, origin
 
+    async def sign_in_link(self, connection_id: uuid.UUID, token: str) -> str:
+        """The provider sign-in link of an open sign-in, for the short link
+        (``GET /connections/go``). The token of the start is the proof."""
+        found = await self._by_id(connection_id)
+        config = {} if found is None else found[1].config
+        expected = config.get("return_token")
+        url = config.get("sign_in_url")
+        if (
+            found is None
+            or not isinstance(expected, str)
+            or not hmac.compare_digest(expected.encode(), token.encode())
+            or found[1].state != "initiated"
+            or not isinstance(url, str)
+            or not url.startswith("https://")
+        ):
+            raise ConnectorError(INVALID_RETURN, status_code=403)
+        return url
+
     async def finish_return(
         self, connection_id: uuid.UUID, token: str
     ) -> tuple[ConnectionView, str]:
@@ -829,7 +859,7 @@ class ConnectionService:
         if (
             found is None
             or not isinstance(expected, str)
-            or not hmac.compare_digest(expected, token)
+            or not hmac.compare_digest(expected.encode(), token.encode())
         ):
             # One answer for an unknown connection and a wrong token: the page tells nothing.
             raise ConnectorError(INVALID_RETURN, status_code=403)
@@ -853,15 +883,13 @@ class ConnectionService:
         if found is None or actor is None:
             raise ConnectorError(INVALID_RETURN, status_code=400)
         org_id, view = found
-        try:
-            done = await self.finish_oauth(
-                org_id, view.id, state=state, code=code, error=error, actor=actor
-            )
-        except ConnectorError as problem:
-            if problem.status_code == 502:
-                raise  # The state matched: the provider refused the code.
-            # Before the state proof, the page says nothing about the connection.
-            raise ConnectorError(INVALID_RETURN, status_code=400) from None
+        # The proof first: before the state matches, the page says nothing about the connection
+        # and changes nothing.
+        if not await self._mcp.state_matches(org_id, view.id, state):
+            raise ConnectorError(INVALID_RETURN, status_code=400)
+        done = await self.finish_oauth(
+            org_id, view.id, state=state, code=code, error=error, actor=actor
+        )
         return done, _via(view)
 
     async def _by_id(self, connection_id: uuid.UUID) -> tuple[uuid.UUID, ConnectionView] | None:
@@ -1309,6 +1337,18 @@ class ConnectionService:
         view = started.connection
         title = manifest.title
         url = started.redirect_url
+        token = view.config.get("return_token")
+        if (
+            url is not None
+            and len(url) > MAX_LINK_IN_TEXT
+            and self.return_base is not None
+            and isinstance(token, str)
+        ):
+            # A long provider link goes through a short link of the control plane, so the card
+            # and the text stay short and the button always works (M8.1).
+            query = urlencode({"connection": str(view.id), "t": token})
+            url = f"{self.return_base}{GO_PATH}?{query}"
+            started = Started(view, url)
         if url is None and view.state == "pending" and manifest.fields:
             url = self.connect_link(view.workspace_id, manifest.name, scope)
         # The card goes first: the preview of a long answer keeps its start (M8.1).
@@ -2166,8 +2206,9 @@ class ConnectionService:
                 org_id, row_id, spec, redirect_uri=redirect, actor=actor
             )
         except McpError as error:
-            await self._set(org_id, row_id, state="failed", error=str(error), config=config)
+            # ``start`` sets ``failed`` only if this start still owns the row.
             raise ConnectorError(str(error), status_code=502) from None
+        config["sign_in_url"] = link
         view = await self._set(
             org_id, row_id, state="initiated", error=None, config=config, secret=True
         )

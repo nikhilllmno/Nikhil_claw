@@ -310,8 +310,12 @@ async def test_a_server_by_url_from_the_chat_signs_in_on_the_return_page(
     )
     [found] = cards(answer)
     assert found["title"] == "Tracker"
-    url = found["url"]
-    assert url is not None
+    short = found["url"]
+    assert short is not None
+    # A long OAuth link goes through the short link of the control plane.
+    assert short.startswith(f"{RETURN}/connections/go?")
+    token = parse_qs(urlsplit(short).query)["t"][0]
+    url = await service.sign_in_link(uuid.UUID(found["connection_id"]), token)
     query = parse_qs(urlsplit(url).query)
     assert query["redirect_uri"] == [f"{RETURN}/connections/oauth/return"]
     code, state = mcp.approve(url)
@@ -371,7 +375,13 @@ async def test_an_older_failed_start_does_not_fail_a_newer_one(
     await service._fail_start(
         org.ids["org"], started.connection.id, "boom", "token-of-an-older-attempt"
     )
-    assert (await row_of(engine, started.connection.id)).state == "initiated"
+    row = await row_of(engine, started.connection.id)
+    assert row.state == "initiated"
+    # The failure of the start that owns the row sets ``failed``.
+    await service._fail_start(
+        org.ids["org"], started.connection.id, "boom", row.config["return_token"]
+    )
+    assert (await row_of(engine, started.connection.id)).state == "failed"
 
 
 async def test_the_poll_rotates_through_open_sign_ins(
@@ -403,6 +413,9 @@ async def test_a_forged_return_says_nothing_about_the_connection(org: Org1, worl
         await service.finish_return(uuid.uuid4(), "x" * 20)
     with pytest.raises(ConnectorError) as wrong:
         await service.finish_return(uuid.UUID(connection_id), "x" * 20)
+    with pytest.raises(ConnectorError) as accented:
+        await service.finish_return(uuid.UUID(connection_id), "é" * 20)
+    assert str(accented.value) == str(wrong.value)
     assert (missing.value.status_code, str(missing.value)) == (
         wrong.value.status_code,
         str(wrong.value),
@@ -413,7 +426,7 @@ async def test_a_long_sign_in_link_keeps_its_card_in_the_runtime_preview(
     org: Org1, world: World
 ) -> None:
     service, fake, _, _ = world
-    long_link = "https://connect.composio.dev/link/" + "x" * 600
+    long_link = "https://connect.composio.dev/link/" + "x" * 1200
     original = fake.__call__
 
     def long(request: Any) -> Any:
@@ -428,4 +441,12 @@ async def test_a_long_sign_in_link_keeps_its_card_in_the_runtime_preview(
     answer = await service.request_for_agent(private(org), "gmail", None)
     preview = output_preview(answer + "\n" + "y" * 3000)
     [found] = cards(preview)
-    assert found["url"] == long_link
+    # The card has a short link of the control plane, which sends the browser on.
+    assert found["url"].startswith(f"{RETURN}/connections/go?connection=")
+    token = parse_qs(urlsplit(found["url"]).query)["t"][0]
+    connection_id = uuid.UUID(found["connection_id"])
+    assert await service.sign_in_link(connection_id, token) == long_link
+    with pytest.raises(ConnectorError):
+        await service.sign_in_link(connection_id, "wrong-token-here")
+    with pytest.raises(ConnectorError):
+        await service.sign_in_link(connection_id, "é" * 20)
