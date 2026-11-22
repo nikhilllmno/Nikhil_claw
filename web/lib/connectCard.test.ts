@@ -30,6 +30,12 @@ describe("connect cards", () => {
     expect(parseConnectCards("no card")).toEqual([]);
   });
 
+  it("reads a card inside JSON text blocks (the OpenAI runtime)", () => {
+    const inner = line({ connector: "gmail", title: "Gmail", url: "https://sama.test/connections/go?t=x" });
+    const wrapped = JSON.stringify({ type: "text", text: `${inner}\nThe sign-in is open.` });
+    expect(parseConnectCards(wrapped)[0]?.url).toBe("https://sama.test/connections/go?t=x");
+  });
+
   it("takes cards only from finished connect calls", () => {
     const preview = line({ connector: "gmail", title: "Gmail", url: "https://a.test/x" });
     expect(bareToolName("mcp__sama__connection_request")).toBe("connection_request");

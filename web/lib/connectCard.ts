@@ -30,16 +30,28 @@ export function safeLink(value: unknown): string | null {
   }
 }
 
+/**
+ * The JSON of a card. The OpenAI runtime gives the tool output as JSON text blocks
+ * (`{"type": "text", "text": "..."}`), so the quotes of the card can be escaped.
+ */
+function cardJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // An escaped card: decode it as the body of a JSON string first.
+  }
+  try {
+    return JSON.parse(JSON.parse(`"${raw}"`) as string);
+  } catch {
+    return null;
+  }
+}
+
 /** The cards in a tool answer, in order. */
 export function parseConnectCards(text: string): ConnectCardData[] {
   const out: ConnectCardData[] = [];
   for (const match of (text ?? "").matchAll(CARD)) {
-    let data: unknown;
-    try {
-      data = JSON.parse(match[1] ?? "");
-    } catch {
-      continue;
-    }
+    const data = cardJson(match[1] ?? "");
     if (typeof data !== "object" || data === null) continue;
     const raw = data as Record<string, unknown>;
     if (typeof raw.title !== "string" || typeof raw.connector !== "string") continue;

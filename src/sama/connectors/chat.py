@@ -65,14 +65,26 @@ def card(
     return f"<{CARD_TAG}>{text}</{CARD_TAG}>"
 
 
+def _card_json(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    try:
+        # An escaped card: decode it as the body of a JSON string first.
+        return json.loads(json.loads(f'"{raw}"'))
+    except ValueError:
+        return None
+
+
 def cards(text: str) -> list[dict[str, Any]]:
-    """The connect cards in a tool answer. A card without an ``https`` link has ``url: None``."""
+    """The connect cards in a tool answer, also when the answer is JSON text blocks. A card
+    without an ``https`` link has ``url: None``."""
     found: list[dict[str, Any]] = []
+    # The OpenAI runtime gives the tool output as JSON text blocks
+    # (``{"type": "text", "text": "..."}``), so the quotes of the card can be escaped.
     for match in CARD_PATTERN.finditer(text or ""):
-        try:
-            data = json.loads(match.group(1))
-        except ValueError:
-            continue
+        data = _card_json(match.group(1))
         if not isinstance(data, dict) or not isinstance(data.get("title"), str):
             continue
         url = data.get("url")

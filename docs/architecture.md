@@ -2928,7 +2928,8 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   of the connection. The Telegram gateway sends an inline URL button, and the Slack gateway
   sends a link button, after the text so far (`follow_run`, `send_connect`). WhatsApp and email
   show the link in the text of the agent. The model reads the same line, so both runtimes work
-  the same.
+  the same. The OpenAI runtime stores the tool output as JSON text blocks, so the readers also
+  take a card whose quotes are escaped.
 - **Return pages on the control plane.** The Composio callback is
   `<SAMA_PUBLIC_URL>/connections/return?connection=<id>&t=<token>`, and the OAuth redirect URI
   of a remote MCP server is `<SAMA_PUBLIC_URL>/connections/oauth/return`. Both need no sama

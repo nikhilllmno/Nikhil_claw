@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from sama.connectors.chat import card, cards, return_page, strip_cards
 from sama.connectors.manifest import Catalog, normalize_alias
 from sama.gateway.slack import connect_blocks
@@ -70,3 +72,19 @@ def test_the_slack_connect_card_is_a_link_button() -> None:
     assert button["url"] == "https://connect.composio.dev/l"
     assert button["text"]["text"] == "Connect Gmail"
     assert "value" not in button
+
+
+def test_a_card_in_json_text_blocks_is_found() -> None:
+    """The OpenAI runtime gives the tool output as JSON text blocks (M8.1, staging)."""
+    line = card(
+        connector="gmail",
+        title="Gmail",
+        url="https://sama.test/connections/go?connection=c&t=x",
+        connection_id="c",
+        state="initiated",
+        scope="personal",
+    )
+    wrapped = json.dumps({"type": "text", "text": f"{line}\nThe sign-in is open."})
+    [found] = cards(wrapped)
+    assert found["url"] == "https://sama.test/connections/go?connection=c&t=x"
+    assert found["title"] == "Gmail"
