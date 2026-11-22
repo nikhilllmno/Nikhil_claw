@@ -67,8 +67,8 @@ test("chat on the OpenAI runtime gets an answer", async ({ ownerPage: page, owne
   try {
     // An admin switches the runtime on the agent page.
     await page.goto(`/agents/${world.org.profileId}`);
-    await page.getByLabel("Runtime").selectOption("openai_agents_sdk");
-    const model = page.getByLabel("Model");
+    await page.getByRole("combobox", { name: "Runtime", exact: true }).selectOption("openai_agents_sdk");
+    const model = page.getByRole("combobox", { name: "Model", exact: true });
     const options = await model.locator("option").evaluateAll((nodes) =>
       nodes.map((node) => (node as HTMLOptionElement).value),
     );

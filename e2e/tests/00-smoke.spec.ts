@@ -55,6 +55,6 @@ test("each page of the shell opens", async ({ ownerPage: page }) => {
 test("the agent page shows the settings of the agent", async ({ ownerPage: page, world }) => {
   await page.goto(`/agents/${world.org.profileId}`);
   await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
-  await expect(page.getByLabel("Runtime")).toBeVisible();
-  await expect(page.getByLabel("Model")).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Runtime", exact: true })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Model", exact: true })).toBeVisible();
 });

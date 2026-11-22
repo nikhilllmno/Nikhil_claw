@@ -1,4 +1,4 @@
-// M7.10: the settings console. Each section opens. A webhook goes through create, a signed
+// M7.10: the settings console. Each of its 14 sections opens (API keys since PR 90). A webhook goes through create, a signed
 // test, an edit, and a delete. The harness changes the reasoning effort of the agent.
 
 import { expect, test } from "../fixtures.ts";
@@ -8,6 +8,7 @@ const SECTIONS: [string, string][] = [
   ["setup", "Setup"],
   ["slack", "Slack"],
   ["roles", "Roles"],
+  ["api-keys", "API keys"],
   ["harness", "Harness"],
   ["tools", "Tools"],
   ["subagents", "Sub-agents"],
@@ -20,7 +21,7 @@ const SECTIONS: [string, string][] = [
   ["sessions", "Sessions"],
 ];
 
-test("each of the 13 console sections opens", async ({ ownerPage: page }) => {
+test("each console section opens", async ({ ownerPage: page }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/console/setup");
@@ -69,8 +70,13 @@ test("make a webhook, send a signed test, edit it, and delete it", async ({
     await edit.getByRole("textbox", { name: /^Prompt/ }).fill("Reply with the word EDITED.");
     await edit.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByText("Reply with the word EDITED.")).toBeVisible();
-    const rows = await ownerApi.get<{ name: string; prompt: string }[]>(triggers);
-    expect(rows.find((t) => t.name === name)?.prompt).toBe("Reply with the word EDITED.");
+    // The save is a request after the click, so read the API until it has the new prompt.
+    await expect
+      .poll(async () => {
+        const rows = await ownerApi.get<{ name: string; prompt: string }[]>(triggers);
+        return rows.find((t) => t.name === name)?.prompt;
+      })
+      .toBe("Reply with the word EDITED.");
 
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Delete", exact: true }).click();

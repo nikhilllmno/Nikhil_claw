@@ -8772,7 +8772,10 @@ for tests.
     mail goes anywhere.
   - One org `e2e-<run>-main` that the owner makes with self-serve sign-up (Section 17.2). It
     is on the free plan, so the plan caps (2 runs at the same time, 10 messages a minute)
-    also apply to the suite. One worker runs the tests in order.
+    also apply to the suite. One worker runs the tests in order (at most 2). Each chat session
+    keeps its E2B sandbox for 15 minutes after its last run, and the E2B account allows 20
+    sandboxes at one time, so the sandbox-heavy files (code, coding agents, coding mode,
+    script tools, hosted MCP servers) run one at a time in their own project.
   - The global teardown deletes each test org with `DELETE /orgs/{org_id}` (all its rows go,
     Section 17.4), and then the users. It tries an org delete up to 5 times when the API
     answers `409` (runs of the org still stop) or a server error. When an org does not go, its
