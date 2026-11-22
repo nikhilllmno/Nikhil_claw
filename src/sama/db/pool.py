@@ -214,17 +214,19 @@ class TimedQueuePool(AsyncAdaptedQueuePool):
 
 def describe(pool: Any) -> str:
     """One line with the state of the pool. It has numbers only, no host and no secret."""
-    stats = getattr(pool, "stats", None)
+    if not isinstance(pool, TimedQueuePool):
+        # A pool of another kind (for example ``NullPool`` in tests) has no size to show.
+        return f"pool kind={type(pool).__name__}"
+    stats = pool.stats
     line = (
         f"pool size={pool.size()} in_use={pool.checkedout()} idle={pool.checkedin()}"
         f" overflow={max(0, pool.overflow())}"
     )
-    if stats is not None:
-        line += (
-            f" checkouts={stats.checkouts} slow={stats.slow} connects={stats.connects}"
-            f" wait_max_ms={stats.wait_max_s * 1000:.0f}"
-            f" wait_avg_ms={_average(stats.wait_total_s, stats.checkouts) * 1000:.1f}"
-        )
+    line += (
+        f" checkouts={stats.checkouts} slow={stats.slow} connects={stats.connects}"
+        f" wait_max_ms={stats.wait_max_s * 1000:.0f}"
+        f" wait_avg_ms={_average(stats.wait_total_s, stats.checkouts) * 1000:.1f}"
+    )
     return line
 
 

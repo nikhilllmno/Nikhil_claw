@@ -245,3 +245,14 @@ def test_the_environment_default_is_used_without_settings(monkeypatch: pytest.Mo
     assert isinstance(engine, AsyncEngine)
     assert engine.sync_engine.pool.size() == 7  # type: ignore[attr-defined]
     assert os.environ["SAMA_DB_POOL_SIZE"] == "7"
+
+
+async def test_describe_and_prewarm_accept_a_pool_without_stats(url: str) -> None:
+    from sqlalchemy.pool import NullPool
+
+    engine = create_engine(url, poolclass=NullPool)
+    try:
+        assert describe(engine.sync_engine.pool) == "pool kind=NullPool"
+        assert await prewarm(engine, 1) == 1
+    finally:
+        await engine.dispose()
