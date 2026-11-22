@@ -391,6 +391,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
       if (command?.kind === "coding") {
         // The direct mode of the session (M7.2).
         const answer = await api.codingAgent(sessionId, command.agent);
+        // The harness menu shows the new mode too.
+        setDetail((current) => (current === null ? current : { ...current, coding_agent: command.agent }));
         clearDraft();
         setNotice(answer.text);
         return;

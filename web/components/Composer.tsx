@@ -125,6 +125,10 @@ export function Composer({
     if (trigger === null) return;
     const next = applyChoice(value, Math.min(caret, value.length), trigger.start, item.insert);
     setActive(0);
+    // A complete choice (for example `/undo`) still matches the trigger: close the menu, so
+    // that the next Enter sends the text.
+    const after = triggerAt(next.text, next.caret);
+    setDismissed(after ? `${after.kind}:${after.start}` : null);
     setText(next.text, next.caret);
   };
 
@@ -243,9 +247,14 @@ export function Composer({
           aria-controls={open ? listId : undefined}
           aria-activedescendant={open ? optionId(current) : undefined}
           onChange={(event) => {
-            onChange(event.target.value);
-            setCaret(event.target.selectionStart ?? event.target.value.length);
+            const text = event.target.value;
+            const at = event.target.selectionStart ?? text.length;
+            onChange(text);
+            setCaret(at);
             setActive(0);
+            // A closed menu opens again for a new token.
+            const found = triggerAt(text, at);
+            if (found === null || `${found.kind}:${found.start}` !== dismissed) setDismissed(null);
             if (historyState.index !== null) setHistoryState(historyStart);
           }}
           onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? 0)}
