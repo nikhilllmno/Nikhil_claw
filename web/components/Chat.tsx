@@ -8,6 +8,7 @@ import {
   type Approval,
   errorText,
   type ChatMessage,
+  type CodingAgentName,
   type ClarifyRequest,
   type ExportFormat,
   type PlanOut,
@@ -52,6 +53,7 @@ import {
 } from "@/lib/coding";
 import { saveFile } from "@/lib/history";
 import { elapsedText, latestTodos } from "@/lib/toolView";
+import { commandItems, filesOfCalls, historyEntries, mentionItems } from "@/lib/commands";
 import { runEventStream } from "@/lib/stream";
 import { runHasEnded } from "@/lib/subagentProgress";
 import { ApprovalCard } from "./ApprovalCard";
@@ -75,7 +77,7 @@ const NOTE_POLL_MS = 2_000;
 
 export function Chat({ sessionId }: { sessionId: string }) {
   const api = useApi();
-  const { me, setWorkspaceId, reloadSessions } = useData();
+  const { me, setWorkspaceId, reloadSessions, sessions } = useData();
   const now = useNow();
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -167,6 +169,41 @@ export function Chat({ sessionId }: { sessionId: string }) {
       // The tool trail is a help. The messages show without it.
     }
   }, [api, sessionId, setLiveState]);
+
+  // The skills of the workspace, for the `/` menu of the message box.
+  const [skills, setSkills] = useState<{ name: string; description: string }[]>([]);
+  const workspaceOfSession = detail?.workspace_id ?? null;
+  useEffect(() => {
+    if (workspaceOfSession === null) return;
+    let live = true;
+    api
+      .listSkills(workspaceOfSession)
+      .then((catalog) => {
+        if (live) setSkills(catalog.skills.map((s) => ({ name: s.name, description: s.description })));
+      })
+      .catch(() => {
+        // The menu shows the commands without the skills.
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, workspaceOfSession]);
+
+  // The direct mode of the session (M7.2): sama, Claude Code, or Codex.
+  const [harnessBusy, setHarnessBusy] = useState(false);
+  const changeHarness = async (agent: CodingAgentName | null) => {
+    setHarnessBusy(true);
+    setSendError(null);
+    try {
+      const answer = await api.codingAgent(sessionId, agent);
+      setDetail((current) => (current === null ? current : { ...current, coding_agent: agent }));
+      setNotice(answer.text);
+    } catch (e) {
+      setSendError(errorText(e, "The harness did not change."));
+    } finally {
+      setHarnessBusy(false);
+    }
+  };
 
   const loadPlan = useCallback(async () => {
     try {
@@ -354,6 +391,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
       if (command?.kind === "coding") {
         // The direct mode of the session (M7.2).
         const answer = await api.codingAgent(sessionId, command.agent);
+        // The harness menu shows the new mode too.
+        setDetail((current) => (current === null ? current : { ...current, coding_agent: command.agent }));
         clearDraft();
         setNotice(answer.text);
         return;
@@ -666,6 +705,20 @@ export function Chat({ sessionId }: { sessionId: string }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  const commandMenu = useMemo(() => commandItems(skills), [skills]);
+  const mentionMenu = useMemo(
+    () =>
+      mentionItems(
+        filesOfCalls(Object.values(live.tools).flat()),
+        (sessions ?? []).filter((s) => s.id !== sessionId).slice(0, 6).map((s) => ({ id: s.id, title: sessionTitle(s) })),
+      ),
+    [live.tools, sessions, sessionId],
+  );
+  const history = useMemo(
+    () => historyEntries((messages ?? []).filter((m) => m.role === "user").map((m) => m.text)),
+    [messages],
+  );
+
   if (loadError) {
     return (
       <ErrorState
@@ -914,6 +967,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
           stopping={stoppingNow}
           onStop={() => void stop()}
           stopLabel={openRuns.length > 1 ? "Stop all" : "Stop"}
+          commands={commandMenu}
+          mentions={mentionMenu}
+          history={history}
+          harness={{ current: detail.coding_agent ?? null, onChange: (agent) => void changeHarness(agent), busy: harnessBusy }}
+          model={profile?.model ?? null}
         />
       </div>
     </div>

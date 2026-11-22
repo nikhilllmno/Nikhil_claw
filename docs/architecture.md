@@ -8576,6 +8576,26 @@ its own pull request.
 - The header has Code, Runs, and one Export menu (Markdown or JSON), so that it fits on one line
   at a width of 390 px.
 
+**Message box (part B).**
+
+- `/` at the start of the text opens a menu of the commands (`/plan`, `/bg`, `/stop`, `/steer`,
+  `/claude`, `/codex`, `/sama`, `/compact`, `/undo`, `/rollback`, `/handoff`) and of the skills
+  of the workspace (`GET /workspaces/{id}/skills`, Section 9.5). A skill with the name of a
+  command does not show.
+- `@` at the start of the text or after a space opens a menu of the files that the agent used in
+  this session (from the tool calls, as `@file:` paths in the work folder), six recent sessions
+  (`@session:`), and the forms `@file:` and `@url:` (Section 6.4). The menu shows only safe
+  `@file:` paths: no `..`, no absolute path outside the work folder, no spaces.
+- In a menu, the arrow keys move, Enter or Tab inserts the item, and Esc closes the menu. That
+  Esc does not stop a run.
+- The up arrow on the first line of the text brings back the earlier messages of the person in
+  the session, newest first. The down arrow on the last line goes forward, and then back to the
+  draft. A recalled text does not open a menu.
+- The harness menu under the text sends the session to sama, Claude Code, or Codex (the direct
+  mode of Section 15.4, `POST /sessions/{id}/coding-agent`). The model of the agent shows next
+  to it.
+- One line of help shows the keys. At a width of 390 px it does not show.
+
 **Tool trail of earlier runs.** `GET /sessions/{id}/activity` gives the stored
 `tool_call_started`, `tool_call_finished`, and `subagent_event` events of the newest 50 chat runs
 of a session, oldest first, in the shape of a `run_event` of the event stream:
