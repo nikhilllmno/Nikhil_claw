@@ -1,0 +1,172 @@
+"""Warms the session sandbox before a run (docs/architecture.md, Section 4.4).
+
+``SessionWarmer.request`` starts ``warm`` (``SandboxedRuntime.warm``) for one session in the
+background and returns at once. The API calls it when a user creates a session
+(``POST /sessions``) and when the web app asks for it (``POST /sessions/{id}/warm``, for
+example when the user starts to type). A warm creates no run, issues no run token, and puts no
+secret in the sandbox.
+
+Limits, all in the memory of this process:
+
+- one warm at a time for each session, and no new warm for ``min_interval_s`` after the
+  start of the last one (the answer is ``recent``),
+- at most ``per_user`` warm requests of one user in ``window_s`` (``WarmRateLimitedError``),
+- at most ``per_org`` new warms of one org and ``total`` new warms of the process in
+  ``window_s``, and at most ``max_running`` warms at the same time. Above a limit the answer is
+  ``limited`` and nothing starts: a warm is a guess, and the capacity stays for real runs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import time
+from collections import deque
+from collections.abc import Awaitable, Callable
+from enum import StrEnum
+from typing import Final
+
+log: Final = logging.getLogger("sama.orchestrator")
+
+WarmFunction = Callable[[str, str], Awaitable[str]]
+"""Warms the sandbox of ``(org_id, session_id)`` and returns a short result. It must not
+raise."""
+
+MIN_INTERVAL_S: Final = 60.0
+PER_USER: Final = 30
+PER_ORG: Final = 10
+TOTAL: Final = 30
+MAX_RUNNING: Final = 4
+WINDOW_S: Final = 60.0
+_MEMORY: Final = 10_000
+
+
+class WarmStatus(StrEnum):
+    WARMING = "warming"
+    """A warm of the session started now."""
+    RECENT = "recent"
+    """A warm of the session runs now, or started less than ``min_interval_s`` ago."""
+    OFF = "off"
+    """This process has no session sandbox to warm."""
+    LIMITED = "limited"
+    """The org or the process started enough warms now. Nothing started."""
+
+
+class WarmRateLimitedError(Exception):
+    def __init__(self, retry_after_s: int) -> None:
+        super().__init__("too many warm requests. Try again later.")
+        self.retry_after_s = retry_after_s
+
+
+class SessionWarmer:
+    def __init__(
+        self,
+        warm: WarmFunction,
+        *,
+        min_interval_s: float = MIN_INTERVAL_S,
+        per_user: int = PER_USER,
+        per_org: int = PER_ORG,
+        total: int = TOTAL,
+        max_running: int = MAX_RUNNING,
+        window_s: float = WINDOW_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._warm = warm
+        self._min_interval_s = min_interval_s
+        self._per_user = per_user
+        self._per_org = per_org
+        self._total = total
+        self._max_running = max_running
+        self._orgs: dict[str, deque[float]] = {}
+        self._all: deque[float] = deque()
+        self._window_s = window_s
+        self._clock = clock
+        self._started: dict[tuple[str, str], float] = {}
+        self._running: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._users: dict[str, deque[float]] = {}
+
+    def request(self, org_id: str, session_id: str, user_id: str) -> WarmStatus:
+        """Starts a warm of the session in the background, unless one is recent. Raises
+        ``WarmRateLimitedError`` when the user asked too often."""
+        now = self._clock()
+        self._limit(user_id, now)
+        key = (org_id, session_id)
+        last = self._started.get(key)
+        if key in self._running or (last is not None and now - last < self._min_interval_s):
+            return WarmStatus.RECENT
+        if not self._admit(org_id, now):
+            return WarmStatus.LIMITED
+        self._started.pop(key, None)
+        self._started[key] = now
+        while len(self._started) > _MEMORY:
+            del self._started[next(iter(self._started))]
+        task = asyncio.create_task(self._run(key))
+        self._running[key] = task
+        return WarmStatus.WARMING
+
+    def _admit(self, org_id: str, now: float) -> bool:
+        """True when the org and the process may start one more warm now. Counts it."""
+        times = self._orgs.setdefault(org_id, deque())
+        for queue in (times, self._all):
+            while queue and now - queue[0] >= self._window_s:
+                queue.popleft()
+        if (
+            len(self._running) >= self._max_running
+            or len(times) >= self._per_org
+            or len(self._all) >= self._total
+        ):
+            return False
+        times.append(now)
+        self._all.append(now)
+        if len(self._orgs) > _MEMORY:
+            idle = [o for o, t in self._orgs.items() if not t or now - t[-1] >= self._window_s]
+            for org in idle:
+                del self._orgs[org]
+        return True
+
+    def _limit(self, user_id: str, now: float) -> None:
+        times = self._users.setdefault(user_id, deque())
+        while times and now - times[0] >= self._window_s:
+            times.popleft()
+        if len(times) >= self._per_user:
+            left = self._window_s - (now - times[0]) if times else self._window_s
+            raise WarmRateLimitedError(max(1, math.ceil(left)))
+        times.append(now)
+        if len(self._users) > _MEMORY:
+            idle = [u for u, t in self._users.items() if not t or now - t[-1] >= self._window_s]
+            for user in idle:
+                del self._users[user]
+
+    async def _run(self, key: tuple[str, str]) -> None:
+        try:
+            result = await self._warm(*key)
+            log.info("session warm org=%s session=%s result=%s", key[0], key[1], result)
+        except Exception:
+            log.exception("the session warm failed org=%s session=%s", key[0], key[1])
+        finally:
+            self._running.pop(key, None)
+
+    async def wait_idle(self) -> None:
+        """Waits for the running warms. For a shutdown and for tests."""
+        while running := list(self._running.values()):
+            await asyncio.wait(running)
+
+    async def aclose(self) -> None:
+        """Cancels the running warms."""
+        for task in list(self._running.values()):
+            task.cancel()
+        await asyncio.gather(*self._running.values(), return_exceptions=True)
+
+
+__all__ = [
+    "MAX_RUNNING",
+    "MIN_INTERVAL_S",
+    "PER_ORG",
+    "PER_USER",
+    "TOTAL",
+    "WINDOW_S",
+    "SessionWarmer",
+    "WarmRateLimitedError",
+    "WarmStatus",
+]

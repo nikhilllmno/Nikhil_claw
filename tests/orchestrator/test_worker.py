@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import uuid
@@ -18,6 +19,7 @@ from sama.db.models import AgentProfile, Approval, Message, Run, RunEvent, ToolP
 from sama.gate.service import GateService
 from sama.orchestrator import worker as worker_module
 from sama.orchestrator.queue import RunQueue
+from sama.orchestrator.signals import SessionSignals
 from sama.orchestrator.worker import MAX_FAILURE_CHARS, Worker
 from sama.runtime.contract import (
     ApprovalDecision,
@@ -26,6 +28,8 @@ from sama.runtime.contract import (
     ResumeRequest,
     RunCompleted,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RuntimeRegistry,
     SubagentEvent,
@@ -117,8 +121,9 @@ async def test_a_run_streams_events_and_stores_the_reply(harness: Harness, tenan
     row = await harness.run(run_id)
     assert (row.status, row.usage["output_tokens"]) == ("completed", 3)
     events = await harness.events(run_id)
-    assert [seq for seq, _ in events] == list(range(4))
-    assert [kind for _, kind in events] == ["text_delta"] * 3 + ["run_completed"]
+    assert [seq for seq, _ in events] == list(range(5))
+    # The first event is the phase "starting" (Section 4.4).
+    assert [kind for _, kind in events] == ["run_phase"] + ["text_delta"] * 3 + ["run_completed"]
     async with harness.engine.connect() as connection:
         reply = (
             await connection.execute(
@@ -190,7 +195,14 @@ async def test_an_approval_pauses_and_resumes_the_run(
     assert resume.decision is expected
     row = await harness.run(run_id)
     assert (row.status, row.pending_approval_id) == ("completed", None)
-    assert [seq for seq, _ in await harness.events(run_id)] == [0, 1, 2]
+    # The run and the resume each start with the phase "starting".
+    assert await harness.events(run_id) == [
+        (0, "run_phase"),
+        (1, "text_delta"),
+        (2, "approval_required"),
+        (3, "run_phase"),
+        (4, "run_completed"),
+    ]
     assert harness.ended == [(str(tenant.org), str(run_id))]
     assert await harness.worker.run_once()
     assert harness.runtime.requests[2].input == "next"  # type: ignore[union-attr]
@@ -505,14 +517,15 @@ async def test_a_tool_of_the_process_adds_events_to_a_running_run(
     assert await harness.worker.run_once()
     assert runtime.emitted == [True]
     assert await harness.events(run_id) == [
-        (0, "text_delta"),
-        (1, "subagent_event"),
-        (2, "run_completed"),
+        (0, "run_phase"),
+        (1, "text_delta"),
+        (2, "subagent_event"),
+        (3, "run_completed"),
     ]
     async with engine.connect() as connection:
         payload = (
             await connection.execute(
-                select(RunEvent.payload).where(RunEvent.run_id == run_id, RunEvent.seq == 1)
+                select(RunEvent.payload).where(RunEvent.run_id == run_id, RunEvent.seq == 2)
             )
         ).scalar_one()
     assert (payload["subagent"], payload["text"]) == ("browser_task", "step 1/15: open a")
@@ -520,7 +533,72 @@ async def test_a_tool_of_the_process_adds_events_to_a_running_run(
     late = SubagentEvent(subagent="browser_task", text="late")
     assert not await harness.worker.emit(str(tenant.org), str(run_id), late)
     assert await harness.events(run_id) == [
-        (0, "text_delta"),
-        (1, "subagent_event"),
-        (2, "run_completed"),
+        (0, "run_phase"),
+        (1, "text_delta"),
+        (2, "subagent_event"),
+        (3, "run_completed"),
     ]
+
+
+# -- run phases and session signals (Section 4.4) ----------------------------------------------
+
+
+def _phase_script() -> FakeScript:
+    return FakeScript(
+        events=(
+            RunPhase(phase=RunPhaseName.THINKING),
+            TextDelta(text="hi", usage=Usage(output_tokens=1)),
+            RunPhase(phase=RunPhaseName.THINKING),  # zero usage after a usage of 1
+            RunCompleted(output="hi", usage=Usage(output_tokens=2)),
+        )
+    )
+
+
+async def test_the_phases_of_the_runtime_are_stored_in_order(
+    engine: AsyncEngine, harness: Harness, tenant: Tenant
+) -> None:
+    harness.runtime.add_script(_phase_script())
+    run_id = await harness.send(tenant, "s1", "hello")
+    assert await harness.worker.run_once()
+    assert await harness.events(run_id) == [
+        (0, "run_phase"),
+        (1, "run_phase"),
+        (2, "text_delta"),
+        (3, "run_phase"),
+        (4, "run_completed"),
+    ]
+    async with engine.connect() as connection:
+        phases = (
+            await connection.execute(
+                select(RunEvent.payload["phase"].astext)
+                .where(RunEvent.run_id == run_id, RunEvent.type == "run_phase")
+                .order_by(RunEvent.seq)
+            )
+        ).scalars()
+        assert list(phases) == ["starting", "thinking", "thinking"]
+    row = await harness.run(run_id)
+    assert (row.status, row.usage["output_tokens"]) == ("completed", 2)
+
+
+async def test_a_run_that_is_not_a_chat_run_stores_no_phase(
+    harness: Harness, tenant: Tenant
+) -> None:
+    harness.runtime.add_script(_phase_script())
+    run_id = await harness.send(tenant, "s1", "hello")
+    claimed = await harness.queue.claim(harness.worker.owner)
+    assert claimed is not None
+    await harness.worker.execute(dataclasses.replace(claimed, kind="review"))
+    assert [kind for _, kind in await harness.events(run_id)] == ["text_delta", "run_completed"]
+
+
+async def test_the_worker_wakes_the_streams_of_the_session(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    signals = SessionSignals()
+    harness = Harness(engine, signals=signals)
+    ticket = signals.ticket(str(tenant.ids["s1"]))
+    other = signals.ticket(str(tenant.ids["s2"]))
+    await harness.send(tenant, "s1", "hello")
+    assert await harness.worker.run_once()
+    assert ticket.is_set()
+    assert not other.is_set()

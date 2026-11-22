@@ -75,6 +75,8 @@ from sama.runtime.contract import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -313,6 +315,9 @@ class _Translator:
         if message.parent_tool_use_id is not None:
             return []
         event = message.event
+        if event.get("type") == "message_start":
+            # The model started a turn: a client shows the phase before the first text.
+            return [RunPhase(phase=RunPhaseName.THINKING, usage=self.usage)]
         delta = event.get("delta") if event.get("type") == "content_block_delta" else None
         if isinstance(delta, dict) and delta.get("type") == "text_delta":
             text = str(delta.get("text", ""))

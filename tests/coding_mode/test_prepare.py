@@ -465,3 +465,68 @@ async def test_a_failed_claim_skips_only_that_repository(
     assert note.endswith(PLAN_MODE_NOTE)
     one, two = (await coding.state(org_id=org, session_id=session)).repos
     assert (one.status, two.status) == ("pending", "ready")
+
+
+# -- the first read (Section 4.4) ---------------------------------------------------------------
+
+
+class CountingCoding:
+    """Counts the calls of a ``CodingService``, so a test sees which reads the step made."""
+
+    def __init__(self, coding: CodingService) -> None:
+        self._coding = coding
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._coding, name)
+        if not callable(target):
+            return target
+
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            self.calls.append(name)
+            return await target(*args, **kwargs)
+
+        return call
+
+
+async def test_a_plain_run_needs_only_the_first_read(coding: CodingService, tenant: Tenant) -> None:
+    counting = CountingCoding(coding)
+    preparer = CodingPreparer(counting, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    look = await coding.look(
+        org_id=tenant.org, session_id=tenant.ids["mine"], run_id=uuid.UUID(scope.run_id)
+    )
+    assert look.idle
+    assert look.runtime is not None
+    assert await preparer.prepare(object(), scope, token) == ""  # type: ignore[arg-type]
+    assert counting.calls == ["look"]
+
+
+async def test_the_first_read_sees_repositories_and_plan_mode(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    org, session = tenant.org, tenant.ids["mine"]
+    scope, _ = await _run(coding, tenant)
+    run_id = uuid.UUID(scope.run_id)
+    await coding.attach(org_id=org, session_id=session, user_id=None, repo="team/app")
+    look = await coding.look(org_id=org, session_id=session, run_id=run_id)
+    assert (look.repos, look.plan_mode, look.plan_changes, look.idle) == (True, False, False, False)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=None, on=True)
+    look = await coding.look(org_id=org, session_id=session, run_id=run_id)
+    assert (look.plan_mode, look.plan_changes) == (True, True)
+    # A run of another session, or an unknown run, is not a chat run of this session.
+    other = await coding.look(org_id=org, session_id=tenant.ids["s1"], run_id=run_id)
+    assert other.runtime is None
+    assert other.idle
+
+
+async def test_the_note_that_plan_mode_is_off_still_comes_after_the_first_read(
+    coding: CodingService, tenant: Tenant
+) -> None:
+    org, session = tenant.org, tenant.ids["mine"]
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=None, on=True)
+    await coding.set_plan_mode(org_id=org, session_id=session, user_id=None, on=False)
+    preparer = CodingPreparer(coding, FakeCloner(), RunTokenSigner(KEY))  # type: ignore[arg-type]
+    scope, token = await _run(coding, tenant)
+    note = await preparer.prepare(object(), scope, token)  # type: ignore[arg-type]
+    assert "Plan mode is off now" in note

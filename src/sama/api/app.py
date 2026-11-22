@@ -14,6 +14,7 @@ exist. Writes go through the run queue and the tool gate, which connect as the t
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -199,7 +200,9 @@ from sama.orchestrator.checkpoints import (
     CheckpointServiceError,
     restored_text,
 )
+from sama.orchestrator.prewarm import SessionWarmer, WarmRateLimitedError, WarmStatus
 from sama.orchestrator.queue import QueueError, QuotaExceededError, RateLimitedError, RunQueue
+from sama.orchestrator.signals import SessionSignals
 from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
 from sama.orgs.permissions import (
     MAX_CHANGES as MAX_PERMISSION_CHANGES,
@@ -284,6 +287,9 @@ class ApiSettings(BaseModel):
     """The public key of the Supabase project. The web page needs it to sign in."""
     poll_s: float = Field(default=0.5, gt=0)
     """How often an event stream reads new rows."""
+    wake_s: float = Field(default=0.05, ge=0)
+    """After a signal of the worker of this process (``SessionSignals``), the stream waits
+    this long before it reads, so that it reads once for a group of stores."""
     heartbeat_s: float = Field(default=15.0, gt=0)
     max_stream_s: float = Field(default=3600.0, gt=0)
     """A stream ends after this time, or when the access token expires if that is earlier.
@@ -1231,6 +1237,8 @@ class SamaApi:
         browser: BrowserSettings | None = None,
         custom_tools: CustomToolService | None = None,
         coding_mode: CodingService | None = None,
+        warmer: SessionWarmer | None = None,
+        signals: SessionSignals | None = None,
     ) -> None:
         """Without ``custom_tools``, the custom tool routes answer ``409``. Without
         ``integrations`` the integration routes answer ``409``. Without ``github``,
@@ -1246,8 +1254,13 @@ class SamaApi:
         routes answer ``503``. Without ``billing``, billing is off: the billing pages show the
         plan and the quotas, and a purchase answers ``409``. Without ``browser``, the browser
         settings routes answer ``409``. Without ``coding_mode``, the coding mode routes that write
-        answer ``409`` (Section 15.5)."""
+        answer ``409`` (Section 15.5). Without ``warmer``, ``POST /sessions/{id}/warm``
+        answers ``{"status": "off"}`` and a new session is not warmed (Section 4.4). With
+        ``signals``, the event streams of this process read at once when the worker of this
+        process stores events (Section 4.4)."""
         self._engine = engine
+        self._warmer = warmer
+        self._signals = signals
         self._coding_mode = coding_mode
         self._browser = browser
         self._api_keys = ApiKeyStore(engine)
@@ -1418,6 +1431,10 @@ class SamaApi:
         @app.post("/sessions", status_code=201)
         async def create_session(principal: Me, body: NewSession) -> SessionOut:
             return await self._create_session(principal, body)
+
+        @app.post("/sessions/{session_id}/warm", status_code=202)
+        async def warm_session(principal: Me, session_id: uuid.UUID) -> JSONResponse:
+            return await self._warm(principal, session_id)
 
         @app.get("/sessions/{session_id}")
         async def get_session(principal: Me, session_id: uuid.UUID) -> SessionDetail:
@@ -3530,7 +3547,34 @@ class SamaApi:
                     details={"audience": body.audience, "channel": "web"},
                 )
             )
+        # The user types the first message next: start the sandbox now (Section 4.4).
+        with contextlib.suppress(WarmRateLimitedError):
+            self._request_warm(org_id, session_id, principal.auth_user_id)
         return _session_out(row, grants)
+
+    def _request_warm(
+        self, org_id: uuid.UUID, session_id: uuid.UUID, user: uuid.UUID
+    ) -> WarmStatus:
+        if self._warmer is None:
+            return WarmStatus.OFF
+        return self._warmer.request(str(org_id), str(session_id), str(user))
+
+    async def _warm(self, principal: Principal, session_id: uuid.UUID) -> JSONResponse:
+        """``POST /sessions/{id}/warm`` (Section 4.4): starts or resumes the session sandbox and
+        the warm runner in the background. It creates no run. It answers ``202`` at once with
+        the status ``warming``, ``recent``, ``limited``, or ``off``; ``429`` when the user asked
+        too often; ``404`` when the user cannot read the session."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+        try:
+            status = self._request_warm(access.org_id, session_id, principal.auth_user_id)
+        except WarmRateLimitedError as error:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": str(error)},
+                headers={"Retry-After": str(error.retry_after_s)},
+            )
+        return JSONResponse(status_code=202, content={"status": status.value})
 
     async def _pairing_code(
         self, principal: Principal, channel: Channel, body: NewPairingCode
@@ -4778,16 +4822,22 @@ class SamaApi:
         - ``end``: the user cannot read the session any more. The events stop.
         - ``ping``: the heartbeat, every ``heartbeat_s``.
 
-        Each poll checks the access again, with both guards. The caller sets the deadline to
-        the token expiry, so that a stream does not live longer than its token. The extension
-        channel moves the deadline when the client sends a fresh token.
+        A poll waits ``poll_s``. With ``signals``, a store of the worker of this process ends
+        the wait early (Section 4.4). Each poll checks the access again, with both guards. The
+        caller sets the deadline to the token expiry, so that a stream does not live longer than
+        its token. The extension channel moves the deadline when the client sends a fresh
+        token.
         """
         settings = self._settings
         loop = asyncio.get_running_loop()
         next_ping = loop.time() + settings.heartbeat_s
         statuses: dict[uuid.UUID, str] = {}
         first = True
+        signals = self._signals
+        key = str(session_id)
         while loop.time() < deadline():
+            # The ticket comes before the read, so a store during the read wakes the next wait.
+            ticket = signals.ticket(key) if signals is not None else None
             out: list[StreamEvent] = []
             async with as_user(self._engine, principal.auth_user_id) as connection:
                 try:
@@ -4842,7 +4892,13 @@ class SamaApi:
                 next_ping = loop.time() + settings.heartbeat_s
                 yield StreamEvent("ping", {})
             if len(out) < STREAM_BATCH:
-                await asyncio.sleep(max(0.0, min(settings.poll_s, deadline() - loop.time())))
+                wait = max(0.0, min(settings.poll_s, deadline() - loop.time()))
+                if ticket is None:
+                    await asyncio.sleep(wait)
+                elif await SessionSignals.wait(ticket, wait):
+                    # A store in this process: read soon, but not more often than
+                    # ``wake_s``, so a fast text stream does not read for each flush.
+                    await asyncio.sleep(max(0.0, min(settings.wake_s, deadline() - loop.time())))
 
     @staticmethod
     async def _stream_runs(

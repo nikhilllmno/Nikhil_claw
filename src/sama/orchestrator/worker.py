@@ -20,6 +20,10 @@ whose approval is decided, and reaps the runs whose lease expired.
 
 An idle slot waits for a queue notification (``QueueWakeup``) or for ``poll_s``, whichever
 comes first. So a new run starts at once, and the poll is the fallback.
+
+For a chat run, the first stored event is ``run_phase`` ``starting``. The worker writes it while
+it builds the config, so a client sees an activity about one database write after the claim.
+With ``signals``, each store wakes the event streams of the session in this process.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from sama.gate.service import GateService
 from sama.observability.logs import log_context
 from sama.observability.steps import Steps
 from sama.orchestrator.queue import ClaimedRun, Lease, Resume, RunQueue
+from sama.orchestrator.signals import SessionSignals
 from sama.orchestrator.wakeup import QueueWakeup
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
@@ -55,6 +60,8 @@ from sama.runtime.contract import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -98,13 +105,20 @@ class _Writer:
     """Stores events in batches. A text delta waits for more events, up to ``flush_s``."""
 
     def __init__(
-        self, queue: RunQueue, run: ClaimedRun, owner: str, watch: _Watch, flush_s: float
+        self,
+        queue: RunQueue,
+        run: ClaimedRun,
+        owner: str,
+        watch: _Watch,
+        flush_s: float,
+        signals: SessionSignals | None = None,
     ) -> None:
         self._queue = queue
         self._run = run
         self._owner = owner
         self._watch = watch
         self._flush_s = flush_s
+        self._signals = signals
         self._seq = run.next_seq
         self._pending: list[tuple[int, str, dict[str, Any]]] = []
         self._last = time.monotonic()
@@ -112,10 +126,14 @@ class _Writer:
         """A tool of the process can add events too (``Worker.emit``), so one flush writes at
         a time and the events keep their order."""
 
-    async def add(self, event: RunEvent) -> None:
+    def put(self, event: RunEvent) -> None:
+        """Gives ``event`` the next ``seq`` and keeps it for the next flush."""
         payload = event.model_dump(mode="json", exclude={"runtime_state"})
         self._pending.append((self._seq, event.type, payload))
         self._seq += 1
+
+    async def add(self, event: RunEvent) -> None:
+        self.put(event)
         if (
             not isinstance(event, TextDelta)
             or len(self._pending) >= FLUSH_EVENTS
@@ -127,12 +145,12 @@ class _Writer:
         async with self._flushing:
             events, self._pending = self._pending, []
             self._last = time.monotonic()
-            if (
-                events
-                and not self._watch.lost
-                and not await self._queue.add_events(self._run, self._owner, events)
-            ):
+            if not events or self._watch.lost:
+                return
+            if not await self._queue.add_events(self._run, self._owner, events):
                 self._watch.lost = True
+            elif self._signals is not None:
+                self._signals.notify(str(self._run.session_id))
 
 
 class Worker:
@@ -153,6 +171,7 @@ class Worker:
         poll_s: float = 1.0,
         maintenance_s: float = 30.0,
         flush_s: float = 0.25,
+        signals: SessionSignals | None = None,
     ) -> None:
         self.owner = owner or default_owner()
         self._queue = queue
@@ -166,6 +185,7 @@ class Worker:
         self._poll_s = poll_s
         self._maintenance_s = maintenance_s
         self._flush_s = flush_s
+        self._signals = signals
         self._wakeup = QueueWakeup(queue.engine)
         self._writers: dict[tuple[str, str], _Writer] = {}
         """The event writers of the runs that stream now, by ``(org_id, run_id)``."""
@@ -268,6 +288,34 @@ class Worker:
 
     async def _execute(self, run: ClaimedRun) -> None:
         steps = Steps()
+        watch = _Watch()
+        writer = _Writer(self._queue, run, self.owner, watch, self._flush_s, self._signals)
+        # The first phase gets the first seq now, and it is stored while the config is built
+        # (Section 4.3).
+        if run.kind == "chat":
+            writer.put(RunPhase(phase=RunPhaseName.STARTING))
+        phase = asyncio.create_task(self._first_flush(run, writer))
+        try:
+            await self._start(run, steps, writer, watch)
+        finally:
+            if not phase.done():
+                phase.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await phase
+            if self._signals is not None:
+                # The status of the run can have changed: the streams read it at once.
+                self._signals.notify(str(run.session_id))
+
+    @staticmethod
+    async def _first_flush(run: ClaimedRun, writer: _Writer) -> None:
+        """Stores the first phase. A failed write only logs: the phase is only for the
+        display."""
+        try:
+            await writer.flush()
+        except Exception:
+            log.exception("the first run phase was not stored run=%s", run.run_id)
+
+    async def _start(self, run: ClaimedRun, steps: Steps, writer: _Writer, watch: _Watch) -> None:
         try:
             runtime = self._runtimes.get(RuntimeKind(run.runtime))
             budget = Budget.model_validate(dict(run.budget))
@@ -290,8 +338,6 @@ class Worker:
             return
         steps.mark("dispatch")
         stream = _stream(runtime, run, scope, config, budget)
-        watch = _Watch()
-        writer = _Writer(self._queue, run, self.owner, watch, self._flush_s)
         key = (str(run.org_id), str(run.run_id))
         self._writers[key] = writer
         heart = asyncio.create_task(self._watch(run, runtime, budget, watch))
@@ -300,6 +346,12 @@ class Worker:
         try:
             async with contextlib.aclosing(stream):
                 async for event in stream:
+                    if isinstance(event, RunPhase):
+                        # A phase is progress for the chat view only. Its usage is not the
+                        # usage of the run.
+                        if run.kind == "chat":
+                            await writer.add(event)
+                        continue
                     steps.mark("first_event", once=True)
                     usage = event.usage
                     await writer.add(event)

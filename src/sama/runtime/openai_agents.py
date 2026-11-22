@@ -86,6 +86,8 @@ from sama.runtime.contract import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -1174,6 +1176,9 @@ class OpenAIRuntime:
                 data = event.data
                 if data.type == "response.output_text.delta" and data.delta:
                     active.send(TextDelta(text=data.delta, usage=job.usage))
+                elif data.type == "response.created":
+                    # The model started a turn: a client shows the phase before the first text.
+                    active.send(RunPhase(phase=RunPhaseName.THINKING, usage=job.usage))
             elif event.type == "run_item_stream_event":
                 if event.name == "tool_called":
                     raw = event.item.raw_item

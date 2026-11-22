@@ -347,6 +347,11 @@ def _become_runner(request: Mapping[str, Any], fds: list[int]) -> NoReturn:
 def main(argv: list[str]) -> NoReturn:
     if len(argv) == 2 and argv[0] == "--server":
         server_main(argv[1])
+    if argv == ["--start"]:
+        # The orchestrator warms the session sandbox before a run (Section 4.4): start a warm
+        # server and exit. A second server exits by itself, so this is safe to repeat.
+        start_server(os.environ.get(SOCKET_ENV) or DEFAULT_SOCKET)
+        raise SystemExit(0)
     client_main()
 
 

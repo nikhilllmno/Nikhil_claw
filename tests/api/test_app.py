@@ -295,7 +295,13 @@ async def test_a_message_runs_and_streams(
     async with open_stream(stream_app, path, cursor) as stream:
         events = await stream.wait_for(_has_run_completed, what="the run_completed event")
     run_events = [e for e in events if e[0] == "run_event"]
-    assert [e[1]["type"] for e in run_events] == ["text_delta", "text_delta", "run_completed"]
+    assert [e[1]["type"] for e in run_events] == [
+        "run_phase",  # "starting": the worker took the run (Section 4.4)
+        "text_delta",
+        "text_delta",
+        "run_completed",
+    ]
+    assert run_events[0][1]["payload"]["phase"] == "starting"
     assert {e[1]["run_id"] for e in run_events} == {str(run_id)}
     ids = [int(e[2] or 0) for e in run_events]
     assert ids == sorted(ids)
@@ -304,7 +310,7 @@ async def test_a_message_runs_and_streams(
     # runner.
 
     # Last-Event-ID wins over ?after=, and a stream without a cursor starts at the end.
-    resume = {**mia(tenant), "Last-Event-ID": str(ids[1])}
+    resume = {**mia(tenant), "Last-Event-ID": str(ids[2])}
     async with open_stream(stream_app, f"{path}?after=0", resume) as resumed:
         later_events = await resumed.wait_for(_has_run_completed, what="the resumed event")
     assert [e[1]["type"] for e in later_events if e[0] == "run_event"] == ["run_completed"]

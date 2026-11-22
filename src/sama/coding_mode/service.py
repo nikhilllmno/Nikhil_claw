@@ -21,9 +21,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
-from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy import and_, delete, exists, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from sama.db.engine import autocommit
 from sama.db.models import (
     MAX_PLAN_CHARS,
     MAX_PLAN_FEEDBACK_CHARS,
@@ -93,6 +94,24 @@ class CodingState:
     plan_mode: bool
     repos: list[RepoView]
     plan: PlanView | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunLook:
+    """What the coding step of one run needs to know first (``CodingService.look``)."""
+
+    runtime: str | None
+    """The runtime of a chat run that answers a message, or None for another run."""
+    plan_mode: bool
+    repos: bool
+    """The session has a ``pending`` or a ``ready`` repository."""
+    plan_changes: bool
+    """Plan mode changed in the session at some time: a run can owe the note that it is off."""
+
+    @property
+    def idle(self) -> bool:
+        """True when the coding step has nothing to do for the run."""
+        return self.runtime is None or not (self.plan_mode or self.repos or self.plan_changes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -741,6 +760,46 @@ class CodingService:
                 )
             ).one_or_none()
         return None if row is None else repo_view(row)
+
+    async def look(self, *, org_id: uuid.UUID, session_id: uuid.UUID, run_id: uuid.UUID) -> RunLook:
+        """The first facts of the coding step of a run, in one statement without a
+        transaction (one round trip, Section 4.4). Most runs have no repository and no plan
+        mode, so the step then ends after this read."""
+        repos = exists().where(
+            SessionRepo.org_id == org_id,
+            SessionRepo.session_id == session_id,
+            SessionRepo.status.in_(("pending", "ready")),
+        )
+        changes = exists().where(
+            AuditEntry.org_id == org_id,
+            AuditEntry.target_type == "session",
+            AuditEntry.target_id == str(session_id),
+            AuditEntry.action.in_(("session.plan_mode", "plan.approved", PLAN_OFF_NOTED)),
+        )
+        async with autocommit(self._engine) as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        Run.kind,
+                        Run.compact,
+                        Run.runtime,
+                        Session.plan_mode,
+                        repos.label("repos"),
+                        changes.label("changes"),
+                    )
+                    .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
+                    .where(Run.org_id == org_id, Run.id == run_id, Run.session_id == session_id)
+                )
+            ).one_or_none()
+        if row is None:
+            return RunLook(runtime=None, plan_mode=False, repos=False, plan_changes=False)
+        chat = row.kind == "chat" and not row.compact
+        return RunLook(
+            runtime=str(row.runtime or "") if chat else None,
+            plan_mode=bool(row.plan_mode),
+            repos=bool(row.repos),
+            plan_changes=bool(row.changes),
+        )
 
     async def chat_run(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
         """The runtime of a chat run that answers a message, or None for another run (a
