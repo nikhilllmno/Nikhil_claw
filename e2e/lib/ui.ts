@@ -52,7 +52,8 @@ export async function waitForReply(page: Page, text: string | RegExp, timeout = 
 
 /** Waits until no run of the session is open: the Working badge is gone. */
 export async function waitIdle(page: Page, timeout = REPLY_TIMEOUT_MS): Promise<void> {
-  await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0, { timeout });
+  // "Stop all" when more than one run is open (M7.1).
+  await expect(page.getByRole("button", { name: /^Stop( all)?$/ })).toHaveCount(0, { timeout });
 }
 
 /** The approval card for a tool. */
@@ -99,4 +100,30 @@ export async function waitForReplyApproving(
   }
   await expect(answer).toBeVisible({ timeout: 1 });
   return approved;
+}
+
+/**
+ * Approves each approval card until no run of the session is open. Use it for a run that makes
+ * an unknown number of tool calls that ask, for example the work after an approved plan.
+ */
+export async function approveUntilIdle(page: Page, timeout = REPLY_TIMEOUT_MS * 2): Promise<string[]> {
+  const approved: string[] = [];
+  const deadline = Date.now() + timeout;
+  const card = page.getByRole("region", { name: /^Approval for / }).first();
+  const stop = page.getByRole("button", { name: /^Stop( all)?$/ });
+  let quiet = 0;
+  while (Date.now() < deadline) {
+    if (await card.isVisible()) {
+      approved.push(((await card.getAttribute("aria-label")) ?? "").replace("Approval for ", ""));
+      await card.getByRole("button", { name: "Approve", exact: true }).click();
+      await expect(card).toHaveCount(0);
+      quiet = 0;
+      continue;
+    }
+    // Idle twice in a row, so a short gap between two runs does not end the wait.
+    quiet = (await stop.count()) === 0 ? quiet + 1 : 0;
+    if (quiet >= 3) return approved;
+    await card.waitFor({ state: "visible", timeout: 3_000 }).catch(() => undefined);
+  }
+  throw new Error(`The session was not idle after ${timeout} ms.`);
 }
