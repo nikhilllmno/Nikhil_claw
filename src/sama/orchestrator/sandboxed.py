@@ -96,6 +96,10 @@ log: Final = logging.getLogger("sama.orchestrator")
 
 RUNNER_ARGV: Final = ("/opt/sama/.venv/bin/python", "-m", "sama.runtime.runner")
 """The runner in the sama image (``sandbox/Dockerfile``)."""
+WARM_IDLE_S: Final = 180
+"""The idle timeout of a sandbox that a warm started (Section 4.4). It pauses after 3 minutes
+when no run comes, so a warm that no message follows costs little."""
+
 WARM_RUNNER_ARGV: Final = ("/opt/sama/.venv/bin/python", "-m", "sama.warm")
 """The same runner, started in a warm process when one is ready (``sama.warm``)."""
 DEFAULT_RUN_WALL_TIME_S: Final = 60 * 60
@@ -416,7 +420,9 @@ class SandboxedRuntime:
                     # A run holds the sandbox with the timeout of the run. A resume with the
                     # idle timeout would make that timeout shorter.
                     return "busy"
-                sandbox = await self._get_sandbox(key, self._spec(*key))
+                # A warm is a guess: its sandbox pauses after a short idle time when no run
+                # comes (``WARM_IDLE_S``). A run sets its own timeout when it starts.
+                sandbox = await self._get_sandbox(key, self._spec(*key, idle_timeout_s=WARM_IDLE_S))
             argv = self._settings.runner_argv
             if tuple(argv[1:]) == WARM_RUNNER_ARGV[1:]:
                 # ``extra_env`` has no secret (``SandboxSettings``). It can set the socket.
@@ -444,7 +450,7 @@ class SandboxedRuntime:
             return "failed"
         finally:
             if sandbox is not None:
-                await self._end_session_run(key, sandbox)
+                await self._end_session_run(key, sandbox, idle_timeout_s=WARM_IDLE_S)
 
     async def exec_script(self, scope: RunScope, script: str, *, timeout_s: float) -> ExecResult:
         """Runs a job script with ``bash -c`` in the session sandbox (Section 12.1). The script
@@ -602,16 +608,19 @@ class SandboxedRuntime:
                 self._sandbox_ids[key] = known
         return known
 
-    async def _end_session_run(self, key: tuple[str, str], sandbox: Sandbox) -> None:
-        """After the last run of the session, sets the idle timeout back. It holds the session
-        lock, so it cannot shorten the timeout of a run that starts at the same time."""
+    async def _end_session_run(
+        self, key: tuple[str, str], sandbox: Sandbox, *, idle_timeout_s: int | None = None
+    ) -> None:
+        """After the last run of the session, sets the idle timeout back (``idle_timeout_s``, or
+        the idle timeout of the session). It holds the session lock, so it cannot shorten the
+        timeout of a run that starts at the same time."""
         async with self._session_locks.setdefault(key, asyncio.Lock()):
             left = self._session_runs.get(key, 0) - 1
             if left > 0:
                 self._session_runs[key] = left
                 return
             self._session_runs.pop(key, None)
-            idle = self._spec(*key).idle_timeout_s
+            idle = idle_timeout_s or self._spec(*key).idle_timeout_s
             try:
                 await asyncio.wait_for(sandbox.keep_alive(idle), timeout=PROVIDER_CALL_S)
             except (SandboxError, TimeoutError) as error:

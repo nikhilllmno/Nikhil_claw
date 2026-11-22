@@ -91,3 +91,44 @@ async def test_aclose_cancels_a_running_warm() -> None:
     await warmer.aclose()
     await warmer.wait_idle()
     assert warm.calls == [("o", "s1")]
+
+
+async def test_the_org_and_process_limits_keep_capacity_for_runs() -> None:
+    started: list[tuple[str, str]] = []
+    gate = asyncio.Event()
+
+    async def warm(org_id: str, session_id: str) -> str:
+        started.append((org_id, session_id))
+        await gate.wait()
+        return "ready"
+
+    now = [0.0]
+    warmer = SessionWarmer(
+        warm, per_org=2, total=3, max_running=10, per_user=100, clock=lambda: now[0]
+    )
+    assert warmer.request("o1", "s1", "u1") is WarmStatus.WARMING
+    assert warmer.request("o1", "s2", "u2") is WarmStatus.WARMING
+    assert warmer.request("o1", "s3", "u3") is WarmStatus.LIMITED, "per org"
+    assert warmer.request("o2", "s4", "u4") is WarmStatus.WARMING
+    assert warmer.request("o3", "s5", "u5") is WarmStatus.LIMITED, "per process"
+    now[0] = 61.0
+    assert warmer.request("o1", "s3", "u3") is WarmStatus.WARMING, "a new window"
+    gate.set()
+    await warmer.wait_idle()
+    assert ("o1", "s3") in started
+
+
+async def test_at_most_max_running_warms_run_at_once() -> None:
+    gate = asyncio.Event()
+
+    async def warm(org_id: str, session_id: str) -> str:
+        await gate.wait()
+        return "ready"
+
+    warmer = SessionWarmer(warm, max_running=1, per_org=100, total=100, per_user=100)
+    assert warmer.request("o1", "s1", "u1") is WarmStatus.WARMING
+    assert warmer.request("o2", "s2", "u2") is WarmStatus.LIMITED
+    gate.set()
+    await warmer.wait_idle()
+    assert warmer.request("o2", "s2", "u2") is WarmStatus.WARMING
+    await warmer.wait_idle()

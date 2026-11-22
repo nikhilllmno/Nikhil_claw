@@ -10,7 +10,10 @@ Limits, all in the memory of this process:
 
 - one warm at a time for each session, and no new warm for ``min_interval_s`` after the
   start of the last one (the answer is ``recent``),
-- at most ``per_user`` warm requests of one user in ``window_s`` (``WarmRateLimitedError``).
+- at most ``per_user`` warm requests of one user in ``window_s`` (``WarmRateLimitedError``),
+- at most ``per_org`` new warms of one org and ``total`` new warms of the process in
+  ``window_s``, and at most ``max_running`` warms at the same time. Above a limit the answer is
+  ``limited`` and nothing starts: a warm is a guess, and the capacity stays for real runs.
 """
 
 from __future__ import annotations
@@ -32,6 +35,9 @@ raise."""
 
 MIN_INTERVAL_S: Final = 60.0
 PER_USER: Final = 30
+PER_ORG: Final = 10
+TOTAL: Final = 30
+MAX_RUNNING: Final = 4
 WINDOW_S: Final = 60.0
 _MEMORY: Final = 10_000
 
@@ -43,6 +49,8 @@ class WarmStatus(StrEnum):
     """A warm of the session runs now, or started less than ``min_interval_s`` ago."""
     OFF = "off"
     """This process has no session sandbox to warm."""
+    LIMITED = "limited"
+    """The org or the process started enough warms now. Nothing started."""
 
 
 class WarmRateLimitedError(Exception):
@@ -58,12 +66,20 @@ class SessionWarmer:
         *,
         min_interval_s: float = MIN_INTERVAL_S,
         per_user: int = PER_USER,
+        per_org: int = PER_ORG,
+        total: int = TOTAL,
+        max_running: int = MAX_RUNNING,
         window_s: float = WINDOW_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._warm = warm
         self._min_interval_s = min_interval_s
         self._per_user = per_user
+        self._per_org = per_org
+        self._total = total
+        self._max_running = max_running
+        self._orgs: dict[str, deque[float]] = {}
+        self._all: deque[float] = deque()
         self._window_s = window_s
         self._clock = clock
         self._started: dict[tuple[str, str], float] = {}
@@ -79,6 +95,8 @@ class SessionWarmer:
         last = self._started.get(key)
         if key in self._running or (last is not None and now - last < self._min_interval_s):
             return WarmStatus.RECENT
+        if not self._admit(org_id, now):
+            return WarmStatus.LIMITED
         self._started.pop(key, None)
         self._started[key] = now
         while len(self._started) > _MEMORY:
@@ -86,6 +104,25 @@ class SessionWarmer:
         task = asyncio.create_task(self._run(key))
         self._running[key] = task
         return WarmStatus.WARMING
+
+    def _admit(self, org_id: str, now: float) -> bool:
+        """True when the org and the process may start one more warm now. Counts it."""
+        times = self._orgs.setdefault(org_id, deque())
+        for queue in (times, self._all):
+            while queue and now - queue[0] >= self._window_s:
+                queue.popleft()
+        if (
+            len(self._running) >= self._max_running
+            or len(times) >= self._per_org
+            or len(self._all) >= self._total
+        ):
+            return False
+        times.append(now)
+        self._all.append(now)
+        if len(self._orgs) > _MEMORY:
+            for org in [o for o, t in self._orgs.items() if not t]:
+                del self._orgs[org]
+        return True
 
     def _limit(self, user_id: str, now: float) -> None:
         times = self._users.setdefault(user_id, deque())
@@ -122,8 +159,11 @@ class SessionWarmer:
 
 
 __all__ = [
+    "MAX_RUNNING",
     "MIN_INTERVAL_S",
+    "PER_ORG",
     "PER_USER",
+    "TOTAL",
     "WINDOW_S",
     "SessionWarmer",
     "WarmRateLimitedError",
