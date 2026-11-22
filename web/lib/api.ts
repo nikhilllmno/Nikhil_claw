@@ -603,6 +603,20 @@ export interface NewPullRequest {
   draft?: boolean;
 }
 
+/**
+ * How far an approval reaches. `once`: this call. `session`: also the same tool for the rest of
+ * this session. `always`: also this tool for this person and this agent profile from now on.
+ */
+export type ApprovalScope = "once" | "session" | "always";
+
+/** The answer of `POST /approvals/{id}/approve` and `/deny`. */
+export interface ApprovalDecision {
+  status: string;
+  /** The scope that the server applied. It can be narrower than the scope that was sent. */
+  scope?: ApprovalScope;
+  resumed: boolean;
+}
+
 export interface Approval {
   id: string;
   run_id: string;
@@ -612,6 +626,8 @@ export interface Approval {
   reason: string;
   /** True for a proposal of a change. A proposal has no "Always allow". */
   proposal?: boolean;
+  /** The scopes that a person may choose. A proposal and a tool that always asks have only `once`. */
+  scopes?: ApprovalScope[];
   /** The diff of a change of an agent profile (M6.1), or null. */
   diff?: string | null;
   created_at: string;
@@ -2192,13 +2208,13 @@ export class ApiClient {
     this.json<{ run_id: string }>(`/sessions/${id}/compact`, { method: "POST", body: { focus } });
   cancelRun = (runId: string) => this.json<{ status: string }>(`/runs/${runId}/cancel`, { method: "POST" });
   listApprovals = (id: string) => this.json<Approval[]>(`/sessions/${id}/approvals`);
-  approve = (approvalId: string, alwaysAllow: boolean) =>
-    this.json<{ status: string; resumed: boolean }>(`/approvals/${approvalId}/approve`, {
+  approve = (approvalId: string, scope: ApprovalScope = "once") =>
+    this.json<ApprovalDecision>(`/approvals/${approvalId}/approve`, {
       method: "POST",
-      body: { always_allow: alwaysAllow },
+      body: { scope },
     });
   deny = (approvalId: string) =>
-    this.json<{ status: string; resumed: boolean }>(`/approvals/${approvalId}/deny`, {
+    this.json<ApprovalDecision>(`/approvals/${approvalId}/deny`, {
       method: "POST",
       body: {},
     });

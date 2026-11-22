@@ -28,6 +28,7 @@ from sama.gate.decide import (
     TOOLSETS,
     Preapproval,
     connection_of,
+    is_direct_coding_run,
     narrow_toolsets,
     run_limit,
     tools_of,
@@ -433,6 +434,63 @@ def test_a_rule_can_turn_a_default_allow_into_ask() -> None:
 def test_always_allow_for_me_allows_the_tool() -> None:
     verdict = decide(context(rules=(rule("Bash", "allow", RuleLevel.USER),)), "Bash", ARGS)
     assert (verdict.action, verdict.step) == ("allow", GateStep.POLICY)
+
+
+def test_a_session_allow_allows_the_tool() -> None:
+    verdict = decide(context(rules=(rule("Bash", "allow", RuleLevel.SESSION),)), "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("allow", GateStep.POLICY)
+    assert "session" in verdict.reason
+
+
+@pytest.mark.parametrize("level", list(RuleLevel))
+def test_a_deny_rule_of_any_level_wins_over_a_session_allow(level: RuleLevel) -> None:
+    rules = (rule("Bash", "allow", RuleLevel.SESSION), rule("Bash", "deny", level))
+    assert decide(context(rules=rules), "Bash", ARGS).action == "deny"
+
+
+@pytest.mark.parametrize("level", [RuleLevel.ORG, RuleLevel.PROFILE])
+def test_an_admin_ask_rule_wins_over_a_session_allow(level: RuleLevel) -> None:
+    rules = (rule("Bash", "allow", RuleLevel.SESSION), rule("Bash", "ask", level))
+    assert decide(context(rules=rules), "Bash", ARGS).action == "ask"
+
+
+def test_a_session_allow_wins_over_an_ask_rule_of_the_user() -> None:
+    rules = (rule("Bash", "ask", RuleLevel.USER), rule("Bash", "allow", RuleLevel.SESSION))
+    assert decide(context(rules=rules), "Bash", ARGS).action == "allow"
+
+
+def test_a_session_allow_does_not_remove_the_ask_of_a_tool_that_always_asks() -> None:
+    rules = (rule("repo_push_approval", "allow", RuleLevel.SESSION),)
+    verdict = policy_verdict(rules, "repo_push_approval")
+    assert verdict.action == "ask"
+
+
+def test_a_session_allow_does_not_beat_the_hardline_list_or_plan_mode() -> None:
+    rules = (rule("Bash", "allow", RuleLevel.SESSION),)
+    deny = decide(context(rules=rules), "Bash", {"command": "rm -rf /"})
+    assert (deny.action, deny.step) == ("deny", GateStep.HARDLINE)
+    planned = decide(context(rules=rules, plan_mode=True), "Bash", {"command": "make build"})
+    assert (planned.action, planned.step) == ("deny", GateStep.PLAN)
+
+
+def test_a_session_allow_still_asks_for_an_escalated_call() -> None:
+    rules = (rule("Bash", "allow", RuleLevel.SESSION),)
+    verdict = decide(context(rules=rules), "Bash", ARGS, escalate="sensitive")
+    assert verdict.action == "ask"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "coding_agent", "direct"),
+    [
+        ("claude_code", None, True),
+        ("codex", None, True),
+        ("claude_code", "claude_code", False),
+        ("claude_agent_sdk", None, False),
+        ("openai_agents_sdk", None, False),
+    ],
+)
+def test_direct_coding_runs(runtime: str, coding_agent: str | None, direct: bool) -> None:
+    assert is_direct_coding_run(runtime, coding_agent) is direct
 
 
 # -- step 5: context --------------------------------------------------------------------------

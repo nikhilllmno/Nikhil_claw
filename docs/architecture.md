@@ -3748,7 +3748,7 @@ cross-org check of Section 17.1 through the API.
 | `GET /sessions/{id}/events` | Server-sent events (below). |
 | `POST /runs/{id}/cancel` | `RunQueue.cancel`. |
 | `GET /sessions/{id}/approvals` | The pending approvals. |
-| `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_approval`, then `RunQueue.release_decided`. `always_allow` writes the user rule. `409` if the approval is decided or expired. |
+| `POST /approvals/{id}/approve`, `/deny` | `GateService.decide_with_scope`, then `RunQueue.release_decided`. The body of `approve` is `{"scope": "once" \| "session" \| "always", "reason": "..."}`. `always_allow: true` is the old form of `"always"`. The answer is `{"status", "scope", "resumed"}`; `scope` is the scope that the gate applied (Section 16.1). `409` if the approval is decided or expired. `422` for `session` on a proposal. |
 | `GET /workspaces/{id}/memory`, `GET .../memory/{target}/revisions`, `PUT .../memory/{target}`, `POST .../memory/{target}/revisions/{seq}/revert` | The memory of the workspace (Section 8.1). `target` is `agent`, `user`, or `workspace`. The `agent` target needs `agent_profile_id` (query or body). `user` is the notes of the caller. A user who cannot see the workspace gets `404`. A `workspace` write needs a workspace admin (`403`). A change that is not valid gets `422`. |
 | `GET /sessions/{id}/questions`, `POST .../questions/{request_id}/answer` | The open `clarify` questions of the session, when the process has a `ClarifyBroker` (Section 16.7). |
 | `POST /orgs/{org_id}/agent-profiles` | Make an agent profile (an org owner or admin, `201`). `409` over 20 profiles (Section 17.6, M6.9). |
@@ -6420,7 +6420,7 @@ the session. They have no provider key and no GitHub token:
 |---|---|
 | Tool `coding_agent_run(agent, prompt, repo, open_pr, session, timeout_s)` | The agent of a run gives one task to `claude_code` or `codex`. The CLI runs in the sandbox of the session of the run, so the agent can read the result and run the tests in the same folder. Toolset `coding_agents`. |
 | `/claude <task>`, `/codex <task>` | The channel queues one message for the coding agent (`runs.coding_agent`). The run uses the runtime of the agent and not the runtime of the session. |
-| Direct mode | `/claude` or `/codex` with no task sets `sessions.coding_agent`. Each later chat message of the session goes to that CLI until `/sama`. An agent profile with the runtime `claude_code` or `codex` is in the direct mode for all its sessions. |
+| Direct mode | `/claude` or `/codex` with no task sets `sessions.coding_agent`. Each later chat message of the session goes to that CLI until `/sama`. An agent profile with the runtime `claude_code` or `codex` is in the direct mode for all its sessions. The person chose the CLI, so direct mode does not ask for each message (see Approvals below). |
 
 **Who may switch.** A switch of the direct mode changes the session for each person in it, so
 it follows the rule of the settings console (`PATCH /sessions/{id}`, M7.10): in a private
@@ -6511,7 +6511,23 @@ sandbox runner does not start it.
   repository, the task (first 4,000 characters), and `open_pr`. The tool is not in
   `DEFAULT_ALLOW`, so the default is `ask`: in a run of the runtimes, the run ends with
   `ApprovalRequired`, and the resume after an approval starts the CLI. "Always allow" writes a
-  user rule, as for other tools. An unattended run gets `deny`. A `deny` rule wins. The run needs
+  user rule, as for other tools. An unattended run gets `deny`. A `deny` rule wins.
+- **Direct mode asks at most once (M8.2).** A run is a direct mode run when it uses a coding agent
+  runtime and `runs.coding_agent` is empty: the session or the profile has the CLI, and the
+  message is not a `/claude <task>` message (`sama.gate.decide.is_direct_coding_run`). The person
+  chose the CLI, so the gate does not ask for each message:
+  (a) In a private session, when the run user is the owner of the session, the gate gives
+  `coding_agent_run` and `coding_agent_plan` an `allow` rule of the level `session`. There is no
+  approval card. (b) In every other session (a shared session, or a member who is not the owner),
+  the first message asks, and the approval of `coding_agent_run` or `coding_agent_plan` is stored
+  with the scope `session` also when the person chose `once`. Later direct mode messages of the
+  same person in the session do not ask again. Another member asks once for himself. `/sama` does not
+  clear the rule.
+  The rule is a session rule (Section 16.1): a `deny` rule and an `ask` rule of the org or the
+  profile still win, an unattended run is not covered by (a), and the budgets, the hardline list,
+  and the sandbox do not change. An explicit call of `coding_agent_run` by the agent of the
+  session (a run of the runtime `claude_agent_sdk` or `openai_agents_sdk`) and a `/claude <task>`
+  message keep the normal policy. The run needs
   the toolset `coding_agents`; migration `0044` adds it to a profile with the default toolsets of
   migration `0036`, and it is in the default list of `bootstrap`. It is not in the default group
   set.
@@ -6881,7 +6897,38 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
    argument limits (Section 12.1).
 
 Approvals time out after 24 hours (configurable) and then count as `deny`. Decisions are in
-the audit log. A user can choose "always allow this tool for me", which writes a policy rule.
+the audit log.
+
+**Approval scopes (M8.2).** A person who approves a call chooses how far the approval reaches, as in
+the permission prompt of Claude Code ("Yes", "Yes, and do not ask again this session", "No"):
+
+| Scope | What it does |
+|---|---|
+| `once` | The approval covers this call only. This is the default. |
+| `session` | The approval covers this call. The same tool also runs without a question for the rest of this session, in all runs of the session and in both runtimes, for the person who approved. |
+| `always` | The approval covers this call. The gate also writes a user policy rule `allow` for the tool and the profile of the run ("always allow this tool for me"). |
+
+A denial has no scope. The old flag `always_allow: true` of the API is the same as `always`.
+
+- A `session` approval writes one row to `session_tool_allows` (`org_id`, `session_id`,
+  `user_id`, `tool`, migration `0048`, RLS: a member reads the rows of the sessions that the member
+  can see, only the control plane writes). The gate reads the rows of the session and of the run
+  user as rules of the level `session`. This level ranks above the user rules. The row ends with
+  the session, and it covers no other session and no other person. An unattended run of the same
+  session (for example a delegated run) uses it, because it has the same session. An unattended
+  run of another session never does.
+- A `session` rule is a user rule. A `deny` rule at any level wins over it. An `ask` rule of the
+  org or the profile wins over it. It does not remove the ask of a tool in `ALWAYS_ASK`, of
+  `db_<conn>_execute`, or of an escalation. The hardline list (step 2) and plan mode (step 4a) come
+  before the policy step, so the rule does not change them. The pre-approval rules of unattended
+  jobs do not change.
+- A proposal (Section 9.4) and a tool that always asks have only the scope `once`. `session` for a
+  proposal gives `422`. For a tool that always asks, the gate applies `once` and tells so in the
+  answer. `always` for a proposal stays ignored.
+- The audit row `approval.approved` has the field `scope`. A `session` approval also writes the
+  audit row `tool_policy.session_allow`.
+- `GET /sessions/{id}/approvals` gives `scopes` for each approval: the scopes that the person can
+  choose.
 
 **Escalation (M5.5).** `GateService` has an optional `escalation` hook: `(org, run, tool,
 arguments)` gives a reason, or nothing. With a reason, the call gets `ask` at step 4 even with
@@ -7007,7 +7054,9 @@ Approvals:
 - With "always allow", it writes a user rule (`allow`) for the tool and the run profile, and
   the audit row `tool_policy.set`. Since M3.2 the chat cards have the button "Always allow for
   me" (Section 9.4.2). The gate ignores "always allow" for a proposal: a rule cannot approve a
-  proposal.
+  proposal. With the scope `session` it writes a session rule instead (Section 16.1). The
+  method `decide_with_scope` returns the status and the scope that the gate applied.
+  `decide_approval` returns the status only.
 - `GateService.expire()` times out due approvals in batches of 500. The worker maintenance
   calls it (Section 4.3). The gate also times out an approval when it reads it.
 - The API (M1.12, Section 11.4) and the channels (M1.13) call `decide_approval` and then

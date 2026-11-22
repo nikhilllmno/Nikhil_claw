@@ -3429,3 +3429,36 @@ class SessionPlan(Base):
     decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()
+
+
+class SessionToolAllow(Base):
+    """A tool that one user allowed for the rest of one session (docs/architecture.md, Section
+    16.1, approval scope ``session``). The tool gate reads it as a rule of the level
+    ``session``: it never beats a ``deny`` rule, an org or profile ``ask`` rule, the hardline
+    list, or plan mode. It ends with the session. Members read the rows of the sessions that
+    they can see. Only the control plane writes the table."""
+
+    __tablename__ = "session_tool_allows"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("session_id", "user_id", "tool"),
+        CheckConstraint("length(tool) BETWEEN 1 AND 200", name="tool_length"),
+        Index(None, "org_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The user who approved. The rule applies to the runs that this user starts."""
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    """An exact tool name."""
+    approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The approval that made the rule. A plain column: the rule stays when a retention purge
+    removes the approval."""
+    created_at: Mapped[datetime] = _created_at()

@@ -43,7 +43,7 @@ export function ApprovalCard({
     setError(null);
     try {
       if (action === "deny") await api.deny(approval.id);
-      else await api.approve(approval.id, action === "always");
+      else await api.approve(approval.id, action === "always" ? "always" : "once");
       onDecided();
     } catch (e) {
       setError(errorText(e, "The decision was not saved."));

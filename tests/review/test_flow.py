@@ -105,9 +105,16 @@ async def test_a_workspace_admin_approves_a_proposal_in_the_api(
     refused = await client.post(f"/approvals/{pending[0]['id']}/approve", headers=member)
     assert refused.status_code == 409
     assert "workspace admin" in refused.json()["detail"]
+    # A proposal has only the scope "once". The scope "session" is refused and changes nothing.
+    assert pending[0]["scopes"] == ["once"]
+    session_scope = await client.post(
+        f"/approvals/{pending[0]['id']}/approve", headers=admin, json={"scope": "session"}
+    )
+    assert session_scope.status_code == 422
+    assert len((await client.get(f"/sessions/{s1}/approvals", headers=admin)).json()) == 1
     decided = await client.post(f"/approvals/{pending[0]['id']}/approve", headers=admin)
     assert decided.status_code == 200
-    assert decided.json() == {"status": "approved", "resumed": False}
+    assert decided.json() == {"status": "approved", "scope": "once", "resumed": False}
     assert await review.entries(Target.WORKSPACE) == ("builds with make",), "applied at once"
     assert (await review.proposal_rows())[0].status == "applied"
     assert (await client.get(f"/sessions/{s1}/approvals", headers=admin)).json() == []
