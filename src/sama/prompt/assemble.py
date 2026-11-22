@@ -227,13 +227,14 @@ class PromptAssembler:
         (Section 16.1). The assembler has no other server, so no MCP server of a user is
         in the config."""
         async with self._engine.connect() as connection:
+            toolsets = await _toolsets(connection, run)
             return RunConfig(
-                memory_snapshot=await _memory_snapshot(connection, run),
+                memory_snapshot=await _memory_snapshot(connection, run, toolsets),
                 runtime=RuntimeKind(run.runtime),
                 model=run.model,
                 system=REVIEW_SYSTEM_PROMPT,
                 environment=environment(run, datetime.now(UTC)),
-                skill_index=await self._skill_index(connection, run),
+                skill_index=await self._skill_index(connection, run, toolsets),
                 mcp_servers=self._mcp_servers,
             )
 
@@ -283,8 +284,10 @@ class PromptAssembler:
                 )
             ).scalar_one()
             runtime = RuntimeKind(profile_runtime)
+        # One read of the toolsets serves the notes, the skill index, and the sub-agents.
+        toolsets = await _toolsets(connection, run)
         return RunConfig(
-            memory_snapshot=await _memory_snapshot(connection, run),
+            memory_snapshot=await _memory_snapshot(connection, run, toolsets),
             runtime=runtime,
             model=run.model,
             system=self._system,
@@ -292,19 +295,20 @@ class PromptAssembler:
             context_files=tuple(files),
             environment=environment(run, started, channel),
             mcp_servers=self._mcp_servers,
-            skill_index=await self._skill_index(connection, run),
+            skill_index=await self._skill_index(connection, run, toolsets),
             # A library agent has no sub-agents: no nested sub-agents (Section 13.3).
-            subagents=() if agent is not None else await _subagents(connection, run, runtime),
+            subagents=()
+            if agent is not None
+            else await _subagents(connection, run, runtime, toolsets),
             reasoning_effort=run.reasoning_effort,
         )
 
     async def _skill_index(
-        self, connection: AsyncConnection, run: ClaimedRun
+        self, connection: AsyncConnection, run: ClaimedRun, toolsets: frozenset[str]
     ) -> tuple[SkillIndexEntry, ...]:
         """The skill index of the run. It is frozen with the config (Section 6.1)."""
         if self._skills is None:
             return ()
-        toolsets = await _toolsets(connection, run)
         if "skills" not in toolsets:
             return ()
         actor = await self._skills.actor(
@@ -350,13 +354,12 @@ async def _toolsets(connection: AsyncConnection, run: ClaimedRun) -> frozenset[s
 
 
 async def _subagents(
-    connection: AsyncConnection, run: ClaimedRun, runtime: RuntimeKind
+    connection: AsyncConnection, run: ClaimedRun, runtime: RuntimeKind, toolsets: frozenset[str]
 ) -> tuple[SubagentDefinition, ...]:
     """The native sub-agents of the run (Section 13.1): the sub-agents of the profile, limited
     to the toolsets of the run. A run without the toolset ``subagents`` has none, and a runtime
     without native sub-agents has none. A bad value in the column gives none and a warning, so
     a run never fails because of it."""
-    toolsets = await _toolsets(connection, run)
     if SUBAGENT_TOOLSET not in toolsets:
         return ()
     raw = (
@@ -433,10 +436,13 @@ def library_snapshot(snapshot: dict[str, Any], agent: dict[str, Any]) -> dict[st
     }
 
 
-async def _memory_snapshot(connection: AsyncConnection, run: ClaimedRun) -> str:
+async def _memory_snapshot(
+    connection: AsyncConnection, run: ClaimedRun, toolsets: frozenset[str]
+) -> str:
     """The notes of the agent, the workspace, and the owner of a private session. Only a run
-    with the ``memory`` toolset gets them (Section 8)."""
-    if "memory" not in await _toolsets(connection, run):
+    with the ``memory`` toolset gets them (Section 8). ``toolsets`` are the toolsets of the
+    run, read once for the whole config."""
+    if "memory" not in toolsets:
         return ""
     # Here, not at the top: ``sama.memory`` imports ``sama.prompt.scan``.
     from sama.memory.store import load_snapshot

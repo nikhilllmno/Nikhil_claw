@@ -31,6 +31,10 @@ Optional environment:
   ``SAMA_SANDBOX_TEMPLATE``, ``SAMA_SANDBOX_ALLOW_OUT`` (comma-separated hosts),
   ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_VISION_MODEL`` (the model of
   ``vision_analyze``, default ``claude-sonnet-5-5``).
+- ``SAMA_DB_POOL_SIZE`` (default 10), ``SAMA_DB_POOL_OVERFLOW`` (5), ``SAMA_DB_POOL_TIMEOUT_S``
+  (30), ``SAMA_DB_POOL_RECYCLE_S`` (1800), ``SAMA_DB_POOL_PREWARM`` (4),
+  ``SAMA_DB_POOL_WARN_MS`` (100), ``SAMA_DB_PREPARED_STATEMENTS`` (``on`` or ``off``): the
+  database pool (docs/architecture.md, Section 4.4).
 - ``SAMA_BROWSER_TASK_MODEL``: the Anthropic model of ``browser_task`` (default
   ``claude-sonnet-5-5``; it must have a price).
 - ``SAMA_CONNECTOR_HOST_TEMPLATE``: the E2B template of the connector hosts of stdio MCP

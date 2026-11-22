@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,6 +12,9 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+
+from sama.db.pool import PoolSettings, configure
+from sama.db.trips import instrument
 
 ASYNC_DRIVER = "postgresql+asyncpg"
 
@@ -27,9 +31,21 @@ def async_url(url: str) -> str:
     return urlunsplit(parts._replace(scheme=ASYNC_DRIVER, query=urlencode(query)))
 
 
-def create_engine(url: str, **kwargs: Any) -> AsyncEngine:
-    """Creates an async engine for a ``postgresql://`` URL."""
-    return create_async_engine(async_url(url), **kwargs)
+def create_engine(url: str, *, pool: PoolSettings | None = None, **kwargs: Any) -> AsyncEngine:
+    """Creates an async engine for a ``postgresql://`` URL.
+
+    Without ``poolclass`` in ``kwargs``, the engine has the measured pool of ``pool`` (default:
+    the settings of the environment, Section 4.4). The engine counts its round trips for
+    ``sama.db.trips.count_trips``.
+    """
+    if "poolclass" not in kwargs:
+        pool = pool or PoolSettings.from_env(os.environ)
+        kwargs = {**pool.engine_options(), **kwargs}
+    engine = create_async_engine(async_url(url), **kwargs)
+    if pool is not None:
+        configure(engine, pool)
+    instrument(engine)
+    return engine
 
 
 @asynccontextmanager

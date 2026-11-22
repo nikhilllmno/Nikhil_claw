@@ -49,7 +49,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy import Select, and_, delete, exists, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Lifespan
@@ -154,6 +154,7 @@ from sama.db.models import (
     ChannelIdentity,
     CustomTool,
     Integration,
+    Membership,
     Message,
     Org,
     ReviewProposal,
@@ -209,7 +210,13 @@ from sama.orchestrator.checkpoints import (
     restored_text,
 )
 from sama.orchestrator.prewarm import SessionWarmer, WarmRateLimitedError, WarmStatus
-from sama.orchestrator.queue import QueueError, QuotaExceededError, RateLimitedError, RunQueue
+from sama.orchestrator.queue import (
+    ACTIVE_STATUSES,
+    QueueError,
+    QuotaExceededError,
+    RateLimitedError,
+    RunQueue,
+)
 from sama.orchestrator.signals import SessionSignals
 from sama.orgs import AuthUsersEmails, OrgService, SignupPolicy
 from sama.orgs.permissions import (
@@ -255,7 +262,13 @@ from sama.skills.store import PostgresSkillStore
 from sama.subagent_library import SubagentLibrary
 from sama.subagents import SubagentError, parse_subagents, supports_subagents
 from sama.tenancy.access import Grants, load_grants
-from sama.tenancy.regions import OrgInOtherRegion, home_regions, member_user_id, served_here
+from sama.tenancy.regions import (
+    OrgInOtherRegion,
+    check_here,
+    home_regions,
+    member_user_id,
+    served_here,
+)
 from sama.tools.clarify import ClarifyBroker, ClarifyError
 from sama.triggers import router as trigger_routes
 from sama.triggers import service as triggers
@@ -306,6 +319,11 @@ class ApiSettings(BaseModel):
     """The open event streams of this process. One more stream gets ``429``."""
     max_streams_per_user: int = Field(default=8, gt=0)
     """The open event streams of one user in this process."""
+    stream_db_slots: int = Field(default=4, gt=0)
+    """At most this many event stream polls read the database at the same time. A poll holds a
+    database connection for about 6 round trips (0.4 s when the database is 60 ms away). Many
+    streams would use the whole pool, and a send or an approval would wait for a connection
+    (Section 4.4). A poll that finds no free slot waits in the process, not in the pool."""
     web_origins: tuple[str, ...] = ()
     """The exact origins of the web app (``SAMA_WEB_ORIGINS``). With none, the API sends no CORS
     headers."""
@@ -976,6 +994,9 @@ class SessionAccess:
     """The user row of the token in the org of the session."""
     grants: Grants | None = None
     """The memberships of the user in the org of the session."""
+    open_run: bool | None = None
+    """Whether the session had a queued, running, or paused run when the access was read.
+    ``None`` when the caller did not ask."""
 
     @property
     def org_id(self) -> uuid.UUID:
@@ -1075,23 +1096,86 @@ _SESSION_COLUMNS: Final = (
 )
 
 
-async def session_access(
-    connection: AsyncConnection, principal: Principal, session_id: uuid.UUID
-) -> SessionAccess:
-    """Checks that the user can read the session, with both guards. ``connection`` must run
-    as the user (``as_user``). Raises ``404`` if not."""
-    row = (
-        await connection.execute(select(*_SESSION_COLUMNS).where(Session.id == session_id))
-    ).one_or_none()
-    if row is None:
+def _access_select(
+    principal: Principal, *extra: Any, source: Any = None, busy: bool = False
+) -> Select[Any]:
+    """One statement for everything that an access check reads: the session, the user of the
+    person in the org (with the region of the org), and the memberships of the user. Three
+    statements cost three round trips, and the database can be 60 ms away (Section 4.4).
+    ``source`` is a join that starts at ``sessions``. ``busy`` adds ``open_run``: whether the
+    session has a queued, running, or paused run."""
+    columns: list[Any] = [
+        *_SESSION_COLUMNS,
+        User.id.label("member_user_id"),
+        Org.region.label("member_region"),
+        Membership.workspace_id.label("grant_workspace_id"),
+        Membership.role.label("grant_role"),
+        *extra,
+    ]
+    if busy:
+        columns.append(
+            exists()
+            .where(
+                Run.org_id == Session.org_id,
+                Run.session_id == Session.id,
+                Run.status.in_(("queued", *ACTIVE_STATUSES)),
+            )
+            .label("open_run")
+        )
+    return (
+        select(*columns)
+        .select_from(Session if source is None else source)
+        .outerjoin(
+            User,
+            and_(User.org_id == Session.org_id, User.auth_user_id == principal.auth_user_id),
+        )
+        .outerjoin(Org, Org.id == User.org_id)
+        .outerjoin(
+            Membership, and_(Membership.org_id == Session.org_id, Membership.user_id == User.id)
+        )
+    )
+
+
+def _access_from(rows: Sequence[Any], *, busy: bool = False) -> SessionAccess:
+    """The access of the rows of ``_access_select``. Raises ``404`` if the user cannot read
+    the session, and ``OrgInOtherRegion`` (``421``) for an org in another region."""
+    if not rows:
         raise _not_found()
-    user_id = await _user_id(connection, principal, row.org_id)
-    if user_id is None:
+    row = rows[0]
+    if row.member_user_id is None or row.member_region is None:
         raise _not_found()
-    grants = await load_grants(connection, row.org_id, user_id)
+    check_here(row.member_region)
+    grants = Grants(
+        row.member_user_id,
+        tuple(
+            (item.grant_workspace_id, item.grant_role)
+            for item in rows
+            if item.grant_role is not None
+        ),
+    )
     if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
         raise _not_found()
-    return SessionAccess(row, user_id, grants)
+    return SessionAccess(
+        row, row.member_user_id, grants, open_run=bool(row.open_run) if busy else None
+    )
+
+
+async def session_access(
+    connection: AsyncConnection,
+    principal: Principal,
+    session_id: uuid.UUID,
+    *,
+    busy: bool = False,
+) -> SessionAccess:
+    """Checks that the user can read the session, with both guards. ``connection`` must run
+    as the user (``as_user``). Raises ``404`` if not. It uses one statement. With ``busy``,
+    the access has ``open_run`` (see ``_access_select``)."""
+    rows = (
+        await connection.execute(
+            _access_select(principal, busy=busy).where(Session.id == session_id)
+        )
+    ).all()
+    return _access_from(rows, busy=busy)
 
 
 def _pin_out(pin: Pin) -> PinOut:
@@ -1346,6 +1430,7 @@ class SamaApi:
         self._engine = engine
         self._warmer = warmer
         self._signals = signals
+        self._poll_slots = asyncio.Semaphore((settings or ApiSettings()).stream_db_slots)
         self._coding_mode = coding_mode
         self._browser = browser
         self._api_keys = ApiKeyStore(engine)
@@ -4440,11 +4525,13 @@ class SamaApi:
         """
         async with as_user(self._engine, principal.auth_user_id) as connection:
             try:
-                access = await session_access(connection, principal, session_id)
+                # ``busy`` also reads whether the session has an open run, in the same statement.
+                access = await session_access(connection, principal, session_id, busy=True)
             except HTTPException as error:
                 raise SendError(error.status_code, str(error.detail)) from None
         attachments: tuple[NewAttachment, ...] = ()
         coding_agent: CodingAgent | None = None
+        steer = False
         if page is None:
             command = parse_command(text)
             if command is not None and command.agent is not None and command.task:
@@ -4454,25 +4541,7 @@ class SamaApi:
             else:
                 typed = text
                 text = await self._expand_skill(access, text)
-                if join and not parallel and text == typed:
-                    try:
-                        steered = await self._queue.steer(
-                            org_id=access.org_id,
-                            session_id=session_id,
-                            text=text,
-                            user_id=access.user_id,
-                            busy_mode=True,
-                        )
-                    except RateLimitedError as error:
-                        raise SendError(
-                            429, str(error), retry_after_s=error.retry_after_s
-                        ) from None
-                    except QuotaExceededError as error:
-                        raise SendError(402, str(error), quota=error.quota) from None
-                    except QueueError as error:
-                        raise SendError(409, str(error)) from None
-                    if steered is not None:
-                        return Sent(run_id=steered, queued=False, steered=True)
+                steer = join and not parallel and text == typed
         else:
             session = access.session
             if session.audience != "private" or session.owner_user_id != access.user_id:
@@ -4483,7 +4552,9 @@ class SamaApi:
                 raise SendError(422, str(error)) from None
             text, attachments = message.text, message.attachments
         try:
-            run_id = await self._queue.enqueue(
+            # One transaction: the note for a running run, or the queued run, and the check
+            # whether it waits (Section 4.4).
+            submitted = await self._queue.submit(
                 org_id=access.org_id,
                 session_id=session_id,
                 text=text,
@@ -4492,15 +4563,16 @@ class SamaApi:
                 coding_agent=None if coding_agent is None else coding_agent.value,
                 parallel=parallel,
                 human=True,
+                steer=steer,
+                open_run=access.open_run,
             )
+            return Sent(run_id=submitted.run_id, queued=submitted.queued, steered=submitted.steered)
         except RateLimitedError as error:
             raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None
         except QuotaExceededError as error:
             raise SendError(402, str(error), quota=error.quota) from None
         except QueueError as error:
             raise SendError(409, str(error)) from None
-        queued = await self._queue.waits(org_id=access.org_id, run_id=run_id)
-        return Sent(run_id=run_id, queued=queued)
 
     async def _steer(self, principal: Principal, session_id: uuid.UUID, text: str) -> JSONResponse:
         """``POST /sessions/{id}/steer`` (M3.9): a note for the open run of the session. When no
@@ -4700,21 +4772,29 @@ class SamaApi:
         is also open to the workspace admin and the org owner, who may not read the private
         session (Section 9.4); the gate checks their role. Raises ``404``."""
         async with as_user(self._engine, principal.auth_user_id) as connection:
-            row = (
+            # One statement reads the approval, the session, the user, and the memberships.
+            rows = (
                 await connection.execute(
-                    select(Approval.session_id, Approval.run_id, Approval.call_id).where(
-                        Approval.id == approval_id
-                    )
+                    _access_select(
+                        principal,
+                        Approval.run_id,
+                        Approval.call_id,
+                        source=Session.__table__.join(
+                            Approval,
+                            and_(
+                                Approval.org_id == Session.org_id, Approval.session_id == Session.id
+                            ),
+                        ),
+                    ).where(Approval.id == approval_id)
                 )
-            ).one_or_none()
-            if row is not None:
-                try:
-                    access = await session_access(connection, principal, row.session_id)
-                except HTTPException as error:
-                    if error.status_code != 404:
-                        raise
-                else:
-                    return access.org_id, access.user_id, row.run_id, row.call_id
+            ).all()
+            try:
+                access = _access_from(rows)
+            except HTTPException as error:
+                if error.status_code != 404:
+                    raise
+            else:
+                return access.org_id, access.user_id, rows[0].run_id, rows[0].call_id
         proposal = await self._review_approval(principal, approval_id)
         if proposal is None:
             raise _not_found("the approval does not exist")
@@ -4841,6 +4921,11 @@ class SamaApi:
         scope: ApprovalScope | None,
     ) -> JSONResponse:
         org_id, user_id, run_id, call_id = await self._approval_target(principal, approval_id)
+
+        async def release(connection: AsyncConnection) -> list[uuid.UUID]:
+            # An expired approval resumes the run as a reject, so it is released too.
+            return await self._queue.release_decided_in(connection, org_id=org_id, run_id=run_id)
+
         try:
             decision = await self._gate.decide_with_scope(
                 org_id=org_id,
@@ -4851,23 +4936,24 @@ class SamaApi:
                 always_allow=always_allow,
                 scope=scope,
                 reason=reason,
+                release=release,
             )
         except ApprovalExpiredError as error:
-            # An expired approval resumes the run as a reject.
-            await self._queue.release_decided(org_id=org_id, run_id=run_id)
+            # The release ran in the transaction of the decision: the run resumes as a reject.
             await self._apply_reviews(org_id, run_id)
             return JSONResponse(status_code=409, content={"detail": str(error)})
         except ApprovalScopeError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
         except ApprovalError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
-        resumed = await self._queue.release_decided(org_id=org_id, run_id=run_id)
-        await self._apply_reviews(org_id, run_id)
+        if decision.proposal:
+            # Only a review proposal has more to do (Section 9.4).
+            await self._apply_reviews(org_id, run_id)
         return JSONResponse(
             content={
                 "status": decision.status,
                 "scope": decision.scope,
-                "resumed": bool(resumed),
+                "resumed": bool(decision.released),
             }
         )
 
@@ -4990,7 +5076,10 @@ class SamaApi:
             # The ticket comes before the read, so a store during the read wakes the next wait.
             ticket = signals.ticket(key) if signals is not None else None
             out: list[StreamEvent] = []
-            async with as_user(self._engine, principal.auth_user_id) as connection:
+            async with (
+                self._poll_slots,
+                as_user(self._engine, principal.auth_user_id) as connection,
+            ):
                 try:
                     access = await session_access(connection, principal, session_id)
                 except HTTPException:
@@ -5073,6 +5162,9 @@ class SamaApi:
         )
         watched = [run_id for run_id, status in statuses.items() if status in OPEN_RUN_STATUSES]
         rows = {run.id: run for run in recent}
+        if len(rows) < RECENT_RUNS:
+            # The recent runs are all the chat runs of the session: no older run is open.
+            return list(rows.values())
         older = await connection.execute(
             select(*columns).where(
                 *scope,
