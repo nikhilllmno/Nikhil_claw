@@ -97,8 +97,10 @@ from sama.observability.langfuse import LangfuseClient
 from sama.observability.traces import TraceExporter
 from sama.orchestrator import PostgresSandboxDirectory, RunQueue, Worker
 from sama.orchestrator.checkpoints import CheckpointService
+from sama.orchestrator.prewarm import SessionWarmer
 from sama.orchestrator.references import ReferenceExpander
 from sama.orchestrator.sandboxed import WARM_RUNNER_ARGV, SandboxedRuntime, SandboxSettings
+from sama.orchestrator.signals import SessionSignals
 from sama.prompt import PromptAssembler
 from sama.review.apply import ReviewApplier
 from sama.review.change import ChangeProposer
@@ -307,6 +309,9 @@ def build(
     chrome = ChromeHub()
     browser = _browser_service(settings, engine, chrome, vault)
     gate.escalation = browser.sensitive_reason
+    # The worker wakes the event streams of this process when it stores events (Section 4.4).
+    signals = SessionSignals()
+    warmer = SessionWarmer(sandboxed.warm) if sandboxed is not None else None
     worker = Worker(
         queue,
         registry,
@@ -326,6 +331,7 @@ def build(
         ),
         poll_s=worker_poll_s,
         on_run_end=[browser.end_run, *([memory_sync] if memory_sync is not None else [])],
+        signals=signals,
     )
     # Without an OpenAI key, there is no embed worker, and session search uses the full-text
     # index alone (Section 7.1).
@@ -685,6 +691,9 @@ def build(
         data=data,
         billing=billing,
         custom_tools=custom_tools,
+        # The session sandbox starts before the first run (Section 4.4).
+        warmer=warmer,
+        signals=signals,
     )
     api_app = api.app()
     tools_app = tools.app()
@@ -715,6 +724,9 @@ def build(
             stack.push_async_callback(engine.dispose)
             if sandboxed is not None:
                 stack.push_async_callback(_close_sandboxes, sandboxed)
+            if warmer is not None:
+                # A warm that still runs stops before the sandboxes pause.
+                stack.push_async_callback(warmer.aclose)
             await stack.enter_async_context(proxy_app.router.lifespan_context(proxy_app))
             await stack.enter_async_context(tools_app.router.lifespan_context(tools_app))
             await stack.enter_async_context(agents_app.router.lifespan_context(agents_app))

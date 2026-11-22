@@ -50,6 +50,7 @@ from sama.runtime.contract import (
     RunConfig,
     RunEvent,
     RunFailed,
+    RunPhase,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -456,6 +457,10 @@ async def _run_job(
             if requested.is_set() and not is_terminal(event):
                 requested.clear()  # The control task sets it once, so this repeats it once.
                 await runtime.cancel(run_id)
+            if isinstance(event, RunPhase):
+                timing.mark("thinking")  # progress only: no usage, not the first event
+                out.event(event)
+                continue
             usage = event.usage
             ended = is_terminal(event)
             timing.mark("first_event")

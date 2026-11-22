@@ -45,6 +45,8 @@ from sama.runtime import (
     RunCompleted,
     RunEvent,
     RunFailed,
+    RunPhase,
+    RunPhaseName,
     RunRequest,
     RunScope,
     RuntimeKind,
@@ -437,6 +439,30 @@ async def test_streams_text_and_completes() -> None:
     state = json.loads(terminal.runtime_state)
     assert state["session_id"] == SESSION
     assert state["pending"] is None
+
+
+def message_start(parent: str | None = None) -> StreamEvent:
+    return StreamEvent(
+        uuid="u", session_id=SESSION, event={"type": "message_start"}, parent_tool_use_id=parent
+    )
+
+
+async def test_a_model_turn_sends_the_thinking_phase_before_its_text() -> None:
+    factory = Factory(
+        [
+            message_start(),
+            message_start(parent="toolu_sub"),  # a sub-agent turn: no phase
+            delta("Hi"),
+            assistant(TextBlock(text="Hi")),
+            result(text="Hi"),
+        ]
+    )
+    events = await collect(ClaudeRuntime(client_factory=factory).run(request()))
+    validate_event_stream(events)
+    assert [type(e) for e in events[:2]] == [RunPhase, TextDelta]
+    phase = events[0]
+    assert isinstance(phase, RunPhase)
+    assert phase.phase is RunPhaseName.THINKING
 
 
 async def test_text_without_stream_events_comes_from_the_assistant_message() -> None:
