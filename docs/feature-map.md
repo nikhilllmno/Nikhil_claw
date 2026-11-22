@@ -52,7 +52,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 | Terminal backends (local, Docker, SSH, Modal, Daytona, ...) | `tools/environments/` | One `SandboxProvider`: E2B in the cloud, Docker for development and CI (D5). | Adapt | M1 |
 | `web_search`, `web_extract` | `tools/web_tools.py` | Sama tools, search provider key on the control plane (§10.2). | Adapt | M1 |
 | `x_search` | `tools/x_search_tool.py` | Sama tool in the `web` toolset: the recent search of the X API v2 with the X token of the org or of sama, at most 20 posts, untrusted content (§10.2.2). | Adapt | M7 (M7.5 done) |
-| `vision_analyze` | `tools/vision_tools.py` | Sama `media` tool. Images from Telegram and Slack are stored, and a vision model answers questions about them (§11.7). | Adapt | M2 (done) |
+| `vision_analyze` | `tools/vision_tools.py` | Sama `media` tool. Images from Telegram, Slack, and the web composer (M8.2, `POST /sessions/{id}/messages/images`) are stored, and a vision model answers questions about them (§11.7). | Adapt | M2 (done) |
 | `video_analyze` | `tools/vision_tools.py` | Sama `media` tool with Gemini: a YouTube link, an `https` video file, or a file of the sandbox (at most 14 MB). Frames and audio in one call, metered (§10.2.2). | Adapt | M7 (M7.5 done) |
 | `video_generate` | `tools/video_generation_tool.py` | Not yet: a video takes minutes to make, costs much more than an image, and needs a new kind of generated file and channel delivery (§10.2.2, A4). | Defer | — |
 | `image_generate` | `tools/image_generation_tool.py` | Sama `media` tool with the OpenAI image model. Telegram sends a photo, Slack uploads a file, and the API lists the file (§11.8). | Adapt | M4 (M4.9 done) |

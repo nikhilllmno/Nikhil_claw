@@ -369,6 +369,42 @@ export interface ChatMessage {
   author_user_id: string | null;
   text: string;
   created_at: string;
+  /**
+   * The images that the user sent with the message (M8.2), in the order of the
+   * `[image attached: ...]` lines of `text`. Load one with `getAttachment`.
+   */
+  images?: MessageImage[];
+}
+
+/** The metadata of an image of a message. The bytes come from `getAttachment`. */
+export interface MessageImage {
+  id: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+}
+
+/** The rules of the API for the images of one message (`sama.media.images`, M8.2). */
+export const MAX_IMAGES_PER_MESSAGE = 4;
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+
+/**
+ * The reason why the API would refuse these files, or `null`. The API checks the first bytes of
+ * each file too, so this is only a fast check before the upload.
+ */
+export function imageProblem(files: readonly File[]): string | null {
+  if (files.length > MAX_IMAGES_PER_MESSAGE) {
+    return `sama reads only the first ${MAX_IMAGES_PER_MESSAGE} images of a message.`;
+  }
+  for (const file of files) {
+    if (!(IMAGE_TYPES as readonly string[]).includes(file.type)) {
+      return "sama reads only PNG, JPEG, GIF, and WebP images.";
+    }
+    if (file.size > MAX_IMAGE_BYTES) return "That image is too large. The limit is 10 MB.";
+    if (file.size === 0) return "sama could not read that image. Send it again.";
+  }
+  return null;
 }
 
 /** The answer of `POST /sessions/{id}/messages`. */
@@ -1926,6 +1962,7 @@ export function errorMessage(status: number, body: unknown): string {
   if (status === 403) return "You do not have permission to do this.";
   if (status === 402) return "The org used a model quota of its plan.";
   if (status === 404) return "Not found.";
+  if (status === 413) return "The upload is too large.";
   if (status === 429) return "Too many requests. Wait a moment and try again.";
   return `The request failed (${status}).`;
 }
@@ -1951,6 +1988,8 @@ export interface TokenSource {
 export interface RequestOptions {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   body?: unknown;
+  /** A `multipart/form-data` body. The browser sets the `Content-Type` with the boundary. */
+  form?: FormData;
   signal?: AbortSignal;
 }
 
@@ -1985,7 +2024,7 @@ export class ApiClient {
       return this.fetcher(`${this.baseUrl}${path}`, {
         method: options.method ?? "GET",
         headers,
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        body: options.form ?? (options.body === undefined ? undefined : JSON.stringify(options.body)),
         signal: options.signal,
       });
     };
@@ -2119,6 +2158,24 @@ export class ApiClient {
       method: "POST",
       body: parallel ? { text, parallel } : { text },
     });
+  /**
+   * Sends a message with up to 4 images (M8.2). `text` can be empty when there is an image.
+   * The answer is the answer of `sendMessage`. A message with images never joins a running
+   * run: it queues, or with `parallel` it starts a run next to the open runs.
+   */
+  sendMessageWithImages = (id: string, text: string, files: readonly File[], parallel = false) => {
+    const form = new FormData();
+    form.append("text", text);
+    if (parallel) form.append("parallel", "true");
+    for (const file of files) form.append("images", file, file.name);
+    return this.json<SentMessage>(`/sessions/${id}/messages/images`, { method: "POST", form });
+  };
+  /**
+   * The bytes of an image of a message. An `img` element cannot send the Bearer token, so the
+   * web app fetches the image here and shows `URL.createObjectURL(file.blob)`.
+   */
+  getAttachment = (sessionId: string, attachmentId: string) =>
+    this.download(`/sessions/${sessionId}/attachments/${attachmentId}`, "image");
   listSteers = (id: string) => this.json<SteerNote[]>(`/sessions/${id}/steers`);
   listOpenRuns = (id: string) => this.json<OpenRun[]>(`/sessions/${id}/open-runs`);
   /** A note for the open run. Without an open run the API sends the text as a message. */

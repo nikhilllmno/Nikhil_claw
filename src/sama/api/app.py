@@ -114,6 +114,7 @@ from sama.api.tasks import (
     TaskOut,
     TaskStatus,
 )
+from sama.api.uploads import read_message
 from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
 from sama.coding.agents import CodingAgent
@@ -141,6 +142,7 @@ from sama.db.models import (
     MAX_STEER_CHARS,
     AgentProfile,
     Approval,
+    Attachment,
     AuditEntry,
     ChannelIdentity,
     CustomTool,
@@ -167,7 +169,8 @@ from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
 from sama.media.generate import GeneratedMediaStore
-from sama.media.images import NewAttachment
+from sama.media.images import NewAttachment, clean_name, with_markers
+from sama.media.store import AttachmentStore
 from sama.memory import (
     CAPS,
     MemoryChangeError,
@@ -976,6 +979,12 @@ class _CorsApp(FastAPI):
         )
 
 
+def _marker_at(text: str, image: dict[str, Any]) -> int:
+    """Where the marker line of an image is in the text of its message."""
+    found = text.find(str(image["id"]))
+    return len(text) if found < 0 else found
+
+
 def _not_found(what: str = NOT_FOUND) -> HTTPException:
     return HTTPException(status_code=404, detail=what)
 
@@ -1239,6 +1248,7 @@ class SamaApi:
         self._jobs = jobs
         self._workflows = workflows
         self._media = GeneratedMediaStore(engine)
+        self._attachments = AttachmentStore(engine)
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._board = TaskBoard(engine, self._queue)
@@ -1405,7 +1415,18 @@ class SamaApi:
         async def send_message(
             principal: Me, session_id: uuid.UUID, body: NewMessage
         ) -> JSONResponse:
-            return await self._send(principal, session_id, body)
+            return await self._send(principal, session_id, body.text, body.parallel)
+
+        @app.post("/sessions/{session_id}/messages/images", status_code=202)
+        async def send_message_with_images(
+            principal: Me, session_id: uuid.UUID, request: Request
+        ) -> JSONResponse:
+            # The access check comes first: a user who cannot see the session sends no byte.
+            await self._access(principal, session_id)
+            message = await read_message(request)
+            return await self._send(
+                principal, session_id, message.text, message.parallel, message.images
+            )
 
         @app.get("/sessions/{session_id}/steers")
         async def list_steers(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -1528,6 +1549,26 @@ class SamaApi:
                 headers={
                     "Content-Disposition": f'inline; filename="{name}"',
                     "Cache-Control": "private, max-age=3600",
+                },
+            )
+
+        @app.get("/sessions/{session_id}/attachments/{attachment_id}")
+        async def get_attachment(
+            principal: Me, session_id: uuid.UUID, attachment_id: uuid.UUID
+        ) -> Response:
+            access = await self._access(principal, session_id)
+            image = await self._attachments.load(
+                org_id=access.org_id, session_id=session_id, attachment_id=attachment_id
+            )
+            if image is None:
+                raise _not_found("the image does not exist")
+            return Response(
+                content=image.data,
+                media_type=image.mime_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{clean_name(image.name)}"',
+                    "Cache-Control": "private, max-age=3600",
+                    "X-Content-Type-Options": "nosniff",
                 },
             )
 
@@ -3049,20 +3090,55 @@ class SamaApi:
                 .order_by(Message.seq)
                 .limit(limit)
             )
-            return [
-                {
-                    "id": str(row.id),
-                    "seq": row.seq,
-                    "run_id": None if row.run_id is None else str(row.run_id),
-                    "role": row.role,
-                    "author_user_id": None
-                    if row.author_user_id is None
-                    else str(row.author_user_id),
-                    "text": str((row.content or {}).get("text", "")),
-                    "created_at": row.created_at.isoformat(),
-                }
-                for row in rows
-            ]
+            messages = rows.all()
+            images: dict[uuid.UUID, list[dict[str, Any]]] = {}
+            if messages:
+                # The metadata only, never the bytes (M8.2): ``data`` is not in the column grant.
+                found = await connection.execute(
+                    select(
+                        Attachment.id,
+                        Attachment.message_id,
+                        Attachment.name,
+                        Attachment.mime_type,
+                        Attachment.size_bytes,
+                    )
+                    .where(
+                        Attachment.org_id == access.org_id,
+                        Attachment.session_id == session_id,
+                        Attachment.message_id.in_([row.id for row in messages]),
+                    )
+                    .order_by(Attachment.created_at, Attachment.id)
+                )
+                for image in found:
+                    images.setdefault(image.message_id, []).append(
+                        {
+                            "id": str(image.id),
+                            "name": image.name,
+                            "mime_type": image.mime_type,
+                            "size_bytes": image.size_bytes,
+                        }
+                    )
+            out: list[dict[str, Any]] = []
+            for row in messages:
+                text = str((row.content or {}).get("text", ""))
+                # The images of one message share a time, so the order of the marker lines in
+                # the text is the order of the images.
+                shown = sorted(images.get(row.id, []), key=lambda item: _marker_at(text, item))
+                out.append(
+                    {
+                        "id": str(row.id),
+                        "seq": row.seq,
+                        "run_id": None if row.run_id is None else str(row.run_id),
+                        "role": row.role,
+                        "author_user_id": None
+                        if row.author_user_id is None
+                        else str(row.author_user_id),
+                        "text": text,
+                        "created_at": row.created_at.isoformat(),
+                        "images": shown,
+                    }
+                )
+            return out
 
     async def _approvals(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
         async with as_user(self._engine, principal.auth_user_id) as connection:
@@ -4111,10 +4187,15 @@ class SamaApi:
         return await self._skills.expand(actor, text.strip()) or text
 
     async def _send(
-        self, principal: Principal, session_id: uuid.UUID, body: NewMessage
+        self,
+        principal: Principal,
+        session_id: uuid.UUID,
+        text: str,
+        parallel: bool,
+        images: tuple[NewAttachment, ...] = (),
     ) -> JSONResponse:
         try:
-            sent = await self.submit(principal, session_id, body.text, parallel=body.parallel)
+            sent = await self.submit(principal, session_id, text, parallel=parallel, images=images)
         except SendError as error:
             headers = {}
             if error.retry_after_s is not None:
@@ -4134,6 +4215,7 @@ class SamaApi:
         page: PageContext | None = None,
         parallel: bool = False,
         join: bool = True,
+        images: tuple[NewAttachment, ...] = (),
     ) -> Sent:
         """Queues a user message, as ``POST /sessions/{id}/messages`` does. Raises
         ``SendError``.
@@ -4163,7 +4245,7 @@ class SamaApi:
             else:
                 typed = text
                 text = await self._expand_skill(access, text)
-                if join and not parallel and text == typed:
+                if join and not parallel and not images and text == typed:
                     try:
                         steered = await self._queue.steer(
                             org_id=access.org_id,
@@ -4191,6 +4273,10 @@ class SamaApi:
             except PageError as error:
                 raise SendError(422, str(error)) from None
             text, attachments = message.text, message.attachments
+        if images and page is None:
+            # A note holds only text, so a message with images never joins a run. The text
+            # names each image, as in the channels (Section 11.7).
+            text, attachments = with_markers(text, images), images
         try:
             run_id = await self._queue.enqueue(
                 org_id=access.org_id,

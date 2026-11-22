@@ -3733,8 +3733,10 @@ cross-org check of Section 17.1 through the API.
 | `GET /invites`, `POST /invites/accept` | The open invites for the confirmed email of the user. Accept with `token` or `invite_id`. `403` for another email, `410` for an ended invite (Section 17.2). |
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
 | `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
-| `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
+| `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. A message that has images also has `images`: a list of `id`, `name`, `mime_type`, and `size_bytes` (M8.2). |
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `402` with `detail` and `quota` when the org or the user used a model quota of the plan (Section 17.5). `409` for an archived session. |
+| `POST /sessions/{id}/messages/images` | Queue a run with images from the web composer (M8.2, Section 11.7). The body is `multipart/form-data` with the fields `text` (can be empty when there is an image), `parallel` (`true` or `false`), and one to four `images` files. The rules of an image are the rules of Telegram and Slack. The answer is the answer of `POST /sessions/{id}/messages`, with the same `402`, `409`, and `429`. `404` when the user cannot see the session. `413` when the body or one image is too large. `422` for a wrong type, bytes that do not match the type, more than 4 images, or no text and no image. A message with an image never joins a running run as a note: it queues, like a message in Telegram. |
+| `GET /sessions/{id}/attachments/{attachment_id}` | The bytes of an image that a user sent with a message (Section 11.7). The answer has the stored image type, `Cache-Control: private`, and `X-Content-Type-Options: nosniff`. `404` for an id of another session. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
@@ -4327,6 +4329,35 @@ The code is in `src/sama/media/`.
   so a file of exactly the limit is accepted and a file of one byte more is refused.
 - The gateway makes the id of each image first, so that the text can name it. `RunQueue.enqueue`
   then stores the message and its images in one transaction. A failed store leaves neither.
+
+**Images from the web (M8.2).** The web composer of the web app sends images with
+`POST /sessions/{id}/messages/images` (Section 11.4). The route uses `sama.media.images`, so the
+rules are the rules of the channels.
+
+- The body is `multipart/form-data`: `text`, `parallel`, and one to four `images` files. A message
+  with an image and no text is valid. The text is at most 32,000 characters.
+- The route checks the session access first, before it reads the body. A user who cannot see the
+  session gets `404` and no byte is read.
+- The route limits the size of the body before it parses it. The limit is 4 images of 10 MB, plus
+  the text and the headers of the parts. The route refuses a `Content-Length` over the limit, and
+  it counts the bytes while it reads, also for a chunked body. A body over the limit gets `413`.
+  The parser keeps at most 5 files, and a file larger than 10 MB gets `413` after it reads at
+  most 10 MB and one byte.
+- Each file goes through `check_image`. The type that the browser gives and the first bytes of the
+  file must agree. A file that has no type, or the type `application/octet-stream`, gets the type
+  from its first bytes. The first bytes must still be PNG, JPEG, GIF, or WebP.
+- The text of the message is the text of the user and one marker line for each image, as in
+  Section 11.7 above. The message and its images are stored in one transaction
+  (`RunQueue.enqueue`). The rate limit, the quotas, the archived check, and the busy mode of a text
+  message apply. A message with images never joins a running run (the same rule as Telegram,
+  because a note holds only text): it queues, or it starts a parallel run with `parallel`.
+- The web shows an image of a message with `GET /sessions/{id}/attachments/{attachment_id}`.
+  The browser cannot add the `Authorization` header to an `img` element. So the web app fetches
+  the URL with the bearer token (`ApiClient.getAttachment`) and makes an object URL for the `img`
+  element. `ApiClient.sendMessageWithImages` sends the message. The CORS rules of
+  the API already allow the header. The answer is only for a user who can see the session.
+- `GET /sessions/{id}/messages` lists the images of each message in `images`, so the web app
+  can hide the marker lines and show a thumbnail.
 
 **Storage (migration `0015`).** The table `attachments` has one row for each image: `id`,
 `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data`
