@@ -116,7 +116,7 @@ from sama.api.tasks import (
 )
 from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
-from sama.coding.agents import CodingAgent
+from sama.coding.agents import CodingAgent, agent_for
 from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
 from sama.coding_mode.service import CodingService
 from sama.connectors.service import ConnectionService, ConnectionView, ConnectorError
@@ -235,7 +235,7 @@ from sama.search.service import SessionSearch
 from sama.skills.service import SkillLibrary
 from sama.skills.store import PostgresSkillStore
 from sama.subagent_library import SubagentLibrary
-from sama.subagents import SubagentError, parse_subagents, supports_subagents
+from sama.subagents import SubagentError, known_models, parse_subagents, supports_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tenancy.regions import OrgInOtherRegion, home_regions, member_user_id, served_here
 from sama.tools.clarify import ClarifyBroker, ClarifyError
@@ -759,6 +759,9 @@ class Answers(_Body):
     answers: list[str] = Field(min_length=1, max_length=10)
 
 
+MAX_MODEL_CHARS: Final = 100
+
+
 class SessionPatch(_Edit):
     """A rename, an archive, or a restore of a session (M7.10). A body has at least one field."""
 
@@ -770,6 +773,15 @@ class SessionPatch(_Edit):
         | None
     ) = None
     status: Literal["active", "archived"] | None = None
+    model: (
+        Annotated[
+            str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MODEL_CHARS)
+        ]
+        | None
+    ) = None
+    """The model for the next runs of the session (M8.2). ``null`` goes back to the model of the
+    profile. The runtime of the session must know the model."""
+    nullable: ClassVar[frozenset[str]] = frozenset({"model"})
 
 
 class SessionOut(BaseModel):
@@ -790,6 +802,28 @@ class SessionOut(BaseModel):
     can_manage: bool = False
     """True when ``PATCH /sessions/{id}`` lets the caller rename, archive, or restore the
     session: the owner of a private session, or the owner or an admin of a shared session."""
+    runtime: str | None = None
+    """The runtime of the session. ``GET /sessions/{id}`` and ``PATCH`` fill this field and the
+    next three. ``GET /sessions`` leaves them empty."""
+    model: str | None = None
+    """The model that the next run of the session uses (M8.2)."""
+    default_model: str | None = None
+    """The model without a choice of the user: the frozen model, or the model of the profile."""
+    model_is_override: bool = False
+    """True when a person chose a model that is not the default one."""
+
+
+class SessionModels(BaseModel):
+    """The models of a session (M8.2), for the model picker of the web app."""
+
+    runtime: str
+    models: list[str]
+    """The model ids that the runtime knows, sorted. Empty for a coding agent."""
+    model: str
+    default_model: str
+    is_override: bool
+    editable: bool
+    """True when the caller can change the model (``can_manage``) and the runtime lets it."""
 
 
 JobAction = Literal["pause", "resume", "run", "cancel"]
@@ -1042,6 +1076,74 @@ def _can_change_session(row: Any, grants: Grants) -> bool:
 def _session_out(row: Any, grants: Grants) -> SessionOut:
     out = SessionOut.model_validate(row, from_attributes=True)
     out.can_manage = _can_change_session(row, grants)
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelState:
+    """The model of a session as the next run sees it (Section 5.4, M8.2)."""
+
+    runtime: RuntimeKind
+    default: str
+    chosen: str | None
+
+    @property
+    def effective(self) -> str:
+        return self.default if self.chosen is None else self.chosen
+
+    @property
+    def is_override(self) -> bool:
+        return self.chosen is not None and self.chosen != self.default
+
+    @property
+    def selectable(self) -> bool:
+        """A coding agent chooses its own model, so the web app cannot choose it."""
+        return agent_for(self.runtime) is None
+
+    @property
+    def allowed(self) -> list[str]:
+        return known_models(self.runtime) if self.selectable else []
+
+
+async def _model_state(
+    connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID
+) -> _ModelState | None:
+    """The runtime and the models of a session. The frozen config wins over the profile, as it
+    does for a run. ``None`` when the session or its profile is not readable."""
+    row = (
+        await connection.execute(
+            select(
+                Session.model_override,
+                Session.run_config["model"].astext.label("frozen_model"),
+                Session.run_config["runtime"].astext.label("frozen_runtime"),
+                AgentProfile.model,
+                AgentProfile.runtime,
+            )
+            .join(
+                AgentProfile,
+                and_(
+                    AgentProfile.org_id == Session.org_id,
+                    AgentProfile.id == Session.agent_profile_id,
+                ),
+            )
+            .where(Session.org_id == org_id, Session.id == session_id)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return _ModelState(
+        runtime=RuntimeKind(row.frozen_runtime or row.runtime),
+        default=row.frozen_model or row.model,
+        chosen=row.model_override,
+    )
+
+
+def _with_model(out: SessionOut, state: _ModelState | None) -> SessionOut:
+    if state is not None:
+        out.runtime = state.runtime.value
+        out.model = state.effective
+        out.default_model = state.default
+        out.model_is_override = state.is_override
     return out
 
 
@@ -1391,6 +1493,10 @@ class SamaApi:
         @app.get("/sessions/{session_id}")
         async def get_session(principal: Me, session_id: uuid.UUID) -> SessionDetail:
             return await self._detail(principal, session_id)
+
+        @app.get("/sessions/{session_id}/models")
+        async def session_models(principal: Me, session_id: uuid.UUID) -> SessionModels:
+            return await self._session_models(principal, session_id)
 
         @app.get("/sessions/{session_id}/messages")
         async def list_messages(
@@ -2835,7 +2941,7 @@ class SamaApi:
         async with self._engine.begin() as connection:
             current = (
                 await connection.execute(
-                    select(Session.title, Session.status, Session.lineage)
+                    select(Session.title, Session.status, Session.lineage, Session.model_override)
                     .where(Session.org_id == access.org_id, Session.id == session_id)
                     .with_for_update()
                 )
@@ -2852,6 +2958,12 @@ class SamaApi:
                 values["status"] = body.status
                 actions.append(
                     ("session.archived" if body.status == "archived" else "session.restored", {})
+                )
+            if "model" in body.model_fields_set and body.model != current.model_override:
+                await self._check_model_change(connection, access.org_id, session_id, body.model)
+                values["model_override"] = body.model
+                actions.append(
+                    ("session.model_changed", {"from": current.model_override, "to": body.model})
                 )
             if values:
                 await connection.execute(
@@ -2879,7 +2991,27 @@ class SamaApi:
                     )
                 )
             ).one()
-        return _session_out(fresh, access.grants)
+            state = await _model_state(connection, access.org_id, session_id)
+        return _with_model(_session_out(fresh, access.grants), state)
+
+    @staticmethod
+    async def _check_model_change(
+        connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, model: str | None
+    ) -> None:
+        """Raises ``409`` for a session of a coding agent and ``422`` for a model that the
+        runtime of the session does not know. ``None`` (the model of the profile) always works.
+        The rule is the rule of the model of a profile (``update_profile``)."""
+        state = await _model_state(connection, org_id, session_id)
+        if state is None:
+            raise _not_found()
+        if not state.selectable:
+            raise HTTPException(
+                status_code=409, detail="a coding agent chooses its own model in this session"
+            )
+        if model is not None and model not in state.allowed:
+            raise HTTPException(
+                status_code=422, detail="the model is not known for the runtime of the session"
+            )
 
     @staticmethod
     async def _check_status_change(
@@ -2948,6 +3080,23 @@ class SamaApi:
             and g.sees_session(row.workspace_id, row.audience, row.owner_user_id)
         ]
 
+    async def _session_models(self, principal: Principal, session_id: uuid.UUID) -> SessionModels:
+        """``GET /sessions/{id}/models`` (M8.2): what the model picker needs."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            state = await _model_state(connection, access.org_id, session_id)
+        if state is None:
+            raise _not_found()
+        assert access.grants is not None  # noqa: S101 (``session_access`` sets it)
+        return SessionModels(
+            runtime=state.runtime.value,
+            models=state.allowed,
+            model=state.effective,
+            default_model=state.default,
+            is_override=state.is_override,
+            editable=state.selectable and _can_change_session(access.session, access.grants),
+        )
+
     async def _detail(self, principal: Principal, session_id: uuid.UUID) -> SessionDetail:
         async with as_user(self._engine, principal.auth_user_id) as connection:
             access = await session_access(connection, principal, session_id)
@@ -2969,9 +3118,10 @@ class SamaApi:
             )
             run_list = [RunOut.model_validate(row, from_attributes=True) for row in runs]
             last = await self._last_event_id(connection, session_id)
+            state = await _model_state(connection, access.org_id, session_id)
         assert access.grants is not None  # noqa: S101 (``session_access`` sets it)
         return SessionDetail(
-            **_session_out(access.session, access.grants).model_dump(),
+            **_with_model(_session_out(access.session, access.grants), state).model_dump(),
             runs=run_list,
             last_event_id=last,
         )

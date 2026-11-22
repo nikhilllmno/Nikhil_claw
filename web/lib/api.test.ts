@@ -727,3 +727,54 @@ describe("admin calls (M6.9)", () => {
     await expect(client.exportOrg("o1")).rejects.toMatchObject({ status: 403, message: "only an org owner can do this" });
   });
 });
+
+describe("the model of a session", () => {
+  const picker = {
+    runtime: "claude_agent_sdk",
+    models: ["claude-haiku-5-5", "claude-sonnet-5"],
+    model: "claude-sonnet-5",
+    default_model: "claude-sonnet-5",
+    is_override: false,
+    editable: true,
+  };
+
+  it("reads the models of a session", async () => {
+    const fetcher = vi.fn(async () => json(200, picker));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.getSessionModels("s 1")).resolves.toEqual(picker);
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/sessions/s%201/models");
+    expect(init.method).toBe("GET");
+  });
+
+  it("sets the model and goes back to the default with null", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, { id: "s1", model: "claude-haiku-5-5", model_is_override: true }))
+      .mockResolvedValueOnce(json(200, { id: "s1", model: "claude-sonnet-5", model_is_override: false }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.setSessionModel("s1", "claude-haiku-5-5")).resolves.toMatchObject({
+      model: "claude-haiku-5-5",
+      model_is_override: true,
+    });
+    await expect(client.setSessionModel("s1", null)).resolves.toMatchObject({
+      model_is_override: false,
+    });
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method, init.body])).toEqual([
+      ["https://api.test/sessions/s1", "PATCH", '{"model":"claude-haiku-5-5"}'],
+      ["https://api.test/sessions/s1", "PATCH", '{"model":null}'],
+    ]);
+  });
+
+  it("throws the detail when the API refuses the model", async () => {
+    const fetcher = vi.fn(async () =>
+      json(422, { detail: "the model is not known for the runtime of the session" }),
+    );
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.setSessionModel("s1", "nope")).rejects.toMatchObject({
+      status: 422,
+      message: "the model is not known for the runtime of the session",
+    });
+  });
+});

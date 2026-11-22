@@ -636,6 +636,10 @@ class Session(Base):
             f"coding_agent IS NULL OR {_one_of('coding_agent', CODING_AGENTS)}",
             name="coding_agent",
         ),
+        CheckConstraint(
+            "model_override IS NULL OR char_length(model_override) BETWEEN 1 AND 100",
+            name="model_override",
+        ),
         Index(None, "org_id", "workspace_id"),
         Index(None, "owner_user_id"),
         Index(None, "org_id", "worker_bot_id", postgresql_where=text("worker_bot_id IS NOT NULL")),
@@ -688,6 +692,10 @@ class Session(Base):
     plan_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     """Plan mode of coding mode (Section 15.5, M7.9). While it is on, the gate refuses the
     tools that change files, and the agent proposes a plan with ``plan_propose``."""
+    model_override: Mapped[str | None] = mapped_column(Text)
+    """The model that a person chose for the session (docs/architecture.md, Section 5.4, M8.2).
+    The assembler puts it in the config of each run. It is not in the frozen ``run_config``.
+    Null: the model of the frozen config."""
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 

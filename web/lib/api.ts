@@ -328,6 +328,30 @@ export interface SessionOut {
   can_manage?: boolean;
   /** The coding agent of the direct mode (M7.2), or `null` for sama. An old API has none. */
   coding_agent?: CodingAgentName | null;
+  /**
+   * The runtime of the session (M8.2). `GET /sessions/{id}` and `PATCH /sessions/{id}` fill it
+   * and the next three fields. `GET /sessions` leaves them `null` or `false`. An old API has none.
+   */
+  runtime?: string | null;
+  /** The model that the next run of the session uses. */
+  model?: string | null;
+  /** The model without a choice of the user (the model that `model: null` goes back to). */
+  default_model?: string | null;
+  /** True when a person chose a model that is not the default one. */
+  model_is_override?: boolean;
+}
+
+/** The answer of `GET /sessions/{id}/models` (M8.2): what a model picker shows. */
+export interface SessionModels {
+  runtime: string;
+  /** The model ids that the runtime knows, sorted. Empty for a coding agent. */
+  models: string[];
+  /** The model that the next run uses. */
+  model: string;
+  default_model: string;
+  is_override: boolean;
+  /** True when the user can change the model of this session. */
+  editable: boolean;
 }
 
 export type CodingAgentName = "claude_code" | "codex";
@@ -1880,6 +1904,8 @@ export interface WorkflowValidation {
 export interface SessionPatch {
   title?: string;
   status?: "active" | "archived";
+  /** A model id of the runtime of the session, or `null` for the model of the profile (M8.2). */
+  model?: string | null;
 }
 
 /** The answer of the test of a chat app. */
@@ -2731,6 +2757,15 @@ export class ApiClient {
     );
   updateSession = (sessionId: string, body: SessionPatch) =>
     this.json<SessionOut>(`/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body });
+  /** The model ids that the session can use, and the model that it uses now (M8.2). */
+  getSessionModels = (sessionId: string) =>
+    this.json<SessionModels>(`/sessions/${encodeURIComponent(sessionId)}/models`);
+  /**
+   * Chooses the model of a session, like `/model` in Claude Code (M8.2). It applies from the
+   * next run. `null` goes back to the model of the profile. The answer is the session.
+   */
+  setSessionModel = (sessionId: string, model: string | null) =>
+    this.updateSession(sessionId, { model });
   checkIntegration = (orgId: string, kind: ChatChannel) =>
     this.json<IntegrationCheck>(
       `/orgs/${encodeURIComponent(orgId)}/integrations/${encodeURIComponent(kind)}/check`,

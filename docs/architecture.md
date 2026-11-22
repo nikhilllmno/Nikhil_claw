@@ -877,6 +877,18 @@ Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
   One message can go to a coding agent with `/claude <task>` or `/codex <task>`. These are the
   only exceptions to "one runtime for the life of a session": the frozen config of the session
   keeps its runtime, and the coding agent keeps its own CLI session in the sandbox.
+- **The model of a session (M8.2).** A session can use another model than its profile, like
+  `/model` in Claude Code. The choice is `sessions.model_override`. It must be a model that the
+  price table knows for the runtime of the session (the same rule as the model of a profile,
+  Section 11.4). The frozen config keeps the model that the session started with (D9): the
+  override is not in `sessions.run_config`. The assembler (`PromptAssembler`) puts the override
+  in the config of each later run of the session, so the change applies from the next run and
+  never to a run that is open. A change of the model does not change the text of the prompt
+  prefix, so D9 holds. It changes `RunConfig.fingerprint()`, and each run records the
+  fingerprint that it used (`runs.config_fingerprint`). The prompt cache of the provider starts
+  again, as in any change of model. Both SDK runtimes use the override. A run of a coding agent
+  (`/claude`, `/codex`, and the direct mode, Section 15.4) and a background review ignore it.
+  See Section 7 for the API.
 
 ### 5.5 Conformance suite
 
@@ -1388,6 +1400,9 @@ for it.
   `(org_id, parent_session_id, parent_run_id)` proves that the run is a run of the parent
   session. Only a `delegation` session has a `parent_run_id` (Section 13.2). `retry` comes
   later.
+- **Model of a session (M8.2).** `PATCH /sessions/{id}` with `model` sets the model of the
+  session for the next runs. `model: null` goes back to the model of the profile. `GET
+  /sessions/{id}/models` lists the models that the session can use. Section 5.4 has the rules.
 - **Cross-channel continuity**: a user can continue a session from another channel with
   `/resume <id>` or a session link.
 - **Search**: `session_search` uses Postgres full-text search plus pgvector embeddings,
@@ -3732,7 +3747,9 @@ cross-org check of Section 17.1 through the API.
 | `POST /stripe/webhook` | Signed Stripe events (Section 17.5). `400` for a bad signature, `404` when billing is off, `503` when Stripe must send the event again. |
 | `GET /invites`, `POST /invites/accept` | The open invites for the confirmed email of the user. Accept with `token` or `invite_id`. `403` for another email, `410` for an ended invite (Section 17.2). |
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
-| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
+| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. Since M8.2 the session also has `runtime`, `model` (the model that the next run uses), `default_model`, and `model_is_override`. `GET /sessions` does not fill these fields. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
+| `PATCH /sessions/{id}` with `model` | Choose the model of the session (M8.2, Sections 5.4 and 7). `model` is a model id that the runtime of the session knows, or `null` for the model of the profile. It applies from the next run. Only a user who can manage the session (`can_manage`: the owner, or an admin for a shared session) can do it, else `403`. `422` for a model that the runtime does not know. The answer is the session, with the fields below. The audit row is `session.model_changed` with `from` and `to`. |
+| `GET /sessions/{id}/models` | The models of the session (M8.2): `runtime`, `models` (the ids that the runtime knows, sorted), `model` (the model that the next run uses), `default_model` (the model without an override), `is_override`, and `editable` (the value of `can_manage`). Any user who can see the session can read it. |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `402` with `detail` and `quota` when the org or the user used a model quota of the plan (Section 17.5). `409` for an archived session. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
@@ -8392,7 +8409,7 @@ without a change of the web app.
 - RLS: a user who sees the workspace of the trigger reads the rows. Writes go through the API.
 
 **Sessions.** `GET /sessions?status=archived` lists the archived sessions. `PATCH
-/sessions/{session_id}` takes `title` and `status` (`active` or `archived`). The owner of a
+/sessions/{session_id}` takes `title`, `status` (`active` or `archived`), and `model` (M8.2, Section 5.4). The owner of a
 private session changes it. An admin of the workspace or the org changes a shared session. A
 compaction archive (Section 6.3) and a session with a compaction child keep their status, and a
 session with an open run cannot be archived (`409`). The audit rows are `session.renamed`,

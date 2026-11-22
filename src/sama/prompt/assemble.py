@@ -46,7 +46,13 @@ from sama.runtime.contract import (
 )
 from sama.subagent_library import Agent as LibraryAgentRow
 from sama.subagent_library import personal_agents, session_agents
-from sama.subagents import MAX_SUBAGENTS, NOT_FOR_SUBAGENTS, SubagentError, parse_subagents
+from sama.subagents import (
+    MAX_SUBAGENTS,
+    NOT_FOR_SUBAGENTS,
+    SubagentError,
+    model_is_known,
+    parse_subagents,
+)
 from sama.subagents import TOOLSET as SUBAGENT_TOOLSET
 from sama.subagents import resolve as resolve_subagents
 from sama.tenancy.authority import run_user
@@ -143,19 +149,35 @@ def environment(run: ClaimedRun, now: datetime, channel: str | None = None) -> s
     return "\n".join([text, *(hint for hint in hints if hint)])
 
 
-def _checked(config: RunConfig, run: ClaimedRun) -> RunConfig:
+def _checked(config: RunConfig, run: ClaimedRun, model_override: str | None = None) -> RunConfig:
     runtime = RuntimeKind(run.runtime)
     if config.runtime == runtime:
-        return config
+        return _chosen_model(config, run, model_override)
     agent = agent_for(runtime)
     if agent is not None:
         # A ``/claude`` or ``/codex`` run, or the direct mode (Section 15.4): the coding agent
         # gets the session config with its own runtime and a model of its provider. The frozen
-        # config of the session does not change.
+        # config of the session does not change, and the model of the session does not apply.
         return config.model_copy(
             update={"runtime": runtime, "model": coding_model(agent, config.model)}
         )
     raise ValueError("the run runtime is not the runtime of the session")
+
+
+def _chosen_model(config: RunConfig, run: ClaimedRun, model: str | None) -> RunConfig:
+    """The config with the model that a person chose for the session (Section 5.4, M8.2). The
+    frozen config is not changed in the database, so the text of the prefix stays the same
+    (D9). A model that the price table no longer knows is ignored: the run uses the model of
+    the frozen config, and a run does not fail for a change that nobody made. A coding agent
+    chooses its own model."""
+    if model is None or model == config.model or agent_for(config.runtime) is not None:
+        return config
+    if config.runtime is not RuntimeKind.FAKE and not model_is_known(config.runtime, model):
+        log.warning(
+            "the model of the session is not known: session=%s model=%s", run.session_id, model
+        )
+        return config
+    return config.model_copy(update={"model": model})
 
 
 class PromptAssembler:
@@ -180,16 +202,25 @@ class PromptAssembler:
         session = (Session.org_id == run.org_id, Session.id == run.session_id)
         # Most runs find a frozen config. One read without a transaction is one round trip.
         async with autocommit(self._engine) as connection:
-            frozen = (
-                await connection.execute(select(Session.run_config).where(*session))
-            ).scalar_one_or_none()
-        if frozen is not None:
-            return _checked(RunConfig.model_validate(frozen), run)
+            current = (
+                await connection.execute(
+                    select(Session.run_config, Session.model_override).where(*session)
+                )
+            ).one_or_none()
+        if current is not None and current.run_config is not None:
+            return _checked(
+                RunConfig.model_validate(current.run_config), run, current.model_override
+            )
         async with self._engine.begin() as connection:
             # The lock makes concurrent first runs of a session build one config.
             stored = (
                 await connection.execute(
-                    select(Session.run_config, Session.created_at, Session.library_agent)
+                    select(
+                        Session.run_config,
+                        Session.created_at,
+                        Session.library_agent,
+                        Session.model_override,
+                    )
                     .where(*session)
                     .with_for_update()
                 )
@@ -215,7 +246,7 @@ class PromptAssembler:
                         profile_snapshot=snapshot,
                     )
                 )
-        return _checked(config, run)
+        return _checked(config, run, stored.model_override)
 
     async def _review(self, run: ClaimedRun) -> RunConfig:
         """The config of a background review (Section 9.4). It is built for this run and not
