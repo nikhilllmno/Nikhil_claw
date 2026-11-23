@@ -16,6 +16,7 @@
 }
 
 .headerText {
+  flex: 1;
   min-width: 0;
 }
 
@@ -49,6 +50,9 @@
 }
 
 .meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--text-sm);
   color: var(--text-muted);
 }
@@ -314,6 +318,35 @@
 /* At a narrow width, Create PR is in the code panel (Code, then Pull request). */
 @media (max-width: 40rem) {
   .createPr {
+    display: none;
+  }
+}
+
+.pictures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.picture {
+  display: block;
+  width: var(--preview-basis);
+  height: var(--preview-basis);
+  border-radius: var(--radius-md);
+  object-fit: cover;
+}
+
+.pictureMissing {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+/* At a narrow width the working line shows the state, so the header keeps room for the title. */
+@media (max-width: 40rem) {
+  .stateBadge {
     display: none;
   }
 }

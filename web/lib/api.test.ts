@@ -6,6 +6,8 @@ import {
   type ChatMessage,
   errorMessage,
   errorText,
+  imageProblem,
+  MAX_IMAGE_BYTES,
   query,
   type TokenSource,
 } from "./api";
@@ -763,5 +765,143 @@ describe("admin calls (M6.9)", () => {
     expect((await client.exportOrg("abcdef0123")).name).toBe("org.zip");
     expect((await client.exportUser("o1", "u1234567890")).name).toBe("sama-user-u1234567.zip");
     await expect(client.exportOrg("o1")).rejects.toMatchObject({ status: 403, message: "only an org owner can do this" });
+  });
+});
+
+describe("images in a message", () => {
+  function file(name: string, type: string, size = 4): File {
+    return new File([new Uint8Array(size)], name, { type });
+  }
+
+  it("sends the text, the flag, and the files as multipart without a JSON type", async () => {
+    const fetcher = vi.fn(async () => json(202, { run_id: "r1", queued: true }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    const png = file("a.png", "image/png");
+    const jpg = file("b.jpg", "image/jpeg");
+    await expect(client.sendMessageWithImages("s1", "look", [png, jpg], true)).resolves.toEqual({
+      run_id: "r1",
+      queued: true,
+    });
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/sessions/s1/messages/images");
+    expect(init.method).toBe("POST");
+    expect(authOf(init)).toBe("Bearer old");
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
+    const form = init.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(form.get("text")).toBe("look");
+    expect(form.get("parallel")).toBe("true");
+    expect(form.getAll("images").map((item) => (item as File).name)).toEqual(["a.png", "b.jpg"]);
+  });
+
+  it("allows empty text and leaves out parallel by default", async () => {
+    const fetcher = vi.fn(async () => json(202, { run_id: "r1", queued: false }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.sendMessageWithImages("s1", "", [file("a.png", "image/png")]);
+    const form = (fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].body as FormData;
+    expect(form.get("text")).toBe("");
+    expect(form.has("parallel")).toBe(false);
+  });
+
+  it("sends the same form again after a refresh on 401", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(401, {}))
+      .mockResolvedValueOnce(json(202, { run_id: "r1", queued: false }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await client.sendMessageWithImages("s1", "hi", [file("a.png", "image/png")]);
+    const bodies = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([, i]) => i.body);
+    expect(bodies[0]).toBe(bodies[1]);
+    expect(authOf(fetcher.mock.calls[1]?.[1])).toBe("Bearer new");
+  });
+
+  it("throws the detail of the API when it refuses the files", async () => {
+    const fetcher = vi.fn(async () => json(422, { detail: "sama reads only PNG, JPEG, GIF, and WebP images." }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.sendMessageWithImages("s1", "x", [file("a.svg", "image/svg+xml")])).rejects.toMatchObject({
+      status: 422,
+      message: "sama reads only PNG, JPEG, GIF, and WebP images.",
+    });
+    expect(errorMessage(413, null)).toBe("The upload is too large.");
+  });
+
+  it("loads the bytes of an image with the Bearer token", async () => {
+    const fetcher = vi.fn(
+      async () =>
+        new Response("png-bytes", {
+          status: 200,
+          headers: {
+            "Content-Type": "image/png",
+            "Content-Disposition": 'inline; filename="shot.png"',
+          },
+        }),
+    );
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    const image = await client.getAttachment("s1", "a1");
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/sessions/s1/attachments/a1");
+    expect(authOf(init)).toBe("Bearer old");
+    expect(image.name).toBe("shot.png");
+    expect(await image.blob.text()).toBe("png-bytes");
+  });
+
+  it("checks the files before the upload", () => {
+    expect(imageProblem([file("a.png", "image/png")])).toBeNull();
+    expect(imageProblem(Array.from({ length: 5 }, () => file("a.png", "image/png")))).toMatch(/first 4/);
+    expect(imageProblem([file("a.svg", "image/svg+xml")])).toMatch(/PNG, JPEG, GIF, and WebP/);
+    expect(imageProblem([file("a.png", "image/png", MAX_IMAGE_BYTES + 1)])).toMatch(/10 MB/);
+    expect(imageProblem([file("a.png", "image/png", 0)])).toMatch(/could not read/);
+    expect(imageProblem([])).toBeNull();
+  });
+});
+
+describe("the model of a session", () => {
+  const picker = {
+    runtime: "claude_agent_sdk",
+    models: ["claude-haiku-5-5", "claude-sonnet-5"],
+    model: "claude-sonnet-5",
+    default_model: "claude-sonnet-5",
+    is_override: false,
+    editable: true,
+  };
+
+  it("reads the models of a session", async () => {
+    const fetcher = vi.fn(async () => json(200, picker));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.getSessionModels("s 1")).resolves.toEqual(picker);
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/sessions/s%201/models");
+    expect(init.method).toBe("GET");
+  });
+
+  it("sets the model and goes back to the default with null", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, { id: "s1", model: "claude-haiku-5-5", model_is_override: true }))
+      .mockResolvedValueOnce(json(200, { id: "s1", model: "claude-sonnet-5", model_is_override: false }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.setSessionModel("s1", "claude-haiku-5-5")).resolves.toMatchObject({
+      model: "claude-haiku-5-5",
+      model_is_override: true,
+    });
+    await expect(client.setSessionModel("s1", null)).resolves.toMatchObject({
+      model_is_override: false,
+    });
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method, init.body])).toEqual([
+      ["https://api.test/sessions/s1", "PATCH", '{"model":"claude-haiku-5-5"}'],
+      ["https://api.test/sessions/s1", "PATCH", '{"model":null}'],
+    ]);
+  });
+
+  it("throws the detail when the API refuses the model", async () => {
+    const fetcher = vi.fn(async () =>
+      json(422, { detail: "the model is not known for the runtime of the session" }),
+    );
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    await expect(client.setSessionModel("s1", "nope")).rejects.toMatchObject({
+      status: 422,
+      message: "the model is not known for the runtime of the session",
+    });
   });
 });

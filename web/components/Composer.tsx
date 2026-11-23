@@ -5,6 +5,8 @@
 // earlier messages, and the harness menu sends the session to sama, Claude Code, or Codex.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { IMAGE_TYPES } from "@/lib/api";
+import { imageFiles } from "@/lib/images";
 import type { CodingAgentName } from "@/lib/api";
 import { CODING_AGENTS } from "@/lib/chat";
 import {
@@ -19,6 +21,29 @@ import {
 import styles from "./Composer.module.css";
 
 export const MAX_MESSAGE_CHARS = 32_000;
+
+export interface ModelControl {
+  /** The model that the next run uses. */
+  current: string;
+  /** The models of the runtime, or `null` while they load. */
+  options: string[] | null;
+  /** The list did not load. */
+  failed?: boolean;
+  /** The model without a choice of the person. */
+  defaultModel: string;
+  editable: boolean;
+  busy?: boolean;
+  /** Called when the menu opens, so that the options load. */
+  onOpen: () => void;
+  /** `null`: back to the default model. */
+  onChange: (model: string | null) => void;
+}
+
+export interface ImageControl {
+  files: readonly File[];
+  onAdd: (files: File[]) => void;
+  onRemove: (index: number) => void;
+}
 
 export interface HarnessControl {
   /** The coding agent of the direct mode, or `null` for sama. */
@@ -51,6 +76,12 @@ interface Props {
   harness?: HarnessControl;
   /** The model of the agent, shown next to the harness. */
   model?: string | null;
+  /** The model menu of the session (like `/model` in Claude Code). */
+  models?: ModelControl;
+  /** The images of the next message: paste, drop, or the attach button. */
+  images?: ImageControl;
+  /** Called when the person focuses the box or types: the session can start its sandbox. */
+  onActivity?: () => void;
 }
 
 const HARNESSES: readonly { agent: CodingAgentName | null; label: string; hint: string }[] = [
@@ -74,6 +105,9 @@ export function Composer({
   history = [],
   harness,
   model = null,
+  models,
+  images,
+  onActivity,
 }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const ids = useId();
@@ -100,7 +134,10 @@ export function Composer({
   const open = trigger !== null && items.length > 0 && dismissed !== triggerKey;
   const current = Math.min(active, Math.max(0, items.length - 1));
 
-  const canSend = !sending && value.trim() !== "";
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+  const hasImages = (images?.files.length ?? 0) > 0;
+  const canSend = !sending && (value.trim() !== "" || hasImages);
   const nearLimit = value.length > MAX_MESSAGE_CHARS * 0.9;
 
   /** Puts an earlier message in the box. Its `/` or `@` does not open a menu. */
@@ -204,7 +241,24 @@ export function Composer({
         send();
       }}
     >
-      <div className={styles.box}>
+      <div
+        className={`${styles.box} ${dragging ? styles.dragging : ""}`}
+        onDragOver={(event) => {
+          if (!images || !event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(event) => {
+          setDragging(false);
+          if (!images) return;
+          const files = imageFiles(event.dataTransfer.files);
+          if (files.length === 0) return;
+          event.preventDefault();
+          images.onAdd(files);
+        }}
+      >
+        {images && images.files.length > 0 ? <Thumbnails files={images.files} onRemove={images.onRemove} /> : null}
         {open ? (
           <ul id={listId} role="listbox" className={styles.menu} aria-label={trigger?.kind === "slash" ? "Commands" : "Mentions"}>
             {items.map((item, index) => (
@@ -249,6 +303,7 @@ export function Composer({
           onChange={(event) => {
             const text = event.target.value;
             const at = event.target.selectionStart ?? text.length;
+            onActivity?.();
             onChange(text);
             setCaret(at);
             setActive(0);
@@ -259,17 +314,54 @@ export function Composer({
           }}
           onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? 0)}
           onKeyDown={onKeyDown}
+          onPaste={(event) => {
+            if (!images) return;
+            const files = imageFiles(event.clipboardData.files);
+            if (files.length === 0) return;
+            event.preventDefault();
+            images.onAdd(files);
+          }}
           onBlur={() => setDismissed(triggerKey)}
-          onFocus={() => setDismissed(null)}
+          onFocus={() => {
+            setDismissed(null);
+            onActivity?.();
+          }}
         />
         <div className={styles.bar}>
           <div className={styles.tools}>
+            {images ? (
+              <>
+                <button
+                  type="button"
+                  className={styles.iconButton}
+                  aria-label="Add images"
+                  title="Add images (or paste or drop them)"
+                  onClick={() => fileInput.current?.click()}
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 3v10M3 8h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                  </svg>
+                </button>
+                <input
+                  ref={fileInput}
+                  type="file"
+                  accept={IMAGE_TYPES.join(",")}
+                  multiple
+                  hidden
+                  onChange={(event) => {
+                    const files = imageFiles(event.target.files ?? []);
+                    if (files.length > 0) images.onAdd(files);
+                    event.target.value = "";
+                  }}
+                />
+              </>
+            ) : null}
             {harness ? (
               <details className={styles.picker} data-menu="harness">
                 <summary className={styles.pill} aria-label={`Harness: ${shownHarness?.label}. Change the harness`}>
                   {harness.busy ? <span className="spinner" aria-hidden="true" /> : null}
                   {shownHarness?.label}
-                  {model && harness.current === null ? <span className={styles.model}>{model}</span> : null}
+
                 </summary>
                 <div className={styles.pickerList} role="menu">
                   {HARNESSES.map((h) => (
@@ -291,9 +383,10 @@ export function Composer({
                   ))}
                 </div>
               </details>
-            ) : model ? (
+            ) : model && !models ? (
               <span className={styles.model}>{model}</span>
             ) : null}
+            {models && harness?.current == null ? <ModelMenu control={models} /> : null}
           </div>
           <div className={styles.actions}>
             {running ? (
@@ -333,5 +426,92 @@ export function Composer({
         {nearLimit ? ` ${value.length.toLocaleString()} of ${MAX_MESSAGE_CHARS.toLocaleString()} characters.` : ""}
       </p>
     </form>
+  );
+}
+
+/** The images of the next message, with a remove button each. */
+function Thumbnails({ files, onRemove }: { files: readonly File[]; onRemove: (index: number) => void }) {
+  return (
+    <ul className={styles.thumbs} aria-label="Images of the next message">
+      {files.map((file, index) => (
+        <li key={`${file.name}-${file.size}-${file.lastModified}-${index}`} className={styles.thumb}>
+          <Preview file={file} />
+          <button
+            type="button"
+            className={styles.thumbRemove}
+            aria-label={`Remove ${file.name}`}
+            onClick={() => onRemove(index)}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+              <path d="M3 3l6 6M9 3L3 9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** A small preview of a local image file (a data URL, so nothing must be revoked). */
+function Preview({ file }: { file: File }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const reader = new FileReader();
+    reader.onload = () => setUrl(typeof reader.result === "string" ? reader.result : null);
+    reader.readAsDataURL(file);
+    return () => reader.abort();
+  }, [file]);
+  // A local preview: next/image cannot load a data URL of a file that is not uploaded yet.
+  // eslint-disable-next-line @next/next/no-img-element
+  return url ? <img src={url} alt={file.name} className={styles.thumbImage} /> : null;
+}
+
+/** The model of the session, as `/model` in Claude Code. */
+function ModelMenu({ control }: { control: ModelControl }) {
+  return (
+    <details
+      className={styles.picker}
+      data-menu="model"
+      onToggle={(event) => {
+        if (event.currentTarget.open) control.onOpen();
+      }}
+    >
+      <summary className={styles.pill} aria-label={`Model: ${control.current}. Change the model`}>
+        {control.busy ? <span className="spinner" aria-hidden="true" /> : null}
+        <span className={styles.modelName}>{control.current}</span>
+      </summary>
+      <div className={styles.pickerList} role="menu">
+        {control.options === null && control.failed ? (
+          <div className={styles.menuNote}>
+            <p className={styles.optionHint}>The models did not load.</p>
+            <button type="button" className="btn btn-small" onClick={control.onOpen}>
+              Try again
+            </button>
+          </div>
+        ) : control.options === null ? (
+          <p className={styles.optionHint}>Loading the models…</p>
+        ) : !control.editable ? (
+          <p className={styles.optionHint}>Only the owner of the session or an admin can change the model.</p>
+        ) : (
+          control.options.map((option) => (
+            <button
+              key={option}
+              type="button"
+              role="menuitemradio"
+              aria-checked={option === control.current}
+              className={styles.pickerItem}
+              disabled={control.busy}
+              onClick={(event) => {
+                event.currentTarget.closest("details")?.removeAttribute("open");
+                if (option !== control.current) control.onChange(option === control.defaultModel ? null : option);
+              }}
+            >
+              <span className={styles.optionLabel}>{option}</span>
+              {option === control.defaultModel ? <span className={styles.optionHint}>The default of the agent</span> : null}
+            </button>
+          ))
+        )}
+      </div>
+    </details>
   );
 }

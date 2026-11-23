@@ -336,7 +336,9 @@ class Worker:
         # the start, so a slow check cannot start a run that another attempt owns now.
         run = await self._reconfirm(run)
         run = await self._expand(run)
-        if not await self._queue.dispatch(run, self.owner, config_fingerprint=config.fingerprint()):
+        if not await self._queue.dispatch(
+            run, self.owner, config_fingerprint=config.fingerprint(), model=config.model
+        ):
             log.warning("the worker lost the lease before the start run=%s", run.run_id)
             return
         steps.mark("dispatch")

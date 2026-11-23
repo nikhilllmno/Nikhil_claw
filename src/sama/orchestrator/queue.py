@@ -1990,18 +1990,29 @@ class RunQueue:
         return _decode_state(state)
 
     async def dispatch(
-        self, run: ClaimedRun, owner: str, *, config_fingerprint: str | None = None
+        self,
+        run: ClaimedRun,
+        owner: str,
+        *,
+        config_fingerprint: str | None = None,
+        model: str | None = None,
     ) -> bool:
         """Records that the worker gives the run to its runtime. Returns False if the lease is
         lost. After this mark, ``reap`` does not start the run again, because a tool can run.
 
-        ``config_fingerprint`` is the fingerprint of the ``RunConfig`` that the run uses."""
+        ``config_fingerprint`` is the fingerprint of the ``RunConfig`` that the run uses.
+        ``model`` is its model. The first dispatch fixes it in ``runs.run_model``; a resume
+        keeps the first one."""
         async with autocommit(self._engine) as connection:
             row = (
                 await connection.execute(
                     update(Run)
                     .where(*self._owned(run, owner))
-                    .values(dispatched_at=func.now(), config_fingerprint=config_fingerprint)
+                    .values(
+                        dispatched_at=func.now(),
+                        config_fingerprint=config_fingerprint,
+                        run_model=func.coalesce(Run.run_model, model),
+                    )
                     .returning(Run.id)
                 )
             ).one_or_none()
