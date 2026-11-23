@@ -113,10 +113,10 @@ LIVE_VIEW_TTL_S: Final = 600
 """The live view URL of the web app ends after 10 minutes. The web app asks for a new one
 before that."""
 CONTROL_WAIT_S: Final = 300.0
+"""The longest wait of one browser call while a person has control of the browser."""
 HANDOFF_S: Final = 35.0
 """A takeover waits at most this long for the browser call that acts now (a navigation can
 take 30 seconds)."""
-"""The longest wait of one browser call while a person has control of the browser."""
 USER_HAS_CONTROL: Final = (
     "the user has control of the browser now; wait for the user, or ask the user to click Give back"
 )
