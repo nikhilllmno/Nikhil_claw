@@ -7,16 +7,23 @@ the control plane. If the control plane does not answer, the adapter denies the 
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any, Final
 
 import httpx
 
-from sama.gate.wire import STEER_HEADER, GateAnswer, GateRequest
+from sama.gate.wire import ASK_PATH, GATE_PATH, STEER_HEADER, AskAnswer, GateAnswer, GateRequest
 from sama.runtime.contract import RunScope
 from sama.runtime.gating import GateDecision
 
 GATE_TIMEOUT_S: Final = 30.0
+ASK_TIMEOUT_S: Final = 900.0
+"""A question waits for the user up to 600 seconds on the control plane (``ClarifyBroker``)."""
+
+
+class AskError(RuntimeError):
+    """The control plane did not ask the questions. The message is for the model."""
 
 
 class RemoteGate:
@@ -71,3 +78,36 @@ class RemoteGate:
         response.raise_for_status()
         answer = GateAnswer.model_validate_json(response.content)
         return GateDecision(answer.action, answer.reason, steer=answer.steer)
+
+    async def ask(
+        self, scope: RunScope, arguments: Mapping[str, Any], *, call_id: str
+    ) -> dict[str, str] | None:
+        """Asks the user the questions of one ``AskUserQuestion`` call (``POST /gate/ask``) and
+        waits for the answers (M8.3). ``None`` when nobody answered in time."""
+        url = self._url
+        if url.endswith(GATE_PATH):
+            url = url[: -len(GATE_PATH)] + ASK_PATH
+        else:
+            url = url.rstrip("/") + "/ask"
+        content = json.dumps({"call_id": call_id, "arguments": dict(arguments)})
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(ASK_TIMEOUT_S, connect=10.0),
+            transport=self._transport,
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(
+                url,
+                content=content,
+                headers={
+                    "authorization": f"Bearer {self._token}",
+                    "content-type": "application/json",
+                },
+            )
+        try:
+            answer = AskAnswer.model_validate_json(response.content)
+        except ValueError:
+            response.raise_for_status()
+            raise AskError("the question server gave an answer that is not valid") from None
+        if response.is_error:
+            raise AskError(answer.error or f"the questions were not asked ({response.status_code})")
+        return answer.answers

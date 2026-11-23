@@ -8250,6 +8250,49 @@ session can be open. The broker is in the process of the tool server, so the API
 server, and the worker run in one process for now. A move of the questions to Postgres is in
 the backlog. In unattended runs the tool gate denies `clarify` (Section 16.1).
 
+**Clarifying questions (M8.3, Claude Agent SDK runtime only for now).** Before M8.3 the Claude
+runtime asked no questions. The model called the native `AskUserQuestion` tool of Claude Code,
+and the gate denied it (it was in no toolset); the model then guessed. Production had 0 `clarify`
+calls in 14 days. A second cause: the MCP client of the CLI ended each sama tool call after 60
+seconds, so a `clarify` card closed after 60 seconds without an answer (seen on staging). Now
+the Claude runtime supports `AskUserQuestion` as Claude Code does:
+
+1. **Gate.** `AskUserQuestion` is in the toolset `clarify`, in `DEFAULT_ALLOW`, in the plan mode
+   tools, and in `NEEDS_A_HUMAN` (an unattended run gets `deny`). A delegated child does not have
+   `clarify`.
+2. **Hook.** On `allow`, the `PreToolUse` hook of the adapter gives no decision for an
+   `AskUserQuestion` call and keeps its tool use id. The CLI then asks `can_use_tool`.
+3. **Questions.** `can_use_tool` sends the input of the call to the control plane with the run
+   token: `POST /gate/ask` (`AskRequest`: the call id and the input). The tool server checks the
+   call with the gate again, turns each question into a `NativeQuestion` (the `clarify` fields
+   plus `header`, one description for each option, and `multi_select`), and waits on the
+   `ClarifyBroker` (at most 10 minutes). At most 4 questions with 2 to 4 options each, as in the
+   tool schema. The runner waits up to 900 seconds for the answer.
+4. **Answer.** `can_use_tool` returns `PermissionResultAllow` with `updated_input`: the
+   `questions` of the call and `answers`, the answer of each question by its text, as the SDK
+   expects. A multi-select answer is the labels joined with ", ". A free answer is the typed
+   text. When nobody answers, the run ends, or the gate denies, the call is denied with a short
+   message ("The user did not answer the question. Continue with your best judgment ...").
+5. **Web card.** The chat shows the open questions of the session (`GET
+   /sessions/{id}/questions`) as `QuestionCard`, like the question prompt of Claude Code: the
+   header as a small label, the question, one numbered button for each option with its
+   description, and "Other" with a free text as the last option. A multi-select question takes
+   one or more options. Keys 1 to 4 pick an option of the first question without an answer (the
+   key after the last option picks "Other"); a key in a text field is text. "Submit" is on only
+   when each question has an answer. A `clarify` question (other runtimes) shows in the same card,
+   without a header and descriptions.
+6. **Prompt.** The sama system text (Section 6.1) tells the agent to ask before it starts when a
+   request misses a detail that changes the result, or when a choice of the user matters, and no
+   tool can find the answer: with `AskUserQuestion`, or `clarify` when it does not have
+   `AskUserQuestion`, with 2 to 4 short options.
+7. **Time limit.** The adapter sets `MCP_TOOL_TIMEOUT=3600000` for the CLI (`MCP_TOOL_TIMEOUT_MS`),
+   the same limit as the OpenAI runtime (`MCP_CALL_TIMEOUT_S`). Before, a `browser_task` (up to
+   600 s) ended for the model after 60 seconds with "The operation timed out." and went on in the
+   background, while the agent used the same browser (seen on production).
+
+The chat channels (Telegram, Slack, WhatsApp, and email) do not show these questions yet. The
+OpenAI runtime keeps `clarify` as before.
+
 **Task list storage.** `session_todos` (migration `0003`) has one row per session: `org_id`,
 `workspace_id`, `session_id`, `items` (JSON), `run_id` of the last change, and `updated_at`. A
 change runs in one transaction with a row lock, so two changes at the same time do not lose an

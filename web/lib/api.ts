@@ -703,6 +703,10 @@ export interface Approval {
 export interface ClarifyQuestion {
   question: string;
   choices: string[];
+  /** A question of the native AskUserQuestion tool of Claude (M8.3) also has these. */
+  header?: string;
+  descriptions?: string[];
+  multi_select?: boolean;
 }
 
 export interface ClarifyRequest {

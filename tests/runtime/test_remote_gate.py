@@ -145,3 +145,38 @@ async def test_an_answer_without_steer_has_no_notes() -> None:
     gate = gate_with(httpx.MockTransport(handler))
     decision = await gate.check(make_scope(), "Bash", {}, call_id="toolu_1")
     assert (decision.action, decision.steer) == ("deny", "")
+
+
+async def test_ask_posts_the_questions_and_returns_the_answers() -> None:
+    """M8.3: ``AskUserQuestion`` goes to ``POST /gate/ask`` with the run token."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"answers": {"Q?": "A"}, "error": ""})
+
+    gate = gate_with(httpx.MockTransport(handler))
+    answers = await gate.ask(make_scope(), {"questions": []}, call_id="q1")
+    assert answers == {"Q?": "A"}
+    [request] = seen
+    assert str(request.url) == "http://tools.test/gate/ask"
+    assert request.headers["authorization"] == f"Bearer {TOKEN}"
+    assert json.loads(request.content) == {"call_id": "q1", "arguments": {"questions": []}}
+
+
+async def test_ask_gives_none_without_an_answer_and_raises_the_error_of_the_server() -> None:
+    from sama.runtime.remote_gate import AskError
+
+    replies = iter(
+        [
+            httpx.Response(200, json={"answers": None, "error": ""}),
+            httpx.Response(403, json={"answers": None, "error": "no human in this run"}),
+            httpx.Response(502, text="bad gateway"),
+        ]
+    )
+    gate = gate_with(httpx.MockTransport(lambda request: next(replies)))
+    assert await gate.ask(make_scope(), {}, call_id="q1") is None
+    with pytest.raises(AskError, match="no human in this run"):
+        await gate.ask(make_scope(), {}, call_id="q2")
+    with pytest.raises(httpx.HTTPStatusError):
+        await gate.ask(make_scope(), {}, call_id="q3")

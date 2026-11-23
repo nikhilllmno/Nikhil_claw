@@ -15,6 +15,7 @@ from claude_agent_sdk.types import TaskNotificationMessage, TaskStartedMessage
 from sama.runtime import RunRequest, SubagentDefinition, SubagentEvent
 from sama.runtime.claude import (
     BACKGROUND_TASKS_ENV,
+    MCP_TOOL_TIMEOUT_ENV,
     TOOL_SEARCH_ENV,
     ClaudeRuntime,
     GateDecision,
@@ -87,7 +88,11 @@ async def test_subagents_turn_off_background_tasks_and_keep_the_other_env() -> N
     factory = Factory([result()])
     await collect(ClaudeRuntime(client_factory=factory).run(with_subagents(RESEARCHER)))
     env = factory.clients[0].options.env
-    assert env == {TOOL_SEARCH_ENV: "false", BACKGROUND_TASKS_ENV: "1"}
+    assert env == {
+        TOOL_SEARCH_ENV: "false",
+        MCP_TOOL_TIMEOUT_ENV: "3600000",
+        BACKGROUND_TASKS_ENV: "1",
+    }
 
 
 # -- the hook ----------------------------------------------------------------------------------

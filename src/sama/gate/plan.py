@@ -35,6 +35,7 @@ PLAN_MODE_TOOLS: Final = frozenset(
         "web_search",
         "web_extract",
         "clarify",
+        "AskUserQuestion",
         PLAN_PROPOSE,
         "coding_agent_plan",
         "repo_clone",

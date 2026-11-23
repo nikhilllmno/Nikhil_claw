@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sama.gate.decide import Action
 
 GATE_PATH: Final = "/gate"
+ASK_PATH: Final = "/gate/ask"
+"""The questions of the native ``AskUserQuestion`` tool of the Claude CLI (M8.3, Section 16.7)."""
 MAX_GATE_BODY_BYTES: Final = 1_000_000
 STEER_HEADER: Final = "x-sama-steer"
 """A runner that sends this header with the value ``1`` can take the notes of ``/steer`` in
@@ -43,3 +45,21 @@ class GateAnswer(BaseModel):
     def wire(self) -> dict[str, object]:
         """The JSON body. ``steer`` is in it only when it is not empty."""
         return self.model_dump(exclude=None if self.steer else {"steer"})
+
+
+class AskRequest(BaseModel):
+    """``POST /gate/ask``: the input of one ``AskUserQuestion`` call, as the CLI gives it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    call_id: str = Field(min_length=1, max_length=200)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class AskAnswer(BaseModel):
+    """The answers by question text, or ``None`` when nobody answered in time."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    answers: dict[str, str] | None = None
+    error: str = ""
