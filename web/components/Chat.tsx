@@ -840,8 +840,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const org = me?.orgs.find((o) => o.id === detail.org_id) ?? null;
   const profile = org?.agent_profiles.find((p) => p.id === detail.agent_profile_id) ?? null;
   // The to-do list of the session (the sama `todo` tool keeps one list per session) while a run works.
+  // Only the to-do calls of the open runs: a finished list of an earlier run does not show.
   const todos =
-    runRows.length > 0 ? latestTodos(Object.values(live.tools).flat().sort((a, b) => a.order - b.order)) : null;
+    runRows.length > 0
+      ? latestTodos(runRows.flatMap((row) => live.tools[row.id] ?? []).sort((a, b) => a.order - b.order))
+      : null;
 
   return (
     <div className={styles.layout}>
