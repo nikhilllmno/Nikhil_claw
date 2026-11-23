@@ -87,6 +87,7 @@ from sama.api.history import (
     SearchHit,
     SessionHistory,
 )
+from sama.api.live_browser import ControlIn, live_of, open_runs
 from sama.api.orgs import router as org_router
 from sama.api.origins import check_extension_ids, check_origins
 from sama.api.skill_editor import (
@@ -125,6 +126,7 @@ from sama.api.tasks import (
 from sama.api.uploads import read_message
 from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
+from sama.browser.service import BrowserService
 from sama.coding.agents import CodingAgent, agent_for
 from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
 from sama.coding_mode.service import CodingService
@@ -1515,6 +1517,7 @@ class SamaApi:
         chrome: ChromeHub | None = None,
         billing: BillingService | None = None,
         browser: BrowserSettings | None = None,
+        live_browser: BrowserService | None = None,
         custom_tools: CustomToolService | None = None,
         coding_mode: CodingService | None = None,
         warmer: SessionWarmer | None = None,
@@ -1544,6 +1547,8 @@ class SamaApi:
         self._poll_slots = asyncio.Semaphore((settings or ApiSettings()).stream_db_slots)
         self._coding_mode = coding_mode
         self._browser = browser
+        self._live_browser = live_browser
+        """The browser sessions of the runs of this process, for the live view (M8.3)."""
         self._api_keys = ApiKeyStore(engine)
         self._library = LibraryRoutes(SubagentLibrary(engine), self._can_manage_agents)
         self._custom_tools = custom_tools
@@ -1947,6 +1952,16 @@ class SamaApi:
         ) -> JSONResponse:
             reason = (body or Decision()).reason
             return await self._decide(principal, approval_id, False, False, reason, None)
+
+        @app.get("/sessions/{session_id}/browser")
+        async def live_browser(principal: Me, session_id: uuid.UUID) -> dict[str, Any]:
+            return await self._live_browser_view(principal, session_id)
+
+        @app.post("/sessions/{session_id}/browser/control", status_code=204)
+        async def live_browser_control(
+            principal: Me, session_id: uuid.UUID, body: ControlIn
+        ) -> None:
+            await self._live_browser_control(principal, session_id, body)
 
         @app.get("/sessions/{session_id}/questions")
         async def questions(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -3695,6 +3710,38 @@ class SamaApi:
             "created_at": row.created_at.isoformat(),
             "expires_at": row.expires_at.isoformat(),
         }
+
+    async def _live_browser_view(
+        self, principal: Principal, session_id: uuid.UUID
+    ) -> dict[str, Any]:
+        """The live browser of the session (M8.3). ``live`` is ``null`` when no open run has a
+        browser session in this process."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            runs = await open_runs(connection, access.org_id, session_id)
+        if self._live_browser is None or not runs:
+            return {"live": None}
+        return {"live": await live_of(self._live_browser, access.org_id, runs)}
+
+    async def _live_browser_control(
+        self, principal: Principal, session_id: uuid.UUID, body: ControlIn
+    ) -> None:
+        """Gives the browser of a run of the session to the person, or back to the agent."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            runs = await open_runs(connection, access.org_id, session_id)
+        if self._live_browser is None or body.run_id not in runs:
+            raise _not_found("the run has no open browser")
+        result = await self._live_browser.set_control(
+            str(access.org_id), str(body.run_id), user=body.action == "take"
+        )
+        if result == "missing":
+            raise _not_found("the run has no open browser")
+        if result == "busy":
+            raise HTTPException(
+                status_code=409,
+                detail="the agent is in the middle of a browser step; try again in a moment",
+            )
 
     async def _questions(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
         async with as_user(self._engine, principal.auth_user_id) as connection:

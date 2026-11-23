@@ -68,6 +68,9 @@ import { escapeTarget } from "@/lib/approvalKeys";
 import { Markdown } from "./Markdown";
 import { QuestionCard } from "./QuestionCard";
 import { CodePanel, type CodeTab } from "./CodePanel";
+import { BrowserPanel } from "./BrowserPanel";
+import { browserStep, POLL_MS as BROWSER_POLL_MS } from "@/lib/liveBrowser";
+import type { LiveBrowser } from "@/lib/api";
 import { PlanCard } from "./PlanPanel";
 import { useMedia } from "./useMedia";
 import { LiveRun, TodoList, ToolTrail } from "./ToolGroup";
@@ -118,6 +121,13 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const [repoCount, setRepoCount] = useState(0);
   const narrow = useMedia("(max-width: 75rem)");
   const closeCode = useCallback(() => setCodeTab(null), []);
+  // The live browser panel (M8.3). It opens by itself once for each run that opens a browser.
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [liveBrowser, setLiveBrowser] = useState<LiveBrowser | null>(null);
+  const [browserBusy, setBrowserBusy] = useState(false);
+  const [browserError, setBrowserError] = useState<string | null>(null);
+  const browserShownFor = useRef<string | null>(null);
+  const closeBrowser = useCallback(() => setBrowserOpen(false), []);
   const [tick, setTick] = useState(0);
   const localId = useRef(0);
   // Keep the view at the end while new text arrives, unless the user scrolled up.
@@ -339,6 +349,54 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const running = openRuns.length > 0;
   const paused = isPaused(live);
   const stoppingNow = stopping && running;
+
+  // The live browser of an open run (M8.3). The live view URL comes only from the API. The
+  // looks run one after the other, and a change of control starts a new generation, so an old
+  // answer never replaces a newer state.
+  const browserGeneration = useRef(0);
+  useEffect(() => {
+    if (!running) return;
+    let gone = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const look = async () => {
+      const generation = browserGeneration.current;
+      try {
+        const { live: found } = await api.getLiveBrowser(sessionId);
+        if (gone || generation !== browserGeneration.current) return;
+        setLiveBrowser((old) => found ?? (old !== null && old.view_url ? old : null));
+        if (found !== null && browserShownFor.current !== found.run_id) {
+          browserShownFor.current = found.run_id;
+          setCodeTab(null);
+          setBrowserOpen(true);
+        }
+      } catch {
+        // The next look tries again. The panel keeps the last state.
+      } finally {
+        if (!gone) timer = setTimeout(() => void look(), BROWSER_POLL_MS);
+      }
+    };
+    void look();
+    return () => {
+      gone = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [running, api, sessionId]);
+
+  const browserControl = async (action: "take" | "give_back") => {
+    if (liveBrowser === null) return;
+    browserGeneration.current += 1;
+    setBrowserBusy(true);
+    setBrowserError(null);
+    try {
+      await api.setBrowserControl(sessionId, liveBrowser.run_id, action);
+      browserGeneration.current += 1;
+      setLiveBrowser({ ...liveBrowser, control: action === "take" ? "user" : "agent" });
+    } catch (e) {
+      setBrowserError(errorText(e, "The control did not change."));
+    } finally {
+      setBrowserBusy(false);
+    }
+  };
 
   // The clarify tool has no stream event for the question, so look while a run is open.
   useEffect(() => {
@@ -881,7 +939,15 @@ export function Chat({ sessionId }: { sessionId: string }) {
           <SessionTools
             sessionId={sessionId}
             codeOpen={codeTab !== null}
-            onCode={() => setCodeTab((current) => (current === null ? "changes" : null))}
+            onCode={() => {
+              setBrowserOpen(false);
+              setCodeTab((current) => (current === null ? "changes" : null));
+            }}
+            browserOpen={browserOpen}
+            onBrowser={() => {
+              setCodeTab(null);
+              setBrowserOpen((open) => !open);
+            }}
           />
         </div>
       </header>
@@ -1117,6 +1183,19 @@ export function Chat({ sessionId }: { sessionId: string }) {
         />
       </div>
     </div>
+      {browserOpen && codeTab === null ? (
+        <BrowserPanel
+          live={liveBrowser}
+          step={liveBrowser === null ? null : browserStep(live, liveBrowser.run_id)}
+          running={liveBrowser !== null && openRuns.includes(liveBrowser.run_id)}
+          modal={narrow}
+          busy={browserBusy}
+          error={browserError}
+          onControl={(action) => void browserControl(action)}
+          onStop={() => void stop()}
+          onClose={closeBrowser}
+        />
+      ) : null}
       {codeTab !== null ? (
         <CodePanel
           sessionId={sessionId}
@@ -1250,10 +1329,14 @@ function SessionTools({
   sessionId,
   codeOpen,
   onCode,
+  browserOpen,
+  onBrowser,
 }: {
   sessionId: string;
   codeOpen: boolean;
   onCode: () => void;
+  browserOpen: boolean;
+  onBrowser: () => void;
 }) {
   const api = useApi();
   const [busy, setBusy] = useState<ExportFormat | null>(null);
@@ -1276,6 +1359,9 @@ function SessionTools({
     <div className={styles.tools}>
       <button type="button" className="btn btn-quiet btn-small" aria-pressed={codeOpen} onClick={onCode}>
         Code
+      </button>
+      <button type="button" className="btn btn-quiet btn-small" aria-pressed={browserOpen} onClick={onBrowser}>
+        Browser
       </button>
       <Link href={`/s/${sessionId}/runs`} className="btn btn-quiet btn-small">
         Runs

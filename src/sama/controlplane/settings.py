@@ -193,6 +193,11 @@ class ControlPlaneSettings:
     """``SAMA_BROWSERBASE_RECORD=1`` turns on the session recording and the session logs of
     Browserbase, for a test. They are off by default: a recording can show a page with a
     login, and a log can keep a form with a password (Section 14.1)."""
+    browserbase_proxies: bool = True
+    """Residential proxies for the cloud browser (M8.3). ``SAMA_BROWSERBASE_PROXIES=0`` turns
+    them off."""
+    browserbase_solve_captchas: bool = True
+    """CAPTCHA solving of Browserbase (M8.3). ``SAMA_BROWSERBASE_CAPTCHAS=0`` turns it off."""
     browser_task_model: str = DEFAULT_VISION_MODEL
     """The Anthropic model of the browser sub-agent (``SAMA_BROWSER_TASK_MODEL``, M5.6). It
     must have a price in the price table of the model proxy."""
@@ -376,6 +381,8 @@ class ControlPlaneSettings:
             browserbase_key=_secret(env, "BROWSERBASE_API_KEY"),
             browserbase_project_id=env.get("BROWSERBASE_PROJECT_ID", "").strip() or None,
             browserbase_record=env.get("SAMA_BROWSERBASE_RECORD", "").strip() == "1",
+            browserbase_proxies=env.get("SAMA_BROWSERBASE_PROXIES", "1").strip() != "0",
+            browserbase_solve_captchas=env.get("SAMA_BROWSERBASE_CAPTCHAS", "1").strip() != "0",
             browser_task_model=_browser_task_model(env),
             composio_key=_secret(env, "COMPOSIO_API_KEY"),
             composio_webhook_secret=_secret(env, "SAMA_COMPOSIO_WEBHOOK_SECRET"),

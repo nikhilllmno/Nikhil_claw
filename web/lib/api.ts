@@ -709,6 +709,20 @@ export interface ClarifyQuestion {
   multi_select?: boolean;
 }
 
+/** The live browser of a session (M8.3): the newest open run with a browser session. */
+export interface LiveBrowser {
+  run_id: string;
+  target: "cloud" | "my_chrome";
+  /** `pending` while a takeover waits for the step that the agent does now. */
+  control: "agent" | "pending" | "user";
+  /** A short-lived live view URL of the active tab, or `null` (no live view for the target). */
+  view_url: string | null;
+  page_url: string | null;
+  title: string | null;
+  tabs: number | null;
+  page_id: string | null;
+}
+
 export interface ClarifyRequest {
   id: string;
   run_id: string;
@@ -2310,6 +2324,12 @@ export class ApiClient {
     this.json<ApprovalDecision>(`/approvals/${approvalId}/deny`, {
       method: "POST",
       body: {},
+    });
+  getLiveBrowser = (id: string) => this.json<{ live: LiveBrowser | null }>(`/sessions/${id}/browser`);
+  setBrowserControl = (id: string, runId: string, action: "take" | "give_back") =>
+    this.json<null>(`/sessions/${id}/browser/control`, {
+      method: "POST",
+      body: { run_id: runId, action },
     });
   listQuestions = (id: string) => this.json<ClarifyRequest[]>(`/sessions/${id}/questions`);
   answerQuestion = (id: string, requestId: string, answers: string[]) =>

@@ -262,6 +262,33 @@ class LoginFiller(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class LiveView:
+    """What the web app shows of a live browser session (M8.3, Section 14.1): a short-lived
+    URL of the live view of the active tab, the URL and the title of that tab, and the number
+    of tabs. The live view URL lets a person watch and use the browser, so only a member who
+    can see the session gets it."""
+
+    view_url: str
+    page_url: str
+    title: str
+    tabs: int = 1
+    page_id: str = ""
+    """The id of the tab at the provider. The view URL of one tab changes at each request (a new
+    time to live), so the web app loads a new URL only when the tab changes."""
+
+
+class LiveViewSource(Protocol):
+    """A session whose browser a person can watch (the ``cloud`` target)."""
+
+    async def live_view(self, ttl_s: int) -> LiveView | None: ...
+
+
+def has_live_view(session: object) -> bool:
+    """True when ``session`` can give a live view (M8.3)."""
+    return callable(getattr(session, "live_view", None))
+
+
 def has_vision(session: object) -> bool:
     """True when ``session`` can act at a point (vision mode, M5.2)."""
     return getattr(session, "vision", False) is True
