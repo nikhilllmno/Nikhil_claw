@@ -6670,6 +6670,49 @@ so a point cannot pass the sensitive check, which reads refs. To add vision mode
   (`DOM.getNodeForLocation`) and checks it as it checks a ref, and the gate treats a point
   that it cannot check as a sensitive action.
 
+#### 14.2.4 My Chrome and the extension card (M8.3)
+
+Claude Agent SDK runtime and the web app only for now. Before M8.3 the agent did not know when
+to use the Chrome of the user, the user could not choose it, and the extension was hard to get:
+on production no extension ever connected.
+
+**The browser of a session.** The composer of the web chat has a menu "Browser: Cloud / My
+Chrome" next to the model menu. The choice is `sessions.browser_target` (migration `0051`,
+`cloud`, `my_chrome`, or null for the default of the process), set with `PATCH /sessions/{id}`
+(`{browser}`) by the owner of the session or an admin, with the audit row
+`session.browser_changed`. `GET /sessions/{id}` gives it as `browser_target`.
+
+- `BrowserService.resolve` picks the target of a call: the named target, else the target of the
+  last browser call of the run, else the choice of the session (`SessionBrowserChoice`, which
+  keeps each answer for 10 seconds), else the default target. A failed read uses the default.
+- The descriptions of the browser tools tell the agent the order, and to use `my_chrome` when the
+  user says "in my browser" or "open a tab", or for a site where the user is logged in, and
+  `cloud` for background research.
+- When the extension is offline, a `my_chrome` call fails with a fixed text that tells the agent
+  to say in one line that the user must open Chrome with the extension (the web app has the
+  download and the steps) or set the session to Cloud, and then to use the cloud target if the
+  task allows it.
+- The menu shows whether the extension of the user is connected, with a link to the card.
+
+**The card.** The settings page has the card "Chrome extension":
+
+- the state: "Connected" or "Not connected" (`GET /me/chrome`: `connected`, `connections`, and
+  `download`, from the `ChromeHub` of the process);
+- "Download the extension": `GET /extension/download` (a signed-in member) gives the zip of the
+  build. The deploy workflow builds the extension once with the placeholder API address
+  `https://sama-api.invalid` and puts the zip in the image (`/opt/sama/extension/`,
+  `SAMA_EXTENSION_ZIP`). The download puts the public address of the API (`SAMA_PUBLIC_URL`) in
+  the place of the placeholder in the `.js`, `.json`, and `.html` files, and keeps each host
+  permission of the manifest once. So the image that production gets from staging gives each API
+  its own build. Without the file, the route answers `404` and the card says so;
+- the 4 steps: unzip, open `chrome://extensions` and turn on Developer mode, "Load unpacked", then
+  sign in in the side panel.
+
+The extension calls the API with the host permission of the API (no CORS) and opens the
+WebSocket with its `chrome-extension://` origin (Section 14.2.1). `SAMA_EXTENSION_IDS` stays unset
+on staging and production until the Chrome Web Store item exists (Section 14.2.3): an unpacked
+extension has an id that depends on the folder, and a list would refuse it.
+
 #### 14.2.3 Publish to the Chrome Web Store
 
 A person does these steps. The agent cannot do them.

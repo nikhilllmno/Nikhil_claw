@@ -49,7 +49,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Final, Literal
@@ -109,6 +109,8 @@ NO_LOGINS: Final = (
 )
 Control = Literal["agent", "pending", "user"]
 ControlResult = Literal["done", "busy", "missing"]
+TargetPreference = Callable[[RunTokenClaims], Awaitable["TargetName | None"]]
+"""Gives the browser that the user chose for the session of the run (M8.3)."""
 LIVE_VIEW_TTL_S: Final = 600
 """The live view URL of the web app ends after 10 minutes. The web app asks for a new one
 before that."""
@@ -190,10 +192,13 @@ class BrowserService:
         clock: Callable[[], float] = time.monotonic,
         control_wait_s: float = CONTROL_WAIT_S,
         handoff_s: float = HANDOFF_S,
+        preference: TargetPreference | None = None,
     ) -> None:
         targets = [target] if not isinstance(target, Sequence) else list(target)
         self._control_wait_s = control_wait_s
         self._handoff_s = handoff_s
+        self._preference = preference
+        """The browser that the user chose for the session of a run (M8.3), or ``None``."""
         if not targets:
             raise ValueError("the browser service needs a target")
         self.targets: dict[TargetName, BrowserTarget] = {item.name: item for item in targets}
@@ -218,6 +223,25 @@ class BrowserService:
         self._closed = False
 
     # -- the life of a session ---------------------------------------------------------------
+
+    async def resolve(self, claims: RunTokenClaims, target: TargetName | None) -> TargetName:
+        """The target of a call: the named one, else the target of the last browser call of the
+        run, else the browser that the user chose for the session (M8.3), else the default
+        target. A failed read of the choice uses the default."""
+        if target is None and (claims.org_id, claims.run_id) not in self._current:
+            chosen: TargetName | None = None
+            if self._preference is not None:
+                try:
+                    chosen = await self._preference(claims)
+                except Exception as error:
+                    log.warning(
+                        "the browser choice of the session failed run=%s error=%s",
+                        claims.run_id,
+                        type(error).__name__,
+                    )
+            if chosen in self.targets:
+                target = chosen
+        return self.target_of(claims, target)
 
     def target_of(self, claims: RunTokenClaims, target: TargetName | None) -> TargetName:
         """The target of a call: the named one, else the target of the last browser call of
@@ -421,7 +445,7 @@ class BrowserService:
         snapshot: bool = True,
         target: TargetName | None = None,
     ) -> str:
-        name = self.target_of(claims, target)
+        name = await self.resolve(claims, target)
         url = await self._checked(claims, url, name)
         live, session = await self._locked_session(claims, name)
         try:
@@ -438,7 +462,7 @@ class BrowserService:
         return self._clean(claims, text)
 
     async def snapshot(self, claims: RunTokenClaims, *, target: TargetName | None = None) -> str:
-        live, session = await self._locked_session(claims, self.target_of(claims, target))
+        live, session = await self._locked_session(claims, await self.resolve(claims, target))
         try:
             shot = await session.snapshot()
         except BrowserError as error:
@@ -456,7 +480,7 @@ class BrowserService:
         target: TargetName | None = None,
     ) -> str:
         check_act(act)
-        live, session = await self._locked_session(claims, self.target_of(claims, target))
+        live, session = await self._locked_session(claims, await self.resolve(claims, target))
         try:
             if act.point is not None and not has_vision(session):
                 raise BrowserError(
@@ -489,7 +513,7 @@ class BrowserService:
             # An image cannot be scrubbed: the page can show the user name, or the password
             # after a click on "show password". So no screenshot after a fill in this run.
             raise BrowserError(SCREENSHOT_AFTER_FILL)
-        live, session = await self._locked_session(claims, self.target_of(claims, target))
+        live, session = await self._locked_session(claims, await self.resolve(claims, target))
         try:
             shot = await session.screenshot(full_page=full_page)
         except BrowserError as error:
@@ -508,7 +532,7 @@ class BrowserService:
         target: TargetName | None = None,
     ) -> str:
         request = extract_request(kind, ref=ref, fields=fields)
-        live, session = await self._locked_session(claims, self.target_of(claims, target))
+        live, session = await self._locked_session(claims, await self.resolve(claims, target))
         try:
             result = await session.extract(request)
         except BrowserError as error:
@@ -528,7 +552,7 @@ class BrowserService:
     ) -> str:
         if action == "select" and index is None:
             raise BrowserError("select needs index: the index of a tab from the list")
-        name = self.target_of(claims, target)
+        name = await self.resolve(claims, target)
         checked = await self._checked(claims, url, name) if url else None
         live, session = await self._locked_session(claims, name)
         try:
@@ -593,7 +617,7 @@ class BrowserService:
             raise BrowserError(error.message) from None
         self._remember(claims, credentials.username.get_secret_value(), username=True)
         self._remember(claims, credentials.password.get_secret_value(), username=False)
-        live, session = await self._locked_session(claims, self.target_of(claims, target))
+        live, session = await self._locked_session(claims, await self.resolve(claims, target))
         try:
             if not isinstance(session, LoginFiller):
                 raise BrowserError(

@@ -78,6 +78,7 @@ from sama.api.coding_mode import Access as CodingAccess
 from sama.api.coding_mode import router as coding_router
 from sama.api.custom_tools import router as custom_tools_router
 from sama.api.events import MAX_MESSAGE_CHARS, SendError, Sent, StreamEvent
+from sama.api.extension import DOWNLOAD_NAME, ExtensionError, build_for, extension_ready
 from sama.api.history import (
     DEFAULT_RUNS,
     MAX_RUNS,
@@ -334,6 +335,13 @@ class ApiSettings(BaseModel):
     headers."""
     signup: SignupPolicy = SignupPolicy()
     """Self-serve sign-up (Section 17.2). The default is ``invite_only``."""
+
+    public_url: str | None = None
+    """The public address of this API (``SAMA_PUBLIC_URL``). The download of the Chrome
+    extension puts it in the build as the API address (M8.3)."""
+    extension_zip: str | None = None
+    """The path of the build of the Chrome extension in the image (``SAMA_EXTENSION_ZIP``).
+    Without a file, the download answers ``404``."""
 
     extension_ids: tuple[str, ...] = ()
     """The ids of the Chrome extensions that may open the extension channel
@@ -837,7 +845,10 @@ class SessionPatch(_Edit):
     ) = None
     """The model for the next runs of the session (M8.2). ``null`` goes back to the model of the
     profile. The runtime of the session must know the model."""
-    nullable: ClassVar[frozenset[str]] = frozenset({"model"})
+    browser: Literal["cloud", "my_chrome"] | None = None
+    """The browser of the session (M8.3): ``cloud`` or ``my_chrome``. ``null`` goes back to the
+    default browser of the process."""
+    nullable: ClassVar[frozenset[str]] = frozenset({"model", "browser"})
 
 
 class SessionOut(BaseModel):
@@ -855,6 +866,8 @@ class SessionOut(BaseModel):
     coding_agent: str | None = None
     """``claude_code`` or ``codex`` when the session is in the direct mode of a coding agent
     (Section 15.4, M7.2), else ``None``."""
+    browser_target: str | None = None
+    """The browser that a person chose for the session (M8.3), or ``None`` for the default."""
     can_manage: bool = False
     """True when ``PATCH /sessions/{id}`` lets the caller rename, archive, or restore the
     session: the owner of a private session, or the owner or an admin of a shared session."""
@@ -1138,6 +1151,7 @@ _SESSION_COLUMNS: Final = (
     Session.lineage,
     Session.parent_session_id,
     Session.coding_agent,
+    Session.browser_target,
 )
 
 
@@ -1952,6 +1966,35 @@ class SamaApi:
         ) -> JSONResponse:
             reason = (body or Decision()).reason
             return await self._decide(principal, approval_id, False, False, reason, None)
+
+        @app.get("/me/chrome")
+        async def my_chrome(principal: Me) -> dict[str, Any]:
+            """The state of the Chrome extension of the user (M8.3)."""
+            links = self.chrome.links(principal.auth_user_id)
+            return {
+                "connected": bool(links),
+                "connections": len(links),
+                "download": extension_ready(self._settings.extension_zip),
+            }
+
+        @app.get("/extension/download")
+        async def extension_download(principal: Me) -> Response:
+            """The build of the Chrome extension for this API, as a zip (M8.3)."""
+            settings = self._settings
+            try:
+                data = await asyncio.to_thread(
+                    build_for, settings.extension_zip, settings.public_url
+                )
+            except ExtensionError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from None
+            return Response(
+                content=data,
+                media_type="application/zip",
+                headers={
+                    "content-disposition": f'attachment; filename="{DOWNLOAD_NAME}"',
+                    "cache-control": "no-store",
+                },
+            )
 
         @app.get("/sessions/{session_id}/browser")
         async def live_browser(principal: Me, session_id: uuid.UUID) -> dict[str, Any]:
@@ -3280,7 +3323,13 @@ class SamaApi:
         async with self._engine.begin() as connection:
             current = (
                 await connection.execute(
-                    select(Session.title, Session.status, Session.lineage, Session.model_override)
+                    select(
+                        Session.title,
+                        Session.status,
+                        Session.lineage,
+                        Session.model_override,
+                        Session.browser_target,
+                    )
                     .where(Session.org_id == access.org_id, Session.id == session_id)
                     .with_for_update()
                 )
@@ -3303,6 +3352,14 @@ class SamaApi:
                 values["model_override"] = body.model
                 actions.append(
                     ("session.model_changed", {"from": current.model_override, "to": body.model})
+                )
+            if "browser" in body.model_fields_set and body.browser != current.browser_target:
+                values["browser_target"] = body.browser
+                actions.append(
+                    (
+                        "session.browser_changed",
+                        {"from": current.browser_target, "to": body.browser},
+                    )
                 )
             if values:
                 await connection.execute(

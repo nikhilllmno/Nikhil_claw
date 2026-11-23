@@ -91,6 +91,20 @@ jobs:
           fi
           echo "TEMPLATE_ALIAS=${ALIAS}" >> "$GITHUB_ENV"
           uv run python -m sama.sandbox.template --alias "${ALIAS}"
+      # The Chrome extension for the download of the web app (M8.3). The build has a
+      # placeholder API address; the API puts its own address in each download, so the image
+      # that production gets from staging serves both.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: Build the Chrome extension
+        working-directory: extension
+        run: |
+          npm ci
+          SAMA_API_URL=https://sama-api.invalid npm run build
+          (cd dist && zip -qr ../../deploy/sama-extension.zip .)
       - name: Deploy
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

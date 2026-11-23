@@ -40,6 +40,9 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 COPY skills ./skills
 COPY connectors ./connectors
+# The build of the Chrome extension, when the deploy workflow made it (M8.3). The toml file is
+# there so the copy works without the zip (a local build).
+COPY deploy/fly.staging.toml deploy/sama-extension.zi[p] ./extension/
 RUN uv sync --frozen --no-dev --no-default-groups --group sandbox-e2b --group databases --group browser --no-editable \
     && pip uninstall --yes uv \
     && useradd --system --no-create-home sama \

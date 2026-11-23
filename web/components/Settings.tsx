@@ -22,6 +22,7 @@ import { ROLE_LABELS, roleBadge } from "@/lib/orgs";
 import { relativeTime } from "@/lib/time";
 import { useApi } from "./AuthProvider";
 import { BrowserSettings } from "./BrowserSettings";
+import { ChromeExtension } from "./ChromeExtension";
 import { ChatApps } from "./ChatApps";
 import { MyData } from "./DataControls";
 import { useData } from "./DataProvider";
@@ -95,6 +96,8 @@ export function Settings() {
         .map((o) => (
           <ChatApps key={o.id} org={o} onChanged={reloadMe} />
         ))}
+
+      <ChromeExtension />
 
       {me.orgs.map((o) => (
         <BrowserSettings key={o.id} org={o} />
