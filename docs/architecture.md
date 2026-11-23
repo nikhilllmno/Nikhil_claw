@@ -707,12 +707,182 @@ The steps that were removed:
 - The first run config of a session takes about 1.5 seconds of sequential reads (context files,
   channel, toolsets, policies, the skill index, and the snapshot). They are independent, but they
   share one transaction and one connection.
-- The OpenAI runtime connects its MCP servers one after the other and reads the session items
-  before the model call.
 - The control plane (`sin`) and the database (`ap-south-1`) are in different regions. A control
   plane in the region of the database (Fly `bom`) would make each round trip about 1 to 2 ms
   instead of 58 ms. It also changes the latency to E2B and to the model providers, so a person
   must measure it before a move.
+
+**Kept runtime (M8.2, part 3).** A follow-up message used to start a new Claude Code CLI, a new
+MCP connection, and a new model connection. The runner now stays alive after a run that ended
+well and gives these to the next run of the session. The goal is a first token of a follow-up
+message in less than 5 seconds. Measured, where the time of a follow-up goes (runner job to
+`thinking`, the staging run of 2026-11-23 had 5.4 seconds):
+
+| Step in the runner | Time | Source |
+|---|---|---|
+| Start of the CLI and its `initialize`, warm file cache | 0.4 to 0.6 s | E2B, 2 vCPU, local stub servers |
+| Start of the CLI, first start in a new sandbox | 2.8 s | E2B, same test (cold file cache) |
+| First message of the CLI and `message_start`, no model delay | 0.13 s | E2B, same test |
+| Connect of the MCP server: `initialize`, the notification, `tools/list` | 3 requests, about 0.7 s | E2B to `sama-staging`: TCP 30 ms, TLS 100 ms, each request 0.2 to 0.25 s |
+| A new TLS connection to the model proxy and to the control plane | 0.13 s each | same |
+| Model call through the proxy | the rest, about 3 s | the proxy made 16 round trips to the database before it forwarded (5 connections, each with `BEGIN` and `ROLLBACK`): about 0.9 s at 58 ms each, then the time to the first byte of the provider |
+
+A kept CLI with kept connections saves the first three rows, the connect of the MCP server, and
+the TLS connections: about 1.4 to 1.6 s of the 5.4 s. The model call is the biggest part now.
+It is in the model proxy and not in the runner (Section 16.6). Its reads were in sequence
+(see "Proxy reads" below).
+
+**Design.** The runner process of a run that ended well does not exit. It becomes a *host*
+(`src/sama/runtime/host.py`, Section 16.2). It listens on `<warm socket>.host`. The next
+`sama.warm` client tries the host first (when `SAMA_RUNNER_KEEP_S` is set) and uses the warm
+server only when the host is busy or gone. The host runs the job in its own process with the
+files, the environment, and the work folder of the client. The kept parts are:
+
+- **Claude.** `ClaudeKeeper` keeps one CLI client. A run reuses it only when all of these are
+  true: the key is the same (the config fingerprint, so D9 holds: the prefix, the tools, the MCP
+  servers, the model, and the sub-agents are the same; the turn limit; the CLI environment; the
+  working folder), the SDK session is the same, the input state of the run is exactly the
+  `runtime_state` that the client left, and the client waited less than the idle time. The state
+  check also catches a session that another process served in between: that run has another
+  state. A run that does not fit stops the client and starts a new CLI. An error, a cancel, a
+  budget stop, a pause for an approval, a background task, a dead client, or a failed MCP
+  server ends the client and it is not kept.
+- **OpenAI.** `OpenAIKeeper` keeps the connected MCP clients and the model client. The MCP
+  servers of a run connect at the same time (`asyncio.gather`, 30 seconds at most), and they
+  start to connect before the session items load, so the two network waits overlap. One task
+  owns each connection: it connects, waits, and closes it, because the SDK needs the task that
+  connects to be the task that closes. A set of connections fits a run when the config
+  fingerprint is the same and it waited less than the idle time. Only a run that completed
+  keeps them.
+- **Callbacks.** The SDK registers the hook and permission callbacks of a CLI once. A kept CLI
+  calls them through a `_Binding` that each run points at its own gate, scope, and state. With
+  no run active, every call is denied.
+- **Limits.** The CLI counts the turns of each message, so the turn limit is a start flag and
+  part of the key. It counts the cost of all messages of its process, so a kept CLI starts with
+  no cost flag. The model proxy stops a run at its cost limit (the limit is in the run token,
+  Section 16.6), and the adapter maps the answer `402` to `budget_exceeded` as before.
+- **Idle time and exit.** The host stops after `SAMA_RUNNER_KEEP_S` seconds with no job (default
+  600), when its socket file is gone, or when a client has other code. It takes its CLI with
+  it. A host that is busy answers `B`, so a main run that comes at that time uses the warm
+  server. A side run (`RunRequest.parallel`) never goes to the host.
+- **Cancel.** A cancel is the same as before: the orchestrator sends a cancel line, and the
+  runtime interrupts the CLI. If the client goes away (the orchestrator kills it, 7 seconds
+  after its cancel line), the host sends the cancel line itself and waits 1 second. Nobody reads
+  the events of such a job, so it does not wait for a graceful end. If the job has not stopped,
+  the host makes a hard stop: it takes the token from the relay, kills and reaps its whole
+  process tree (the CLI and everything under it, see "Process fence"), and exits. The warm
+  watcher killed the runner at once before the host existed, so the stop is at most 1 second
+  slower than before. A cancelled run is never kept, and a job whose client went away ends
+  every kept client. The skill sync that restarts the runner (`skills=changed`) sets
+  `SAMA_RUNNER_FRESH=1`: the host then ends its kept clients first.
+- **Process fence.** A kept runner lives for more than one run, so a process that a run left
+  behind (a shell command that started work in the background without `run_in_background`, a
+  tool that forked) must not live into the next run: it could call the relay or read the token
+  file while the next token is active. The runner and the host are *child subreapers*
+  (`prctl(PR_SET_CHILD_SUBREAPER)`): the orphans of the processes of a run come to the runner
+  and stay in its process tree, also after they left their shell. `sama.runtime.fence` reads the
+  tree from `/proc`, kills and reaps every descendant (`SIGKILL`, look again, 3 seconds at most),
+  and spares only the kept CLI itself. Its own children are killed too: the CLI has none between
+  two runs. The fence runs at three places. (1) At the end of a run, after the token is gone
+  (`RunnerKeep.after_run`): if it found a process, the run was not clean, and no client is kept
+  (the CLI and the MCP connections end). (2) Before the next run, before its token is active
+  (`RunnerKeep.before_run`): a dirty fence ends all kept clients. (3) When the runner stops
+  (`RunnerKeep.close`, `stop_now`): it kills the CLI and everything under it. A fence that cannot
+  kill a process fails the job with a retryable `sandbox_error` and stops the host. A zombie
+  does not hold the fence: it has no code and no files. The token of a run becomes active only
+  after the fence, so a process of run N never reads the token of run N+1.
+- **Replacement.** A kept CLI that the next run cannot use is retired before anything starts:
+  `before_run` calls `ClaudeRuntime.prepare` and `OpenAIRuntime.prepare`, which end the kept
+  client when the key, the session, or the state of the run does not fit, or when the run is an
+  approval resume, and the call waits until the process has exited (the SDK stop for 6 seconds,
+  then `SIGKILL`). A client that is not healthy at the start of a run is retired the same way
+  (`ClaudeKeeper.discard`) before the new CLI starts. If a CLI does not exit, the run fails
+  (retryable `sandbox_error`) and the host stops: two CLIs never work on one SDK session at the
+  same time. These steps run under the runner lock.
+- **Timing line.** The line has `mode=host` for a job that a host ran, and the steps
+  `client_spawned_s` or `client_kept_s` (Claude), `mcp_kept_s`, `items_ready_s`, `mcp_ready_s`,
+  and `sandbox_ready_s` (OpenAI), `query_sent_s`, and `first_message_s`. They show where the
+  time goes on staging.
+
+**Run token and the kept runtime.** The run token stays per run (D6): the model proxy and the
+tool server read the scope, the budget, and the live authority of the run from it, and
+`SAMA_RUN_TOKEN` is also the password of the git credential helper of a proxy clone. A CLI or an
+MCP client that lives for more than one run cannot get a new environment or new headers, and
+the SDK has no call for it. So the kept clients never hold a token. The *token relay*
+(`src/sama/runtime/relay.py`) is a small HTTP forwarder on `127.0.0.1` in the host:
+
+- The CLI, the MCP clients, the model client, and the session items client call the relay with
+  one random local secret. The relay adds the token of the run that is active now and forwards
+  the call to the model proxy (`/anthropic/...`, `/openai/...`) or to the registered URL of a
+  server (`/mcp/<name>`) over one connection pool that stays open. It passes the answer on as a
+  stream. The routes are for one job: the runner replaces the whole list for each job (the MCP
+  servers of its config and the session items URL), and a name that is not in the list gets
+  `404`. The relay reads the body of a request in pieces. It refuses a body of more than 64 MB
+  with `413` when it passes the limit, and it refuses a call with `503` when all bodies together
+  would hold more than 192 MB.
+- The host gives the relay the token when a job starts and takes it away when the job ends
+  (`set_token`, `clear_token`). Between jobs, and after a cancel, every call gets `401`. A call
+  of the previous run in a kept process cannot use the token of an ended run: it has none.
+  Each change of the token or the routes starts a new generation. The relay notes the
+  generation when it admits a call, and it forwards only when the generation is the same
+  after the body came. So a call of run N whose body ends after run N+1 started gets `401`: it
+  never gets the token or a route of N+1.
+- The CLI gets `ANTHROPIC_API_KEY=<local secret>`, `ANTHROPIC_BASE_URL=<relay>/anthropic`,
+  and `SAMA_RUN_TOKEN=` (empty). The run token is not in its environment, its command line,
+  or its MCP configuration. The shell commands of the agent run through a prefix script
+  (`CLAUDE_CODE_SHELL_PREFIX`) that reads the token of the active run from a private file
+  (mode 0600 in a folder with mode 0700) and sets `SAMA_RUN_TOKEN` for that command only. So
+  the git credential helper keeps working in a follow-up run. The file is for one run: it has a
+  new random name for each run, a pointer file (`current`) names it, and the relay deletes both
+  when the run ends, so a reader that is late gets nothing.
+- This is not a new trust boundary. A process in the sandbox could read the token from the
+  environment of the CLI before. The local secret keeps other local users out, and the relay
+  holds a token only while its run is active. The relay sends the token only to the model proxy
+  and to URLs that its runner registered for the job. A process that a run left behind is killed
+  before the next token is active (see "Process fence"), so it never gets that token. A run that is not kept (a side run, a run on a
+  cold runner, a run with no model URL) uses the old path: the token in the environment.
+
+**CLI file cache.** A new sandbox loads the blocks of its disk when they are first read. The
+first start of the CLI took 2.6 to 3.2 s, and the next ones 0.35 to 0.6 s. The warm server now
+reads the CLI file once in the background (`sama.warm`, a thread). The session warm starts the
+server before the first message, so the first start of the CLI took 1.4 s in the same test.
+
+**Expected savings and risk.** Measured end to end on E2B (2 vCPU, the sama template, the
+warm runner, the real CLI, stub servers in the sandbox, the exec calls of the E2B API as the
+orchestrator makes them): the time from the job to `thinking` was 0.45 to 0.65 s for a run
+with a new CLI and 0.03 to 0.14 s for a run with the kept CLI. The kept CLI was also used after
+a pause and a resume of the sandbox. A killed client stopped the CLI in 0.7 s, and the next run
+started a new CLI. On Claude, the saving on staging is the first three rows and the MCP connect
+of the table, about 1.4 to 1.6 s. Local measures on the OpenAI runtime: 0.30 to 0.13 s. The OpenAI saving is the MCP connect (about 0.7 s, now at the same time as the
+item load), the TLS connections (0.13 s each), and the tool list. The kept CLI uses about
+200 MB of memory for each session sandbox (4 GB) until the idle time ends. The risks are in the
+tests: a stray message of a CLI that serves two runs, and a model connection that a pause of
+the sandbox broke. The first is covered because a run with a background task is not kept. The
+second is covered because the relay keeps an upstream connection for at most 60 seconds idle.
+
+**Proxy reads (M8.2, part 4).** Before the model proxy forwards a call, it reads the live
+authority of the run, the spend of the run, the limits of the org, the cost of the org this month,
+and the cost of the user today (Section 16.6). Each read was its own call of the store, with its
+own connection and its own `BEGIN` and `ROLLBACK`. `tests/modelproxy/test_roundtrips.py` counts
+the round trips of a call with a real database:
+
+| Call | Before | After | Time saved at 58 ms |
+|---|---|---|---|
+| Recorded call, run budget, monthly quota, daily quota | 16 | 3 | 0.75 s |
+| Recorded call, run budget, no quota | 10 | 3 | 0.41 s |
+| `count_tokens` (authority only) | 4 | 2 | 0.12 s |
+| Call of a run that ended | 3 | 1 | 0.12 s |
+
+`UsageStore.live` is the one store call. `PostgresUsageStore.live` uses one connection without a
+transaction (the reads change nothing), loads the authority (the run with its profile and its
+session, then the grants of the user), and then reads the limits of the org, the spend of the run,
+the cost of the org, and the cost of the user in one statement. The cost of the org is read only if
+the limits have a monthly quota, and the cost of the user only if there is a user and a daily
+quota (a `CASE` on the limits, so the database does the same work as before). Every part has the
+`org_id` of the token. The checks and their order stay in the proxy: authority, run budget, month,
+day (`_check_limits`). A store that cannot read gives `503`, and a value that a limit needs and the
+store did not read also gives `503`. The key of the org comes from the vault cache and costs no
+round trip, except for the first call of an org. The ledger flush (`settle`) still runs first.
 
 **Database pool.** The API, the worker, the tool server, the gate, the model proxy, and the
 event streams of one process share one SQLAlchemy pool. Before, the pool had 5 connections and
@@ -965,6 +1135,17 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   the paid work of the failed run again. The adapter
   does not use the CLI hook `SessionStart` with the source `compact`, because the Python SDK
   does not expose it: sama injects the pins itself (Section 6.3).
+- **Kept client (M8.2).** With `ClaudeSettings.keeper` and `relay`, a run that completed keeps
+  its CLI client, and the next run of the session reuses it (Section 4.4). The key is the config
+  fingerprint, the turn limit, and the process settings. The input state of the run must be the
+  `runtime_state` that the client left. The hooks and `can_use_tool` go through a `_Binding` that
+  each run sets, and that denies every call with no run. The CLI gets the secret of the token
+  relay as its key, its MCP header, and its model URL, and no run token. A kept CLI starts with
+  no `max_budget_usd`, because the CLI counts the cost of all messages of its process. The CLI
+  stderr goes to a callback, so a kept CLI never holds the pipe of the first runner. These are
+  checked with the real CLI: `mcp_set_servers` replaces the headers of a live CLI, but it
+  connects the server again, and `update_environment_variables` is refused, so the adapter does
+  not use them.
 
 #### OpenAI adapter notes (M3.6)
 
@@ -1064,6 +1245,13 @@ The adapter is `src/sama/runtime/openai_agents.py`. It uses `openai-agents==0.25
   `session_url` to `<tools_url>/session-items` (`SandboxSettings.session_url`). The control
   plane has one `SandboxedRuntime` for each kind (`for_kind`). The two share the sandboxes and
   the run state, so a cancel or an approval finds the run in either one.
+- **Connections (M8.2).** The MCP servers of a run connect at the same time, with a limit of 30
+  seconds, and they start before the session items load. One task owns each connection (the
+  SDK enters cancel scopes when it connects, so the task that connects must close). With
+  `OpenAISettings.keeper` and `relay`, a run that completed keeps the connected clients and the
+  model client for the next run when the config fingerprint is the same (Section 4.4). The
+  clients call the token relay with its local secret. They never hold a run token, so each run
+  uses its own token.
 
 Versions at the time of writing: `claude-agent-sdk==0.2.184` and `openai-agents==0.25.0`.
 Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
@@ -7668,8 +7856,24 @@ not change.
   process in `/tmp` stay through an E2B pause and resume, so a follow-up run of a session is
   warm.
 - Each runner logs one line on stderr at its end:
-  `runner timing mode=<cold|warm> job_s= lock_s= runtime_s= first_event_s= terminal_s= exit_s=`.
-  The orchestrator logs this line with `run=<id>` (Section 18.1).
+  `runner timing mode=<cold|warm|host> job_s= lock_s= runtime_s= first_event_s= terminal_s=
+  exit_s=`, and the steps of the runtime (`client_spawned_s`, `client_kept_s`, `mcp_ready_s`,
+  and others, Section 4.4). The orchestrator logs this line with `run=<id>` (Section 18.1).
+- **Host (M8.2).** With `SAMA_RUNNER_KEEP_S` set (the orchestrator sets it for each main run;
+  `SandboxSettings.keep_runner_s`, default 600), a warm runner that ended a run well, and holds
+  a kept CLI or kept MCP connections, does not exit. It makes the socket `<socket>.host` (mode
+  0600, one host for each socket, a lock file decides), tells its watcher the exit code of the
+  job (a pipe), and points its standard files at `/dev/null`, so the orchestrator sees the end
+  of the job. The watcher then answers the client and does not kill the runner. The next client
+  tries the host first, with the same protocol as the warm server: the host answers `S` (other
+  code; the host stops), `B` (the host runs a job now; the client uses the warm server), or
+  `X<exit code>`. The host runs the job in its process, one job at a time, with the files and the
+  environment of the client. It checks the user of the peer. It never holds a run token between
+  jobs (the token relay, Section 4.4). If the client closes the socket, the host cancels the job,
+  and it makes a hard stop (token away, whole process tree killed, exit) if the job does not stop
+  in 1 second. The host and the first runner are child subreapers, and a process fence kills what
+  a run left before the next token is active (Section 4.4). A run that is not a main run of the Claude
+  or OpenAI runtime, and a run with no model URL, never uses it.
 
 **Runner lock.** A main runner holds an exclusive `flock` on `.sama/runner.lock` in the work
 folder while it builds the runtime, streams, and closes it. A side runner (M7.1,
@@ -7696,8 +7900,11 @@ before this stop ends.
 
 **Tests.** `tests/sandbox/` runs the same provider tests on `local`, `docker` (with
 `SAMA_DOCKER_IMAGE`), and `e2b` (live). The conformance suite has three more targets:
-`claude-runner` (local provider), `claude-warm` (local provider with the warm runner), and
-`claude-docker` (sama image). The tool server of the
+`claude-runner` (local provider), `claude-warm` (local provider with the warm runner),
+`openai-warm` (the same for the OpenAI runtime), and `claude-docker` (sama image).
+`tests/conformance/test_kept_runtime.py` runs the follow-up of a session on the two warm
+targets: it checks the reuse, the token of each run in the model proxy, a new config, a
+cancel, and that the CLI holds no run token. The tool server of the
 suite accepts only run tokens that it signed. CI builds the image and runs the Docker tests.
 The nightly job builds the E2B template from `main` and runs the E2B tests.
 
@@ -7961,7 +8168,8 @@ in-memory store.
 environment second (Section 16.3). The Langfuse traces (M1.14, Section 18.2) read these rows.
 
 **Live authority (M1.18).** Before each call, the proxy reads the live authority of the run
-(Section 16.1). A run that ended (a cancel ends the run) or a run user who lost access gets
+(Section 16.1). It reads the authority, the spend of the run, the limits of the org, and the costs
+of the org and the user in one store call (`UsageStore.live`: 3 round trips, Section 4.4). A run that ended (a cancel ends the run) or a run user who lost access gets
 `403` on every route, also on `count_tokens`. The run limits are the lower of the token claims and the live budget. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 
@@ -8074,6 +8282,11 @@ the checks:
 `ContextArchive` redacts each entry whole (the structure of a tool input), cuts it after, and
 stores it. The runner sends the request. The sandbox needs the control plane host in its egress
 list, like the model and gate URLs.
+
+**Kept runner (M8.2).** A runner that serves more than one run of a session does not hold the
+run token. The token relay in the runner adds the token of the active run to each call, so the
+server still takes the scope from the token of each call, and a call of a run that ended gets
+no token (Section 4.4).
 
 **Not in M1.8.** The Claude adapter does not yet map the native `TodoWrite` tool
 to `todo`. The search key of the org comes from the vault, with the key of the server
@@ -9233,6 +9446,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_STRIPE_ALLOW_LIVE` | No | `true` accepts a live Stripe key. Without it, a live key turns billing off. |
 | `SAMA_DB_POOL_SIZE`, `SAMA_DB_POOL_OVERFLOW`, `SAMA_DB_POOL_TIMEOUT_S`, `SAMA_DB_POOL_RECYCLE_S`, `SAMA_DB_POOL_PREWARM`, `SAMA_DB_POOL_WARN_MS` | No | The database pool of the process (Section 4.4). Defaults: 5, 2, 30, 1800, 4, 100. Two processes must fit the connections of the Supabase session pooler (30 on staging and production since 2026-11-23; `deploy/fly.*.toml` set 10 and 4). |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
+| `SAMA_RUNNER_KEEP_S` | No | How long a warm runner stays alive after a run that ended well, in seconds (default 600). It keeps the CLI and the MCP connections of the session for the next run (Section 4.4). `0` turns the kept runtime off. |
 
 The provider and search keys are the defaults. An org key in the vault comes first
 (Sections 16.3 and 17.3).

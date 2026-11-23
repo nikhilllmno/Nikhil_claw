@@ -29,7 +29,8 @@ Optional environment:
   open it. The channel always needs a valid access token.
 - ``SAMA_ENVIRONMENT``, ``SAMA_TRACE_CONTENT``, ``SAMA_SUPABASE_JWT_SECRET``,
   ``SAMA_SANDBOX_TEMPLATE``, ``SAMA_SANDBOX_ALLOW_OUT`` (comma-separated hosts),
-  ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_VISION_MODEL`` (the model of
+  ``SAMA_WORKER_CONCURRENCY`` (default 4), ``SAMA_RUNNER_KEEP_S`` (seconds that a warm runner
+  stays alive after a run, default 600, 0 is off), ``SAMA_VISION_MODEL`` (the model of
   ``vision_analyze``, default ``claude-sonnet-5-5``).
 - ``SAMA_DB_POOL_SIZE`` (default 5), ``SAMA_DB_POOL_OVERFLOW`` (2), ``SAMA_DB_POOL_TIMEOUT_S``
   (30), ``SAMA_DB_POOL_RECYCLE_S`` (1800), ``SAMA_DB_POOL_PREWARM`` (4),

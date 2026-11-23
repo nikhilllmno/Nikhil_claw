@@ -6,6 +6,10 @@ import asyncio
 import io
 import json
 import os
+import shlex
+import subprocess
+import sys
+import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
@@ -13,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 import sama.runtime.runner as runner_module
+import sama.warm as warm_module
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
@@ -25,6 +30,7 @@ from sama.runtime import (
     RuntimeKind,
     TextDelta,
     Usage,
+    fence,
     run_event_adapter,
     validate_event_stream,
 )
@@ -420,3 +426,289 @@ async def test_the_runner_writes_a_timing_line(
     for mark in ("job_s=", "lock_s=", "runtime_s=", "first_event_s=", "terminal_s=", "exit_s="):
         assert mark in lines[0]
     assert (tmp_path / ".sama" / "runner.lock").exists()
+
+
+# -- the kept runtime (docs/architecture.md, Section 4.4) ---------------------------------------
+
+
+class _Probe:
+    """A runtime that records the state of the token relay while it runs."""
+
+    kind = RuntimeKind.CLAUDE_AGENT_SDK
+
+    def __init__(self, keep: runner_module.RunnerKeep) -> None:
+        self.keep = keep
+        self.active_during_run: list[bool] = []
+
+    def capabilities(self) -> object:
+        raise NotImplementedError
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.active_during_run.append(self.keep.relay.active)
+        yield RunCompleted(output="ok", usage=Usage(output_tokens=1))
+
+    async def cancel(self, run_id: str) -> None:
+        return None
+
+
+def _claude_job(*, parallel: bool = False) -> RunnerJob:
+    request = RunRequest(
+        scope=make_scope("run-1"),
+        input="hi",
+        config=make_config(RuntimeKind.CLAUDE_AGENT_SDK),
+        parallel=parallel,
+    )
+    return RunnerJob(op="run", run=request)
+
+
+KEEP_ENV = {**ENV, runner_module.MODEL_URL_ENV: "http://127.0.0.1:1"}
+
+
+async def test_the_relay_has_the_token_only_while_the_job_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    probe = _Probe(keep)
+    monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+    env = {**KEEP_ENV, WORKDIR_ENV: str(tmp_path)}
+    out = io.StringIO()
+    try:
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        assert code == 0
+        assert probe.active_during_run == [True]
+        assert not keep.relay.active  # the token left with the job
+    finally:
+        await keep.close()
+
+
+async def test_the_relay_loses_the_token_when_the_runtime_cannot_be_built(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+
+    def broken(job: RunnerJob, env: object, keep: object, mark: object) -> object:
+        raise ValueError("no runtime")
+
+    monkeypatch.setattr(runner_module, "build_runtime", broken)
+    out = io.StringIO()
+    try:
+        env = {**KEEP_ENV, WORKDIR_ENV: str(tmp_path)}
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        assert code == 2
+        assert not keep.relay.active
+    finally:
+        await keep.close()
+
+
+async def test_a_side_run_does_not_use_the_kept_runtime(tmp_path: Path) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    try:
+        job = _claude_job(parallel=True)
+        assert runner_module._keeps(job, KEEP_ENV, keep) is None
+        assert runner_module._keeps(_claude_job(), KEEP_ENV, keep) is keep
+        assert runner_module._keeps(_claude_job(), KEEP_ENV, None) is None
+        # The relay needs the URL of the model proxy.
+        assert runner_module._keeps(_claude_job(), ENV, keep) is None
+        assert runner_module._keeps(_job(), KEEP_ENV, keep) is None  # the fake runtime
+    finally:
+        await keep.close()
+
+
+def test_a_kept_cli_gets_no_run_token_and_no_model_key() -> None:
+    env = runner_module.kept_cli_env({RUN_TOKEN_ENV: "secret-token", "HOME": "/home/user"})
+    assert env["HOME"] == "/home/user"
+    assert RUN_TOKEN_ENV not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["DISABLE_TELEMETRY"] == "1"
+
+
+async def test_the_kept_runtimes_are_made_when_they_are_needed() -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    assert not keep.holds
+    assert keep.claude.idle_s == keep.openai.idle_s == 60
+    assert not keep.holds
+    await keep.reset()
+    await keep.close()
+
+
+def test_a_cold_runner_does_not_keep(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = {warm_module.KEEP_ENV: "600"}
+    monkeypatch.setattr(runner_module, "MODE", "cold")
+    assert runner_module._keep_idle_s(env) == 0.0
+    monkeypatch.setattr(runner_module, "MODE", "warm")
+    monkeypatch.setattr(runner_module, "HOST", None)
+    assert runner_module._keep_idle_s(env) == 0.0
+    handle = warm_module.HostHandle("/x.host", "code", -1)
+    monkeypatch.setattr(runner_module, "HOST", handle)
+    assert runner_module._keep_idle_s(env) == 600.0
+    assert runner_module._keep_idle_s({}) == 0.0
+    assert runner_module._keep_idle_s({warm_module.KEEP_ENV: "soon"}) == 0.0
+
+
+# -- the process fence (docs/architecture.md, Section 4.4) --------------------------------------
+
+
+class _Seen:
+    """A runtime that records what was alive when the run started, and holds the relay."""
+
+    kind = RuntimeKind.CLAUDE_AGENT_SDK
+
+    def __init__(self, keep: runner_module.RunnerKeep, survivor: int) -> None:
+        self.keep = keep
+        self.survivor = survivor
+        self.survivor_gone_at_start: bool | None = None
+        self.token_active = False
+
+    def capabilities(self) -> object:
+        raise NotImplementedError
+
+    async def prepare(self, request: object) -> None:
+        return None
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.survivor_gone_at_start = fence.exited(self.survivor)
+        self.token_active = self.keep.relay.active
+        yield RunCompleted(output="ok", usage=Usage(output_tokens=1))
+
+    async def cancel(self, run_id: str) -> None:
+        return None
+
+
+SURVIVOR = """
+import os, sys, time
+folder, log = sys.argv[1], sys.argv[2]
+open(log + '.pid', 'w').write(str(os.getpid()))
+while True:
+    try:
+        name = open(os.path.join(folder, 'current')).read()
+        token = open(os.path.join(folder, name)).read()
+        open(log, 'a').write(token + '\\n')
+    except OSError:
+        pass
+    time.sleep(0.02)
+"""
+
+
+def _start_survivor(folder: str, log_path: Path) -> int:
+    """A process that a run left behind: it left its shell, and it reads the token file of the
+    relay in a loop, as a hostile process of the last run could."""
+    command = (
+        f"nohup {sys.executable} -c {shlex.quote(SURVIVOR)} {folder} {log_path} >/dev/null 2>&1 &"
+    )
+    subprocess.run(["/bin/sh", "-c", command], check=True)
+    pid_file = Path(f"{log_path}.pid")
+    for _ in range(200):
+        if pid_file.exists() and pid_file.read_text():
+            return int(pid_file.read_text())
+        time.sleep(0.02)
+    raise AssertionError("the survivor did not start")
+
+
+async def test_a_process_of_the_last_run_is_killed_before_the_next_token_is_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The regression of the review: a process that outlived run N must never read the token of
+    run N+1, and the clients that run N kept must not be reused."""
+    fence.set_subreaper()
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    await keep.start()
+    folder = os.path.dirname(keep.relay.shell_prefix)
+    log_path = tmp_path / "seen.log"
+    survivor = _start_survivor(folder, log_path)
+    reset_calls: list[bool] = []
+    original_reset = keep.reset
+
+    async def reset() -> None:
+        reset_calls.append(True)
+        await original_reset()
+
+    monkeypatch.setattr(keep, "reset", reset)
+    try:
+        # Run N: the survivor reads its token while the run is active.
+        keep.relay.set_token("token-run-one")
+        await asyncio.sleep(0.2)
+        keep.relay.clear_token()
+        assert "token-run-one" in log_path.read_text()
+        assert not fence.exited(survivor)  # the run ended, and the survivor lives
+        # Run N+1 starts through the runner. The fence runs before its token is active.
+        probe = _Seen(keep, survivor)
+        monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+        env = {**KEEP_ENV, RUN_TOKEN_ENV: "token-run-two", WORKDIR_ENV: str(tmp_path)}
+        out = io.StringIO()
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        assert code == 0
+        assert probe.token_active
+        assert probe.survivor_gone_at_start is True  # killed before the token was active
+        assert reset_calls, "a dirty fence must end the kept clients"
+        await asyncio.sleep(0.2)
+        assert "token-run-two" not in log_path.read_text()
+        assert fence.exited(survivor)
+    finally:
+        await keep.close()
+
+
+async def test_a_survivor_that_a_run_starts_is_found_at_the_end_of_that_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run that leaves a process behind keeps nothing: the fence at the end finds it."""
+    fence.set_subreaper()
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    await keep.start()
+    folder = os.path.dirname(keep.relay.shell_prefix)
+    log_path = tmp_path / "seen.log"
+    resets: list[bool] = []
+    original_reset = keep.reset
+
+    async def reset() -> None:
+        resets.append(True)
+        await original_reset()
+
+    monkeypatch.setattr(keep, "reset", reset)
+
+    class Leaves(_Seen):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.survivor = _start_survivor(folder, log_path)  # the run leaves it behind
+            async for event in super().run(request):
+                yield event
+
+    probe = Leaves(keep, 0)
+    monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+    env = {**KEEP_ENV, RUN_TOKEN_ENV: "token-run-one", WORKDIR_ENV: str(tmp_path)}
+    try:
+        code = await serve(
+            _lines([_claude_job().model_dump_json()]), Output(io.StringIO()), env, keep=keep
+        )
+        assert code == 0
+        assert resets  # not kept
+        assert fence.exited(probe.survivor)
+        assert not keep.broken
+    finally:
+        await keep.close()
+
+
+async def test_a_fence_that_cannot_kill_stops_the_runner_and_fails_the_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    probe = _Probe(keep)
+    monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+
+    def stuck(root: int, trusted: object = (), **kwargs: object) -> list[int]:
+        raise fence.FenceError("a process does not stop")
+
+    monkeypatch.setattr(fence, "kill_descendants", stuck)
+    out = io.StringIO()
+    env = {**KEEP_ENV, WORKDIR_ENV: str(tmp_path)}
+    try:
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        events = [run_event_adapter.validate_json(line) for line in out.getvalue().splitlines()]
+        assert code == 3
+        assert isinstance(events[-1], RunFailed)
+        assert events[-1].retryable
+        assert keep.broken
+        assert probe.active_during_run == []  # the run never started, and no token was active
+        assert not keep.relay.active
+    finally:
+        monkeypatch.undo()
+        await keep.close()

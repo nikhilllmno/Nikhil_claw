@@ -651,6 +651,42 @@ async def test_the_runner_gets_only_the_run_token(
     await sandboxed.close_sandboxes(kill=True)
 
 
+_KEEP_SCRIPT = (
+    "import json, os; "
+    "print(json.dumps({'type': 'run_completed', "
+    "'output': 'keep=' + os.environ.get('SAMA_RUNNER_KEEP_S', 'none'), 'usage': {}}))"
+)
+
+
+@pytest.mark.parametrize(
+    ("keep_s", "parallel", "expected"),
+    [
+        (600.0, False, "keep=600.0"),  # a main run asks the warm runner to stay
+        (0.0, False, "keep=none"),  # the kept runtime is off
+        (600.0, True, "keep=none"),  # a side run runs next to the host and never uses it
+    ],
+)
+async def test_the_runner_gets_the_keep_time_for_a_main_run_only(
+    provider: CountingProvider, keep_s: float, parallel: bool, expected: str
+) -> None:
+    sandboxed = SandboxedRuntime(
+        kind=RuntimeKind.FAKE,
+        provider=provider,
+        signer=RunTokenSigner(KEY),
+        settings=SandboxSettings(
+            template="local",
+            runner_argv=(sys.executable, "-c", _KEEP_SCRIPT),
+            keep_runner_s=keep_s,
+        ),
+    )
+    request = _request(make_scope("run-9")).model_copy(update={"parallel": parallel})
+    events = await collect(sandboxed.run(request))
+    last = events[-1]
+    assert isinstance(last, RunCompleted), last
+    assert last.output == expected
+    await sandboxed.close_sandboxes(kill=True)
+
+
 async def test_the_idle_timeout_is_set_back_after_the_run(
     runtime: SandboxedRuntime, provider: CountingProvider
 ) -> None:

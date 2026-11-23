@@ -11,8 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -328,3 +330,106 @@ def test_a_lost_reply_does_not_run_the_job_again(tmp_path: Path) -> None:
     assert errors == []
     assert client.returncode == 1, client.stderr.decode()
     assert b"the connection to the warm runner failed" in client.stderr
+
+
+# -- the host (docs/architecture.md, Section 4.4) -----------------------------------------------
+
+
+def test_a_host_that_is_busy_gives_the_job_to_the_warm_server(socket_path: str) -> None:
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(1)
+
+    def answer() -> None:
+        conn, _ = server.accept()
+        socket.recv_fds(conn, 65536, 3)
+        conn.sendall(warm.REPLY_BUSY + b"\n")
+        conn.close()
+
+    thread = threading.Thread(target=answer)
+    thread.start()
+    try:
+        assert warm.run_warm(socket_path, warm.code_id(), time.time()) is None
+    finally:
+        thread.join(timeout=5)
+        server.close()
+
+
+def test_a_runner_that_releases_itself_stays_alive_and_the_watcher_gets_its_exit_code() -> None:
+    status_read, status_write = os.pipe()
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import os, time; os.write({status_write}, b'D5\\n'); time.sleep(30)",
+        ],
+        pass_fds=[status_write],
+    )
+    os.close(status_write)
+    conn, other = socket.socketpair()
+    try:
+        assert warm._wait_or_kill(conn, child.pid, status_read) == (5, True)
+        assert child.poll() is None  # the watcher does not kill a host
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        for fd in (status_read,):
+            os.close(fd)
+        conn.close()
+        other.close()
+
+
+def test_a_runner_that_exits_gives_its_own_exit_code_and_is_not_released() -> None:
+    status_read, status_write = os.pipe()
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.exit(3)"], pass_fds=[status_write]
+    )
+    os.close(status_write)
+    conn, other = socket.socketpair()
+    try:
+        assert warm._wait_or_kill(conn, child.pid, status_read) == (3, False)
+    finally:
+        os.close(status_read)
+        conn.close()
+        other.close()
+
+
+def test_the_client_reads_the_keep_time_from_its_environment() -> None:
+    assert warm._keep_seconds({warm.KEEP_ENV: "600"}) == 600.0
+    assert warm._keep_seconds({}) == 0.0
+    assert warm._keep_seconds({warm.KEEP_ENV: "-3"}) == 0.0
+    assert warm._keep_seconds({warm.KEEP_ENV: "x"}) == 0.0
+
+
+def test_a_released_runner_tells_the_watcher_its_exit_code() -> None:
+    read, write = os.pipe()
+    handle = warm.HostHandle("/x.host", "code", write)
+    handle.release(4)
+    assert os.read(read, 64) == b"D4\n"
+    os.close(read)
+
+
+def test_the_server_reads_the_cli_file_once_for_the_disk_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "claude_agent_sdk"
+    (folder / "_bundled").mkdir(parents=True)
+    binary = folder / "_bundled" / "claude"
+    binary.write_bytes(b"x" * 3_000_000)
+    opened: list[str] = []
+    real_open = open
+
+    def spy(file: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    module = types.SimpleNamespace(__file__=str(folder / "__init__.py"))
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+    monkeypatch.setattr("builtins.open", spy)
+    warm._read_cli_binary()
+    assert str(binary) in opened
+
+
+def test_a_server_without_the_claude_sdk_reads_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delitem(sys.modules, "claude_agent_sdk", raising=False)
+    warm._read_cli_binary()  # no error

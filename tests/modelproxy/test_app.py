@@ -30,7 +30,7 @@ from sama.modelproxy import (
 from sama.modelproxy import app as app_module
 from sama.modelproxy.app import QUEUE_CHUNKS, UpstreamStreamError
 from sama.modelproxy.prices import Provider
-from sama.modelproxy.store import CallRecord
+from sama.modelproxy.store import CallRecord, LiveState, UsageStore
 from sama.modelproxy.usage import Endpoint
 from sama.runtime import Budget
 from sama.tenancy.authority import Authority
@@ -149,7 +149,7 @@ class FakeKeys(OrgKeys):
 
 def make_proxy(
     upstream: Upstream,
-    store: MemoryUsageStore,
+    store: UsageStore,
     signer: RunTokenSigner,
     *,
     keys: OrgKeys | None = None,
@@ -746,6 +746,49 @@ async def test_a_store_that_cannot_read_refuses_the_call() -> None:
     await proxy.aclose()
     assert response.status_code == 503
     assert upstream.requests == []
+
+
+async def test_a_live_state_that_lacks_a_value_for_a_limit_refuses_the_call() -> None:
+    """The store must read the cost of the org when the org has a quota. If a store does not,
+    the proxy refuses the call: it never reads a missing value as zero."""
+
+    class Lacking(MemoryUsageStore):
+        def __init__(self, **missing: Any) -> None:
+            super().__init__()
+            self.missing = missing
+
+        async def live(self, org_id: str, run_id: str, **kwargs: Any) -> LiveState:
+            limits = OrgLimits(model_usd_per_month=Decimal(1), model_usd_per_user_day=Decimal(1))
+            return LiveState(
+                Authority(max_cost_usd=Decimal(5)),
+                limits,
+                self.missing.get("spend"),
+                self.missing.get("month"),
+                self.missing.get("day"),
+            )
+
+    from sama.tenancy.authority import RunSpend
+
+    spend = RunSpend(tokens=1, cost_usd=Decimal("0.1"))
+    cases: list[dict[str, Any]] = [
+        {"month": Decimal(0), "day": Decimal(0)},  # no spend
+        {"spend": spend, "day": Decimal(0)},  # no month cost
+        {"spend": spend, "month": Decimal(0)},  # no day cost
+    ]
+    for missing in cases:
+        upstream, signer = Upstream(), RunTokenSigner(KEY)
+        proxy = make_proxy(upstream, Lacking(**missing), signer)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app()), base_url="http://p"
+        ) as client:
+            response = await client.post(
+                "/anthropic/v1/messages",
+                json={"model": MODEL, "messages": []},
+                headers={"x-api-key": signer.issue(make_scope("run-1"), ttl_s=60)},
+            )
+        await proxy.aclose()
+        assert response.status_code == 503, missing
+        assert upstream.requests == []
 
 
 async def test_openai_calls_use_the_standard_tier(harness: Harness) -> None:

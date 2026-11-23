@@ -100,6 +100,11 @@ TARGETS = [
         marks=pytest.mark.skipif(not HAS_OPENAI_SDK, reason="openai-agents is not installed"),
     ),
     pytest.param(
+        "openai-warm",
+        id="openai-warm",
+        marks=pytest.mark.skipif(not HAS_OPENAI_SDK, reason="openai-agents is not installed"),
+    ),
+    pytest.param(
         "claude-live",
         id="claude-live",
         marks=[
@@ -226,14 +231,22 @@ async def target(
         await openai_runtime.aclose()
         return
 
-    if request.param in {"claude-runner", "claude-warm", "claude-docker", "openai-runner"}:
+    if request.param in {
+        "claude-runner",
+        "claude-warm",
+        "claude-docker",
+        "openai-runner",
+        "openai-warm",
+    }:
         store, proxy_url = request.getfixturevalue("model_proxy")
         socket = (
-            request.getfixturevalue("warm_server_socket") if request.param == "claude-warm" else ""
+            request.getfixturevalue("warm_server_socket")
+            if request.param in {"claude-warm", "openai-warm"}
+            else ""
         )
         kind = (
             RuntimeKind.OPENAI_AGENTS_SDK
-            if request.param == "openai-runner"
+            if request.param in {"openai-runner", "openai-warm"}
             else RuntimeKind.CLAUDE_AGENT_SDK
         )
         model = OPENAI_MODEL if kind is RuntimeKind.OPENAI_AGENTS_SDK else "claude-sonnet-4-5"

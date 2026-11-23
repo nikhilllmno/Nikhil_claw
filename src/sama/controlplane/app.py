@@ -294,6 +294,8 @@ def build(
                 allow_out=settings.allow_out,
                 # The warm runner saves the Python start of each run (Section 16.2).
                 runner_argv=WARM_RUNNER_ARGV,
+                # The warm runner keeps the CLI between the runs of a session (Section 4.4).
+                keep_runner_s=settings.runner_keep_s,
             ),
             directory=PostgresSandboxDirectory(engine),
             skills=SessionSkillSource(engine, library),

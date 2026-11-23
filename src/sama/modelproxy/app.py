@@ -28,9 +28,9 @@ from starlette.types import Receive, Scope, Send
 
 from sama.modelproxy.ledger import UsageLedger
 from sama.modelproxy.prices import PriceTable, Provider, TokenCounts
-from sama.modelproxy.store import CallRecord, UsageStore, day_start, month_start
+from sama.modelproxy.store import CallRecord, LiveState, UsageStore, day_start, month_start
 from sama.modelproxy.usage import Endpoint, UsageReader, estimate_counts
-from sama.tenancy.authority import Authority, budget_problem, lower
+from sama.tenancy.authority import budget_problem, lower
 from sama.tenancy.run_token import InvalidRunTokenError, RunTokenClaims, RunTokenSigner
 from sama.vault.store import KeySource, OrgKey, OrgKeys, SecretName
 
@@ -318,9 +318,11 @@ class ModelProxy:
         # budget of a worker bot) count it.
         if route.recorded:
             await self._settle(claims)
-        authority = await self._check_authority(claims)
+        live = await self._live(claims, recorded=route.recorded)
+        if live.authority.problem is not None:
+            raise ProxyError(REVOKED_STATUS, "permission_error", live.authority.problem)
         if route.recorded:
-            await self._check_budget(claims, authority)
+            self._check_limits(claims, live)
         stream = body.get("stream") is True
         if route.provider is Provider.OPENAI:
             # `auto` can use a tier of the project with other prices, so the proxy asks for the
@@ -468,17 +470,25 @@ class ModelProxy:
             _allowed(body, "service_tier", _OPENAI_TIERS)
         return model
 
-    async def _check_authority(self, claims: RunTokenClaims) -> Authority:
-        """Live authority (Section 5.1): a cancel or a lost membership stops the next call.
+    async def _live(self, claims: RunTokenClaims, *, recorded: bool) -> LiveState:
+        """Reads the live authority of the run and, for a recorded route, what the budget
+        checks need, in one store call (Section 4.4: the reads of a call cost round trips).
         Fails closed: a store that cannot read refuses the call."""
+        now = self._clock()
         try:
-            authority = await self._store.authority(claims.org_id, claims.run_id)
+            return await self._store.live(
+                claims.org_id,
+                claims.run_id,
+                user_id=claims.user_id,
+                month_since=month_start(now),
+                day_since=day_start(now),
+                recorded=recorded,
+            )
         except Exception:
-            log.exception("the authority check failed run=%s", claims.run_id)
-            raise ProxyError(503, "api_error", "the proxy cannot check the run now") from None
-        if authority.problem is not None:
-            raise ProxyError(REVOKED_STATUS, "permission_error", authority.problem)
-        return authority
+            log.exception("the live check failed run=%s", claims.run_id)
+            raise ProxyError(
+                503, "api_error", "the proxy cannot check the run or its budget now"
+            ) from None
 
     async def _settle(self, claims: RunTokenClaims) -> None:
         """Writes the pending usage of the org. Fails closed: a record that the store did not
@@ -487,42 +497,37 @@ class ModelProxy:
         if self._ledger.blocked(claims.org_id):
             raise ProxyError(503, "api_error", "the proxy cannot record usage now")
 
-    async def _check_budget(self, claims: RunTokenClaims, authority: Authority) -> None:
-        """Fails closed: a store that cannot read refuses the call. ``_settle`` runs first."""
-        try:
-            await self._check_limits(claims, authority)
-        except ProxyError:
-            raise
-        except Exception:
-            log.exception("the budget check failed run=%s", claims.run_id)
-            raise ProxyError(503, "api_error", "the proxy cannot check the budget now") from None
-
-    async def _check_limits(self, claims: RunTokenClaims, authority: Authority) -> None:
+    def _check_limits(self, claims: RunTokenClaims, live: LiveState) -> None:
+        """The budget checks, in the same order as before: the run, the month of the org, the day
+        of the user. They run on the values of ``live``, so they read nothing."""
+        authority = live.authority
         # A lower live budget applies at once (Section 5.1).
         max_tokens = lower(claims.max_tokens, authority.max_tokens)
         max_cost_usd = lower(claims.max_cost_usd, authority.max_cost_usd)
         if max_tokens is not None or max_cost_usd is not None:
-            spend = await self._store.run_spend(claims.org_id, claims.run_id)
+            spend = live.spend
+            if spend is None:
+                raise ProxyError(503, "api_error", "the proxy cannot check the budget now")
             problem = budget_problem(spend.tokens, spend.cost_usd, max_tokens, max_cost_usd)
             if problem is not None:
                 raise _budget(problem)
-        limits = await self._store.org_limits(claims.org_id)
-        now = self._clock()
         monthly, daily, user = (
-            limits.model_usd_per_month,
-            limits.model_usd_per_user_day,
+            live.limits.model_usd_per_month,
+            live.limits.model_usd_per_user_day,
             claims.user_id,
         )
         if monthly is not None:
-            spent = await self._store.org_cost(claims.org_id, month_start(now))
-            if spent >= monthly:
+            if live.month_cost is None:
+                raise ProxyError(503, "api_error", "the proxy cannot check the budget now")
+            if live.month_cost >= monthly:
                 raise _budget(
                     "the org used its monthly model quota. An org admin can change the plan"
                     " on the Billing page."
                 )
         if daily is not None and user is not None:
-            spent = await self._store.user_cost(claims.org_id, user, day_start(now))
-            if spent >= daily:
+            if live.day_cost is None:
+                raise ProxyError(503, "api_error", "the proxy cannot check the budget now")
+            if live.day_cost >= daily:
                 raise _budget(
                     "the user used the daily model quota (UTC day). An org admin can change"
                     " the plan on the Billing page."

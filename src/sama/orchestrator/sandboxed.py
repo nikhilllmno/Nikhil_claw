@@ -91,6 +91,7 @@ from sama.skills.sync import (
     wanted_files,
 )
 from sama.tenancy import RUN_TOKEN_MAX_TTL_S, RunTokenSigner
+from sama.warm import FRESH_ENV, KEEP_ENV
 
 log: Final = logging.getLogger("sama.orchestrator")
 
@@ -241,6 +242,10 @@ class SandboxSettings:
     runner_argv: tuple[str, ...] = RUNNER_ARGV
     extra_env: Mapping[str, str] = field(default_factory=dict)
     """More variables for the runner. Never a secret."""
+    keep_runner_s: float = 600.0
+    """How long a warm runner stays alive after a run that ended well, in seconds (Section 4.4).
+    The kept runner holds the Claude CLI or the MCP connections of the session for the next
+    run. ``0`` turns it off: each run starts all again. A side run never uses it."""
     carry_dirs: tuple[str, ...] = CARRY_DIRS
     """Folders in the home folder of the sandbox user that go to the new sandbox when the
     session sandbox is from another template (Section 16.2). The default is the folder of
@@ -736,6 +741,8 @@ class SandboxedRuntime:
                 events.put_nowait(RunPhase(phase=RunPhaseName.STARTING_RUNTIME))
                 if self._settings.model_url:
                     env[MODEL_URL_ENV] = self._settings.model_url
+                if self._settings.keep_runner_s > 0 and not job.request.parallel:
+                    env[KEEP_ENV] = str(self._settings.keep_runner_s)
                 argv = list(self._settings.runner_argv)
                 # One command checks the skills and starts the runner (Section 9.3).
                 start = argv if wanted is None else checked_start(sandbox, wanted, argv)
@@ -763,7 +770,8 @@ class SandboxedRuntime:
                             return
                         await _publish(sandbox, wanted, scope)
                         steps.mark("sync")
-                        process = await sandbox.start(argv, env=env)
+                        # The skill files changed: a kept CLI must not keep the old ones.
+                        process = await sandbox.start(argv, env={**env, FRESH_ENV: "1"})
                         if active.cancelled.is_set():
                             events.put_nowait(_cancelled(usage))
                             return

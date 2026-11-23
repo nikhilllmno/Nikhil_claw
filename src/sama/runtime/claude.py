@@ -23,11 +23,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
+import os
+import signal
+import sys
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Final, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 
 from claude_agent_sdk import (
     AgentDefinition,
@@ -61,6 +67,7 @@ from claude_agent_sdk.types import (
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from sama.runtime import fence
 from sama.runtime.archive import Archiver, TranscriptArchive, bound_for_wire
 from sama.runtime.claude_transcript import read_transcript
 from sama.runtime.contract import (
@@ -91,10 +98,14 @@ from sama.runtime.contract import (
     is_terminal,
     output_preview,
 )
+from sama.runtime.fence import KeepError
 from sama.runtime.gating import AllowAllGate as AllowAllGate
 from sama.runtime.gating import BoundedSet
 from sama.runtime.gating import GateDecision as GateDecision
 from sama.runtime.gating import ToolGate as ToolGate
+
+if TYPE_CHECKING:
+    from sama.runtime.relay import TokenRelay
 
 log: Final = logging.getLogger("sama.runtime.claude")
 
@@ -130,6 +141,10 @@ _NATIVE_TOOLS: Final = frozenset(
 server, and the CLI names it ``mcp__sama__<tool>``."""
 _SAMA_MCP_PREFIX: Final = "mcp__sama__"
 _PREVIEW_CHARS: Final = 2_000
+_VOLATILE_ENV_PREFIXES: Final = ("E2B_", "SAMA_RUNNER_", "SAMA_RUN_TOKEN")
+"""Variables that are not part of the key of a kept CLI (``_stable``)."""
+_ALIVE_CHECK_S: Final = 3.0
+"""The longest wait for the answer of a kept CLI before the run starts a new one."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -177,10 +192,219 @@ class ClaudeSettings:
     """Checks that the CLI can resume an SDK session (its transcript is there). The runner sets
     it. ``None`` skips the check. A run whose session is gone starts a new SDK session, and an
     approval resume of it fails (Section 16.2)."""
+    relay: TokenRelay | None = None
+    """The token relay of a kept runner (Section 4.4). With it, the CLI gets no run token. Its
+    model key, its MCP servers, and the ``SAMA_RUN_TOKEN`` of its shell commands come from the
+    relay, which holds the token of the run that is active now."""
+    keeper: ClaudeKeeper | None = None
+    """Keeps the CLI client alive between runs of the session (Section 4.4). It needs
+    ``relay``."""
+    mark: Callable[[str], None] | None = None
+    """Called with the name of a step the first time that it happens in a run. The runner uses
+    it for its timing line."""
 
     def __post_init__(self) -> None:
         if not 0 < self.cancel_grace_s <= 8:
             raise ValueError("cancel_grace_s must be more than 0 and at most 8 seconds")
+        if self.keeper is not None and self.relay is None:
+            raise ValueError("a keeper needs a relay: the kept CLI must not hold a run token")
+
+
+class _Binding:
+    """The callbacks that one CLI client holds. The SDK registers them once, when the CLI
+    starts. A kept client lives for more than one run, so the callbacks call the targets that
+    the active run set (``bind``). Without a run, each call is denied."""
+
+    def __init__(self) -> None:
+        self.pre_tool_use: HookCallback | None = None
+        self.pre_compact: HookCallback | None = None
+        self.can_use_tool: CanUseTool | None = None
+
+    def bind(
+        self,
+        *,
+        pre_tool_use: HookCallback,
+        pre_compact: HookCallback | None,
+        can_use_tool: CanUseTool,
+    ) -> None:
+        self.pre_tool_use = pre_tool_use
+        self.pre_compact = pre_compact
+        self.can_use_tool = can_use_tool
+
+    def release(self) -> None:
+        self.pre_tool_use = self.pre_compact = self.can_use_tool = None
+
+    async def on_pre_tool_use(
+        self, data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> SyncHookJSONOutput:
+        if self.pre_tool_use is None:
+            return _deny("no run is active")
+        return cast(SyncHookJSONOutput, await self.pre_tool_use(data, tool_use_id, context))
+
+    async def on_pre_compact(
+        self, data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> SyncHookJSONOutput:
+        if self.pre_compact is None:
+            return {}
+        return cast(SyncHookJSONOutput, await self.pre_compact(data, tool_use_id, context))
+
+    async def on_can_use_tool(
+        self, tool_name: str, arguments: dict[str, Any], context: ToolPermissionContext
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if self.can_use_tool is None:
+            return PermissionResultDeny(message="No run is active.")
+        return await self.can_use_tool(tool_name, arguments, context)
+
+
+@dataclass(slots=True)
+class _Kept:
+    """A CLI client that waits for the next run of its session."""
+
+    client: ClaudeClient
+    binding: _Binding
+    key: str
+    session_id: str
+    state: bytes
+    """The ``runtime_state`` of the last run that the client served. The next run reuses the
+    client only if its own input state is exactly this one, so a run that another process
+    served in between (it has another state) never reuses a client with an old history."""
+    pid: int | None = None
+    """The process id of the CLI. The process fence trusts this process and no other child."""
+    idle_since: float = field(default_factory=time.monotonic)
+
+
+def _cli_pid(client: ClaudeClient) -> int | None:
+    """The process id of the CLI of a client, or ``None`` if the client cannot say."""
+    pid = getattr(client, "pid", None)
+    if isinstance(pid, int):
+        return pid
+    process = getattr(getattr(client, "_transport", None), "_process", None)
+    pid = getattr(process, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
+RETIRE_S: Final = 6.0
+"""The longest wait for the stop of a kept CLI. The SDK stops the CLI in steps (close stdin,
+terminate, kill) and its own limit is about 20 seconds, so after this time the keeper kills the
+process itself."""
+
+
+class ClaudeKeeper:
+    """Holds the CLI client of one session between runs (docs/architecture.md, Section 4.4).
+
+    A client is reused only when all of these are true: the key is the same (the config
+    fingerprint, the model, the turn limit, and the CLI environment), the SDK session is the
+    same, the input state of the run is the state that the client left, and the client did not
+    wait longer than ``idle_s``. Else the client stops, and the run starts a new CLI. A run
+    takes the client out of the keeper (``take``), so a client serves one run at a time. A
+    run puts it back only after a clean end (``put``). An error, a cancel, a budget stop, a
+    pause for an approval, and a background task all end the client.
+
+    A client that does not fit is retired before anything else starts: the keeper waits until
+    its process has exited (``retire``). So two CLIs never work on one SDK session at once.
+    """
+
+    def __init__(self, *, idle_s: float = 600.0, retire_s: float = RETIRE_S) -> None:
+        self.idle_s = idle_s
+        self._retire_s = retire_s
+        self._kept: _Kept | None = None
+        self._stops: set[asyncio.Task[None]] = set()
+        self.failed = False
+        """A CLI did not stop. The runner must stop too."""
+
+    @property
+    def holds(self) -> bool:
+        return self._kept is not None
+
+    def pids(self) -> set[int]:
+        """The processes that the fence must leave alone: the kept CLI."""
+        kept = self._kept
+        return {kept.pid} if kept is not None and kept.pid is not None else set()
+
+    def _misfit(
+        self, kept: _Kept, key: str, session_id: str | None, state: bytes | None
+    ) -> str | None:
+        if kept.key != key:
+            return "the config or the process settings changed"
+        if session_id is None or kept.session_id != session_id:
+            return "another sdk session"
+        if state is None or kept.state != state:
+            return "the state of the run is not the state that the client left"
+        if time.monotonic() - kept.idle_since > self.idle_s:
+            return "the client was idle too long"
+        return None
+
+    async def take(self, key: str, session_id: str | None, state: bytes | None) -> _Kept | None:
+        """Gives the client to the run if it fits. Else it retires the client (waits for its
+        process to exit) and returns ``None``."""
+        kept, self._kept = self._kept, None
+        if kept is None:
+            return None
+        reason = self._misfit(kept, key, session_id, state)
+        if reason is None:
+            return kept
+        log.info("the kept CLI is not used: %s", reason)
+        await self.retire(kept)
+        return None
+
+    async def retire_unless(self, key: str, session_id: str | None, state: bytes | None) -> None:
+        """Retires the kept client if the next run cannot use it. The runner calls it before
+        the token of the next run is active."""
+        kept = self._kept
+        if kept is not None and self._misfit(kept, key, session_id, state) is not None:
+            self._kept = None
+            await self.retire(kept)
+
+    def put(self, kept: _Kept) -> None:
+        old, self._kept = self._kept, kept
+        kept.idle_since = time.monotonic()
+        if old is not None:
+            self._stop(old)
+
+    async def discard(self, kept: _Kept) -> None:
+        """Ends a client that a run took and does not put back, and waits for its exit."""
+        await self.retire(kept)
+
+    async def retire(self, kept: _Kept) -> None:
+        """Stops the CLI and waits until its process has exited. Raises ``KeepError`` if it
+        did not exit in ``retire_s`` plus the time to kill it."""
+        kept.binding.release()
+        pid = kept.pid if kept.pid is not None else _cli_pid(kept.client)
+        task = self._stop(kept)
+        await asyncio.wait({task}, timeout=self._retire_s)
+        if pid is not None and not fence.exited(pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+            for _ in range(200):
+                if fence.exited(pid):
+                    break
+                await asyncio.sleep(0.01)
+        stopped = fence.exited(pid) if pid is not None else task.done()
+        if not stopped:
+            self.failed = True
+            raise KeepError("the kept CLI did not stop")
+
+    def _stop(self, kept: _Kept) -> asyncio.Task[None]:
+        kept.binding.release()
+
+        async def stop() -> None:
+            with contextlib.suppress(Exception):
+                await kept.client.disconnect()
+
+        task = asyncio.create_task(stop())
+        self._stops.add(task)
+        task.add_done_callback(self._stops.discard)
+        return task
+
+    async def close(self) -> None:
+        """Ends the kept client and waits until every CLI of the keeper has stopped."""
+        kept, self._kept = self._kept, None
+        if kept is not None:
+            with contextlib.suppress(KeepError):
+                await self.retire(kept)
+        while self._stops:
+            await asyncio.wait(set(self._stops), timeout=self._retire_s)
+            break
 
 
 # ---------------------------------------------------------------------------------------------
@@ -269,6 +493,10 @@ def _reject_prompt(tool_name: str, reason: str | None) -> str:
 # ---------------------------------------------------------------------------------------------
 
 
+class _KeepFailed(Exception):
+    """A kept CLI did not stop, so no new CLI starts on its session."""
+
+
 class _UnexpectedResult(Exception):
     """The CLI ended a phase in a way that the adapter does not expect."""
 
@@ -293,6 +521,11 @@ class _Translator:
     elapsed_before_s: float = 0.0
     """Wall time that the run used in earlier streams (before a pause)."""
     started_at: float | None = None
+    input_state: bytes | None = None
+    """The ``runtime_state`` that the run got. A kept CLI client fits only this state."""
+    background_seen: bool = False
+    """The run started a background task. Its late messages could reach a later run, so the
+    CLI of this run is not kept."""
     ask_reasons: dict[str, str] = field(default_factory=dict)
     allowed_calls: set[str] = field(default_factory=set)
     """Tool use ids that the gate or a human allowed. ``can_use_tool`` allows only these."""
@@ -350,6 +583,8 @@ class _Translator:
                 self._text.append(block.text)
                 events.append(TextDelta(text=block.text, usage=self.usage))
             elif isinstance(block, ToolUseBlock):
+                if block.input.get("run_in_background"):
+                    self.background_seen = True
                 if block.name in _SUBAGENT_TOOLS:
                     kind = block.input.get("subagent_type") or block.input.get("description")
                     self._subagents[block.id] = str(kind or block.name)
@@ -397,7 +632,9 @@ class _Translator:
         only here, because the usage of the stream is the usage of the run."""
         call_id = message.tool_use_id
         if call_id is None or call_id not in self._subagents:
-            return []  # Not a sub-agent of the Agent tool, for example a background command.
+            # Not a sub-agent of the Agent tool, for example a background command.
+            self.background_seen = True
+            return []
         name = self._subagents[call_id]
         if isinstance(message, TaskStartedMessage):
             text = bound_subagent_text(f"started: {message.description}")
@@ -751,6 +988,7 @@ class ClaudeRuntime:
             base_session_id=previous.session_id if previous else None,
             compact=request.compact is not None,
             session_id=previous.session_id if previous else None,
+            input_state=request.runtime_state,
         )
         stream = self._stream(request.scope, request.config, request.budget, phases, translator)
         async with contextlib.aclosing(stream):
@@ -801,11 +1039,31 @@ class ClaudeRuntime:
             session_id=state.session_id,
             turns=state.turns,
             elapsed_before_s=state.elapsed_s,
+            input_state=request.runtime_state,
         )
         stream = self._stream(request.scope, request.config, request.budget, phases, translator)
         async with contextlib.aclosing(stream):
             async for event in stream:
                 yield event
+
+    async def prepare(self, request: RunRequest | ResumeRequest) -> None:
+        """Before the token of the run is active: retires the kept CLI if this run cannot use
+        it. The runner calls it, so an old CLI never runs while the next token is active.
+        Raises ``KeepError`` if the old CLI does not stop."""
+        keeper = self._settings.keeper
+        if keeper is None or not keeper.holds:
+            return
+        if isinstance(request, ResumeRequest):
+            # An approval resume starts its own CLI.
+            await keeper.retire_unless("", None, None)
+            return
+        try:
+            previous = _State.load(request.runtime_state)
+        except ValidationError:
+            previous = None
+        key = self._client_key(request.config, request.budget, 0)
+        session = previous.session_id if previous is not None else None
+        await keeper.retire_unless(key, session, request.runtime_state)
 
     async def cancel(self, run_id: str) -> None:
         self._cancelled_runs.add(run_id)
@@ -962,6 +1220,15 @@ class ClaudeRuntime:
         except asyncio.CancelledError:
             send(_cancelled(translator.usage))
             raise
+        except _KeepFailed as exc:
+            send(
+                RunFailed(
+                    code=FailureCode.SANDBOX_ERROR,
+                    message=str(exc),
+                    retryable=True,
+                    usage=translator.usage,
+                )
+            )
         except _UnexpectedResult as exc:
             send(RunFailed(code=FailureCode.INTERNAL, message=str(exc), usage=translator.usage))
         except ClaudeSDKError as exc:
@@ -993,16 +1260,55 @@ class ClaudeRuntime:
         translator: _Translator,
         active: _ActiveRun,
     ) -> TerminalEvent | None:
-        """Runs one CLI process. Returns the terminal event, or None to go to the next phase."""
-        options = self._options(scope, config, budget, phase, translator)
-        client = self._client_factory(options)
-        active.client = client
-        final: ResultMessage | None = None
+        """Runs one CLI process. Returns the terminal event, or None to go to the next phase.
+
+        With a keeper (Section 4.4), a phase can reuse the CLI client of the last run of the
+        session, and a clean end keeps the client for the next run.
+        """
+        settings = self._settings
+        keeper = settings.keeper if phase.drop_tool is None else None
+        mark = settings.mark or _no_mark
+        key = self._client_key(config, budget, translator.turns) if keeper is not None else ""
         try:
-            await client.connect()
+            held = (
+                await keeper.take(key, translator.session_id, translator.input_state)
+                if keeper
+                else None
+            )
+            if keeper is not None and held is not None and not await _alive(held.client):
+                log.info(
+                    "the kept CLI does not answer or has a failed MCP server; a new one starts"
+                )
+                await keeper.discard(held)
+                held = None
+        except KeepError as error:
+            raise _KeepFailed(str(error)) from None
+        binding = held.binding if held is not None else _Binding()
+        binding.bind(
+            pre_tool_use=self._hook(scope, config, phase, translator),
+            pre_compact=(
+                self._archive_hook(scope, self._archiver) if self._archiver is not None else None
+            ),
+            can_use_tool=_can_use_tool(translator),
+        )
+        client = held.client if held is not None else None
+        final: ResultMessage | None = None
+        kept_ok = False
+        try:
+            if client is None:
+                options = self._options(config, budget, phase, translator, binding, keep=keeper)
+                client = self._client_factory(options)
+                active.client = client
+                await client.connect()
+                mark("client_spawned")
+            else:
+                active.client = client
+                mark("client_kept")
             if phase.prompt is not None:
                 await client.query(phase.prompt)
+            mark("query_sent")
             async for message in client.receive_messages():
+                mark("first_message")
                 if isinstance(message, ResultMessage):
                     translator.add_result_usage(message)
                     final = message
@@ -1016,9 +1322,33 @@ class ClaudeRuntime:
                     # and does not wait for the CLI to stop (Section 16.2). ``aclose`` still
                     # waits for the CLI, so the runner exits only after the CLI.
                     active.send(early)
+                    state, session = early.runtime_state, translator.session_id
+                    if (
+                        keeper is not None
+                        and state is not None
+                        and session is not None
+                        and not translator.background_seen
+                        and not active.cancelled.is_set()
+                    ):
+                        # No stop: the CLI waits for the next run. The runtime does not own
+                        # it any more, so ``aclose`` does not wait for it.
+                        kept_ok = True
+                        binding.release()
+                        keeper.put(
+                            _Kept(
+                                client=client,
+                                binding=binding,
+                                key=key,
+                                session_id=session,
+                                state=state,
+                                pid=_cli_pid(client),
+                            )
+                        )
         finally:
             active.client = None
-            await self._disconnect(client, translator.session_id)
+            if client is not None and not kept_ok:
+                binding.release()
+                await self._disconnect(client, translator.session_id)
         # Map other results only after the CLI stopped, so the wall time in runtime_state
         # also counts the time to stop the CLI.
         if final is None:
@@ -1032,6 +1362,26 @@ class ClaudeRuntime:
                 f"the CLI did not drop the rejected tool call (stop_reason: {final.stop_reason})"
             )
         return None
+
+    def _client_key(self, config: RunConfig, budget: Budget, turns_used: int) -> str:
+        """Names the CLI that a client is. Another key means another CLI process.
+
+        It holds what the CLI reads when it starts: the frozen config (D9: the prefix, the
+        tools, the MCP servers, the model, and the sub-agents), the turn limit (the CLI counts
+        it for each message, but its value is a start flag), and the process settings. The
+        budget limit of the cost is not a start flag of a kept CLI (see ``_options``).
+        """
+        settings = self._settings
+        parts = [
+            config.fingerprint(),
+            str(None if budget.max_turns is None else budget.max_turns - turns_used),
+            str(settings.claude_code_preset),
+            str(self._archiver is not None),
+            settings.cwd or "",
+            settings.cli_path or "",
+            json.dumps(sorted((str(k), str(v)) for k, v in settings.env.items() if _stable(k))),
+        ]
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
     async def _disconnect(self, client: ClaudeClient, session_id: str | None = None) -> None:
         """Stops the CLI process in a task of its own.
@@ -1073,13 +1423,16 @@ class ClaudeRuntime:
 
     def _options(
         self,
-        scope: RunScope,
         config: RunConfig,
         budget: Budget,
         phase: _Phase,
         translator: _Translator,
+        binding: _Binding,
+        *,
+        keep: ClaudeKeeper | None = None,
     ) -> ClaudeAgentOptions:
         settings = self._settings
+        relay = settings.relay
         prefix = config.render_prefix()
         system_prompt: str | SystemPromptPreset
         if settings.claude_code_preset:
@@ -1092,6 +1445,10 @@ class ClaudeRuntime:
         else:
             system_prompt = prefix
         env = {TOOL_SEARCH_ENV: "false", **settings.env}
+        if relay is not None:
+            from sama.runtime.relay import relay_env
+
+            env.update(relay_env(relay))
         if config.subagents:
             env[BACKGROUND_TASKS_ENV] = "1"
         disallowed: list[str] = []
@@ -1101,31 +1458,34 @@ class ClaudeRuntime:
         return ClaudeAgentOptions(
             model=config.model,
             system_prompt=system_prompt,
-            mcp_servers=_mcp_servers(config),
+            mcp_servers=_mcp_servers(config, relay),
             agents=_agents(config),
             strict_mcp_config=True,
             setting_sources=[],
             disallowed_tools=disallowed,
             resume=translator.session_id,
             max_turns=_remaining_turns(budget, translator),
-            max_budget_usd=_remaining_cost(budget, translator),
+            # The CLI counts the cost of all messages of its process. A CLI that a keeper
+            # keeps serves more than one run, so a start flag would use up the budget of
+            # the next runs. The model proxy stops a run at its cost limit (Section 16.6).
+            max_budget_usd=None if keep is not None else _remaining_cost(budget, translator),
             effort=config.reasoning_effort,
             include_partial_messages=True,
-            hooks=self._hooks(scope, config, phase, translator),
-            can_use_tool=_can_use_tool(translator),
+            hooks=self._hooks(binding),
+            can_use_tool=binding.on_can_use_tool,
             env=env,
             cwd=settings.cwd,
             cli_path=settings.cli_path,
+            # A CLI that outlives the run must not hold the stderr of the first runner.
+            stderr=_to_stderr if relay is not None else None,
         )
 
-    def _hooks(
-        self, scope: RunScope, config: RunConfig, phase: _Phase, translator: _Translator
-    ) -> dict[Any, list[HookMatcher]]:
+    def _hooks(self, binding: _Binding) -> dict[Any, list[HookMatcher]]:
         hooks: dict[Any, list[HookMatcher]] = {
-            "PreToolUse": [HookMatcher(hooks=[self._hook(scope, config, phase, translator)])]
+            "PreToolUse": [HookMatcher(hooks=[binding.on_pre_tool_use])]
         }
         if self._archiver is not None:
-            hooks["PreCompact"] = [HookMatcher(hooks=[self._archive_hook(scope, self._archiver)])]
+            hooks["PreCompact"] = [HookMatcher(hooks=[binding.on_pre_compact])]
         return hooks
 
     def _archive_hook(self, scope: RunScope, archiver: Archiver) -> HookCallback:
@@ -1288,14 +1648,54 @@ def _can_use_tool(translator: _Translator) -> CanUseTool:
     return can_use_tool
 
 
-def _mcp_servers(config: RunConfig) -> dict[str, Any]:
+def _mcp_servers(config: RunConfig, relay: TokenRelay | None = None) -> dict[str, Any]:
+    """The MCP servers of the CLI. With a relay, the CLI calls the relay with the local secret,
+    and the relay adds the token of the run that is active (``sama.runtime.relay``)."""
     servers: dict[str, Any] = {}
     for server in config.mcp_servers:
-        entry: McpHttpServerConfig = {"type": "http", "url": server.url}
-        if server.bearer_token is not None:
-            entry["headers"] = {"Authorization": f"Bearer {server.bearer_token.get_secret_value()}"}
+        if relay is not None:
+            entry: McpHttpServerConfig = {"type": "http", "url": relay.mcp_url(server.name)}
+            entry["headers"] = {"Authorization": f"Bearer {relay.secret}"}
+        else:
+            entry = {"type": "http", "url": server.url}
+            if server.bearer_token is not None:
+                entry["headers"] = {
+                    "Authorization": f"Bearer {server.bearer_token.get_secret_value()}"
+                }
         servers[server.name] = entry
     return servers
+
+
+def _stable(name: str) -> bool:
+    """False for an environment variable that changes between two runs of the same session
+    without a change of the CLI: the variables of the sandbox provider (E2B gives a resumed
+    sandbox a new ``E2B_TEMPLATE_ID``) and the switches of the runner."""
+    return not name.startswith(_VOLATILE_ENV_PREFIXES)
+
+
+def _no_mark(name: str) -> None:
+    return None
+
+
+def _to_stderr(line: str) -> None:
+    """The CLI stderr goes to the stderr of the process that serves the run now."""
+    sys.stderr.write(line.rstrip("\n") + "\n")
+
+
+async def _alive(client: ClaudeClient) -> bool:
+    """True if a kept client still answers and none of its MCP servers failed. A client that
+    cannot say (a fake in a test) counts as alive."""
+    status = getattr(client, "get_mcp_status", None)
+    if status is None:
+        return True
+    try:
+        answer = await asyncio.wait_for(status(), timeout=_ALIVE_CHECK_S)
+    except Exception:
+        return False
+    servers = answer.get("mcpServers", []) if isinstance(answer, Mapping) else []
+    return not any(
+        isinstance(server, Mapping) and server.get("status") == "failed" for server in servers
+    )
 
 
 def _remaining_turns(budget: Budget, translator: _Translator) -> int | None:
