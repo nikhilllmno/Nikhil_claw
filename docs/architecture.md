@@ -707,11 +707,6 @@ The steps that were removed:
 - The first run config of a session takes about 1.5 seconds of sequential reads (context files,
   channel, toolsets, policies, the skill index, and the snapshot). They are independent, but they
   share one transaction and one connection.
-- The model proxy reads its authority, run spend, org limits, org cost, user cost, and key one
-  after the other before it forwards a call (6 to 9 reads, about 0.4 to 0.5 s). Most of them do
-  not depend on each other and could run at the same time. This is now the biggest part of the
-  first token that the runner cannot change. The first run of a session still pays the CLI
-  start, because the host starts only after a run that ended well.
 - The control plane (`sin`) and the database (`ap-south-1`) are in different regions. A control
   plane in the region of the database (Fly `bom`) would make each round trip about 1 to 2 ms
   instead of 58 ms. It also changes the latency to E2B and to the model providers, so a person
@@ -730,12 +725,12 @@ message in less than 5 seconds. Measured, where the time of a follow-up goes (ru
 | First message of the CLI and `message_start`, no model delay | 0.13 s | E2B, same test |
 | Connect of the MCP server: `initialize`, the notification, `tools/list` | 3 requests, about 0.7 s | E2B to `sama-staging`: TCP 30 ms, TLS 100 ms, each request 0.2 to 0.25 s |
 | A new TLS connection to the model proxy and to the control plane | 0.13 s each | same |
-| Model call through the proxy | the rest, about 3 s | the proxy makes 6 to 9 database reads before it forwards (settle, authority, run spend, org limits, org cost, user cost, key): about 0.4 to 0.5 s at 58 ms each, then the time to the first byte of the provider |
+| Model call through the proxy | the rest, about 3 s | the proxy made 16 round trips to the database before it forwarded (5 connections, each with `BEGIN` and `ROLLBACK`): about 0.9 s at 58 ms each, then the time to the first byte of the provider |
 
 A kept CLI with kept connections saves the first three rows, the connect of the MCP server, and
 the TLS connections: about 1.4 to 1.6 s of the 5.4 s. The model call is the biggest part now.
-It is in the model proxy and not in the runner (Section 16.6). Its reads are in sequence, and
-most do not depend on each other. See "Not done yet" below.
+It is in the model proxy and not in the runner (Section 16.6). Its reads were in sequence
+(see "Proxy reads" below).
 
 **Design.** The runner process of a run that ended well does not exit. It becomes a *host*
 (`src/sama/runtime/host.py`, Section 16.2). It listens on `<warm socket>.host`. The next
@@ -826,6 +821,30 @@ item load), the TLS connections (0.13 s each), and the tool list. The kept CLI u
 tests: a stray message of a CLI that serves two runs, and a model connection that a pause of
 the sandbox broke. The first is covered because a run with a background task is not kept. The
 second is covered because the relay keeps an upstream connection for at most 60 seconds idle.
+
+**Proxy reads (M8.2, part 4).** Before the model proxy forwards a call, it reads the live
+authority of the run, the spend of the run, the limits of the org, the cost of the org this month,
+and the cost of the user today (Section 16.6). Each read was its own call of the store, with its
+own connection and its own `BEGIN` and `ROLLBACK`. `tests/modelproxy/test_roundtrips.py` counts
+the round trips of a call with a real database:
+
+| Call | Before | After | Time saved at 58 ms |
+|---|---|---|---|
+| Recorded call, run budget, monthly quota, daily quota | 16 | 3 | 0.75 s |
+| Recorded call, run budget, no quota | 10 | 3 | 0.41 s |
+| `count_tokens` (authority only) | 4 | 2 | 0.12 s |
+| Call of a run that ended | 3 | 1 | 0.12 s |
+
+`UsageStore.live` is the one store call. `PostgresUsageStore.live` uses one connection without a
+transaction (the reads change nothing), loads the authority (the run with its profile and its
+session, then the grants of the user), and then reads the limits of the org, the spend of the run,
+the cost of the org, and the cost of the user in one statement. The cost of the org is read only if
+the limits have a monthly quota, and the cost of the user only if there is a user and a daily
+quota (a `CASE` on the limits, so the database does the same work as before). Every part has the
+`org_id` of the token. The checks and their order stay in the proxy: authority, run budget, month,
+day (`_check_limits`). A store that cannot read gives `503`, and a value that a limit needs and the
+store did not read also gives `503`. The key of the org comes from the vault cache and costs no
+round trip, except for the first call of an org. The ledger flush (`settle`) still runs first.
 
 **Database pool.** The API, the worker, the tool server, the gate, the model proxy, and the
 event streams of one process share one SQLAlchemy pool. Before, the pool had 5 connections and
@@ -8109,7 +8128,8 @@ in-memory store.
 environment second (Section 16.3). The Langfuse traces (M1.14, Section 18.2) read these rows.
 
 **Live authority (M1.18).** Before each call, the proxy reads the live authority of the run
-(Section 16.1). A run that ended (a cancel ends the run) or a run user who lost access gets
+(Section 16.1). It reads the authority, the spend of the run, the limits of the org, and the costs
+of the org and the user in one store call (`UsageStore.live`: 3 round trips, Section 4.4). A run that ended (a cancel ends the run) or a run user who lost access gets
 `403` on every route, also on `count_tokens`. The run limits are the lower of the token claims and the live budget. The proxy prices only the costs that the table lists. For example, OpenAI
 hosted tools are not priced yet.
 

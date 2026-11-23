@@ -8,19 +8,26 @@ writes runs (M1.10).
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import ModelCall, Org
 from sama.modelproxy.prices import Provider, TokenCounts
 from sama.modelproxy.usage import Endpoint
-from sama.tenancy.authority import Authority, RunSpend, load_authority, load_run_spend
+from sama.tenancy.authority import (
+    RUN_TOKENS,
+    Authority,
+    RunSpend,
+    load_authority,
+    load_run_spend,
+)
 from sama.vault.store import KeySource
 
 
@@ -60,6 +67,24 @@ class OrgLimits(BaseModel):
     model_usd_per_user_day: Decimal | None = Field(default=None, ge=0)
 
 
+@dataclass(frozen=True, slots=True)
+class LiveState:
+    """What the proxy reads before it forwards a call, from one store call (``UsageStore.live``).
+
+    ``spend`` is the spend of the run. ``month_cost`` is the cost of the org since the start of
+    the month, and it is read only when the org has a monthly quota. ``day_cost`` is the cost of
+    the user since the start of the day, and it is read only when the call has a user and the org
+    has a daily quota. A field that was not read is ``None``. A store reads the fields of the
+    spend and the costs only when ``recorded`` is true (the route spends the budget).
+    """
+
+    authority: Authority
+    limits: OrgLimits = field(default_factory=OrgLimits)
+    spend: RunSpend | None = None
+    month_cost: Decimal | None = None
+    day_cost: Decimal | None = None
+
+
 class UsageStore(Protocol):
     async def record(self, call: CallRecord) -> None: ...
 
@@ -74,6 +99,47 @@ class UsageStore(Protocol):
     async def authority(self, org_id: str, run_id: str) -> Authority:
         """The live authority of the run (Section 5.1)."""
         ...
+
+    async def live(
+        self,
+        org_id: str,
+        run_id: str,
+        *,
+        user_id: str | None,
+        month_since: datetime,
+        day_since: datetime,
+        recorded: bool,
+    ) -> LiveState:
+        """Everything that the proxy reads before a call, in one store call. The checks and
+        their order stay in the proxy: the store only reads."""
+        ...
+
+
+async def live_from_parts(
+    store: UsageStore,
+    org_id: str,
+    run_id: str,
+    *,
+    user_id: str | None,
+    month_since: datetime,
+    day_since: datetime,
+    recorded: bool,
+) -> LiveState:
+    """``UsageStore.live`` made of the single reads, one after the other. A store that has no
+    faster way (a store in memory) uses it, and so does a test store that overrides a single
+    read. It reads only what the checks need, as the proxy did before ``live``."""
+    authority = await store.authority(org_id, run_id)
+    if not recorded or authority.problem is not None:
+        return LiveState(authority)
+    spend = await store.run_spend(org_id, run_id)
+    limits = await store.org_limits(org_id)
+    month_cost = None
+    if limits.model_usd_per_month is not None:
+        month_cost = await store.org_cost(org_id, month_since)
+    day_cost = None
+    if limits.model_usd_per_user_day is not None and user_id is not None:
+        day_cost = await store.user_cost(org_id, user_id, day_since)
+    return LiveState(authority, limits, spend, month_cost, day_cost)
 
 
 class MemoryUsageStore:
@@ -114,12 +180,36 @@ class MemoryUsageStore:
     async def authority(self, org_id: str, run_id: str) -> Authority:
         return self.authorities.get(run_id, Authority())
 
+    async def live(
+        self,
+        org_id: str,
+        run_id: str,
+        *,
+        user_id: str | None,
+        month_since: datetime,
+        day_since: datetime,
+        recorded: bool,
+    ) -> LiveState:
+        return await live_from_parts(
+            self,
+            org_id,
+            run_id,
+            user_id=user_id,
+            month_since=month_since,
+            day_since=day_since,
+            recorded=recorded,
+        )
+
 
 class PostgresUsageStore:
     """Writes ``model_calls`` and reads the spend and ``orgs.limits`` as the table owner."""
 
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
+        # The reads of ``live`` change nothing and need no snapshot (each statement reads on its
+        # own, as in a transaction at the default level). Without a transaction, a read costs
+        # no ``BEGIN`` and no ``ROLLBACK``: two round trips less.
+        self._reads = engine.execution_options(isolation_level="AUTOCOMMIT")
 
     async def record(self, call: CallRecord) -> None:
         values: dict[str, Any] = {
@@ -177,6 +267,73 @@ class PostgresUsageStore:
     async def authority(self, org_id: str, run_id: str) -> Authority:
         async with self._engine.connect() as connection:
             return await load_authority(connection, uuid.UUID(org_id), uuid.UUID(run_id))
+
+    async def live(
+        self,
+        org_id: str,
+        run_id: str,
+        *,
+        user_id: str | None,
+        month_since: datetime,
+        day_since: datetime,
+        recorded: bool,
+    ) -> LiveState:
+        """The authority of the run (its statements) and, for a recorded route, one statement
+        for the limits of the org, the spend of the run, and the costs of the org and the user.
+        All of it runs on one connection. Every part reads with the ``org_id`` of the token.
+        The cost of the org is read only if the limits have a monthly quota, and the cost of the
+        user only if they have a daily quota, as before (a ``CASE`` on the limits)."""
+        org, run = uuid.UUID(org_id), uuid.UUID(run_id)
+        async with self._reads.connect() as connection:
+            authority = await load_authority(connection, org, run)
+            if not recorded or authority.problem is not None:
+                return LiveState(authority)
+            limits = select(Org.limits).where(Org.id == org).cte("live_limits")
+            monthly = limits.c.limits.op("->>")("model_usd_per_month").is_not(None)
+            daily = limits.c.limits.op("->>")("model_usd_per_user_day").is_not(None)
+            org_cost = (
+                select(func.coalesce(func.sum(ModelCall.cost_usd), 0))
+                .where(ModelCall.org_id == org, ModelCall.created_at >= month_since)
+                .scalar_subquery()
+            )
+            statement = select(
+                select(limits.c.limits).scalar_subquery().label("limits"),
+                select(func.coalesce(func.sum(RUN_TOKENS), 0))
+                .where(ModelCall.org_id == org, ModelCall.run_id == run)
+                .scalar_subquery()
+                .label("run_tokens"),
+                select(func.coalesce(func.sum(ModelCall.cost_usd), 0))
+                .where(ModelCall.org_id == org, ModelCall.run_id == run)
+                .scalar_subquery()
+                .label("run_cost"),
+                case((select(monthly).scalar_subquery(), org_cost)).label("month_cost"),
+                *(
+                    ()
+                    if user_id is None
+                    else (
+                        case(
+                            (
+                                select(daily).scalar_subquery(),
+                                select(func.coalesce(func.sum(ModelCall.cost_usd), 0))
+                                .where(
+                                    ModelCall.org_id == org,
+                                    ModelCall.user_id == uuid.UUID(user_id),
+                                    ModelCall.created_at >= day_since,
+                                )
+                                .scalar_subquery(),
+                            )
+                        ).label("day_cost"),
+                    )
+                ),
+            )
+            row = (await connection.execute(statement)).one()
+        return LiveState(
+            authority,
+            OrgLimits.model_validate(row.limits or {}),
+            RunSpend(tokens=int(row.run_tokens), cost_usd=Decimal(row.run_cost)),
+            None if row.month_cost is None else Decimal(row.month_cost),
+            None if user_id is None or row.day_cost is None else Decimal(row.day_cost),
+        )
 
     async def _cost(self, *where: ColumnElement[bool]) -> Decimal:
         query = select(func.coalesce(func.sum(ModelCall.cost_usd), 0)).where(*where)
