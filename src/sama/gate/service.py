@@ -1226,8 +1226,9 @@ class GateService:
 
 
 def _keep_used(status: str) -> Any:
-    """The new status of a ``tool_calls`` row. A used ticket stays used."""
-    return case((ToolCall.status == "finished", "finished"), else_=status)
+    """The new status of a ``tool_calls`` row. A used ticket stays used, and a call that
+    ended (``finished`` or ``failed``) stays ended, so a check again cannot make a ticket."""
+    return case((ToolCall.status.in_(("finished", "failed")), ToolCall.status), else_=status)
 
 
 def _details(name: str, verdict: Verdict) -> dict[str, Any]:

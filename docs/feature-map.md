@@ -100,7 +100,7 @@ sama implements it as a sama tool or in the control plane (architecture §5.3).
 
 | Hermes feature | Hermes location | Sama design | Decision | Milestone |
 |---|---|---|---|---|
-| SQLite `state.db` with FTS5 | `hermes_state.py`, `persistence/` | Postgres tables `sessions`, `messages`, `tool_calls`, `runs`, `run_events` with RLS (§7). | Adapt | M1 |
+| SQLite `state.db` with FTS5 | `hermes_state.py`, `persistence/` | Postgres tables `sessions`, `messages`, `tool_calls`, `runs`, `run_events` with RLS (§7). Since M8.3 each `tool_calls` row ends with its status, time, and result preview (§16.1). | Adapt | M1 (M8.3 part E) |
 | Session per chat, survives restarts | `gateway/session.py` | `session_bindings` map a channel thread to a session. | Adapt | M1 |
 | `/new`, `/reset`, `/resume`, `/title`, `/branch` | `hermes_cli/commands.py` | Same commands in all channels. Branch creates a child session (lineage). | Adapt | M1 |
 | `session_search` | `tools/session_search_tool.py` | Postgres full-text plus pgvector. No LLM call in the tool (§7.1). | Adapt | M2 (M2.5 done) |

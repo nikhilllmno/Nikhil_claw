@@ -7600,7 +7600,13 @@ Rules of the steps:
 Records, all in the transaction of the verdict:
 
 - `tool_calls`: one row per call id, with the tool name, the arguments, `arguments_digest`
-  (migration `0004`), `decision`, and `status` (`started` or `denied`).
+  (migration `0004`), `decision`, and `status` (`started` or `denied`). Since M8.3 the row
+  also ends: when the worker stores the `tool_call_finished` run event of the call, the same
+  connection sets `finished_at` and `result_preview` (the redacted preview of the event, at
+  most 2,000 characters), and a `started` row gets `finished`, or `failed` when the result is
+  an error. A `denied` row does not change. A used ticket is `finished` already and keeps that
+  status. A check again of the call id keeps `finished` and `failed`, so an ended call is
+  never a ticket again. The activity view and the traces (Section 18.2) read these rows.
 - `approvals` (migration `0004`): one row per `ask`, keyed by `(run_id, call_id)`. The
   approval id is the tool use id. Columns: the tool name, the arguments (cut at 8,000
   characters), the digest, the reason, the status, `expires_at`, and the decider. RLS follows

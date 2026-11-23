@@ -86,6 +86,7 @@ from sama.db.models import (
     RunEvent,
     RunSteer,
     Session,
+    ToolCall,
     WorkflowInstance,
 )
 from sama.gate.decide import arguments_digest, narrow_toolsets
@@ -544,6 +545,59 @@ def _stored_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     if kind == "subagent_event" and isinstance(text, str):
         redacted["text"] = clip_subagent_text(text)
     return redacted
+
+
+def _finished_calls(
+    events: Sequence[tuple[int, str, dict[str, Any]]],
+) -> list[tuple[str, str, str]]:
+    """``(call_id, status, preview)`` for each ``tool_call_finished`` event of a batch. The
+    preview is redacted like the stored event. The last event of a call id wins."""
+    calls: dict[str, tuple[str, str]] = {}
+    for _seq, kind, payload in events:
+        call_id = payload.get("call_id")
+        if kind != "tool_call_finished" or not isinstance(call_id, str) or not call_id:
+            continue
+        stored = _stored_payload(kind, payload)
+        preview = stored.get("output_preview")
+        status = "failed" if payload.get("is_error") else "finished"
+        calls[call_id] = (status, preview if isinstance(preview, str) else "")
+    return [(call_id, status, preview) for call_id, (status, preview) in calls.items()]
+
+
+async def _finish_tool_calls(
+    connection: AsyncConnection, run: ClaimedRun, calls: Sequence[tuple[str, str, str]]
+) -> None:
+    """Ends the ``tool_calls`` rows of finished calls (Section 16.1): ``finished`` or
+    ``failed``, ``finished_at``, and ``result_preview``.
+
+    Only a ``started`` row changes its status. A ``denied`` row stays as it is. A used ticket
+    is ``finished`` already: it keeps that status (so a check again cannot make a new ticket)
+    and gets the time and the preview."""
+    if not calls:
+        return
+    rows = (
+        func.unnest(
+            bindparam("call_ids", [c[0] for c in calls], ARRAY(Text)),
+            bindparam("statuses", [c[1] for c in calls], ARRAY(Text)),
+            bindparam("previews", [c[2] for c in calls], ARRAY(Text)),
+        )
+        .table_valued(column("call_id", Text), column("status", Text), column("preview", Text))
+        .render_derived(name="done")
+    )
+    await connection.execute(
+        update(ToolCall)
+        .where(
+            ToolCall.org_id == run.org_id,
+            ToolCall.run_id == run.run_id,
+            ToolCall.call_id == rows.c.call_id,
+            ToolCall.status.in_(("started", "finished")),
+        )
+        .values(
+            status=case((ToolCall.status == "started", rows.c.status), else_=ToolCall.status),
+            finished_at=func.now(),
+            result_preview=rows.c.preview,
+        )
+    )
 
 
 def _encode_state(state: bytes | None) -> str | None:
@@ -2040,9 +2094,12 @@ class RunQueue:
 
         Usually one statement without a transaction stores the events: the insert takes the
         run row ``FOR UPDATE`` while it checks the lease, so a reap waits until it ends. A
-        ``compacted`` event writes a second record, so it uses a transaction."""
+        ``compacted`` event writes a second record, so it uses a transaction. A
+        ``tool_call_finished`` event also ends the ``tool_calls`` row of its call (one more
+        statement, only for a batch that has such an event)."""
         if not events:
             return True
+        finished = _finished_calls(events)
         leased = select(Run.id).where(*self._owned(run, owner)).with_for_update()
         if all(kind != "compacted" for _seq, kind, _payload in events):
             rows = (
@@ -2077,7 +2134,10 @@ class RunQueue:
                     )
                     .returning(RunEvent.seq)
                 )
-                return bool(stored.first())
+                if stored.first() is None:
+                    return False
+                await _finish_tool_calls(connection, run, finished)
+                return True
         async with self._engine.begin() as connection:
             held = (await connection.execute(leased)).scalar_one_or_none()
             if held is None:
@@ -2107,6 +2167,7 @@ class RunQueue:
                         run_id=run.run_id,
                         payload=payload,
                     )
+            await _finish_tool_calls(connection, run, finished)
         return True
 
     async def complete(
