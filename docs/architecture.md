@@ -2970,6 +2970,18 @@ could not see the end of a sign-in, so it said "tell me when you are done".
   and `googledrive` (Composio) since M8.1. `slack` and `email` are the connectors of the user.
   The chat channels have their own names: `slack_app`, `telegram`, `whatsapp`, `whatsapp_meta`,
   `whatsapp_twilio`, `whatsapp_gupshup`, and `email_channel` (Section 11.9).
+- **MCP twins.** Some services have a database connector and an MCP server (`supabase` and
+  `supabase-mcp`). `connection_request` reads the message of the user that started the run:
+  the word "mcp" chooses the MCP server, and database words (database, SQL, Postgres, tables)
+  choose the database. Without a hint, the answer has a card for each choice (a link that starts
+  it on the Connections page) and the agent asks the user; the next call has `exact: true`.
+- **Forms continue too.** A form connector (a database, an API key, a bearer MCP server) that
+  the chat asks for gets its row at once (`pending`) with the origin of the request. The card
+  opens the form. When the saved form checks green, sama continues the request as after a
+  sign-in. A start on the page without an origin keeps a fresh origin of the same user, so a
+  card that opens the page still continues the chat. A new start reuses the row of the same
+  connector and user (also an old `initiated` row), so no second row exists. The Connections page
+  says "Waiting for the form" for a `pending` form row.
 - **Role.** `connections_list` says the role of the user. A workspace connection needs a
   workspace admin or the org owner, and the call must say `scope: workspace`, so that the tool
   gate asks a person first (an escalation of the control plane). A chat channel needs an org

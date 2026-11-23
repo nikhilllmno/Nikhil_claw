@@ -1669,7 +1669,9 @@ class ToolServer:
                 "name from connections_list, or the words of the user: 'email', 'inbox', or "
                 "'mail' mean the inbox of the user (gmail or outlook), 'calendar' means "
                 "googlecalendar, 'drive' means googledrive, 'slack' means the Slack account of "
-                "the user. It starts the sign-in and the user gets a Connect button with the "
+                "the user. When the user says 'MCP', use the connector whose name ends in -mcp "
+                "(supabase-mcp, not the supabase database). It starts the sign-in and the user "
+                "gets a Connect button with the "
                 "sign-in page of the provider. When the sign-in finishes, sama continues the "
                 "request by itself: do not ask the user to tell you when they are done. A "
                 "chat channel, where people talk to sama, is slack_app, telegram, whatsapp, "
@@ -1678,7 +1680,9 @@ class ToolServer:
                 "the user only) or workspace (for all members; only a workspace admin or the "
                 "org owner, and a person approves it first). The default is personal in a "
                 "private session and workspace in a shared session. Never ask for passwords, "
-                "API keys, or tokens in the chat."
+                "API keys, or tokens in the chat. A form connector (a database, an API key) "
+                "also continues by itself after the user saves the form. exact=true only after "
+                "the user chose between options that this tool gave."
             ),
             annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
             structured_output=False,
@@ -1687,15 +1691,20 @@ class ToolServer:
             connector: Annotated[str, Field(min_length=1, max_length=40)],
             ctx: Context,
             scope: Literal["personal", "workspace"] | None = None,
+            exact: bool = False,
         ) -> str:
             async def body(claims: RunTokenClaims) -> str:
                 # A chat channel is an integration of the org, not a connection (Section 11.9).
                 guide = await connections.channel_for_agent(claims, connector)
                 if guide is not None:
                     return guide
+                if exact:
+                    return await connections.request_for_agent(claims, connector, scope, exact=True)
                 return await connections.request_for_agent(claims, connector, scope)
 
-            arguments = {"connector": connector, "scope": scope}
+            arguments: dict[str, Any] = {"connector": connector, "scope": scope}
+            if exact:
+                arguments["exact"] = True
             return await self._call(ctx, CONNECTION_REQUEST, arguments, body)
 
         @server.tool(

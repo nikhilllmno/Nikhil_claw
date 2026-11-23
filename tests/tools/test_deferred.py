@@ -541,7 +541,7 @@ class FakeConnections:
         return "Connectors:\n- gmail (Gmail, via Composio): connected (personal)."
 
     async def request_for_agent(
-        self, claims: RunTokenClaims, connector: str, scope: str | None
+        self, claims: RunTokenClaims, connector: str, scope: str | None, *, exact: bool = False
     ) -> str:
         self.calls.append(("request", (connector, scope)))
         return f"Give the user this link: https://app.test/connections?connect={connector}"

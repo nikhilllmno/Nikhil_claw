@@ -604,6 +604,7 @@ describe("connector order and stuck rows (M8.1)", () => {
     expect(stuckHint("initiated", "http_api")).toBeNull();
     expect(stuckHint("expired", "composio")).toContain("Retry");
     expect(stuckHint("connected", "composio")).toBeNull();
+    expect(stuckHint("pending", "database")).toContain("Waiting for the form");
     expect(connectLabel(null)).toBe("Connect");
     expect(connectLabel("initiated")).toBe("Retry");
     expect(connectLabel("failed")).toBe("Retry");
