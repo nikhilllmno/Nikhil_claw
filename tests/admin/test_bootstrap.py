@@ -52,12 +52,14 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
         ).one()
         soul = (
             await connection.execute(
-                select(AgentProfile.soul).where(AgentProfile.id == first.agent_profile_id)
+                select(AgentProfile.soul, AgentProfile.reasoning_effort).where(
+                    AgentProfile.id == first.agent_profile_id
+                )
             )
         ).one()
         grants = await load_grants(connection, first.org_id, first.user_id)
     assert role == "owner"
-    assert soul == (DEFAULT_SOUL,)  # M8.5
+    assert soul == (DEFAULT_SOUL, "high")  # M8.5
     assert profile == (
         None,
         "claude-sonnet-5-5",

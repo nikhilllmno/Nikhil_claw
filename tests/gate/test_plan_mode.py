@@ -143,7 +143,7 @@ def test_plan_mode_denies_tools_that_change_files() -> None:
 def test_plan_mode_keeps_the_policy_of_allowed_calls() -> None:
     assert decide(plan(), "Read", {"file_path": "a"}).action == "allow"
     assert decide(plan(), "mcp__sama__plan_propose", {"plan": "x"}).action == "allow"
-    # A read command gets the default of Bash in a private chat: allow (M8.4). A shared
+    # A read command gets the default of Bash in a private chat: allow (M8.5). A shared
     # session asks.
     assert decide(plan(), "Bash", {"command": "ls"}).action == "allow"
     assert decide(plan(shared=True), "Bash", {"command": "ls"}).action == "ask"

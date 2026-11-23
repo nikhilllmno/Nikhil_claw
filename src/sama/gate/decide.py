@@ -173,16 +173,16 @@ that open and read pages are here, as ``web_extract`` is; ``browser_act`` and ``
 are not, because a click, a form, or a saved login can change data with the logins of the user
 (Section 14.1). ``browser_task`` is not here for the same reason: its sub-agent clicks and types
 (M5.6). ``WebFetch`` only reads a page, as ``web_extract`` does. The tools in ``SANDBOX_TOOLS``
-are here since M8.4: they change only the files of the sandbox of the session, which has no
+are here since M8.5: they change only the files of the sandbox of the session, which has no
 secret (D6), so a person in a private chat is not asked for each command or file write. They
 still ask in a shared session and in an unattended run (``SANDBOX_TOOLS``)."""
 
 SANDBOX_TOOLS: Final = frozenset(
     {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "execute_code"}
 )
-"""Tools that work only in the sandbox of the session (M8.4). They are in ``DEFAULT_ALLOW`` for
+"""Tools that work only in the sandbox of the session (M8.5). They are in ``DEFAULT_ALLOW`` for
 a private chat run. In a shared session and in an unattended run (a job, a workflow, a webhook)
-they get ``ask`` by default, as before M8.4: other people steer a shared chat, and nobody
+they get ``ask`` by default, as before M8.5: other people steer a shared chat, and nobody
 watches an unattended run, so a pre-approval of the job version must cover them. A rule of the
 org, the profile, or the user wins over this default, and the hardline list and plan mode come
 before it (Section 16.1)."""

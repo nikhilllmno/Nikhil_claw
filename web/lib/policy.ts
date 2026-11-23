@@ -169,7 +169,7 @@ export function checkChangeCount(changes: readonly ToolPolicyChange[], maxRules:
 
 /**
  * A short note when the default of a tool in a private chat is not its default everywhere
- * (M8.4): for example the sandbox tools allow in a private chat but ask in a shared session and
+ * (M8.5): for example the sandbox tools allow in a private chat but ask in a shared session and
  * in a job. `null` when the default is the same in all three places, or the API is older.
  */
 export function defaultNote(tool: ToolInfo): string | null {

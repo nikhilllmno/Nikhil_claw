@@ -34,7 +34,7 @@ def tool_list(toolsets: Sequence[str]) -> list[dict[str, Any]]:
     toolset is one of ``toolsets``. ``default`` is the verdict of the gate in a private chat when
     no rule matches. ``shared_default`` is that verdict in a shared session, and
     ``unattended_default`` in a job, workflow, or webhook run before a pre-approval: some tools
-    that a private chat allows ask there (``SHARED_ASK`` and ``SANDBOX_TOOLS``, M8.4)."""
+    that a private chat allows ask there (``SHARED_ASK`` and ``SANDBOX_TOOLS``, M8.5)."""
     enabled = set(toolsets)
     out: list[dict[str, Any]] = []
     for toolset, names in sorted(TOOLSETS.items()):

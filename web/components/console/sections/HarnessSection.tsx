@@ -195,7 +195,10 @@ function HarnessForm({
               </option>
             ))}
           </select>
-          <span className="hint">More effort gives better answers to hard tasks. It costs more time and tokens.</span>
+          <span className="hint">
+            More effort gives better answers to hard tasks. It costs more time and tokens. New agents
+            start at High, which costs about twice the model default.
+          </span>
         </label>
       </section>
 

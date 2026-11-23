@@ -161,7 +161,7 @@ describe("checkChangeCount", () => {
 describe("defaultNote", () => {
   const base: ToolInfo = { name: "Bash", toolset: "core", enabled: true, default: "allow", always_ask: false };
 
-  it("names the places where the default asks (M8.4)", () => {
+  it("names the places where the default asks (M8.5)", () => {
     expect(defaultNote({ ...base, shared_default: "ask", unattended_default: "ask" })).toBe(
       "Asks in shared chats and jobs.",
     );

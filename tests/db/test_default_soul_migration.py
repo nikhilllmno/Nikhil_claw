@@ -1,5 +1,5 @@
-"""Migration 0051: the default SOUL for default profiles whose SOUL is empty (docs/architecture.md,
-Section 6.1; roadmap M8.4)."""
+"""Migration 0051: the default SOUL and reasoning effort for default profiles without them
+(docs/architecture.md, Section 6.1; roadmap M8.5)."""
 
 from __future__ import annotations
 
@@ -13,13 +13,16 @@ import asyncpg
 import pytest
 from alembic import command
 
+from sama.admin.bootstrap import DEFAULT_REASONING_EFFORT
 from sama.instructions import DEFAULT_SOUL
 from tests.db.conftest import alembic_config, migrated_database
 from tests.db.world import seed
 
 pytestmark = pytest.mark.filterwarnings("ignore::ResourceWarning")
 
-MIGRATION = Path(__file__).parents[2] / "migrations" / "versions" / "0051_default_soul.py"
+MIGRATION = (
+    Path(__file__).parents[2] / "migrations" / "versions" / "0051_default_soul_and_effort.py"
+)
 
 
 def _migration() -> ModuleType:
@@ -48,8 +51,14 @@ def _soul(url: str, profile_id: uuid.UUID) -> str:
     return str(row["soul"])
 
 
-def test_the_migration_text_is_the_default_soul_of_new_profiles() -> None:
+def _effort(url: str, profile_id: uuid.UUID) -> str | None:
+    [row] = _fetch(url, "SELECT reasoning_effort FROM agent_profiles WHERE id = $1", profile_id)
+    return row["reasoning_effort"]
+
+
+def test_the_migration_values_are_the_defaults_of_new_profiles() -> None:
     assert _migration().SOUL == DEFAULT_SOUL
+    assert _migration().EFFORT == DEFAULT_REASONING_EFFORT
 
 
 def test_the_upgrade_fills_only_empty_default_souls_and_the_downgrade_undoes_it() -> None:
@@ -59,8 +68,14 @@ def test_the_upgrade_fills_only_empty_default_souls_and_the_downgrade_undoes_it(
         config = alembic_config(url)
         command.downgrade(config, "0050")
         a, a2, b = (world.ids[name] for name in ("profile-a", "profile-a2", "profile-b"))
-        # A person wrote the SOUL of org B: it must not change.
-        _fetch(url, "UPDATE agent_profiles SET soul = 'Custom soul.' WHERE id = $1", b)
+        # A person wrote the SOUL of org B and chose its effort: they must not change.
+        _fetch(
+            url,
+            "UPDATE agent_profiles SET soul = 'Custom soul.', reasoning_effort = 'low'"
+            " WHERE id = $1",
+            b,
+        )
+        _fetch(url, "UPDATE agent_profiles SET reasoning_effort = NULL WHERE id <> $1", b)
         # A second org-wide profile of org A, newer than the default profile.
         [later] = _fetch(
             url,
@@ -75,12 +90,28 @@ def test_the_upgrade_fills_only_empty_default_souls_and_the_downgrade_undoes_it(
         assert _soul(url, a2) == ""  # a profile of a workspace is not a default profile
         assert _soul(url, b) == "Custom soul."
         assert _soul(url, later["id"]) == ""
+        # The reasoning effort: only a default profile without a value gets "high".
+        assert _effort(url, a) == "high"
+        assert _effort(url, b) == "low"
+        assert _effort(url, a2) is None
+        assert _effort(url, later["id"]) is None
+        [effort] = _fetch(
+            url,
+            "SELECT kind, before, after FROM profile_changes WHERE agent_profile_id = $1"
+            " AND summary = $2",
+            a,
+            _migration().EFFORT_SUMMARY,
+        )
+        assert effort["kind"] == "profile"
+        assert '"reasoning_effort": null' in effort["before"]
+        assert '"reasoning_effort": "high"' in effort["after"]
 
         [change] = _fetch(
             url,
             "SELECT kind, source, before, after, actor_user_id, summary FROM profile_changes"
-            " WHERE agent_profile_id = $1 AND summary IS NOT NULL",
+            " WHERE agent_profile_id = $1 AND summary = $2",
             a,
+            _migration().SUMMARY,
         )
         assert (change["kind"], change["source"], change["actor_user_id"]) == (
             "soul",
@@ -89,18 +120,20 @@ def test_the_upgrade_fills_only_empty_default_souls_and_the_downgrade_undoes_it(
         )
         assert '"soul": ""' in change["before"]
         assert soul[:40] in change["after"]
-        [audit] = _fetch(
+        audits = _fetch(
             url,
             "SELECT actor_kind, details FROM audit_log"
             " WHERE action = 'profile.updated' AND target_id = $1",
             str(a),
         )
-        assert audit["actor_kind"] == "system"
-        assert "migration 0051" in audit["details"]
+        assert [row["actor_kind"] for row in audits] == ["system", "system"]
+        assert all("migration 0051" in row["details"] for row in audits)
 
         command.downgrade(config, "0050")
         assert _soul(url, a) == ""
+        assert _effort(url, a) is None
         assert _soul(url, b) == "Custom soul."
+        assert _effort(url, b) == "low"
         assert not _fetch(
             url, "SELECT 1 FROM profile_changes WHERE summary = $1", _migration().SUMMARY
         )

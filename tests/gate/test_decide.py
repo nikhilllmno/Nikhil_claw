@@ -1041,7 +1041,7 @@ def test_the_hermes_parity_tools_have_their_toolsets() -> None:
     assert "moa" not in child
 
 
-# -- the sandbox tools (M8.4) -----------------------------------------------------------------
+# -- the sandbox tools (M8.5) -----------------------------------------------------------------
 
 
 SANDBOX_CALLS = {
