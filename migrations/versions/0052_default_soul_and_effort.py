@@ -22,8 +22,8 @@ session.
 The text is a copy, so a later change of ``DEFAULT_SOUL`` does not change this migration. The
 tables have ``org_id`` and RLS already. No table is new.
 
-Revision ID: 0051
-Revises: 0050
+Revision ID: 0052
+Revises: 0051
 Create Date: 2026-11-23
 """
 
@@ -32,8 +32,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0051"
-down_revision: str | None = "0050"
+revision: str = "0052"
+down_revision: str | None = "0051"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -71,7 +71,7 @@ history AS (
 )
 INSERT INTO audit_log (org_id, actor_kind, action, target_type, target_id, details)
 SELECT h.org_id, 'system', 'profile.updated', 'agent_profile', h.agent_profile_id::text,
-       jsonb_build_object('fields', jsonb_build_array('soul'), 'via', 'migration 0051')
+       jsonb_build_object('fields', jsonb_build_array('soul'), 'via', 'migration 0052')
 FROM history h
 """
 
@@ -100,7 +100,7 @@ history AS (
 )
 INSERT INTO audit_log (org_id, actor_kind, action, target_type, target_id, details)
 SELECT h.org_id, 'system', 'profile.updated', 'agent_profile', h.agent_profile_id::text,
-       jsonb_build_object('fields', jsonb_build_array('reasoning_effort'), 'via', 'migration 0051')
+       jsonb_build_object('fields', jsonb_build_array('reasoning_effort'), 'via', 'migration 0052')
 FROM history h
 """
 

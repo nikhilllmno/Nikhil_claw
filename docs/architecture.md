@@ -1442,12 +1442,12 @@ Rules:
 - **The default SOUL (M8.5).** `sama.instructions.DEFAULT_SOUL` sets the voice of the agent in
   four sentences. The working rules stay in `SYSTEM_PROMPT`, so an edit of the SOUL cannot remove
   them. A new org (sign-up and `bootstrap`) and a new profile without a soul get it. Migration
-  `0051` gives it to the default profile of each existing org (its oldest profile without a
+  `0052` gives it to the default profile of each existing org (its oldest profile without a
   workspace) only when the SOUL is still empty. Each fill writes a `profile_changes` row (kind
   `soul`, source `edit`, no actor) and the audit action `profile.updated`, so the agent history
   shows it and an admin can revert it. A later `change_propose` of the SOUL starts from it.
 - **The default reasoning effort (M8.5).** A new profile gets `reasoning_effort = 'high'`
-  (`DEFAULT_REASONING_EFFORT`), and migration `0051` gives it to the default profile of each
+  (`DEFAULT_REASONING_EFFORT`), and migration `0052` gives it to the default profile of each
   existing org when the value is still null (a `profile_changes` row of the kind `profile`). A
   value that a person set does not change. On the M8.5 benchmark, `high` lifted the weakest seven
   tasks from 7.0 to 8.3 of 10 points, at about twice the model cost of the model default. An admin

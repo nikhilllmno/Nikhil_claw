@@ -1,4 +1,4 @@
-"""Migration 0051: the default SOUL and reasoning effort for default profiles without them
+"""Migration 0052: the default SOUL and reasoning effort for default profiles without them
 (docs/architecture.md, Section 6.1; roadmap M8.5)."""
 
 from __future__ import annotations
@@ -21,12 +21,12 @@ from tests.db.world import seed
 pytestmark = pytest.mark.filterwarnings("ignore::ResourceWarning")
 
 MIGRATION = (
-    Path(__file__).parents[2] / "migrations" / "versions" / "0051_default_soul_and_effort.py"
+    Path(__file__).parents[2] / "migrations" / "versions" / "0052_default_soul_and_effort.py"
 )
 
 
 def _migration() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("migration_0051", MIGRATION)
+    spec = importlib.util.spec_from_file_location("migration_0052", MIGRATION)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -67,7 +67,7 @@ def test_the_upgrade_fills_only_empty_default_souls_and_the_downgrade_undoes_it(
     with migrated_database() as url:
         world = asyncio.run(seed(url))
         config = alembic_config(url)
-        command.downgrade(config, "0050")
+        command.downgrade(config, "0051")
         a, a2, b = (world.ids[name] for name in ("profile-a", "profile-a2", "profile-b"))
         # A person wrote the SOUL of org B and chose its effort: they must not change.
         _fetch(
@@ -128,9 +128,9 @@ def test_the_upgrade_fills_only_empty_default_souls_and_the_downgrade_undoes_it(
             str(a),
         )
         assert [row["actor_kind"] for row in audits] == ["system", "system"]
-        assert all("migration 0051" in row["details"] for row in audits)
+        assert all("migration 0052" in row["details"] for row in audits)
 
-        command.downgrade(config, "0050")
+        command.downgrade(config, "0051")
         assert _soul(url, a) == ""
         assert _effort(url, a) is None
         assert _soul(url, b) == "Custom soul."
@@ -144,12 +144,12 @@ def test_the_downgrade_keeps_a_soul_that_a_person_changed_after_the_fill() -> No
     with migrated_database() as url:
         world = asyncio.run(seed(url))
         config = alembic_config(url)
-        command.downgrade(config, "0050")
+        command.downgrade(config, "0051")
         command.upgrade(config, "head")
         a = world.ids["profile-a"]
         assert _soul(url, a) == _migration().SOUL
         _fetch(url, "UPDATE agent_profiles SET soul = 'Edited.' WHERE id = $1", a)
-        command.downgrade(config, "0050")
+        command.downgrade(config, "0051")
         assert _soul(url, a) == "Edited."
 
 
@@ -159,7 +159,7 @@ def test_the_downgrade_keeps_a_value_that_a_person_changed_away_and_back() -> No
     with migrated_database() as url:
         world = asyncio.run(seed(url))
         config = alembic_config(url)
-        command.downgrade(config, "0050")
+        command.downgrade(config, "0051")
         command.upgrade(config, "head")
         a = world.ids["profile-a"]
         for before, after in (("high", "low"), ("low", "high")):
@@ -181,7 +181,7 @@ def test_the_downgrade_keeps_a_value_that_a_person_changed_away_and_back() -> No
             a,
             _migration().SUMMARY,
         )
-        command.downgrade(config, "0050")
+        command.downgrade(config, "0051")
         assert _effort(url, a) == "high"  # changed away and back by a person
         assert _soul(url, a) == _migration().SOUL  # the fill was reverted and done again
         assert not _fetch(

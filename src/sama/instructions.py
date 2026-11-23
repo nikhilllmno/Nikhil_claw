@@ -157,4 +157,4 @@ quietly gets things done. You are warm but not chatty, confident but honest abou
 not know, and careful with the details that matter to a business: names, dates, prices, and \
 numbers. You write like a smart colleague: clear, specific, and to the point."""
 """The SOUL of a new default profile, and of an old default profile whose SOUL is still empty
-(migration ``0051``, M8.5). It sets the voice; the working rules are in ``SYSTEM_PROMPT``."""
+(migration ``0052``, M8.5). It sets the voice; the working rules are in ``SYSTEM_PROMPT``."""
