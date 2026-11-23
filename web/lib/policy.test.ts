@@ -3,6 +3,7 @@ import type { ToolInfo, ToolPolicyRule } from "./api";
 import {
   checkChangeCount,
   customRules,
+  defaultNote,
   groupTools,
   isPrefixRule,
   newRuleRow,
@@ -154,5 +155,23 @@ describe("checkChangeCount", () => {
     const changes = Array.from({ length: 21 }, (_, i) => ({ tool: `t${i}`, action: null }));
     expect(checkChangeCount(changes, 20)).toContain("at most 20");
     expect(checkChangeCount(changes.slice(0, 20), 20)).toBeNull();
+  });
+});
+
+describe("defaultNote", () => {
+  const base: ToolInfo = { name: "Bash", toolset: "core", enabled: true, default: "allow", always_ask: false };
+
+  it("names the places where the default asks (M8.4)", () => {
+    expect(defaultNote({ ...base, shared_default: "ask", unattended_default: "ask" })).toBe(
+      "Asks in shared chats and jobs.",
+    );
+    expect(defaultNote({ ...base, name: "memory", shared_default: "ask", unattended_default: "allow" })).toBe(
+      "Asks in shared chats.",
+    );
+  });
+
+  it("is empty when the default is the same everywhere or the API is older", () => {
+    expect(defaultNote({ ...base, shared_default: "allow", unattended_default: "allow" })).toBeNull();
+    expect(defaultNote(base)).toBeNull();
   });
 });

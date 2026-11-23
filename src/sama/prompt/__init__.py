@@ -1,8 +1,8 @@
 """Prompt assembly: the frozen ``RunConfig`` of a session (docs/architecture.md, Section 6.1)."""
 
+from sama.instructions import DEFAULT_SOUL, SYSTEM_PROMPT
 from sama.prompt.assemble import (
     MAX_CONTEXT_FILES,
-    SYSTEM_PROMPT,
     PromptAssembler,
     environment,
     prepare,
@@ -12,6 +12,7 @@ from sama.prompt.assemble import (
 from sama.prompt.scan import HIDDEN_COMMENT, PATTERNS, scan
 
 __all__ = [
+    "DEFAULT_SOUL",
     "HIDDEN_COMMENT",
     "MAX_CONTEXT_FILES",
     "PATTERNS",

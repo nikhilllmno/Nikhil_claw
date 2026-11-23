@@ -23,7 +23,7 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import AuditEntry
-from sama.gate.decide import DEFAULT_ALLOW, TOOLSETS, always_asks
+from sama.gate.decide import TOOLSETS, always_asks, policy_verdict
 from sama.profile_changes import MAX_RULES, check_rules, profile_rules, set_rule, write_change
 from sama.profiles import ProfileError, lock_admin
 from sama.subagents import lock_profile
@@ -31,19 +31,23 @@ from sama.subagents import lock_profile
 
 def tool_list(toolsets: Sequence[str]) -> list[dict[str, Any]]:
     """Every tool of ``TOOLSETS``, sorted by toolset and name. ``enabled`` is true when the
-    toolset is one of ``toolsets``. ``default`` is the verdict of the gate when no rule matches."""
+    toolset is one of ``toolsets``. ``default`` is the verdict of the gate in a private chat when
+    no rule matches. ``shared_default`` is that verdict in a shared session, and
+    ``unattended_default`` in a job, workflow, or webhook run before a pre-approval: some tools
+    that a private chat allows ask there (``SHARED_ASK`` and ``SANDBOX_TOOLS``, M8.4)."""
     enabled = set(toolsets)
     out: list[dict[str, Any]] = []
     for toolset, names in sorted(TOOLSETS.items()):
         for name in sorted(names):
-            always = always_asks(name)
             out.append(
                 {
                     "name": name,
                     "toolset": toolset,
                     "enabled": toolset in enabled,
-                    "default": "allow" if name in DEFAULT_ALLOW and not always else "ask",
-                    "always_ask": always,
+                    "default": policy_verdict((), name).action,
+                    "shared_default": policy_verdict((), name, shared=True).action,
+                    "unattended_default": policy_verdict((), name, unattended=True).action,
+                    "always_ask": always_asks(name),
                 }
             )
     return out

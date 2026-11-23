@@ -365,12 +365,8 @@ async def test_maps_the_request_to_options() -> None:
     await collect(runtime.run(request(budget=budget)))
     options = factory.clients[0].options
     assert options.model == "claude-sonnet-4-5"
-    assert options.system_prompt == {
-        "type": "preset",
-        "preset": "claude_code",
-        "append": config().render_prefix(),
-        "exclude_dynamic_sections": True,
-    }
+    # Since M8.5 the CLI gets the sama prefix alone, without the Claude Code preset.
+    assert options.system_prompt == config().render_prefix()
     assert options.mcp_servers == {
         "sama": {
             "type": "http",
@@ -403,13 +399,18 @@ async def test_the_settings_can_turn_tool_search_on() -> None:
     assert factory.clients[0].options.env[TOOL_SEARCH_ENV] == "true"
 
 
-async def test_custom_system_prompt_without_the_preset() -> None:
+async def test_the_settings_can_turn_the_claude_code_preset_on() -> None:
     factory = Factory([result()])
     runtime = ClaudeRuntime(
-        settings=ClaudeSettings(claude_code_preset=False), client_factory=factory
+        settings=ClaudeSettings(claude_code_preset=True), client_factory=factory
     )
     await collect(runtime.run(request()))
-    assert factory.clients[0].options.system_prompt == config().render_prefix()
+    assert factory.clients[0].options.system_prompt == {
+        "type": "preset",
+        "preset": "claude_code",
+        "append": config().render_prefix(),
+        "exclude_dynamic_sections": True,
+    }
 
 
 def test_settings_reject_a_long_cancel_grace() -> None:

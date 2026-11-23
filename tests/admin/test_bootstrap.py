@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sama.admin.__main__ import main
 from sama.admin.bootstrap import DEFAULT_GROUP_TOOLSETS, BootstrapError, Owner, bootstrap
 from sama.db.models import AgentProfile, Membership, Org, User, Workspace
+from sama.instructions import DEFAULT_SOUL
 from sama.tenancy.access import load_grants
 
 
@@ -49,8 +50,14 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
                 ).where(AgentProfile.id == first.agent_profile_id)
             )
         ).one()
+        soul = (
+            await connection.execute(
+                select(AgentProfile.soul).where(AgentProfile.id == first.agent_profile_id)
+            )
+        ).one()
         grants = await load_grants(connection, first.org_id, first.user_id)
     assert role == "owner"
+    assert soul == (DEFAULT_SOUL,)  # M8.5
     assert profile == (
         None,
         "claude-sonnet-5-5",

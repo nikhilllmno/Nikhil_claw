@@ -201,12 +201,17 @@ class ClaudeSettings:
     token as ``ANTHROPIC_API_KEY`` here (M1.7). ``cancel_grace_s`` is how long ``cancel``
     waits for the CLI to stop by itself before the adapter stops the stream. Keep it well
     under 10 seconds.
+
+    ``claude_code_preset`` puts the prompt prefix after the Claude Code preset of the SDK. It is
+    off since M8.5: the CLI gets the sama prefix alone, so the agent presents itself as Sama and
+    not as a coding CLI. On the M8.5 benchmark both choices scored the same, and the prefix alone
+    cost about a quarter less (docs/architecture.md, Section 5.2).
     """
 
     cwd: str | None = None
     cli_path: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
-    claude_code_preset: bool = True
+    claude_code_preset: bool = False
     cancel_grace_s: float = 5.0
     session_exists: Callable[[str], bool] | None = None
     """Checks that the CLI can resume an SDK session (its transcript is there). The runner sets

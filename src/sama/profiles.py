@@ -747,7 +747,10 @@ async def create_profile(
         if count >= MAX_PROFILES_PER_ORG:
             raise ProfileLimitError(f"an org has at most {MAX_PROFILES_PER_ORG} agents")
         values = default_profile(org_id, name=name, model=model, budget=plan_of(plan).run_budget)
-        values.update(workspace_id=new.workspace_id, soul=new.soul, runtime=runtime.value)
+        # A new profile without a soul gets the default soul of a new org (M8.4).
+        values.update(
+            workspace_id=new.workspace_id, soul=new.soul or values["soul"], runtime=runtime.value
+        )
         profile_id: uuid.UUID = (
             await connection.execute(
                 insert(AgentProfile).values(**values).returning(AgentProfile.id)

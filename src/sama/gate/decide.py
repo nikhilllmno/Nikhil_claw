@@ -106,6 +106,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "web_search",
         "web_extract",
         "x_search",
+        "WebFetch",
         "clarify",
         ASK_USER_QUESTION,
         "repo_clone",
@@ -145,6 +146,12 @@ DEFAULT_ALLOW: Final = frozenset(
         "browser_screenshot",
         "browser_extract",
         "browser_tabs",
+        "Bash",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "execute_code",
     }
 )
 """Tools that only read, ask the user, or copy public data into the sandbox. Without a policy
@@ -165,7 +172,20 @@ writes waits for the approval of its owner before it runs (Section 12.3). The br
 that open and read pages are here, as ``web_extract`` is; ``browser_act`` and ``browser_vault``
 are not, because a click, a form, or a saved login can change data with the logins of the user
 (Section 14.1). ``browser_task`` is not here for the same reason: its sub-agent clicks and types
-(M5.6)."""
+(M5.6). ``WebFetch`` only reads a page, as ``web_extract`` does. The tools in ``SANDBOX_TOOLS``
+are here since M8.4: they change only the files of the sandbox of the session, which has no
+secret (D6), so a person in a private chat is not asked for each command or file write. They
+still ask in a shared session and in an unattended run (``SANDBOX_TOOLS``)."""
+
+SANDBOX_TOOLS: Final = frozenset(
+    {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "execute_code"}
+)
+"""Tools that work only in the sandbox of the session (M8.4). They are in ``DEFAULT_ALLOW`` for
+a private chat run. In a shared session and in an unattended run (a job, a workflow, a webhook)
+they get ``ask`` by default, as before M8.4: other people steer a shared chat, and nobody
+watches an unattended run, so a pre-approval of the job version must cover them. A rule of the
+org, the profile, or the user wins over this default, and the hardline list and plan mode come
+before it (Section 16.1)."""
 
 
 DELEGATION_LINEAGE: Final = "delegation"
@@ -612,11 +632,21 @@ _STRICTNESS: Final = {"allow": 0, "ask": 1, "deny": 2}
 def context_policy(context: GateContext, name: str) -> Verdict:
     """Step 4 with the live rules and, for a session with a snapshot, with the frozen profile
     rules. The stricter verdict wins."""
-    live = policy_verdict(context.rules, name, shared=context.shared, access=context.access)
+    live = policy_verdict(
+        context.rules,
+        name,
+        shared=context.shared,
+        unattended=context.unattended,
+        access=context.access,
+    )
     if context.frozen_rules is None:
         return live
     frozen = policy_verdict(
-        context.frozen_rules, name, shared=context.shared, access=context.access
+        context.frozen_rules,
+        name,
+        shared=context.shared,
+        unattended=context.unattended,
+        access=context.access,
     )
     if _STRICTNESS[frozen.action] > _STRICTNESS[live.action]:
         return Verdict(frozen.action, frozen.step, f"{frozen.reason} (until the next session)")
@@ -656,13 +686,15 @@ def policy_verdict(
     name: str,
     *,
     shared: bool = False,
+    unattended: bool = False,
     access: Mapping[str, ToolAccess] | None = None,
 ) -> Verdict:
     """Step 4. A ``deny`` rule at any level wins. A tool that ``always_asks`` gets ``ask``. An
     org or profile ``ask`` rule cannot be removed by a user rule. Otherwise a user rule wins,
     then the profile rule, then the org rule. At one level an exact name wins over a prefix.
     Without a rule, the built-in default applies, and the default for unknown tools is
-    ``ask``. In a shared session, the tools in ``SHARED_ASK`` also get ``ask`` by default. A
+    ``ask``. In a shared session, the tools in ``SHARED_ASK`` also get ``ask`` by default, and
+    in a shared session or an unattended run the tools in ``SANDBOX_TOOLS`` do too. A
     deferred tool with an ``access`` gets the connector default: ``read`` is ``allow``,
     ``write`` and ``destructive`` are ``ask`` (Section 10.3)."""
     matching = [rule for rule in rules if rule.matches(name)]
@@ -680,8 +712,10 @@ def policy_verdict(
         return Verdict(
             chosen.action, GateStep.POLICY, f"the {chosen.level} policy: {chosen.action}"
         )
-    if shared and name in SHARED_ASK:
+    if shared and name in SHARED_ASK | SANDBOX_TOOLS:
         return Verdict("ask", GateStep.POLICY, f"{name} needs an approval in a shared session")
+    if unattended and name in SANDBOX_TOOLS:
+        return Verdict("ask", GateStep.POLICY, f"{name} needs an approval in an unattended run")
     if name in DEFAULT_ALLOW:
         return Verdict("allow", GateStep.POLICY, f"{name} is allowed by default")
     match (access or {}).get(name):

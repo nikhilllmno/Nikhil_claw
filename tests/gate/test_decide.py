@@ -385,8 +385,8 @@ def test_an_approval_of_another_call_is_a_deny(recorded: Recorded) -> None:
 
 
 def test_unknown_tools_default_to_ask() -> None:
-    assert decide(context(), "Bash", ARGS).action == "ask"
-    assert decide(context(), "Write", {"file_path": "a"}).action == "ask"
+    assert decide(context(toolsets=ALL | {"github"}), "mcp__sama__pr_create", {}).action == "ask"
+    assert decide(context(toolsets=ALL | {"browser"}), "mcp__sama__browser_act", {}).action == "ask"
 
 
 def test_read_only_tools_default_to_allow() -> None:
@@ -1039,3 +1039,66 @@ def test_the_hermes_parity_tools_have_their_toolsets() -> None:
         DEFAULT_TOOLSETS, DEFAULT_GROUP_TOOLSETS, audience="private", lineage="delegation"
     )
     assert "moa" not in child
+
+
+# -- the sandbox tools (M8.4) -----------------------------------------------------------------
+
+
+SANDBOX_CALLS = {
+    "Bash": ARGS,
+    "Write": {"file_path": "/workspace/a.py", "content": "print(1)\n"},
+    "Edit": {"file_path": "/workspace/a.py", "old_string": "1", "new_string": "2"},
+    "MultiEdit": {"file_path": "/workspace/a.py", "edits": []},
+    "NotebookEdit": {"notebook_path": "/workspace/a.ipynb", "new_source": "1"},
+    "mcp__sama__execute_code": {"code": "print(1)"},
+}
+
+
+@pytest.mark.parametrize("name", sorted(SANDBOX_CALLS))
+def test_a_sandbox_tool_is_allowed_in_a_private_chat(name: str) -> None:
+    toolsets = ALL | {"code_exec"}
+    verdict = decide(context(toolsets=toolsets), name, SANDBOX_CALLS[name])
+    assert (verdict.action, verdict.step) == ("allow", GateStep.POLICY)
+
+
+@pytest.mark.parametrize("name", sorted(SANDBOX_CALLS))
+def test_a_sandbox_tool_asks_in_a_shared_session_and_is_denied_unattended(name: str) -> None:
+    toolsets = ALL | {"code_exec"}
+    shared = decide(context(toolsets=toolsets, shared=True), name, SANDBOX_CALLS[name])
+    assert shared.action == "ask"
+    unattended = decide(context(toolsets=toolsets, unattended=True), name, SANDBOX_CALLS[name])
+    assert (unattended.action, unattended.step) == ("deny", GateStep.CONTEXT)
+
+
+def test_a_pre_approval_still_covers_a_sandbox_tool_in_a_job() -> None:
+    approved = (Preapproval(tool="Bash"),)
+    verdict = decide(context(unattended=True, preapproved=approved), "Bash", ARGS)
+    assert verdict.action == "allow"
+
+
+@pytest.mark.parametrize(
+    ("level", "action"),
+    [(RuleLevel.ORG, "ask"), (RuleLevel.PROFILE, "ask"), (RuleLevel.ORG, "deny")],
+)
+def test_an_admin_rule_wins_over_the_sandbox_default(level: RuleLevel, action: str) -> None:
+    verdict = decide(context(rules=(rule("Bash", action, level),)), "Bash", ARGS)
+    assert (verdict.action, verdict.step) == (action, GateStep.POLICY)
+
+
+def test_an_admin_allow_rule_still_allows_a_sandbox_tool_in_a_shared_session() -> None:
+    rules = (rule("Bash", "allow", RuleLevel.PROFILE),)
+    assert decide(context(rules=rules, shared=True), "Bash", ARGS).action == "allow"
+
+
+def test_the_hardline_list_and_plan_mode_come_before_the_sandbox_default() -> None:
+    hardline = decide(context(), "Bash", {"command": "rm -rf /"})
+    assert (hardline.action, hardline.step) == ("deny", GateStep.HARDLINE)
+    planned = decide(context(plan_mode=True), "Write", SANDBOX_CALLS["Write"])
+    assert (planned.action, planned.step) == ("deny", GateStep.PLAN)
+
+
+def test_web_fetch_only_reads_so_it_is_allowed() -> None:
+    assert decide(context(), "WebFetch", {"url": "https://example.com"}).action == "allow"
+    assert decide(context(shared=True), "WebFetch", {"url": "https://example.com"}).action == (
+        "allow"
+    )

@@ -25,6 +25,7 @@ from sama.db.models import (
     Org,
     User,
 )
+from sama.instructions import DEFAULT_SOUL
 from sama.profiles import MAX_PROFILES_PER_ORG
 from tests.api.conftest import bearer
 from tests.api.test_app import add_user, mia
@@ -412,6 +413,8 @@ async def test_the_profile_create_uses_the_plan_budget_and_the_cap(
     url = f"/orgs/{tenant.org}/agent-profiles"
     first = await client.post(url, headers=headers, json={"name": "one"})
     assert first.status_code == 201
+    # A profile without a soul gets the default soul of a new org (M8.5).
+    assert first.json()["soul"] == DEFAULT_SOUL
     async with engine.connect() as connection:
         budget = (
             await connection.execute(

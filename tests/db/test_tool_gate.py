@@ -458,8 +458,25 @@ async def test_concurrent_first_checks_of_one_call_id_are_in_a_sequence(
 
 async def ask(gate: GateService, org: Org1, call_id: str = "c1", run: str = "run") -> None:
     session = "secret" if run == "secret-run" else "shared"
+    if run == "secret-run":
+        await private_bash_asks(gate, org)
     claims = org.claims(run, session_id=str(org.ids[session]))
     assert (await gate.check(claims, call_id, "Bash", ARGS)).action == "ask"
+
+
+async def private_bash_asks(gate: GateService, org: Org1) -> None:
+    """Since M8.5 ``Bash`` is allowed by default in a private session. A personal ``ask`` rule of
+    mia makes it ask there, and a session approval (a higher level) still wins over the rule."""
+    async with gate._engine.begin() as connection:
+        found = await connection.scalar(
+            select(ToolPolicy.id).where(
+                ToolPolicy.org_id == org.ids["org"],
+                ToolPolicy.user_id == org.ids["mia"],
+                ToolPolicy.tool == "Bash",
+            )
+        )
+    if found is None:
+        await add_rule(gate._engine, org, "Bash", "ask", user="mia")
 
 
 async def test_an_approval_allows_the_same_call(engine: AsyncEngine, org: Org1) -> None:
@@ -917,7 +934,13 @@ async def test_reconfirm_loads_the_rules_of_the_private_session_owner(
         user_id=org.ids["mia"],
         approve=True,
     )
-    await add_rule(engine, org, "Bash", "deny", user="mia")
+    async with engine.begin() as connection:
+        # The ask rule of mia (``private_bash_asks``) becomes a deny rule.
+        await connection.execute(
+            update(ToolPolicy)
+            .where(ToolPolicy.user_id == org.ids["mia"], ToolPolicy.tool == "Bash")
+            .values(action="deny")
+        )
     verdict = await gate.reconfirm(
         org_id=org.ids["org"], run_id=org.ids["secret-run"], call_id="c1"
     )
@@ -945,8 +968,9 @@ async def test_a_shared_run_uses_the_group_toolsets(engine: AsyncEngine, org: Or
     assert (shared.action, shared.step) == ("deny", GateStep.TOOLSET)
     assert "not in the toolsets" in shared.reason
     # The same call in a private run is not denied at the toolset step: the profile has core.
+    # Since M8.5 the default of Bash in a private run is allow.
     private = await gate.check(private_claims(org), "c1", "Bash", ARGS)
-    assert (private.action, private.step) == ("ask", GateStep.POLICY)
+    assert (private.action, private.step) == ("allow", GateStep.POLICY)
     # A group tool and a tool loader still work in the shared run.
     assert (await gate.check(org.claims(), "c2", "web_search", {})).action == "allow"
     assert (await gate.check(org.claims(), "c3", "ToolSearch", {})).action == "allow"
@@ -1356,6 +1380,7 @@ async def test_a_session_approval_does_not_reach_another_session_or_user(
     await ask(gate, org)
     await decide_scope(gate, org)
     other_session = org.claims("secret-run", session_id=str(org.ids["secret"]))
+    await private_bash_asks(gate, org)
     assert (await gate.check(other_session, "c2", "Bash", ARGS)).action == "ask"
     # The grant of the other session is its own rule.
     await ask(gate, org, "c4", run="secret-run")

@@ -144,6 +144,22 @@ async def test_later_runs_reuse_the_frozen_config(engine: AsyncEngine, tenant: T
     assert [f.path for f in config.context_files] == ["AGENTS.md"]
 
 
+async def test_a_session_keeps_the_system_text_that_it_froze(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """A new sama text (M8.5) applies from the next session. A session that froze the old text
+    keeps it, so its prompt prefix and its fingerprint do not change (decision D9)."""
+    first = await claimed(engine, tenant)
+    old = await PromptAssembler(engine, system="The old sama text.")(first)
+    await end(engine, first)
+    second = await claimed(engine, tenant)
+    kept = await PromptAssembler(engine)(second)
+    assert (kept.system, kept.fingerprint()) == ("The old sama text.", old.fingerprint())
+    await end(engine, second)
+    fresh = await PromptAssembler(engine)(await claimed(engine, tenant, "s2"))
+    assert fresh.system == SYSTEM_PROMPT
+
+
 async def test_concurrent_first_runs_store_one_config(engine: AsyncEngine, tenant: Tenant) -> None:
     run = await claimed(engine, tenant)
     configs = await asyncio.gather(
