@@ -740,18 +740,22 @@ connections, and the next send or approval waited for a connection. The change h
 - The size comes from the environment: `SAMA_DB_POOL_SIZE` (default 5), `SAMA_DB_POOL_OVERFLOW`
   (2), `SAMA_DB_POOL_TIMEOUT_S` (30), `SAMA_DB_POOL_RECYCLE_S` (1800).
 
-**Pool size and the pooler limit.** The staging `SAMA_DATABASE_URL` uses the Supabase pooler in
-session mode (port 5432). It gives 15 server connections to one database user, and a 16th
-client gets an error. A rolling deploy starts the new machine before it stops the old one, so
-two processes hold connections at the same time. The queue listener (`QueueWakeup`) takes one
-connection of the pool for ever. The default is therefore 5 + 2 = 7 connections for each process,
-the listener included: 2 x 7 = 14 of 15, and one connection stays free for the release command
-(`alembic upgrade head`) and for a person with `psql`. `deploy/fly.staging.toml` and
-`deploy/fly.production.toml` set these two values. A process has 4 connections for requests,
-the worker, and the gate when two event stream polls (`stream_db_slots` = size / 2) and the
-listener use theirs; the log line above tells when this is too small. To raise the numbers, raise
-the pool size of the Supabase pooler first (Management API or dashboard), then the two variables.
-The sum for two processes must stay at or below the pooler limit.
+**Pool size and the pooler limit.** The `SAMA_DATABASE_URL` of staging and production uses the
+Supabase pooler in session mode (port 5432). Both projects run on the Micro compute
+(`max_connections` 60). Since 2026-11-23 the pooler gives 30 server connections to one database
+user (`default_pool_size` 30, set with the Management API; before, the default was 15), and a
+31st client gets an error. The other 30 connections of Postgres stay free for Supabase Auth, the
+dashboard, and other Supabase services. A rolling deploy starts the new machine before it stops
+the old one, so two processes hold connections at the same time. The queue listener
+(`QueueWakeup`) takes one connection of the pool for ever. `deploy/fly.staging.toml` and
+`deploy/fly.production.toml` therefore set 10 + 4 = 14 connections for each process, the
+listener included: 2 x 14 = 28 of 30, and two connections stay free for the release command
+(`alembic upgrade head`) and for a person with `psql`. The code default stays 5 + 2 for a local
+database. A process has 8 connections for requests, the worker, and the gate when five event
+stream polls (`stream_db_slots` = size / 2) and the listener use theirs; the log line above tells
+when this is too small. To raise the numbers, raise the pool size of the Supabase pooler first
+(Management API or dashboard), then the two variables. The sum for two processes must stay at or
+below the pooler limit.
 
 Only the session pooler and a direct connection are supported. The transaction pooler (port 6543)
 cannot carry `LISTEN` for the queue wake-up, and it does not keep the prepared statements of the
@@ -9227,7 +9231,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_REGION`, `SAMA_REGION_URLS` | No | The home region of the deployment (default `ap-south-1`) and the `region=url` pairs of the other regions (Section 17.3) |
 | `SAMA_STRIPE_SECRET_KEY`, `SAMA_STRIPE_WEBHOOK_SECRET` | No | Billing (Section 17.5). Without both, or when Stripe refuses the key at start, billing is off and the plans add no model quota. |
 | `SAMA_STRIPE_ALLOW_LIVE` | No | `true` accepts a live Stripe key. Without it, a live key turns billing off. |
-| `SAMA_DB_POOL_SIZE`, `SAMA_DB_POOL_OVERFLOW`, `SAMA_DB_POOL_TIMEOUT_S`, `SAMA_DB_POOL_RECYCLE_S`, `SAMA_DB_POOL_PREWARM`, `SAMA_DB_POOL_WARN_MS` | No | The database pool of the process (Section 4.4). Defaults: 5, 2, 30, 1800, 4, 100. Two processes must fit the 15 connections of the Supabase session pooler. |
+| `SAMA_DB_POOL_SIZE`, `SAMA_DB_POOL_OVERFLOW`, `SAMA_DB_POOL_TIMEOUT_S`, `SAMA_DB_POOL_RECYCLE_S`, `SAMA_DB_POOL_PREWARM`, `SAMA_DB_POOL_WARN_MS` | No | The database pool of the process (Section 4.4). Defaults: 5, 2, 30, 1800, 4, 100. Two processes must fit the connections of the Supabase session pooler (30 on staging and production since 2026-11-23; `deploy/fly.*.toml` set 10 and 4). |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first
