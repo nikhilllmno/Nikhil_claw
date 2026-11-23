@@ -41,14 +41,20 @@
 .view {
   display: flex;
   flex: 1;
+  align-items: center;
+  justify-content: center;
   min-height: 0;
+  overflow: hidden;
   background: var(--surface-sunken);
 }
 
+/* The live view has the 16:9 viewport of the cloud browser (1280x720). The box keeps that
+   shape and sits in the middle of the panel, so a narrow or tall panel shows no empty frame. */
 .frameBox {
   display: flex;
-  flex: 1;
-  min-height: 0;
+  width: 100%;
+  max-height: 100%;
+  aspect-ratio: 16 / 9;
 }
 
 .frame {

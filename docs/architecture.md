@@ -6073,14 +6073,17 @@ panel does.
   (for example "Browser: open: booking.com/..."), or for a running `browser_task` the newest step
   of its sub-agent ("Browser task: step 3/15: click e12"). The line has "Take control" and Stop
   (it cancels the open runs, as Esc does).
-- The live view is an `iframe` (`sandbox="allow-same-origin allow-scripts"`, no referrer). While
+- The live view is an `iframe` (`sandbox="allow-same-origin allow-scripts"`, no referrer). It
+  keeps the 16:9 shape of the viewport of the cloud browser (1280x720) and sits in the middle of
+  the panel, so a narrow or tall panel shows no empty frame. While
   the agent has control, the frame is in an `inert` box and takes no pointer events and no
   keyboard focus, so the person only watches.
 - **Take control.** The takeover first stops new browser calls of the run (`control` is
   `pending`, and the frame stays inert), then waits until a call that acts now ends (at most 35
   seconds, `HANDOFF_S`). Only then is `control` `user` and the route answers `204`, so the agent
   sends no more input. When the call does not end in time, the takeover is undone and the route
-  answers `409` ("the agent is in the middle of a browser step; try again in a moment"). The browser calls of the run then wait, without the lock of the session (at
+  answers `409` ("the agent is in the middle of a browser step; try again in a moment"). When the
+  run ended a moment before (`404`), the panel says "The run ended, so its browser closed." The browser calls of the run then wait, without the lock of the session (at
   most 300 seconds each, `CONTROL_WAIT_S`); then the call fails with "the user has control of the
   browser now; wait for the user, or ask the user to click Give back". The idle reaper keeps a
   session that a person controls. The run end, the reaper, and the stop of the process wake a
