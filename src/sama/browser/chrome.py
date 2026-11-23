@@ -239,8 +239,10 @@ ERRORS: Final[Mapping[str, str]] = {
 the page or of Chrome) goes in the untrusted block of ``BrowserError``."""
 
 OFFLINE: Final = (
-    "the sama Chrome extension of this user is offline; ask the user to open Chrome with the "
-    "extension and sign in"
+    "the sama Chrome extension of this user is offline; tell the user in one line to open "
+    "Chrome with the sama extension and sign in (the web app has the download and the steps in "
+    "Settings, Chrome extension), or to set the browser of this session to Cloud; then use the "
+    "cloud target if the task allows it"
 )
 NO_USER: Final = "my_chrome needs a run of a user; this run has no user"
 

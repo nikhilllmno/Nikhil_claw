@@ -39,6 +39,20 @@ export interface ModelControl {
   onChange: (model: string | null) => void;
 }
 
+export interface BrowserChoiceControl {
+  /** The browser of the session: the cloud browser or the Chrome of the person (M8.3). */
+  current: "cloud" | "my_chrome";
+  /** True when the sama Chrome extension of the person is online; `null` while it loads. */
+  connected: boolean | null;
+  /** The state of the extension did not load. */
+  failed?: boolean;
+  editable: boolean;
+  busy?: boolean;
+  /** Called when the menu opens, so that the state of the extension loads. */
+  onOpen: () => void;
+  onChange: (target: "cloud" | "my_chrome") => void;
+}
+
 export interface ImageControl {
   files: readonly File[];
   onAdd: (files: File[]) => void;
@@ -78,6 +92,8 @@ interface Props {
   model?: string | null;
   /** The model menu of the session (like `/model` in Claude Code). */
   models?: ModelControl;
+  /** The browser menu of the session: Cloud or My Chrome (M8.3). */
+  browser?: BrowserChoiceControl;
   /** The images of the next message: paste, drop, or the attach button. */
   images?: ImageControl;
   /** Called when the person focuses the box or types: the session can start its sandbox. */
@@ -106,6 +122,7 @@ export function Composer({
   harness,
   model = null,
   models,
+  browser,
   images,
   onActivity,
 }: Props) {
@@ -387,6 +404,7 @@ export function Composer({
               <span className={styles.model}>{model}</span>
             ) : null}
             {models && harness?.current == null ? <ModelMenu control={models} /> : null}
+            {browser && harness?.current == null ? <BrowserMenu control={browser} /> : null}
           </div>
           <div className={styles.actions}>
             {running ? (
@@ -464,6 +482,73 @@ function Preview({ file }: { file: File }) {
   // A local preview: next/image cannot load a data URL of a file that is not uploaded yet.
   // eslint-disable-next-line @next/next/no-img-element
   return url ? <img src={url} alt={file.name} className={styles.thumbImage} /> : null;
+}
+
+const BROWSERS: readonly { target: "cloud" | "my_chrome"; label: string; hint: string }[] = [
+  { target: "cloud", label: "Cloud", hint: "A browser in the cloud. Good for research in the background." },
+  { target: "my_chrome", label: "My Chrome", hint: "Your own Chrome, with your logins. Needs the sama extension." },
+];
+
+/** The browser of the session (M8.3): the cloud browser, or the Chrome of the person. */
+function BrowserMenu({ control }: { control: BrowserChoiceControl }) {
+  const label = control.current === "my_chrome" ? "My Chrome" : "Cloud";
+  return (
+    <details
+      className={styles.picker}
+      data-menu="browser"
+      onToggle={(event) => {
+        if (event.currentTarget.open) control.onOpen();
+      }}
+    >
+      <summary className={styles.pill} aria-label={`Browser: ${label}. Change the browser`}>
+        {control.busy ? <span className="spinner" aria-hidden="true" /> : null}
+        <span className={styles.modelName}>Browser: {label}</span>
+      </summary>
+      <div className={styles.pickerList} role="menu">
+        {!control.editable ? (
+          <p className={styles.optionHint}>Only the owner of the session or an admin can change the browser.</p>
+        ) : (
+          BROWSERS.map((option) => (
+            <button
+              key={option.target}
+              type="button"
+              role="menuitemradio"
+              aria-checked={option.target === control.current}
+              className={styles.pickerItem}
+              disabled={control.busy}
+              onClick={(event) => {
+                event.currentTarget.closest("details")?.removeAttribute("open");
+                if (option.target !== control.current) control.onChange(option.target);
+              }}
+            >
+              <span className={styles.optionLabel}>{option.label}</span>
+              <span className={styles.optionHint}>{option.hint}</span>
+            </button>
+          ))
+        )}
+        <div className={styles.menuNote}>
+          <p className={styles.optionHint}>
+            {control.failed
+              ? "Could not check your Chrome extension."
+              : control.connected === null
+              ? "Looking for your Chrome extension…"
+              : control.connected
+                ? "Your Chrome extension is connected."
+                : "Your Chrome extension is not connected."}
+          </p>
+          {control.failed ? (
+            <button type="button" className="btn btn-small" onClick={control.onOpen}>
+              Try again
+            </button>
+          ) : control.connected === false ? (
+            <a className="btn btn-small" href="/settings#chrome-extension">
+              Set up the extension
+            </a>
+          ) : null}
+        </div>
+      </div>
+    </details>
+  );
 }
 
 /** The model of the session, as `/model` in Claude Code. */

@@ -45,6 +45,7 @@ from sama.browser.contexts import PostgresContextStore
 from sama.browser.guard import UrlGuard
 from sama.browser.logins import BrowserLogins
 from sama.browser.policy import PolicyCache, PolicyStore
+from sama.browser.preference import SessionBrowserChoice
 from sama.browser.service import BrowserService
 from sama.browser.target import CLOUD, BrowserTarget
 from sama.browser.task import BrowserTaskRunner, ProxyModelClient
@@ -678,6 +679,8 @@ def build(
             web_origins=settings.web_origins,
             signup=settings.signup,
             extension_ids=settings.extension_ids,
+            public_url=settings.public_url,
+            extension_zip=settings.extension_zip,
             # The polls of the event streams use at most half of the pool (Section 4.4).
             stream_db_slots=max(1, settings.db_pool.size // 2),
         ),
@@ -861,6 +864,7 @@ def _browser_service(
     return BrowserService(
         targets,
         UrlGuard(),
+        preference=SessionBrowserChoice(engine),
         policies=PolicyCache(PolicyStore(engine)),
         logins=BrowserLogins(engine, vault) if vault is not None else None,
     )

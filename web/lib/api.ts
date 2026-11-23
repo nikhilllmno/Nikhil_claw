@@ -343,6 +343,8 @@ export interface SessionOut {
   default_model?: string | null;
   /** True when a person chose a model that is not the default one. */
   model_is_override?: boolean;
+  /** The browser that a person chose for the session (M8.3), or `null` for the default. */
+  browser_target?: BrowserTarget | null;
 }
 
 /** The answer of `GET /sessions/{id}/models` (M8.2): what a model picker shows. */
@@ -1986,9 +1988,21 @@ export interface WorkflowValidation {
   next_fire_at: string | null;
 }
 
+export type BrowserTarget = "cloud" | "my_chrome";
+
+/** The state of the Chrome extension of the user (M8.3). */
+export interface ChromeState {
+  connected: boolean;
+  connections: number;
+  /** True when the API has a build of the extension to download. */
+  download: boolean;
+}
+
 export interface SessionPatch {
   title?: string;
   status?: "active" | "archived";
+  /** The browser of the session (M8.3), or `null` for the default. */
+  browser?: BrowserTarget | null;
   /** A model id of the runtime of the session, or `null` for the model of the profile (M8.2). */
   model?: string | null;
 }
@@ -2886,6 +2900,18 @@ export class ApiClient {
    */
   setSessionModel = (sessionId: string, model: string | null) =>
     this.updateSession(sessionId, { model });
+  setSessionBrowser = (sessionId: string, browser: BrowserTarget | null) =>
+    this.updateSession(sessionId, { browser });
+  chromeState = () => this.json<ChromeState>("/me/chrome");
+  /** The build of the Chrome extension for this API, as a zip (M8.3). */
+  downloadExtension = async () => {
+    const response = await this.raw("/extension/download", {});
+    if (!response.ok) {
+      const data: unknown = await response.json().catch(() => null);
+      throw new ApiError(response.status, errorMessage(response.status, data));
+    }
+    return response.blob();
+  };
   checkIntegration = (orgId: string, kind: ChatChannel) =>
     this.json<IntegrationCheck>(
       `/orgs/${encodeURIComponent(orgId)}/integrations/${encodeURIComponent(kind)}/check`,

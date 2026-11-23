@@ -148,7 +148,9 @@ def _targets_text(service: BrowserService) -> str:
         return f" {lines}"
     return (
         f" target: {' or '.join(names)}. Without it, the target of the last browser call of "
-        f"this run, else {names[0]}. {lines}"
+        f"this run, else the browser that the user chose for this session (Cloud or My Chrome), "
+        f"else {names[0]}. Use my_chrome when the user says 'in my browser' or 'open a tab', or "
+        f"for a site where the user is logged in; use cloud for background research. {lines}"
     )
 
 

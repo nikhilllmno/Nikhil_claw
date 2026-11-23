@@ -38,6 +38,10 @@ DEFAULT_SANDBOX_HOSTS: Final = (
 public clones, and the Python and npm package registries for test dependencies."""
 
 
+EXTENSION_ZIP: Final = "/opt/sama/extension/sama-extension.zip"
+"""Where the image keeps the build of the Chrome extension (``deploy/Dockerfile``, M8.3)."""
+
+
 class SettingsError(ValueError):
     """A variable is missing or not valid. The message names the variable, never its value."""
 
@@ -218,6 +222,9 @@ class ControlPlaneSettings:
     """The origins of the web app that may call the API from a browser (``SAMA_WEB_ORIGINS``)."""
     extension_ids: tuple[str, ...] = ()
     """The Chrome extensions that may open the extension channel (``SAMA_EXTENSION_IDS``)."""
+    extension_zip: str | None = EXTENSION_ZIP
+    """The build of the Chrome extension in the image (``SAMA_EXTENSION_ZIP``, M8.3). The web app
+    offers it as a download. Without the file, the download answers ``404``."""
     github: GitHubAppConfig | None = None
     """The sama GitHub App (``SAMA_GITHUB_*``). Without it, the git proxy and the pull request
     tools are off."""
@@ -394,6 +401,7 @@ class ControlPlaneSettings:
             vault_key=vault_key,
             web_origins=web_origins,
             extension_ids=extension_ids,
+            extension_zip=env.get("SAMA_EXTENSION_ZIP", EXTENSION_ZIP).strip() or None,
             sendgrid_key=_secret(env, "SAMA_SENDGRID_API_KEY"),
             email_from=env.get("SAMA_EMAIL_FROM", "").strip() or None,
             self_repo=_self_repo(env),

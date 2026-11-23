@@ -60,6 +60,7 @@ async def test_the_owner_renames_a_private_session(
         "lineage",
         "parent_session_id",
         "coding_agent",
+        "browser_target",
         "can_manage",
         "runtime",
         "model",

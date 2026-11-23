@@ -70,7 +70,7 @@ import { QuestionCard } from "./QuestionCard";
 import { CodePanel, type CodeTab } from "./CodePanel";
 import { BrowserPanel } from "./BrowserPanel";
 import { browserStep, POLL_MS as BROWSER_POLL_MS } from "@/lib/liveBrowser";
-import type { LiveBrowser } from "@/lib/api";
+import type { BrowserTarget, LiveBrowser } from "@/lib/api";
 import { PlanCard } from "./PlanPanel";
 import { useMedia } from "./useMedia";
 import { LiveRun, TodoList, ToolTrail } from "./ToolGroup";
@@ -246,6 +246,41 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setSendError(errorText(e, "The model did not change."));
     } finally {
       setModelBusy(false);
+    }
+  };
+
+  // The browser of the session (M8.3): Cloud or My Chrome, and the state of the extension.
+  const [chromeConnected, setChromeConnected] = useState<boolean | null>(null);
+  const [chromeFailed, setChromeFailed] = useState(false);
+  const [browserChoiceBusy, setBrowserChoiceBusy] = useState(false);
+  const loadChrome = useCallback(async () => {
+    setChromeFailed(false);
+    try {
+      setChromeConnected((await api.chromeState()).connected);
+    } catch {
+      setChromeFailed(true);
+    }
+  }, [api]);
+  const changeBrowser = async (target: BrowserTarget) => {
+    setBrowserChoiceBusy(true);
+    setSendError(null);
+    try {
+      const changed = await api.setSessionBrowser(sessionId, target);
+      setDetail((current) => (current === null ? current : { ...current, browser_target: changed.browser_target ?? target }));
+      void loadChrome();
+      const which =
+        target === "my_chrome"
+          ? "New runs in this session use your own Chrome. Keep Chrome open with the sama extension."
+          : "New runs in this session use the cloud browser.";
+      setNotice(
+        openRunIds(liveRef.current).length > 0
+          ? `${which} The run that works now keeps its browser.`
+          : which,
+      );
+    } catch (e) {
+      setSendError(errorText(e, "The browser did not change."));
+    } finally {
+      setBrowserChoiceBusy(false);
     }
   };
 
@@ -1170,6 +1205,15 @@ export function Chat({ sessionId }: { sessionId: string }) {
                 }
               : undefined
           }
+          browser={{
+            current: detail.browser_target === "my_chrome" ? "my_chrome" : "cloud",
+            connected: chromeConnected,
+            failed: chromeFailed,
+            editable: detail.can_manage ?? false,
+            busy: browserChoiceBusy,
+            onOpen: () => void loadChrome(),
+            onChange: (target) => void changeBrowser(target),
+          }}
           onActivity={warm}
           images={{
             files: images,

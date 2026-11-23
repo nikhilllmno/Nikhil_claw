@@ -640,6 +640,10 @@ class Session(Base):
             "model_override IS NULL OR char_length(model_override) BETWEEN 1 AND 100",
             name="model_override",
         ),
+        CheckConstraint(
+            "browser_target IS NULL OR browser_target IN ('cloud', 'my_chrome')",
+            name="browser_target",
+        ),
         Index(None, "org_id", "workspace_id"),
         Index(None, "owner_user_id"),
         Index(None, "org_id", "worker_bot_id", postgresql_where=text("worker_bot_id IS NOT NULL")),
@@ -692,6 +696,9 @@ class Session(Base):
     plan_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     """Plan mode of coding mode (Section 15.5, M7.9). While it is on, the gate refuses the
     tools that change files, and the agent proposes a plan with ``plan_propose``."""
+    browser_target: Mapped[str | None] = mapped_column(Text)
+    """The browser that a person chose for the session (M8.3): ``cloud`` or ``my_chrome``. A
+    browser call without a target uses it. Null: the default target of the process."""
     model_override: Mapped[str | None] = mapped_column(Text)
     """The model that a person chose for the session (docs/architecture.md, Section 5.4, M8.2).
     The assembler puts it in the config of each run. It is not in the frozen ``run_config``.
