@@ -6018,8 +6018,8 @@ view of Codex.
 
 | Route | Who | Answer |
 |---|---|---|
-| `GET /sessions/{id}/browser` | a member who can see the session (`session_access`) | `{live: null}`, or `{live: {run_id, target, control, view_url, page_url, title, tabs, page_id}}` for the newest open run of the session that has a browser session in this process. `view_url` is `null` for the `my_chrome` target. |
-| `POST /sessions/{id}/browser/control` | the same | `{run_id, action: take or give_back}`. `204`, or `404` when the run is not an open run of the session or has no browser session. |
+| `GET /sessions/{id}/browser` | a member who can see the session (`session_access`) | `{live: null}`, or `{live: {run_id, target, control, view_url, page_url, title, tabs, page_id}}` (`control` is `agent`, `pending`, or `user`) for the newest open run of the session that has a browser session in this process. `view_url` is `null` for the `my_chrome` target. |
+| `POST /sessions/{id}/browser/control` | the same | `{run_id, action: take or give_back}`. `204`, `409` when a takeover cannot finish, or `404` when the run is not an open run of the session or has no browser session. |
 
 **Panel.** While a run of the session is open, the chat asks for the live browser 3 seconds
 after each answer (one request at a time; a change of control makes older answers void). When a run first has a browser, the panel opens (it closes the code panel; the two
@@ -6037,9 +6037,11 @@ panel does.
 - The live view is an `iframe` (`sandbox="allow-same-origin allow-scripts"`, no referrer). While
   the agent has control, the frame is in an `inert` box and takes no pointer events and no
   keyboard focus, so the person only watches.
-- **Take control.** The takeover first stops new browser calls of the run, then waits until a
-  call that acts now ends (at most 35 seconds, `HANDOFF_S`), so the agent sends no more input when
-  the route answers. The browser calls of the run then wait, without the lock of the session (at
+- **Take control.** The takeover first stops new browser calls of the run (`control` is
+  `pending`, and the frame stays inert), then waits until a call that acts now ends (at most 35
+  seconds, `HANDOFF_S`). Only then is `control` `user` and the route answers `204`, so the agent
+  sends no more input. When the call does not end in time, the takeover is undone and the route
+  answers `409` ("the agent is in the middle of a browser step; try again in a moment"). The browser calls of the run then wait, without the lock of the session (at
   most 300 seconds each, `CONTROL_WAIT_S`); then the call fails with "the user has control of the
   browser now; wait for the user, or ask the user to click Give back". The idle reaper keeps a
   session that a person controls. The run end, the reaper, and the stop of the process wake a

@@ -62,14 +62,14 @@ async def test_the_agent_waits_while_the_user_has_control(
     browser, target = service
     claims = make_claims("run-1")
     await browser.open(claims, "https://shop.example/")
-    assert await browser.set_control(claims.org_id, "run-1", user=True)
+    assert await browser.set_control(claims.org_id, "run-1", user=True) == "done"
     state = await browser.live_state(claims.org_id, "run-1")
     assert state is not None
     assert state.user_control
     waiting = asyncio.create_task(browser.snapshot(claims))
     await asyncio.sleep(0.05)
     assert not waiting.done()
-    assert await browser.set_control(claims.org_id, "run-1", user=False)
+    assert await browser.set_control(claims.org_id, "run-1", user=False) == "done"
     assert "[ref=e1]" in await waiting
     # One snapshot of browser_open, one after the give back.
     assert target.sessions[0].calls.count("snapshot") == 2
@@ -92,7 +92,7 @@ async def test_a_call_fails_when_the_user_keeps_control(
 
 async def test_control_needs_an_open_session(service: tuple[BrowserService, FakeTarget]) -> None:
     browser, _target = service
-    assert not await browser.set_control("org-1", "run-1", user=True)
+    assert await browser.set_control("org-1", "run-1", user=True) == "missing"
 
 
 def test_a_bot_check_page_gets_a_fixed_note() -> None:
@@ -136,10 +136,37 @@ async def test_a_takeover_waits_for_the_call_that_acts_now() -> None:
     taking = asyncio.create_task(browser.set_control(claims.org_id, "run-1", user=True))
     await asyncio.sleep(0.05)
     assert not taking.done()
+    # While the takeover waits, the person does not have control yet.
+    pending = await browser.live_state(claims.org_id, "run-1")
+    assert pending is not None
+    assert (pending.control, pending.user_control) == ("pending", False)
     gate.set()
     await acting
-    assert await taking
+    assert await taking == "done"
+    state = await browser.live_state(claims.org_id, "run-1")
+    assert state is not None
+    assert state.control == "user"
     target.sessions[0].gate = None
     with pytest.raises(BrowserError, match="the user has control"):
         await browser.snapshot(claims)
+    await browser.aclose()
+
+
+async def test_a_takeover_that_cannot_finish_is_undone() -> None:
+    """Review round 2: when the call that acts does not end in time, the takeover fails and
+    the agent keeps control."""
+    target = FakeTarget(session_class=LiveSession)
+    browser = BrowserService(target, AllowAll(), idle_s=60, handoff_s=0.05)
+    claims = make_claims("run-1")
+    await browser.open(claims, "https://shop.example/")
+    gate = asyncio.Event()
+    target.sessions[0].gate = gate
+    acting = asyncio.create_task(browser.snapshot(claims))
+    await asyncio.sleep(0.02)
+    assert await browser.set_control(claims.org_id, "run-1", user=True) == "busy"
+    state = await browser.live_state(claims.org_id, "run-1")
+    assert state is not None
+    assert state.control == "agent"
+    gate.set()
+    await acting
     await browser.aclose()

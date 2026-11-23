@@ -3732,10 +3732,16 @@ class SamaApi:
             runs = await open_runs(connection, access.org_id, session_id)
         if self._live_browser is None or body.run_id not in runs:
             raise _not_found("the run has no open browser")
-        if not await self._live_browser.set_control(
+        result = await self._live_browser.set_control(
             str(access.org_id), str(body.run_id), user=body.action == "take"
-        ):
+        )
+        if result == "missing":
             raise _not_found("the run has no open browser")
+        if result == "busy":
+            raise HTTPException(
+                status_code=409,
+                detail="the agent is in the middle of a browser step; try again in a moment",
+            )
 
     async def _questions(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
         async with as_user(self._engine, principal.auth_user_id) as connection:

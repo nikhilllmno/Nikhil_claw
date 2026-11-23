@@ -52,7 +52,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, Final
+from typing import Any, Final, Literal
 from urllib.parse import quote, quote_plus
 
 from sama.browser.guard import BLANK, OrgGuard
@@ -107,6 +107,8 @@ NO_LOGINS: Final = (
     "There are no saved logins for you. An org admin adds the logins of the org, and each user "
     "adds personal logins, in the web app (Settings, Browser)."
 )
+Control = Literal["agent", "pending", "user"]
+ControlResult = Literal["done", "busy", "missing"]
 LIVE_VIEW_TTL_S: Final = 600
 """The live view URL of the web app ends after 10 minutes. The web app asks for a new one
 before that."""
@@ -137,14 +139,23 @@ class _Live:
     used: float = field(default_factory=time.monotonic)
     ended: bool = False
     agent_turn: asyncio.Event = field(default_factory=asyncio.Event)
-    """Set while the agent may act. Clear while a person has control (M8.3)."""
+    """Set while the agent may act. Clear while a person has control or takes it (M8.3)."""
+    handing_over: bool = False
+    """A takeover waits for the call that acts now. The person does not have control yet."""
 
     def __post_init__(self) -> None:
         self.agent_turn.set()
 
     @property
     def user_control(self) -> bool:
+        """True while the agent may not act: a person has control, or a takeover runs."""
         return not self.agent_turn.is_set()
+
+    @property
+    def control(self) -> Control:
+        if self.agent_turn.is_set():
+            return "agent"
+        return "pending" if self.handing_over else "user"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +166,12 @@ class LiveState:
     target: TargetName
     view: LiveView | None
     """The live view, or ``None`` when the target has none (``my_chrome``) or it failed."""
-    user_control: bool
+    control: Control
+    """``agent``, ``pending`` (a takeover waits for the call that acts now), or ``user``."""
+
+    @property
+    def user_control(self) -> bool:
+        return self.control == "user"
 
 
 class BrowserService:
@@ -173,9 +189,11 @@ class BrowserService:
         max_sessions: int = MAX_SESSIONS,
         clock: Callable[[], float] = time.monotonic,
         control_wait_s: float = CONTROL_WAIT_S,
+        handoff_s: float = HANDOFF_S,
     ) -> None:
         targets = [target] if not isinstance(target, Sequence) else list(target)
         self._control_wait_s = control_wait_s
+        self._handoff_s = handoff_s
         if not targets:
             raise ValueError("the browser service needs a target")
         self.targets: dict[TargetName, BrowserTarget] = {item.name: item for item in targets}
@@ -684,34 +702,47 @@ class BrowserService:
                     run_id,
                     type(error).__name__,
                 )
-        return LiveState(run_id=run_id, target=name, view=view, user_control=live.user_control)
+        return LiveState(run_id=run_id, target=name, view=view, control=live.control)
 
-    async def set_control(self, org_id: str, run_id: str, *, user: bool) -> bool:
+    async def set_control(self, org_id: str, run_id: str, *, user: bool) -> ControlResult:
         """Gives the browser of the run to a person (``user=True``) or back to the agent.
 
-        A takeover first stops new browser calls of the run, then waits until a call that
-        acts now ends (at most ``HANDOFF_S``), so the agent sends no more input when this
-        returns. While a person has control, the browser calls of the run wait (at most
-        ``control_wait_s`` each), and the idle reaper keeps the session. False when the run has
-        no open session."""
+        A takeover first stops new browser calls of the run (``pending``), then waits until a
+        call that acts now ends (at most ``handoff_s``). Only then does the person have control
+        (``done``), so the agent sends no more input. When the call does not end in time, the
+        takeover is undone (``busy``). While a person has control, the browser calls of the run
+        wait (at most ``control_wait_s`` each), and the idle reaper keeps the session.
+        ``missing`` when the run has no open session."""
         lives = [
             live
             for key, live in self._live.items()
             if key[0] == org_id and key[1] == run_id and not live.ended and live.session is not None
         ]
+        if not lives:
+            return "missing"
         for live in lives:
             live.used = self._clock()
-            if user:
-                live.agent_turn.clear()
-            else:
-                live.agent_turn.set()
-        if user:
+        if not user:
             for live in lives:
-                with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(HANDOFF_S):
-                        await live.lock.acquire()
-                        live.lock.release()
-        return bool(lives)
+                live.handing_over = False
+                live.agent_turn.set()
+            return "done"
+        for live in lives:
+            live.handing_over = True
+            live.agent_turn.clear()
+        try:
+            for live in lives:
+                async with asyncio.timeout(self._handoff_s):
+                    await live.lock.acquire()
+                live.lock.release()
+        except TimeoutError:
+            for live in lives:
+                live.handing_over = False
+                live.agent_turn.set()
+            return "busy"
+        for live in lives:
+            live.handing_over = False
+        return "done"
 
     def _release(self, live: _Live) -> None:
         live.used = self._clock()

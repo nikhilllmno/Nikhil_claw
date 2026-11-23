@@ -60,7 +60,7 @@ def public(state: LiveState) -> dict[str, Any]:
     return {
         "run_id": state.run_id,
         "target": state.target,
-        "control": "user" if state.user_control else "agent",
+        "control": state.control,
         "view_url": None if view is None else view.view_url,
         "page_url": None if view is None else view.page_url,
         "title": None if view is None else view.title,

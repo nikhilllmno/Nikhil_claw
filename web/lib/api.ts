@@ -713,7 +713,8 @@ export interface ClarifyQuestion {
 export interface LiveBrowser {
   run_id: string;
   target: "cloud" | "my_chrome";
-  control: "agent" | "user";
+  /** `pending` while a takeover waits for the step that the agent does now. */
+  control: "agent" | "pending" | "user";
   /** A short-lived live view URL of the active tab, or `null` (no live view for the target). */
   view_url: string | null;
   page_url: string | null;

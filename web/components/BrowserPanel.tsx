@@ -94,7 +94,12 @@ export function BrowserPanel({
 
       {live !== null ? (
         <div className={`${styles.bar} ${userControl ? styles.barUser : ""}`} role="status">
-          {userControl ? (
+          {live.control === "pending" ? (
+            <span className={styles.barText}>
+              <span className="spinner" aria-hidden="true" />
+              Taking control: the agent finishes its step.
+            </span>
+          ) : userControl ? (
             <span className={styles.barText}>
               You have control. The agent waits. Close any live view tab before you give back.
             </span>
@@ -111,7 +116,7 @@ export function BrowserPanel({
                   Give back
                 </button>
               ) : (
-                <button type="button" className="btn btn-small" disabled={busy || !running} onClick={() => onControl("take")}>
+                <button type="button" className="btn btn-small" disabled={busy || !running || live.control === "pending"} onClick={() => onControl("take")}>
                   Take control
                 </button>
               )
