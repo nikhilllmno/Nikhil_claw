@@ -6684,7 +6684,10 @@ Chrome" next to the model menu. The choice is `sessions.browser_target` (migrati
 
 - `BrowserService.resolve` picks the target of a call: the named target, else the target of the
   last browser call of the run, else the choice of the session (`SessionBrowserChoice`, which
-  keeps each answer for 10 seconds), else the default target. A failed read uses the default.
+  keeps each answer for 10 seconds), else the default target. A failed read uses the default. A
+  choice that the process does not have (for example `cloud` without a Browserbase key) gives the
+  error of an unknown target; it never falls back to the Chrome of the user. A run that already
+  used a browser keeps it, so a change of the choice applies to the next runs (the chat says so).
 - The descriptions of the browser tools tell the agent the order, and to use `my_chrome` when the
   user says "in my browser" or "open a tab", or for a site where the user is logged in, and
   `cloud` for background research.

@@ -251,12 +251,14 @@ export function Chat({ sessionId }: { sessionId: string }) {
 
   // The browser of the session (M8.3): Cloud or My Chrome, and the state of the extension.
   const [chromeConnected, setChromeConnected] = useState<boolean | null>(null);
+  const [chromeFailed, setChromeFailed] = useState(false);
   const [browserChoiceBusy, setBrowserChoiceBusy] = useState(false);
   const loadChrome = useCallback(async () => {
+    setChromeFailed(false);
     try {
       setChromeConnected((await api.chromeState()).connected);
     } catch {
-      setChromeConnected(null);
+      setChromeFailed(true);
     }
   }, [api]);
   const changeBrowser = async (target: BrowserTarget) => {
@@ -266,10 +268,14 @@ export function Chat({ sessionId }: { sessionId: string }) {
       const changed = await api.setSessionBrowser(sessionId, target);
       setDetail((current) => (current === null ? current : { ...current, browser_target: changed.browser_target ?? target }));
       void loadChrome();
-      setNotice(
+      const which =
         target === "my_chrome"
-          ? "The agent uses your own Chrome in this session. Keep Chrome open with the sama extension."
-          : "The agent uses the cloud browser in this session.",
+          ? "New runs in this session use your own Chrome. Keep Chrome open with the sama extension."
+          : "New runs in this session use the cloud browser.";
+      setNotice(
+        openRunIds(liveRef.current).length > 0
+          ? `${which} The run that works now keeps its browser.`
+          : which,
       );
     } catch (e) {
       setSendError(errorText(e, "The browser did not change."));
@@ -1202,6 +1208,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
           browser={{
             current: detail.browser_target === "my_chrome" ? "my_chrome" : "cloud",
             connected: chromeConnected,
+            failed: chromeFailed,
             editable: detail.can_manage ?? false,
             busy: browserChoiceBusy,
             onOpen: () => void loadChrome(),

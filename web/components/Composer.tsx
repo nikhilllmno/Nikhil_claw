@@ -44,6 +44,8 @@ export interface BrowserChoiceControl {
   current: "cloud" | "my_chrome";
   /** True when the sama Chrome extension of the person is online; `null` while it loads. */
   connected: boolean | null;
+  /** The state of the extension did not load. */
+  failed?: boolean;
   editable: boolean;
   busy?: boolean;
   /** Called when the menu opens, so that the state of the extension loads. */
@@ -526,13 +528,19 @@ function BrowserMenu({ control }: { control: BrowserChoiceControl }) {
         )}
         <div className={styles.menuNote}>
           <p className={styles.optionHint}>
-            {control.connected === null
+            {control.failed
+              ? "Could not check your Chrome extension."
+              : control.connected === null
               ? "Looking for your Chrome extension…"
               : control.connected
                 ? "Your Chrome extension is connected."
                 : "Your Chrome extension is not connected."}
           </p>
-          {control.connected === false ? (
+          {control.failed ? (
+            <button type="button" className="btn btn-small" onClick={control.onOpen}>
+              Try again
+            </button>
+          ) : control.connected === false ? (
             <a className="btn btn-small" href="/settings#chrome-extension">
               Set up the extension
             </a>

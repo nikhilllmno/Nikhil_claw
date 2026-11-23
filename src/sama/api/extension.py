@@ -20,6 +20,7 @@ PLACEHOLDER_API_URL: Final = "https://sama-api.invalid"
 REWRITTEN: Final = (".js", ".json", ".html")
 """The files of the build that can hold the address."""
 MAX_ZIP_BYTES: Final = 20_000_000
+MAX_UNZIPPED_BYTES: Final = 50_000_000
 DOWNLOAD_NAME: Final = "sama-extension.zip"
 
 
@@ -43,15 +44,27 @@ def build_for(path: str | None, api_url: str | None) -> bytes:
     if len(data) > MAX_ZIP_BYTES:
         raise ExtensionError("the extension build is too large")
     origin = api_url.rstrip("/")
+    try:
+        return _rewrite(data, origin)
+    except (zipfile.BadZipFile, ValueError, KeyError) as error:
+        raise ExtensionError("the extension build is not valid") from error
+
+
+def _rewrite(data: bytes, origin: str) -> bytes:
     out = io.BytesIO()
+    total = 0
     with (
         zipfile.ZipFile(io.BytesIO(data)) as source,
         zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target,
     ):
         for info in source.infolist():
             name = info.filename
-            if name.startswith("/") or ".." in Path(name).parts:
+            parts = Path(name.replace("\\", "/")).parts
+            if name.startswith(("/", "\\")) or ".." in parts or ":" in name:
                 raise ExtensionError("the extension build is not valid")
+            total += info.file_size
+            if total > MAX_UNZIPPED_BYTES:
+                raise ExtensionError("the extension build is too large")
             content = source.read(info)
             if name.endswith(REWRITTEN):
                 content = content.replace(PLACEHOLDER_API_URL.encode(), origin.encode())

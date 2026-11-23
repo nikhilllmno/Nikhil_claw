@@ -239,8 +239,9 @@ class BrowserService:
                         claims.run_id,
                         type(error).__name__,
                     )
-            if chosen in self.targets:
-                target = chosen
+            # A choice that this process does not have gives the error of ``target_of``: a
+            # cloud choice must never fall back to the Chrome of the user.
+            target = chosen
         return self.target_of(claims, target)
 
     def target_of(self, claims: RunTokenClaims, target: TargetName | None) -> TargetName:

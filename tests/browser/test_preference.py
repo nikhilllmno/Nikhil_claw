@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.browser.preference import SessionBrowserChoice
 from sama.browser.service import BrowserService
-from sama.browser.target import CLOUD, MY_CHROME, TargetName
+from sama.browser.target import CLOUD, MY_CHROME, BrowserError, TargetName
 from sama.db.models import Session
 from sama.tenancy.run_token import RunTokenClaims
 from tests.browser.fakes import AllowAll, FakeTarget
@@ -82,3 +83,18 @@ async def test_the_store_reads_the_column_of_the_session(
     assert await choice(claims) == MY_CHROME
     choice.forget(claims.org_id, claims.session_id)
     assert await choice(claims) == MY_CHROME
+
+
+async def test_a_cloud_choice_never_falls_back_to_the_chrome_of_the_user() -> None:
+    """Review: without the cloud target, a cloud choice gives the error of the target, not the
+    default target (``my_chrome``)."""
+
+    async def cloud(claims: RunTokenClaims) -> TargetName | None:
+        return CLOUD
+
+    chrome = ChromeFake()
+    browser = BrowserService(chrome, AllowAll(), preference=cloud)
+    with pytest.raises(BrowserError, match="not available here"):
+        await browser.open(make_claims("run-1"), "https://shop.example/")
+    assert chrome.sessions == []
+    await browser.aclose()
