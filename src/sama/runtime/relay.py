@@ -12,7 +12,7 @@ the run that is active now and forwards the call to the model proxy or to the to
 over one pool of connections that stays open.
 
 - ``/anthropic/...`` and ``/openai/...`` go to the same path of the model proxy.
-- ``/mcp/<name>`` goes to the URL that ``set_mcp`` registered for the server ``<name>``.
+- ``/mcp/<name>`` goes to the URL that ``set_routes`` registered for the server ``<name>``.
 - Without a token (no run is active), every call gets ``401``. ``set_token`` and
   ``clear_token`` are the only places where a token enters or leaves the relay.
 
@@ -20,10 +20,13 @@ The relay also writes the token to a private file and makes a shell prefix scrip
 runs each shell command of the agent through the prefix (``CLAUDE_CODE_SHELL_PREFIX``). The
 script reads the file and sets ``SAMA_RUN_TOKEN`` for that command. This keeps the git
 credential helper of a proxy clone working (Section 15.5), because the environment of a kept
-CLI cannot change.
+CLI cannot change. The file is for one run: it has a new random name for each run, a pointer
+file names it, and both are deleted when the run ends, so a reader that is late gets nothing.
 
 The relay is not a new trust boundary. A process in the sandbox could already read the token
-of the run from the environment of the CLI. The local secret keeps other local users out.
+of the run from the environment of the CLI. The local secret keeps other local users out. A
+process that a run left behind must not reach the relay in a later run: the runner kills it
+before the next token is active (``sama.runtime.fence``).
 """
 
 from __future__ import annotations
@@ -54,6 +57,9 @@ SHELL_PREFIX_ENV: Final = "CLAUDE_CODE_SHELL_PREFIX"
 RUN_TOKEN_ENV: Final = "SAMA_RUN_TOKEN"  # noqa: S105 -- the name of a variable
 MAX_BODY_BYTES: Final = 64 * 1024 * 1024
 """The largest request body that the relay forwards. The model proxy refuses more than 32 MB."""
+MAX_BUFFERED_BYTES: Final = 192 * 1024 * 1024
+"""The most bytes of request bodies that the relay holds at one time, for all calls. A call that
+would pass it gets ``503``."""
 KEEPALIVE_EXPIRY_S: Final = 60.0
 """An idle upstream connection that is older than this is not used again. A sandbox that
 paused and resumed has dead connections, and a new connection costs less than a failed call."""
@@ -91,13 +97,16 @@ class TokenRelay:
         self.secret = secrets.token_urlsafe(24)
         """The only credential that the kept CLI and the kept MCP clients hold."""
         self._token: str | None = None
-        self._mcp: dict[str, str] = {}
+        self._routes: dict[str, str] = {}
+        self._buffered = 0
+        self._epoch: str | None = None
         self._client: httpx.AsyncClient | None = None
         self._server: _QuietServer | None = None
         self._task: asyncio.Task[None] | None = None
         self._sock: socket.socket | None = None
         self._folder: str | None = None
         self.url = ""
+        self.app: Starlette | None = None
         """The root URL of the relay, for example ``http://127.0.0.1:41233``."""
 
     # -- life ------------------------------------------------------------------------------
@@ -117,6 +126,7 @@ class TokenRelay:
             follow_redirects=False,
         )
         app = Starlette(routes=[Route("/{path:path}", self._handle, methods=_METHODS)])
+        self.app = app
         config = uvicorn.Config(
             app, log_level="warning", access_log=False, lifespan="off", ws="none", interface="asgi3"
         )
@@ -155,27 +165,46 @@ class TokenRelay:
         return self._token is not None
 
     def set_token(self, token: str) -> None:
-        """Gives the relay the token of the run that starts now."""
+        """Gives the relay the token of the run that starts now. The file of the token is for
+        this run only: a new name, and a pointer file that names it."""
         self._token = token
         if self._folder is not None:
-            path = self._token_path()
-            temporary = f"{path}.new"
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(token)
-            os.replace(temporary, path)
+            self._remove_files()
+            self._epoch = secrets.token_hex(8)
+            name = f"token.{self._epoch}"
+            self._write(os.path.join(self._folder, name), token)
+            # The pointer comes last, so a reader never sees a name without its file.
+            self._write(self._pointer_path(), name)
 
     def clear_token(self) -> None:
-        """Takes the token away when the run ends. The next call gets ``401``."""
+        """Takes the token away when the run ends. The next call gets ``401``, and the files
+        are gone."""
         self._token = None
         if self._folder is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(self._token_path())
+            self._remove_files()
 
-    def set_mcp(self, servers: Mapping[str, str]) -> None:
-        """Registers the upstream URL of each server by name. A name that is registered again
-        gets the new URL. The relay sends the token only to a URL that its runner registered."""
-        self._mcp.update(servers)
+    def _write(self, path: str, text: str) -> None:
+        temporary = f"{path}.new"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+
+    def _remove_files(self) -> None:
+        if self._folder is None:
+            return
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self._pointer_path())
+        if self._epoch is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(self._folder, f"token.{self._epoch}"))
+            self._epoch = None
+
+    def set_routes(self, routes: Mapping[str, str]) -> None:
+        """Replaces all routes: the upstream URL of each server by name. A name that is not in
+        ``routes`` gets ``404`` from now on. The relay sends the token only to a URL that its
+        runner registered for the job that runs now."""
+        self._routes = dict(routes)
 
     def mcp_url(self, name: str) -> str:
         return f"{self.url}/mcp/{name}"
@@ -194,18 +223,17 @@ class TokenRelay:
         assert self._folder is not None  # noqa: S101 -- only after start
         return os.path.join(self._folder, "shell.sh")
 
-    def _token_path(self) -> str:
+    def _pointer_path(self) -> str:
         assert self._folder is not None  # noqa: S101 -- only after start
-        return os.path.join(self._folder, "token")
+        return os.path.join(self._folder, "current")
 
     def _write_prefix(self) -> None:
-        token = shlex.quote(self._token_path())
+        folder = shlex.quote(self._folder or "")
         script = (
             "#!/bin/sh\n"
             f"unset {RUN_TOKEN_ENV}\n"
-            f"if [ -r {token} ]; then\n"
-            f"  {RUN_TOKEN_ENV}=$(cat {token}) && export {RUN_TOKEN_ENV}\n"
-            "fi\n"
+            f"name=$(cat {folder}/current 2>/dev/null) && "
+            f'{RUN_TOKEN_ENV}=$(cat {folder}/"$name" 2>/dev/null) && export {RUN_TOKEN_ENV}\n'
             'exec /bin/bash -c "$1"\n'
         )
         path = self.shell_prefix
@@ -224,7 +252,7 @@ class TokenRelay:
     def _upstream(self, path: str) -> str | None:
         kind, _, rest = path.partition("/")
         if kind == "mcp":
-            return self._mcp.get(rest)
+            return self._routes.get(rest)
         if kind in {"anthropic", "openai"} and self._model_url is not None:
             return f"{self._model_url}/{path}"
         return None
@@ -245,9 +273,14 @@ class TokenRelay:
         length = request.headers.get("content-length")
         if length is not None and length.isdigit() and int(length) > MAX_BODY_BYTES:
             return JSONResponse({"error": "the request is too large"}, status_code=413)
-        body = await request.body()
-        if len(body) > MAX_BODY_BYTES:
-            return JSONResponse({"error": "the request is too large"}, status_code=413)
+        read = await self._read_body(request)
+        if isinstance(read, Response):
+            return read
+        body, held = read
+        token = self._token  # the run can have ended while the body came
+        if token is None:
+            self._buffered -= held
+            return JSONResponse({"error": "no run is active"}, status_code=401)
         headers = {
             name: value
             for name, value in request.headers.items()
@@ -264,6 +297,8 @@ class TokenRelay:
         except httpx.HTTPError as error:
             log.warning("the relay could not reach the upstream: %s", type(error).__name__)
             return JSONResponse({"error": "the upstream is not reachable"}, status_code=502)
+        finally:
+            self._buffered -= held
         response_headers = {
             name: value for name, value in upstream.headers.items() if name not in _HOP_BY_HOP
         }
@@ -272,6 +307,28 @@ class TokenRelay:
             status_code=upstream.status_code,
             headers=response_headers,
         )
+
+    async def _read_body(self, request: Request) -> tuple[bytes, int] | Response:
+        """Reads the body in pieces. It stops at ``MAX_BODY_BYTES`` for this call and at
+        ``MAX_BUFFERED_BYTES`` for all calls, and it never holds more than it needs to refuse.
+        Returns the body and the bytes that it counted, or the refusal."""
+        chunks: list[bytes] = []
+        held = 0
+        try:
+            async for chunk in request.stream():
+                held += len(chunk)
+                self._buffered += len(chunk)
+                if held > MAX_BODY_BYTES:
+                    self._buffered -= held
+                    return JSONResponse({"error": "the request is too large"}, status_code=413)
+                if self._buffered > MAX_BUFFERED_BYTES:
+                    self._buffered -= held
+                    return JSONResponse({"error": "the relay is busy"}, status_code=503)
+                chunks.append(chunk)
+        except BaseException:
+            self._buffered -= held
+            raise
+        return b"".join(chunks), held
 
 
 async def _stream(upstream: httpx.Response) -> AsyncIterator[bytes]:

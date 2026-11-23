@@ -26,6 +26,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
+import signal
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -65,6 +67,7 @@ from claude_agent_sdk.types import (
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from sama.runtime import fence
 from sama.runtime.archive import Archiver, TranscriptArchive, bound_for_wire
 from sama.runtime.claude_transcript import read_transcript
 from sama.runtime.contract import (
@@ -95,6 +98,7 @@ from sama.runtime.contract import (
     is_terminal,
     output_preview,
 )
+from sama.runtime.fence import KeepError
 from sama.runtime.gating import AllowAllGate as AllowAllGate
 from sama.runtime.gating import BoundedSet
 from sama.runtime.gating import GateDecision as GateDecision
@@ -264,7 +268,25 @@ class _Kept:
     """The ``runtime_state`` of the last run that the client served. The next run reuses the
     client only if its own input state is exactly this one, so a run that another process
     served in between (it has another state) never reuses a client with an old history."""
+    pid: int | None = None
+    """The process id of the CLI. The process fence trusts this process and no other child."""
     idle_since: float = field(default_factory=time.monotonic)
+
+
+def _cli_pid(client: ClaudeClient) -> int | None:
+    """The process id of the CLI of a client, or ``None`` if the client cannot say."""
+    pid = getattr(client, "pid", None)
+    if isinstance(pid, int):
+        return pid
+    process = getattr(getattr(client, "_transport", None), "_process", None)
+    pid = getattr(process, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
+RETIRE_S: Final = 6.0
+"""The longest wait for the stop of a kept CLI. The SDK stops the CLI in steps (close stdin,
+terminate, kill) and its own limit is about 20 seconds, so after this time the keeper kills the
+process itself."""
 
 
 class ClaudeKeeper:
@@ -277,35 +299,61 @@ class ClaudeKeeper:
     takes the client out of the keeper (``take``), so a client serves one run at a time. A
     run puts it back only after a clean end (``put``). An error, a cancel, a budget stop, a
     pause for an approval, and a background task all end the client.
+
+    A client that does not fit is retired before anything else starts: the keeper waits until
+    its process has exited (``retire``). So two CLIs never work on one SDK session at once.
     """
 
-    def __init__(self, *, idle_s: float = 600.0) -> None:
+    def __init__(self, *, idle_s: float = 600.0, retire_s: float = RETIRE_S) -> None:
         self.idle_s = idle_s
+        self._retire_s = retire_s
         self._kept: _Kept | None = None
         self._stops: set[asyncio.Task[None]] = set()
+        self.failed = False
+        """A CLI did not stop. The runner must stop too."""
 
     @property
     def holds(self) -> bool:
         return self._kept is not None
 
-    def take(self, key: str, session_id: str | None, state: bytes | None) -> _Kept | None:
+    def pids(self) -> set[int]:
+        """The processes that the fence must leave alone: the kept CLI."""
+        kept = self._kept
+        return {kept.pid} if kept is not None and kept.pid is not None else set()
+
+    def _misfit(
+        self, kept: _Kept, key: str, session_id: str | None, state: bytes | None
+    ) -> str | None:
+        if kept.key != key:
+            return "the config or the process settings changed"
+        if session_id is None or kept.session_id != session_id:
+            return "another sdk session"
+        if state is None or kept.state != state:
+            return "the state of the run is not the state that the client left"
+        if time.monotonic() - kept.idle_since > self.idle_s:
+            return "the client was idle too long"
+        return None
+
+    async def take(self, key: str, session_id: str | None, state: bytes | None) -> _Kept | None:
+        """Gives the client to the run if it fits. Else it retires the client (waits for its
+        process to exit) and returns ``None``."""
         kept, self._kept = self._kept, None
         if kept is None:
             return None
-        reason = None
-        if kept.key != key:
-            reason = "the config or the process settings changed"
-        elif session_id is None or kept.session_id != session_id:
-            reason = "another sdk session"
-        elif state is None or kept.state != state:
-            reason = "the state of the run is not the state that the client left"
-        elif time.monotonic() - kept.idle_since > self.idle_s:
-            reason = "the client was idle too long"
+        reason = self._misfit(kept, key, session_id, state)
         if reason is None:
             return kept
         log.info("the kept CLI is not used: %s", reason)
-        self._stop(kept)
+        await self.retire(kept)
         return None
+
+    async def retire_unless(self, key: str, session_id: str | None, state: bytes | None) -> None:
+        """Retires the kept client if the next run cannot use it. The runner calls it before
+        the token of the next run is active."""
+        kept = self._kept
+        if kept is not None and self._misfit(kept, key, session_id, state) is not None:
+            self._kept = None
+            await self.retire(kept)
 
     def put(self, kept: _Kept) -> None:
         old, self._kept = self._kept, kept
@@ -313,11 +361,30 @@ class ClaudeKeeper:
         if old is not None:
             self._stop(old)
 
-    def discard(self, kept: _Kept) -> None:
-        """Ends a client that a run took and does not put back."""
-        self._stop(kept)
+    async def discard(self, kept: _Kept) -> None:
+        """Ends a client that a run took and does not put back, and waits for its exit."""
+        await self.retire(kept)
 
-    def _stop(self, kept: _Kept) -> None:
+    async def retire(self, kept: _Kept) -> None:
+        """Stops the CLI and waits until its process has exited. Raises ``KeepError`` if it
+        did not exit in ``retire_s`` plus the time to kill it."""
+        kept.binding.release()
+        pid = kept.pid if kept.pid is not None else _cli_pid(kept.client)
+        task = self._stop(kept)
+        await asyncio.wait({task}, timeout=self._retire_s)
+        if pid is not None and not fence.exited(pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+            for _ in range(200):
+                if fence.exited(pid):
+                    break
+                await asyncio.sleep(0.01)
+        stopped = fence.exited(pid) if pid is not None else task.done()
+        if not stopped:
+            self.failed = True
+            raise KeepError("the kept CLI did not stop")
+
+    def _stop(self, kept: _Kept) -> asyncio.Task[None]:
         kept.binding.release()
 
         async def stop() -> None:
@@ -327,14 +394,17 @@ class ClaudeKeeper:
         task = asyncio.create_task(stop())
         self._stops.add(task)
         task.add_done_callback(self._stops.discard)
+        return task
 
     async def close(self) -> None:
         """Ends the kept client and waits until every CLI of the keeper has stopped."""
         kept, self._kept = self._kept, None
         if kept is not None:
-            self._stop(kept)
+            with contextlib.suppress(KeepError):
+                await self.retire(kept)
         while self._stops:
-            await asyncio.wait(set(self._stops))
+            await asyncio.wait(set(self._stops), timeout=self._retire_s)
+            break
 
 
 # ---------------------------------------------------------------------------------------------
@@ -421,6 +491,10 @@ def _reject_prompt(tool_name: str, reason: str | None) -> str:
 # ---------------------------------------------------------------------------------------------
 # Message translation
 # ---------------------------------------------------------------------------------------------
+
+
+class _KeepFailed(Exception):
+    """A kept CLI did not stop, so no new CLI starts on its session."""
 
 
 class _UnexpectedResult(Exception):
@@ -972,6 +1046,25 @@ class ClaudeRuntime:
             async for event in stream:
                 yield event
 
+    async def prepare(self, request: RunRequest | ResumeRequest) -> None:
+        """Before the token of the run is active: retires the kept CLI if this run cannot use
+        it. The runner calls it, so an old CLI never runs while the next token is active.
+        Raises ``KeepError`` if the old CLI does not stop."""
+        keeper = self._settings.keeper
+        if keeper is None or not keeper.holds:
+            return
+        if isinstance(request, ResumeRequest):
+            # An approval resume starts its own CLI.
+            await keeper.retire_unless("", None, None)
+            return
+        try:
+            previous = _State.load(request.runtime_state)
+        except ValidationError:
+            previous = None
+        key = self._client_key(request.config, request.budget, 0)
+        session = previous.session_id if previous is not None else None
+        await keeper.retire_unless(key, session, request.runtime_state)
+
     async def cancel(self, run_id: str) -> None:
         self._cancelled_runs.add(run_id)
         self._paused.discard(run_id)
@@ -1127,6 +1220,15 @@ class ClaudeRuntime:
         except asyncio.CancelledError:
             send(_cancelled(translator.usage))
             raise
+        except _KeepFailed as exc:
+            send(
+                RunFailed(
+                    code=FailureCode.SANDBOX_ERROR,
+                    message=str(exc),
+                    retryable=True,
+                    usage=translator.usage,
+                )
+            )
         except _UnexpectedResult as exc:
             send(RunFailed(code=FailureCode.INTERNAL, message=str(exc), usage=translator.usage))
         except ClaudeSDKError as exc:
@@ -1166,12 +1268,21 @@ class ClaudeRuntime:
         settings = self._settings
         keeper = settings.keeper if phase.drop_tool is None else None
         mark = settings.mark or _no_mark
-        key = self._client_key(config, budget, translator) if keeper is not None else ""
-        held = keeper.take(key, translator.session_id, translator.input_state) if keeper else None
-        if keeper is not None and held is not None and not await _alive(held.client):
-            log.info("the kept CLI does not answer or has a failed MCP server; a new one starts")
-            keeper.discard(held)
-            held = None
+        key = self._client_key(config, budget, translator.turns) if keeper is not None else ""
+        try:
+            held = (
+                await keeper.take(key, translator.session_id, translator.input_state)
+                if keeper
+                else None
+            )
+            if keeper is not None and held is not None and not await _alive(held.client):
+                log.info(
+                    "the kept CLI does not answer or has a failed MCP server; a new one starts"
+                )
+                await keeper.discard(held)
+                held = None
+        except KeepError as error:
+            raise _KeepFailed(str(error)) from None
         binding = held.binding if held is not None else _Binding()
         binding.bind(
             pre_tool_use=self._hook(scope, config, phase, translator),
@@ -1230,6 +1341,7 @@ class ClaudeRuntime:
                                 key=key,
                                 session_id=session,
                                 state=state,
+                                pid=_cli_pid(client),
                             )
                         )
         finally:
@@ -1251,7 +1363,7 @@ class ClaudeRuntime:
             )
         return None
 
-    def _client_key(self, config: RunConfig, budget: Budget, translator: _Translator) -> str:
+    def _client_key(self, config: RunConfig, budget: Budget, turns_used: int) -> str:
         """Names the CLI that a client is. Another key means another CLI process.
 
         It holds what the CLI reads when it starts: the frozen config (D9: the prefix, the
@@ -1262,7 +1374,7 @@ class ClaudeRuntime:
         settings = self._settings
         parts = [
             config.fingerprint(),
-            str(_remaining_turns(budget, translator)),
+            str(None if budget.max_turns is None else budget.max_turns - turns_used),
             str(settings.claude_code_preset),
             str(self._archiver is not None),
             settings.cwd or "",
@@ -1540,8 +1652,6 @@ def _mcp_servers(config: RunConfig, relay: TokenRelay | None = None) -> dict[str
     """The MCP servers of the CLI. With a relay, the CLI calls the relay with the local secret,
     and the relay adds the token of the run that is active (``sama.runtime.relay``)."""
     servers: dict[str, Any] = {}
-    if relay is not None:
-        relay.set_mcp({server.name: server.url for server in config.mcp_servers})
     for server in config.mcp_servers:
         if relay is not None:
             entry: McpHttpServerConfig = {"type": "http", "url": relay.mcp_url(server.name)}

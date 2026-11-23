@@ -48,7 +48,7 @@ from typing import IO, TYPE_CHECKING, Any, Final, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
 from sama import warm
-from sama.runtime import host
+from sama.runtime import fence, host
 from sama.runtime.checkpoints import RUNNER_LOCK, CheckpointGate, Checkpoints
 from sama.runtime.contract import (
     AgentRuntime,
@@ -67,6 +67,7 @@ from sama.runtime.contract import (
     run_event_adapter,
 )
 from sama.runtime.fake import FakeRuntime, FakeScript
+from sama.runtime.fence import FenceError, KeepError
 from sama.runtime.gating import GateDecision, ToolGate
 from sama.sandbox.base import WORKDIR
 
@@ -258,8 +259,48 @@ class RunnerKeep:
             self._openai is not None and self._openai.holds
         )
 
+    broken = False
+    """A fence step failed: the runner must stop after this job."""
+
     async def start(self) -> None:
         await self.relay.start()
+
+    async def fence(self) -> bool:
+        """Kills and reaps every process that a run left (Section 4.4). ``True`` if there was
+        none. The kept CLI is the only process that it spares. Raises ``FenceError``."""
+        trusted = self._claude.pids() if self._claude is not None else set()
+        killed = await asyncio.to_thread(fence.kill_descendants, os.getpid(), trusted)
+        if killed:
+            log.warning("the fence killed %d process(es) that a run left", len(killed))
+        return not killed
+
+    async def before_run(self, runtime: AgentRuntime, job: RunnerJob) -> None:
+        """Before the token of a run is active: the fence, then the end of every kept client
+        that the run cannot use. A dirty fence ends all kept clients."""
+        if not await self.fence():
+            await self.reset()
+        prepare = getattr(runtime, "prepare", None)
+        if prepare is not None:
+            await prepare(job.request)
+
+    async def after_run(self) -> None:
+        """After a run and after its token is gone: the fence. If it found a process, the run
+        was not clean, and no client is kept."""
+        try:
+            clean = await self.fence()
+        except FenceError:
+            self.broken = True
+            return
+        if not clean:
+            await self.reset()
+
+    def stop_now(self) -> None:
+        """The hard stop: takes the token away, kills the whole tree of this process (the kept
+        CLI and everything under it), and exits. It never waits for a client."""
+        self.relay.clear_token()
+        with contextlib.suppress(Exception):
+            fence.kill_all(os.getpid(), timeout_s=2.0)
+        os._exit(1)
 
     async def reset(self) -> None:
         """Ends the kept clients. The next job starts them again."""
@@ -269,11 +310,15 @@ class RunnerKeep:
             await self._openai.close()
 
     async def close(self) -> None:
+        """Ends everything: the kept clients, the relay, and every process under this one."""
+        self.relay.clear_token()
         if self._claude is not None:
             await self._claude.close()
         if self._openai is not None:
             await self._openai.close()
         await self.relay.aclose()
+        with contextlib.suppress(FenceError):
+            await asyncio.to_thread(fence.kill_all, os.getpid())
 
 
 def build_runtime(
@@ -330,7 +375,6 @@ def build_runtime(
         items = RemoteSessionItems(job.session_url, token)
         if keep is not None:
             # The call goes over the connection of the relay, which stays open between runs.
-            keep.relay.set_mcp({SESSION_ROUTE: job.session_url})
             items = RemoteSessionItems(keep.relay.mcp_url(SESSION_ROUTE), keep.relay.secret)
         return OpenAIRuntime(
             items=items,
@@ -556,33 +600,56 @@ async def _run_job(
     keep: RunnerKeep | None = None,
 ) -> int:
     use = _keeps(job, env, keep)
-    if use is None:
-        return await _run_job_with(job, lines, out, env, token, timing, None)
-    await use.start()
-    # The relay holds the token for this job only. The kept clients never see it.
-    use.relay.set_token(token)
+    if use is not None:
+        await use.start()
     try:
-        return await _run_job_with(job, lines, out, env, token, timing, use)
-    finally:
-        use.relay.clear_token()
-
-
-async def _run_job_with(
-    job: RunnerJob,
-    lines: AsyncIterator[str],
-    out: Output,
-    env: Mapping[str, str],
-    token: str,
-    timing: _Timing,
-    keep: RunnerKeep | None,
-) -> int:
-    try:
-        runtime = build_runtime(job, env, keep, timing.mark)
+        runtime = build_runtime(job, env, use, timing.mark)
     except (ValueError, ImportError, ContractViolation) as error:
         out.event(_failed(FailureCode.INVALID_REQUEST, str(error)))
         return 2
     timing.mark("runtime")
+    if use is None:
+        return await _stream_job(job, lines, out, token, timing, runtime)
+    # The fence (Section 4.4): nothing that an earlier run left may be alive, and no kept
+    # client may be in the way, when the token of this run becomes active.
+    try:
+        await use.before_run(runtime, job)
+    except (KeepError, FenceError) as error:
+        log.error("the kept runtime is not safe to use: %s", type(error).__name__)
+        use.broken = True
+        out.event(
+            RunFailed(
+                code=FailureCode.SANDBOX_ERROR,
+                message="the runner could not clear the last run",
+                retryable=True,
+            )
+        )
+        return 3
+    use.relay.set_routes(_routes(job))
+    use.relay.set_token(token)  # the relay holds the token for this job only
+    try:
+        return await _stream_job(job, lines, out, token, timing, runtime)
+    finally:
+        use.relay.clear_token()
+        await use.after_run()
 
+
+def _routes(job: RunnerJob) -> dict[str, str]:
+    """The upstream URLs that the relay may call for this job, and no other."""
+    routes = {server.name: server.url for server in job.request.config.mcp_servers}
+    if job.session_url is not None:
+        routes[SESSION_ROUTE] = job.session_url
+    return routes
+
+
+async def _stream_job(
+    job: RunnerJob,
+    lines: AsyncIterator[str],
+    out: Output,
+    token: str,
+    timing: _Timing,
+    runtime: AgentRuntime,
+) -> int:
     config = with_run_token(job.request.config, token)
     stream: AsyncIterator[RunEvent]
     if job.run is not None:
@@ -667,6 +734,11 @@ async def _main(out_stream: IO[str]) -> int:
     env = dict(os.environ)
     idle_s = _keep_idle_s(env)
     keep = RunnerKeep(idle_s, env[MODEL_URL_ENV]) if idle_s > 0 and env.get(MODEL_URL_ENV) else None
+    if keep is not None and not fence.set_subreaper():
+        # The orphans of the processes of a run must come to this process, so the fence finds
+        # them. Without that, the runner keeps nothing.
+        log.warning("the system does not allow a subreaper; the runner keeps nothing")
+        keep = None
     job_input = host.JobInput(0)
     await job_input.start()
     try:
@@ -682,7 +754,7 @@ async def _become_host(keep: RunnerKeep, code: int) -> int:
     """After a run that ended well, stays alive as the host of the session. Else exits."""
     handle = HOST
     listener = None
-    if handle is not None and keep.holds and code == 0:
+    if handle is not None and keep.holds and code == 0 and not keep.broken:
         try:
             listener = host.HostListener.bind(handle.path)
         except OSError as error:
@@ -696,7 +768,13 @@ async def _become_host(keep: RunnerKeep, code: int) -> int:
     _detach_stdio()
     try:
         await host.serve_jobs(
-            listener, lambda job: _run_hosted(keep, job), code=handle.code, idle_s=keep.idle_s
+            listener,
+            lambda job: _run_hosted(keep, job),
+            code=handle.code,
+            idle_s=keep.idle_s,
+            hard_stop=keep.stop_now,
+            retire=keep.reset,
+            should_stop=lambda: keep.broken,
         )
     finally:
         await keep.close()

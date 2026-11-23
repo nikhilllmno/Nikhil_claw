@@ -43,9 +43,12 @@ from sama import warm
 log: Final = logging.getLogger("sama.host")
 
 HOST_SUFFIX: Final = warm.HOST_SUFFIX
-CANCEL_LIMIT_S: Final = 8.0
-"""The longest time between the end of the client and the exit of the host if the job does not
-stop. The orchestrator waits 10 seconds for a cancel (Section 4.3)."""
+CANCEL_LIMIT_S: Final = 1.0
+"""The longest time between the end of the client and the hard stop of the host if the job does
+not stop. The client goes away when the orchestrator kills it, and the orchestrator does that 7
+seconds after its cancel line (``CANCEL_KILL_AFTER_S``). Before the host, the warm watcher killed
+the runner at once, so the total stop time must not grow by more than this second. Nobody reads
+the events of a job whose client is gone, so the host does not wait for a graceful end."""
 WATCH_S: Final = 5.0
 """How often an idle host checks that its socket file is still there."""
 CANCEL_LINE: Final = '{"op": "cancel"}\n'
@@ -121,6 +124,9 @@ class HostedJob:
 
 RunHosted = Callable[[HostedJob], Coroutine[Any, Any, int]]
 HardStop = Callable[[], None]
+"""Revokes the token, kills the whole process tree of the host, and exits."""
+Retire = Callable[[], Coroutine[Any, Any, None]]
+"""Ends the kept clients. The host calls it after a job whose client went away."""
 
 
 class HostListener:
@@ -180,8 +186,11 @@ async def serve_jobs(
     code: str,
     idle_s: float,
     hard_stop: HardStop | None = None,
+    retire: Retire | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> None:
-    """Serves jobs one at a time until the host is idle, stale, or has no socket file."""
+    """Serves jobs one at a time until the host is idle, stale, or has no socket file, or until
+    ``should_stop`` says so after a job."""
     loop = asyncio.get_running_loop()
     stop = hard_stop or _exit_now
     last = loop.time()
@@ -200,7 +209,10 @@ async def serve_jobs(
                     log.info("the socket of the host is gone; it stops")
                     return
                 continue
-            if await _serve_one(listener, conn, run, code, stop):
+            if await _serve_one(listener, conn, run, code, stop, retire):
+                return
+            if should_stop is not None and should_stop():
+                log.warning("the host cannot go on; it stops")
                 return
             last = loop.time()
     finally:
@@ -226,7 +238,12 @@ def _refuse_waiting(listener: HostListener) -> None:
 
 
 async def _serve_one(
-    listener: HostListener, conn: socket.socket, run: RunHosted, code: str, stop: HardStop
+    listener: HostListener,
+    conn: socket.socket,
+    run: RunHosted,
+    code: str,
+    stop: HardStop,
+    retire: Retire | None,
 ) -> bool:
     """Runs the job of one client. Returns True if the host must stop."""
     conn.settimeout(2.0)
@@ -259,9 +276,11 @@ async def _serve_one(
             job.cancel()
             done, _ = await asyncio.wait({work}, timeout=CANCEL_LIMIT_S)
             if not done:
-                log.warning("the job did not stop after the client left; the host exits")
+                log.warning("the job did not stop after the client left; the host stops")
                 stop()
                 return True
+            if retire is not None:
+                await retire()  # nobody saw this job end: keep nothing from it
         status = _status(work)
     finally:
         gone.cancel()

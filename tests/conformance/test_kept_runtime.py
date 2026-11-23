@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -20,11 +21,19 @@ import pytest
 
 from sama.modelproxy.store import MemoryUsageStore
 from sama.orchestrator.sandboxed import SandboxedRuntime
-from sama.runtime import FailureCode, RunFailed, RunScope, TextDelta
+from sama.runtime import (
+    ApprovalDecision,
+    ApprovalRequired,
+    FailureCode,
+    RunFailed,
+    RunScope,
+    TextDelta,
+    fence,
+)
 from sama.tenancy import InvalidRunTokenError
 from sama.tenancy.authority import Authority
 from tests.conformance.targets import Scenario, Target, new_word
-from tests.conformance.test_conformance import completed, request, run, scope
+from tests.conformance.test_conformance import completed, request, resume, run, scope
 from tests.support import collect
 
 pytestmark = pytest.mark.usefixtures("warm_only")
@@ -178,3 +187,57 @@ async def test_the_kept_cli_holds_no_run_token(target: Target) -> None:
                 target.tools.run_tokens.verify(environ.get("ANTHROPIC_API_KEY", ""))
             assert os.environ.get("SAMA_RUN_TOKEN") is None
     assert found >= 1
+
+
+async def test_a_process_that_a_run_left_behind_is_killed_and_never_sees_a_later_token(
+    target: Target, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The agent starts OS work in the background with ``nohup ... &`` (not a CLI background
+    task). It reads the token file of the relay in a loop. The runner must kill it at the end of
+    the run, must not keep the CLI of that run, and the next run must never be read by it."""
+    if target.name != "claude-warm":
+        pytest.skip("only the Claude runtime has a CLI with a shell tool")
+    caplog.set_level(logging.INFO, logger="sama.orchestrator")
+    seen = tmp_path / "seen.log"
+    loop = (
+        'while :; do d=$(dirname "$CLAUDE_CODE_SHELL_PREFIX"); n=$(cat "$d/current" 2>/dev/null)'
+        f' && cat "$d/$n" >> {seen}; echo $$ > {seen}.pid; sleep 0.05; done'
+    )
+    command = f"nohup sh -c '{loop}' >/dev/null 2>&1 &"
+    first_scope = scope()
+    paused = (
+        await run(
+            target,
+            "CALL Bash " + json.dumps({"command": command}),
+            run_scope=first_scope,
+        )
+    )[-1]
+    assert isinstance(paused, ApprovalRequired)
+    done = completed(await resume(target, paused, first_scope, ApprovalDecision.APPROVE))
+    pid_file = Path(f"{seen}.pid")
+    for _ in range(100):
+        if await asyncio.to_thread(pid_file.exists):
+            break
+        await asyncio.sleep(0.05)
+    survivor = int((await asyncio.to_thread(pid_file.read_text)).strip())
+    # The run is over: the fence kills the process (the process is a child of the runner now).
+    for _ in range(100):
+        if fence.exited(survivor):
+            break
+        await asyncio.sleep(0.05)
+    assert fence.exited(survivor), "the process of the run is still alive after the run"
+    size = (await asyncio.to_thread(seen.stat)).st_size
+    second_scope = scope()
+    second = completed(
+        await run(
+            target,
+            target.prompt(Scenario.RECALL),
+            run_scope=second_scope,
+            state=done.runtime_state,
+        )
+    )
+    assert second.output
+    await asyncio.sleep(0.3)
+    assert (await asyncio.to_thread(seen.stat)).st_size == size, "the process read a later token"
+    _, rest = await timing_of(caplog, second_scope.run_id)
+    assert kept_step(target) not in rest  # the CLI of the dirty run was not kept

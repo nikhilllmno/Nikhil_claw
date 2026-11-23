@@ -6,6 +6,10 @@ import asyncio
 import io
 import json
 import os
+import shlex
+import subprocess
+import sys
+import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
@@ -26,6 +30,7 @@ from sama.runtime import (
     RuntimeKind,
     TextDelta,
     Usage,
+    fence,
     run_event_adapter,
     validate_event_stream,
 )
@@ -539,3 +544,171 @@ def test_a_cold_runner_does_not_keep(monkeypatch: pytest.MonkeyPatch) -> None:
     assert runner_module._keep_idle_s(env) == 600.0
     assert runner_module._keep_idle_s({}) == 0.0
     assert runner_module._keep_idle_s({warm_module.KEEP_ENV: "soon"}) == 0.0
+
+
+# -- the process fence (docs/architecture.md, Section 4.4) --------------------------------------
+
+
+class _Seen:
+    """A runtime that records what was alive when the run started, and holds the relay."""
+
+    kind = RuntimeKind.CLAUDE_AGENT_SDK
+
+    def __init__(self, keep: runner_module.RunnerKeep, survivor: int) -> None:
+        self.keep = keep
+        self.survivor = survivor
+        self.survivor_gone_at_start: bool | None = None
+        self.token_active = False
+
+    def capabilities(self) -> object:
+        raise NotImplementedError
+
+    async def prepare(self, request: object) -> None:
+        return None
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.survivor_gone_at_start = fence.exited(self.survivor)
+        self.token_active = self.keep.relay.active
+        yield RunCompleted(output="ok", usage=Usage(output_tokens=1))
+
+    async def cancel(self, run_id: str) -> None:
+        return None
+
+
+SURVIVOR = """
+import os, sys, time
+folder, log = sys.argv[1], sys.argv[2]
+open(log + '.pid', 'w').write(str(os.getpid()))
+while True:
+    try:
+        name = open(os.path.join(folder, 'current')).read()
+        token = open(os.path.join(folder, name)).read()
+        open(log, 'a').write(token + '\\n')
+    except OSError:
+        pass
+    time.sleep(0.02)
+"""
+
+
+def _start_survivor(folder: str, log_path: Path) -> int:
+    """A process that a run left behind: it left its shell, and it reads the token file of the
+    relay in a loop, as a hostile process of the last run could."""
+    command = (
+        f"nohup {sys.executable} -c {shlex.quote(SURVIVOR)} {folder} {log_path} >/dev/null 2>&1 &"
+    )
+    subprocess.run(["/bin/sh", "-c", command], check=True)
+    pid_file = Path(f"{log_path}.pid")
+    for _ in range(200):
+        if pid_file.exists() and pid_file.read_text():
+            return int(pid_file.read_text())
+        time.sleep(0.02)
+    raise AssertionError("the survivor did not start")
+
+
+async def test_a_process_of_the_last_run_is_killed_before_the_next_token_is_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The regression of the review: a process that outlived run N must never read the token of
+    run N+1, and the clients that run N kept must not be reused."""
+    fence.set_subreaper()
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    await keep.start()
+    folder = os.path.dirname(keep.relay.shell_prefix)
+    log_path = tmp_path / "seen.log"
+    survivor = _start_survivor(folder, log_path)
+    reset_calls: list[bool] = []
+    original_reset = keep.reset
+
+    async def reset() -> None:
+        reset_calls.append(True)
+        await original_reset()
+
+    monkeypatch.setattr(keep, "reset", reset)
+    try:
+        # Run N: the survivor reads its token while the run is active.
+        keep.relay.set_token("token-run-one")
+        await asyncio.sleep(0.2)
+        keep.relay.clear_token()
+        assert "token-run-one" in log_path.read_text()
+        assert not fence.exited(survivor)  # the run ended, and the survivor lives
+        # Run N+1 starts through the runner. The fence runs before its token is active.
+        probe = _Seen(keep, survivor)
+        monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+        env = {**KEEP_ENV, RUN_TOKEN_ENV: "token-run-two", WORKDIR_ENV: str(tmp_path)}
+        out = io.StringIO()
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        assert code == 0
+        assert probe.token_active
+        assert probe.survivor_gone_at_start is True  # killed before the token was active
+        assert reset_calls, "a dirty fence must end the kept clients"
+        await asyncio.sleep(0.2)
+        assert "token-run-two" not in log_path.read_text()
+        assert fence.exited(survivor)
+    finally:
+        await keep.close()
+
+
+async def test_a_survivor_that_a_run_starts_is_found_at_the_end_of_that_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run that leaves a process behind keeps nothing: the fence at the end finds it."""
+    fence.set_subreaper()
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    await keep.start()
+    folder = os.path.dirname(keep.relay.shell_prefix)
+    log_path = tmp_path / "seen.log"
+    resets: list[bool] = []
+    original_reset = keep.reset
+
+    async def reset() -> None:
+        resets.append(True)
+        await original_reset()
+
+    monkeypatch.setattr(keep, "reset", reset)
+
+    class Leaves(_Seen):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.survivor = _start_survivor(folder, log_path)  # the run leaves it behind
+            async for event in super().run(request):
+                yield event
+
+    probe = Leaves(keep, 0)
+    monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+    env = {**KEEP_ENV, RUN_TOKEN_ENV: "token-run-one", WORKDIR_ENV: str(tmp_path)}
+    try:
+        code = await serve(
+            _lines([_claude_job().model_dump_json()]), Output(io.StringIO()), env, keep=keep
+        )
+        assert code == 0
+        assert resets  # not kept
+        assert fence.exited(probe.survivor)
+        assert not keep.broken
+    finally:
+        await keep.close()
+
+
+async def test_a_fence_that_cannot_kill_stops_the_runner_and_fails_the_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    probe = _Probe(keep)
+    monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+
+    def stuck(root: int, trusted: object = (), **kwargs: object) -> list[int]:
+        raise fence.FenceError("a process does not stop")
+
+    monkeypatch.setattr(fence, "kill_descendants", stuck)
+    out = io.StringIO()
+    env = {**KEEP_ENV, WORKDIR_ENV: str(tmp_path)}
+    try:
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        events = [run_event_adapter.validate_json(line) for line in out.getvalue().splitlines()]
+        assert code == 3
+        assert isinstance(events[-1], RunFailed)
+        assert events[-1].retryable
+        assert keep.broken
+        assert probe.active_during_run == []  # the run never started, and no token was active
+        assert not keep.relay.active
+    finally:
+        monkeypatch.undo()
+        await keep.close()

@@ -201,6 +201,8 @@ class _Owned:
         self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._ready.add_done_callback(_consume)
         self._stop = asyncio.Event()
+        self.clean: bool | None = None
+        """After ``close``: whether the cleanup of the server completed in its own task."""
         self._task = asyncio.create_task(self._own())
 
     async def _own(self) -> None:
@@ -212,7 +214,7 @@ class _Owned:
                     self._ready.cancel()
                 else:
                     self._ready.set_exception(error)
-            await _cleanup(self.server.cleanup())  # type: ignore[no-untyped-call]
+            self.clean = await _cleanup(self.server.cleanup())  # type: ignore[no-untyped-call]
             if isinstance(error, asyncio.CancelledError):
                 raise
             return
@@ -220,7 +222,7 @@ class _Owned:
         try:
             await self._stop.wait()
         finally:
-            await _cleanup(self.server.cleanup())  # type: ignore[no-untyped-call]
+            self.clean = await _cleanup(self.server.cleanup())  # type: ignore[no-untyped-call]
 
     async def ready(self) -> None:
         await asyncio.shield(self._ready)
@@ -249,6 +251,11 @@ class _ServerSet:
     @property
     def servers(self) -> list[MCPServer]:
         return [owned.server for owned in self._owners]
+
+    @property
+    def clean(self) -> bool:
+        """After ``close``: every server finished its cleanup in its own task."""
+        return all(owned.clean is True for owned in self._owners)
 
     async def ready(self, timeout_s: float = MCP_CONNECT_S) -> None:
         """Waits until every server is connected. Raises the first connect error."""
@@ -280,14 +287,26 @@ class OpenAIKeeper:
     def holds(self) -> bool:
         return self._kept is not None
 
-    def take(self, key: str) -> _ServerSet | None:
+    async def take(self, key: str) -> _ServerSet | None:
+        """Gives the set to the run if it fits. Else it closes the set (and waits for it) and
+        returns ``None``."""
         kept, self._kept = self._kept, None
         if kept is None:
             return None
         if kept.key == key and time.monotonic() - kept.idle_since <= self.idle_s:
             return kept
-        self._stop(kept.close())
+        await kept.close()
         return None
+
+    async def retire_unless(self, key: str) -> None:
+        """Closes the kept set if the next run cannot use it. The runner calls it before the
+        token of the next run is active."""
+        kept = self._kept
+        if kept is not None and not (
+            kept.key == key and time.monotonic() - kept.idle_since <= self.idle_s
+        ):
+            self._kept = None
+            await kept.close()
 
     def put(self, kept: _ServerSet) -> None:
         old, self._kept = self._kept, kept
@@ -1131,7 +1150,7 @@ class OpenAIRuntime:
                 store = _Store(self._items, job.scope, job.conversation)
                 if job.compact is None:
                     # The servers connect while the items load: both wait for the network.
-                    servers = self._open_servers(job)
+                    servers = await self._open_servers(job)
                 if job.resume is None:
                     job.base_count = await self._prepare(store, previous)
                     job.repair = False
@@ -1164,19 +1183,30 @@ class OpenAIRuntime:
             finally:
                 active.queue.put_nowait(_Done())
 
-    def _open_servers(self, job: _Job) -> _ServerSet:
+    async def _open_servers(self, job: _Job) -> _ServerSet:
         """The MCP servers of the run: the kept ones, or new ones that start to connect now."""
         settings = self._settings
         relay = settings.relay
-        key = hashlib.sha256(
-            f"{job.config.fingerprint()}\0{relay.secret if relay else ''}".encode()
-        ).hexdigest()
+        key = self._servers_key(job.config)
         if settings.keeper is not None:
-            kept = settings.keeper.take(key)
+            kept = await settings.keeper.take(key)
             if kept is not None:
                 self._mark("mcp_kept")
                 return kept
         return _ServerSet(key, [_Owned(server) for server in _mcp_servers(job.config, relay)])
+
+    def _servers_key(self, config: RunConfig) -> str:
+        relay = self._settings.relay
+        return hashlib.sha256(
+            f"{config.fingerprint()}\0{relay.secret if relay else ''}".encode()
+        ).hexdigest()
+
+    async def prepare(self, request: RunRequest | ResumeRequest) -> None:
+        """Before the token of the run is active: closes the kept connections if this run
+        cannot use them (the runner calls it)."""
+        keeper = self._settings.keeper
+        if keeper is not None and keeper.holds:
+            await keeper.retire_unless(self._servers_key(request.config))
 
     async def _end_servers(self, servers: _ServerSet | None, *, keep: bool) -> None:
         """Keeps the servers after a run that completed, else closes them."""
@@ -1599,8 +1629,6 @@ def _mcp_servers(config: RunConfig, relay: TokenRelay | None = None) -> list[MCP
     """The MCP clients of a run. With a relay, a client calls the relay with the local secret,
     and the relay adds the token of the active run (``sama.runtime.relay``)."""
     servers: list[MCPServer] = []
-    if relay is not None:
-        relay.set_mcp({server.name: server.url for server in config.mcp_servers})
     for server in config.mcp_servers:
         headers: dict[str, str] = {}
         url = server.url
@@ -1627,12 +1655,16 @@ def _find_interruption(items: Sequence[ToolApprovalItem], call_id: str) -> ToolA
     return None
 
 
-async def _cleanup(close: Any) -> None:
-    """Runs one close step with a time limit. A close step that fails is only logged."""
+async def _cleanup(close: Any) -> bool:
+    """Runs one close step in the calling task, with a time limit. Returns whether it
+    completed. A step that fails or runs too long is only logged."""
     try:
-        await asyncio.wait_for(close, timeout=_CLEANUP_S)
+        async with asyncio.timeout(_CLEANUP_S):
+            await close
     except Exception as exc:
         log.warning("an openai run cleanup step failed: %s", type(exc).__name__)
+        return False
+    return True
 
 
 async def _close_sandbox(client: UnixLocalSandboxClient, sandbox: Any) -> None:

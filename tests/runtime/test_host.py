@@ -8,6 +8,8 @@ import json
 import os
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Iterator
@@ -16,7 +18,7 @@ from typing import Any
 import pytest
 
 from sama import warm
-from sama.runtime import host
+from sama.runtime import fence, host
 from sama.runtime.host import HostedJob, HostListener, JobInput, serve_jobs
 
 pytestmark = pytest.mark.asyncio
@@ -222,3 +224,132 @@ async def test_the_input_of_a_job_has_the_lines_of_stdin_and_a_cancel_line() -> 
     os.close(write)  # the end of stdin ends the lines
     assert [line async for line in iterator] == []
     await job_input.close()
+
+
+async def test_a_job_that_stops_after_the_client_left_retires_the_kept_clients(
+    path: str, listener: HostListener
+) -> None:
+    retired = asyncio.Event()
+
+    async def run(job: HostedJob) -> int:
+        stub = StubInput()
+        job.input = stub
+        await stub.cancelled.wait()
+        return 1
+
+    async def retire() -> None:
+        retired.set()
+
+    server = asyncio.create_task(serve_jobs(listener, run, code=CODE, idle_s=5, retire=retire))
+    await asyncio.to_thread(send_and_leave, path)
+    await asyncio.wait_for(retired.wait(), timeout=3)
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+async def test_the_host_stops_when_the_runner_says_it_cannot_go_on(
+    path: str, listener: HostListener
+) -> None:
+    async def run(job: HostedJob) -> int:
+        return 0
+
+    broken = False
+
+    def should_stop() -> bool:
+        return broken
+
+    server = asyncio.create_task(
+        serve_jobs(listener, run, code=CODE, idle_s=30, should_stop=should_stop)
+    )
+    assert await client(path) == 0
+    assert not server.done()
+    broken = True
+    assert await client(path) == 0
+    await asyncio.wait_for(server, timeout=3)
+
+
+HARD_STOP_SCRIPT = """
+import asyncio, os, subprocess, sys
+from sama.runtime import fence, host
+from sama.runtime.runner import RunnerKeep
+
+async def main(path):
+    fence.set_subreaper()
+    keep = RunnerKeep(60, "http://127.0.0.1:1")
+    await keep.start()
+    keep.relay.set_token("run-token")
+    # A tool process of the run, and one that left its shell (it belongs to this process now).
+    tool = subprocess.Popen(["sleep", "60"])
+    subprocess.run(["/bin/sh", "-c", "sleep 60 &"], check=True)
+    listener = host.HostListener.bind(path)
+    host.CANCEL_LIMIT_S = 0.3
+
+    async def run(job):
+        await asyncio.sleep(60)  # a job that does not react to the cancel
+        return 0
+
+    folder = os.path.dirname(keep.relay.shell_prefix)
+    print(tool.pid, folder, flush=True)
+    await host.serve_jobs(listener, run, code="code-1", idle_s=60, hard_stop=keep.stop_now,
+                          retire=keep.reset)
+
+asyncio.run(main(sys.argv[1]))
+"""
+
+
+async def test_an_unresponsive_client_makes_the_host_kill_its_whole_tree_and_drop_the_token(
+    path: str,
+) -> None:
+    process = start_script(path)
+    try:
+        assert process.stdout is not None
+        tool_pid, folder = (await asyncio.to_thread(process.stdout.readline)).split()
+        await asyncio.sleep(0.2)
+        assert not fence.exited(int(tool_pid))
+        assert active_token_files(folder)  # the token of the run is active
+        await asyncio.to_thread(send_and_leave, path)  # the client goes away; the job never stops
+        assert await asyncio.to_thread(process.wait, 8) == 1
+        assert fence.exited(int(tool_pid))
+        assert not active_token_files(folder)
+        # The shell child that left its shell is gone too: no process of the tree is left.
+        await asyncio.sleep(0.2)
+        assert not any(
+            b"sleep\x0060" in (entry / "cmdline").read_bytes()
+            for entry in _procs_of_children(process.pid)
+        )
+    finally:
+        process.kill()
+        process.wait()
+
+
+def start_script(path: str) -> Any:
+    return subprocess.Popen(
+        [sys.executable, "-c", HARD_STOP_SCRIPT, path],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+
+
+def active_token_files(folder: str) -> list[str]:
+    if not os.path.exists(folder):
+        return []
+    return [n for n in os.listdir(folder) if n.startswith(("current", "token."))]
+
+
+def _procs_of_children(parent: int) -> list[Any]:
+    """Processes that were children of ``parent`` and that run now (none after a hard stop)."""
+    from pathlib import Path
+
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            if int(stat[stat.rindex(")") + 2 :].split()[1]) == parent:
+                found.append(entry)
+        except (OSError, ValueError):
+            continue
+    return found

@@ -35,9 +35,13 @@ class FakeServer:
         self.fail = fail
         self.connected = False
         self.cleaned = False
+        self.connect_task: asyncio.Task[Any] | None = None
+        self.cleanup_task: asyncio.Task[Any] | None = None
+        self.cleanup_s = 0.0
         self._stack = contextlib.AsyncExitStack()
 
     async def connect(self) -> None:
+        self.connect_task = asyncio.current_task()
         await asyncio.sleep(self.connect_s)
         if self.fail:
             raise ConnectionError("no route")
@@ -45,6 +49,8 @@ class FakeServer:
         self.connected = True
 
     async def cleanup(self) -> None:
+        self.cleanup_task = asyncio.current_task()
+        await asyncio.sleep(self.cleanup_s)
         await self._stack.aclose()
         self.cleaned = True
 
@@ -63,6 +69,7 @@ async def test_the_servers_connect_at_the_same_time() -> None:
     assert all(server.connected for server in servers)
     await group.close()
     assert all(server.cleaned for server in servers)
+    assert group.clean
 
 
 async def test_a_connection_can_be_closed_by_another_task() -> None:
@@ -73,6 +80,10 @@ async def test_a_connection_can_be_closed_by_another_task() -> None:
     await asyncio.create_task(group.ready())
     await asyncio.create_task(group.close())
     assert server.cleaned
+    # The same task connected and cleaned up, and it is not the task of either caller.
+    assert server.connect_task is server.cleanup_task
+    assert server.connect_task is not asyncio.current_task()
+    assert group.clean
 
 
 async def test_a_failed_connect_raises_and_cleans_up_the_others() -> None:
@@ -100,7 +111,7 @@ async def test_the_keeper_gives_the_set_back_for_the_same_key() -> None:
     await group.ready()
     keeper.put(group)
     assert keeper.holds
-    assert keeper.take("key") is group
+    assert await keeper.take("key") is group
     assert not keeper.holds
     assert not server.cleaned
     await group.close()
@@ -112,7 +123,8 @@ async def test_the_keeper_closes_the_set_for_another_key() -> None:
     group = _ServerSet("key", owned(server))
     await group.ready()
     keeper.put(group)
-    assert keeper.take("other") is None
+    assert await keeper.take("other") is None
+    assert server.cleaned  # the take waited for the close
     await keeper.close()
     assert server.cleaned
 
@@ -124,9 +136,9 @@ async def test_the_keeper_closes_an_idle_set() -> None:
     await group.ready()
     keeper.put(group)
     await asyncio.sleep(0.1)
-    assert keeper.take("key") is None
-    await keeper.close()
+    assert await keeper.take("key") is None
     assert server.cleaned
+    await keeper.close()
 
 
 async def test_a_new_set_replaces_the_kept_one() -> None:
@@ -170,3 +182,33 @@ async def test_the_clients_of_a_kept_runtime_hold_only_the_local_secret() -> Non
         await keeper.close()
     finally:
         await relay.aclose()
+
+
+async def test_a_cleanup_that_takes_too_long_is_stopped_in_its_own_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sama.runtime import openai_agents
+
+    monkeypatch.setattr(openai_agents, "_CLEANUP_S", 0.05)
+    slow = FakeServer("slow")
+    slow.cleanup_s = 5
+    group = _ServerSet("key", owned(slow))
+    await group.ready()
+    await asyncio.wait_for(group.close(), timeout=2)
+    assert not group.clean  # the owner task knows that the cleanup did not finish
+    assert not slow.cleaned
+    assert slow.cleanup_task is slow.connect_task
+
+
+async def test_retire_unless_closes_a_set_that_the_next_run_cannot_use() -> None:
+    keeper = OpenAIKeeper()
+    server = FakeServer("s")
+    group = _ServerSet("key", owned(server))
+    await group.ready()
+    keeper.put(group)
+    await keeper.retire_unless("key")
+    assert keeper.holds
+    assert not server.cleaned
+    await keeper.retire_unless("other")
+    assert not keeper.holds
+    assert server.cleaned

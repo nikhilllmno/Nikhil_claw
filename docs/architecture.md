@@ -766,11 +766,39 @@ files, the environment, and the work folder of the client. The kept parts are:
   it. A host that is busy answers `B`, so a main run that comes at that time uses the warm
   server. A side run (`RunRequest.parallel`) never goes to the host.
 - **Cancel.** A cancel is the same as before: the orchestrator sends a cancel line, and the
-  runtime interrupts the CLI. If the client goes away (the orchestrator kills it), the host
-  sends the cancel line itself. If the job does not stop in 8 seconds, the host exits, and the
-  CLI with it. So a cancel never waits for a kept process, and a cancelled run is never kept.
-  The skill sync that restarts the runner (`skills=changed`) sets `SAMA_RUNNER_FRESH=1`: the
-  host then ends its kept clients first.
+  runtime interrupts the CLI. If the client goes away (the orchestrator kills it, 7 seconds
+  after its cancel line), the host sends the cancel line itself and waits 1 second. Nobody reads
+  the events of such a job, so it does not wait for a graceful end. If the job has not stopped,
+  the host makes a hard stop: it takes the token from the relay, kills and reaps its whole
+  process tree (the CLI and everything under it, see "Process fence"), and exits. The warm
+  watcher killed the runner at once before the host existed, so the stop is at most 1 second
+  slower than before. A cancelled run is never kept, and a job whose client went away ends
+  every kept client. The skill sync that restarts the runner (`skills=changed`) sets
+  `SAMA_RUNNER_FRESH=1`: the host then ends its kept clients first.
+- **Process fence.** A kept runner lives for more than one run, so a process that a run left
+  behind (a shell command that started work in the background without `run_in_background`, a
+  tool that forked) must not live into the next run: it could call the relay or read the token
+  file while the next token is active. The runner and the host are *child subreapers*
+  (`prctl(PR_SET_CHILD_SUBREAPER)`): the orphans of the processes of a run come to the runner
+  and stay in its process tree, also after they left their shell. `sama.runtime.fence` reads the
+  tree from `/proc`, kills and reaps every descendant (`SIGKILL`, look again, 3 seconds at most),
+  and spares only the kept CLI itself. Its own children are killed too: the CLI has none between
+  two runs. The fence runs at three places. (1) At the end of a run, after the token is gone
+  (`RunnerKeep.after_run`): if it found a process, the run was not clean, and no client is kept
+  (the CLI and the MCP connections end). (2) Before the next run, before its token is active
+  (`RunnerKeep.before_run`): a dirty fence ends all kept clients. (3) When the runner stops
+  (`RunnerKeep.close`, `stop_now`): it kills the CLI and everything under it. A fence that cannot
+  kill a process fails the job with a retryable `sandbox_error` and stops the host. A zombie
+  does not hold the fence: it has no code and no files. The token of a run becomes active only
+  after the fence, so a process of run N never reads the token of run N+1.
+- **Replacement.** A kept CLI that the next run cannot use is retired before anything starts:
+  `before_run` calls `ClaudeRuntime.prepare` and `OpenAIRuntime.prepare`, which end the kept
+  client when the key, the session, or the state of the run does not fit, or when the run is an
+  approval resume, and the call waits until the process has exited (the SDK stop for 6 seconds,
+  then `SIGKILL`). A client that is not healthy at the start of a run is retired the same way
+  (`ClaudeKeeper.discard`) before the new CLI starts. If a CLI does not exit, the run fails
+  (retryable `sandbox_error`) and the host stops: two CLIs never work on one SDK session at the
+  same time. These steps run under the runner lock.
 - **Timing line.** The line has `mode=host` for a job that a host ran, and the steps
   `client_spawned_s` or `client_kept_s` (Claude), `mcp_kept_s`, `items_ready_s`, `mcp_ready_s`,
   and `sandbox_ready_s` (OpenAI), `query_sent_s`, and `first_message_s`. They show where the
@@ -787,7 +815,11 @@ the SDK has no call for it. So the kept clients never hold a token. The *token r
   one random local secret. The relay adds the token of the run that is active now and forwards
   the call to the model proxy (`/anthropic/...`, `/openai/...`) or to the registered URL of a
   server (`/mcp/<name>`) over one connection pool that stays open. It passes the answer on as a
-  stream.
+  stream. The routes are for one job: the runner replaces the whole list for each job (the MCP
+  servers of its config and the session items URL), and a name that is not in the list gets
+  `404`. The relay reads the body of a request in pieces. It refuses a body of more than 64 MB
+  with `413` when it passes the limit, and it refuses a call with `503` when all bodies together
+  would hold more than 192 MB.
 - The host gives the relay the token when a job starts and takes it away when the job ends
   (`set_token`, `clear_token`). Between jobs, and after a cancel, every call gets `401`. A call
   of the previous run in a kept process cannot use the token of an ended run: it has none.
@@ -796,12 +828,14 @@ the SDK has no call for it. So the kept clients never hold a token. The *token r
   or its MCP configuration. The shell commands of the agent run through a prefix script
   (`CLAUDE_CODE_SHELL_PREFIX`) that reads the token of the active run from a private file
   (mode 0600 in a folder with mode 0700) and sets `SAMA_RUN_TOKEN` for that command only. So
-  the git credential helper keeps working in a follow-up run. The relay removes the file when
-  the job ends.
+  the git credential helper keeps working in a follow-up run. The file is for one run: it has a
+  new random name for each run, a pointer file (`current`) names it, and the relay deletes both
+  when the run ends, so a reader that is late gets nothing.
 - This is not a new trust boundary. A process in the sandbox could read the token from the
   environment of the CLI before. The local secret keeps other local users out, and the relay
   holds a token only while its run is active. The relay sends the token only to the model proxy
-  and to URLs that its own runner registered. A run that is not kept (a side run, a run on a
+  and to URLs that its runner registered for the job. A process that a run left behind is killed
+  before the next token is active (see "Process fence"), so it never gets that token. A run that is not kept (a side run, a run on a
   cold runner, a run with no model URL) uses the old path: the token in the environment.
 
 **CLI file cache.** A new sandbox loads the blocks of its disk when they are first read. The
@@ -7832,7 +7866,9 @@ not change.
   `X<exit code>`. The host runs the job in its process, one job at a time, with the files and the
   environment of the client. It checks the user of the peer. It never holds a run token between
   jobs (the token relay, Section 4.4). If the client closes the socket, the host cancels the job,
-  and it exits if the job does not stop in 8 seconds. A run that is not a main run of the Claude
+  and it makes a hard stop (token away, whole process tree killed, exit) if the job does not stop
+  in 1 second. The host and the first runner are child subreapers, and a process fence kills what
+  a run left before the next token is active (Section 4.4). A run that is not a main run of the Claude
   or OpenAI runtime, and a run with no model URL, never uses it.
 
 **Runner lock.** A main runner holds an exclusive `flock` on `.sama/runner.lock` in the work

@@ -52,9 +52,17 @@ pytestmark = pytest.mark.asyncio
 class KeptClient:
     """A fake CLI process that serves more than one query. Each query plays the next script."""
 
-    def __init__(self, options: ClaudeAgentOptions, scripts: list[Sequence[Any]]) -> None:
+    def __init__(
+        self,
+        options: ClaudeAgentOptions,
+        scripts: list[Sequence[Any]],
+        journal: list[str] | None = None,
+        disconnect_gate: asyncio.Event | None = None,
+    ) -> None:
         self.options = options
         self.scripts = scripts
+        self.journal = journal if journal is not None else []
+        self.disconnect_gate = disconnect_gate
         self.prompts: list[str] = []
         self.connects = 0
         self.disconnected = False
@@ -66,6 +74,7 @@ class KeptClient:
 
     async def connect(self, prompt: str | None = None) -> None:
         self.connects += 1
+        self.journal.append(f"connect {id(self)}")
 
     async def query(self, prompt: str) -> None:
         self.prompts.append(prompt)
@@ -84,7 +93,11 @@ class KeptClient:
         self.interrupted.set()
 
     async def disconnect(self) -> None:
+        self.journal.append(f"disconnect start {id(self)}")
+        if self.disconnect_gate is not None:
+            await self.disconnect_gate.wait()
         self.disconnected = True
+        self.journal.append(f"disconnect done {id(self)}")
 
     async def get_mcp_status(self) -> dict[str, Any]:
         if self.status_error is not None:
@@ -99,9 +112,13 @@ class Factory:
     def __init__(self, *processes: list[Sequence[Any]]) -> None:
         self.processes = list(processes)
         self.clients: list[KeptClient] = []
+        self.journal: list[str] = []
+        self.disconnect_gate: asyncio.Event | None = None
 
     def __call__(self, options: ClaudeAgentOptions) -> ClaudeClient:
-        client = KeptClient(options, self.processes[len(self.clients)])
+        client = KeptClient(
+            options, self.processes[len(self.clients)], self.journal, self.disconnect_gate
+        )
         self.clients.append(client)
         return cast(ClaudeClient, client)
 
@@ -431,4 +448,82 @@ async def test_a_variable_of_the_sandbox_provider_does_not_change_the_key(
         req("run-3", second.runtime_state),
     )
     assert len(factory.clients) == 2
+    await keeper.close()
+
+
+async def test_a_replacement_starts_only_after_the_old_cli_has_stopped(
+    relay: TokenRelay,
+) -> None:
+    """The old CLI needs time to stop. The new CLI on the same SDK session must not start
+    before the old process has exited."""
+    keeper = ClaudeKeeper()
+    factory = Factory([ok()], [ok()])
+    runtime = make_runtime(factory, relay, keeper)
+    first = await finish(runtime, req("run-1", None))
+    first_client = factory.clients[0]
+    original = first_client.disconnect
+
+    async def slow() -> None:
+        await asyncio.sleep(0.2)
+        await original()
+
+    first_client.disconnect = slow  # type: ignore[method-assign]
+    await finish(runtime, req("run-2", first.runtime_state, changed=True))
+    done = factory.journal.index(f"disconnect done {id(first_client)}")
+    started = factory.journal.index(f"connect {id(factory.clients[1])}")
+    assert done < started
+    await keeper.close()
+
+
+async def test_a_cli_that_does_not_stop_fails_the_run_and_no_replacement_starts(
+    relay: TokenRelay,
+) -> None:
+    keeper = ClaudeKeeper(retire_s=0.2)
+    factory = Factory([ok()], [ok()])
+    runtime = make_runtime(factory, relay, keeper)
+    first = await finish(runtime, req("run-1", None))
+    factory.disconnect_gate = asyncio.Event()  # the old CLI blocks in its stop
+    factory.clients[0].disconnect_gate = factory.disconnect_gate
+    events = await collect(runtime.run(req("run-2", first.runtime_state, changed=True)))
+    failed = events[-1]
+    assert isinstance(failed, RunFailed)
+    assert failed.code is FailureCode.SANDBOX_ERROR
+    assert failed.retryable
+    assert len(factory.clients) == 1  # no replacement on the session of the stuck CLI
+    assert keeper.failed
+    factory.disconnect_gate.set()
+    await keeper.close()
+
+
+async def test_prepare_retires_a_cli_that_the_next_run_cannot_use(relay: TokenRelay) -> None:
+    """The runner calls ``prepare`` before the token of the next run is active."""
+    keeper = ClaudeKeeper()
+    factory = Factory([ok()])
+    runtime = make_runtime(factory, relay, keeper)
+    first = await finish(runtime, req("run-1", None))
+    await runtime.prepare(req("run-2", first.runtime_state))
+    assert keeper.holds  # the same config and state: the CLI waits for the run
+    await runtime.prepare(req("run-2", first.runtime_state, changed=True))
+    assert not keeper.holds
+    assert factory.clients[0].disconnected  # and it has stopped when prepare returns
+    await keeper.close()
+
+
+async def test_prepare_retires_the_cli_for_an_approval_resume(relay: TokenRelay) -> None:
+    from sama.runtime import ApprovalDecision, ResumeRequest
+
+    keeper = ClaudeKeeper()
+    factory = Factory([ok()])
+    runtime = make_runtime(factory, relay, keeper)
+    first = await finish(runtime, req("run-1", None))
+    resume = ResumeRequest(
+        scope=make_scope("run-1"),
+        config=config(),
+        approval_id="a",
+        decision=ApprovalDecision.APPROVE,
+        runtime_state=first.runtime_state,
+    )
+    await runtime.prepare(resume)
+    assert not keeper.holds
+    assert factory.clients[0].disconnected
     await keeper.close()

@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+import sama.runtime.relay as relay_module
 from sama.runtime.relay import TokenRelay, relay_env
 from tests.conformance.scripted_model import serve
 
@@ -70,7 +71,7 @@ def upstream() -> Any:
 async def relay(upstream: Any) -> AsyncIterator[TokenRelay]:
     _, url = upstream
     relay = TokenRelay(url)
-    relay.set_mcp({"sama": f"{url}/tools/mcp"})
+    relay.set_routes({"sama": f"{url}/tools/mcp"})
     await relay.start()
     yield relay
     await relay.aclose()
@@ -214,11 +215,115 @@ async def test_the_shell_prefix_sets_the_token_of_the_active_run(relay: TokenRel
     assert run(command).startswith("|")
 
 
-async def test_the_token_file_is_private(relay: TokenRelay) -> None:
+def exists(path: str) -> bool:
+    return os.path.exists(path)
+
+
+def shell(relay: TokenRelay, command: str) -> str:
+    """Runs a command through the shell prefix, as the CLI does."""
+    env = {"PATH": os.environ["PATH"]}
+    return subprocess.run(
+        [relay.shell_prefix, command], capture_output=True, text=True, env=env, check=True
+    ).stdout
+
+
+def token_files(relay: TokenRelay) -> list[str]:
+    folder = os.path.dirname(relay.shell_prefix)
+    return sorted(name for name in os.listdir(folder) if name.startswith(("token.", "current")))
+
+
+async def test_the_token_file_is_private_and_for_one_run(relay: TokenRelay) -> None:
+    folder = os.path.dirname(relay.shell_prefix)
     relay.set_token("run-token")
-    path = os.path.join(os.path.dirname(relay.shell_prefix), "token")
-    assert os.stat(path).st_mode & 0o777 == 0o600
-    assert os.stat(os.path.dirname(path)).st_mode & 0o777 == 0o700
+    first = token_files(relay)
+    assert len(first) == 2  # the token file of the run and the pointer to it
+    for name in first:
+        assert os.stat(os.path.join(folder, name)).st_mode & 0o777 == 0o600
+    assert os.stat(folder).st_mode & 0o777 == 0o700
+    relay.set_token("run-token-2")
+    second = token_files(relay)
+    assert len(second) == 2
+    assert set(first) & set(second) == {"current"}  # a new name for each run, no old file
+    relay.clear_token()
+    assert token_files(relay) == []
+
+
+async def test_a_reader_that_is_late_gets_no_token(relay: TokenRelay) -> None:
+    """A process of the last run that reads the token file after its run ended gets nothing,
+    and a path that it kept does not hold the token of the next run."""
+    relay.set_token("run-one")
+    folder = os.path.dirname(relay.shell_prefix)
+    (old_name,) = [n for n in token_files(relay) if n.startswith("token.")]
+    relay.clear_token()
+    assert not exists(os.path.join(folder, old_name))
+    relay.set_token("run-two")
+    assert not exists(os.path.join(folder, old_name))  # the next run has its own file
+    assert shell(relay, 'printf "%s" "$SAMA_RUN_TOKEN"') == "run-two"
+    relay.clear_token()
+    assert shell(relay, 'printf "%s" "$SAMA_RUN_TOKEN"') == ""
+
+
+async def test_the_routes_of_a_job_replace_the_routes_of_the_last_job(
+    upstream: Any, relay: TokenRelay
+) -> None:
+    _, url = upstream
+    relay.set_token("run-token")
+    relay.set_routes({"other": f"{url}/tools/mcp", "session-items": f"{url}/tools/mcp"})
+    async with httpx.AsyncClient() as client:
+        gone = await client.post(f"{relay.url}/mcp/sama", headers=local(relay), content=b"{}")
+        kept = await client.post(f"{relay.url}/mcp/other", headers=local(relay), content=b"{}")
+        session = await client.post(
+            f"{relay.url}/mcp/session-items", headers=local(relay), content=b"{}"
+        )
+    assert gone.status_code == 404  # a server of the last job has no route now
+    assert kept.status_code == session.status_code == 200
+    relay.set_routes({})
+    async with httpx.AsyncClient() as client:
+        none = await client.post(
+            f"{relay.url}/mcp/session-items", headers=local(relay), content=b"{}"
+        )
+    assert none.status_code == 404
+
+
+async def test_a_chunked_body_over_the_limit_is_refused_before_it_is_read_all(
+    upstream: Any, relay: TokenRelay, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _ = upstream
+    monkeypatch.setattr(relay_module, "MAX_BODY_BYTES", 1_000)
+    relay.set_token("run-token")
+    sent = 0
+
+    async def body() -> AsyncIterator[bytes]:
+        nonlocal sent
+        for _ in range(1_000):
+            sent += 1
+            yield b"x" * 100
+            await asyncio.sleep(0)
+
+    assert relay.app is not None
+    # In process, the request body is pulled by the app only: a relay that reads to the end
+    # would pull all 1,000 chunks.
+    transport = httpx.ASGITransport(app=relay.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://relay") as client:
+        answer = await client.post("/anthropic/v1/messages", headers=local(relay), content=body())
+    assert answer.status_code == 413
+    assert sent < 100  # the relay stopped reading at the limit and not at the end of the body
+    assert model.seen == []
+    assert relay._buffered == 0
+
+
+async def test_all_the_calls_together_cannot_buffer_more_than_the_limit(
+    upstream: Any, relay: TokenRelay, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(relay_module, "MAX_BUFFERED_BYTES", 150)
+    relay.set_token("run-token")
+    relay._buffered = 100  # other calls hold 100 bytes now
+    async with httpx.AsyncClient() as client:
+        answer = await client.post(
+            f"{relay.anthropic_url}/v1/messages", headers=local(relay), content=b"y" * 100
+        )
+    assert answer.status_code == 503
+    assert relay._buffered == 100  # the refused call gave back its bytes
 
 
 async def test_close_removes_the_files(relay: TokenRelay) -> None:
