@@ -9,10 +9,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Delivery, Job, JobFire, Run
+from sama.db.models import Delivery, Job, JobFire, Run, SessionToolAllow
 from sama.gate.service import GateService
 from sama.orchestrator.queue import RunQueue
 from sama.scheduler.fire import finish_fire
@@ -265,3 +265,47 @@ async def test_a_once_job_pauses_after_its_fire(
             await connection.execute(select(JobFire.run_id).where(JobFire.job_id == view.id))
         ).scalar_one()
     await _end_run(engine, run_id)
+
+
+async def test_a_session_grant_does_not_widen_a_job_run_of_an_attached_session(
+    engine: AsyncEngine, jobs: JobService, tenant: Tenant
+) -> None:
+    """The owner allowed Bash for the long-lived session of a job. The unattended run of the
+    job keeps the pre-approval limits of its approved version (D13): the grant adds nothing."""
+    gate = GateService(engine)
+    given = EVERY_HOUR.model_copy(
+        update={"name": "report", "preapproved_tools": BASH, "attach_to_session": True}
+    )
+    view = await jobs.create(tenant.agent(), given)
+    await jobs.approve(tenant.user(), view.id, 1)
+    fire = await _fire(engine, await jobs.run_now(tenant.user(), view.id))
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(SessionToolAllow).values(
+                org_id=tenant.org,
+                session_id=fire.session_id,
+                user_id=tenant.ids["ana"],
+                tool="Bash",
+            )
+        )
+    claims = _claims(tenant, fire)
+    assert (await gate.check(claims, "c1", "Bash", {"command": "make report"})).action == "allow"
+    other = await gate.check(claims, "c2", "Bash", {"command": "make deploy"})
+    assert (other.action, other.step.value) == ("deny", "context")
+    await _end_run(engine, fire.run_id)
+
+    plain = EVERY_HOUR.model_copy(update={"name": "plain", "attach_to_session": True})
+    view = await jobs.create(tenant.agent(), plain)
+    fire = await _fire(engine, await jobs.run_now(tenant.user(), view.id))
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(SessionToolAllow).values(
+                org_id=tenant.org,
+                session_id=fire.session_id,
+                user_id=tenant.ids["ana"],
+                tool="Bash",
+            )
+        )
+    verdict = await gate.check(_claims(tenant, fire), "c3", "Bash", {"command": "make report"})
+    assert verdict.action == "deny"
+    await _end_run(engine, fire.run_id)

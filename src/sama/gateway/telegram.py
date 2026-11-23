@@ -549,6 +549,7 @@ class TelegramGateway:
                 attachments=images,
                 coding_agent=None if coding is None else coding.value,
                 parallel=parallel,
+                human=True,
             )
         except QueueError as error:
             self._followers.discard(place)

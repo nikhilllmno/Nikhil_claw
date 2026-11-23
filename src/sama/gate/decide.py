@@ -226,6 +226,18 @@ JOB_TOOLSET: Final = "cron"
 
 MCP_PREFIX: Final = "mcp__"
 
+DIRECT_CODING_TOOLS: Final = ("coding_agent_run", "coding_agent_plan")
+"""The calls that a coding agent run gives the gate before its CLI starts (Section 15.4)."""
+CODING_AGENT_RUNTIMES: Final = ("claude_code", "codex")
+
+
+def is_direct_coding_run(runtime: str, coding_agent: str | None) -> bool:
+    """True for a run in the direct mode of a coding agent (Section 15.4): the run uses a
+    coding agent runtime because the session or the agent profile has it, not because of one
+    message of ``/claude <task>`` (that run names its agent in ``runs.coding_agent``). The
+    person chose the CLI, so the gate does not ask again for each message."""
+    return runtime in CODING_AGENT_RUNTIMES and coding_agent is None
+
 
 class GateStep(StrEnum):
     AUTHORITY = "authority"
@@ -241,6 +253,11 @@ class RuleLevel(StrEnum):
     ORG = "org"
     PROFILE = "profile"
     USER = "user"
+    SESSION = "session"
+    """An ``allow`` that one user gave for the rest of one session (approval scope
+    ``session``), or that direct mode of a coding agent gives (Section 15.4). It is a user
+    rule that ends with the session. A ``deny`` rule and an org or profile ``ask`` rule win
+    over it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,8 +664,9 @@ def policy_verdict(
         return Verdict("deny", GateStep.POLICY, f"a policy rule denies {name}")
     if always_asks(name):
         return Verdict("ask", GateStep.POLICY, f"{name} needs an approval for each call")
-    admin = _most_specific(r for r in matching if r.level is not RuleLevel.USER)
-    user = _most_specific(r for r in matching if r.level is RuleLevel.USER)
+    personal = (RuleLevel.USER, RuleLevel.SESSION)
+    admin = _most_specific(r for r in matching if r.level not in personal)
+    user = _most_specific(r for r in matching if r.level in personal)
     if admin is not None and admin.action == "ask":
         return Verdict("ask", GateStep.POLICY, f"the {admin.level} policy asks for {name}")
     chosen = user or admin
@@ -678,7 +696,7 @@ def _most_specific(rules: Iterable[PolicyRule]) -> PolicyRule | None:
     same level and the same kind of name, the stricter rule wins, so the order of the rules
     never loosens a verdict (for example a stored rule and the policy of a custom tool,
     Section 10.8)."""
-    rank = {RuleLevel.ORG: 0, RuleLevel.PROFILE: 1, RuleLevel.USER: 2}
+    rank = {RuleLevel.ORG: 0, RuleLevel.PROFILE: 1, RuleLevel.USER: 2, RuleLevel.SESSION: 3}
     return max(
         rules,
         key=lambda rule: (rank[rule.level], rule.exact, _STRICTNESS[rule.action]),

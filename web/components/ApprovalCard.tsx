@@ -9,6 +9,7 @@ import styles from "./Cards.module.css";
 
 const DONE_TEXT: Record<ApprovalAction, string> = {
   approve: "Allowed. The run goes on.",
+  session: "Allowed for this session. The run goes on.",
   always: "Always allowed. The run goes on.",
   deny: "Denied. The agent gets the answer.",
 };
@@ -36,6 +37,10 @@ export function ApprovalCard({
   // A proposal of a change of the agent shows its diff. A rule cannot approve a proposal, so it
   // has no "Always allow".
   const proposal = approval.proposal === true;
+  // The scopes that the server allows. An old API gives none: then all, except for a proposal.
+  const scopes = approval.scopes ?? (proposal ? ["once"] : ["once", "session", "always"]);
+  const canSession = scopes.includes("session");
+  const canAlways = scopes.includes("always");
 
   const decide = async (action: ApprovalAction) => {
     if (busy !== null) return;
@@ -43,7 +48,7 @@ export function ApprovalCard({
     setError(null);
     try {
       if (action === "deny") await api.deny(approval.id);
-      else await api.approve(approval.id, action === "always");
+      else await api.approve(approval.id, action === "approve" ? "once" : action);
       onDecided();
     } catch (e) {
       setError(errorText(e, "The decision was not saved."));
@@ -59,14 +64,14 @@ export function ApprovalCard({
   useEffect(() => {
     if (!active) return;
     const onKey = (event: KeyboardEvent) => {
-      const action = approvalKey(event, document.activeElement, !proposal);
+      const action = approvalKey(event, document.activeElement, canSession);
       if (action === null || behindModal(card.current, document)) return;
       event.preventDefault();
       void decideRef.current(action);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, proposal]);
+  }, [active, canSession]);
 
   const args = JSON.stringify(approval.arguments, null, 2);
   const subject = toolSubject(approval.tool_name, approval.arguments);
@@ -120,15 +125,15 @@ export function ApprovalCard({
           {proposal ? "Approve" : "Allow once"}
           {active ? <kbd className={styles.key}>1</kbd> : null}
         </button>
-        {!proposal ? (
+        {canSession ? (
           <button
             type="button"
             className="btn"
             aria-keyshortcuts={active ? "2" : undefined}
-            onClick={() => void decide("always")}
-            title={`Let this agent use ${approval.tool_name} for you without asking again.`}
+            onClick={() => void decide("session")}
+            title={`Do not ask again for ${approval.tool_name} in this session.`}
           >
-            Always allow
+            Allow for this session
             {active ? <kbd className={styles.key}>2</kbd> : null}
           </button>
         ) : null}
@@ -141,6 +146,16 @@ export function ApprovalCard({
           Deny
           {active ? <kbd className={styles.key}>3</kbd> : null}
         </button>
+        {canAlways ? (
+          <button
+            type="button"
+            className="btn btn-quiet"
+            onClick={() => void decide("always")}
+            title={`Let this agent use ${approval.tool_name} for you without asking again, in every session.`}
+          >
+            Always allow
+          </button>
+        ) : null}
       </div>
       {proposal && approval.diff ? <p className="hint">After the approval, the change applies to new sessions.</p> : null}
     </section>

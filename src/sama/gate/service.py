@@ -40,11 +40,13 @@ from sama.db.models import (
     ReviewProposal,
     Run,
     Session,
+    SessionToolAllow,
     ToolCall,
     ToolPolicy,
 )
 from sama.gate.approvers import SHARED_REFUSAL, approvers_of, may_decide_shared
 from sama.gate.decide import (
+    DIRECT_CODING_TOOLS,
     JOB_TOOLSET,
     WORKFLOW_TOOLSET,
     Action,
@@ -66,6 +68,7 @@ from sama.gate.decide import (
     effective_call,
     effective_toolsets,
     frozen_toolsets,
+    is_direct_coding_run,
     json_default,
     merged_catalog,
     run_limit,
@@ -87,6 +90,13 @@ MAX_STORED_ARGUMENT_CHARS: Final = 8_000
 """Longer arguments are stored cut. The approval keeps the digest of the full arguments."""
 EXPIRE_BATCH: Final = 500
 _POLICY_KEY: Final = "uq_tool_policies_org_id_agent_profile_id_user_id_tool"
+_SESSION_ALLOW_KEY: Final = "uq_session_tool_allows_session_id_user_id_tool"
+
+ApprovalScope = Literal["once", "session", "always"]
+"""How far an approval reaches. ``once`` covers this call. ``session`` also lets the same tool
+run without a question for the rest of this session, for the user who approved. ``always``
+writes a user policy rule for the tool and the agent profile."""
+APPROVAL_SCOPES: Final[tuple[ApprovalScope, ...]] = ("once", "session", "always")
 
 
 class ApprovalError(Exception):
@@ -95,6 +105,28 @@ class ApprovalError(Exception):
 
 class ApprovalExpiredError(ApprovalError):
     """The approval timed out. It counts as ``deny``."""
+
+
+class ApprovalScopeError(ApprovalError):
+    """The scope does not fit the approval, for example ``session`` for a proposal."""
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalDecision:
+    """The result of a human decision."""
+
+    status: str
+    scope: ApprovalScope
+    """The scope that the gate applied. ``once`` for a denial, for a tool that always asks,
+    and for a proposal that was approved with ``always``."""
+
+
+def allowed_scopes(tool_name: str, *, proposal: bool) -> tuple[ApprovalScope, ...]:
+    """The scopes that an approval of this tool can have. A proposal and a tool that always
+    asks need a person for each call, so they have only ``once``."""
+    if proposal or always_asks(tool_name):
+        return ("once",)
+    return APPROVAL_SCOPES
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +552,9 @@ class GateService:
                     Run.triggered_by_user_id,
                     Run.unattended,
                     Run.kind,
+                    Run.runtime,
+                    Run.coding_agent,
+                    Run.human_origin,
                     Run.toolsets.label("run_toolsets"),
                     AgentProfile.toolsets,
                     AgentProfile.group_toolsets,
@@ -598,6 +633,29 @@ class GateService:
         # A fixed tool keeps its own access.
         access = {**access, **fixed_access}
         rules = await self._rules(connection, org_id, row.agent_profile_id, user_id)
+        if not row.unattended:
+            # An unattended run has no person to ask, and a pre-approval of the job version
+            # limits what it may do (Section 12.1). A session grant is for a run with a person.
+            rules = (*rules, *await self._session_rules(connection, ref, user_id))
+        if (
+            not row.unattended
+            and row.human_origin
+            and row.audience == "private"
+            and row.owner_user_id is not None
+            and user_id == row.owner_user_id
+            and is_direct_coding_run(row.runtime, row.coding_agent)
+        ):
+            # The owner sent the message in a private session through a human channel: the
+            # owner chose the CLI, so the call of the CLI needs no approval (Section 15.4). A
+            # run of an org API key or of other automation has no ``human_origin`` and keeps
+            # the normal gate. A deny rule and an admin ask rule still win.
+            rules = (
+                *rules,
+                *(
+                    PolicyRule(tool=tool, action="allow", level=RuleLevel.SESSION)
+                    for tool in DIRECT_CODING_TOOLS
+                ),
+            )
         for rule_source in self._run_rules:
             rules = (*rules, *await rule_source.run_rules(connection, **who))
         context = GateContext(
@@ -675,6 +733,23 @@ class GateService:
             )
             rules.append(PolicyRule(tool=tool, action=cast(Action, action), level=level))
         return tuple(rules)
+
+    async def _session_rules(
+        self, connection: AsyncConnection, ref: _Ref, user_id: uuid.UUID | None
+    ) -> tuple[PolicyRule, ...]:
+        """The tools that the run user allowed for this session (approval scope ``session``)."""
+        if user_id is None:
+            return ()
+        tools = await connection.execute(
+            select(SessionToolAllow.tool).where(
+                SessionToolAllow.org_id == ref.org_id,
+                SessionToolAllow.session_id == ref.session_id,
+                SessionToolAllow.user_id == user_id,
+            )
+        )
+        return tuple(
+            PolicyRule(tool=tool, action="allow", level=RuleLevel.SESSION) for (tool,) in tools
+        )
 
     async def _recorded(
         self,
@@ -782,15 +857,49 @@ class GateService:
         user_id: uuid.UUID,
         approve: bool,
         always_allow: bool = False,
+        scope: ApprovalScope | None = None,
         reason: str | None = None,
     ) -> str:
-        """Records a human decision and returns the new status. Raises ``ApprovalError``.
+        """Records a human decision and returns the new status. See ``decide_with_scope``."""
+        decision = await self.decide_with_scope(
+            org_id=org_id,
+            run_id=run_id,
+            call_id=call_id,
+            user_id=user_id,
+            approve=approve,
+            always_allow=always_allow,
+            scope=scope,
+            reason=reason,
+        )
+        return decision.status
+
+    async def decide_with_scope(
+        self,
+        *,
+        org_id: uuid.UUID,
+        run_id: uuid.UUID,
+        call_id: str,
+        user_id: uuid.UUID,
+        approve: bool,
+        always_allow: bool = False,
+        scope: ApprovalScope | None = None,
+        reason: str | None = None,
+    ) -> ApprovalDecision:
+        """Records a human decision and returns the new status and the applied scope. Raises
+        ``ApprovalError``.
 
         Only a user who can read the session decides. In a shared session, only the user who
         started the run, a workspace admin, or an approver of the profile decides.
-        ``always_allow`` with ``approve`` also writes a user policy rule for this tool and the
-        profile of the run.
+
+        ``scope`` with ``approve`` says how far the approval reaches (``ApprovalScope``).
+        ``always_allow=True`` is the old form of ``scope="always"``. ``always`` writes a user
+        policy rule for this tool and the profile of the run. ``session`` writes a session
+        rule for this user (``session_tool_allows``). A proposal has only ``once``: ``session``
+        raises ``ApprovalScopeError``, and ``always`` is ignored. A tool that always asks has
+        only ``once``. In the direct mode of a coding agent (Section 15.4), the approval of
+        ``coding_agent_run`` is a ``session`` approval, because the person chose the CLI.
         """
+        scope = scope or ("always" if always_allow else "once")
         reason = redact(reason) if reason else reason
         status = "expired"
         async with self._engine.begin() as connection:
@@ -807,6 +916,8 @@ class GateService:
                         Session.owner_user_id,
                         Run.agent_profile_id,
                         Run.triggered_by_user_id,
+                        Run.runtime,
+                        Run.coding_agent,
                         AgentProfile.policy,
                     )
                     .join(
@@ -857,6 +968,8 @@ class GateService:
                 # session does not: the owner of a private session may lack the role, and an
                 # admin may not read the private session. The admin sees the redacted proposal
                 # only.
+                if scope == "session":
+                    raise ApprovalScopeError("a proposal needs a decision each time")
                 allowed = (
                     grants.org_owner
                     if proposed == "org"
@@ -868,9 +981,17 @@ class GateService:
                         if proposed == "org"
                         else "only a workspace admin or the org owner can decide this proposal"
                     )
-                always_allow = False
+                scope = "once"
             if row.status != "pending":
                 raise ApprovalError(f"the approval is already {row.status}")
+            if not approve or always_asks(row.tool_name):
+                scope = "once"
+            elif (
+                scope == "once"
+                and canonical_name(row.tool_name) in DIRECT_CODING_TOOLS
+                and is_direct_coding_run(row.runtime, row.coding_agent)
+            ):
+                scope = "session"
             now = self._clock()
             run = _Ref(org_id, row.workspace_id, row.session_id, run_id)
             if row.expires_at <= now:
@@ -892,16 +1013,57 @@ class GateService:
                     run,
                     f"approval.{status}",
                     call_id,
-                    {"tool": row.tool_name, "reason": reason, "always_allow": always_allow},
+                    {
+                        "tool": row.tool_name,
+                        "reason": reason,
+                        "scope": scope,
+                        "always_allow": scope == "always",
+                    },
                     user_id=user_id,
                 )
-                if approve and always_allow and not always_asks(row.tool_name):
+                if scope == "always":
                     await self._always_allow(
                         connection, run, row.agent_profile_id, user_id, row.tool_name, call_id
                     )
+                elif scope == "session":
+                    await self._session_allow(
+                        connection, run, user_id, canonical_name(row.tool_name), call_id, row.id
+                    )
         if status == "expired":
             raise ApprovalExpiredError("the approval timed out, so it counts as deny")
-        return status
+        return ApprovalDecision(status, scope)
+
+    async def _session_allow(
+        self,
+        connection: AsyncConnection,
+        run: _Ref,
+        user_id: uuid.UUID,
+        tool: str,
+        call_id: str,
+        approval_id: uuid.UUID,
+    ) -> None:
+        """Lets ``tool`` run for the rest of the session without a question, for ``user_id``."""
+        created = await connection.execute(
+            pg_insert(SessionToolAllow)
+            .values(
+                org_id=run.org_id,
+                session_id=run.session_id,
+                user_id=user_id,
+                tool=tool,
+                approval_id=approval_id,
+            )
+            .on_conflict_do_nothing(constraint=_SESSION_ALLOW_KEY)
+            .returning(SessionToolAllow.id)
+        )
+        if created.first() is not None:
+            await self._audit(
+                connection,
+                run,
+                "tool_policy.session_allow",
+                call_id,
+                {"tool": tool, "action": "allow", "level": "session"},
+                user_id=user_id,
+            )
 
     async def _always_allow(
         self,
@@ -1026,10 +1188,15 @@ def _details(name: str, verdict: Verdict) -> dict[str, Any]:
 
 
 __all__ = [
+    "APPROVAL_SCOPES",
     "APPROVAL_TTL",
+    "ApprovalDecision",
     "ApprovalError",
     "ApprovalExpiredError",
+    "ApprovalScope",
+    "ApprovalScopeError",
     "GateService",
+    "allowed_scopes",
 ]
 
 

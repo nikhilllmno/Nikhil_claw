@@ -48,6 +48,7 @@ SESSION_CHILDREN = (
     "session_handoffs",
     "session_repos",
     "session_plans",
+    "session_tool_allows",
 )
 INSUFFICIENT_PRIVILEGE = "42501"
 

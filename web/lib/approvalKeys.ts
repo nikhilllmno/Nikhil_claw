@@ -1,7 +1,7 @@
 // The keys of an approval card, as in the permission prompt of Claude Code: 1 allows once,
-// 2 allows always, 3 denies. Pure, so tests can run it.
+// 2 allows for this session, 3 denies. "Always allow" has no key. Pure, so tests can run it.
 
-export type ApprovalAction = "approve" | "always" | "deny";
+export type ApprovalAction = "approve" | "session" | "always" | "deny";
 
 /** The id of the message box of the chat. */
 export const MESSAGE_FIELD_ID = "message";
@@ -39,7 +39,7 @@ export function approvalKey(
     case "1":
       return "approve";
     case "2":
-      return allowAlways ? "always" : null;
+      return allowAlways ? "session" : null;
     case "3":
       return "deny";
     default:

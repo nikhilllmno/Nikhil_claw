@@ -831,6 +831,11 @@ class Run(Base):
     """The coding agent of a ``/claude`` or ``/codex`` run with a task (Section 15.4). The run
     uses this runtime and not the runtime of the session."""
     allow_parallel: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    human_origin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True when a person sent the message of the run through a human channel (the web app,
+    Telegram, Slack, WhatsApp, or email). It is false for an org API key, a job, a trigger, a
+    workflow, a delegated run, and the notes of a run that ended. The direct mode of a coding
+    agent asks no approval only for a run with this flag (Section 15.4)."""
     """True when the run can start next to an open chat run of its session (M7.1): the profile
     was in the busy mode ``parallel`` at the enqueue, or the person asked for it (``/bg``)."""
     side: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
@@ -3428,4 +3433,37 @@ class SessionPlan(Base):
     feedback: Mapped[str | None] = mapped_column(Text)
     decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class SessionToolAllow(Base):
+    """A tool that one user allowed for the rest of one session (docs/architecture.md, Section
+    16.1, approval scope ``session``). The tool gate reads it as a rule of the level
+    ``session``: it never beats a ``deny`` rule, an org or profile ``ask`` rule, the hardline
+    list, or plan mode. It ends with the session. Members read the rows of the sessions that
+    they can see. Only the control plane writes the table."""
+
+    __tablename__ = "session_tool_allows"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["org_id", "session_id"], ["sessions.org_id", "sessions.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "user_id"], ["users.org_id", "users.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("session_id", "user_id", "tool"),
+        CheckConstraint("length(tool) BETWEEN 1 AND 200", name="tool_length"),
+        Index(None, "org_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = _org_id()
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The user who approved. The rule applies to the runs that this user starts."""
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    """An exact tool name."""
+    approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    """The approval that made the rule. A plain column: the rule stays when a retention purge
+    removes the approval."""
     created_at: Mapped[datetime] = _created_at()

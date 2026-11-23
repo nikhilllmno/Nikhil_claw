@@ -16,7 +16,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import SamaApi
 from sama.api.app import STREAM_GRACE_S, _EventStream
-from sama.db.models import AgentProfile, AuditEntry, Membership, Org, Run, Session, User, Workspace
+from sama.db.models import (
+    AgentProfile,
+    AuditEntry,
+    Membership,
+    Org,
+    Run,
+    Session,
+    SessionToolAllow,
+    ToolPolicy,
+    User,
+    Workspace,
+)
 from sama.orchestrator.queue import RunQueue
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
@@ -583,6 +594,7 @@ async def test_a_user_decides_an_approval(
     assert decided.status_code == 200
     assert decided.json() == {
         "status": "approved" if action == "approve" else "rejected",
+        "scope": "once",
         "resumed": True,
     }
     assert await harness.status_is(run_id, "queued"), "the API releases the run at once"
@@ -594,6 +606,115 @@ async def test_a_user_decides_an_approval(
 
     again = await client.post(f"/approvals/{pending[0]['id']}/approve", headers=mia(tenant))
     assert again.status_code == 409
+
+
+def gate_claims(tenant: Tenant, run_id: uuid.UUID) -> RunTokenClaims:
+    return RunTokenClaims(
+        org_id=str(tenant.org),
+        workspace_id=str(tenant.ids["ws"]),
+        session_id=str(tenant.ids["s1"]),
+        run_id=str(run_id),
+        token_id="t-1",
+        expires_at=2_000_000_000,
+    )
+
+
+async def paused_approval(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> tuple[Harness, uuid.UUID, dict[str, Any]]:
+    harness = Harness(engine)
+    harness.runtime.add_script(approval_script())
+    run_id = await harness.send(tenant, "s1", "clean up")
+    assert await harness.worker.run_once()
+    pending = (
+        await client.get(f"/sessions/{tenant.ids['s1']}/approvals", headers=mia(tenant))
+    ).json()
+    return harness, run_id, pending[0]
+
+
+async def test_the_approval_list_names_the_scopes_that_the_user_may_choose(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    _, _, pending = await paused_approval(client, engine, tenant)
+    assert pending["scopes"] == ["once", "session", "always"]
+
+
+async def test_a_session_approval_lets_the_next_call_of_the_tool_run_without_a_card(
+    api: SamaApi, client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness, run_id, pending = await paused_approval(client, engine, tenant)
+    claims = gate_claims(tenant, run_id)
+    ask_args = {"command": "rm -rf build"}
+    decided = await client.post(
+        f"/approvals/{pending['id']}/approve", headers=mia(tenant), json={"scope": "session"}
+    )
+    assert decided.status_code == 200
+    assert decided.json() == {"status": "approved", "scope": "session", "resumed": True}
+    # The same tool in the same session runs without a card.
+    verdict = await api._gate.check(claims, "next-call", "Bash", {"command": "make test"})
+    assert verdict.action == "allow"
+    assert (
+        await client.get(f"/sessions/{tenant.ids['s1']}/approvals", headers=mia(tenant))
+    ).json() == []
+    async with engine.connect() as connection:
+        allows = (
+            await connection.execute(
+                select(SessionToolAllow.tool, SessionToolAllow.session_id).where(
+                    SessionToolAllow.org_id == tenant.org
+                )
+            )
+        ).all()
+        scopes = (
+            (
+                await connection.execute(
+                    select(AuditEntry.details["scope"].astext).where(
+                        AuditEntry.org_id == tenant.org, AuditEntry.action == "approval.approved"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [tuple(row) for row in allows] == [("Bash", tenant.ids["s1"])]
+    assert scopes == ["session"]
+    # Another session of the tenant still asks.
+    other = await harness.send(tenant, "s2", "other")
+    other_claims = gate_claims(tenant, other).model_copy(
+        update={"session_id": str(tenant.ids["s2"])}
+    )
+    assert (await api._gate.check(other_claims, "c-1", "Bash", ask_args)).action == "ask"
+
+
+async def test_the_old_always_allow_flag_still_writes_a_user_rule(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    _, _, pending = await paused_approval(client, engine, tenant)
+    decided = await client.post(
+        f"/approvals/{pending['id']}/approve", headers=mia(tenant), json={"always_allow": True}
+    )
+    assert decided.json()["scope"] == "always"
+    async with engine.connect() as connection:
+        rules = (
+            (
+                await connection.execute(
+                    select(ToolPolicy.tool).where(ToolPolicy.org_id == tenant.org)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rules == ["Bash"]
+
+
+async def test_an_unknown_scope_is_refused(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness, run_id, pending = await paused_approval(client, engine, tenant)
+    response = await client.post(
+        f"/approvals/{pending['id']}/approve", headers=mia(tenant), json={"scope": "forever"}
+    )
+    assert response.status_code == 422
+    assert await harness.status_is(run_id, "paused")
 
 
 async def test_an_org_member_outside_the_workspace_cannot_decide(

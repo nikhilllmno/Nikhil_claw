@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import delete, insert, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import (
@@ -26,6 +26,7 @@ from sama.db.models import (
     Org,
     Run,
     Session,
+    SessionToolAllow,
     ToolCall,
     ToolPolicy,
     User,
@@ -37,6 +38,7 @@ from sama.gate.service import (
     ApprovalError,
     ApprovalExpiredError,
     GateService,
+    allowed_scopes,
     stored_arguments,
 )
 from sama.tenancy import RunTokenClaims
@@ -1252,3 +1254,363 @@ async def test_plan_mode_with_a_ticket_still_obeys_a_new_deny_rule(
         )
     assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"
     assert (await call_row(engine, org, "c1")).status != "finished"
+
+
+# -- the approval scope "session" and the direct mode of a coding agent -----------------------
+
+
+async def decide_scope(
+    gate: GateService,
+    org: Org1,
+    call_id: str = "c1",
+    *,
+    scope: Any = "session",
+    run: str = "run",
+    user: str = "mia",
+    approve: bool = True,
+) -> Any:
+    return await gate.decide_with_scope(
+        org_id=org.ids["org"],
+        run_id=org.ids[run],
+        call_id=call_id,
+        user_id=org.ids[user],
+        approve=approve,
+        scope=scope,
+    )
+
+
+async def session_allows(engine: AsyncEngine, org: Org1) -> list[tuple[str, uuid.UUID, uuid.UUID]]:
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            select(
+                SessionToolAllow.tool, SessionToolAllow.user_id, SessionToolAllow.session_id
+            ).where(SessionToolAllow.org_id == org.ids["org"])
+        )
+        return [(tool, user, session) for tool, user, session in rows]
+
+
+async def test_a_session_approval_lets_the_tool_run_for_the_rest_of_the_session(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    decision = await decide_scope(gate, org)
+    assert (decision.status, decision.scope) == ("approved", "session")
+    assert await session_allows(engine, org) == [("Bash", org.ids["mia"], org.ids["shared"])]
+    verdict = await gate.check(org.claims(), "c2", "Bash", {"command": "make lint"})
+    assert (verdict.action, verdict.step) == ("allow", GateStep.POLICY)
+    assert "session" in verdict.reason
+    # A new attended run of the session does not ask either.
+    assert (await gate.check(org.claims(), "c3", "Bash", {"command": "make docs"})).action == (
+        "allow"
+    )
+    entries = await audit(engine, org)
+    approved = [d for a, _, d in entries if a == "approval.approved"]
+    assert [d["scope"] for d in approved] == ["session"]
+    assert [d["tool"] for a, _, d in entries if a == "tool_policy.session_allow"] == ["Bash"]
+    # No user rule: the grant ends with the session.
+    async with engine.connect() as connection:
+        rules = (
+            await connection.execute(
+                select(func.count())
+                .select_from(ToolPolicy)
+                .where(ToolPolicy.org_id == org.ids["org"])
+            )
+        ).scalar_one()
+    assert rules == 0
+
+
+async def test_a_session_approval_keeps_the_rest_of_the_call_rules(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    # Another tool still asks.
+    assert (await gate.check(org.claims(), "c2", "Write", {"file_path": "a"})).action == "ask"
+    assert len(await session_allows(engine, org)) == 1
+
+
+async def test_a_session_approval_does_not_reach_another_session_or_user(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    other_session = org.claims("secret-run", session_id=str(org.ids["secret"]))
+    assert (await gate.check(other_session, "c2", "Bash", ARGS)).action == "ask"
+    # The grant of the other session is its own rule.
+    await ask(gate, org, "c4", run="secret-run")
+    await decide_scope(gate, org, "c4", run="secret-run")
+    assert (await gate.check(other_session, "c5", "Bash", ARGS)).action == "allow"
+    assert {session for _, _, session in await session_allows(engine, org)} == {
+        org.ids["shared"],
+        org.ids["secret"],
+    }
+
+
+async def test_an_admin_session_approval_is_for_the_admin_only(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    decision = await decide_scope(gate, org, user="admin")
+    assert decision.scope == "session"
+    # The run belongs to mia, and the rule is for the admin.
+    assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == "ask"
+
+
+@pytest.mark.parametrize("action", ["deny", "ask"])
+async def test_a_policy_rule_wins_over_a_session_approval(
+    engine: AsyncEngine, org: Org1, action: str
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    await add_rule(engine, org, "Bash", action)
+    assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == action
+
+
+async def test_a_user_deny_rule_wins_over_a_session_approval(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    await add_rule(engine, org, "Bash", "deny", user="mia")
+    assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == "deny"
+
+
+async def test_the_hardline_list_wins_over_a_session_approval(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    verdict = await gate.check(org.claims(), "c2", "Bash", {"command": "rm -rf /"})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.HARDLINE)
+
+
+async def test_a_rejection_or_once_writes_no_session_rule(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    denied = await decide_scope(gate, org, approve=False)
+    assert (denied.status, denied.scope) == ("rejected", "once")
+    await ask(gate, org, "c2")
+    once = await decide_scope(gate, org, "c2", scope="once")
+    assert (once.status, once.scope) == ("approved", "once")
+    assert await session_allows(engine, org) == []
+
+
+async def test_a_tool_that_always_asks_gets_only_the_scope_once(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await set_profile(engine, org, toolsets=["core", "github"], group_toolsets=["core", "github"])
+    verdict = await gate.check(org.claims(), "c1", "repo_push_approval", {"path": "a"})
+    assert verdict.action == "ask"
+    decision = await decide_scope(gate, org, scope="session")
+    assert decision.scope == "once"
+    assert await session_allows(engine, org) == []
+
+
+async def test_the_old_always_allow_flag_means_the_scope_always(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    decision = await gate.decide_with_scope(
+        org_id=org.ids["org"],
+        run_id=org.ids["run"],
+        call_id="c1",
+        user_id=org.ids["mia"],
+        approve=True,
+        always_allow=True,
+    )
+    assert decision.scope == "always"
+    assert await session_allows(engine, org) == []
+    assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == "allow"
+    approved = [d for a, _, d in await audit(engine, org) if a == "approval.approved"]
+    assert (approved[0]["scope"], approved[0]["always_allow"]) == ("always", True)
+
+
+def test_the_scopes_of_a_tool() -> None:
+    assert allowed_scopes("Bash", proposal=False) == ("once", "session", "always")
+    assert allowed_scopes("Bash", proposal=True) == ("once",)
+    assert allowed_scopes("repo_push_approval", proposal=False) == ("once",)
+    assert allowed_scopes("db_main_execute", proposal=False) == ("once",)
+
+
+async def test_a_session_rule_does_not_beat_plan_mode(engine: AsyncEngine, org: Org1) -> None:
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Session).where(Session.id == org.ids["shared"]).values(plan_mode=True)
+        )
+    verdict = await gate.check(org.claims(), "c2", "Bash", {"command": "make build"})
+    assert (verdict.action, verdict.step) == ("deny", GateStep.PLAN)
+
+
+# -- direct mode of a coding agent (Section 15.4) ---------------------------------------------
+
+CODING_ARGS = {"agent": "claude_code", "repo": "", "prompt": "fix it", "open_pr": False}
+
+
+async def direct_run(
+    engine: AsyncEngine,
+    org: Org1,
+    run: str,
+    *,
+    runtime: str = "claude_code",
+    coding_agent: str | None = None,
+    user: str | None = "mia",
+    unattended: bool = False,
+    human: bool = True,
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run)
+            .where(Run.id == org.ids[run])
+            .values(
+                runtime=runtime,
+                coding_agent=coding_agent,
+                triggered_by_user_id=org.ids[user] if user else None,
+                unattended=unattended,
+                human_origin=human,
+            )
+        )
+
+
+async def coding_profile(engine: AsyncEngine, org: Org1) -> None:
+    await set_profile(
+        engine,
+        org,
+        toolsets=["core", "coding_agents"],
+        group_toolsets=["core", "coding_agents"],
+    )
+
+
+async def test_direct_mode_in_a_private_session_of_the_owner_needs_no_approval(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await coding_profile(engine, org)
+    await direct_run(engine, org, "secret-run")
+    gate = GateService(engine)
+    claims = private_claims(org)
+    verdict = await gate.check(claims, "c1", "coding_agent_run", CODING_ARGS)
+    assert verdict.action == "allow"
+    plan = await gate.check(claims, "c2", "coding_agent_plan", CODING_ARGS)
+    assert plan.action == "allow"
+    assert await approval(engine, org, "c1") is None
+    # The same applies when the run has no starting user: the owner is the user.
+    await direct_run(engine, org, "secret-run", user=None)
+    assert (await gate.check(claims, "c3", "coding_agent_run", CODING_ARGS)).action == "allow"
+
+
+async def test_direct_mode_keeps_deny_and_ask_rules(engine: AsyncEngine, org: Org1) -> None:
+    await coding_profile(engine, org)
+    await direct_run(engine, org, "secret-run")
+    gate = GateService(engine)
+    claims = private_claims(org)
+    await add_rule(engine, org, "coding_agent_run", "ask")
+    assert (await gate.check(claims, "c1", "coding_agent_run", CODING_ARGS)).action == "ask"
+    await add_rule(engine, org, "coding_agent_run", "deny", user="mia")
+    assert (await gate.check(claims, "c2", "coding_agent_run", CODING_ARGS)).action == "deny"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "coding_agent", "unattended", "human"),
+    [
+        ("claude_agent_sdk", None, False, True),  # an explicit call of the sama agent
+        ("claude_code", "claude_code", False, True),  # one message of "/claude <task>"
+        ("claude_code", None, True, True),  # a job or a delegated run
+        ("claude_code", None, False, False),  # an org API key that waits for approvals
+    ],
+)
+async def test_other_runs_of_a_private_session_keep_the_normal_policy(
+    engine: AsyncEngine,
+    org: Org1,
+    runtime: str,
+    coding_agent: str | None,
+    unattended: bool,
+    human: bool,
+) -> None:
+    await coding_profile(engine, org)
+    await direct_run(
+        engine,
+        org,
+        "secret-run",
+        runtime=runtime,
+        coding_agent=coding_agent,
+        unattended=unattended,
+        human=human,
+    )
+    gate = GateService(engine)
+    verdict = await gate.check(private_claims(org), "c1", "coding_agent_run", CODING_ARGS)
+    assert verdict.action == ("deny" if unattended else "ask")
+
+
+async def test_direct_mode_in_a_shared_session_asks_once_then_the_session_rule_allows(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await coding_profile(engine, org)
+    await direct_run(engine, org, "run")
+    gate = GateService(engine)
+    first = await gate.check(org.claims(), "c1", "coding_agent_run", CODING_ARGS)
+    assert first.action == "ask"
+    # The person approves "once", and the gate stores it as a session approval.
+    decision = await decide_scope(gate, org, scope="once")
+    assert (decision.status, decision.scope) == ("approved", "session")
+    assert await session_allows(engine, org) == [
+        ("coding_agent_run", org.ids["mia"], org.ids["shared"])
+    ]
+    again = {**CODING_ARGS, "prompt": "and now the tests"}
+    assert (await gate.check(org.claims(), "c2", "coding_agent_run", again)).action == "allow"
+    # Another member of the shared session asks once for himself.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Run).where(Run.id == org.ids["run"]).values(triggered_by_user_id=org.ids["max"])
+        )
+    assert (await gate.check(org.claims(), "c3", "coding_agent_run", again)).action == "ask"
+
+
+async def test_an_explicit_call_of_the_sama_agent_keeps_the_scope_once(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await coding_profile(engine, org)
+    gate = GateService(engine)
+    assert (await gate.check(org.claims(), "c1", "coding_agent_run", CODING_ARGS)).action == "ask"
+    decision = await decide_scope(gate, org, scope="once")
+    assert decision.scope == "once"
+    assert await session_allows(engine, org) == []
+    assert (await gate.check(org.claims(), "c2", "coding_agent_run", CODING_ARGS)).action == "ask"
+
+
+async def test_a_session_grant_does_not_reach_an_unattended_run(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """An unattended run (an API key with approvals ``deny``, a job, a delegated run) gets no
+    session grant: ``ask`` stays ``deny``, and only a pre-approval of a job version allows."""
+    gate = GateService(engine)
+    await ask(gate, org)
+    await decide_scope(gate, org)
+    assert (await gate.check(org.claims(), "c2", "Bash", ARGS)).action == "allow"
+    verdict = await gate.check(org.claims("night"), "c3", "Bash", ARGS)
+    assert (verdict.action, verdict.step) == ("deny", GateStep.CONTEXT)
+    assert await approval(engine, org, "c3") is None
+
+
+async def test_the_direct_mode_rule_of_a_session_grant_does_not_reach_an_unattended_run(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    await coding_profile(engine, org)
+    await direct_run(engine, org, "run")
+    gate = GateService(engine)
+    assert (await gate.check(org.claims(), "c1", "coding_agent_run", CODING_ARGS)).action == "ask"
+    await decide_scope(gate, org, scope="once")
+    assert (await gate.check(org.claims(), "c2", "coding_agent_run", CODING_ARGS)).action == "allow"
+    await direct_run(engine, org, "run", unattended=True)
+    verdict = await gate.check(org.claims(), "c3", "coding_agent_run", CODING_ARGS)
+    assert verdict.action == "deny"

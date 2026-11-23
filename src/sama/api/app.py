@@ -166,7 +166,14 @@ from sama.db.models import (
     Workspace,
 )
 from sama.db.models import Connection as ConnectionRow
-from sama.gate.service import ApprovalError, ApprovalExpiredError, GateService
+from sama.gate.service import (
+    ApprovalError,
+    ApprovalExpiredError,
+    ApprovalScope,
+    ApprovalScopeError,
+    GateService,
+    allowed_scopes,
+)
 from sama.gateway.chrome import ChromeHub, PageContext, PageError, page_message
 from sama.gateway.handoff import HandoffError, Handoffs
 from sama.gateway.pairing import PairingError, create_code
@@ -426,8 +433,12 @@ class Decision(_Body):
 
 
 class Approve(Decision):
+    scope: ApprovalScope | None = None
+    """How far the approval reaches. ``once``: this call. ``session``: also the same tool for
+    the rest of this session, for this user. ``always``: also this tool for this user and this
+    agent profile from now on. Empty: ``always`` when ``always_allow`` is true, else ``once``."""
     always_allow: bool = False
-    """Also allow this tool for this user and this agent profile from now on."""
+    """The old form of ``scope="always"``. ``scope`` wins when both are set."""
 
 
 class DataSettingsIn(_Body):
@@ -1677,14 +1688,16 @@ class SamaApi:
             principal: Me, approval_id: uuid.UUID, body: Approve | None = None
         ) -> JSONResponse:
             body = body or Approve()
-            return await self._decide(principal, approval_id, True, body.always_allow, body.reason)
+            return await self._decide(
+                principal, approval_id, True, body.always_allow, body.reason, body.scope
+            )
 
         @app.post("/approvals/{approval_id}/deny")
         async def deny(
             principal: Me, approval_id: uuid.UUID, body: Decision | None = None
         ) -> JSONResponse:
             reason = (body or Decision()).reason
-            return await self._decide(principal, approval_id, False, False, reason)
+            return await self._decide(principal, approval_id, False, False, reason, None)
 
         @app.get("/sessions/{session_id}/questions")
         async def questions(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -3347,6 +3360,9 @@ class SamaApi:
             "arguments": arguments,
             "reason": reason,
             "proposal": row.proposal_payload is not None,
+            "scopes": list(
+                allowed_scopes(row.tool_name, proposal=row.proposal_payload is not None)
+            ),
             "diff": diff,
             "created_at": row.created_at.isoformat(),
             "expires_at": row.expires_at.isoformat(),
@@ -4431,6 +4447,7 @@ class SamaApi:
                 attachments=attachments,
                 coding_agent=None if coding_agent is None else coding_agent.value,
                 parallel=parallel,
+                human=True,
             )
         except RateLimitedError as error:
             raise SendError(429, str(error), retry_after_s=error.retry_after_s) from None
@@ -4455,7 +4472,11 @@ class SamaApi:
                     content={"steered": True, "run_id": str(steer_id), "queued": False},
                 )
             run_id = await self._queue.enqueue(
-                org_id=access.org_id, session_id=session_id, text=text, user_id=access.user_id
+                org_id=access.org_id,
+                session_id=session_id,
+                text=text,
+                user_id=access.user_id,
+                human=True,
             )
         except RateLimitedError as error:
             return JSONResponse(
@@ -4773,16 +4794,18 @@ class SamaApi:
         approve: bool,
         always_allow: bool,
         reason: str | None,
+        scope: ApprovalScope | None,
     ) -> JSONResponse:
         org_id, user_id, run_id, call_id = await self._approval_target(principal, approval_id)
         try:
-            status = await self._gate.decide_approval(
+            decision = await self._gate.decide_with_scope(
                 org_id=org_id,
                 run_id=run_id,
                 call_id=call_id,
                 user_id=user_id,
                 approve=approve,
                 always_allow=always_allow,
+                scope=scope,
                 reason=reason,
             )
         except ApprovalExpiredError as error:
@@ -4790,11 +4813,19 @@ class SamaApi:
             await self._queue.release_decided(org_id=org_id, run_id=run_id)
             await self._apply_reviews(org_id, run_id)
             return JSONResponse(status_code=409, content={"detail": str(error)})
+        except ApprovalScopeError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
         except ApprovalError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         resumed = await self._queue.release_decided(org_id=org_id, run_id=run_id)
         await self._apply_reviews(org_id, run_id)
-        return JSONResponse(content={"status": status, "resumed": bool(resumed)})
+        return JSONResponse(
+            content={
+                "status": decision.status,
+                "scope": decision.scope,
+                "resumed": bool(resumed),
+            }
+        )
 
     async def _apply_reviews(self, org_id: uuid.UUID, run_id: uuid.UUID) -> None:
         """Applies a decided proposal of a background review at once (Section 9.4). The worker
