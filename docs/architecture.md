@@ -1065,6 +1065,24 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   tools with the switch off, so the gate allows `ToolSearch` in every run (a tool loader,
   Section 16.1). When a run has many connector tools, sama `tool_search`
   (Section 10.3) does this job.
+- **Built-in tools of the CLI.** The adapter gives `tools` (the CLI flag `--tools`): only the
+  built-in tools that a sama toolset has (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`,
+  `NotebookEdit`, `Glob`, `Grep`, `WebFetch`, `TodoWrite`, `Task`, `Agent`,
+  `AskUserQuestion`) and the loader `ToolSearch`. The list does not limit MCP tools, and the CLI
+  ignores a name that it does not know. Without the list, the CLI also offers its own features
+  (`CronCreate`, `WebSearch`, `Monitor`, and more). The gate denies them, so the model lost a
+  turn and told the user that a feature was not available. Sama has its own tools for them
+  (`cronjob_manage`, `web_search`). The gate still checks the toolsets of the run.
+- **Auto memory off.** The adapter sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. With auto memory
+  on, the CLI tells the model to save facts about the user in files under
+  `~/.claude/projects/<cwd>/memory`. Those files stay in one sandbox: a new session did not
+  know the fact, and the sama `memory` tool (Section 8) did not get it. `ClaudeSettings.env`
+  can override the switch.
+- **WebFetch.** The adapter gives the CLI the settings `{"skipWebFetchPreflight": true}`, as
+  the coding agents do (Section 15.4). Before each `WebFetch`, the CLI asks claude.ai if the
+  domain is safe. The sandbox cannot reach that check, so every `WebFetch` failed with "Unable
+  to verify if domain ... is safe to fetch". `WebFetch` still gets `ask` by default
+  (Section 16.1).
 - **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
   16.1). `allow` and `deny` go to the CLI.
   `ask` becomes `defer`. A sub-agent cannot pause the run, so the hook tells the gate that a

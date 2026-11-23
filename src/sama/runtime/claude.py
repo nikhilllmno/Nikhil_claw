@@ -159,6 +159,24 @@ _NATIVE_TOOLS: Final = frozenset(
 )
 """The sama tools that the CLI has built in. Every other sama tool is a tool of the sama MCP
 server, and the CLI names it ``mcp__sama__<tool>``."""
+_CLI_TOOLS: Final = sorted(_NATIVE_TOOLS | _SUBAGENT_TOOLS | {ASK_USER_QUESTION, "ToolSearch"})
+"""The built-in tools that the CLI offers to the model (``--tools``). Without the list, the CLI
+also offers its own features, for example ``CronCreate``, ``WebSearch``, and ``Monitor``. No
+sama toolset has them, so the gate denies each call, and the model loses a turn and tells the
+user that a feature is "not available". Sama has its own tools for them (``cronjob_manage``,
+``web_search``). ``AskUserQuestion`` stays, because sama supports it (M8.3, toolset
+``clarify``). ``ToolSearch`` stays, because the CLI can defer MCP tools. The CLI ignores a name
+that it does not know (``MultiEdit``, ``TodoWrite`` in new versions). The list does not limit
+the MCP tools."""
+AUTO_MEMORY_ENV: Final = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+"""CLI switch: no auto memory. With it on, the CLI tells the model to save facts about the user
+in files under ``~/.claude/projects/<cwd>/memory``. Those files stay in one sandbox, so a new
+session does not see them, and the sama ``memory`` tool does not get the fact (Section 8)."""
+_CLI_SETTINGS: Final = json.dumps({"skipWebFetchPreflight": True})
+"""Settings of the CLI (``--settings``). Before each ``WebFetch``, the CLI asks claude.ai if the
+domain is safe. The sandbox cannot reach that check, so every ``WebFetch`` failed with "Unable
+to verify if domain ... is safe to fetch". The coding agents (Section 15.4) use the same
+setting."""
 _SAMA_MCP_PREFIX: Final = "mcp__sama__"
 _PREVIEW_CHARS: Final = 2_000
 _VOLATILE_ENV_PREFIXES: Final = ("E2B_", "SAMA_RUNNER_", "SAMA_RUN_TOKEN")
@@ -1483,6 +1501,7 @@ class ClaudeRuntime:
         env = {
             TOOL_SEARCH_ENV: "false",
             MCP_TOOL_TIMEOUT_ENV: str(MCP_TOOL_TIMEOUT_MS),
+            AUTO_MEMORY_ENV: "1",
             **settings.env,
         }
         if relay is not None:
@@ -1502,6 +1521,8 @@ class ClaudeRuntime:
             agents=_agents(config),
             strict_mcp_config=True,
             setting_sources=[],
+            tools=list(_CLI_TOOLS),
+            settings=_CLI_SETTINGS,
             disallowed_tools=disallowed,
             resume=translator.session_id,
             max_turns=_remaining_turns(budget, translator),
