@@ -297,7 +297,8 @@ class GateService:
                 )
             else:
                 escalate = self._escalate(claims, name, effective)
-                verdict = decide(run.context, tool_name, original, escalate=escalate)
+                context = dataclasses.replace(run.context, child=True) if child else run.context
+                verdict = decide(context, tool_name, original, escalate=escalate)
                 if child and verdict.action == "ask":
                     verdict = Verdict(
                         "deny", GateStep.POLICY, "a sub-agent cannot ask for an approval"

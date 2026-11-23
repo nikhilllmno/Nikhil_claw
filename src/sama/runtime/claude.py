@@ -189,6 +189,13 @@ class ClaudeClient(Protocol):
 ClientFactory = Callable[[ClaudeAgentOptions], ClaudeClient]
 
 
+def _uses_preset(config: RunConfig, settings: ClaudeSettings) -> bool:
+    """True when the run puts the prefix after the Claude Code preset (``ClaudeSettings``)."""
+    if settings.claude_code_preset is not None:
+        return settings.claude_code_preset
+    return config.claude_code_preset is not False
+
+
 def _sdk_client(options: ClaudeAgentOptions) -> ClaudeClient:
     return cast(ClaudeClient, ClaudeSDKClient(options))
 
@@ -202,16 +209,18 @@ class ClaudeSettings:
     waits for the CLI to stop by itself before the adapter stops the stream. Keep it well
     under 10 seconds.
 
-    ``claude_code_preset`` puts the prompt prefix after the Claude Code preset of the SDK. It is
-    off since M8.5: the CLI gets the sama prefix alone, so the agent presents itself as Sama and
-    not as a coding CLI. On the M8.5 benchmark both choices scored the same, and the prefix alone
-    cost about a quarter less (docs/architecture.md, Section 5.2).
+    ``claude_code_preset`` overrides ``RunConfig.claude_code_preset`` for every run of the
+    process. ``None`` (the default) follows the frozen config: a new session (since M8.5) sends
+    the sama prefix alone, so the agent presents itself as Sama and not as a coding CLI, and a
+    session from before M8.5 keeps the preset that it started with (decision D9). On the M8.5
+    benchmark both choices scored the same, and the prefix alone cost about a quarter less
+    (docs/architecture.md, Section 5.2).
     """
 
     cwd: str | None = None
     cli_path: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
-    claude_code_preset: bool = False
+    claude_code_preset: bool | None = None
     cancel_grace_s: float = 5.0
     session_exists: Callable[[str], bool] | None = None
     """Checks that the CLI can resume an SDK session (its transcript is there). The runner sets
@@ -1402,7 +1411,7 @@ class ClaudeRuntime:
         parts = [
             config.fingerprint(),
             str(None if budget.max_turns is None else budget.max_turns - turns_used),
-            str(settings.claude_code_preset),
+            str(_uses_preset(config, settings)),
             str(self._archiver is not None),
             settings.cwd or "",
             settings.cli_path or "",
@@ -1462,7 +1471,7 @@ class ClaudeRuntime:
         relay = settings.relay
         prefix = config.render_prefix()
         system_prompt: str | SystemPromptPreset
-        if settings.claude_code_preset:
+        if _uses_preset(config, settings):
             system_prompt = {
                 "type": "preset",
                 "preset": "claude_code",

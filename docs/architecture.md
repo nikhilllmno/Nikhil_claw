@@ -1029,7 +1029,7 @@ RunEvent = (
 | Package | `claude-agent-sdk` (Python). It drives the bundled Claude Code CLI as a subprocess, so the sandbox image needs the CLI. | `openai-agents` (Python), in process. |
 | Turn API | `ClaudeSDKClient.query()` and `receive_response()` | `Runner.run_streamed()` |
 | Model routing | `ANTHROPIC_BASE_URL` points at the sama model proxy; the run token is the API key. | `AsyncOpenAI(base_url=<proxy>/openai/v1, api_key=<run token>)` and the Responses API |
-| System prompt | The sama prefix as the full `system_prompt` (since M8.5). `ClaudeSettings.claude_code_preset=True` puts it after the preset `claude_code` instead. | `Agent.instructions` |
+| System prompt | The sama prefix as the full `system_prompt` for a session from M8.5 on (`RunConfig.claude_code_preset=False`). A session from before M8.5 keeps the preset `claude_code` with the prefix appended. `ClaudeSettings.claude_code_preset` overrides both. | `Agent.instructions` |
 | Sama tools | `mcp_servers` with the sama MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the sama tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
 | Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to sama. | Serialised `RunState` plus a sama `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
@@ -1049,8 +1049,10 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
 
 - **Options.** `setting_sources=[]`, so no file settings from the sandbox apply.
   `strict_mcp_config=True`. Remote MCP servers are `http` servers with the run token in an
-  `Authorization` header. `include_partial_messages=True` gives text deltas. Since M8.5 the CLI gets the sama prefix
-  alone, without the Claude Code preset (`claude_code_preset=False`). The M8.5 benchmark (19
+  `Authorization` header. `include_partial_messages=True` gives text deltas. Since M8.5 a new session freezes
+  `RunConfig.claude_code_preset=False`, and the CLI gets the sama prefix alone, without the
+  Claude Code preset. A session from before M8.5 has no value and keeps the preset, so its system
+  prompt and its fingerprint do not change (D9). The M8.5 benchmark (19
   tasks, the same prompt, a local control plane) gave both choices 165 of 190 points. Without
   the preset the cost was 26% lower, and the agent answered "Who are you?" as Sama; with the
   preset it said that it ran "inside the Claude Code environment". With the preset on, the
@@ -5731,7 +5733,7 @@ fingerprint of a config without sub-agents does not change.
   toolset `subagents`. A rule can still deny them.
 - A sub-agent cannot pause the run. The gate gets `child` for a call inside a sub-agent. For
   such a call, it changes `ask` to `deny` before it records anything: the `tool_calls` row is
-  `denied`, and there is no pending approval and no `approval.requested` entry. A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it.
+  `denied`, and there is no pending approval and no `approval.requested` entry. A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it. Since M8.5 the gate judges a sub-agent call with `GateContext.child`, so the sandbox tools keep the default `ask` (then `deny`) in a sub-agent, also in a private chat where the run itself may use them without a card.
 - A sub-agent runs in the foreground. The adapter turns off the background tasks of the CLI.
 
 **Budget.** The model calls of a sub-agent go through the model proxy (D6) with the run

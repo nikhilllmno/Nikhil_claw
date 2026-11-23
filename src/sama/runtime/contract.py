@@ -268,6 +268,12 @@ class RunConfig(_Frozen):
     reasoning_effort: ReasoningEffort | None = None
     """How much the model thinks before it answers. ``None``: the default of the model. Each
     adapter passes it to its SDK."""
+    claude_code_preset: bool | None = None
+    """The Claude runtime puts the prefix after the Claude Code preset of the SDK (``True``), or
+    sends the prefix alone (``False``, the default of new sessions since M8.5). ``None``: a config
+    from before the field existed, which used the preset. The choice is frozen with the session,
+    so a session keeps the system prompt that it started with (decision D9). Other runtimes ignore
+    it."""
 
     @model_validator(mode="after")
     def _names_are_unique(self) -> Self:
@@ -292,6 +298,9 @@ class RunConfig(_Frozen):
         if self.reasoning_effort is None:
             # The same for a config with no reasoning effort.
             del payload["reasoning_effort"]
+        if self.claude_code_preset is None:
+            # The same for a config from before M8.5.
+            del payload["claude_code_preset"]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

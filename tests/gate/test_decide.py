@@ -1044,7 +1044,7 @@ def test_the_hermes_parity_tools_have_their_toolsets() -> None:
 # -- the sandbox tools (M8.5) -----------------------------------------------------------------
 
 
-SANDBOX_CALLS = {
+SANDBOX_CALLS: dict[str, dict[str, Any]] = {
     "Bash": ARGS,
     "Write": {"file_path": "/workspace/a.py", "content": "print(1)\n"},
     "Edit": {"file_path": "/workspace/a.py", "old_string": "1", "new_string": "2"},
@@ -1102,3 +1102,11 @@ def test_web_fetch_only_reads_so_it_is_allowed() -> None:
     assert decide(context(shared=True), "WebFetch", {"url": "https://example.com"}).action == (
         "allow"
     )
+
+
+def test_a_sandbox_tool_asks_for_a_native_sub_agent() -> None:
+    """The gate service turns this ``ask`` of a sub-agent into ``deny`` (Section 13.1)."""
+    assert decide(context(child=True), "Bash", ARGS).action == "ask"
+    allowed = context(child=True, rules=(rule("Bash", "allow", RuleLevel.PROFILE),))
+    assert decide(allowed, "Bash", ARGS).action == "allow"
+    assert decide(context(child=True), "Read", {"file_path": "a"}).action == "allow"

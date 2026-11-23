@@ -53,7 +53,8 @@ def _soul(url: str, profile_id: uuid.UUID) -> str:
 
 def _effort(url: str, profile_id: uuid.UUID) -> str | None:
     [row] = _fetch(url, "SELECT reasoning_effort FROM agent_profiles WHERE id = $1", profile_id)
-    return row["reasoning_effort"]
+    effort = row["reasoning_effort"]
+    return None if effort is None else str(effort)
 
 
 def test_the_migration_values_are_the_defaults_of_new_profiles() -> None:
@@ -150,3 +151,42 @@ def test_the_downgrade_keeps_a_soul_that_a_person_changed_after_the_fill() -> No
         _fetch(url, "UPDATE agent_profiles SET soul = 'Edited.' WHERE id = $1", a)
         command.downgrade(config, "0050")
         assert _soul(url, a) == "Edited."
+
+
+def test_the_downgrade_keeps_a_value_that_a_person_changed_away_and_back() -> None:
+    """A later change in the history of the field is a choice of a person, also when the value is
+    the filled value again. A revert of the fill is a choice too."""
+    with migrated_database() as url:
+        world = asyncio.run(seed(url))
+        config = alembic_config(url)
+        command.downgrade(config, "0050")
+        command.upgrade(config, "head")
+        a = world.ids["profile-a"]
+        for before, after in (("high", "low"), ("low", "high")):
+            _fetch(
+                url,
+                "INSERT INTO profile_changes (org_id, agent_profile_id, kind, source, before,"
+                " after, created_at) SELECT org_id, id, 'profile', 'edit',"
+                " jsonb_build_object('reasoning_effort', $2::text),"
+                " jsonb_build_object('reasoning_effort', $3::text), now() + interval '1 minute'"
+                " FROM agent_profiles WHERE id = $1",
+                a,
+                before,
+                after,
+            )
+        _fetch(
+            url,
+            "UPDATE profile_changes SET reverted_by_change_id = gen_random_uuid()"
+            " WHERE agent_profile_id = $1 AND summary = $2",
+            a,
+            _migration().SUMMARY,
+        )
+        command.downgrade(config, "0050")
+        assert _effort(url, a) == "high"  # changed away and back by a person
+        assert _soul(url, a) == _migration().SOUL  # the fill was reverted and done again
+        assert not _fetch(
+            url,
+            "SELECT 1 FROM profile_changes WHERE summary IN ($1, $2)",
+            _migration().SUMMARY,
+            _migration().EFFORT_SUMMARY,
+        )

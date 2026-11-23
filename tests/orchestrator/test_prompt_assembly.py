@@ -77,6 +77,7 @@ async def test_the_first_run_builds_and_stores_the_config(
     config = await PromptAssembler(engine, mcp_servers=[server])(run)
     assert (config.runtime, config.model) == (RuntimeKind.FAKE, "fake-model")
     assert (config.system, config.soul) == (SYSTEM_PROMPT, "You are a test agent.")
+    assert config.claude_code_preset is False  # M8.5: the sama prefix alone
     assert config.mcp_servers == (server,)
     assert "Audience: shared." in config.environment
     row = await stored(engine, tenant)

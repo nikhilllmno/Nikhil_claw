@@ -14,8 +14,10 @@ Each fill also writes the audit entry ``profile.updated``.
 
 The same profiles get ``reasoning_effort = 'high'`` when it is still null (the default of the
 model), with a ``profile_changes`` row of the kind ``profile``, so an admin sees it in the
-history and can revert it or lower it in the Harness section. A set value never changes. A session keeps the SOUL that it
-froze (decision D9), so the change applies from the next session.
+history and can revert it or lower it in the Harness section. A set value never changes.
+
+A session keeps the SOUL that it froze (decision D9), so the change applies from the next
+session.
 
 The text is a copy, so a later change of ``DEFAULT_SOUL`` does not change this migration. The
 tables have ``org_id`` and RLS already. No table is new.
@@ -102,31 +104,36 @@ SELECT h.org_id, 'system', 'profile.updated', 'agent_profile', h.agent_profile_i
 FROM history h
 """
 
-EFFORT_UNFILL = """
-WITH changes AS (
-    DELETE FROM profile_changes c
-    WHERE c.kind = 'profile' AND c.source = 'edit' AND c.actor_user_id IS NULL
-      AND c.summary = :summary
-    RETURNING c.org_id, c.agent_profile_id
-)
-UPDATE agent_profiles p
-SET reasoning_effort = NULL, updated_at = now()
-FROM changes c
-WHERE p.org_id = c.org_id AND p.id = c.agent_profile_id AND p.reasoning_effort = :effort
-"""
-
 UNFILL = """
-WITH changes AS (
-    DELETE FROM profile_changes c
-    WHERE c.kind = 'soul' AND c.source = 'edit' AND c.actor_user_id IS NULL
+WITH mine AS (
+    SELECT c.id, c.org_id, c.agent_profile_id, c.created_at, c.reverted_by_change_id
+    FROM profile_changes c
+    WHERE c.kind = :kind AND c.source = 'edit' AND c.actor_user_id IS NULL
       AND c.summary = :summary
-    RETURNING c.org_id, c.agent_profile_id
+),
+untouched AS (
+    SELECT m.org_id, m.agent_profile_id
+    FROM mine m
+    WHERE m.reverted_by_change_id IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM profile_changes l
+          WHERE l.org_id = m.org_id AND l.agent_profile_id = m.agent_profile_id
+            AND l.id <> m.id AND l.created_at >= m.created_at
+            AND (l.after -> CAST(:field AS text) IS NOT NULL
+                 OR l.before -> CAST(:field AS text) IS NOT NULL)
+      )
+),
+reset AS (
+    UPDATE agent_profiles p
+    SET {field} = {empty}, updated_at = now()
+    FROM untouched u
+    WHERE p.org_id = u.org_id AND p.id = u.agent_profile_id AND p.{field} = :value
+    RETURNING p.id
 )
-UPDATE agent_profiles p
-SET soul = '', updated_at = now()
-FROM changes c
-WHERE p.org_id = c.org_id AND p.id = c.agent_profile_id AND p.soul = :soul
+DELETE FROM profile_changes WHERE id IN (SELECT id FROM mine)
 """
+"""Undoes one fill. Only a value that has no later change in the history of the profile, and
+that is still the filled value, goes back. The history rows of the fill go away in all cases."""
 
 
 def upgrade() -> None:
@@ -136,7 +143,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Only a value that nobody changed after the fill goes back.
     bind = op.get_bind()
-    bind.execute(sa.text(EFFORT_UNFILL), {"effort": EFFORT, "summary": EFFORT_SUMMARY})
-    bind.execute(sa.text(UNFILL), {"soul": SOUL, "summary": SUMMARY})
+    for kind, field, empty, value, summary in (
+        ("profile", "reasoning_effort", "NULL", EFFORT, EFFORT_SUMMARY),
+        ("soul", "soul", "''", SOUL, SUMMARY),
+    ):
+        bind.execute(
+            sa.text(UNFILL.format(field=field, empty=empty)),
+            {"kind": kind, "field": field, "value": value, "summary": summary},
+        )

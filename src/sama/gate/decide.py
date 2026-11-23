@@ -183,7 +183,9 @@ SANDBOX_TOOLS: Final = frozenset(
 """Tools that work only in the sandbox of the session (M8.5). They are in ``DEFAULT_ALLOW`` for
 a private chat run. In a shared session and in an unattended run (a job, a workflow, a webhook)
 they get ``ask`` by default, as before M8.5: other people steer a shared chat, and nobody
-watches an unattended run, so a pre-approval of the job version must cover them. A rule of the
+watches an unattended run, so a pre-approval of the job version must cover them. A native
+sub-agent (``GateContext.child``) also gets ``ask``, which the gate service turns into ``deny``
+(Section 13.1). A rule of the
 org, the profile, or the user wins over this default, and the hardline list and plan mode come
 before it (Section 16.1)."""
 
@@ -396,6 +398,10 @@ class GateContext:
     """The tools of each toolset. The default is the fixed table."""
     access: Mapping[str, ToolAccess] = field(default_factory=dict)
     """What each deferred tool does, for its default policy (``ToolsetSource.access``)."""
+    child: bool = False
+    """The call comes from a native sub-agent (Section 13.1). The tools in ``SANDBOX_TOOLS`` keep
+    the default ``ask`` for it, as in a shared session (M8.5), and the gate service turns an
+    ``ask`` of a sub-agent into ``deny``. A rule that allows a tool still allows it."""
     plan_mode: bool = False
     """The session is in plan mode (Section 15.5): the tools that change files or data get
     ``deny`` (``sama.gate.plan``)."""
@@ -636,7 +642,7 @@ def context_policy(context: GateContext, name: str) -> Verdict:
         context.rules,
         name,
         shared=context.shared,
-        unattended=context.unattended,
+        unattended=context.unattended or context.child,
         access=context.access,
     )
     if context.frozen_rules is None:
@@ -645,7 +651,7 @@ def context_policy(context: GateContext, name: str) -> Verdict:
         context.frozen_rules,
         name,
         shared=context.shared,
-        unattended=context.unattended,
+        unattended=context.unattended or context.child,
         access=context.access,
     )
     if _STRICTNESS[frozen.action] > _STRICTNESS[live.action]:

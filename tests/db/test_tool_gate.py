@@ -271,6 +271,21 @@ async def test_a_call_of_a_subagent_that_would_ask_is_denied_and_has_no_approval
     assert row.status == "pending"
 
 
+async def test_a_sub_agent_in_a_private_session_cannot_run_a_sandbox_tool_by_default(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """Since M8.5 the run itself may run ``Bash`` in a private session without a card, but a
+    native sub-agent keeps the old default: ``ask``, which becomes ``deny`` (Section 13.1). An
+    allow rule still allows it."""
+    gate = GateService(engine)
+    claims = org.claims("secret-run", session_id=str(org.ids["secret"]))
+    assert (await gate.check(claims, "c1", "Bash", ARGS)).action == "allow"
+    child = await gate.check(claims, "c2", "Bash", ARGS, child=True)
+    assert (child.action, "sub-agent" in child.reason) == ("deny", True)
+    await add_rule(engine, org, "Bash", "allow")
+    assert (await gate.check(claims, "c3", "Bash", ARGS, child=True)).action == "allow"
+
+
 async def test_a_call_of_a_subagent_that_would_allow_is_allowed(
     engine: AsyncEngine, org: Org1
 ) -> None:

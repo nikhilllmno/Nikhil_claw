@@ -331,6 +331,8 @@ class PromptAssembler:
             if agent is not None
             else await _subagents(connection, run, runtime, toolsets),
             reasoning_effort=run.reasoning_effort,
+            # A new session sends the sama prefix alone (M8.5, Section 5.2).
+            claude_code_preset=False,
         )
 
     async def _skill_index(
