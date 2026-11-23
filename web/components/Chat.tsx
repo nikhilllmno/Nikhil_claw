@@ -866,9 +866,9 @@ export function Chat({ sessionId }: { sessionId: string }) {
         </div>
         <div className={styles.headerActions}>
           {paused ? (
-            <span className="badge badge-warning">Waiting for you</span>
+            <span className={`badge badge-warning ${styles.stateBadge}`}>Waiting for you</span>
           ) : running ? (
-            <span className="badge badge-accent">
+            <span className={`badge badge-accent ${styles.stateBadge}`}>
               <span className="spinner" aria-hidden="true" />{" "}
               {openRuns.length > 1 ? `${openRuns.length} runs working` : "Working"}
             </span>
