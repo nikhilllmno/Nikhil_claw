@@ -50,7 +50,7 @@ class Case:
     """One question of the eval. ``followup`` answers a question of the agent once."""
 
     id: str
-    kind: Literal["hotel", "flight", "product", "other"]
+    kind: Literal["hotel", "flight", "product", "other", "learn"]
     text: str
     followup: str = "Use your best judgement for anything I did not say, and go ahead."
 
@@ -158,6 +158,46 @@ CASES: Final[tuple[Case, ...]] = (
     ),
 )
 """18 questions. Relative dates keep the eval valid on any day."""
+
+
+LEARN_CASES: Final[tuple[Case, ...]] = (
+    Case(
+        "learn-hotel-prices",
+        "learn",
+        "can you learn this, \n\nWhenever i ask you to see the hotel's price, always go to"
+        " booking.com, expedia.com, hotel's website, google hotel's price and then extract the"
+        " price of that hotel for all kinds of rooms for those dates\n\nYou will need the exact"
+        " name of hotel, dates, number of people, pets (if any) before you can make a search",
+    ),
+    Case(
+        "learn-flight-prices",
+        "learn",
+        "Remember this for the future: when I ask for a flight price, always check Google"
+        " Flights and the airline's own site, and show the cheapest fare with its baggage rules.",
+    ),
+    Case(
+        "learn-product-prices",
+        "learn",
+        "From now on, when I ask you to compare product prices, always include Amazon and Best"
+        " Buy and give the price with tax if the page shows it.",
+    ),
+)
+"""The "learn this" probe (``--learn``): the first one is the production message of
+2026-11-23 that the Claude runtime saved only in a sandbox file."""
+
+LEARN_TOOLS: Final = frozenset({"memory", "skill_manage"})
+"""The sama stores that later sessions read. The runner approves them in a learn case."""
+
+Learned = Literal["saved", "file_only", "not_saved", "error"]
+
+
+def learned(result: Result) -> Learned:
+    """How a learn case kept the rule: in a sama store, only in a sandbox file, or not at all."""
+    if LEARN_TOOLS & set(result.tools):
+        return "saved"
+    if result.writes:
+        return "file_only"
+    return "error" if result.error is not None or not result.answers else "not_saved"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -312,6 +352,12 @@ class Result:
     cost_usd: float = 0.0
     seconds: float = 0.0
     error: str | None = None
+    writes: list[str] = field(default_factory=list)
+    """The files that the agent wrote with the native ``Write`` or ``Edit`` tools."""
+    skills: list[str] = field(default_factory=list)
+    """The skills that the agent loaded with ``skill_view``."""
+    learned: str | None = None
+    """The outcome of a learn case (``learned``); ``None`` for a price case."""
 
 
 class Api:
@@ -366,7 +412,7 @@ async def _settle(
         for approval in await api.call("GET", f"/sessions/{session_id}/approvals"):
             tool = approval["tool_name"]
             result.approvals.append(tool)
-            if tool in AUTO_APPROVE:
+            if tool in AUTO_APPROVE or (case.kind == "learn" and tool in LEARN_TOOLS):
                 await api.call("POST", f"/approvals/{approval['id']}/approve", {"scope": "session"})
             else:
                 await api.call(
@@ -426,6 +472,16 @@ async def run_case(
             result.cost_usd += float(run["cost_usd"])
             trace = await api.call("GET", f"/runs/{run['id']}/trace")
             result.tools.extend(call["tool_name"] for call in trace["tool_calls"])
+            result.skills.extend(
+                str(call["arguments"].get("name"))
+                for call in trace["tool_calls"]
+                if call["tool_name"] == "skill_view"
+            )
+            result.writes.extend(
+                str(call["arguments"].get("file_path"))
+                for call in trace["tool_calls"]
+                if call["tool_name"] in {"Write", "Edit", "MultiEdit"}
+            )
             if run["status"] == "failed":
                 result.error = f"{run['failure_code']}: {run['failure_message']}"
         if not ok:
@@ -433,6 +489,8 @@ async def run_case(
         result.answers = answers
         result.deflections = [d for answer in answers for d in deflections(answer)]
         result.outcome = classify(answers, failed=failed)
+        if case.kind == "learn":
+            result.learned = learned(result)
     except (httpx.HTTPError, KeyError, ValueError) as error:
         result.error = f"{type(error).__name__}: {error}"
         result.outcome = classify(result.answers, failed=True)
@@ -447,7 +505,12 @@ async def _answers(api: Api, session_id: str) -> list[str]:
 
 
 def summary(results: Iterable[Result]) -> str:
-    """A Markdown table: the count of each outcome per runtime, and the totals."""
+    """A Markdown table: the count of each outcome per runtime, and the totals. Learn cases get
+    their own table."""
+    results = list(results)
+    learn = [result for result in results if result.kind == "learn"]
+    if learn:
+        return learn_summary(learn)
     rows: dict[str, Counter[str]] = {}
     cost: Counter[str] = Counter()
     browser: Counter[str] = Counter()
@@ -468,6 +531,22 @@ def summary(results: Iterable[Result]) -> str:
             f"| {runtime} | {total} | {' | '.join(cells)} | {browser[runtime]}"
             f" | {cost[runtime] / 100:.2f} |"
         )
+    return "\n".join(lines)
+
+
+def learn_summary(results: Iterable[Result]) -> str:
+    """A Markdown table of the learn probe: how each runtime kept the rule."""
+    rows: dict[str, Counter[str]] = {}
+    for result in results:
+        rows.setdefault(result.runtime, Counter())[result.learned or "error"] += 1
+    lines = [
+        "| Runtime | Cases | Saved in memory or a skill | Only in a sandbox file | Not saved"
+        " | Error |",
+        "|---|---|---|---|---|---|",
+    ]
+    for runtime, counts in sorted(rows.items()):
+        cells = [str(counts[k]) for k in ("saved", "file_only", "not_saved", "error")]
+        lines.append(f"| {runtime} | {sum(counts.values())} | {' | '.join(cells)} |")
     return "\n".join(lines)
 
 
@@ -526,7 +605,8 @@ def _done(path: Path) -> set[tuple[str, str]]:
 
 async def run(args: argparse.Namespace, guard: SandboxGuard | None = None) -> list[Result]:
     profiles = dict(item.split("=", 1) for item in args.profile)
-    cases = [case for case in CASES if not args.case or case.id in args.case]
+    pool = LEARN_CASES if args.learn else CASES
+    cases = [case for case in pool if not args.case or case.id in args.case]
     api = Api(args.api, Path(args.token_file))
     out = Path(args.out)
     done = _done(out / "results.jsonl") if args.resume else set()
@@ -575,6 +655,8 @@ def rescore(path: Path) -> list[Result]:
         failed = result.error is not None
         result.deflections = [d for answer in result.answers for d in deflections(answer)]
         result.outcome = classify(result.answers, failed=failed)
+        if result.kind == "learn":
+            result.learned = learned(result)
         results[(result.case, result.runtime)] = result
     return list(results.values())
 
@@ -592,6 +674,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--case", action="append", help="run only this case id (repeatable)")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=480.0, help="seconds per turn")
+    parser.add_argument(
+        "--learn",
+        action="store_true",
+        help="run the 'learn this' probe: does the agent save a rule in memory or a skill?",
+    )
     parser.add_argument(
         "--resume", action="store_true", help="skip the cases that results.jsonl already has"
     )

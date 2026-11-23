@@ -191,6 +191,7 @@ async def test_the_runner_waits_for_room_releases_each_session_and_resumes(
         token_file=str(token),
         out=str(tmp_path),
         resume=True,
+        learn=False,
         concurrency=2,
         workspace="w1",
         timeout=1.0,
@@ -203,3 +204,26 @@ async def test_the_runner_waits_for_room_releases_each_session_and_resumes(
         ("wyndham-vague", "off_platform"),
     ]
     assert "| claude | 2 | 1 | 1 | 0 | 0 |" in (tmp_path / "summary.md").read_text()
+
+
+def test_a_learn_case_is_saved_only_through_a_sama_store() -> None:
+    from sama.evals.off_platform import LEARN_CASES, learn_summary, learned
+
+    assert "can you learn this" in LEARN_CASES[0].text
+    saved = Result("l", "learn", "claude", answers=["Saved."], tools=["skill_manage"])
+    file_only = Result(
+        "l",
+        "learn",
+        "openai",
+        answers=["Saved."],
+        tools=["Read", "Write"],
+        writes=["/home/user/.claude/projects/-home-user-work/memory/hotel.md"],
+    )
+    nothing = Result("l", "learn", "openai", answers=["OK, I will."])
+    assert [learned(r) for r in (saved, file_only, nothing)] == ["saved", "file_only", "not_saved"]
+    for result in (saved, file_only, nothing):
+        result.learned = learned(result)
+    table = learn_summary([saved, file_only, nothing])
+    assert "| claude | 1 | 1 | 0 | 0 | 0 |" in table
+    assert "| openai | 2 | 0 | 1 | 1 | 0 |" in table
+    assert summary([saved]) == learn_summary([saved])
