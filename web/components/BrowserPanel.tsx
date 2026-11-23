@@ -82,7 +82,7 @@ export function BrowserPanel({
             </p>
           ) : null}
         </div>
-        {running && live?.view_url ? (
+        {running && userControl && live?.view_url ? (
           <a className="btn btn-quiet btn-small" href={live.view_url} target="_blank" rel="noopener noreferrer">
             Open in new tab
           </a>
@@ -95,7 +95,9 @@ export function BrowserPanel({
       {live !== null ? (
         <div className={`${styles.bar} ${userControl ? styles.barUser : ""}`} role="status">
           {userControl ? (
-            <span className={styles.barText}>You have control. The agent waits.</span>
+            <span className={styles.barText}>
+              You have control. The agent waits. Close any live view tab before you give back.
+            </span>
           ) : (
             <span className={styles.barText}>
               {running ? <span className="spinner" aria-hidden="true" /> : null}
@@ -130,15 +132,20 @@ export function BrowserPanel({
 
       <div className={styles.view}>
         {shown && frame !== null ? (
-          <iframe
-            key={frame.url}
-            src={frame.url}
-            title={`Live view: ${live?.title || shortUrl(live?.page_url) || "browser"}`}
-            className={`${styles.frame} ${userControl ? "" : styles.frameReadOnly}`}
-            sandbox="allow-same-origin allow-scripts"
-            allow="clipboard-read; clipboard-write"
-            referrerPolicy="no-referrer"
-          />
+          // While the agent has control, `inert` keeps the pointer and the keyboard out of the
+          // live view; the person only watches.
+          <div className={styles.frameBox} inert={!userControl}>
+            <iframe
+              key={frame.url}
+              src={frame.url}
+              title={`Live view: ${live?.title || shortUrl(live?.page_url) || "browser"}`}
+              className={`${styles.frame} ${userControl ? "" : styles.frameReadOnly}`}
+              tabIndex={userControl ? 0 : -1}
+              sandbox="allow-same-origin allow-scripts"
+              allow="clipboard-read; clipboard-write"
+              referrerPolicy="no-referrer"
+            />
+          </div>
         ) : (
           <p className={styles.empty}>
             {live !== null && live.target === "my_chrome"

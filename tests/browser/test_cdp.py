@@ -387,3 +387,28 @@ async def test_the_live_view_follows_the_active_tab(
     session._live = None
     assert await session.live_view(600) is None
     await session.close()
+
+
+async def test_the_live_view_matches_the_tab_by_its_target_id(
+    browser: Browser, guard: DenyHosts, site: str
+) -> None:
+    """Two tabs with the same URL: the CDP target id of the active page picks the tab."""
+    ids: list[str] = []
+
+    async def pages(ttl: int) -> list[dict[str, object]]:
+        return [
+            {"id": ids[0], "url": f"{site}/", "debuggerFullscreenUrl": "https://bb.test/mine"},
+            {"id": "other", "url": f"{site}/", "debuggerFullscreenUrl": "https://bb.test/other"},
+        ]
+
+    session = await PlaywrightSession.attach(browser, guard, target="cloud", live=pages)
+    await session.navigate(f"{site}/")
+    page = session._active
+    assert page is not None
+    cdp = await page.context.new_cdp_session(page)
+    ids.append(str((await cdp.send("Target.getTargetInfo"))["targetInfo"]["targetId"]))
+    await cdp.detach()
+    view = await session.live_view(600)
+    assert view is not None
+    assert view.view_url == "https://bb.test/mine?navbar=false"
+    await session.close()

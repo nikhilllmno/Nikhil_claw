@@ -350,15 +350,20 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const paused = isPaused(live);
   const stoppingNow = stopping && running;
 
-  // The live browser of an open run (M8.3). The live view URL comes only from the API.
+  // The live browser of an open run (M8.3). The live view URL comes only from the API. The
+  // looks run one after the other, and a change of control starts a new generation, so an old
+  // answer never replaces a newer state.
+  const browserGeneration = useRef(0);
   useEffect(() => {
     if (!running) return;
     let gone = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const look = async () => {
+      const generation = browserGeneration.current;
       try {
         const { live: found } = await api.getLiveBrowser(sessionId);
-        if (gone) return;
-        setLiveBrowser((old) => (found === null && old !== null && !old.view_url ? null : found ?? old));
+        if (gone || generation !== browserGeneration.current) return;
+        setLiveBrowser((old) => found ?? (old !== null && old.view_url ? old : null));
         if (found !== null && browserShownFor.current !== found.run_id) {
           browserShownFor.current = found.run_id;
           setCodeTab(null);
@@ -366,22 +371,25 @@ export function Chat({ sessionId }: { sessionId: string }) {
         }
       } catch {
         // The next look tries again. The panel keeps the last state.
+      } finally {
+        if (!gone) timer = setTimeout(() => void look(), BROWSER_POLL_MS);
       }
     };
     void look();
-    const timer = setInterval(() => void look(), BROWSER_POLL_MS);
     return () => {
       gone = true;
-      clearInterval(timer);
+      if (timer !== undefined) clearTimeout(timer);
     };
   }, [running, api, sessionId]);
 
   const browserControl = async (action: "take" | "give_back") => {
     if (liveBrowser === null) return;
+    browserGeneration.current += 1;
     setBrowserBusy(true);
     setBrowserError(null);
     try {
       await api.setBrowserControl(sessionId, liveBrowser.run_id, action);
+      browserGeneration.current += 1;
       setLiveBrowser({ ...liveBrowser, control: action === "take" ? "user" : "agent" });
     } catch (e) {
       setBrowserError(errorText(e, "The control did not change."));

@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
@@ -303,6 +304,8 @@ class PlaywrightSession:
         live: LiveUrls | None = None,
     ) -> None:
         self._live = live
+        self._target_ids: weakref.WeakKeyDictionary[Page, str] = weakref.WeakKeyDictionary()
+        """The CDP target id of each page, for the live view."""
         """Gives the live view URLs of the remote session (Browserbase), or ``None``."""
         self._browser = browser
         self._context = context
@@ -357,6 +360,24 @@ class PlaywrightSession:
     def target(self) -> TargetName:
         return self._target
 
+    async def _target_id(self, page: Page) -> str:
+        """The CDP target id of a page (cached), or "" when CDP does not give it."""
+        known = self._target_ids.get(page)
+        if known is not None:
+            return known
+        found = ""
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(LIVE_TITLE_TIMEOUT_S):
+                cdp = await self._context.new_cdp_session(page)
+                try:
+                    info = await cdp.send("Target.getTargetInfo")
+                    found = str((info.get("targetInfo") or {}).get("targetId") or "")
+                finally:
+                    await cdp.detach()
+        if found:
+            self._target_ids[page] = found
+        return found
+
     async def live_view(self, ttl_s: int) -> LiveView | None:
         """The live view of the active tab (M8.3), or ``None`` without a live source or a tab.
         The remote session lists each tab with its URL and its live view URL. The tab with
@@ -368,7 +389,13 @@ class PlaywrightSession:
         if not pages:
             return None
         url = page.url
-        chosen = next((p for p in reversed(pages) if p.get("url") == url), pages[-1])
+        # The provider names each tab by its CDP target id. Two tabs can have the same URL, so
+        # the id of the active page decides; the URL is the fallback.
+        target_id = await self._target_id(page)
+        chosen = next(
+            (p for p in pages if target_id and p.get("id") == target_id),
+            None,
+        ) or next((p for p in reversed(pages) if p.get("url") == url), pages[-1])
         view = str(chosen.get("debuggerFullscreenUrl") or "")
         if not view.startswith("https://"):
             return None

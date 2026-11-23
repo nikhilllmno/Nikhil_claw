@@ -45,6 +45,12 @@
   background: var(--surface-sunken);
 }
 
+.frameBox {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
 .frame {
   flex: 1;
   width: 100%;

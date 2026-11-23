@@ -3732,7 +3732,7 @@ class SamaApi:
             runs = await open_runs(connection, access.org_id, session_id)
         if self._live_browser is None or body.run_id not in runs:
             raise _not_found("the run has no open browser")
-        if not self._live_browser.set_control(
+        if not await self._live_browser.set_control(
             str(access.org_id), str(body.run_id), user=body.action == "take"
         ):
             raise _not_found("the run has no open browser")

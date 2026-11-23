@@ -111,6 +111,9 @@ LIVE_VIEW_TTL_S: Final = 600
 """The live view URL of the web app ends after 10 minutes. The web app asks for a new one
 before that."""
 CONTROL_WAIT_S: Final = 300.0
+HANDOFF_S: Final = 35.0
+"""A takeover waits at most this long for the browser call that acts now (a navigation can
+take 30 seconds)."""
 """The longest wait of one browser call while a person has control of the browser."""
 USER_HAS_CONTROL: Final = (
     "the user has control of the browser now; wait for the user, or ask the user to click Give back"
@@ -287,6 +290,7 @@ class BrowserService:
         for key in [key for key in self._live if key[0] == org_id and key[1] == run_id]:
             live = self._live.pop(key)
             live.ended = True
+            live.agent_turn.set()  # a call that waits for control ends at once
             self._spawn_close(live)
 
     def _spawn_close(self, live: _Live) -> None:
@@ -324,6 +328,7 @@ class BrowserService:
         for key in idle:
             live = self._live.pop(key)
             live.ended = True
+            live.agent_turn.set()
             if live.session is not None:
                 log.info("closing an idle browser session org=%s run=%s target=%s", *key)
             self._spawn_close(live)
@@ -340,6 +345,7 @@ class BrowserService:
         self._current.clear()
         for live in lives:
             live.ended = True
+            live.agent_turn.set()
             self._spawn_close(live)
         if self._closing:
             await asyncio.gather(*self._closing, return_exceptions=True)
@@ -626,24 +632,31 @@ class BrowserService:
     async def _locked_session(
         self, claims: RunTokenClaims, target: TargetName
     ) -> tuple[_Live, BrowserSession]:
+        """The session of the run, with its lock. While a person has control (M8.3), the call
+        waits before it takes the lock, so the person's takeover only waits for a call that
+        already acts, and a waiting call does not hold the lock."""
         live = self._live_of(claims, target)
-        await live.lock.acquire()
-        try:
-            if live.ended:
-                raise BrowserError("the run ended; the browser session is closed")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._control_wait_s
+        while True:
             if live.user_control:
-                # A person uses the browser in the live view: the agent waits (M8.3).
                 try:
-                    async with asyncio.timeout(self._control_wait_s):
+                    async with asyncio.timeout(max(0.0, deadline - loop.time())):
                         await live.agent_turn.wait()
                 except TimeoutError:
                     raise BrowserError(USER_HAS_CONTROL) from None
+            await live.lock.acquire()
+            if live.user_control and not live.ended:
+                # A person took control while the call waited for the lock.
+                live.lock.release()
+                continue
+            try:
                 if live.ended:
                     raise BrowserError("the run ended; the browser session is closed")
-            return await self._session(claims, live)
-        except BaseException:
-            live.lock.release()
-            raise
+                return await self._session(claims, live)
+            except BaseException:
+                live.lock.release()
+                raise
 
     # -- the live view (M8.3) ----------------------------------------------------------------
 
@@ -673,22 +686,32 @@ class BrowserService:
                 )
         return LiveState(run_id=run_id, target=name, view=view, user_control=live.user_control)
 
-    def set_control(self, org_id: str, run_id: str, *, user: bool) -> bool:
+    async def set_control(self, org_id: str, run_id: str, *, user: bool) -> bool:
         """Gives the browser of the run to a person (``user=True``) or back to the agent.
-        While a person has control, the browser calls of the run wait (at most
-        ``control_wait_s`` each), and the idle reaper keeps the session. False when the run
-        has no open session."""
-        found = False
-        for key, live in self._live.items():
-            if key[0] != org_id or key[1] != run_id or live.ended or live.session is None:
-                continue
-            found = True
+
+        A takeover first stops new browser calls of the run, then waits until a call that
+        acts now ends (at most ``HANDOFF_S``), so the agent sends no more input when this
+        returns. While a person has control, the browser calls of the run wait (at most
+        ``control_wait_s`` each), and the idle reaper keeps the session. False when the run has
+        no open session."""
+        lives = [
+            live
+            for key, live in self._live.items()
+            if key[0] == org_id and key[1] == run_id and not live.ended and live.session is not None
+        ]
+        for live in lives:
             live.used = self._clock()
             if user:
                 live.agent_turn.clear()
             else:
                 live.agent_turn.set()
-        return found
+        if user:
+            for live in lives:
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(HANDOFF_S):
+                        await live.lock.acquire()
+                        live.lock.release()
+        return bool(lives)
 
     def _release(self, live: _Live) -> None:
         live.used = self._clock()

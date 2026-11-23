@@ -6009,7 +6009,7 @@ view of Codex.
 | Part | Module | Job |
 |---|---|---|
 | Live URLs | `sama.browser.browserbase` | `_live_pages(session)`: `GET /v1/sessions/{id}/debug` with `expiresIn` (60 to 3,600 seconds). The answer lists each tab with its URL, title, id, and live view URL. |
-| Session | `sama.browser.cdp` | `PlaywrightSession.live_view(ttl_s)`: the tab with the URL of the active page (else the last tab), its title, the number of tabs, the tab id, and the live view URL with `navbar=false`. Only an `https` URL is used. |
+| Session | `sama.browser.cdp` | `PlaywrightSession.live_view(ttl_s)`: the tab of the provider with the CDP target id of the active page (else the same URL, else the last tab), its title, the number of tabs, the tab id, and the live view URL with `navbar=false`. Only an `https` URL is used. |
 | Service | `sama.browser.service` | `live_state(org, run)`: the open session of the last target of the run, with a live view URL that lives 10 minutes (`LIVE_VIEW_TTL_S`). `set_control(org, run, user)`: gives the browser to the person or back to the agent. |
 | API | `sama.api.live_browser` | `GET /sessions/{id}/browser` and `POST /sessions/{id}/browser/control`. |
 | Web | `web/components/BrowserPanel.tsx`, `web/lib/liveBrowser.ts` | The panel. |
@@ -6021,24 +6021,29 @@ view of Codex.
 | `GET /sessions/{id}/browser` | a member who can see the session (`session_access`) | `{live: null}`, or `{live: {run_id, target, control, view_url, page_url, title, tabs, page_id}}` for the newest open run of the session that has a browser session in this process. `view_url` is `null` for the `my_chrome` target. |
 | `POST /sessions/{id}/browser/control` | the same | `{run_id, action: take or give_back}`. `204`, or `404` when the run is not an open run of the session or has no browser session. |
 
-**Panel.** While a run of the session is open, the chat asks for the live browser every 3
-seconds. When a run first has a browser, the panel opens (it closes the code panel; the two
+**Panel.** While a run of the session is open, the chat asks for the live browser 3 seconds
+after each answer (one request at a time; a change of control makes older answers void). When a run first has a browser, the panel opens (it closes the code panel; the two
 share one place). The "Browser" button in the header opens and closes it. At a wide width the
 panel is a column next to the chat; at a narrow width it covers the chat as a dialog, as the code
 panel does.
 
-- The head has the title of the tab, the address (host and path) and the number of tabs, "Open
-  in new tab" (the live view URL in a new tab), and Close.
+- The head has the title of the tab, the address (host and path) and the number of tabs, and
+  Close. While the person has control, it also has "Open in new tab" (the live view URL in a new
+  tab); the line asks the person to close that tab before "Give back".
 - A line on top shows the current step of the agent: the newest browser tool call of the run
   (for example "Browser: open: booking.com/..."), or for a running `browser_task` the newest step
   of its sub-agent ("Browser task: step 3/15: click e12"). The line has "Take control" and Stop
   (it cancels the open runs, as Esc does).
 - The live view is an `iframe` (`sandbox="allow-same-origin allow-scripts"`, no referrer). While
-  the agent has control, the frame takes no pointer events, so the person only watches.
-- **Take control.** The browser calls of the run wait while the person has control (at most 300
-  seconds each, `CONTROL_WAIT_S`); then the call fails with "the user has control of the browser
-  now; wait for the user, or ask the user to click Give back". The idle reaper keeps a session
-  that a person controls. The frame takes clicks and keys, and the line says "You have control.
+  the agent has control, the frame is in an `inert` box and takes no pointer events and no
+  keyboard focus, so the person only watches.
+- **Take control.** The takeover first stops new browser calls of the run, then waits until a
+  call that acts now ends (at most 35 seconds, `HANDOFF_S`), so the agent sends no more input when
+  the route answers. The browser calls of the run then wait, without the lock of the session (at
+  most 300 seconds each, `CONTROL_WAIT_S`); then the call fails with "the user has control of the
+  browser now; wait for the user, or ask the user to click Give back". The idle reaper keeps a
+  session that a person controls. The run end, the reaper, and the stop of the process wake a
+  waiting call, so the session still closes at once. The frame takes clicks and keys, and the line says "You have control.
   The agent waits." with "Give back".
 - The view URL of one tab changes at each answer (a new time to live), so the frame loads a new
   URL only when the tab changes, or every 8 minutes.
