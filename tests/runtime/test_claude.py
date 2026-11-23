@@ -426,6 +426,7 @@ async def test_the_cli_offers_only_the_built_in_tools_that_sama_has() -> None:
     ]
     for feature in ("CronCreate", "WebSearch", "Monitor", "Skill"):
         assert feature not in options.tools
+    assert options.settings is not None
     assert json.loads(options.settings) == {"skipWebFetchPreflight": True}
     assert options.env[AUTO_MEMORY_ENV] == "1"
 
