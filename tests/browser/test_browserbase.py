@@ -144,6 +144,31 @@ class FakeApi:
             return httpx.Response(
                 201, json={"id": f"sess-{self.count}", "connectUrl": f"wss://connect/{self.count}"}
             )
+        if request.method == "GET" and path.endswith("/debug"):
+            sid = path.split("/")[3]
+            ttl = request.url.params.get("expiresIn")
+            return httpx.Response(
+                200,
+                json={
+                    "debuggerFullscreenUrl": f"https://www.browserbase.com/devtools-fullscreen/{sid}?t={ttl}",
+                    "debuggerUrl": "https://www.browserbase.com/devtools/x",
+                    "wsUrl": "wss://x",
+                    "pages": [
+                        {
+                            "id": "page-a",
+                            "url": "https://a.example/",
+                            "title": "A",
+                            "debuggerFullscreenUrl": f"https://www.browserbase.com/fs/{sid}/a?t={ttl}",
+                        },
+                        {
+                            "id": "page-b",
+                            "url": "https://b.example/",
+                            "title": "B",
+                            "debuggerFullscreenUrl": f"https://www.browserbase.com/fs/{sid}/b?t={ttl}",
+                        },
+                    ],
+                },
+            )
         if request.method == "POST" and path.startswith("/v1/sessions/"):
             if self.release_status != 200:
                 return httpx.Response(self.release_status, json={})
@@ -174,10 +199,12 @@ def make_target(
     time: FakeTime | None = None,
     *,
     record: bool = False,
+    proxies: bool = True,
 ) -> BrowserbaseTarget:
     time = time or FakeTime()
     return BrowserbaseTarget(
         record=record,
+        proxies=proxies,
         api_key=SecretStr(KEY),
         project_id=PROJECT,
         contexts=contexts if contexts is not None else MemoryContextStore(),
@@ -207,8 +234,10 @@ async def test_a_private_run_gets_the_persistent_context_of_its_user() -> None:
             "recordSession": False,
             "logSession": False,
             "viewport": {"width": 1280, "height": 720},
+            "solveCaptchas": True,
             "context": {"id": "ctx-1", "persist": True},
         },
+        "proxies": True,
     }
     assert connector.urls == ["wss://connect/2"]
     assert store.rows == {("org-1", "user-1", "cloud"): "ctx-1"}
@@ -305,6 +334,7 @@ async def test_recording_and_logs_are_off_unless_asked() -> None:
         "recordSession": False,
         "logSession": False,
         "viewport": {"width": 1280, "height": 720},
+        "solveCaptchas": True,
     }
     await target.aclose()
     api, connector = FakeApi(), FakeConnector()
@@ -314,6 +344,7 @@ async def test_recording_and_logs_are_off_unless_asked() -> None:
         "recordSession": True,
         "logSession": True,
         "viewport": {"width": 1280, "height": 720},
+        "solveCaptchas": True,
     }
     await target.aclose()
 
@@ -523,4 +554,28 @@ async def test_delete_contexts_counts_an_unknown_context_as_deleted() -> None:
     assert seen == ["/v1/contexts/ctx-1", "/v1/contexts/gone"]
     with pytest.raises(BrowserError, match="500"):
         await target.delete_contexts(["broken"])
+    await target.aclose()
+
+
+async def test_proxies_can_be_turned_off() -> None:
+    """M8.3: proxies are on by default (see the first payload test) and off with the setting."""
+    api, connector, store = FakeApi(), FakeConnector(), MemoryContextStore()
+    target = make_target(api, connector, store, proxies=False)
+    await target.start(org_id="org-1", user_id=None, run_id="run-1", guard=AllowAll())
+    assert "proxies" not in api.requests[0][2]
+    await target.aclose()
+
+
+async def test_the_live_pages_have_a_short_time_to_live() -> None:
+    """M8.3: the live view URLs come from ``GET /v1/sessions/{id}/debug`` with ``expiresIn``,
+    clamped to 60 to 3,600 seconds."""
+    api, connector, store = FakeApi(), FakeConnector(), MemoryContextStore()
+    target = make_target(api, connector, store)
+    pages = target._live_pages("sess-9")
+    found = await pages(600)
+    assert [p["id"] for p in found] == ["page-a", "page-b"]
+    assert api.requests[-1][:2] == ("GET", "/v1/sessions/sess-9/debug")
+    assert found[0]["debuggerFullscreenUrl"].endswith("t=600")
+    assert (await pages(5))[0]["debuggerFullscreenUrl"].endswith("t=60")
+    assert (await pages(99_999))[0]["debuggerFullscreenUrl"].endswith("t=3600")
     await target.aclose()

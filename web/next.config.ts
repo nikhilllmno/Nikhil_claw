@@ -24,6 +24,8 @@ const csp = [
   `connect-src ${["'self'", apiOrigin, "https://*.supabase.co", isDev ? "ws:" : null]
     .filter(Boolean)
     .join(" ")}`,
+  // The live view of the cloud browser (M8.3) is a Browserbase page in a frame.
+  "frame-src https://www.browserbase.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",

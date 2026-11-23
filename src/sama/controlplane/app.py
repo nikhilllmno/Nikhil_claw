@@ -698,6 +698,7 @@ def build(
         model_keys=model_keys,
         # The browser settings of the org (M5.3). A change of the URL policy applies at once to
         # the browser sessions of this process.
+        live_browser=browser,
         browser=BrowserSettings(
             PolicyStore(engine),
             BrowserLogins(engine, vault) if vault is not None else None,
@@ -852,6 +853,8 @@ def _browser_service(
                 project_id=settings.browserbase_project_id,
                 contexts=PostgresContextStore(engine),
                 record=settings.browserbase_record,
+                proxies=settings.browserbase_proxies,
+                solve_captchas=settings.browserbase_solve_captchas,
             )
         )
     targets.append(ChromeTarget(chrome, AuthUsers(engine).of))

@@ -47,6 +47,7 @@ import contextlib
 import html
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -70,6 +71,7 @@ from sama.browser.target import (
     ExtractKind,
     ExtractRequest,
     FillRequest,
+    LiveView,
     LoginFiller,
     NavigationGuard,
     PageState,
@@ -78,6 +80,7 @@ from sama.browser.target import (
     Tab,
     TabAction,
     TargetName,
+    has_live_view,
     has_vision,
 )
 from sama.tenancy.run_token import RunTokenClaims
@@ -104,6 +107,14 @@ NO_LOGINS: Final = (
     "There are no saved logins for you. An org admin adds the logins of the org, and each user "
     "adds personal logins, in the web app (Settings, Browser)."
 )
+LIVE_VIEW_TTL_S: Final = 600
+"""The live view URL of the web app ends after 10 minutes. The web app asks for a new one
+before that."""
+CONTROL_WAIT_S: Final = 300.0
+"""The longest wait of one browser call while a person has control of the browser."""
+USER_HAS_CONTROL: Final = (
+    "the user has control of the browser now; wait for the user, or ask the user to click Give back"
+)
 VISION_HINT_REFS: Final = 2
 """A snapshot with this many refs or fewer gets the vision hint."""
 VISION_HINT: Final = (
@@ -122,6 +133,26 @@ class _Live:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     used: float = field(default_factory=time.monotonic)
     ended: bool = False
+    agent_turn: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set while the agent may act. Clear while a person has control (M8.3)."""
+
+    def __post_init__(self) -> None:
+        self.agent_turn.set()
+
+    @property
+    def user_control(self) -> bool:
+        return not self.agent_turn.is_set()
+
+
+@dataclass(frozen=True, slots=True)
+class LiveState:
+    """The live browser of a run, for the web app (M8.3, Section 14.1)."""
+
+    run_id: str
+    target: TargetName
+    view: LiveView | None
+    """The live view, or ``None`` when the target has none (``my_chrome``) or it failed."""
+    user_control: bool
 
 
 class BrowserService:
@@ -138,8 +169,10 @@ class BrowserService:
         max_sessions_per_org: int = MAX_SESSIONS_PER_ORG,
         max_sessions: int = MAX_SESSIONS,
         clock: Callable[[], float] = time.monotonic,
+        control_wait_s: float = CONTROL_WAIT_S,
     ) -> None:
         targets = [target] if not isinstance(target, Sequence) else list(target)
+        self._control_wait_s = control_wait_s
         if not targets:
             raise ValueError("the browser service needs a target")
         self.targets: dict[TargetName, BrowserTarget] = {item.name: item for item in targets}
@@ -286,7 +319,7 @@ class BrowserService:
         idle = [
             key
             for key, live in self._live.items()
-            if not live.lock.locked() and now - live.used >= self._idle_s
+            if not live.lock.locked() and not live.user_control and now - live.used >= self._idle_s
         ]
         for key in idle:
             live = self._live.pop(key)
@@ -598,10 +631,64 @@ class BrowserService:
         try:
             if live.ended:
                 raise BrowserError("the run ended; the browser session is closed")
+            if live.user_control:
+                # A person uses the browser in the live view: the agent waits (M8.3).
+                try:
+                    async with asyncio.timeout(self._control_wait_s):
+                        await live.agent_turn.wait()
+                except TimeoutError:
+                    raise BrowserError(USER_HAS_CONTROL) from None
+                if live.ended:
+                    raise BrowserError("the run ended; the browser session is closed")
             return await self._session(claims, live)
         except BaseException:
             live.lock.release()
             raise
+
+    # -- the live view (M8.3) ----------------------------------------------------------------
+
+    async def live_state(self, org_id: str, run_id: str) -> LiveState | None:
+        """The live browser of a run: the open session of the target of its last browser
+        call (else any open session of the run). ``None`` when the run has no open session."""
+        lives = {
+            key[2]: live
+            for key, live in self._live.items()
+            if key[0] == org_id and key[1] == run_id and live.session is not None and not live.ended
+        }
+        if not lives:
+            return None
+        target = self._current.get((org_id, run_id))
+        name = target if target in lives else next(iter(lives))
+        live = lives[name]
+        view: LiveView | None = None
+        if live.session is not None and has_live_view(live.session):
+            try:
+                view = await live.session.live_view(LIVE_VIEW_TTL_S)  # type: ignore[attr-defined]
+            except Exception as error:
+                log.warning(
+                    "the live view failed org=%s run=%s error=%s",
+                    org_id,
+                    run_id,
+                    type(error).__name__,
+                )
+        return LiveState(run_id=run_id, target=name, view=view, user_control=live.user_control)
+
+    def set_control(self, org_id: str, run_id: str, *, user: bool) -> bool:
+        """Gives the browser of the run to a person (``user=True``) or back to the agent.
+        While a person has control, the browser calls of the run wait (at most
+        ``control_wait_s`` each), and the idle reaper keeps the session. False when the run
+        has no open session."""
+        found = False
+        for key, live in self._live.items():
+            if key[0] != org_id or key[1] != run_id or live.ended or live.session is None:
+                continue
+            found = True
+            live.used = self._clock()
+            if user:
+                live.agent_turn.clear()
+            else:
+                live.agent_turn.set()
+        return found
 
     def _release(self, live: _Live) -> None:
         live.used = self._clock()
@@ -686,8 +773,24 @@ def _merged(state: PageState, shot: Snapshot) -> Snapshot:
     return replace(shot, page=page)
 
 
+BOT_CHECK_TITLE: Final = re.compile(
+    r"access denied|just a moment|attention required|are you a (robot|human)|captcha|"
+    r"verify you are human|request blocked|pardon our interruption|^40[3-9]\b|forbidden",
+    re.IGNORECASE,
+)
+"""Titles of the pages that sites show to a browser that they block (a bot check)."""
+BOT_CHECK_NOTE: Final = (
+    "this page looks like a bot check or a block of the site, not the content; tell the user "
+    "in one line that the site blocks the cloud browser, then try another site, or offer the "
+    "user's own Chrome (target my_chrome)"
+)
+
+
 def _notes(state: PageState) -> str:
-    return "".join(f"\nNote: {note}" for note in state.notes)
+    notes = list(state.notes)
+    if state.title and BOT_CHECK_TITLE.search(state.title.strip()):
+        notes.append(BOT_CHECK_NOTE)
+    return "".join(f"\nNote: {note}" for note in notes)
 
 
 def _blocked(state: PageState) -> str:

@@ -5999,6 +5999,78 @@ host lists of the org (M5.3, below). See Section 16.4 for the limits.
 ("Browser sub-agent (M5.6)" below). The Browserbase key is a setting of the process. A key for
 each org comes later.
 
+#### Live browser (M8.3)
+
+Claude Agent SDK runtime and the web app only for now. Before M8.3 the cloud browser was
+invisible: the agent opened pages on Browserbase, and the user saw no browser in the chat and no
+tab anywhere. Now the web chat has a "Live browser" panel like Claude for Chrome and the browser
+view of Codex.
+
+| Part | Module | Job |
+|---|---|---|
+| Live URLs | `sama.browser.browserbase` | `_live_pages(session)`: `GET /v1/sessions/{id}/debug` with `expiresIn` (60 to 3,600 seconds). The answer lists each tab with its URL, title, id, and live view URL. |
+| Session | `sama.browser.cdp` | `PlaywrightSession.live_view(ttl_s)`: the tab with the URL of the active page (else the last tab), its title, the number of tabs, the tab id, and the live view URL with `navbar=false`. Only an `https` URL is used. |
+| Service | `sama.browser.service` | `live_state(org, run)`: the open session of the last target of the run, with a live view URL that lives 10 minutes (`LIVE_VIEW_TTL_S`). `set_control(org, run, user)`: gives the browser to the person or back to the agent. |
+| API | `sama.api.live_browser` | `GET /sessions/{id}/browser` and `POST /sessions/{id}/browser/control`. |
+| Web | `web/components/BrowserPanel.tsx`, `web/lib/liveBrowser.ts` | The panel. |
+
+**Routes.**
+
+| Route | Who | Answer |
+|---|---|---|
+| `GET /sessions/{id}/browser` | a member who can see the session (`session_access`) | `{live: null}`, or `{live: {run_id, target, control, view_url, page_url, title, tabs, page_id}}` for the newest open run of the session that has a browser session in this process. `view_url` is `null` for the `my_chrome` target. |
+| `POST /sessions/{id}/browser/control` | the same | `{run_id, action: take or give_back}`. `204`, or `404` when the run is not an open run of the session or has no browser session. |
+
+**Panel.** While a run of the session is open, the chat asks for the live browser every 3
+seconds. When a run first has a browser, the panel opens (it closes the code panel; the two
+share one place). The "Browser" button in the header opens and closes it. At a wide width the
+panel is a column next to the chat; at a narrow width it covers the chat as a dialog, as the code
+panel does.
+
+- The head has the title of the tab, the address (host and path) and the number of tabs, "Open
+  in new tab" (the live view URL in a new tab), and Close.
+- A line on top shows the current step of the agent: the newest browser tool call of the run
+  (for example "Browser: open: booking.com/..."), or for a running `browser_task` the newest step
+  of its sub-agent ("Browser task: step 3/15: click e12"). The line has "Take control" and Stop
+  (it cancels the open runs, as Esc does).
+- The live view is an `iframe` (`sandbox="allow-same-origin allow-scripts"`, no referrer). While
+  the agent has control, the frame takes no pointer events, so the person only watches.
+- **Take control.** The browser calls of the run wait while the person has control (at most 300
+  seconds each, `CONTROL_WAIT_S`); then the call fails with "the user has control of the browser
+  now; wait for the user, or ask the user to click Give back". The idle reaper keeps a session
+  that a person controls. The frame takes clicks and keys, and the line says "You have control.
+  The agent waits." with "Give back".
+- The view URL of one tab changes at each answer (a new time to live), so the frame loads a new
+  URL only when the tab changes, or every 8 minutes.
+- The web CSP allows frames from `https://www.browserbase.com` only.
+
+**Security.** The live view URL lets a person watch and use the browser with the logins of the
+run user. So:
+
+- only a member who can see the session gets it, from the API of the control plane; the
+  Browserbase key never reaches the web app;
+- the URL ends after 10 minutes, and Browserbase ends it with the session (the run end, the idle
+  reaper, or the hard timeout of 15 minutes);
+- every navigation that the person starts in the live view goes through the same CDP request
+  interception as the agent, so the URL policy of the org (M5.3) and the address rules (Section
+  16.4) still apply;
+- the person, not the agent, types in the live view, so a password that the person types does
+  not reach the model; a screenshot of the agent after that can show the page.
+
+**Fewer blocked pages (M8.3).** The cloud target asks Browserbase for residential proxies
+(`proxies: true`) and CAPTCHA solving (`browserSettings.solveCaptchas`), on by default.
+`SAMA_BROWSERBASE_PROXIES=0` and `SAMA_BROWSERBASE_CAPTCHAS=0` turn them off. Advanced stealth
+(`advancedStealth`) needs the Enterprise plan of Browserbase (the project answers 403), so sama
+does not ask for it. When the title of a page looks like a bot check or a block ("Access Denied",
+"Just a moment", "captcha", "403", and others), the result has the fixed note "this page looks
+like a bot check or a block of the site, not the content; tell the user in one line that the site
+blocks the cloud browser, then try another site, or offer the user's own Chrome (target
+my_chrome)".
+
+**Limits.** One control plane process holds the browser sessions (D18), so the routes answer
+for the sessions of this process. The chat channels get no live view yet. The live view of
+Browserbase has its own viewer page; sama does not draw the agent cursor in it.
+
 #### Browser vault and URL policy (M5.3)
 
 **Saved logins.** A saved login has a name (for example `GitHub`), a site, a user name, and a

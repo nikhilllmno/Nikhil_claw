@@ -54,6 +54,7 @@ from sama.browser.target import (
     ExtractRequest,
     Filled,
     FillRequest,
+    LiveView,
     NavigationGuard,
     PageState,
     Screenshot,
@@ -79,6 +80,11 @@ if TYPE_CHECKING:
     )
 
 log = logging.getLogger("sama.browser")
+LiveUrls = Callable[[int], Awaitable[list[dict[str, Any]]]]
+"""Gives the tabs of a remote browser session with their live view URLs, for a time to live in
+seconds (Browserbase ``GET /v1/sessions/{id}/debug``, field ``pages``)."""
+LIVE_TITLE_TIMEOUT_S: Final = 1.0
+MAX_LIVE_TITLE_CHARS: Final = 300
 
 NAVIGATION_TIMEOUT_MS: Final = 30_000
 ACTION_TIMEOUT_MS: Final = 10_000
@@ -294,7 +300,10 @@ class PlaywrightSession:
         *,
         target: TargetName,
         on_close: Callable[[], Awaitable[None]] | None = None,
+        live: LiveUrls | None = None,
     ) -> None:
+        self._live = live
+        """Gives the live view URLs of the remote session (Browserbase), or ``None``."""
         self._browser = browser
         self._context = context
         self._guard = guard
@@ -323,11 +332,13 @@ class PlaywrightSession:
         target: TargetName,
         on_close: Callable[[], Awaitable[None]] | None = None,
         notes: tuple[str, ...] = (),
+        live: LiveUrls | None = None,
     ) -> PlaywrightSession:
         """Uses the first context of the browser (the persistent context of a Browserbase
-        session), or a new one. ``notes`` go to the agent with the first state."""
+        session), or a new one. ``notes`` go to the agent with the first state. ``live`` gives
+        the live view URLs of the remote session (M8.3)."""
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        session = cls(browser, context, guard, target=target, on_close=on_close)
+        session = cls(browser, context, guard, target=target, on_close=on_close, live=live)
         session._notes.extend(notes)
         context.set_default_timeout(ACTION_TIMEOUT_MS)
         context.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
@@ -345,6 +356,34 @@ class PlaywrightSession:
     @property
     def target(self) -> TargetName:
         return self._target
+
+    async def live_view(self, ttl_s: int) -> LiveView | None:
+        """The live view of the active tab (M8.3), or ``None`` without a live source or a tab.
+        The remote session lists each tab with its URL and its live view URL. The tab with
+        the URL of the active page wins, else the last tab."""
+        page = self._active
+        if self._live is None or page is None or self._closed:
+            return None
+        pages = await self._live(ttl_s)
+        if not pages:
+            return None
+        url = page.url
+        chosen = next((p for p in reversed(pages) if p.get("url") == url), pages[-1])
+        view = str(chosen.get("debuggerFullscreenUrl") or "")
+        if not view.startswith("https://"):
+            return None
+        title = str(chosen.get("title") or "")
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(LIVE_TITLE_TIMEOUT_S):
+                title = await page.title()
+        joiner = "&" if "?" in view else "?"
+        return LiveView(
+            view_url=f"{view}{joiner}navbar=false",
+            page_url=url,
+            title=title[:MAX_LIVE_TITLE_CHARS],
+            tabs=len(pages),
+            page_id=str(chosen.get("id") or ""),
+        )
 
     # -- events ------------------------------------------------------------------------------
 

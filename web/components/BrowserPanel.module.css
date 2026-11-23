@@ -1,0 +1,67 @@
+/* The live browser panel next to the chat (M8.3). The column and the dialog come from
+   CodePanel.module.css, so both panels look the same. */
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: var(--border-width) solid var(--border);
+  background: var(--surface-sunken);
+  font-size: var(--text-sm);
+}
+
+.barUser {
+  background: var(--warning-soft);
+}
+
+.barText {
+  display: inline-flex;
+  flex: 1;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.barActions {
+  display: inline-flex;
+  flex: none;
+  gap: var(--space-2);
+}
+
+.error {
+  margin: var(--space-2) var(--space-4) 0;
+}
+
+.view {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  background: var(--surface-sunken);
+}
+
+.frame {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: var(--surface);
+}
+
+/* While the agent has control, the live view only shows. "Take control" lets the person
+   click and type. */
+.frameReadOnly {
+  pointer-events: none;
+}
+
+.empty {
+  margin: auto;
+  padding: var(--space-6);
+  color: var(--text-muted);
+  text-align: center;
+}

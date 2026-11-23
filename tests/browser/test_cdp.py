@@ -342,3 +342,48 @@ async def test_scroll_press_wait_and_reload(session: PlaywrightSession, site: st
     assert state.title == "Home"
     with pytest.raises(BrowserError, match="press needs text"):
         await session.act(Act(action="press"))
+
+
+async def test_the_live_view_follows_the_active_tab(
+    browser: Browser, guard: DenyHosts, site: str
+) -> None:
+    """M8.3: the live view is the tab of the provider with the URL of the active page, with
+    ``navbar=false``; without a live source there is none."""
+    asked: list[int] = []
+
+    async def pages(ttl: int) -> list[dict[str, object]]:
+        asked.append(ttl)
+        return [
+            {
+                "id": "p0",
+                "url": "about:blank",
+                "title": "",
+                "debuggerFullscreenUrl": "https://bb.test/0?x=1",
+            },
+            {
+                "id": "p1",
+                "url": f"{site}/",
+                "title": "Home",
+                "debuggerFullscreenUrl": "https://bb.test/1?x=1",
+            },
+            {
+                "id": "p2",
+                "url": "https://other.test/",
+                "debuggerFullscreenUrl": "http://insecure.test/2",
+            },
+        ]
+
+    session = await PlaywrightSession.attach(browser, guard, target="cloud", live=pages)
+    await session.navigate(f"{site}/")
+    view = await session.live_view(600)
+    assert view is not None
+    assert (view.page_id, view.view_url, view.tabs) == (
+        "p1",
+        "https://bb.test/1?x=1&navbar=false",
+        3,
+    )
+    assert view.page_url == f"{site}/"
+    assert asked == [600]
+    session._live = None
+    assert await session.live_view(600) is None
+    await session.close()

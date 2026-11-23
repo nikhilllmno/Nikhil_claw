@@ -53,6 +53,9 @@ DEFAULT_SESSION_TIMEOUT_S: Final = 900
 """The hard limit of one Browserbase session. sama releases a session at the end of its run or
 after it is idle, so this limit is a guard."""
 MAX_MESSAGE_CHARS: Final = 200
+LIVE_TTL_MIN_S: Final = 60
+LIVE_TTL_MAX_S: Final = 3_600
+"""The time to live of a live view URL (Browserbase accepts 60 to 21,600 seconds)."""
 CONTEXT_SAVE_S: Final = 10.0
 """After a writer session of a persistent context ends, the time that Browserbase can need to
 save the context. A new session of the context waits for the rest of this time."""
@@ -117,11 +120,16 @@ class BrowserbaseTarget:
         transport: httpx.AsyncBaseTransport | None = None,
         context_save_s: float = CONTEXT_SAVE_S,
         record: bool = False,
+        proxies: bool = True,
+        solve_captchas: bool = True,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._project_id = project_id
         self._record = record
+        self._proxies = proxies
+        """Browserbase residential proxies (M8.3): fewer bot checks, billed per GB."""
+        self._solve_captchas = solve_captchas
         self._context_save_s = context_save_s
         self._clock = clock
         self._sleep = sleep
@@ -218,6 +226,7 @@ class BrowserbaseTarget:
                 target=CLOUD,
                 on_close=self._releaser(session_id, written),
                 notes=notes,
+                live=self._live_pages(session_id),
             )
         except BaseException as error:
             # Also a cancelled start ends the remote session before it frees the context.
@@ -254,6 +263,24 @@ class BrowserbaseTarget:
         wait = self._saved_at.get(context_id, 0.0) - self._clock()
         if 0 < wait <= self._context_save_s:  # a quarantined context makes a reader; no wait
             await self._sleep(wait)
+
+    def _live_pages(self, session_id: str) -> Callable[[int], Awaitable[list[dict[str, Any]]]]:
+        """The tabs of the session with their live view URLs (M8.3): ``GET
+        /v1/sessions/{id}/debug`` with ``expiresIn``, so each URL ends after ``ttl_s``."""
+
+        async def pages(ttl_s: int) -> list[dict[str, Any]]:
+            ttl = max(LIVE_TTL_MIN_S, min(int(ttl_s), LIVE_TTL_MAX_S))
+            try:
+                response = await self._client.get(
+                    f"/v1/sessions/{session_id}/debug", params={"expiresIn": ttl}
+                )
+            except httpx.HTTPError as error:
+                raise BrowserError(f"Browserbase did not answer: {type(error).__name__}") from None
+            body = self._ok(response, "give the live view")
+            found = body.get("pages")
+            return [p for p in found if isinstance(p, dict)] if isinstance(found, list) else []
+
+        return pages
 
     def _releaser(self, session_id: str, written: str | None) -> Callable[[], Any]:
         async def release() -> None:
@@ -323,7 +350,10 @@ class BrowserbaseTarget:
             "recordSession": self._record,
             "logSession": self._record,
             "viewport": dict(VIEWPORT),
+            "solveCaptchas": self._solve_captchas,
         }
+        if self._proxies:
+            payload["proxies"] = True
         if context_id is not None:
             settings["context"] = {"id": context_id, "persist": persist}
         payload["browserSettings"] = settings
