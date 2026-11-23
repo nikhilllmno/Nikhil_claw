@@ -556,6 +556,99 @@ uses the default (`sama.orchestrator.limits.QueueLimits`):
 from the prompt assembler (Section 6.1). The worker stores the config fingerprint on the run
 when it dispatches the run.
 
+### 4.4 Run start latency (M8.2)
+
+**Warm limits.** A warm is a guess, so it has limits that keep the sandbox capacity for real
+runs: at most 10 new warms of one org and 30 of the process in 60 seconds, at most 4 warms at
+the same time, and a short idle timeout (3 minutes) for a sandbox that a warm started. Above a
+limit the answer is `limited`, and the run starts the sandbox as before.
+
+The web chat must show an activity soon after the user sends a message, as Claude Code and
+Codex do (M8.2, Section 17.8). The targets are: the first visible activity in less than 3
+seconds, and the first token of a follow-up message in less than 5 seconds.
+
+**Measured on staging (2026-11-22).** The control plane is in Fly region `sin`. The database is
+in `ap-south-1`. One database round trip takes about 58 ms. The time from the send to the first
+event in the web chat was 19 to 25 seconds for the first message of a new session, and 8.5 to 15
+seconds for a follow-up message. The time goes to these steps:
+
+| Step | Follow-up | First message |
+|---|---|---|
+| `POST /sessions/{id}/messages` | 1.7 to 2.0 s | 1.7 to 2.0 s |
+| Claim of the run | 0.5 to 0.8 s | 0.5 to 0.8 s |
+| Run config (prompt assembly) | 0.1 s (frozen) | 1.5 to 2.3 s |
+| Sandbox resume or create | 0.4 s | 0.6 to 1.1 s |
+| Coding step (`CodingPreparer`) | 1.4 s | 1.4 s |
+| Skill sync and runner restart | none | 1.8 s |
+| Runner start | 0.2 s (warm) | 1 to 3 s (cold) |
+| Runner job to first event, Claude | 3.7 to 4.3 s | 7 to 9 s |
+| Runner job to first event, OpenAI | 8.5 to 8.9 s | 11 to 14 s |
+| Event write and stream poll | 0.3 to 0.9 s | 0.3 to 0.9 s |
+
+**Run phases.** A run event `run_phase` tells the client which step runs now. Its payload is
+`{"phase": <name>, "usage": {...}}`. The `usage` is only for information: the usage rule of the
+contract does not apply to a phase (Section 5.1), and a client must not read the usage of the
+run from it. The phases are:
+
+| Phase | Sent by | When |
+|---|---|---|
+| `starting` | the worker | The worker took the run. It is the first event (`seq` 0) of a chat run and of each resume. The worker stores it while it builds the config. |
+| `starting_sandbox` | `SandboxedRuntime` | Before the sandbox resume or create. |
+| `starting_runtime` | `SandboxedRuntime` | The sandbox and the coding step are ready. The runner starts. |
+| `thinking` | both model runtimes | A model turn started: the Claude stream event `message_start` of the main agent, or the OpenAI event `response.created`. A run has it one time for each model turn. |
+
+The worker stores phases only for chat runs. A background review run has none. The gateway, the
+OpenAI-compatible server, and the trace view ignore phases. The runner timing line has
+`thinking_s`, and the sandbox step line has `thinking_s`, so the logs show the time to the model.
+
+**Session warm.** `POST /sessions/{id}/warm` gets the session sandbox ready before the first
+run. It needs read access to the session (`404` otherwise). It creates no run, issues no run
+token, and puts no secret in the sandbox. It answers `202` at once with
+`{"status": "warming" | "recent" | "off"}`:
+
+- `warming`: a warm started now, in the background.
+- `recent`: a warm of the session runs now, or started less than 60 seconds ago.
+- `off`: the process has no session sandbox (for example, the API runs without a worker).
+
+One user can ask at most 30 times in 60 seconds (`429` with `Retry-After`). The limits are in
+the memory of the process (`SessionWarmer`, `src/sama/orchestrator/prewarm.py`). The web app
+calls the route when the user puts the focus in the message box or starts to type.
+`POST /sessions` also starts a warm of the new session, because the web app creates the session
+before the user types the first message.
+
+The warm (`SandboxedRuntime.warm`) resumes the sandbox or creates one with the idle timeout,
+and runs `python -m sama.warm --start` in it: this starts the warm runner server (Section 16.2)
+and exits at once. A second server exits by itself, so a warm is safe to repeat. When a run of
+the session holds the sandbox, the warm does nothing (`busy`), because a resume with the idle
+timeout would make the timeout of the run shorter. A failed warm only logs. The next run then
+finds a sandbox that runs and a warm runner, so it skips the create (about 1 second) and the
+cold runner start (1 to 3 seconds). The skill sync still runs with the first run, because the
+skills of a session depend on the run (Section 9.3).
+
+**Coding step.** `CodingService.look` reads in one statement, without a transaction, whether
+the run is a chat run, whether plan mode is on, whether the session has a `pending` or a `ready`
+repository, and whether plan mode ever changed in the session. When none is true, the coding
+step ends after this read. Before, it made five transactions for each run (about 1.4 seconds).
+`SandboxedRuntime` now reads the skill files during the coding step, not before it.
+
+**Stream wake.** The worker and the API run in one control plane process. The worker calls
+`SessionSignals.notify` after each store of events and at the end of each run. The event stream
+of the session then reads at once, after `wake_s` (0.05 seconds), and does not wait for the rest
+of `poll_s` (0.5 seconds). A stream in another process finds the events on its next poll, as
+before. A signal only starts a read, so it cannot change what a stream sends.
+
+**Not done yet.** These steps stay slow and need more work:
+
+- `POST /sessions/{id}/messages` makes about 30 sequential round trips (access check, skill
+  expansion, steer check, enqueue with the rate and quota checks, and `waits`).
+- The first run config of a session takes about 2 seconds of sequential reads.
+- The OpenAI runtime connects its MCP servers one after the other and reads the session items
+  before the model call.
+- The control plane (`sin`) and the database (`ap-south-1`) are in different regions. A control
+  plane in the region of the database (Fly `bom`) would make each round trip about 1 to 2 ms
+  instead of 58 ms. It also changes the latency to E2B and to the model providers, so a person
+  must measure it before a move.
+
 ---
 
 ## 5. Runtime adapter layer
@@ -592,6 +685,7 @@ RunEvent = (
     | ApprovalRequired
     | Compacted
     | SubagentEvent
+    | RunPhase  # progress before the first text (Section 4.4)
     | RunCompleted
     | RunFailed
 )
@@ -620,7 +714,8 @@ RunEvent = (
 - Every event carries running `Usage` for the whole run. The stream ends with exactly one of
   `ApprovalRequired`, `RunCompleted`, or `RunFailed` (with a `FailureCode`). Usage never goes
   down, also across an approval resume: the resumed stream starts from the usage of
-  `ApprovalRequired`.
+  `ApprovalRequired`. A `RunPhase` event (Section 4.4) is not in this rule: its usage is only
+  for information, and the orchestrator can send one with zero usage before the runner starts.
 - One stream at a time per run. A runtime frees the run before it yields the terminal event,
   so the orchestrator can resume at once. Each approval resumes once, and only for its run.
   `cancel` stops an active stream and makes the approvals of a paused run invalid.
@@ -3844,6 +3939,7 @@ cross-org check of Section 17.1 through the API.
 | `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
 | `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `402` with `detail` and `quota` when the org or the user used a model quota of the plan (Section 17.5). `409` for an archived session. |
+| `POST /sessions/{id}/warm` | Start or resume the session sandbox and the warm runner before a run (Section 4.4). It creates no run. `202` with `status` (`warming`, `recent`, `limited`, or `off`). `limited`: the org started 10 warms, or the process 30 warms, in the last 60 seconds, or 4 warms run now; nothing starts. `429` with `Retry-After` after 30 requests of one user in 60 seconds. A sandbox that a warm started pauses after 3 minutes without a run. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
@@ -3883,7 +3979,9 @@ cross-org check of Section 17.1 through the API.
 - `end`: the user cannot read the session any more. The stream ends.
 
 The stream reads new rows every 0.5 seconds, sends `: ping` every 15 seconds, and checks the
-access again at each read. It ends after one hour, or when the access token expires if that is
+access again at each read. When the worker of the same process stores events of the session, the
+stream reads at once (Section 4.4). The first `run_event` of a chat run is `run_phase` with the
+phase `starting` (Section 4.4). It ends after one hour, or when the access token expires if that is
 earlier. The time limit covers the whole response, also a slow database read or a send to a
 client that does not read: the response stops at most one second after it. The client then
 connects again with a fresh token. One process has at most 1,000 open
@@ -7398,6 +7496,8 @@ not change.
   orchestrator gets no terminal event (a sandbox error).
 - The warm server starts with a short allow list of variables (`SERVER_ENV`). It never gets
   the run token. Only a forked runner gets the environment of its client.
+- `python -m sama.warm --start` starts a warm server (detached) and exits at once. The session
+  warm uses it before the first run (Section 4.4).
 - If there is no warm server, the client starts one (detached) for the next run and runs this
   job in its own process (cold). The code id (a hash of the Python executable and the sama
   source files) must be the same in the client and the server. If it is not, the server

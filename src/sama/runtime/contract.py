@@ -527,6 +527,30 @@ class SubagentEvent(_Event):
     only when the runtime reports it."""
 
 
+class RunPhaseName(StrEnum):
+    """The phases of the start of a run (Section 4.3, "Run start latency")."""
+
+    STARTING = "starting"
+    """The worker took the run from the queue. It builds the run config."""
+    STARTING_SANDBOX = "starting_sandbox"
+    """The orchestrator starts or resumes the session sandbox."""
+    STARTING_RUNTIME = "starting_runtime"
+    """The sandbox is ready. The orchestrator starts the runner and the runtime."""
+    THINKING = "thinking"
+    """The runtime sent a model request and the model started its answer. A run can have this
+    phase one time for each model turn."""
+
+
+class RunPhase(_Event):
+    """Progress before the first text or tool call, so that a client can show an activity at
+    once. It has no other effect. Its ``usage`` is only for information: the usage rule of
+    the stream (``validate_event_stream``) does not apply to it, and a consumer must not read
+    the usage of the run from it."""
+
+    type: Literal["run_phase"] = "run_phase"
+    phase: RunPhaseName
+
+
 class ApprovalRequired(_Event):
     """Terminal. The run pauses until a human decides. Resume with ``ResumeRequest``."""
 
@@ -567,6 +591,7 @@ RunEvent = Annotated[
     | ToolCallFinished
     | Compacted
     | SubagentEvent
+    | RunPhase
     | ApprovalRequired
     | RunCompleted
     | RunFailed,
@@ -593,9 +618,9 @@ def validate_event_stream(events: Sequence[RunEvent], start: Usage | None = None
     """Checks the stream rules and returns the terminal event.
 
     Rules: the stream is not empty, it ends with exactly one terminal event, and token counts
-    and cost in ``usage`` never go down. For a resumed run, ``start`` is the usage of the
-    ``ApprovalRequired`` event that paused it: usage is for the whole run, so the resumed
-    stream must not report less.
+    and cost in ``usage`` never go down (a ``RunPhase`` event is not in this rule). For a
+    resumed run, ``start`` is the usage of the ``ApprovalRequired`` event that paused it: usage
+    is for the whole run, so the resumed stream must not report less.
     """
     if not events:
         raise ContractViolation("the stream has no events")
@@ -607,6 +632,8 @@ def validate_event_stream(events: Sequence[RunEvent], start: Usage | None = None
         )
     previous = start if start is not None else Usage()
     for index, event in enumerate(events):
+        if isinstance(event, RunPhase):
+            continue  # its usage is only for information
         if not _usage_not_lower(event.usage, previous):
             raise ContractViolation(f"usage went down at event {index}")
         previous = event.usage

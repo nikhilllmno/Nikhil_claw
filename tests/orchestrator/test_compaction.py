@@ -147,7 +147,7 @@ async def test_a_compact_run_records_the_compaction(
     assert request.compact.focus == "keep the plan"
     assert request.runtime_state is not None
     events = await harness.events(run_id)
-    assert [kind for _, kind in events] == ["compacted", "run_completed"]
+    assert [kind for _, kind in events] == ["run_phase", "compacted", "run_completed"]
     (row,) = await compactions(engine, tenant, "s1")
     assert (row.trigger, row.tokens_before, row.tokens_after) == ("manual", 1000, 500)
     assert row.run_id == run_id

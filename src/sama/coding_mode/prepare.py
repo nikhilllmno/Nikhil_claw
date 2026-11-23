@@ -8,6 +8,9 @@ run token, and before it starts the runner. The step:
 2. returns a note for the input of the run: the repositories that it cloned or could not clone,
    and the rules of plan mode while plan mode is on.
 
+The first read (``CodingService.look``) is one statement. When the session has no repository and
+plan mode never changed in it, the step ends there, so a plain chat run does not wait for it.
+
 The step is the same for every runtime and harness that runs in the session sandbox, because
 the note goes into the user message of the run. A failure never stops the run: the repository
 gets the status ``failed`` with the reason, and the note tells the agent.
@@ -101,11 +104,17 @@ class CodingPreparer:
         stay."""
         try:
             org_id, session_id = uuid.UUID(scope.org_id), uuid.UUID(scope.session_id)
-            runtime = await self._coding.chat_run(org_id=org_id, run_id=uuid.UUID(scope.run_id))
+            look = await self._coding.look(
+                org_id=org_id, session_id=session_id, run_id=uuid.UUID(scope.run_id)
+            )
+            runtime = look.runtime
             if runtime is None:
                 return ""  # a background review or a /compact run has no coding step
+            if look.idle and not plan:
+                # No repository and no plan mode: one read, and no note (Section 4.4).
+                return ""
             if plan is None:
-                plan = await self._coding.plan_mode(org_id=org_id, session_id=session_id)
+                plan = look.plan_mode
             lost = await self._lost(sandbox, org_id, session_id)
             pending = await self._coding.pending_repos(org_id=org_id, session_id=session_id)
         except Exception as error:
