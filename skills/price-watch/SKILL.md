@@ -1,7 +1,7 @@
 ---
 name: price-watch
 description: Watch a product price and alert at a target price
-version: 1.0.0
+version: 1.1.0
 tags: [productivity, shopping, schedule]
 requires_toolsets: [cron, web]
 ---
@@ -16,8 +16,9 @@ a listing goes up or down, or reaches a target.
 1. Get the item: the URL, the exact variant (size, color, dates, class), the target price,
    and the currency.
 2. Read the page once now with `web_extract`. Find the current price and the stock state.
-   If the page has no price in its text (for example it loads the price with script), tell
-   the user that the watch cannot work on that page, and suggest another source.
+   If the page has no price in its text (for example it loads the price with script), find
+   another page for the same item that has the price in its text, and use that page. If no
+   page has it, tell the user that a scheduled watch cannot read this price.
 3. Agree on how often to check. Once or twice a day is normal. Do not check more than once
    an hour.
 4. Write the job prompt. It must stand alone: the URL, the variant, the target, the price
