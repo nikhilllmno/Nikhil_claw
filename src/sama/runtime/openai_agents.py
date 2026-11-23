@@ -34,12 +34,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import json
 import logging
+import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import httpx
 from agents import (
@@ -109,6 +118,9 @@ from sama.runtime.session_items import (
     SessionItemsRequest,
 )
 
+if TYPE_CHECKING:
+    from sama.runtime.relay import TokenRelay
+
 log: Final = logging.getLogger("sama.runtime.openai_agents")
 
 DEFAULT_MAX_TURNS: Final = 200
@@ -123,6 +135,9 @@ _PROXY_BUDGET_STATUS: Final = 402
 _RETRYABLE_STATUS: Final = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _PREVIEW_CHARS: Final = 2_000
 _CLEANUP_S: Final = 10.0
+MCP_CONNECT_S: Final = 30.0
+"""The longest wait for the MCP servers of a run to connect. The servers connect at the same
+time, so this is also the limit for one server."""
 MCP_CALL_TIMEOUT_S: Final = 3_600.0
 """How long the runtime waits for one call of a sama MCP tool. The SDK default is 5 seconds,
 and many sama tools take longer: a browser session starts in more than 5 seconds, ``clarify``
@@ -153,9 +168,162 @@ class OpenAISettings:
     api_key: str | None = None
     cancel_grace_s: float = 4.0
     max_retries: int = 2
+    relay: TokenRelay | None = None
+    """The token relay of a kept runner (Section 4.4). With it, the model client and the MCP
+    clients hold only the local secret of the relay, which adds the token of the active run."""
+    keeper: OpenAIKeeper | None = None
+    """Keeps the MCP connections and the model client between runs of the session. It needs
+    ``relay``."""
+    mark: Callable[[str], None] | None = None
+    """Called with the name of a step the first time that it happens in a run (the timing line
+    of the runner)."""
+
+    def __post_init__(self) -> None:
+        if self.keeper is not None and self.relay is None:
+            raise ValueError("a keeper needs a relay: kept clients must not hold a run token")
 
     def __repr__(self) -> str:
         return f"OpenAISettings(cwd={self.cwd!r}, model_url={self.model_url!r}, api_key=<hidden>)"
+
+
+# ---------------------------------------------------------------------------------------------
+# MCP connections: parallel connect and reuse between runs
+# ---------------------------------------------------------------------------------------------
+
+
+class _Owned:
+    """One MCP server. One task connects it, waits, and closes it, because the SDK enters
+    cancel scopes when it connects, and a scope must exit in the task that entered it. So a
+    connection can outlive the task of the run that made it."""
+
+    def __init__(self, server: MCPServer) -> None:
+        self.server = server
+        self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._ready.add_done_callback(_consume)
+        self._stop = asyncio.Event()
+        self._task = asyncio.create_task(self._own())
+
+    async def _own(self) -> None:
+        try:
+            await self.server.connect()  # type: ignore[no-untyped-call]
+        except BaseException as error:
+            if not self._ready.done():
+                if isinstance(error, asyncio.CancelledError):
+                    self._ready.cancel()
+                else:
+                    self._ready.set_exception(error)
+            await _cleanup(self.server.cleanup())  # type: ignore[no-untyped-call]
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            return
+        self._ready.set_result(None)
+        try:
+            await self._stop.wait()
+        finally:
+            await _cleanup(self.server.cleanup())  # type: ignore[no-untyped-call]
+
+    async def ready(self) -> None:
+        await asyncio.shield(self._ready)
+
+    async def close(self) -> None:
+        self._stop.set()
+        if not self._ready.done():
+            self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
+
+
+def _consume(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()  # a failure that nobody waits for is not an error of the loop
+
+
+class _ServerSet:
+    """The MCP servers of one run. They connect at the same time, and the run waits for all."""
+
+    def __init__(self, key: str, owners: list[_Owned]) -> None:
+        self.key = key
+        self._owners = owners
+        self.idle_since = time.monotonic()
+
+    @property
+    def servers(self) -> list[MCPServer]:
+        return [owned.server for owned in self._owners]
+
+    async def ready(self, timeout_s: float = MCP_CONNECT_S) -> None:
+        """Waits until every server is connected. Raises the first connect error."""
+        async with asyncio.timeout(timeout_s):
+            await asyncio.gather(*(owned.ready() for owned in self._owners))
+
+    async def close(self) -> None:
+        await asyncio.gather(*(owned.close() for owned in self._owners), return_exceptions=True)
+
+
+class OpenAIKeeper:
+    """Keeps the MCP connections and the model client between runs of the session
+    (docs/architecture.md, Section 4.4).
+
+    A set of connections fits a run when the key is the same (the config fingerprint and the
+    relay) and it did not wait longer than ``idle_s``. A run takes the set out (``take``), so
+    one run uses it at a time, and puts it back after a clean end. An error, a cancel, a pause
+    for an approval, and a timeout close it. The connections hold no token: the relay adds the
+    token of the active run.
+    """
+
+    def __init__(self, *, idle_s: float = 600.0) -> None:
+        self.idle_s = idle_s
+        self._kept: _ServerSet | None = None
+        self._client: AsyncOpenAI | None = None
+        self._closing: set[asyncio.Task[None]] = set()
+
+    @property
+    def holds(self) -> bool:
+        return self._kept is not None
+
+    def take(self, key: str) -> _ServerSet | None:
+        kept, self._kept = self._kept, None
+        if kept is None:
+            return None
+        if kept.key == key and time.monotonic() - kept.idle_since <= self.idle_s:
+            return kept
+        self._stop(kept.close())
+        return None
+
+    def put(self, kept: _ServerSet) -> None:
+        old, self._kept = self._kept, kept
+        kept.idle_since = time.monotonic()
+        if old is not None:
+            self._stop(old.close())
+
+    def client(self, settings: OpenAISettings) -> AsyncOpenAI:
+        """The model client. It lives as long as the keeper."""
+        if self._client is None:
+            self._client = _model_client(settings)
+        return self._client
+
+    def _stop(self, work: Any) -> None:
+        task = asyncio.create_task(work)
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+
+    async def close(self) -> None:
+        kept, self._kept = self._kept, None
+        if kept is not None:
+            self._stop(kept.close())
+        while self._closing:
+            await asyncio.wait(set(self._closing))
+        client, self._client = self._client, None
+        if client is not None:
+            await client.close()
+
+
+def _model_client(settings: OpenAISettings) -> AsyncOpenAI:
+    relay = settings.relay
+    return AsyncOpenAI(
+        base_url=relay.openai_url if relay is not None else settings.model_url,
+        api_key=relay.secret if relay is not None else settings.api_key,
+        max_retries=settings.max_retries,
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -705,6 +873,8 @@ class _ActiveRun:
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     pump: asyncio.Task[None] | None = None
     sent_terminal: bool = False
+    completed: bool = False
+    """The terminal event is ``RunCompleted``. Only then does a keeper keep the connections."""
 
     def send(self, event: RunEvent) -> None:
         if self.sent_terminal:
@@ -712,6 +882,7 @@ class _ActiveRun:
         if isinstance(event, RunFailed) and event.runtime_state is None:
             event = event.model_copy(update={"runtime_state": self.job.failure_state()})
         self.sent_terminal = is_terminal(event)
+        self.completed = isinstance(event, RunCompleted)
         self.queue.put_nowait(event)
 
 
@@ -753,6 +924,7 @@ class OpenAIRuntime:
         self._used_approvals = BoundedSet()
         self._cancelled_runs = BoundedSet()
         self._pumps: set[asyncio.Task[None]] = set()
+        self._closing: set[asyncio.Task[None]] = set()
 
     def __repr__(self) -> str:
         return f"OpenAIRuntime(settings={self._settings!r})"
@@ -775,13 +947,16 @@ class OpenAIRuntime:
         )
 
     def _openai(self) -> AsyncOpenAI:
+        keeper = self._settings.keeper
+        if keeper is not None:
+            return keeper.client(self._settings)
         if self._client is None:
-            self._client = AsyncOpenAI(
-                base_url=self._settings.model_url,
-                api_key=self._settings.api_key,
-                max_retries=self._settings.max_retries,
-            )
+            self._client = _model_client(self._settings)
         return self._client
+
+    def _mark(self, name: str) -> None:
+        if self._settings.mark is not None:
+            self._settings.mark(name)
 
     async def aclose(self) -> None:
         for task in list(self._pumps):
@@ -789,6 +964,8 @@ class OpenAIRuntime:
         for task in list(self._pumps):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        while self._closing:
+            await asyncio.wait(set(self._closing))
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -944,6 +1121,7 @@ class OpenAIRuntime:
         job = active.job
         job.started_at = asyncio.get_running_loop().time()
         wall_time: float | None = None
+        servers: _ServerSet | None = None
         if job.budget.max_wall_time_s is not None:
             wall_time = max(0.0, job.budget.max_wall_time_s - job.elapsed_before_s)
         try:
@@ -951,15 +1129,20 @@ class OpenAIRuntime:
                 if wall_time == 0.0:
                     raise TimeoutError
                 store = _Store(self._items, job.scope, job.conversation)
+                if job.compact is None:
+                    # The servers connect while the items load: both wait for the network.
+                    servers = self._open_servers(job)
                 if job.resume is None:
                     job.base_count = await self._prepare(store, previous)
                     job.repair = False
+                    self._mark("items_ready")
                 if active.cancelled.is_set():
                     active.send(_cancelled(job.usage))
                 elif job.compact is not None:
                     await self._compact(active, store, job.compact)
                 else:
-                    await self._agent_run(active, store)
+                    assert servers is not None  # noqa: S101 -- set above for a run with no compact
+                    await self._agent_run(active, store, servers)
         except TimeoutError:
             active.send(
                 RunFailed(
@@ -976,7 +1159,39 @@ class OpenAIRuntime:
         except Exception as exc:
             active.send(self._failure(exc, job))
         finally:
-            active.queue.put_nowait(_Done())
+            try:
+                await self._end_servers(servers, keep=active.completed)
+            finally:
+                active.queue.put_nowait(_Done())
+
+    def _open_servers(self, job: _Job) -> _ServerSet:
+        """The MCP servers of the run: the kept ones, or new ones that start to connect now."""
+        settings = self._settings
+        relay = settings.relay
+        key = hashlib.sha256(
+            f"{job.config.fingerprint()}\0{relay.secret if relay else ''}".encode()
+        ).hexdigest()
+        if settings.keeper is not None:
+            kept = settings.keeper.take(key)
+            if kept is not None:
+                self._mark("mcp_kept")
+                return kept
+        return _ServerSet(key, [_Owned(server) for server in _mcp_servers(job.config, relay)])
+
+    async def _end_servers(self, servers: _ServerSet | None, *, keep: bool) -> None:
+        """Keeps the servers after a run that completed, else closes them."""
+        if servers is None:
+            return
+        keeper = self._settings.keeper
+        if keeper is not None and keep:
+            keeper.put(servers)
+            return
+        # A task closes them. A cancel of this pump (the caller has its terminal event and
+        # stops the pump) must not leave a connection half closed. ``aclose`` waits for it.
+        task = asyncio.create_task(servers.close())
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+        await asyncio.wait({task})
 
     def _failure(self, exc: Exception, job: _Job) -> RunFailed:
         if isinstance(exc, MaxTurnsExceeded):
@@ -1108,20 +1323,20 @@ class OpenAIRuntime:
             max_turns=definition.max_turns or DEFAULT_SUBAGENT_TURNS,
         )
 
-    async def _agent_run(self, active: _ActiveRun, store: _Store) -> None:
+    async def _agent_run(self, active: _ActiveRun, store: _Store, owned: _ServerSet) -> None:
         job = active.job
         gate = _RunGate(self._gate, job.scope)
-        servers = _mcp_servers(job.config)
         client = UnixLocalSandboxClient()
         sandbox: Any = None
         async with contextlib.AsyncExitStack() as stack:
-            for server in servers:
-                await server.connect()  # type: ignore[no-untyped-call]
-                stack.push_async_callback(_cleanup, server.cleanup())  # type: ignore[no-untyped-call]
+            await owned.ready()
+            self._mark("mcp_ready")
+            servers = owned.servers
             manifest = Manifest(root=self._settings.cwd) if self._settings.cwd else Manifest()
             sandbox = await client.create(manifest=manifest, snapshot=NoopSnapshotSpec())
             stack.push_async_callback(_cleanup, _close_sandbox(client, sandbox))
             await sandbox.start()
+            self._mark("sandbox_ready")
             agent = self._agent(job, gate, servers, active)
             run_config = SdkRunConfig(
                 sandbox=SandboxRunConfig(session=sandbox), tracing_disabled=True
@@ -1380,15 +1595,23 @@ def _shell_tools(toolset: Any) -> None:
     toolset.write_stdin = None
 
 
-def _mcp_servers(config: RunConfig) -> list[MCPServer]:
+def _mcp_servers(config: RunConfig, relay: TokenRelay | None = None) -> list[MCPServer]:
+    """The MCP clients of a run. With a relay, a client calls the relay with the local secret,
+    and the relay adds the token of the active run (``sama.runtime.relay``)."""
     servers: list[MCPServer] = []
+    if relay is not None:
+        relay.set_mcp({server.name: server.url for server in config.mcp_servers})
     for server in config.mcp_servers:
         headers: dict[str, str] = {}
-        if server.bearer_token is not None:
+        url = server.url
+        if relay is not None:
+            url = relay.mcp_url(server.name)
+            headers["Authorization"] = f"Bearer {relay.secret}"
+        elif server.bearer_token is not None:
             headers["Authorization"] = f"Bearer {server.bearer_token.get_secret_value()}"
         servers.append(
             MCPServerStreamableHttp(
-                params={"url": server.url, "headers": headers},
+                params={"url": url, "headers": headers},
                 name=server.name,
                 cache_tools_list=True,
                 client_session_timeout_seconds=MCP_CALL_TIMEOUT_S,

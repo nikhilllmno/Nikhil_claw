@@ -103,6 +103,18 @@ def test_an_extension_id_that_is_not_valid_is_refused(value: str) -> None:
         settings(SAMA_EXTENSION_IDS=value)
 
 
+def test_the_kept_runtime_time_is_read() -> None:
+    assert settings().runner_keep_s == 600.0
+    assert settings(SAMA_RUNNER_KEEP_S="120").runner_keep_s == 120.0
+    assert settings(SAMA_RUNNER_KEEP_S="0").runner_keep_s == 0.0
+
+
+@pytest.mark.parametrize("value", ["soon", "-1"])
+def test_a_keep_time_that_is_not_valid_is_refused(value: str) -> None:
+    with pytest.raises(SettingsError, match="SAMA_RUNNER_KEEP_S"):
+        settings(SAMA_RUNNER_KEEP_S=value)
+
+
 def test_the_options_are_read() -> None:
     s = settings(
         SAMA_SANDBOX_ALLOW_OUT=" GitHub.com, pypi.org,,example.org,sama-staging.fly.dev ",

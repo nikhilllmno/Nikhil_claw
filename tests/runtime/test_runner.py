@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 import sama.runtime.runner as runner_module
+import sama.warm as warm_module
 from sama.runtime import (
     ApprovalDecision,
     ApprovalRequired,
@@ -420,3 +421,121 @@ async def test_the_runner_writes_a_timing_line(
     for mark in ("job_s=", "lock_s=", "runtime_s=", "first_event_s=", "terminal_s=", "exit_s="):
         assert mark in lines[0]
     assert (tmp_path / ".sama" / "runner.lock").exists()
+
+
+# -- the kept runtime (docs/architecture.md, Section 4.4) ---------------------------------------
+
+
+class _Probe:
+    """A runtime that records the state of the token relay while it runs."""
+
+    kind = RuntimeKind.CLAUDE_AGENT_SDK
+
+    def __init__(self, keep: runner_module.RunnerKeep) -> None:
+        self.keep = keep
+        self.active_during_run: list[bool] = []
+
+    def capabilities(self) -> object:
+        raise NotImplementedError
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.active_during_run.append(self.keep.relay.active)
+        yield RunCompleted(output="ok", usage=Usage(output_tokens=1))
+
+    async def cancel(self, run_id: str) -> None:
+        return None
+
+
+def _claude_job(*, parallel: bool = False) -> RunnerJob:
+    request = RunRequest(
+        scope=make_scope("run-1"),
+        input="hi",
+        config=make_config(RuntimeKind.CLAUDE_AGENT_SDK),
+        parallel=parallel,
+    )
+    return RunnerJob(op="run", run=request)
+
+
+KEEP_ENV = {**ENV, runner_module.MODEL_URL_ENV: "http://127.0.0.1:1"}
+
+
+async def test_the_relay_has_the_token_only_while_the_job_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    probe = _Probe(keep)
+    monkeypatch.setattr(runner_module, "build_runtime", lambda job, env, keep, mark: probe)
+    env = {**KEEP_ENV, WORKDIR_ENV: str(tmp_path)}
+    out = io.StringIO()
+    try:
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        assert code == 0
+        assert probe.active_during_run == [True]
+        assert not keep.relay.active  # the token left with the job
+    finally:
+        await keep.close()
+
+
+async def test_the_relay_loses_the_token_when_the_runtime_cannot_be_built(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+
+    def broken(job: RunnerJob, env: object, keep: object, mark: object) -> object:
+        raise ValueError("no runtime")
+
+    monkeypatch.setattr(runner_module, "build_runtime", broken)
+    out = io.StringIO()
+    try:
+        env = {**KEEP_ENV, WORKDIR_ENV: str(tmp_path)}
+        code = await serve(_lines([_claude_job().model_dump_json()]), Output(out), env, keep=keep)
+        assert code == 2
+        assert not keep.relay.active
+    finally:
+        await keep.close()
+
+
+async def test_a_side_run_does_not_use_the_kept_runtime(tmp_path: Path) -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    try:
+        job = _claude_job(parallel=True)
+        assert runner_module._keeps(job, KEEP_ENV, keep) is None
+        assert runner_module._keeps(_claude_job(), KEEP_ENV, keep) is keep
+        assert runner_module._keeps(_claude_job(), KEEP_ENV, None) is None
+        # The relay needs the URL of the model proxy.
+        assert runner_module._keeps(_claude_job(), ENV, keep) is None
+        assert runner_module._keeps(_job(), KEEP_ENV, keep) is None  # the fake runtime
+    finally:
+        await keep.close()
+
+
+def test_a_kept_cli_gets_no_run_token_and_no_model_key() -> None:
+    env = runner_module.kept_cli_env({RUN_TOKEN_ENV: "secret-token", "HOME": "/home/user"})
+    assert env["HOME"] == "/home/user"
+    assert RUN_TOKEN_ENV not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["DISABLE_TELEMETRY"] == "1"
+
+
+async def test_the_kept_runtimes_are_made_when_they_are_needed() -> None:
+    keep = runner_module.RunnerKeep(60, "http://127.0.0.1:1")
+    assert not keep.holds
+    assert keep.claude.idle_s == keep.openai.idle_s == 60
+    assert not keep.holds
+    await keep.reset()
+    await keep.close()
+
+
+def test_a_cold_runner_does_not_keep(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = {warm_module.KEEP_ENV: "600"}
+    monkeypatch.setattr(runner_module, "MODE", "cold")
+    assert runner_module._keep_idle_s(env) == 0.0
+    monkeypatch.setattr(runner_module, "MODE", "warm")
+    monkeypatch.setattr(runner_module, "HOST", None)
+    assert runner_module._keep_idle_s(env) == 0.0
+    handle = warm_module.HostHandle("/x.host", "code", -1)
+    monkeypatch.setattr(runner_module, "HOST", handle)
+    assert runner_module._keep_idle_s(env) == 600.0
+    assert runner_module._keep_idle_s({}) == 0.0
+    assert runner_module._keep_idle_s({warm_module.KEEP_ENV: "soon"}) == 0.0

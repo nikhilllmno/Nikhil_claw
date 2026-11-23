@@ -17,11 +17,17 @@ change. This module imports only the standard library, so the client starts fast
 
 The warm server never gets the run token: it starts with a short list of variables, and only
 the forked processes get the environment of a client.
+
+A runner can stay alive after a run that ended well, and become a host (``sama.runtime.host``,
+Section 4.4). The client then tries the host first (``<socket>.host``) when ``SAMA_RUNNER_KEEP_S``
+is set. The runner tells the watcher that the job is over (``HostHandle.release``), and the
+watcher answers the client and does not kill the runner.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -33,6 +39,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from typing import Any, Final, NoReturn
@@ -59,6 +66,8 @@ PRELOAD: Final = (
     "sama.runtime.remote_gate",
     "sama.runtime.gating",
     "sama.runtime.session_items",
+    "sama.runtime.host",
+    "sama.runtime.relay",
     "sama.runtime.openai_agents",
     "sama.runtime.archive",
 )
@@ -68,8 +77,21 @@ SERVER_LOCK_WAIT_S: Final = 3.0
 """A new warm server waits this long for a stale one to stop."""
 _HEADER: Final = struct.Struct("!I")
 _MAX_REQUEST: Final = 4 * 1024 * 1024
-_STALE: Final = b"S"
-_EXIT: Final = b"X"
+REPLY_STALE: Final = b"S"
+"""The server has other code than the client, and it stops. The client uses another path."""
+REPLY_BUSY: Final = b"B"
+"""A host runs a job now. The client uses the warm server (``sama.runtime.host``)."""
+REPLY_EXIT: Final = b"X"
+"""``X<exit code>``: the job ended."""
+_STALE: Final = REPLY_STALE
+_EXIT: Final = REPLY_EXIT
+KEEP_ENV: Final = "SAMA_RUNNER_KEEP_S"
+"""The idle time in seconds of a kept runner. ``0`` or no value: the runner exits after its run
+and no host takes the job. The orchestrator sets it (Section 4.4)."""
+FRESH_ENV: Final = "SAMA_RUNNER_FRESH"
+"""``1``: the host must not use the kept CLI of an earlier run for this job (the skill files of
+the session changed)."""
+HOST_SUFFIX: Final = ".host"
 
 
 def code_id() -> str:
@@ -121,7 +143,7 @@ def run_warm(path: str, code: str, started: float) -> int | None:
             # the work of the job two times.
             _log(f"the connection to the warm runner failed: {type(error).__name__}")
             return 1
-        if reply == _STALE:
+        if reply in {REPLY_STALE, REPLY_BUSY}:
             return None
         if reply.startswith(_EXIT):
             with contextlib.suppress(ValueError):
@@ -161,10 +183,23 @@ def start_server(path: str) -> None:
         )
 
 
+def _keep_seconds(env: Mapping[str, str]) -> float:
+    """The value of ``SAMA_RUNNER_KEEP_S``, or 0 if it is not set or not a positive number."""
+    try:
+        return max(0.0, float(env.get(KEEP_ENV, "0")))
+    except ValueError:
+        return 0.0
+
+
 def client_main() -> NoReturn:
     started = time.time()
     path = os.environ.get(SOCKET_ENV) or DEFAULT_SOCKET
     code = code_id()
+    if _keep_seconds(os.environ) > 0:
+        # A host that runs this session has the CLI of the last run (Section 4.4).
+        exit_code = run_warm(path + HOST_SUFFIX, code, started)
+        if exit_code is not None:
+            raise SystemExit(exit_code)
     exit_code = run_warm(path, code, started)
     if exit_code is not None:
         raise SystemExit(exit_code)
@@ -200,6 +235,7 @@ def server_main(path: str) -> NoReturn:
         with contextlib.suppress(ImportError):
             importlib.import_module(module)
     code = code_id()
+    threading.Thread(target=_read_cli_binary, daemon=True).start()
     with contextlib.suppress(FileNotFoundError):
         os.unlink(path)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -223,18 +259,33 @@ def server_main(path: str) -> NoReturn:
             signal.signal(signal.SIGCHLD, signal.SIG_DFL)
             exit_code = 1
             try:
-                exit_code = _watch(conn, code)
+                exit_code = _watch(conn, code, path)
             finally:
                 os._exit(exit_code)
         conn.close()
 
 
-def _peer_uid(conn: socket.socket) -> int:
+def _read_cli_binary() -> None:
+    """Reads the Claude CLI file once, so the disk cache has it. A new sandbox loads the blocks
+    of its disk when they are first read: the first start of the CLI took 2.6 seconds, and the
+    next ones 0.4 seconds (E2B, Section 4.4). The server does this in the background, when the
+    session warm starts it, so the first run does not wait for the disk."""
+    module = sys.modules.get("claude_agent_sdk")
+    origin = getattr(module, "__file__", None)
+    if not origin:
+        return
+    binary = os.path.join(os.path.dirname(origin), "_bundled", "claude")
+    with contextlib.suppress(OSError), open(binary, "rb", buffering=0) as handle:
+        while handle.read(1 << 20):
+            pass
+
+
+def peer_uid(conn: socket.socket) -> int:
     creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     return int(struct.unpack("3i", creds)[1])
 
 
-def _receive(conn: socket.socket) -> tuple[dict[str, Any], list[int]]:
+def receive_request(conn: socket.socket) -> tuple[dict[str, Any], list[int]]:
     data, fds, _, _ = socket.recv_fds(conn, 65536, 3)
     if len(fds) != 3 or len(data) < _HEADER.size:
         raise ValueError("the request has no files or no header")
@@ -252,29 +303,52 @@ def _receive(conn: socket.socket) -> tuple[dict[str, Any], list[int]]:
     return request, fds
 
 
-def _watch(conn: socket.socket, code: str) -> int:
+@dataclasses.dataclass(frozen=True)
+class HostHandle:
+    """What a runner needs to become a host: the path of the host socket, the code id that a
+    client must have, and the pipe to the watcher."""
+
+    path: str
+    code: str
+    status_fd: int
+
+    def release(self, exit_code: int) -> None:
+        """Tells the watcher that the job is over. The watcher answers the client with the exit
+        code and does not kill this process."""
+        with contextlib.suppress(OSError):
+            os.write(self.status_fd, b"D" + str(exit_code).encode() + b"\n")
+        with contextlib.suppress(OSError):
+            os.close(self.status_fd)
+
+
+def _watch(conn: socket.socket, code: str, path: str) -> int:
     """Starts the runner for one client and waits. Kills the runner if the client stops."""
-    if _peer_uid(conn) != os.getuid():
+    if peer_uid(conn) != os.getuid():
         return 1
-    request, fds = _receive(conn)
+    request, fds = receive_request(conn)
     if request.get("code") != code:
         conn.sendall(_STALE + b"\n")
         # The server has other code than the client: stop it, so the client starts a new one.
         with contextlib.suppress(OSError):
             os.kill(os.getppid(), signal.SIGTERM)
         return 0
+    status_r, status_w = os.pipe()
     pid = os.fork()
     if pid == 0:
         conn.close()
-        _become_runner(request, fds)
+        os.close(status_r)
+        _become_runner(request, fds, HostHandle(path + HOST_SUFFIX, code, status_w))
     # The runner gets its own process group. The child does the same, and the first call wins,
     # so the group exists before the watcher can kill it.
     with contextlib.suppress(OSError):
         os.setpgid(pid, pid)
     for fd in fds:
         os.close(fd)
-    status = _wait_or_kill(conn, pid)
-    _kill(pid)  # child processes that the runner left
+    os.close(status_w)
+    status, released = _wait_or_kill(conn, pid, status_r)
+    os.close(status_r)
+    if not released:
+        _kill(pid)  # child processes that the runner left
     with contextlib.suppress(OSError):
         conn.sendall(_EXIT + str(status).encode() + b"\n")
     return 0
@@ -287,15 +361,33 @@ def _kill(pid: int) -> None:
             kill(pid, signal.SIGKILL)
 
 
-def _wait_or_kill(conn: socket.socket, pid: int) -> int:
-    """Waits for the runner. If the client closes the socket first, kills the runner."""
+def _wait_or_kill(conn: socket.socket, pid: int, status_fd: int) -> tuple[int, bool]:
+    """Waits for the runner. If the client closes the socket first, kills the runner.
+
+    Returns the exit code and whether the runner released itself: a runner that became a host
+    (``HostHandle.release``) tells the exit code of its job on ``status_fd`` and stays alive.
+    """
     pidfd: int | None = None
     with contextlib.suppress(OSError, AttributeError):
         pidfd = os.pidfd_open(pid)
-    watched = [conn.fileno()] + ([pidfd] if pidfd is not None else [])
+    watched = [conn.fileno(), status_fd] + ([pidfd] if pidfd is not None else [])
+    pending = b""
     while True:
         timeout = 0.1 if pidfd is None or conn.fileno() not in watched else None
         ready, _, _ = select.select(watched, [], [], timeout)
+        if status_fd in ready:
+            chunk = os.read(status_fd, 64)
+            if not chunk:
+                watched.remove(status_fd)  # the runner closed it without a message
+            pending += chunk
+            if pending.endswith(b"\n") and pending.startswith(b"D"):
+                try:
+                    exit_code = int(pending[1:])
+                except ValueError:
+                    exit_code = 1
+                if pidfd is not None:
+                    os.close(pidfd)
+                return exit_code, True
         if conn.fileno() in ready and not conn.recv(1):
             watched.remove(conn.fileno())
             _kill(pid)
@@ -304,10 +396,10 @@ def _wait_or_kill(conn: socket.socket, pid: int) -> int:
             if pidfd is not None:
                 os.close(pidfd)
             code = os.waitstatus_to_exitcode(status)
-            return code if code >= 0 else 128 - code
+            return (code if code >= 0 else 128 - code), False
 
 
-def _become_runner(request: Mapping[str, Any], fds: list[int]) -> NoReturn:
+def _become_runner(request: Mapping[str, Any], fds: list[int], host: HostHandle) -> NoReturn:
     """In the runner process: take the files, the environment, and the work folder of the
     client, then run the runner."""
     exit_code = 1
@@ -329,6 +421,7 @@ def _become_runner(request: Mapping[str, Any], fds: list[int]) -> NoReturn:
 
         runner.STARTED_AT = float(request["started"])
         runner.MODE = "warm"
+        runner.HOST = host
         try:
             runner.main()
         except SystemExit as stop:

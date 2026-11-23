@@ -117,6 +117,19 @@ def _self_repo(env: Mapping[str, str]) -> str:
     return f"{owner}/{name}"
 
 
+def _non_negative_float(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SettingsError(f"{name} must be a number of seconds") from None
+    if value < 0:
+        raise SettingsError(f"{name} must not be negative")
+    return value
+
+
 def _hosts(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(h.strip().lower() for h in value.split(",") if h.strip()))
 
@@ -151,6 +164,9 @@ class ControlPlaneSettings:
     e2b_api_key: SecretStr
     supabase_jwt_secret: SecretStr | None = None
     sandbox_template: str = DEFAULT_TEMPLATE
+    runner_keep_s: float = 600.0
+    """How long a warm runner stays alive after a run that ended well (Section 4.4). ``0`` turns
+    the kept runtime off."""
     connector_host_template: str = DEFAULT_HOST_TEMPLATE
     """The E2B template of the connector hosts of stdio MCP servers (Section 10.3.2)."""
     sandbox_allow_out: tuple[str, ...] = ()
@@ -345,6 +361,7 @@ class ControlPlaneSettings:
             e2b_api_key=SecretStr(_required(env, "E2B_API_KEY")),
             supabase_jwt_secret=_secret(env, "SAMA_SUPABASE_JWT_SECRET"),
             sandbox_template=env.get("SAMA_SANDBOX_TEMPLATE", "").strip() or DEFAULT_TEMPLATE,
+            runner_keep_s=_non_negative_float(env, "SAMA_RUNNER_KEEP_S", 600.0),
             connector_host_template=env.get("SAMA_CONNECTOR_HOST_TEMPLATE", "").strip()
             or DEFAULT_HOST_TEMPLATE,
             sandbox_allow_out=_hosts(env.get("SAMA_SANDBOX_ALLOW_OUT", "")),
