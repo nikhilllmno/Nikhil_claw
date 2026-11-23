@@ -7,6 +7,12 @@ import { createContext, useCallback, useContext, useMemo, useState } from "react
 import type { AgentProfileSummary, Me, Org, SessionOut } from "@/lib/api";
 import { useApi } from "./AuthProvider";
 import { useLoad } from "./useLoad";
+import { usePolled } from "./usePolled";
+import { anyOpen } from "@/lib/sessionList";
+
+const ACTIVE_POLL_MS = 8_000;
+const IDLE_POLL_MS = 30_000;
+
 
 const WORKSPACE_KEY = "sama.workspace";
 
@@ -52,11 +58,17 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
     [api],
   );
   const { data: me, error: meError, reload: reloadMe } = useLoad(loadMe, "Could not load your account.");
+  // The list polls one request at a time (M8.2): every 8 s while a session works or waits, so
+  // that the sidebar dots stay right, else every 30 s, so that a run from another tab or
+  // channel shows too.
+  const [sessionsActive, setSessionsActive] = useState(false);
   const {
     data: sessions,
     error: sessionsError,
     reload: reloadSessions,
-  } = useLoad(loadSessions, "Could not load sessions.");
+  } = usePolled(loadSessions, "Could not load sessions.", sessionsActive ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+  const active = sessions !== null && anyOpen(sessions);
+  if (active !== sessionsActive) setSessionsActive(active);
 
   const workspaces = useMemo<WorkspaceChoice[]>(() => {
     const orgs = me?.orgs ?? [];

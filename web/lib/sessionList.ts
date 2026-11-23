@@ -2,7 +2,7 @@
 // sessions of one workspace, an Active and an Archived list, and the rename and archive rules
 // that the screen shows. The API checks every change again.
 
-import type { CodingAgentName, SessionOut } from "./api";
+import type { CodingAgentName, SessionOut, SessionRunState } from "./api";
 
 export type SessionFilter = "active" | "archived";
 
@@ -101,4 +101,30 @@ export function directAgent(choice: DirectChoice): CodingAgentName | null {
 export function directBadge(session: Pick<SessionOut, "coding_agent">): string | null {
   if (!session.coding_agent) return null;
   return session.coding_agent === "claude_code" ? "Direct: Claude Code" : "Direct: Codex";
+}
+
+/** The label of the status dot of a session in the sidebar, or `null` for no dot. */
+export function runStateLabel(state: SessionRunState | null | undefined): string | null {
+  switch (state) {
+    case "running":
+      return "Working";
+    case "waiting":
+      return "Waiting for you";
+    case "failed":
+      return "The last run failed";
+    default:
+      return null;
+  }
+}
+
+/** True while a session of the list works or waits: the sidebar then reads the list again. */
+export function anyOpen(sessions: readonly Pick<SessionOut, "run_state">[]): boolean {
+  return sessions.some((s) => s.run_state === "running" || s.run_state === "waiting");
+}
+
+/** The sessions whose title has the query, case-insensitive. An empty query gives all. */
+export function filterSessions<T extends Pick<SessionOut, "id" | "title">>(sessions: readonly T[], query: string): T[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [...sessions];
+  return sessions.filter((s) => (s.title?.trim() || `Session ${s.id.slice(0, 8)}`).toLowerCase().includes(q));
 }

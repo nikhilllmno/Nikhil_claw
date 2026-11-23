@@ -61,6 +61,8 @@ async def test_the_owner_renames_a_private_session(
         "parent_session_id",
         "coding_agent",
         "can_manage",
+        "run_state",
+        "last_activity_at",
     }
     assert await audit_actions(engine, mine) == ["session.renamed"]
     again = await client.patch(

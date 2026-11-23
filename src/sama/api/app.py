@@ -806,6 +806,12 @@ class SessionOut(BaseModel):
     can_manage: bool = False
     """True when ``PATCH /sessions/{id}`` lets the caller rename, archive, or restore the
     session: the owner of a private session, or the owner or an admin of a shared session."""
+    run_state: Literal["running", "waiting", "failed", "done"] | None = None
+    """The state of the chat runs (only in ``GET /sessions``, Section 17.8): ``waiting`` when a
+    run waits for a person, ``running`` when a run is queued or works, else the end of the
+    newest run (``failed`` or ``done``). ``None``: no run yet."""
+    last_activity_at: datetime | None = None
+    """The start of the newest chat run, or ``None`` (only in ``GET /sessions``)."""
 
 
 JobAction = Literal["pause", "resume", "run", "cancel"]
@@ -1085,6 +1091,45 @@ def _can_change_session(row: Any, grants: Grants) -> bool:
             and (grants.org_admin or grants.admins_workspace(row.workspace_id))
         )
     )
+
+
+async def _run_states(
+    connection: AsyncConnection, session_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, tuple[Any, datetime | None]]:
+    """The run state and the newest run start of each session (``SessionOut.run_state``).
+
+    One read for the open runs and one for the newest run of each session. Both use the index
+    on ``(org_id, session_id)`` of ``runs`` through the session ids."""
+    if not session_ids:
+        return {}
+    scope = (Run.session_id.in_(session_ids), Run.kind == "chat")
+    newest = (
+        await connection.execute(
+            select(Run.session_id, Run.status, Run.created_at)
+            .where(*scope)
+            .distinct(Run.session_id)
+            .order_by(Run.session_id, Run.created_at.desc(), Run.id.desc())
+        )
+    ).all()
+    open_rows = (
+        await connection.execute(
+            select(Run.session_id, Run.status).where(*scope, Run.status.in_(OPEN_RUN_STATUSES))
+        )
+    ).all()
+    waiting = {row.session_id for row in open_rows if row.status == "paused"}
+    working = {row.session_id for row in open_rows}
+    states: dict[uuid.UUID, tuple[Any, datetime | None]] = {}
+    for row in newest:
+        if row.session_id in waiting:
+            state = "waiting"
+        elif row.session_id in working:
+            state = "running"
+        elif row.status in ("failed", "error"):
+            state = "failed"
+        else:
+            state = "done"
+        states[row.session_id] = (state, row.created_at)
+    return states
 
 
 def _session_out(row: Any, grants: Grants) -> SessionOut:
@@ -3064,12 +3109,19 @@ class SamaApi:
                 grants[org_id] = (
                     None if user_id is None else await load_grants(connection, org_id, user_id)
                 )
-        return [
-            _session_out(row, g)
-            for row in rows
-            if (g := grants[row.org_id]) is not None
-            and g.sees_session(row.workspace_id, row.audience, row.owner_user_id)
-        ]
+            shown = [
+                (row, g)
+                for row in rows
+                if (g := grants[row.org_id]) is not None
+                and g.sees_session(row.workspace_id, row.audience, row.owner_user_id)
+            ]
+            states = await _run_states(connection, [row.id for row, _ in shown])
+        out: list[SessionOut] = []
+        for row, g in shown:
+            item = _session_out(row, g)
+            item.run_state, item.last_activity_at = states.get(row.id, (None, None))
+            out.append(item)
+        return out
 
     async def _detail(self, principal: Principal, session_id: uuid.UUID) -> SessionDetail:
         async with as_user(self._engine, principal.auth_user_id) as connection:

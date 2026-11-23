@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { SessionOut } from "./api";
 import {
+  anyOpen,
+  filterSessions,
+  runStateLabel,
   directAgent,
   directBadge,
   directChoice,
@@ -132,5 +135,30 @@ describe("direct mode", () => {
     expect(directBadge({})).toBeNull();
     expect(directBadge({ coding_agent: "claude_code" })).toBe("Direct: Claude Code");
     expect(directBadge({ coding_agent: "codex" })).toBe("Direct: Codex");
+  });
+});
+
+describe("sidebar helpers (M8.2)", () => {
+  it("labels the run state", () => {
+    expect(runStateLabel("running")).toBe("Working");
+    expect(runStateLabel("waiting")).toBe("Waiting for you");
+    expect(runStateLabel("failed")).toBe("The last run failed");
+    expect(runStateLabel("done")).toBeNull();
+    expect(runStateLabel(undefined)).toBeNull();
+  });
+
+  it("knows when a session is open", () => {
+    expect(anyOpen([{ run_state: "done" }, { run_state: "waiting" }])).toBe(true);
+    expect(anyOpen([{ run_state: null }, {}])).toBe(false);
+  });
+
+  it("filters by title", () => {
+    const sessions = [
+      { id: "abcdef1234", title: "Fix login" },
+      { id: "0123456789", title: null },
+    ];
+    expect(filterSessions(sessions, "LOGIN").map((s) => s.id)).toEqual(["abcdef1234"]);
+    expect(filterSessions(sessions, "session 0123").map((s) => s.id)).toEqual(["0123456789"]);
+    expect(filterSessions(sessions, " ")).toHaveLength(2);
   });
 });

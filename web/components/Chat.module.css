@@ -310,3 +310,10 @@
   flex: 1;
   min-width: 0;
 }
+
+/* At a narrow width, Create PR is in the code panel (Code, then Pull request). */
+@media (max-width: 40rem) {
+  .createPr {
+    display: none;
+  }
+}

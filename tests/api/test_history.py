@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import history
@@ -494,3 +494,26 @@ async def test_the_activity_answers_404_for_a_session_that_the_user_cannot_read(
     assert (await client.get(path, headers=zed)).status_code == 404
     shared = await client.get(f"/sessions/{tenant.ids['s1']}/activity", headers=zed)
     assert shared.status_code == 200
+
+
+async def test_the_session_list_has_the_run_state_of_each_session(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    await add_run(engine, tenant, "mine", status="completed")
+    newest = await add_run(engine, tenant, "mine", status="failed")
+    await add_run(engine, tenant, "s1", status="completed")
+    await add_run(engine, tenant, "s1", status="paused", pending_approval_id="call-1")
+    sessions = {s["id"]: s for s in (await client.get("/sessions", headers=mia(tenant))).json()}
+    assert sessions[str(tenant.ids["mine"])]["run_state"] == "failed"
+    assert sessions[str(tenant.ids["mine"])]["last_activity_at"] is not None
+    assert sessions[str(tenant.ids["s1"])]["run_state"] == "waiting"
+    async with engine.begin() as connection:
+        await connection.execute(update(Run).where(Run.id == newest).values(status="queued"))
+    sessions = {s["id"]: s for s in (await client.get("/sessions", headers=mia(tenant))).json()}
+    assert sessions[str(tenant.ids["mine"])]["run_state"] == "running"
+    no_runs = [
+        s
+        for s in sessions.values()
+        if s["id"] not in {str(tenant.ids["mine"]), str(tenant.ids["s1"])}
+    ]
+    assert all(s["run_state"] is None for s in no_runs)

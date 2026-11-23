@@ -77,6 +77,8 @@ export default function HomePage() {
       if (steps.repo !== null) await api.attachRepo(session.id, steps.repo);
       if (steps.first === "plan") await api.startPlan(session.id, steps.task);
       else if (steps.first === "message") await api.sendMessage(session.id, steps.task);
+      // The run exists now: the sidebar shows the session as working.
+      reloadSessions();
       router.push(`/s/${session.id}`);
     } catch (e) {
       setError(errorText(e, sessionId === null ? "Could not start the session." : "The session started, but a step failed."));
