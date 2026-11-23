@@ -7,6 +7,8 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import {
   type Approval,
   errorText,
+  imageProblem,
+  type SessionModels,
   type ChatMessage,
   type CodingAgentName,
   type ClarifyRequest,
@@ -52,6 +54,7 @@ import {
   proposedPlan,
 } from "@/lib/coding";
 import { saveFile } from "@/lib/history";
+import { addImages, withoutImageMarkers } from "@/lib/images";
 import { elapsedText, latestTodos } from "@/lib/toolView";
 import { commandItems, filesOfCalls, historyEntries, mentionItems } from "@/lib/commands";
 import { runEventStream } from "@/lib/stream";
@@ -98,6 +101,8 @@ export function Chat({ sessionId }: { sessionId: string }) {
   });
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  // The images of the next message (M8.2).
+  const [images, setImages] = useState<File[]>([]);
   // A message that is on its way to the API: it shows at once (optimistic).
   const [pending, setPending] = useState<{ text: string; at: number } | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -195,6 +200,44 @@ export function Chat({ sessionId }: { sessionId: string }) {
       live = false;
     };
   }, [api, workspaceOfSession]);
+
+  // Warm the sandbox while the person types, at most once a minute (M8.2, architecture §4.4).
+  const warmedAt = useRef(0);
+  const warm = useCallback(() => {
+    const now = Date.now();
+    if (now - warmedAt.current < 60_000) return;
+    warmedAt.current = now;
+    api.warmSession(sessionId).catch(() => {
+      // A warm is only a help: an old API has no route, and the run starts the sandbox anyway.
+    });
+  }, [api, sessionId]);
+
+  // The model of the session (M8.2), as `/model` in Claude Code.
+  const [models, setModels] = useState<SessionModels | null>(null);
+  const [modelsError, setModelsError] = useState(false);
+  const [modelBusy, setModelBusy] = useState(false);
+  const loadModels = useCallback(async () => {
+    setModelsError(false);
+    try {
+      setModels(await api.getSessionModels(sessionId));
+    } catch {
+      setModelsError(true);
+    }
+  }, [api, sessionId]);
+  const changeModel = async (model: string | null) => {
+    setModelBusy(true);
+    setSendError(null);
+    try {
+      const changed = await api.setSessionModel(sessionId, model);
+      setDetail((current) => (current === null ? current : { ...current, ...changed, runs: current.runs, last_event_id: current.last_event_id }));
+      setModels((current) => (current === null ? current : { ...current, model: changed.model ?? current.model, is_override: changed.model_is_override ?? false }));
+      setNotice(`The next run uses ${changed.model ?? model ?? "the default model"}.`);
+    } catch (e) {
+      setSendError(errorText(e, "The model did not change."));
+    } finally {
+      setModelBusy(false);
+    }
+  };
 
   // The direct mode of the session (M7.2): sama, Claude Code, or Codex.
   const [harnessBusy, setHarnessBusy] = useState(false);
@@ -345,7 +388,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
   const send = async (parallel = false) => {
     const submitted = draft;
     const text = submitted.trim();
-    if (!text) return;
+    const files = images;
+    if (!text && files.length === 0) return;
+    if (files.length > 0) {
+      await sendImages(text, files, parallel);
+      return;
+    }
     // Only the text that was sent goes: what the user typed meanwhile stays.
     let optimistic = false;
     const clearDraft = () => {
@@ -559,6 +607,51 @@ export function Chat({ sessionId }: { sessionId: string }) {
     }
   };
 
+  /** A message with images (`POST /sessions/{id}/messages/images`). Commands do not take images. */
+  const sendImages = async (text: string, files: File[], parallel: boolean) => {
+    const problem = imageProblem(files);
+    if (problem !== null) {
+      setSendError(problem);
+      return;
+    }
+    if (text && (parseCommand(text) !== null || /^\/(claude|codex)\s/i.test(text))) {
+      setSendError("A command cannot have images. Remove the images, or write a message.");
+      return;
+    }
+    setSending(true);
+    setSendError(null);
+    setQuotaError(false);
+    setNotice(null);
+    setPending({ text: text || `${files.length} ${files.length === 1 ? "image" : "images"}`, at: new Date().getTime() });
+    stick.current = true;
+    try {
+      const answer = await api.sendMessageWithImages(sessionId, text, files, parallel);
+      // Only the sent images go: an image that the person added while the send worked stays.
+      setImages((current) => current.filter((file) => !files.includes(file)));
+      setDraft((current) => (current.trim() === text ? "" : current));
+      if (answer.queued) setNotice(QUEUED_NOTICE);
+      const current = liveRef.current;
+      if (current.runs[answer.run_id] === undefined) {
+        setLiveState({
+          ...current,
+          failure: null,
+          runs: {
+            ...current.runs,
+            [answer.run_id]: { run_id: answer.run_id, status: "queued", failure_code: null, failure_message: null },
+          },
+        });
+      }
+      await loadMessages();
+      reloadSessions();
+    } catch (e) {
+      setSendError(errorText(e, "The message was not sent."));
+      setQuotaError(isQuotaError(e));
+    } finally {
+      setPending(null);
+      setSending(false);
+    }
+  };
+
   const stop = async () => {
     setStopping(true);
     setSendError(null);
@@ -660,7 +753,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
         const group = progress(m.run_id);
         if (group) items.push(group);
       }
-      items.push(<MessageView key={m.id} message={m} />);
+      items.push(<MessageView key={m.id} message={m} sessionId={sessionId} />);
     }
     notesBefore(null);
     // Runs that ended without a reply (stopped or failed) keep their trail. Open runs show live.
@@ -670,7 +763,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       if (group) items.push(group);
     }
     return items;
-  }, [messages, notes, live.tools, live.subagents, live.runs]);
+  }, [messages, notes, live.tools, live.subagents, live.runs, sessionId]);
 
   // The open runs, oldest request first, numbered as `/stop NUMBER` counts them (M7.1).
   const runRows = useMemo(() => {
@@ -993,6 +1086,30 @@ export function Chat({ sessionId }: { sessionId: string }) {
           history={history}
           harness={{ current: detail.coding_agent ?? null, onChange: (agent) => void changeHarness(agent), busy: harnessBusy }}
           model={profile?.model ?? null}
+          models={
+            detail.model
+              ? {
+                  current: detail.model,
+                  options: models?.models ?? null,
+                  failed: modelsError,
+                  defaultModel: models?.default_model ?? detail.default_model ?? detail.model,
+                  editable: models?.editable ?? false,
+                  busy: modelBusy,
+                  onOpen: () => void loadModels(),
+                  onChange: (model) => void changeModel(model),
+                }
+              : undefined
+          }
+          onActivity={warm}
+          images={{
+            files: images,
+            onAdd: (files) => {
+              const next = addImages(images, files);
+              setImages(next.files);
+              if (next.dropped > 0) setSendError("A message has at most 4 images. The other images were not added.");
+            },
+            onRemove: (index) => setImages((current) => current.filter((_, i) => i !== index)),
+          }}
         />
       </div>
     </div>
@@ -1057,11 +1174,22 @@ function NoteView({ note }: { note: SteerNote }) {
   );
 }
 
-function MessageView({ message: m }: { message: ChatMessage }) {
+function MessageView({ message: m, sessionId }: { message: ChatMessage; sessionId: string }) {
   if (m.role === "user") {
+    const pictures = m.images ?? [];
+    const text = pictures.length > 0 ? withoutImageMarkers(m.text) : m.text;
     return (
       <article className={styles.user} aria-label="You">
-        <p className={styles.userText}>{m.text}</p>
+        {pictures.length > 0 ? (
+          <ul className={styles.pictures} aria-label="Images">
+            {pictures.map((image) => (
+              <li key={image.id}>
+                <SentImage sessionId={sessionId} id={image.id} name={image.name} />
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {text ? <p className={styles.userText}>{text}</p> : null}
       </article>
     );
   }
@@ -1076,6 +1204,40 @@ function MessageView({ message: m }: { message: ChatMessage }) {
     <p className={styles.note}>
       {m.role}: {m.text}
     </p>
+  );
+}
+
+/** An image of a sent message. The bytes need the token, so the page loads them as a blob. */
+function SentImage({ sessionId, id, name }: { sessionId: string; id: string; name: string }) {
+  const api = useApi();
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    let made: string | null = null;
+    api
+      .getAttachment(sessionId, id)
+      .then((file) => {
+        if (!live) return;
+        made = URL.createObjectURL(file.blob);
+        setUrl(made);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
+      });
+    return () => {
+      live = false;
+      if (made !== null) URL.revokeObjectURL(made);
+    };
+  }, [api, sessionId, id]);
+  if (failed) return <span className={styles.pictureMissing}>{name}</span>;
+  if (url === null) return <span className={`skeleton ${styles.picture}`} aria-label={`Loading ${name}`} />;
+  return (
+    <a href={url} target="_blank" rel="noreferrer" title={name}>
+      {/* A blob URL of a private image: next/image cannot load it. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={url} alt={name} className={styles.picture} />
+    </a>
   );
 }
 

@@ -122,9 +122,10 @@ from sama.api.tasks import (
     TaskOut,
     TaskStatus,
 )
+from sama.api.uploads import read_message
 from sama.apikeys.store import ApiKeyStore
 from sama.billing import BillingService
-from sama.coding.agents import CodingAgent
+from sama.coding.agents import CodingAgent, agent_for
 from sama.coding.commands import SwitchNotAllowedError, parse_command, set_direct
 from sama.coding_mode.service import CodingService
 from sama.connectors.chat import return_page
@@ -150,6 +151,7 @@ from sama.db.models import (
     MAX_STEER_CHARS,
     AgentProfile,
     Approval,
+    Attachment,
     AuditEntry,
     ChannelIdentity,
     CustomTool,
@@ -184,7 +186,8 @@ from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
 from sama.media.generate import GeneratedMediaStore
-from sama.media.images import NewAttachment
+from sama.media.images import NewAttachment, clean_name, with_markers
+from sama.media.store import AttachmentStore
 from sama.memory import (
     CAPS,
     MemoryChangeError,
@@ -260,7 +263,7 @@ from sama.search.service import SessionSearch
 from sama.skills.service import SkillLibrary
 from sama.skills.store import PostgresSkillStore
 from sama.subagent_library import SubagentLibrary
-from sama.subagents import SubagentError, parse_subagents, supports_subagents
+from sama.subagents import SubagentError, known_models, parse_subagents, supports_subagents
 from sama.tenancy.access import Grants, load_grants
 from sama.tenancy.regions import (
     OrgInOtherRegion,
@@ -810,6 +813,9 @@ class Answers(_Body):
     answers: list[str] = Field(min_length=1, max_length=10)
 
 
+MAX_MODEL_CHARS: Final = 100
+
+
 class SessionPatch(_Edit):
     """A rename, an archive, or a restore of a session (M7.10). A body has at least one field."""
 
@@ -821,6 +827,15 @@ class SessionPatch(_Edit):
         | None
     ) = None
     status: Literal["active", "archived"] | None = None
+    model: (
+        Annotated[
+            str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MODEL_CHARS)
+        ]
+        | None
+    ) = None
+    """The model for the next runs of the session (M8.2). ``null`` goes back to the model of the
+    profile. The runtime of the session must know the model."""
+    nullable: ClassVar[frozenset[str]] = frozenset({"model"})
 
 
 class SessionOut(BaseModel):
@@ -847,6 +862,28 @@ class SessionOut(BaseModel):
     newest run (``failed`` or ``done``). ``None``: no run yet."""
     last_activity_at: datetime | None = None
     """The start of the newest chat run, or ``None`` (only in ``GET /sessions``)."""
+    runtime: str | None = None
+    """The runtime of the session. ``GET /sessions/{id}`` and ``PATCH`` fill this field and the
+    next three. ``GET /sessions`` and ``POST /sessions`` leave them empty."""
+    model: str | None = None
+    """The model that the next run of the session uses (M8.2)."""
+    default_model: str | None = None
+    """The model without a choice of the user: the frozen model, or the model of the profile."""
+    model_is_override: bool = False
+    """True when a person chose a model that is not the default one."""
+
+
+class SessionModels(BaseModel):
+    """The models of a session (M8.2), for the model picker of the web app."""
+
+    runtime: str
+    models: list[str]
+    """The model ids that the runtime knows, sorted. Empty for a coding agent."""
+    model: str
+    default_model: str
+    is_override: bool
+    editable: bool
+    """True when the caller can change the model (``can_manage``) and the runtime lets it."""
 
 
 JobAction = Literal["pause", "resume", "run", "cancel"]
@@ -1068,6 +1105,12 @@ def _return_page(
     return HTMLResponse(page, status_code=400 if view is None else 200, headers=headers)
 
 
+def _marker_at(text: str, image: dict[str, Any]) -> int:
+    """Where the marker line of an image is in the text of its message."""
+    found = text.find(str(image["id"]))
+    return len(text) if found < 0 else found
+
+
 def _not_found(what: str = NOT_FOUND) -> HTTPException:
     return HTTPException(status_code=404, detail=what)
 
@@ -1236,6 +1279,74 @@ async def _run_states(
 def _session_out(row: Any, grants: Grants) -> SessionOut:
     out = SessionOut.model_validate(row, from_attributes=True)
     out.can_manage = _can_change_session(row, grants)
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelState:
+    """The model of a session as the next run sees it (Section 5.4, M8.2)."""
+
+    runtime: RuntimeKind
+    default: str
+    chosen: str | None
+
+    @property
+    def effective(self) -> str:
+        return self.default if self.chosen is None else self.chosen
+
+    @property
+    def is_override(self) -> bool:
+        return self.chosen is not None and self.chosen != self.default
+
+    @property
+    def selectable(self) -> bool:
+        """A coding agent chooses its own model, so the web app cannot choose it."""
+        return agent_for(self.runtime) is None
+
+    @property
+    def allowed(self) -> list[str]:
+        return known_models(self.runtime) if self.selectable else []
+
+
+async def _model_state(
+    connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID
+) -> _ModelState | None:
+    """The runtime and the models of a session. The frozen config wins over the profile, as it
+    does for a run. ``None`` when the session or its profile is not readable."""
+    row = (
+        await connection.execute(
+            select(
+                Session.model_override,
+                Session.run_config["model"].astext.label("frozen_model"),
+                Session.run_config["runtime"].astext.label("frozen_runtime"),
+                AgentProfile.model,
+                AgentProfile.runtime,
+            )
+            .join(
+                AgentProfile,
+                and_(
+                    AgentProfile.org_id == Session.org_id,
+                    AgentProfile.id == Session.agent_profile_id,
+                ),
+            )
+            .where(Session.org_id == org_id, Session.id == session_id)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return _ModelState(
+        runtime=RuntimeKind(row.frozen_runtime or row.runtime),
+        default=row.frozen_model or row.model,
+        chosen=row.model_override,
+    )
+
+
+def _with_model(out: SessionOut, state: _ModelState | None) -> SessionOut:
+    if state is not None:
+        out.runtime = state.runtime.value
+        out.model = state.effective
+        out.default_model = state.default
+        out.model_is_override = state.is_override
     return out
 
 
@@ -1453,6 +1564,7 @@ class SamaApi:
         self._jobs = jobs
         self._workflows = workflows
         self._media = GeneratedMediaStore(engine)
+        self._attachments = AttachmentStore(engine)
         self._verifier = verifier
         self._queue = queue or RunQueue(engine)
         self._board = TaskBoard(engine, self._queue)
@@ -1610,6 +1722,10 @@ class SamaApi:
         async def get_session(principal: Me, session_id: uuid.UUID) -> SessionDetail:
             return await self._detail(principal, session_id)
 
+        @app.get("/sessions/{session_id}/models")
+        async def session_models(principal: Me, session_id: uuid.UUID) -> SessionModels:
+            return await self._session_models(principal, session_id)
+
         @app.get("/sessions/{session_id}/messages")
         async def list_messages(
             principal: Me,
@@ -1623,7 +1739,18 @@ class SamaApi:
         async def send_message(
             principal: Me, session_id: uuid.UUID, body: NewMessage
         ) -> JSONResponse:
-            return await self._send(principal, session_id, body)
+            return await self._send(principal, session_id, body.text, body.parallel)
+
+        @app.post("/sessions/{session_id}/messages/images", status_code=202)
+        async def send_message_with_images(
+            principal: Me, session_id: uuid.UUID, request: Request
+        ) -> JSONResponse:
+            # The access check comes first: a user who cannot see the session sends no byte.
+            await self._access(principal, session_id)
+            message = await read_message(request)
+            return await self._send(
+                principal, session_id, message.text, message.parallel, message.images
+            )
 
         @app.get("/sessions/{session_id}/steers")
         async def list_steers(principal: Me, session_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -1750,6 +1877,26 @@ class SamaApi:
                 headers={
                     "Content-Disposition": f'inline; filename="{name}"',
                     "Cache-Control": "private, max-age=3600",
+                },
+            )
+
+        @app.get("/sessions/{session_id}/attachments/{attachment_id}")
+        async def get_attachment(
+            principal: Me, session_id: uuid.UUID, attachment_id: uuid.UUID
+        ) -> Response:
+            access = await self._access(principal, session_id)
+            image = await self._attachments.load(
+                org_id=access.org_id, session_id=session_id, attachment_id=attachment_id
+            )
+            if image is None:
+                raise _not_found("the image does not exist")
+            return Response(
+                content=image.data,
+                media_type=image.mime_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{clean_name(image.name)}"',
+                    "Cache-Control": "private, max-age=3600",
+                    "X-Content-Type-Options": "nosniff",
                 },
             )
 
@@ -3118,7 +3265,7 @@ class SamaApi:
         async with self._engine.begin() as connection:
             current = (
                 await connection.execute(
-                    select(Session.title, Session.status, Session.lineage)
+                    select(Session.title, Session.status, Session.lineage, Session.model_override)
                     .where(Session.org_id == access.org_id, Session.id == session_id)
                     .with_for_update()
                 )
@@ -3135,6 +3282,12 @@ class SamaApi:
                 values["status"] = body.status
                 actions.append(
                     ("session.archived" if body.status == "archived" else "session.restored", {})
+                )
+            if "model" in body.model_fields_set and body.model != current.model_override:
+                await self._check_model_change(connection, access.org_id, session_id, body.model)
+                values["model_override"] = body.model
+                actions.append(
+                    ("session.model_changed", {"from": current.model_override, "to": body.model})
                 )
             if values:
                 await connection.execute(
@@ -3162,7 +3315,27 @@ class SamaApi:
                     )
                 )
             ).one()
-        return _session_out(fresh, access.grants)
+            state = await _model_state(connection, access.org_id, session_id)
+        return _with_model(_session_out(fresh, access.grants), state)
+
+    @staticmethod
+    async def _check_model_change(
+        connection: AsyncConnection, org_id: uuid.UUID, session_id: uuid.UUID, model: str | None
+    ) -> None:
+        """Raises ``409`` for a session of a coding agent and ``422`` for a model that the
+        runtime of the session does not know. ``None`` (the model of the profile) always works.
+        The rule is the rule of the model of a profile (``update_profile``)."""
+        state = await _model_state(connection, org_id, session_id)
+        if state is None:
+            raise _not_found()
+        if not state.selectable:
+            raise HTTPException(
+                status_code=409, detail="a coding agent chooses its own model in this session"
+            )
+        if model is not None and model not in state.allowed:
+            raise HTTPException(
+                status_code=422, detail="the model is not known for the runtime of the session"
+            )
 
     @staticmethod
     async def _check_status_change(
@@ -3238,6 +3411,23 @@ class SamaApi:
             out.append(item)
         return out
 
+    async def _session_models(self, principal: Principal, session_id: uuid.UUID) -> SessionModels:
+        """``GET /sessions/{id}/models`` (M8.2): what the model picker needs."""
+        async with as_user(self._engine, principal.auth_user_id) as connection:
+            access = await session_access(connection, principal, session_id)
+            state = await _model_state(connection, access.org_id, session_id)
+        if state is None:
+            raise _not_found()
+        assert access.grants is not None  # noqa: S101 (``session_access`` sets it)
+        return SessionModels(
+            runtime=state.runtime.value,
+            models=state.allowed,
+            model=state.effective,
+            default_model=state.default,
+            is_override=state.is_override,
+            editable=state.selectable and _can_change_session(access.session, access.grants),
+        )
+
     async def _detail(self, principal: Principal, session_id: uuid.UUID) -> SessionDetail:
         async with as_user(self._engine, principal.auth_user_id) as connection:
             access = await session_access(connection, principal, session_id)
@@ -3259,9 +3449,10 @@ class SamaApi:
             )
             run_list = [RunOut.model_validate(row, from_attributes=True) for row in runs]
             last = await self._last_event_id(connection, session_id)
+            state = await _model_state(connection, access.org_id, session_id)
         assert access.grants is not None  # noqa: S101 (``session_access`` sets it)
         return SessionDetail(
-            **_session_out(access.session, access.grants).model_dump(),
+            **_with_model(_session_out(access.session, access.grants), state).model_dump(),
             runs=run_list,
             last_event_id=last,
         )
@@ -3395,20 +3586,55 @@ class SamaApi:
                 .order_by(Message.seq)
                 .limit(limit)
             )
-            return [
-                {
-                    "id": str(row.id),
-                    "seq": row.seq,
-                    "run_id": None if row.run_id is None else str(row.run_id),
-                    "role": row.role,
-                    "author_user_id": None
-                    if row.author_user_id is None
-                    else str(row.author_user_id),
-                    "text": str((row.content or {}).get("text", "")),
-                    "created_at": row.created_at.isoformat(),
-                }
-                for row in rows
-            ]
+            messages = rows.all()
+            images: dict[uuid.UUID, list[dict[str, Any]]] = {}
+            if messages:
+                # The metadata only, never the bytes (M8.2): ``data`` is not in the column grant.
+                found = await connection.execute(
+                    select(
+                        Attachment.id,
+                        Attachment.message_id,
+                        Attachment.name,
+                        Attachment.mime_type,
+                        Attachment.size_bytes,
+                    )
+                    .where(
+                        Attachment.org_id == access.org_id,
+                        Attachment.session_id == session_id,
+                        Attachment.message_id.in_([row.id for row in messages]),
+                    )
+                    .order_by(Attachment.created_at, Attachment.id)
+                )
+                for image in found:
+                    images.setdefault(image.message_id, []).append(
+                        {
+                            "id": str(image.id),
+                            "name": image.name,
+                            "mime_type": image.mime_type,
+                            "size_bytes": image.size_bytes,
+                        }
+                    )
+            out: list[dict[str, Any]] = []
+            for row in messages:
+                text = str((row.content or {}).get("text", ""))
+                # The images of one message share a time, so the order of the marker lines in
+                # the text is the order of the images.
+                shown = sorted(images.get(row.id, []), key=lambda item: _marker_at(text, item))
+                out.append(
+                    {
+                        "id": str(row.id),
+                        "seq": row.seq,
+                        "run_id": None if row.run_id is None else str(row.run_id),
+                        "role": row.role,
+                        "author_user_id": None
+                        if row.author_user_id is None
+                        else str(row.author_user_id),
+                        "text": text,
+                        "created_at": row.created_at.isoformat(),
+                        "images": shown,
+                    }
+                )
+            return out
 
     async def _approvals(self, principal: Principal, session_id: uuid.UUID) -> list[dict[str, Any]]:
         async with as_user(self._engine, principal.auth_user_id) as connection:
@@ -4487,10 +4713,15 @@ class SamaApi:
         return await self._skills.expand(actor, text.strip()) or text
 
     async def _send(
-        self, principal: Principal, session_id: uuid.UUID, body: NewMessage
+        self,
+        principal: Principal,
+        session_id: uuid.UUID,
+        text: str,
+        parallel: bool,
+        images: tuple[NewAttachment, ...] = (),
     ) -> JSONResponse:
         try:
-            sent = await self.submit(principal, session_id, body.text, parallel=body.parallel)
+            sent = await self.submit(principal, session_id, text, parallel=parallel, images=images)
         except SendError as error:
             headers = {}
             if error.retry_after_s is not None:
@@ -4510,6 +4741,7 @@ class SamaApi:
         page: PageContext | None = None,
         parallel: bool = False,
         join: bool = True,
+        images: tuple[NewAttachment, ...] = (),
     ) -> Sent:
         """Queues a user message, as ``POST /sessions/{id}/messages`` does. Raises
         ``SendError``.
@@ -4541,7 +4773,7 @@ class SamaApi:
             else:
                 typed = text
                 text = await self._expand_skill(access, text)
-                steer = join and not parallel and text == typed
+                steer = join and not parallel and not images and text == typed
         else:
             session = access.session
             if session.audience != "private" or session.owner_user_id != access.user_id:
@@ -4551,6 +4783,10 @@ class SamaApi:
             except PageError as error:
                 raise SendError(422, str(error)) from None
             text, attachments = message.text, message.attachments
+        if images and page is None:
+            # A note holds only text, so a message with images never joins a run. The text
+            # names each image, as in the channels (Section 11.7).
+            text, attachments = with_markers(text, images), images
         try:
             # One transaction: the note for a running run, or the queued run, and the check
             # whether it waits (Section 4.4).

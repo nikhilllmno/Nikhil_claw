@@ -1081,6 +1081,20 @@ Each adapter pins its SDK version in its own dependency group (`runtime-claude`,
   One message can go to a coding agent with `/claude <task>` or `/codex <task>`. These are the
   only exceptions to "one runtime for the life of a session": the frozen config of the session
   keeps its runtime, and the coding agent keeps its own CLI session in the sandbox.
+- **The model of a session (M8.2).** A session can use another model than its profile, like
+  `/model` in Claude Code. The choice is `sessions.model_override`. It must be a model that the
+  price table knows for the runtime of the session (the same rule as the model of a profile,
+  Section 11.4). The frozen config keeps the model that the session started with (D9): the
+  override is not in `sessions.run_config`. The assembler (`PromptAssembler`) puts the override
+  in the config of each later run of the session, so the change applies from the next run and
+  never to a run that is open. A change of the model does not change the text of the prompt
+  prefix, so D9 holds. It changes `RunConfig.fingerprint()`, and each run records the
+  fingerprint that it used (`runs.config_fingerprint`). The first dispatch of a run also
+  fixes its model in `runs.run_model`, and a resume after an approval uses that model, so a
+  change while a run waits does not reach that run. The prompt cache of the provider starts
+  again, as in any change of model. Both SDK runtimes use the override. A run of a coding agent
+  (`/claude`, `/codex`, and the direct mode, Section 15.4) and a background review ignore it.
+  See Section 7 for the API.
 
 ### 5.5 Conformance suite
 
@@ -1592,6 +1606,9 @@ for it.
   `(org_id, parent_session_id, parent_run_id)` proves that the run is a run of the parent
   session. Only a `delegation` session has a `parent_run_id` (Section 13.2). `retry` comes
   later.
+- **Model of a session (M8.2).** `PATCH /sessions/{id}` with `model` sets the model of the
+  session for the next runs. `model: null` goes back to the model of the profile. `GET
+  /sessions/{id}/models` lists the models that the session can use. Section 5.4 has the rules.
 - **Cross-channel continuity**: a user can continue a session from another channel with
   `/resume <id>` or a session link.
 - **Search**: `session_search` uses Postgres full-text search plus pgvector embeddings,
@@ -4045,10 +4062,14 @@ cross-org check of Section 17.1 through the API.
 | `POST /stripe/webhook` | Signed Stripe events (Section 17.5). `400` for a bad signature, `404` when billing is off, `503` when Stripe must send the event again. |
 | `GET /invites`, `POST /invites/accept` | The open invites for the confirmed email of the user. Accept with `token` or `invite_id`. `403` for another email, `410` for an ended invite (Section 17.2). |
 | `GET /sessions`, `POST /sessions` | List the active sessions that the user can read (at most 100). Create a `private` or `shared` session with a profile of the workspace. The audit row is `session.created`. |
-| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
-| `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. |
+| `GET /sessions/{id}` | The session, its last 20 runs, and `last_event_id`. Since M8.2 the session also has `runtime`, `model` (the model that the next run uses), `default_model`, and `model_is_override`. `GET /sessions` and `POST /sessions` do not fill these fields. A session has `lineage` and `parent_session_id` (null for a session with no parent). |
+| `PATCH /sessions/{id}` with `model` | Choose the model of the session (M8.2, Sections 5.4 and 7). `model` is a model id that the runtime of the session knows, or `null` for the model of the profile. It applies from the next run. Only a user who can manage the session (`can_manage`: the owner, or an admin for a shared session) can do it, else `403`. `422` for a model that the runtime does not know. The answer is the session, with the fields below. The audit row is `session.model_changed` with `from` and `to`. |
+| `GET /sessions/{id}/models` | The models of the session (M8.2): `runtime`, `models` (the ids that the runtime knows, sorted), `model` (the model that the next run uses), `default_model` (the model without an override), `is_override`, and `editable` (the value of `can_manage`). Any user who can see the session can read it. |
+| `GET /sessions/{id}/messages` | The messages by `seq`, after `?after=`. A message that has images also has `images`: a list of `id`, `name`, `mime_type`, and `size_bytes` (M8.2). |
 | `POST /sessions/{id}/messages` | Queue a run (`202` with `run_id` and `queued`). `queued` is true when the run waits behind an open run of the session (M3.9). At most 32,000 characters. `429` over a rate limit. `402` with `detail` and `quota` when the org or the user used a model quota of the plan (Section 17.5). `409` for an archived session. |
 | `POST /sessions/{id}/warm` | Start or resume the session sandbox and the warm runner before a run (Section 4.4). It creates no run. `202` with `status` (`warming`, `recent`, `limited`, or `off`). `limited`: the org started 10 warms, or the process 30 warms, in the last 60 seconds, or 4 warms run now; nothing starts. `429` with `Retry-After` after 30 requests of one user in 60 seconds. A sandbox that a warm started pauses after 3 minutes without a run. |
+| `POST /sessions/{id}/messages/images` | Queue a run with images from the web composer (M8.2, Section 11.7). The body is `multipart/form-data` with the fields `text` (can be empty when there is an image), `parallel` (`true` or `false`), and one to four `images` files. The rules of an image are the rules of Telegram and Slack. The answer is the answer of `POST /sessions/{id}/messages`, with the same `402`, `409`, and `429`. `404` when the user cannot see the session. `413` when the body or one image is too large. `422` for a wrong type, bytes that do not match the type, more than 4 images, or no text and no image. A message with an image never joins a running run as a note: it queues, like a message in Telegram. |
+| `GET /sessions/{id}/attachments/{attachment_id}` | The bytes of an image that a user sent with a message (Section 11.7). The answer has the stored image type, `Cache-Control: private`, and `X-Content-Type-Options: nosniff`. `404` for an id of another session. |
 | `POST /sessions/{id}/steer` | Add a note (`text`, at most 4,000 characters) to the open run (`202` with `steered: true` and `run_id`). With no open run, queue the text as a message (`steered: false`, `run_id`, `queued`). `409` when the run has 10 pending notes or the session is not active. `429` over a rate limit (Section 4.3, M3.9). |
 | `POST /sessions/{id}/handoff` | Move the session to the direct chat of the user in `telegram`, `slack`, or `web` (`200` with `to_channel` and `text`). `409` with the reason when the move is not possible (Section 11.1, M3.9). |
 | `GET /sessions/{id}/checkpoints` | The checkpoints of the session files, newest first (`number`, `created_at`, `tool`, `kind`). `?limit=` from 1 to 50, default 10. `409` without a session sandbox (Section 15.3, M6.4). |
@@ -4643,6 +4664,35 @@ The code is in `src/sama/media/`.
   so a file of exactly the limit is accepted and a file of one byte more is refused.
 - The gateway makes the id of each image first, so that the text can name it. `RunQueue.enqueue`
   then stores the message and its images in one transaction. A failed store leaves neither.
+
+**Images from the web (M8.2).** The web composer of the web app sends images with
+`POST /sessions/{id}/messages/images` (Section 11.4). The route uses `sama.media.images`, so the
+rules are the rules of the channels.
+
+- The body is `multipart/form-data`: `text`, `parallel`, and one to four `images` files. A message
+  with an image and no text is valid. The text is at most 32,000 characters.
+- The route checks the session access first, before it reads the body. A user who cannot see the
+  session gets `404` and no byte is read.
+- The route limits the size of the body before it parses it. The limit is 4 images of 10 MB, plus
+  the text and the headers of the parts. The route refuses a `Content-Length` over the limit, and
+  it counts the bytes while it reads, also for a chunked body. A body over the limit gets `413`.
+  The parser keeps at most 5 files, and a file larger than 10 MB gets `413` after it reads at
+  most 10 MB and one byte.
+- Each file goes through `check_image`. The type that the browser gives and the first bytes of the
+  file must agree. A file that has no type, or the type `application/octet-stream`, gets the type
+  from its first bytes. The first bytes must still be PNG, JPEG, GIF, or WebP.
+- The text of the message is the text of the user and one marker line for each image, as in
+  Section 11.7 above. The message and its images are stored in one transaction
+  (`RunQueue.enqueue`). The rate limit, the quotas, the archived check, and the busy mode of a text
+  message apply. A message with images never joins a running run (the same rule as Telegram,
+  because a note holds only text): it queues, or it starts a parallel run with `parallel`.
+- The web shows an image of a message with `GET /sessions/{id}/attachments/{attachment_id}`.
+  The browser cannot add the `Authorization` header to an `img` element. So the web app fetches
+  the URL with the bearer token (`ApiClient.getAttachment`) and makes an object URL for the `img`
+  element. `ApiClient.sendMessageWithImages` sends the message. The CORS rules of
+  the API already allow the header. The answer is only for a user who can see the session.
+- `GET /sessions/{id}/messages` lists the images of each message in `images`, so the web app
+  can hide the marker lines and show a thumbnail.
 
 **Storage (migration `0015`).** The table `attachments` has one row for each image: `id`,
 `org_id`, `session_id`, `message_id`, `name`, `mime_type`, `size_bytes`, `sha256`, `data`
@@ -8796,7 +8846,7 @@ without a change of the web app.
 - RLS: a user who sees the workspace of the trigger reads the rows. Writes go through the API.
 
 **Sessions.** `GET /sessions?status=archived` lists the archived sessions. `PATCH
-/sessions/{session_id}` takes `title` and `status` (`active` or `archived`). The owner of a
+/sessions/{session_id}` takes `title`, `status` (`active` or `archived`), and `model` (M8.2, Section 5.4). The owner of a
 private session changes it. An admin of the workspace or the org changes a shared session. A
 compaction archive (Section 6.3) and a session with a compaction child keep their status, and a
 session with an open run cannot be archived (`409`). The audit rows are `session.renamed`,
@@ -8875,6 +8925,22 @@ its own pull request.
   mode of Section 15.4, `POST /sessions/{id}/coding-agent`). The model of the agent shows next
   to it.
 - One line of help shows the keys. At a width of 390 px it does not show.
+
+**Images and the model (part E).**
+
+- The message box takes up to 4 images: paste, drop, or the add button. Each image shows as a
+  small preview with a remove button. A message with images goes to
+  `POST /sessions/{id}/messages/images` (Section 11.7); a command cannot have images. The chat
+  shows the images of a sent message from `GET /sessions/{id}/attachments/{id}` (loaded with the
+  token as a blob) and hides the marker lines of the API.
+- The model menu next to the harness shows the model of the next run (`GET /sessions/{id}`
+  `model`). It lists the models of the runtime (`GET /sessions/{id}/models`) and sets one with
+  `PATCH /sessions/{id}` `{"model": ...}`; the default model of the agent sends `null`. Only a
+  person who can manage the session can change it. In the direct mode of Claude Code or Codex
+  the menu does not show.
+- When the person focuses the message box or types, the chat calls `POST /sessions/{id}/warm`
+  (Section 4.4) at most once a minute, so that the sandbox is ready when the message goes. An
+  error of that call does not show.
 
 **Coding flow (part C).**
 

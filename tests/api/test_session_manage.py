@@ -61,6 +61,10 @@ async def test_the_owner_renames_a_private_session(
         "parent_session_id",
         "coding_agent",
         "can_manage",
+        "runtime",
+        "model",
+        "default_model",
+        "model_is_override",
         "run_state",
         "last_activity_at",
     }
