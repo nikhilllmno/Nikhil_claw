@@ -46,7 +46,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 2. Set `NEXT_PUBLIC_SAMA_API_URL` for each environment.
 3. Add the deployed origin to the API's `SAMA_WEB_ORIGINS` and the `/login` URL to Supabase's redirect URLs.
 
-`next.config.ts` sets a Content-Security-Policy, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`.
+`next.config.ts` sets a Content-Security-Policy, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`. The policy allows `blob:` images, because the chat shows the images of sent messages from blobs that it loads with the access token.
 
 ## Routes
 

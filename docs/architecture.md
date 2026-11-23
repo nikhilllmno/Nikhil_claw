@@ -8932,7 +8932,8 @@ its own pull request.
   small preview with a remove button. A message with images goes to
   `POST /sessions/{id}/messages/images` (Section 11.7); a command cannot have images. The chat
   shows the images of a sent message from `GET /sessions/{id}/attachments/{id}` (loaded with the
-  token as a blob) and hides the marker lines of the API.
+  token as a blob; the Content-Security-Policy of the web app allows `blob:` images) and hides
+  the marker lines of the API.
 - The model menu next to the harness shows the model of the next run (`GET /sessions/{id}`
   `model`). It lists the models of the runtime (`GET /sessions/{id}/models`) and sets one with
   `PATCH /sessions/{id}` `{"model": ...}`; the default model of the agent sends `null`. Only a

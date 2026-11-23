@@ -19,7 +19,7 @@ const csp = [
   // Next.js writes small inline scripts and styles. Dev mode also needs eval.
   `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data:",
+  "img-src 'self' data: blob:",
   "font-src 'self' data:",
   `connect-src ${["'self'", apiOrigin, "https://*.supabase.co", isDev ? "ws:" : null]
     .filter(Boolean)
