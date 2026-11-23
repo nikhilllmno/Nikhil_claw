@@ -1466,6 +1466,23 @@ Rules:
   for the whole session, and a repo is cloned during a run. Since M1.16 the `repo_clone`
   result holds these files (Section 15.1).
 
+**Off-platform rules (M8.4).** The M8.5 `SYSTEM_PROMPT` holds four rules that M8.4 measured
+with the off-platform eval (Section 18.4): own the outcome and do not give the user a list of
+things to try; get a live value (a price, a fare, availability) now, official site first, and
+never send the user off to look it up, because a source link is good and a task for the user is
+not; load a fitting skill with `skill_view` (for prices: the builtin `price-check`, Section
+9.2); and save "learn this" with `memory` or `skill_manage`, not in a file.
+`tests/prompt/test_off_platform_rules.py` keeps the rules in the text. The text names these
+tools in every session, also when the profile does not have the toolset.
+
+The production sessions of 2026-11-23 show why. The user asked for the price of a Wyndham
+hotel. The agent read one search page and answered "Enter your dates on wyndhamhotels.com or
+Kayak". Production had 2 `skill_view` calls in total, both from slash commands: the skill index
+alone did not make the agent load a skill. Before that, the user asked the agent to "learn" how
+to check hotel prices: the auto memory of the Claude Code preset made the agent write the note
+to `~/.claude/projects/<folder>/memory/` in the sandbox of that session and say "Saved", so the
+next session did not have it.
+
 ### 6.2 Context management
 
 | Mechanism | How |
@@ -2334,8 +2351,13 @@ store, and the sync. The rules:
   `.claude/skills`, because that folder turns on the native `Skill` tool of Claude, and the
   gate does not allow it.
 
-**Builtin library (M7.7).** `skills/` has 70 builtin skills: 68 from M7.7, and `claude-code` and
-`openai-codex` from M7.2 (Section 15.4). Sama wrote all of them. They
+**Builtin library (M7.7).** `skills/` has 71 builtin skills: 68 from M7.7, `claude-code` and
+`openai-codex` from M7.2 (Section 15.4), and `price-check` from M8.4. `price-check` gets the
+live price of a room, a fare, or a product with the web and browser tools: a direct URL with
+the dates first, then the search form, at least two sources, and a table with the total and
+what it includes. It never sends the user to look the price up. M8.4 also changed
+`trip-planning` and `price-watch`, which told the agent to send the user to check a price or
+to another source. Sama wrote all of them. They
 cover the categories of the Hermes bundled skills (docs/feature-map.md, Section 3), except
 `apple`, because those skills need a Mac. No Hermes text is in them. The rules:
 
@@ -9549,6 +9571,42 @@ message. A new alert comes only 30 minutes or more after the last alert.
 - The webhook URL is a secret. It is never logged.
 
 ---
+
+### 18.4 Behaviour evals (M8.4)
+
+An eval sends real questions to a deployed sama and counts the outcomes. It is not a unit test:
+it needs a user token, it spends model and browser money, and its result changes with the web.
+Run it by hand on staging before and after a change, and compare the counts, not single runs.
+
+`python -m sama.evals.off_platform` is the first eval. It has 18 price questions (7 hotels, 3
+flights, 5 products, 3 other) with relative dates, so it stays valid on any day. For each
+question and each runtime it makes a new session, sends the question, approves the web and
+browser tools (scope `session`), denies other approvals, and answers one `clarify` question
+or one question in the answer text with the follow-up of the case. A regular expression
+classifier labels each case:
+
+| Outcome | Rule |
+|---|---|
+| `off_platform` | An answer tells the user to get the data elsewhere: "you can check X.com", a line "Call the hotel", "enter your dates on", or "I cannot get live prices". |
+| `answered` | No answer sends the user away, and the last answer has an amount of money. |
+| `no_price` | No answer sends the user away, and the last answer has no amount. |
+| `error` | A run failed or timed out, or an API call failed. |
+
+A source link or an offer ("Do you want me to try the Wyndham site next?") is not
+`off_platform`. The output folder gets `results.jsonl` (the answers, the tools, the
+deflections that matched, the cost) and `summary.md`. `--rescore results.jsonl` classifies
+stored answers again after a change to the rules, and `--resume` skips the cases that
+`results.jsonl` already has. The classifier skips an offer of the agent ("I can also try
+Goibibo") and a link label; it flags "open this link and check the dates".
+
+Staging and production share one E2B account with a limit of 20 running sandboxes, and a
+session sandbox keeps running for some minutes after its run. Run the eval with
+`--concurrency 2 --e2b-max-running 12`: before each case the runner waits while more than 12
+sandboxes run, and after each case it kills only the sandboxes with the `sama.session_id` of
+that case, so that production sessions can still start. For a change that is not deployed,
+run the eval against a local control plane with its own database and a public tunnel as
+`SAMA_PUBLIC_URL`; never point a second control plane at a shared database, because its worker
+would claim the runs of that database.
 
 ## 19. Technology stack and repository layout
 
