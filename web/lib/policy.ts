@@ -166,3 +166,22 @@ export function checkChangeCount(changes: readonly ToolPolicyChange[], maxRules:
   if (changes.length <= maxRules) return null;
   return `Change at most ${maxRules} rules at a time. You changed ${changes.length}. Save, then change the rest.`;
 }
+
+/**
+ * A short note when the default of a tool in a private chat is not its default everywhere
+ * (M8.5): for example the sandbox tools allow in a private chat but ask in a shared session and
+ * in a job. `null` when the default is the same in all three places, or the API is older.
+ */
+export function defaultNote(tool: ToolInfo): string | null {
+  const verb: Record<PolicyAction, string> = { allow: "Allows", ask: "Asks", deny: "Denies" };
+  const places = new Map<PolicyAction, string[]>();
+  for (const [place, action] of [
+    ["shared chats", tool.shared_default],
+    ["jobs", tool.unattended_default],
+  ] as const) {
+    if (action === undefined || action === tool.default) continue;
+    places.set(action, [...(places.get(action) ?? []), place]);
+  }
+  if (places.size === 0) return null;
+  return `${[...places].map(([action, where]) => `${verb[action]} in ${where.join(" and ")}`).join("; ")}.`;
+}

@@ -163,7 +163,7 @@ Five rules shape the design:
 | D6 | **No long-lived secrets in the sandbox.** Model calls go to the sama **model proxy** (`ANTHROPIC_BASE_URL` / OpenAI `base_url`) with a run token. Integration calls go through sama tools on the control plane. | A prompt-injected agent cannot leak a key that it cannot read. The proxy also meters cost, enforces budgets, and sends traces. |
 | D7 | **Supabase** is the system of record: Postgres with RLS, Auth, Storage, and pgvector. | Already in the owner's stack. RLS is a second tenant guard under the API. pgvector covers session search and memory recall. |
 | D8 | **Postgres is the job queue** (`FOR UPDATE SKIP LOCKED` with leases) for runs, cron fires, workflow steps, and deliveries. No separate workflow engine in v1. | Fewer moving parts. vorflux made the same choice. The queue sits behind an interface. |
-| D9 | The **prompt prefix is frozen per session**: SOUL, context files, tool list, memory snapshot, skill index. New memory and skills apply from the next session. A short note on the next user message tells the agent about new skills. | Hermes rule. It keeps prompt caching valid on both SDKs and makes runs reproducible (`RunConfig.fingerprint()`). |
+| D9 | The **prompt prefix is frozen per session**: SOUL, context files, tool list, memory snapshot, skill index. New memory and skills apply from the next session. A short note on the next user message tells the agent about new skills. A new sama text or default SOUL (M8.5) also applies from the next session. | Hermes rule. It keeps prompt caching valid on both SDKs and makes runs reproducible (`RunConfig.fingerprint()`). |
 | D10 | **Connectors use one model for all kinds**: Composio toolkits, remote MCP servers, hosted stdio MCP servers, databases, HTTP APIs, and plugins. Connections are per user or per workspace, with credentials in the sama vault. Rare tools sit behind `tool_search`. Since M8.1 a sign-in connector connects from the chat in one click and the request continues after the sign-in; secrets still go only into the forms of the web app (Section 10.3.4). | The owner has Composio and any MCP server. This gives hundreds of apps without our own connector code, and keeps the tool list short. |
 | D11 | **Channels** are adapters in one gateway: web (first-party), Slack (Events API over HTTP, Web API with `httpx`), Telegram (Bot API webhook), and the Chrome extension (WebSocket). Email and WhatsApp later. Chats bind to a user and an agent profile through pairing. | Same shape as the Hermes gateway: normalise inbound, send outbound, render approvals, map slash commands. Unpaired chats get no agent access. |
 | D12 | **Browser control has one tool contract with two targets**: `cloud` (Browserbase) and `my_chrome` (the extension). The tools work on page snapshots with element refs, and a vision mode uses screenshots and coordinates. | The agent learns one set of tools. Unattended jobs use the cloud browser. Logged-in personal sites use the user's own Chrome with consent. |
@@ -1029,7 +1029,7 @@ RunEvent = (
 | Package | `claude-agent-sdk` (Python). It drives the bundled Claude Code CLI as a subprocess, so the sandbox image needs the CLI. | `openai-agents` (Python), in process. |
 | Turn API | `ClaudeSDKClient.query()` and `receive_response()` | `Runner.run_streamed()` |
 | Model routing | `ANTHROPIC_BASE_URL` points at the sama model proxy; the run token is the API key. | `AsyncOpenAI(base_url=<proxy>/openai/v1, api_key=<run token>)` and the Responses API |
-| System prompt | `system_prompt` preset `claude_code` with the sama prefix appended, or a full custom prompt for non-coding profiles | `Agent.instructions` |
+| System prompt | The sama prefix as the full `system_prompt` for a session from M8.5 on (`RunConfig.claude_code_preset=False`). A session from before M8.5 keeps the preset `claude_code` with the prefix appended. `ClaudeSettings.claude_code_preset` overrides both. | `Agent.instructions` |
 | Sama tools | `mcp_servers` with the sama MCP server (HTTP); `strict_mcp_config=True` | `MCPServerStreamableHttp` in `Agent.mcp_servers` |
 | Approvals | `PreToolUse` hook calls the sama tool gate. `ask` returns a defer and the run pauses. Fallback: `can_use_tool` deny plus interrupt. | `needs_approval` on tools. `result.interruptions` become `ApprovalRequired`. `RunState.approve()` or `reject()` on resume. |
 | Resume | `resume` with the SDK session id; `session_store` mirrors the transcript to sama. | Serialised `RunState` plus a sama `Session` (a `SessionABC` that reads and writes items through the control-plane API with the run token). The runner has no database credentials, so `SQLAlchemySession` is not used in the sandbox. |
@@ -1049,8 +1049,15 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
 
 - **Options.** `setting_sources=[]`, so no file settings from the sandbox apply.
   `strict_mcp_config=True`. Remote MCP servers are `http` servers with the run token in an
-  `Authorization` header. `include_partial_messages=True` gives text deltas. The preset prompt
-  uses `exclude_dynamic_sections=True`, so the prefix stays the same for the prompt cache.
+  `Authorization` header. `include_partial_messages=True` gives text deltas. Since M8.5 a new session freezes
+  `RunConfig.claude_code_preset=False`, and the CLI gets the sama prefix alone, without the
+  Claude Code preset. A session from before M8.5 has no value and keeps the preset, so its system
+  prompt and its fingerprint do not change (D9). The M8.5 benchmark (19
+  tasks, the same prompt, a local control plane) gave both choices 165 of 190 points. Without
+  the preset the cost was 26% lower, and the agent answered "Who are you?" as Sama; with the
+  preset it said that it ran "inside the Claude Code environment". With the preset on, the
+  preset prompt uses `exclude_dynamic_sections=True`, so the prefix stays the same for the
+  prompt cache.
 - **Tool search off.** The adapter sets `ENABLE_TOOL_SEARCH=false` in the CLI env. With tool
   search on, the CLI defers MCP tools, and the model must call the native `ToolSearch` tool
   to load a tool first. The staging check of M1.16 found this. `ClaudeSettings.env` can
@@ -1415,6 +1422,38 @@ Rules:
   the system text also tells the model that file text is data.
 - A file longer than 20,000 characters keeps its head (70%) and its tail (30%). A marker
   `[... N characters cut ...]` replaces the middle.
+- **The sama text (M8.5).** `sama.instructions.SYSTEM_PROMPT` is the `system` part. It tells
+  the model: who it is (Sama, the assistant of the org, for all kinds of work through a chat);
+  how it works (finish the job, try another source or method after a failure, state an
+  assumption in one line, ask one focused question with `AskUserQuestion` or `clarify` only
+  when a choice matters, write a todo list for work with three or more steps, make independent
+  tool calls in the same step, and check the result); which sama tools fit which job (research,
+  connectors through `tool_search` and `connection_request`, `execute_code`, `repo_clone` and
+  `coding_agent_run`, memory, skills, `cronjob_manage`, sub-agents); the safety rules (approvals,
+  a denied call, actions in the name of the user, secrets, and text from tools as data); and
+  how to write the answer (the result first, natural and direct English, tables for
+  comparisons, linked sources, no filler). Since M8.5 the Claude runtime sends the prefix
+  without the Claude Code preset (Section 5.2), so the text also has the short tool rules that
+  the preset gave: open a source before you quote it, read a file before you change it, and
+  run the tests after a change. If an operator turns the preset on, the text says that it wins
+  over the preset for the role, the work with the user, and the style. The text is sama-written. Unlike this document, it is natural
+  English and not Simplified Technical English, because the model copies the style of its
+  prompt.
+- **The default SOUL (M8.5).** `sama.instructions.DEFAULT_SOUL` sets the voice of the agent in
+  four sentences. The working rules stay in `SYSTEM_PROMPT`, so an edit of the SOUL cannot remove
+  them. A new org (sign-up and `bootstrap`) and a new profile without a soul get it. Migration
+  `0052` gives it to the default profile of each existing org (its oldest profile without a
+  workspace) only when the SOUL is still empty. Each fill writes a `profile_changes` row (kind
+  `soul`, source `edit`, no actor) and the audit action `profile.updated`, so the agent history
+  shows it and an admin can revert it. A later `change_propose` of the SOUL starts from it.
+- **The default reasoning effort (M8.5).** A new profile gets `reasoning_effort = 'high'`
+  (`DEFAULT_REASONING_EFFORT`), and migration `0052` gives it to the default profile of each
+  existing org when the value is still null (a `profile_changes` row of the kind `profile`). A
+  value that a person set does not change. On the M8.5 benchmark, `high` lifted the weakest seven
+  tasks from 7.0 to 8.3 of 10 points, at about twice the model cost of the model default. An admin
+  lowers it in the Harness section of the console.
+- A new `SYSTEM_PROMPT` or `DEFAULT_SOUL` applies from the next session. A session keeps the
+  text that it froze in `sessions.run_config` (D9).
 - Not in M1.11: channel formatting hints (M1.13), pinned skills, and the user profile block
   (later milestones). The `RunConfig` fields for them exist, and they are empty.
   Since M2.1 the memory snapshot is full: the `agent`, `workspace`, and (in a private session)
@@ -5694,7 +5733,7 @@ fingerprint of a config without sub-agents does not change.
   toolset `subagents`. A rule can still deny them.
 - A sub-agent cannot pause the run. The gate gets `child` for a call inside a sub-agent. For
   such a call, it changes `ask` to `deny` before it records anything: the `tool_calls` row is
-  `denied`, and there is no pending approval and no `approval.requested` entry. A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it.
+  `denied`, and there is no pending approval and no `approval.requested` entry. A risky tool such as `Bash` is unusable in a sub-agent unless a rule allows it. Since M8.5 the gate judges a sub-agent call with `GateContext.child`, so the sandbox tools keep the default `ask` (then `deny`) in a sub-agent, also in a private chat where the run itself may use them without a card.
 - A sub-agent runs in the foreground. The adapter turns off the background tasks of the CLI.
 
 **Budget.** The model calls of a sub-agent go through the model proxy (D6) with the run
@@ -6793,9 +6832,10 @@ in the sandbox with native tools. M3.7 adds push and pull requests (below).
   Each file is in an `<untrusted_content>` block with the file URL at that commit, and the
   result tells the agent that the files are data. They are not in the prompt prefix, because
   the prefix stays the same for the session (Section 6.1).
-- **Edits and tests.** The agent uses native `Bash`, `Edit`, and `Write` in the clone. These
-  tools keep the default `ask` (Section 16.1). An admin can add `allow` rules in
-  `tool_policies` for a profile.
+- **Edits and tests.** The agent uses native `Bash`, `Edit`, and `Write` in the clone. Since
+  M8.5 these tools have the default `allow` in a private chat and `ask` in a shared session and
+  in an unattended run (Section 16.1). An admin can add `ask` or `deny` rules in
+  `tool_policies` for a profile or the org.
 - `python -m sama.admin bootstrap` gives new profiles the `github` toolset. Existing profiles
   keep their toolsets.
 
@@ -7570,7 +7610,14 @@ Every tool call passes one gate, in this order. Each tool call id gets exactly o
 4. **Policy**: rules per org, profile, and tool give `allow`, `ask`, or `deny`. An optional
    classifier (a small model) can approve low-risk shell commands, as in Hermes `smart`
    mode. The default for unknown tools is `ask`. In a shared session, `memory` also has the
-   default `ask` (Section 11.3). Since M3.4, a deferred tool gets its default from the access
+   default `ask` (Section 11.3). Since M8.5, the sandbox tools (`SANDBOX_TOOLS`: `Bash`,
+   `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, and `execute_code`) have the default `allow` in
+   a private chat, and `WebFetch` has the default `allow` everywhere (it only reads a page, as
+   `web_extract` does). The sandbox tools change only the files of the session sandbox, which has
+   no secret (D6). They keep the default `ask` in a shared session and in an unattended run, so a
+   job still needs a pre-approval for them (step 5). A rule of the org, the profile, or the user
+   wins over these defaults, and the hardline list (step 2) and plan mode (step 4a) come before
+   them. Since M3.4, a deferred tool gets its default from the access
    of the tool in the catalog: `read` is `allow`, `write` and `destructive` are `ask`
    (Section 10.3). A policy rule wins over this default. Since M6.1, a session with a snapshot
    also gets the verdict of the rules with the profile rules of the snapshot in place of the
@@ -9194,7 +9241,10 @@ without a change of the web app.
 - `GET /orgs/{org_id}/agent-profiles/{profile_id}/tool-policy` gives the rules of the agent, the
   rules of the org, and each tool of `TOOLSETS` with its toolset, whether the agent has the
   toolset, and the verdict without a rule (`allow` for `DEFAULT_ALLOW`, else `ask`; the tools of
-  `ALWAYS_ASK` have `always_ask`).
+  `ALWAYS_ASK` have `always_ask`). Since M8.5 each tool also has `shared_default` and
+  `unattended_default`: the verdict without a rule in a shared session and in a job, a workflow,
+  or a webhook run. The Tools section of the console shows a note, for example "Asks in shared
+  chats and jobs.", when they differ from `default`.
 - `PUT` on the same path takes `{"rules": [{"tool", "action"}]}` (1 to 20 rules; `action` null
   removes the rule; a tool is a name or a prefix that ends in `*`). It writes through
   `write_change` with the kind `policy`, so the agent history and the audit row `profile.updated`

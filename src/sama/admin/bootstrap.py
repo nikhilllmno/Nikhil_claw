@@ -17,8 +17,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.dml import ReturningInsert
 
 from sama.db.models import AgentProfile, Membership, Org, User, Workspace
+from sama.instructions import DEFAULT_SOUL
 
 DEFAULT_MODEL: Final = "claude-sonnet-5-5"
+DEFAULT_REASONING_EFFORT: Final = "high"
+"""The reasoning effort of a new profile (M8.5). On the M8.5 benchmark ``high`` lifted the weak
+tasks from 7.0 to 8.3 of 10 points, at about twice the model cost of the model default. An admin
+can lower it in the Harness section of the console."""
 DEFAULT_TOOLSETS: Final = (
     "core",
     "todo",
@@ -64,12 +69,15 @@ def default_profile(
     budget: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The values of the org-wide agent profile of a new org. Sign-up (``sama.orgs``) uses
-    them too, with the run budget of the plan."""
+    them too, with the run budget of the plan. The profile gets the default SOUL of sama
+    (M8.5)."""
     return {
         "org_id": org_id,
         "workspace_id": None,
         "name": name,
+        "soul": DEFAULT_SOUL,
         "model": model,
+        "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "toolsets": list(DEFAULT_TOOLSETS),
         "group_toolsets": list(DEFAULT_GROUP_TOOLSETS),
         "budget": dict(budget or {}),

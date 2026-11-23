@@ -143,8 +143,10 @@ def test_plan_mode_denies_tools_that_change_files() -> None:
 def test_plan_mode_keeps_the_policy_of_allowed_calls() -> None:
     assert decide(plan(), "Read", {"file_path": "a"}).action == "allow"
     assert decide(plan(), "mcp__sama__plan_propose", {"plan": "x"}).action == "allow"
-    # A read command still gets the default of Bash: ask.
-    assert decide(plan(), "Bash", {"command": "ls"}).action == "ask"
+    # A read command gets the default of Bash in a private chat: allow (M8.5). A shared
+    # session asks.
+    assert decide(plan(), "Bash", {"command": "ls"}).action == "allow"
+    assert decide(plan(shared=True), "Bash", {"command": "ls"}).action == "ask"
     rule = PolicyRule(tool="Bash", action="allow", level=RuleLevel.PROFILE)
     assert decide(plan(rules=(rule,)), "Bash", {"command": "git status"}).action == "allow"
     # A deny rule still wins.
@@ -165,7 +167,9 @@ def test_plan_mode_applies_to_a_deferred_call() -> None:
 
 def test_without_plan_mode_nothing_changes() -> None:
     context = GateContext(toolsets=ALL)
-    assert decide(context, "Write", {"file_path": "a"}).action == "ask"
+    assert decide(context, "Write", {"file_path": "a"}).action == "allow"
+    github = GateContext(toolsets=ALL | {"github"})
+    assert decide(github, "mcp__sama__pr_create", {}).action == "ask"
 
 
 def test_a_recorded_approval_is_not_stopped_by_plan_mode() -> None:

@@ -365,6 +365,7 @@ async def test_maps_the_request_to_options() -> None:
     await collect(runtime.run(request(budget=budget)))
     options = factory.clients[0].options
     assert options.model == "claude-sonnet-4-5"
+    # A config from before M8.5 (no ``claude_code_preset``) keeps the preset (D9).
     assert options.system_prompt == {
         "type": "preset",
         "preset": "claude_code",
@@ -403,13 +404,42 @@ async def test_the_settings_can_turn_tool_search_on() -> None:
     assert factory.clients[0].options.env[TOOL_SEARCH_ENV] == "true"
 
 
-async def test_custom_system_prompt_without_the_preset() -> None:
+async def test_a_new_session_sends_the_sama_prefix_without_the_preset() -> None:
+    """Since M8.5 a session freezes ``claude_code_preset=False`` (Section 5.2)."""
     factory = Factory([result()])
-    runtime = ClaudeRuntime(
-        settings=ClaudeSettings(claude_code_preset=False), client_factory=factory
+    given = request()
+    given = given.model_copy(
+        update={"config": given.config.model_copy(update={"claude_code_preset": False})}
     )
-    await collect(runtime.run(request()))
-    assert factory.clients[0].options.system_prompt == config().render_prefix()
+    await collect(ClaudeRuntime(client_factory=factory).run(given))
+    assert factory.clients[0].options.system_prompt == given.config.render_prefix()
+
+
+@pytest.mark.parametrize(
+    ("frozen", "setting", "preset"), [(False, True, True), (None, False, False)]
+)
+async def test_the_settings_override_the_frozen_preset_choice(
+    frozen: bool | None, setting: bool, preset: bool
+) -> None:
+    factory = Factory([result()])
+    given = request()
+    given = given.model_copy(
+        update={"config": given.config.model_copy(update={"claude_code_preset": frozen})}
+    )
+    runtime = ClaudeRuntime(
+        settings=ClaudeSettings(claude_code_preset=setting), client_factory=factory
+    )
+    await collect(runtime.run(given))
+    assert isinstance(factory.clients[0].options.system_prompt, dict) is preset
+
+
+def test_a_config_from_before_the_preset_field_keeps_its_fingerprint() -> None:
+    old = config()
+    assert old.claude_code_preset is None
+    payload = old.model_dump(mode="json")
+    del payload["claude_code_preset"]
+    assert type(old).model_validate(payload).fingerprint() == old.fingerprint()
+    assert old.model_copy(update={"claude_code_preset": False}).fingerprint() != old.fingerprint()
 
 
 def test_settings_reject_a_long_cancel_grace() -> None:

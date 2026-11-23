@@ -113,6 +113,7 @@ def test_the_reasoning_effort_changes_the_fingerprint_only_when_it_is_set() -> N
     # A config with no effort keeps the digest that it had before the field existed.
     del payload["reasoning_effort"]
     del payload["subagents"]
+    del payload["claude_code_preset"]  # M8.5: no key for a config from before the field
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     assert base.fingerprint() == hashlib.sha256(canonical.encode()).hexdigest()
     high = base.model_copy(update={"reasoning_effort": "high"})

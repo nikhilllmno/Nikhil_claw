@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
 from sama.db.models import AgentProfile, AuditEntry, Membership, Org, OrgInvite, User
+from sama.instructions import DEFAULT_SOUL
 from sama.orgs import OrgService, SignupPolicy
 from sama.orgs import service as org_service
 from sama.orgs.plans import FREE, Plan, limits_for
@@ -154,9 +155,13 @@ async def test_a_verified_user_makes_an_org_and_owns_it(
     assert [p["name"] for p in seen["agent_profiles"]] == ["sama"]
     async with engine.connect() as connection:
         limits = await connection.scalar(select(Org.limits).where(Org.id == uuid.UUID(org["id"])))
-        budget = await connection.scalar(
-            select(AgentProfile.budget).where(AgentProfile.org_id == uuid.UUID(org["id"]))
-        )
+        budget, soul = (
+            await connection.execute(
+                select(AgentProfile.budget, AgentProfile.soul).where(
+                    AgentProfile.org_id == uuid.UUID(org["id"])
+                )
+            )
+        ).one()
         actions = (
             await connection.scalars(
                 select(AuditEntry.action).where(AuditEntry.org_id == uuid.UUID(org["id"]))
@@ -165,6 +170,7 @@ async def test_a_verified_user_makes_an_org_and_owns_it(
     # Billing is off in these tests: the plan adds no model quota (Section 17.5).
     assert limits == limits_for(FREE, None, quotas=False)
     assert budget == dict(FREE.run_budget)
+    assert soul == DEFAULT_SOUL  # M8.5
     assert actions == ["org.created"]
     # The same name again gets a free slug.
     again = await new_org(web, ana, "Acme Labs")

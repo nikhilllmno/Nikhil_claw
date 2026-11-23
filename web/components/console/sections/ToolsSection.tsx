@@ -20,6 +20,7 @@ import {
   type RuleRow,
   checkChangeCount,
   customRules,
+  defaultNote,
   groupTools,
   newRuleRow,
   orgRuleFor,
@@ -41,6 +42,11 @@ import { AgentProfileEditor, SectionHeader, useAgentChoice } from "../parts";
 import own from "./Tools.module.css";
 
 const ACTION_TONE = { allow: "accent", ask: "warning", deny: "danger" } as const;
+
+function DefaultNote({ tool }: { tool: ToolInfo }) {
+  const note = defaultNote(tool);
+  return note ? <span className="hint">{note}</span> : null;
+}
 
 function ActionBadge({ action }: { action: PolicyAction }) {
   return <ToneBadge tone={ACTION_TONE[action]}>{policyActionLabel(action)}</ToneBadge>;
@@ -457,6 +463,7 @@ function GroupRows({
               <span className={own.verdict}>
                 <ActionBadge action={tool.default} />
                 {tool.always_ask ? <span className="hint">Always asks a person</span> : null}
+                <DefaultNote tool={tool} />
               </span>
             </td>
             <td>

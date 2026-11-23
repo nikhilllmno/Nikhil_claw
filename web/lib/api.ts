@@ -1817,8 +1817,12 @@ export interface ToolInfo {
   toolset: string;
   /** True when the toolset of the tool is on for the profile. */
   enabled: boolean;
-  /** The verdict without a rule. */
+  /** The verdict without a rule, in a private chat. */
   default: PolicyAction;
+  /** The verdict without a rule in a shared session (M8.5). Older APIs leave it out. */
+  shared_default?: PolicyAction;
+  /** The verdict without a rule in a job, workflow, or webhook run (M8.5). */
+  unattended_default?: PolicyAction;
   /** True when the tool always asks a person (for example `repo_push_approval`). */
   always_ask: boolean;
 }

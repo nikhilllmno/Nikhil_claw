@@ -72,9 +72,21 @@ async def test_a_member_reads_the_policy_of_a_profile(
         "toolset": "web",
         "enabled": True,
         "default": "allow",
+        "shared_default": "allow",
+        "unattended_default": "allow",
         "always_ask": False,
     }
     assert "web_search" in DEFAULT_ALLOW
+    # The sandbox tools allow in a private chat only (M8.5).
+    assert {k: by_name["Bash"][k] for k in ("default", "shared_default", "unattended_default")} == {
+        "default": "allow",
+        "shared_default": "ask",
+        "unattended_default": "ask",
+    }
+    assert (by_name["memory"]["shared_default"], by_name["memory"]["unattended_default"]) == (
+        "ask",
+        "allow",
+    )
     assert by_name["repo_push_approval"]["always_ask"] is True
     assert by_name["repo_push_approval"]["default"] == "ask"
     assert all(t["enabled"] == (t["toolset"] in ("web", "core")) for t in tools)
