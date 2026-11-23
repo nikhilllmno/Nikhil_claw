@@ -55,7 +55,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Final, Literal
 
 from sama.runtime.contract import RunScope
-from sama.runtime.gating import GateDecision, ToolGate
+from sama.runtime.gating import GateDecision, ToolGate, asker_of
 from sama.sandbox.base import WORKDIR
 
 __all__ = [
@@ -663,6 +663,15 @@ class CheckpointGate:
         if decision.action != "deny" and tool_name in CHANGE_TOOLS:
             await self._take(scope.run_id, tool_name)
         return decision
+
+    async def ask(
+        self, scope: RunScope, arguments: Mapping[str, Any], *, call_id: str
+    ) -> dict[str, str] | None:
+        """The questions of ``AskUserQuestion`` go to the inner gate (M8.3)."""
+        asker = asker_of(self._inner)
+        if asker is None:
+            raise RuntimeError("nobody can answer a question in this run")
+        return await asker.ask(scope, arguments, call_id=call_id)
 
     async def _take(self, run_id: str, tool_name: str) -> None:
         started = time.monotonic()

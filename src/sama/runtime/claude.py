@@ -100,7 +100,7 @@ from sama.runtime.contract import (
 )
 from sama.runtime.fence import KeepError
 from sama.runtime.gating import AllowAllGate as AllowAllGate
-from sama.runtime.gating import BoundedSet
+from sama.runtime.gating import BoundedSet, QuestionAsker, asker_of
 from sama.runtime.gating import GateDecision as GateDecision
 from sama.runtime.gating import ToolGate as ToolGate
 
@@ -123,6 +123,26 @@ call the native ``ToolSearch`` tool to load a tool schema first. ``ToolSearch`` 
 toolset, so the gate denies it and the model cannot call a sama MCP tool. The adapter sets the
 switch to ``false``, so the CLI loads all MCP tools at the start. ``ClaudeSettings.env`` can
 override it."""
+
+MCP_TOOL_TIMEOUT_ENV: Final = "MCP_TOOL_TIMEOUT"
+"""CLI switch: the time limit of one MCP tool call, in milliseconds. Without it, the MCP client
+of the CLI ends a call after 60 seconds with "The operation timed out.", while the tool server
+goes on. A ``browser_task`` (up to 600 s) then went on in the background, and the agent used
+the same browser at the same time. A ``clarify`` call (up to 600 s) ended before the user
+answered (M8.3)."""
+MCP_TOOL_TIMEOUT_MS: Final = 3_600_000
+"""The same limit as ``MCP_CALL_TIMEOUT_S`` of the OpenAI runtime."""
+
+ASK_USER_QUESTION: Final = "AskUserQuestion"
+"""The native question tool of the CLI (M8.3, Section 16.7). The hook asks the gate, and on
+``allow`` it gives no decision, so the CLI asks ``can_use_tool``. That callback sends the
+questions to the control plane (``QuestionAsker``), waits for the answers, and gives them to
+the CLI in ``updated_input`` (``questions`` and ``answers`` by question text), as the SDK
+expects. Without an asker, or when nobody answers, the call is denied with a message."""
+NO_ANSWER: Final = (
+    "The user did not answer the question. Continue with your best judgment, and tell the "
+    "user which assumptions you made."
+)
 
 _ABORTED: Final = frozenset({"aborted_streaming", "aborted_tools"})
 _BUDGET_SUBTYPES: Final = frozenset({"error_max_turns", "error_max_budget_usd"})
@@ -529,6 +549,8 @@ class _Translator:
     ask_reasons: dict[str, str] = field(default_factory=dict)
     allowed_calls: set[str] = field(default_factory=set)
     """Tool use ids that the gate or a human allowed. ``can_use_tool`` allows only these."""
+    question_calls: set[str] = field(default_factory=set)
+    """Tool use ids of ``AskUserQuestion`` calls that the gate allowed (M8.3)."""
     _subagents: dict[str, str] = field(default_factory=dict)
     _streamed_text: bool = False
     _text: list[str] = field(default_factory=list)
@@ -1289,7 +1311,7 @@ class ClaudeRuntime:
             pre_compact=(
                 self._archive_hook(scope, self._archiver) if self._archiver is not None else None
             ),
-            can_use_tool=_can_use_tool(translator),
+            can_use_tool=_can_use_tool(translator, scope, asker_of(self._gate)),
         )
         client = held.client if held is not None else None
         final: ResultMessage | None = None
@@ -1444,7 +1466,11 @@ class ClaudeRuntime:
             }
         else:
             system_prompt = prefix
-        env = {TOOL_SEARCH_ENV: "false", **settings.env}
+        env = {
+            TOOL_SEARCH_ENV: "false",
+            MCP_TOOL_TIMEOUT_ENV: str(MCP_TOOL_TIMEOUT_MS),
+            **settings.env,
+        }
         if relay is not None:
             from sama.runtime.relay import relay_env
 
@@ -1567,6 +1593,10 @@ class ClaudeRuntime:
                 translator.ask_reasons[call_id] = decision.reason
             else:
                 action = decision.action
+            if action == "allow" and call_id and tool_name == ASK_USER_QUESTION:
+                # No decision: the CLI then asks ``can_use_tool``, which gets the answers.
+                translator.question_calls.add(call_id)
+                return {}
             if action == "allow" and call_id:
                 translator.allowed_calls.add(call_id)
             return _pre_tool_use_output(
@@ -1631,21 +1661,44 @@ def _agent(agent: SubagentDefinition) -> AgentDefinition:
     )
 
 
-def _can_use_tool(translator: _Translator) -> CanUseTool:
+def _can_use_tool(
+    translator: _Translator, scope: RunScope, asker: QuestionAsker | None = None
+) -> CanUseTool:
     """The permission callback of the CLI. It allows only calls that the hook or a human allowed.
 
     The hook decides each new call, so the CLI asks this callback only in other cases. One
-    case is the deferred call on an approve resume: there the CLI can skip the hook.
+    case is the deferred call on an approve resume: there the CLI can skip the hook. The other
+    case is ``AskUserQuestion`` (M8.3): the callback asks the user and gives the answers.
     """
 
     async def can_use_tool(
         tool_name: str, arguments: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResultAllow | PermissionResultDeny:
-        if context.tool_use_id and context.tool_use_id in translator.allowed_calls:
+        call_id = context.tool_use_id
+        if tool_name == ASK_USER_QUESTION and call_id and call_id in translator.question_calls:
+            return await _ask_user(asker, scope, arguments, call_id)
+        if call_id and call_id in translator.allowed_calls:
             return PermissionResultAllow()
         return PermissionResultDeny(message="The sama tool gate did not allow this call.")
 
     return can_use_tool
+
+
+async def _ask_user(
+    asker: QuestionAsker | None, scope: RunScope, arguments: dict[str, Any], call_id: str
+) -> PermissionResultAllow | PermissionResultDeny:
+    """Asks the questions of an ``AskUserQuestion`` call and gives the CLI the answers."""
+    if asker is None:
+        return PermissionResultDeny(message="Nobody can answer a question in this run.")
+    try:
+        answers = await asker.ask(scope, arguments, call_id=call_id)
+    except Exception as error:
+        log.warning("a question failed run=%s error=%s", scope.run_id, type(error).__name__)
+        message = str(error)[:300] or type(error).__name__
+        return PermissionResultDeny(message=f"The question was not asked: {message}")
+    if answers is None:
+        return PermissionResultDeny(message=NO_ANSWER)
+    return PermissionResultAllow(updated_input={**arguments, "answers": answers})
 
 
 def _mcp_servers(config: RunConfig, relay: TokenRelay | None = None) -> dict[str, Any]:

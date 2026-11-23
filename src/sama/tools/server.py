@@ -41,11 +41,21 @@ from sama.connectors.errors import ConnectorError
 from sama.context.compaction import ArchiveError
 from sama.db.models import MAX_PLAN_CHARS
 from sama.delegation import DelegationError, DelegationService
-from sama.gate.decide import TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH, GateStep, Verdict
+from sama.gate.decide import (
+    ASK_USER_QUESTION,
+    TOOL_CALL,
+    TOOL_DESCRIBE,
+    TOOL_SEARCH,
+    GateStep,
+    Verdict,
+)
 from sama.gate.wire import (
+    ASK_PATH,
     GATE_PATH,
     MAX_GATE_BODY_BYTES,
     STEER_HEADER,
+    AskAnswer,
+    AskRequest,
     GateAnswer,
     GateRequest,
 )
@@ -136,6 +146,8 @@ from sama.tools.clarify import (
     ClarifyBroker,
     ClarifyError,
     ClarifyQuestion,
+    native_answers,
+    native_questions,
     render_answers,
 )
 from sama.tools.code import DEFAULT_TIMEOUT_S, MAX_CODE_CHARS, MAX_TIMEOUT_S, CodeError, CodeRunner
@@ -1868,6 +1880,7 @@ class ToolServer:
             routes=[
                 Route("/healthz", healthz, methods=["GET"]),
                 Route(GATE_PATH, self._gate_endpoint, methods=["POST"]),
+                Route(ASK_PATH, self._ask_endpoint, methods=["POST"]),
                 Route(ARCHIVE_PATH, self._archive_endpoint, methods=["POST"]),
                 Route(SESSION_ITEMS_PATH, self._session_items_endpoint, methods=["POST"]),
                 Mount("", app=_RunTokenGate(inner, self.signer)),
@@ -1921,6 +1934,44 @@ class ToolServer:
                 if steer:
                     answer = answer.model_copy(update={"steer": steer})
         return JSONResponse(answer.wire())
+
+    async def _ask_endpoint(self, request: Request) -> Response:
+        """``POST /gate/ask``: asks the user the questions of one ``AskUserQuestion`` call of the
+        Claude CLI and waits for the answers (M8.3, Section 16.7). The gate checks the call
+        again, so a process in the sandbox cannot ask without the toolset ``clarify`` or in an
+        unattended run. The answer has the answers by question text, or ``null`` when nobody
+        answered in time or the run ended."""
+        try:
+            claims = verify_bearer(self.signer, request.headers)
+        except InvalidRunTokenError as error:
+            return _unauthorized(error)
+        if self.gate is None or self.clarify is None:
+            return JSONResponse({"error": "questions are not configured"}, status_code=503)
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > MAX_GATE_BODY_BYTES:
+                return JSONResponse({"error": "the ask request is too large"}, status_code=413)
+        try:
+            body = AskRequest.model_validate_json(bytes(raw))
+            questions = native_questions(body.arguments)
+        except (ValidationError, ClarifyError) as error:
+            message = str(error) if isinstance(error, ClarifyError) else "not valid"
+            return JSONResponse(AskAnswer(error=message).model_dump(), status_code=422)
+        try:
+            verdict = await self.gate.check(claims, body.call_id, ASK_USER_QUESTION, body.arguments)
+        except Exception as error:
+            log.error("ask gate failed run=%s error=%s", claims.run_id, type(error).__name__)
+            return JSONResponse(AskAnswer(error="the tool gate failed").model_dump(), 503)
+        if verdict.action != "allow":
+            return JSONResponse(AskAnswer(error=verdict.reason).model_dump(), status_code=403)
+        try:
+            answers = await self.clarify.ask(claims, questions)
+        except ClarifyError as error:
+            return JSONResponse(AskAnswer(error=str(error)).model_dump(), status_code=409)
+        if answers is None:
+            return JSONResponse(AskAnswer().model_dump())
+        return JSONResponse(AskAnswer(answers=native_answers(questions, answers)).model_dump())
 
     async def _archive_endpoint(self, request: Request) -> Response:
         """``POST /archive``: the transcript before a compaction of the run of the token."""

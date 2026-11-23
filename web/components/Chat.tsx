@@ -1004,11 +1004,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
             }}
           />
         ))}
-        {questions.map((request) => (
+        {questions.map((request, index) => (
           <QuestionCard
             key={request.id}
             sessionId={sessionId}
             request={request}
+            active={index === 0}
             onAnswered={() => {
               setQuestions((list) => list.filter((r) => r.id !== request.id));
               void loadQuestions();

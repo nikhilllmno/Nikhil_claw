@@ -11,11 +11,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from sama.tenancy.run_token import RunTokenClaims
 
@@ -41,6 +41,70 @@ class ClarifyQuestion(BaseModel):
         max_length=MAX_CHOICES,
         description="2 to 6 short choices, or none for a free answer.",
     )
+
+
+class NativeQuestion(ClarifyQuestion):
+    """A question of the native ``AskUserQuestion`` tool of the Claude CLI (M8.3). It has the
+    fields of a ``clarify`` question plus the short ``header``, one description for each
+    choice, and ``multi_select``. The web app shows these fields as Claude Code does."""
+
+    header: str = Field(default="", max_length=40)
+    descriptions: tuple[str, ...] = ()
+    multi_select: bool = False
+
+
+MAX_NATIVE_QUESTIONS: Final = 4
+MAX_NATIVE_OPTIONS: Final = 4
+MAX_DESCRIPTION_CHARS: Final = 500
+
+
+def native_questions(arguments: Mapping[str, Any]) -> list[NativeQuestion]:
+    """The questions of an ``AskUserQuestion`` input: ``questions`` with ``question``,
+    ``header``, ``options`` (``label`` and ``description``), and ``multiSelect``. Raises
+    ``ClarifyError`` for an input that does not fit."""
+    raw = arguments.get("questions")
+    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_NATIVE_QUESTIONS:
+        raise ClarifyError(f"ask 1 to {MAX_NATIVE_QUESTIONS} questions")
+    questions: list[NativeQuestion] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ClarifyError("a question is not an object")
+        options = item.get("options")
+        if not isinstance(options, list) or not 2 <= len(options) <= MAX_NATIVE_OPTIONS:
+            raise ClarifyError(f"a question needs 2 to {MAX_NATIVE_OPTIONS} options")
+        labels: list[str] = []
+        descriptions: list[str] = []
+        for option in options:
+            if not isinstance(option, Mapping) or not isinstance(option.get("label"), str):
+                raise ClarifyError("an option needs a label")
+            labels.append(str(option["label"]).strip())
+            description = option.get("description")
+            descriptions.append(
+                description.strip()[:MAX_DESCRIPTION_CHARS] if isinstance(description, str) else ""
+            )
+        header = item.get("header")
+        try:
+            questions.append(
+                NativeQuestion(
+                    question=str(item.get("question") or "").strip(),
+                    choices=tuple(labels),
+                    header=header.strip()[:40] if isinstance(header, str) else "",
+                    descriptions=tuple(descriptions),
+                    multi_select=item.get("multiSelect") is True,
+                )
+            )
+        except ValidationError as error:
+            raise ClarifyError("a question is not valid") from error
+    texts = [q.question for q in questions]
+    if len(set(texts)) != len(texts):
+        raise ClarifyError("two questions have the same text")
+    return questions
+
+
+def native_answers(questions: Sequence[ClarifyQuestion], answers: Sequence[str]) -> dict[str, str]:
+    """The ``answers`` of the ``AskUserQuestion`` result: the answer of each question by the
+    text of the question. A multi-select answer is the labels joined with ", "."""
+    return {q.question: a for q, a in zip(questions, answers, strict=True)}
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,7 @@ import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from decimal import Decimal
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 
@@ -59,6 +59,7 @@ from sama.runtime import (
 )
 from sama.runtime.claude import (
     DROP_DEFERRED_ENV,
+    MCP_TOOL_TIMEOUT_ENV,
     TOOL_SEARCH_ENV,
     ClaudeClient,
     ClaudeRuntime,
@@ -257,14 +258,17 @@ def call_hook(
     return step
 
 
-def call_can_use(tool_name: str, call_id: str) -> Callable[[FakeClient], Any]:
+def call_can_use(
+    tool_name: str, call_id: str, tool_input: Mapping[str, Any] | None = None
+) -> Callable[[FakeClient], Any]:
     """A step that asks the ``can_use_tool`` callback of the options, like the CLI does."""
 
     async def step(client: FakeClient) -> list[Any]:
         callback = client.options.can_use_tool
         assert callback is not None
         context = ToolPermissionContext(tool_use_id=call_id)
-        client.permission_results.append(await callback(tool_name, {"to": "a@b.c"}, context))
+        arguments = dict(tool_input) if tool_input is not None else {"to": "a@b.c"}
+        client.permission_results.append(await callback(tool_name, arguments, context))
         return []
 
     return step
@@ -383,7 +387,11 @@ async def test_maps_the_request_to_options() -> None:
     assert options.disallowed_tools == []
     assert options.cwd == "/workspace"
     # Tool search off: the CLI loads the sama MCP tools at the start (no ``ToolSearch`` call).
-    assert options.env == {TOOL_SEARCH_ENV: "false", "ANTHROPIC_BASE_URL": "https://proxy.test"}
+    assert options.env == {
+        TOOL_SEARCH_ENV: "false",
+        MCP_TOOL_TIMEOUT_ENV: "3600000",
+        "ANTHROPIC_BASE_URL": "https://proxy.test",
+    }
     assert factory.clients[0].prompts == ["hello"]
     assert factory.clients[0].disconnected
 
@@ -1206,3 +1214,86 @@ async def test_closing_the_stream_early_stops_the_cli() -> None:
     await stream.aclose()
     assert factory.clients[0].disconnected
     assert "run-1" not in runtime._active
+
+
+QUESTION_INPUT: Final = {
+    "questions": [
+        {
+            "question": "Which dates?",
+            "header": "Dates",
+            "options": [
+                {"label": "Tonight", "description": "1 night"},
+                {"label": "Weekend", "description": "Fri to Sun"},
+            ],
+            "multiSelect": False,
+        }
+    ]
+}
+
+
+class AskingGate(ScriptedGate):
+    def __init__(self, decision: GateDecision, answers: dict[str, str] | Exception | None) -> None:
+        super().__init__(decision)
+        self.answers = answers
+        self.asked: list[tuple[str, Mapping[str, Any]]] = []
+
+    async def ask(
+        self, scope: RunScope, arguments: Mapping[str, Any], *, call_id: str
+    ) -> dict[str, str] | None:
+        self.asked.append((call_id, arguments))
+        if isinstance(self.answers, Exception):
+            raise self.answers
+        return self.answers
+
+
+async def ask_run(gate: ScriptedGate) -> FakeClient:
+    factory = Factory(
+        [
+            call_hook("AskUserQuestion", "q1", tool_input=QUESTION_INPUT),
+            call_can_use("AskUserQuestion", "q1", QUESTION_INPUT),
+            call_can_use("AskUserQuestion", "q2", QUESTION_INPUT),
+            result(),
+        ]
+    )
+    await collect(ClaudeRuntime(gate=gate, client_factory=factory).run(request()))
+    return factory.clients[0]
+
+
+async def test_ask_user_question_gets_the_answers_of_the_user() -> None:
+    """M8.3: the hook gives no decision, and ``can_use_tool`` returns the answers in
+    ``updated_input`` as the SDK expects. An id that the hook did not allow is denied."""
+    gate = AskingGate(GateDecision("allow"), {"Which dates?": "Weekend"})
+    client = await ask_run(gate)
+    assert client.hook_outputs[0] == {}
+    answered, unknown = client.permission_results
+    assert isinstance(answered, PermissionResultAllow)
+    assert answered.updated_input == {**QUESTION_INPUT, "answers": {"Which dates?": "Weekend"}}
+    assert isinstance(unknown, PermissionResultDeny)
+    assert gate.asked == [("q1", QUESTION_INPUT)]
+    assert client.options.disallowed_tools == []
+
+
+async def test_ask_user_question_without_an_answer_is_denied_with_a_note() -> None:
+    client = await ask_run(AskingGate(GateDecision("allow"), None))
+    denied = client.permission_results[0]
+    assert isinstance(denied, PermissionResultDeny)
+    assert "did not answer" in denied.message
+
+
+async def test_ask_user_question_that_fails_or_has_no_asker_is_denied() -> None:
+    client = await ask_run(AskingGate(GateDecision("allow"), RuntimeError("too many questions")))
+    failed = client.permission_results[0]
+    assert isinstance(failed, PermissionResultDeny)
+    assert "too many questions" in failed.message
+    client = await ask_run(ScriptedGate(GateDecision("allow")))
+    nobody = client.permission_results[0]
+    assert isinstance(nobody, PermissionResultDeny)
+    assert "Nobody can answer" in nobody.message
+
+
+async def test_a_denied_ask_user_question_never_asks() -> None:
+    gate = AskingGate(GateDecision("deny", "unattended"), {"Which dates?": "Tonight"})
+    client = await ask_run(gate)
+    assert client.hook_outputs[0]["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert all(isinstance(r, PermissionResultDeny) for r in client.permission_results)
+    assert gate.asked == []

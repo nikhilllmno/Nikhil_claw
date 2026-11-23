@@ -13,7 +13,7 @@ from typing import Any, Final, Literal, Protocol
 
 from sama.runtime.contract import RunScope
 
-__all__ = ["AllowAllGate", "BoundedSet", "GateDecision", "ToolGate"]
+__all__ = ["AllowAllGate", "BoundedSet", "GateDecision", "QuestionAsker", "ToolGate", "asker_of"]
 
 MEMORY_SIZE: Final = 10_000
 """How many paused runs, used approvals, and cancelled runs an adapter remembers."""
@@ -48,6 +48,24 @@ class ToolGate(Protocol):
         call_id: str,
         child: bool = False,
     ) -> GateDecision: ...
+
+
+class QuestionAsker(Protocol):
+    """A gate that can ask the user the questions of the native ``AskUserQuestion`` tool of
+    the Claude CLI (M8.3, architecture Section 16.7). ``RemoteGate`` asks the control plane."""
+
+    async def ask(
+        self, scope: RunScope, arguments: Mapping[str, Any], *, call_id: str
+    ) -> dict[str, str] | None:
+        """The answers by question text, or ``None`` when nobody answered. Raises an error
+        with a message for the model when the questions cannot be asked."""
+        ...
+
+
+def asker_of(gate: object) -> QuestionAsker | None:
+    """The question asker of a gate, or ``None`` when the gate cannot ask."""
+    ask = getattr(gate, "ask", None)
+    return gate if callable(ask) else None  # type: ignore[return-value]
 
 
 class AllowAllGate:

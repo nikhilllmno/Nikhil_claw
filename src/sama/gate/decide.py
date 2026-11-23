@@ -26,13 +26,18 @@ SUBAGENT_TOOLS: Final = frozenset({"Task", "Agent"})
 """The native tool that starts a Claude sub-agent. The CLI calls it ``Task`` in old versions and
 ``Agent`` in new versions. The toolset ``subagents`` has it (Section 13.1)."""
 
+ASK_USER_QUESTION: Final = "AskUserQuestion"
+"""The native question tool of the Claude CLI (M8.3). The toolset ``clarify`` has it. The Claude
+adapter sends its questions to the control plane (``POST /gate/ask``) and gives the answers to
+the CLI (Section 16.7)."""
+
 TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "core": frozenset(
         {"Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch"}
     ),
     "todo": frozenset({"todo", "TodoWrite"}),
     "web": frozenset({"web_search", "web_extract", "x_search"}),
-    "clarify": frozenset({"clarify"}),
+    "clarify": frozenset({"clarify", ASK_USER_QUESTION}),
     "github": frozenset({"repo_clone", "pr_create", "pr_comment", "repo_push_approval"}),
     "plan": frozenset({PLAN_PROPOSE}),
     "memory": frozenset({"memory", "memory_recall"}),
@@ -102,6 +107,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "web_extract",
         "x_search",
         "clarify",
+        ASK_USER_QUESTION,
         "repo_clone",
         "memory",
         "memory_recall",
@@ -187,7 +193,7 @@ authority of the user, and only a run that the user watches asks the user to con
 (Section 14.1). ``moa`` is out because one call spends the money of several model calls, and a
 child has a small budget (Section 10.2.2)."""
 
-NEEDS_A_HUMAN: Final = frozenset({"clarify", "repo_push_approval"})
+NEEDS_A_HUMAN: Final = frozenset({"clarify", ASK_USER_QUESTION, "repo_push_approval"})
 """Tools that wait for a human. Unattended runs cannot use them."""
 
 ALWAYS_ASK: Final = frozenset({"repo_push_approval"})
