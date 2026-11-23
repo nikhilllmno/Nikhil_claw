@@ -5,6 +5,7 @@
 import Link from "next/link";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  ApiError,
   type Approval,
   errorText,
   imageProblem,
@@ -401,6 +402,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
         setLiveBrowser((old) => found ?? (old !== null && old.view_url ? old : null));
         if (found !== null && browserShownFor.current !== found.run_id) {
           browserShownFor.current = found.run_id;
+          setBrowserError(null);
           setCodeTab(null);
           setBrowserOpen(true);
         }
@@ -427,7 +429,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
       browserGeneration.current += 1;
       setLiveBrowser({ ...liveBrowser, control: action === "take" ? "user" : "agent" });
     } catch (e) {
-      setBrowserError(errorText(e, "The control did not change."));
+      // 404: the run ended a moment ago, and its browser closed with it.
+      setBrowserError(
+        e instanceof ApiError && e.status === 404
+          ? "The run ended, so its browser closed."
+          : errorText(e, "The control did not change."),
+      );
     } finally {
       setBrowserBusy(false);
     }
