@@ -173,16 +173,15 @@ export function checkChangeCount(changes: readonly ToolPolicyChange[], maxRules:
  * in a job. `null` when the default is the same in all three places, or the API is older.
  */
 export function defaultNote(tool: ToolInfo): string | null {
-  const other: [string, PolicyAction | undefined][] = [
+  const verb: Record<PolicyAction, string> = { allow: "Allows", ask: "Asks", deny: "Denies" };
+  const places = new Map<PolicyAction, string[]>();
+  for (const [place, action] of [
     ["shared chats", tool.shared_default],
     ["jobs", tool.unattended_default],
-  ];
-  const differs = other.filter(([, action]) => action !== undefined && action !== tool.default);
-  if (differs.length === 0) return null;
-  const verb: Record<PolicyAction, string> = { allow: "Allows", ask: "Asks", deny: "Denies" };
-  const parts = differs.map(([place, action]) => `${verb[action as PolicyAction]} in ${place}`);
-  if (differs.length === 2 && differs[0][1] === differs[1][1]) {
-    return `${verb[differs[0][1] as PolicyAction]} in shared chats and jobs.`;
+  ] as const) {
+    if (action === undefined || action === tool.default) continue;
+    places.set(action, [...(places.get(action) ?? []), place]);
   }
-  return `${parts.join("; ")}.`;
+  if (places.size === 0) return null;
+  return `${[...places].map(([action, where]) => `${verb[action]} in ${where.join(" and ")}`).join("; ")}.`;
 }
