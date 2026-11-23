@@ -24,12 +24,12 @@ kill_timeout = 180
   SAMA_SUPABASE_URL = "https://yuekhvwifbjukuujuqwb.supabase.co"
   LANGFUSE_BASE_URL = "https://us.cloud.langfuse.com"
   SAMA_WORKER_CONCURRENCY = "4"
-  # The database pool of one process (docs/architecture.md, Section 4.4): 5 + 2 connections, and
+  # The database pool of one process (docs/architecture.md, Section 4.4): 10 + 4 connections, and
   # the queue listener is one of them. A rolling deploy runs two processes at the same time, and
-  # the Supabase session pooler (port 5432) gives 15 connections: 2 x 7 = 14. Raise the pooler
-  # limit before you raise these numbers.
-  SAMA_DB_POOL_SIZE = "5"
-  SAMA_DB_POOL_OVERFLOW = "2"
+  # the Supabase session pooler (port 5432) gives 30 connections since 2026-11-23: 2 x 14 = 28.
+  # Raise the pooler limit before you raise these numbers.
+  SAMA_DB_POOL_SIZE = "10"
+  SAMA_DB_POOL_OVERFLOW = "4"
 
 # One machine only: the clarify broker is in memory (Section 19.1).
 [http_service]
