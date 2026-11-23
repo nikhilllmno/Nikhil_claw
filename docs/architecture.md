@@ -823,6 +823,10 @@ the SDK has no call for it. So the kept clients never hold a token. The *token r
 - The host gives the relay the token when a job starts and takes it away when the job ends
   (`set_token`, `clear_token`). Between jobs, and after a cancel, every call gets `401`. A call
   of the previous run in a kept process cannot use the token of an ended run: it has none.
+  Each change of the token or the routes starts a new generation. The relay notes the
+  generation when it admits a call, and it forwards only when the generation is the same
+  after the body came. So a call of run N whose body ends after run N+1 started gets `401`: it
+  never gets the token or a route of N+1.
 - The CLI gets `ANTHROPIC_API_KEY=<local secret>`, `ANTHROPIC_BASE_URL=<relay>/anthropic`,
   and `SAMA_RUN_TOKEN=` (empty). The run token is not in its environment, its command line,
   or its MCP configuration. The shell commands of the agent run through a prefix script

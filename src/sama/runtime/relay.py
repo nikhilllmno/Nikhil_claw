@@ -97,6 +97,10 @@ class TokenRelay:
         self.secret = secrets.token_urlsafe(24)
         """The only credential that the kept CLI and the kept MCP clients hold."""
         self._token: str | None = None
+        self._generation = 0
+        """Grows with each change of the token or the routes. A call forwards only when the
+        generation is the one that admitted it, so a call of an earlier run never gets the
+        token or a route of a later run."""
         self._routes: dict[str, str] = {}
         self._buffered = 0
         self._epoch: str | None = None
@@ -140,6 +144,7 @@ class TokenRelay:
 
     async def aclose(self) -> None:
         self._token = None
+        self._generation += 1
         server, task = self._server, self._task
         self._server = self._task = None
         if server is not None:
@@ -168,6 +173,7 @@ class TokenRelay:
         """Gives the relay the token of the run that starts now. The file of the token is for
         this run only: a new name, and a pointer file that names it."""
         self._token = token
+        self._generation += 1
         if self._folder is not None:
             self._remove_files()
             self._epoch = secrets.token_hex(8)
@@ -180,6 +186,7 @@ class TokenRelay:
         """Takes the token away when the run ends. The next call gets ``401``, and the files
         are gone."""
         self._token = None
+        self._generation += 1
         if self._folder is not None:
             self._remove_files()
 
@@ -205,6 +212,7 @@ class TokenRelay:
         ``routes`` gets ``404`` from now on. The relay sends the token only to a URL that its
         runner registered for the job that runs now."""
         self._routes = dict(routes)
+        self._generation += 1
 
     def mcp_url(self, name: str) -> str:
         return f"{self.url}/mcp/{name}"
@@ -262,6 +270,7 @@ class TokenRelay:
             return JSONResponse({"error": "the local secret is not valid"}, status_code=401)
         token = self._token
         client = self._client
+        generation = self._generation
         if token is None or client is None:
             return JSONResponse({"error": "no run is active"}, status_code=401)
         path = str(request.path_params["path"])
@@ -277,8 +286,9 @@ class TokenRelay:
         if isinstance(read, Response):
             return read
         body, held = read
-        token = self._token  # the run can have ended while the body came
-        if token is None:
+        # The run can have ended, and the next one started, while the body came: forward only
+        # with the token and the route of the run that admitted the call.
+        if self._generation != generation or self._token != token:
             self._buffered -= held
             return JSONResponse({"error": "no run is active"}, status_code=401)
         headers = {

@@ -340,3 +340,36 @@ async def test_the_cli_env_points_at_the_relay(relay: TokenRelay) -> None:
     assert env["ANTHROPIC_BASE_URL"] == f"{relay.url}/anthropic"
     assert env["CLAUDE_CODE_SHELL_PREFIX"] == relay.shell_prefix
     assert env["SAMA_RUN_TOKEN"] == ""
+
+
+@pytest.mark.parametrize("same_token", [False, True])
+async def test_a_call_of_an_earlier_run_never_gets_the_token_of_the_next_run(
+    upstream: Any, relay: TokenRelay, same_token: bool
+) -> None:
+    """A call that the relay admitted for run N, whose body comes after run N+1 started,
+    gets ``401`` and does not reach the upstream: not with the token of N+1, and not on a
+    route that N+1 does not have."""
+    model, url = upstream
+    relay.set_token("run-n")
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b'{"part": 1'
+        started.set()
+        await release.wait()
+        yield b"}"
+
+    assert relay.app is not None
+    transport = httpx.ASGITransport(app=relay.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://relay") as client:
+        call = asyncio.create_task(client.post("/mcp/sama", headers=local(relay), content=body()))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        relay.clear_token()
+        relay.set_routes({"other": f"{url}/tools/mcp"})
+        # Even the same token value must not pass: the generation changed.
+        relay.set_token("run-n" if same_token else "run-n-plus-1")
+        release.set()
+        answer = await asyncio.wait_for(call, timeout=5)
+    assert answer.status_code == 401
+    assert model.seen == []
+    assert relay._buffered == 0
