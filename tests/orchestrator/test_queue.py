@@ -12,7 +12,7 @@ from sqlalchemy import insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from sama.db.models import Approval, AuditEntry, Message, Run, RunEvent, Session
+from sama.db.models import Approval, AuditEntry, Message, Run, RunEvent, Session, ToolCall
 from sama.gate.service import GateService
 from sama.orchestrator.directory import PostgresSandboxDirectory
 from sama.orchestrator.queue import (
@@ -658,3 +658,119 @@ async def test_the_sandbox_directory_stores_one_id_per_session(
     assert await directory.get(org, session) == "sbx-1"
     assert await directory.get("not-a-uuid", session) is None
     await directory.put("not-a-uuid", session, "x")
+
+
+async def _tool_row(
+    engine: AsyncEngine, run: ClaimedRun, call_id: str, status: str, decision: str = "allow"
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(ToolCall).values(
+                org_id=run.org_id,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                call_id=call_id,
+                tool_name="browser_open",
+                arguments={},
+                decision=decision,
+                status=status,
+            )
+        )
+
+
+async def _tool_rows(engine: AsyncEngine, run: ClaimedRun) -> dict[str, Any]:
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                select(
+                    ToolCall.call_id,
+                    ToolCall.status,
+                    ToolCall.finished_at,
+                    ToolCall.result_preview,
+                ).where(ToolCall.run_id == run.run_id)
+            )
+        ).all()
+    return {r.call_id: r for r in rows}
+
+
+def _done(call_id: str, *, error: bool = False, preview: str = "ok") -> dict[str, Any]:
+    return {
+        "type": "tool_call_finished",
+        "call_id": call_id,
+        "is_error": error,
+        "output_preview": preview,
+    }
+
+
+async def test_a_finished_event_ends_the_tool_call_row(engine: AsyncEngine, tenant: Tenant) -> None:
+    """Item E of M8.3: a call that the gate allowed without an approval was never ended."""
+    queue = RunQueue(engine)
+    await enqueue(queue, tenant, "s1")
+    run = await claim(queue)
+    await _tool_row(engine, run, "ok-call", "started")
+    await _tool_row(engine, run, "bad-call", "started")
+    await _tool_row(engine, run, "no-call", "denied", decision="deny")
+    await _tool_row(engine, run, "ticket-call", "finished")
+    assert await queue.add_events(
+        run,
+        OWNER,
+        [
+            (0, "tool_call_started", {"call_id": "ok-call", "name": "browser_open"}),
+            (1, "tool_call_finished", _done("ok-call", preview="the page")),
+            (2, "tool_call_finished", _done("bad-call", error=True, preview="boom")),
+            (3, "tool_call_finished", _done("no-call", error=True, preview="denied")),
+            (4, "tool_call_finished", _done("ticket-call", error=True, preview="late")),
+            (5, "tool_call_finished", _done("unknown-call")),
+        ],
+    )
+    rows = await _tool_rows(engine, run)
+    assert (rows["ok-call"].status, rows["ok-call"].result_preview) == ("finished", "the page")
+    assert rows["ok-call"].finished_at is not None
+    assert (rows["bad-call"].status, rows["bad-call"].result_preview) == ("failed", "boom")
+    assert rows["bad-call"].finished_at is not None
+    # A denied row stays as the gate wrote it.
+    assert (rows["no-call"].status, rows["no-call"].finished_at) == ("denied", None)
+    assert rows["no-call"].result_preview is None
+    # A used ticket stays ``finished`` and gets the time and the preview.
+    assert (rows["ticket-call"].status, rows["ticket-call"].result_preview) == ("finished", "late")
+    assert "unknown-call" not in rows
+
+
+async def test_the_finished_preview_is_redacted(engine: AsyncEngine, tenant: Tenant) -> None:
+    known = "opaque-preview-secret-0123456789"
+    default_redactor().add(known)
+    try:
+        queue = RunQueue(engine)
+        await enqueue(queue, tenant, "s1")
+        run = await claim(queue)
+        await _tool_row(engine, run, "c1", "started")
+        assert await queue.add_events(
+            run, OWNER, [(0, "tool_call_finished", _done("c1", preview=f"key {known}"))]
+        )
+        rows = await _tool_rows(engine, run)
+    finally:
+        default_redactor().forget(known)
+    assert rows["c1"].result_preview == "key [REDACTED]"
+
+
+async def test_a_finished_event_in_a_compaction_batch_ends_the_row(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await enqueue(queue, tenant, "s1")
+    run = await claim(queue)
+    await _tool_row(engine, run, "c1", "started")
+    compacted = {"type": "compacted", "tokens_before": 10, "tokens_after": 5, "trigger": "auto"}
+    assert await queue.add_events(
+        run, OWNER, [(0, "tool_call_finished", _done("c1")), (1, "compacted", compacted)]
+    )
+    assert (await _tool_rows(engine, run))["c1"].status == "finished"
+
+
+async def test_a_lost_lease_ends_no_tool_call(engine: AsyncEngine, tenant: Tenant) -> None:
+    queue = RunQueue(engine)
+    await enqueue(queue, tenant, "s1")
+    run = await claim(queue)
+    await _tool_row(engine, run, "c1", "started")
+    assert not await queue.add_events(run, "intruder", [(0, "tool_call_finished", _done("c1"))])
+    assert (await _tool_rows(engine, run))["c1"].status == "started"

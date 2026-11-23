@@ -730,6 +730,24 @@ async def test_an_approved_call_gives_one_ticket(engine: AsyncEngine, org: Org1)
     assert actions.count("tool_gate.reconfirm") == 2
 
 
+async def test_a_failed_call_stays_failed_and_gives_no_ticket(
+    engine: AsyncEngine, org: Org1
+) -> None:
+    """A call that ended with an error (``failed``, M8.3) is not a ticket again after a new
+    check of the same call id."""
+    gate = GateService(engine)
+    await approve(gate, org)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(ToolCall)
+            .where(ToolCall.run_id == org.ids["run"], ToolCall.call_id == "c1")
+            .values(status="failed")
+        )
+    assert (await reconfirm(gate, org)).action == "allow"
+    assert (await call_row(engine, org, "c1")).status == "failed"
+    assert (await gate.screen(org.claims(), "Bash", ARGS)).action == "deny"
+
+
 async def test_a_ticket_is_only_for_its_run(engine: AsyncEngine, org: Org1) -> None:
     gate = GateService(engine)
     await approve(gate, org)
