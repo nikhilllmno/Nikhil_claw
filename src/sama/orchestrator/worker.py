@@ -203,16 +203,18 @@ class Worker:
                 group.create_task(self._slot(stop))
 
     async def _slot(self, stop: asyncio.Event) -> None:
+        woken = True  # the first look has no peek
         while not stop.is_set():
             # The ticket comes first, so a run that is queued during the claim wakes the slot.
             ticket = self._wakeup.ticket()
             try:
-                worked = await self.run_once()
+                worked = await self.run_once(peek=not woken)
             except Exception:
                 log.exception("the worker could not handle a run owner=%s", self.owner)
                 worked = False
+            woken = worked
             if not worked:
-                await ticket.wait(stop, self._poll_s)
+                woken = await ticket.wait(stop, self._poll_s)
 
     async def _maintenance_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -254,10 +256,11 @@ class Worker:
             log.warning("run ended after a lost lease run=%s", ref.run_id)
             self._ended(ref.org_id, ref.run_id)
 
-    async def run_once(self) -> bool:
-        """Claims one run and executes it. Returns False if no run was ready."""
+    async def run_once(self, *, peek: bool = True) -> bool:
+        """Claims one run and executes it. Returns False if no run was ready. ``peek=False``
+        skips the cheap check for a ready run (``RunQueue.claim``)."""
         started = time.monotonic()
-        run = await self._queue.claim(self.owner)
+        run = await self._queue.claim(self.owner, peek=peek)
         if run is None:
             return False
         log.info(

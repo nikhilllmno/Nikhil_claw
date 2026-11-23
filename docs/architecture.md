@@ -637,17 +637,126 @@ of the session then reads at once, after `wake_s` (0.05 seconds), and does not w
 of `poll_s` (0.5 seconds). A stream in another process finds the events on its next poll, as
 before. A signal only starts a read, so it cannot change what a stream sends.
 
+**Round trips (M8.2, part 2).** Each step of a request that waits for the database costs one
+round trip: about 58 ms from `sin` to `ap-south-1`. A transaction costs two more (`BEGIN` and
+`COMMIT`). `sama.db.trips.count_trips` counts the statements and the transaction commands of a
+block, and the tests in `tests/api/test_roundtrips.py` fail when a path needs more than its
+limit. With the log level `DEBUG`, the logger `sama.db.monitor` writes the count of each request
+(`request POST /sessions/{id}/messages db_round_trips=9`). The counts are:
+
+| Path | Before | After | Time saved at 58 ms |
+|---|---|---|---|
+| `POST /sessions/{id}/messages`, idle session | 18 | 9 | 0.52 s |
+| `POST /sessions/{id}/messages`, busy session (note for the run) | 11 | 9 | 0.12 s |
+| `POST /approvals/{id}/approve` | 17 | 9 | 0.46 s |
+| Claim of a run, worker slot woken by a notification | 8 | 7 | 0.06 s |
+| Idle claim, each second for each worker slot | 4 | 1 | 0.17 s |
+| Event stream poll, session with fewer than 20 runs | 9 | 6 | 0.17 s |
+| First run of a session, claim to the first pause (fake runtime, tests) | 32 | 31 | 0.06 s |
+
+The counts are from the tests with one fake runtime. A real first config reads more (skill
+index, notes, sub-agents), so its saving is larger than one round trip. The send and the
+approval save their time in the API answer, and the user sees it as a shorter wait for the
+first activity and for the resume.
+
+The steps that were removed:
+
+- **One access statement.** `session_access` reads the session, the user of the person with the
+  region of the org, and the memberships of the user in one statement (joins), where it made
+  three. With `busy=True` it also reads whether the session has a queued, running, or paused
+  run. `_approval_target` reads the approval together with all of this. The two guards stay:
+  the statement runs as the user with RLS, and the code checks `Grants.sees_session` and the
+  region as before.
+- **One transaction for a message.** `RunQueue.submit` takes the rate lock once and makes the
+  note for the running run, or the queued run, and checks whether the run waits, in one
+  transaction. Before, these were three transactions with the lock taken twice. The access
+  statement tells whether the session has an open run, and `submit` uses it only as a hint. With
+  `open_run=True` it tries the note first. With `False` it skips that try, and the enqueue reads
+  the open runs again, after the rate lock and in the same statement as the session and the
+  limits. When that read finds an open run, the hint was stale: `submit` ends the transaction
+  and starts again with the note first. The lock order is always the rate lock, then the run
+  row, then the session row, the order of `complete`. Going on in the same transaction would
+  lock the session row first and then the run row, and it would deadlock with `complete`.
+  So a message that another send overtakes between the access read and the write still waits
+  behind it, and a run that started in between still gets the note.
+  `submit` forwards `human=True` like the other sends of a person (`runs.human_origin`,
+  Section 15.4).
+- **One transaction for an approval.** `GateService.decide_with_scope` is the one implementation
+  of a human decision. It keeps the rules of the approval scope (Section 16.1): `once`,
+  `session`, `always`, the old `always_allow`, a proposal that has only `once`, a tool that
+  always asks, the direct mode of a coding agent, and the applied scope in the answer. It reads
+  the approval, the memberships, and the review proposal in one statement, writes the audit
+  entry in the statement of the update (a CTE), writes the `always` or `session` rule, and
+  queues the run again in the same transaction (`release`, from `RunQueue.release_decided_in`).
+  The decision, the rule, and the release cannot part: when the release fails, the approval
+  stays `pending` and no rule exists. An expired approval is released in the same transaction
+  and then raises `ApprovalExpiredError`. The one result type is `ApprovalDecision` (`status`,
+  `scope`, `proposal`, `released`). The API applies review proposals only for an approval of a
+  proposal, and after an expiry.
+- **Idle claim.** `RunQueue.claim` first runs one read without a transaction and without a lock
+  that tells whether a run is ready. A worker slot that a notification woke, or that just ended
+  a run, skips it (`peek=False`).
+- **One read of the toolsets.** The first config of a session read the toolsets of the run
+  three times (notes, skill index, sub-agents). It reads them once now.
+
 **Not done yet.** These steps stay slow and need more work:
 
-- `POST /sessions/{id}/messages` makes about 30 sequential round trips (access check, skill
-  expansion, steer check, enqueue with the rate and quota checks, and `waits`).
-- The first run config of a session takes about 2 seconds of sequential reads.
+- `POST /sessions/{id}/messages` still has two transactions (the access check as the user, and
+  the write as the owner of the connection), 9 round trips in all. One transaction needs the
+  role change in the middle of a transaction.
+- The first run config of a session takes about 1.5 seconds of sequential reads (context files,
+  channel, toolsets, policies, the skill index, and the snapshot). They are independent, but they
+  share one transaction and one connection.
 - The OpenAI runtime connects its MCP servers one after the other and reads the session items
   before the model call.
 - The control plane (`sin`) and the database (`ap-south-1`) are in different regions. A control
   plane in the region of the database (Fly `bom`) would make each round trip about 1 to 2 ms
   instead of 58 ms. It also changes the latency to E2B and to the model providers, so a person
   must measure it before a move.
+
+**Database pool.** The API, the worker, the tool server, the gate, the model proxy, and the
+event streams of one process share one SQLAlchemy pool. Before, the pool had 5 connections and
+10 more for a burst, and a checkout waited up to 30 seconds. A request that is slow because it
+makes 30 round trips holds its connection for 2 seconds, and each open event stream holds one for
+about 0.4 seconds of each 0.5 second. A few streams and a few runs could then use all 15
+connections, and the next send or approval waited for a connection. The change has four parts:
+
+- `sama.db.pool.TimedQueuePool` measures the wait of each checkout, without the time to open a
+  new connection. A wait of more than `SAMA_DB_POOL_WARN_MS` (100 ms) logs one warning:
+  `database pool wait 340 ms component=POST /approvals/{approval_id}/approve pool size=5 in_use=5
+  idle=0 overflow=2 checkouts=... slow=... connects=... wait_max_ms=... wait_avg_ms=...`. The
+  component is `METHOD` and the route template that matched (`RequestMonitor` follows the
+  mounted apps), or the name of a loop (`worker`, the class of a background loop). It is never
+  the raw path, because a path can hold a secret (the token of `/email/{integration_id}/approvals/{token}`
+  and of `/whatsapp/{integration_id}/webhook/{token}`). A path that matches no route is
+  `unmatched`. The line has numbers only: no host, no user, no secret. At the level
+  `DEBUG`, `PoolMonitor` logs the same state every 30 seconds.
+- The event stream polls share `stream_db_slots` slots in the process (`ApiSettings`, half of the
+  pool size). A poll that finds no slot waits in memory and not in the pool, so a send and an
+  approval always find a connection.
+- The process opens `SAMA_DB_POOL_PREWARM` connections (4) when it starts, so the first requests
+  do not wait for a connect (about 4 round trips). The pool gives the most recent connection
+  first (`pool_use_lifo`), so the others close by themselves when they are old.
+- The size comes from the environment: `SAMA_DB_POOL_SIZE` (default 5), `SAMA_DB_POOL_OVERFLOW`
+  (2), `SAMA_DB_POOL_TIMEOUT_S` (30), `SAMA_DB_POOL_RECYCLE_S` (1800).
+
+**Pool size and the pooler limit.** The staging `SAMA_DATABASE_URL` uses the Supabase pooler in
+session mode (port 5432). It gives 15 server connections to one database user, and a 16th
+client gets an error. A rolling deploy starts the new machine before it stops the old one, so
+two processes hold connections at the same time. The queue listener (`QueueWakeup`) takes one
+connection of the pool for ever. The default is therefore 5 + 2 = 7 connections for each process,
+the listener included: 2 x 7 = 14 of 15, and one connection stays free for the release command
+(`alembic upgrade head`) and for a person with `psql`. `deploy/fly.staging.toml` and
+`deploy/fly.production.toml` set these two values. A process has 4 connections for requests,
+the worker, and the gate when two event stream polls (`stream_db_slots` = size / 2) and the
+listener use theirs; the log line above tells when this is too small. To raise the numbers, raise
+the pool size of the Supabase pooler first (Management API or dashboard), then the two variables.
+The sum for two processes must stay at or below the pooler limit.
+
+Only the session pooler and a direct connection are supported. The transaction pooler (port 6543)
+cannot carry `LISTEN` for the queue wake-up, and it does not keep the prepared statements of the
+driver. `SAMA_DB_PREPARED_STATEMENTS=off` is refused at the start, and a database URL with the port
+6543 logs a warning.
 
 ---
 
@@ -9051,6 +9160,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_REGION`, `SAMA_REGION_URLS` | No | The home region of the deployment (default `ap-south-1`) and the `region=url` pairs of the other regions (Section 17.3) |
 | `SAMA_STRIPE_SECRET_KEY`, `SAMA_STRIPE_WEBHOOK_SECRET` | No | Billing (Section 17.5). Without both, or when Stripe refuses the key at start, billing is off and the plans add no model quota. |
 | `SAMA_STRIPE_ALLOW_LIVE` | No | `true` accepts a live Stripe key. Without it, a live key turns billing off. |
+| `SAMA_DB_POOL_SIZE`, `SAMA_DB_POOL_OVERFLOW`, `SAMA_DB_POOL_TIMEOUT_S`, `SAMA_DB_POOL_RECYCLE_S`, `SAMA_DB_POOL_PREWARM`, `SAMA_DB_POOL_WARN_MS` | No | The database pool of the process (Section 4.4). Defaults: 5, 2, 30, 1800, 4, 100. Two processes must fit the 15 connections of the Supabase session pooler. |
 | `SAMA_WEB_ORIGINS`, `SAMA_ENVIRONMENT`, `SAMA_TRACE_CONTENT`, `SAMA_SUPABASE_JWT_SECRET`, `SAMA_SANDBOX_TEMPLATE`, `SAMA_SANDBOX_ALLOW_OUT`, `SAMA_WORKER_CONCURRENCY`, `SAMA_VISION_MODEL` | No | See the module doc of `sama.controlplane.__main__` |
 
 The provider and search keys are the defaults. An org key in the vault comes first

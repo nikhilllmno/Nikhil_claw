@@ -15,6 +15,7 @@ from pydantic import SecretStr
 from sama.api.origins import parse_extension_ids, parse_origins
 from sama.billing.stripe import is_live_key
 from sama.connectors.host import DEFAULT_HOST_TEMPLATE
+from sama.db.pool import PoolSettings
 from sama.github.client import GitHubAppConfig
 from sama.github.service import DEFAULT_SELF_REPO, GitHubSetupError, split_repo
 from sama.media.vision import DEFAULT_VISION_MODEL
@@ -219,6 +220,8 @@ class ControlPlaneSettings:
     stripe_allow_live: bool = False
     """Accept a live Stripe key (``SAMA_STRIPE_ALLOW_LIVE``). Without it, a live key turns
     billing off."""
+    db_pool: PoolSettings = field(default_factory=PoolSettings)
+    """The size of the database pool (``SAMA_DB_POOL_*``, Section 4.4)."""
 
     def stripe_key(self) -> str | None:
         """The Stripe key that billing can use, or ``None``: billing is off. Billing needs the
@@ -328,6 +331,10 @@ class ControlPlaneSettings:
             regions = regions_from_env(env, web_origins[0] if web_origins else public_url)
         except RegionError as error:
             raise SettingsError(f"SAMA_REGION: {error}") from None
+        try:
+            db_pool = PoolSettings.from_env(env)
+        except ValueError as error:
+            raise SettingsError(str(error)) from None
         return cls(
             database_url=SecretStr(_required(env, "SAMA_DATABASE_URL")),
             github=_github(env),
@@ -372,4 +379,5 @@ class ControlPlaneSettings:
             stripe_webhook_secret=_secret(env, "SAMA_STRIPE_WEBHOOK_SECRET"),
             stripe_allow_live=env.get("SAMA_STRIPE_ALLOW_LIVE", "").strip().lower()
             in ("1", "true", "yes"),
+            db_pool=db_pool,
         )

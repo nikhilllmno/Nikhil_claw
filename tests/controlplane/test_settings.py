@@ -310,3 +310,14 @@ def test_a_live_stripe_key_turns_billing_off_unless_it_is_allowed() -> None:
     assert settings(**live, SAMA_STRIPE_ALLOW_LIVE="true").stripe_key() == "sk_live_a"
     restricted = {**live, "SAMA_STRIPE_SECRET_KEY": "rk_live_a"}
     assert settings(**restricted).stripe_key() is None
+
+
+def test_the_database_pool_comes_from_the_environment() -> None:
+    assert settings().db_pool.size == 5
+    s = settings(SAMA_DB_POOL_SIZE="12", SAMA_DB_POOL_OVERFLOW="3", SAMA_DB_POOL_WARN_MS="50")
+    assert (s.db_pool.size, s.db_pool.overflow, s.db_pool.warn_ms) == (12, 3, 50.0)
+
+
+def test_a_bad_pool_value_is_refused_with_its_name() -> None:
+    with pytest.raises(SettingsError, match="SAMA_DB_POOL_SIZE"):
+        settings(SAMA_DB_POOL_SIZE="0")

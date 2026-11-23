@@ -131,6 +131,12 @@ CLAIM_TRIES: Final = 5
 """How many candidate runs one ``claim`` tries before it gives up for this call."""
 
 
+class _StaleOpenRun(Exception):
+    """``RunQueue.submit`` read an open run of the session after it locked the session row. The
+    transaction ends, and ``submit`` starts again with the note first (run row before session
+    row, the lock order of ``complete``)."""
+
+
 class QueueError(Exception):
     """The queue cannot do the operation. The message is safe to show to the user."""
 
@@ -449,6 +455,18 @@ class Lease(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class Submitted:
+    """The result of ``RunQueue.submit``."""
+
+    run_id: uuid.UUID
+    """The run that got the note, or the new run."""
+    queued: bool
+    """The new run waits behind an open run."""
+    steered: bool
+    """The message is a note for a running run."""
+
+
+@dataclass(frozen=True, slots=True)
 class RunRef:
     org_id: uuid.UUID
     run_id: uuid.UUID
@@ -736,6 +754,7 @@ class RunQueue:
         coding_agent: str | None = None,
         parallel: bool = False,
         human: bool = False,
+        locked: bool = False,
     ) -> uuid.UUID:
         """``enqueue`` in the transaction of the caller. A caller that makes the session in
         the same transaction (delegation, the task dispatcher, an event trigger) gets the
@@ -746,8 +765,54 @@ class RunQueue:
         apply the message rate: a job fire is not a message of a person, and the notes of
         ``/steer`` passed the rate check already. ``toolsets`` limits the toolsets of the run
         (``runs.toolsets``, Section 12.2). ``parallel`` lets the run start next to an open run of
-        the session (M7.1); the busy mode ``parallel`` of the profile does the same."""
-        await self._rate_lock(connection, org_id)  # the lock order of all enqueues
+        the session (M7.1); the busy mode ``parallel`` of the profile does the same.
+        ``locked=True`` says that the caller took the rate lock in this transaction already
+        (it saves a round trip)."""
+        outcome = await self._enqueue_in(
+            connection,
+            org_id=org_id,
+            session_id=session_id,
+            text=text,
+            user_id=user_id,
+            unattended=unattended,
+            attachments=attachments,
+            budget=budget,
+            model=model,
+            check_rate=check_rate,
+            toolsets=toolsets,
+            coding_agent=coding_agent,
+            parallel=parallel,
+            human=human,
+            locked=locked,
+        )
+        return outcome.run_id
+
+    async def _enqueue_in(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None = None,
+        unattended: bool = False,
+        attachments: Sequence[NewAttachment] = (),
+        budget: Mapping[str, Any] | None = None,
+        model: str | None = None,
+        check_rate: bool = True,
+        toolsets: Sequence[str] | None = None,
+        coding_agent: str | None = None,
+        parallel: bool = False,
+        human: bool = False,
+        locked: bool = False,
+        steer_note: str | None = None,
+    ) -> Submitted:
+        """The body of ``enqueue_in``. With ``steer_note``, a session that has an open run (read
+        after the rate lock) raises ``_StaleOpenRun``: the caller ends the transaction and takes
+        the note first, so the run row is locked before the session row (the order of
+        ``complete``)."""
+        if not locked:
+            await self._rate_lock(connection, org_id)  # the lock order of all enqueues
         # One statement reads the session, the limits, and the rate counts. It comes
         # after the lock statement, so its snapshot has every enqueue before the lock.
         session = (
@@ -763,6 +828,15 @@ class RunQueue:
                     AgentProfile.budget,
                     AgentProfile.busy_mode,
                     Session.library_agent,
+                    # An open run of the session, read after the rate lock: no other send of
+                    # the org can slip in between this read and the insert below.
+                    exists()
+                    .where(
+                        Run.org_id == Session.org_id,
+                        Run.session_id == Session.id,
+                        Run.status.in_(("queued", *ACTIVE_STATUSES)),
+                    )
+                    .label("open_run"),
                     *_rate_columns(org_id, user_id),
                 )
                 .join(
@@ -784,6 +858,11 @@ class RunQueue:
             raise QueueError("the session does not exist")
         if session.status != "active":
             raise QueueError("the session is not active")
+        if steer_note is not None and session.open_run:
+            # The session row has the share lock now, and a note locks the run row. ``complete``
+            # locks them in the other order (the run, then the session), so going on would be a
+            # deadlock. The caller rolls back, which frees the lock, and tries the note first.
+            raise _StaleOpenRun
         if check_rate:
             _check_rate(session)
         if isinstance(session.library_agent, dict):
@@ -852,7 +931,111 @@ class RunQueue:
                     for image in attachments
                 ],
             )
-        return run_id
+        queued = bool(session.open_run) and await self._waits_in(connection, org_id, run_id)
+        return Submitted(run_id, queued=queued, steered=False)
+
+    async def submit(
+        self,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None = None,
+        attachments: Sequence[NewAttachment] = (),
+        coding_agent: str | None = None,
+        parallel: bool = False,
+        human: bool = False,
+        steer: bool = False,
+        open_run: bool | None = None,
+    ) -> Submitted:
+        """A message of a person: a note for the running run (``steer``), or a queued run, in
+        one transaction. Before, the steer check, the enqueue, and the check for a wait were
+        three transactions and 14 round trips. Now a send costs 5 in this transaction
+        (Section 4.4).
+
+        With ``steer``, the message is a note when a run of the session runs and the busy mode
+        of its profile is ``steer`` (``RunQueue.steer`` with ``busy_mode=True``). Otherwise it
+        is a run (``enqueue``). ``human`` is passed to the run (``runs.human_origin``).
+
+        ``open_run`` is a hint of the caller: what its earlier read said about open runs of the
+        session. ``True`` or ``None`` tries the note first. ``False`` skips that try, and the
+        enqueue reads the open runs again after the rate lock: the hint never decides alone,
+        so a send that slips in between cannot make this message skip a note or a wait.
+
+        Raises what ``steer`` and ``enqueue`` raise.
+        """
+        note = self._note_text(text, True) if steer else None
+        try_first = note is not None and open_run is not False
+        try:
+            return await self._submit_once(
+                org_id=org_id,
+                session_id=session_id,
+                text=text,
+                user_id=user_id,
+                attachments=attachments,
+                coding_agent=coding_agent,
+                parallel=parallel,
+                human=human,
+                note=note,
+                try_first=try_first,
+            )
+        except _StaleOpenRun:
+            # The hint said ``False``, but a run is open. Every lock order is run before session.
+            return await self._submit_once(
+                org_id=org_id,
+                session_id=session_id,
+                text=text,
+                user_id=user_id,
+                attachments=attachments,
+                coding_agent=coding_agent,
+                parallel=parallel,
+                human=human,
+                note=note,
+                try_first=True,
+            )
+
+    async def _submit_once(
+        self,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None,
+        attachments: Sequence[NewAttachment],
+        coding_agent: str | None,
+        parallel: bool,
+        human: bool,
+        note: str | None,
+        try_first: bool,
+    ) -> Submitted:
+        """One transaction of ``submit``. With ``try_first``, the note comes before the session
+        row is locked. Without it, an open run found after the lock raises ``_StaleOpenRun``."""
+        async with self._engine.begin() as connection:
+            if try_first:
+                await self._rate_lock(connection, org_id)
+                steered = await self._steer_in(
+                    connection,
+                    org_id=org_id,
+                    session_id=session_id,
+                    text=note or "",
+                    user_id=user_id,
+                    busy_mode=True,
+                )
+                if steered is not None:
+                    return Submitted(steered, queued=False, steered=True)
+            return await self._enqueue_in(
+                connection,
+                org_id=org_id,
+                session_id=session_id,
+                text=text,
+                user_id=user_id,
+                attachments=attachments,
+                coding_agent=coding_agent,
+                parallel=parallel,
+                human=human,
+                locked=try_first,
+                steer_note=None if try_first else note,
+            )
 
     async def enqueue_compact(
         self,
@@ -991,35 +1174,39 @@ class RunQueue:
         """True if the run is queued behind an open run of the same session and cannot start
         now: the new message waits in the queue (Section 4.3). A run that can start in parallel
         (M7.1) does not wait."""
+        async with autocommit(self._engine) as connection:
+            return await self._waits_in(connection, org_id, run_id)
+
+    @staticmethod
+    async def _waits_in(connection: AsyncConnection, org_id: uuid.UUID, run_id: uuid.UUID) -> bool:
         mine = aliased(Run)
-        async with self._engine.connect() as connection:
-            return bool(
-                (
-                    await connection.execute(
-                        select(
-                            and_(
-                                mine.status == "queued",
-                                exists().where(
-                                    Run.org_id == mine.org_id,
-                                    Run.session_id == mine.session_id,
-                                    Run.id != mine.id,
-                                    Run.status.in_(("queued", *ACTIVE_STATUSES)),
-                                    Run.created_at <= mine.created_at,
-                                ),
-                                ~_ready(mine, AgentProfile.max_parallel_runs),
-                            )
-                        )
-                        .join(
-                            AgentProfile,
-                            and_(
-                                AgentProfile.org_id == mine.org_id,
-                                AgentProfile.id == mine.agent_profile_id,
+        return bool(
+            (
+                await connection.execute(
+                    select(
+                        and_(
+                            mine.status == "queued",
+                            exists().where(
+                                Run.org_id == mine.org_id,
+                                Run.session_id == mine.session_id,
+                                Run.id != mine.id,
+                                Run.status.in_(("queued", *ACTIVE_STATUSES)),
+                                Run.created_at <= mine.created_at,
                             ),
+                            ~_ready(mine, AgentProfile.max_parallel_runs),
                         )
-                        .where(mine.org_id == org_id, mine.id == run_id)
                     )
-                ).scalar_one_or_none()
-            )
+                    .join(
+                        AgentProfile,
+                        and_(
+                            AgentProfile.org_id == mine.org_id,
+                            AgentProfile.id == mine.agent_profile_id,
+                        ),
+                    )
+                    .where(mine.org_id == org_id, mine.id == run_id)
+                )
+            ).scalar_one_or_none()
+        )
 
     async def open_runs(self, *, org_id: uuid.UUID, session_id: uuid.UUID) -> list[OpenRun]:
         """The open chat runs of a session (queued, running, or paused), oldest first, with the
@@ -1082,6 +1269,24 @@ class RunQueue:
         Raises ``RateLimitedError`` when the user or the org is over its message rate, and
         ``QueueError`` when the run has too many pending notes.
         """
+        note = self._note_text(text, busy_mode)
+        if note is None:
+            return None
+        async with self._engine.begin() as connection:
+            await self._rate_lock(connection, org_id)
+            return await self._steer_in(
+                connection,
+                org_id=org_id,
+                session_id=session_id,
+                text=note,
+                user_id=user_id,
+                busy_mode=busy_mode,
+            )
+
+    @staticmethod
+    def _note_text(text: str, busy_mode: bool) -> str | None:
+        """The text of a note, or ``None`` when a busy-mode message is too long to be one.
+        Raises ``QueueError`` for an empty note and, outside the busy mode, a long one."""
         text = text.strip()
         if not text:
             raise QueueError("the note is empty")
@@ -1089,74 +1294,85 @@ class RunQueue:
             return None
         if len(text) > MAX_STEER_CHARS:
             raise QueueError(f"the note is longer than {MAX_STEER_CHARS} characters")
-        async with self._engine.begin() as connection:
-            await self._rate_lock(connection, org_id)
-            # The share lock keeps the run active until the note is in: ``_end`` must wait,
-            # so it sees the note and sends it on.
-            row = (
-                await connection.execute(
-                    select(
-                        Run.id,
-                        select(func.count())
-                        .where(RunSteer.run_id == Run.id, RunSteer.status == "pending")
-                        .scalar_subquery()
-                        .label("pending"),
-                        *_rate_columns(org_id, user_id),
-                    )
-                    .where(
-                        Run.org_id == org_id,
-                        Run.session_id == session_id,
-                        Run.status.in_(("running",) if busy_mode else ACTIVE_STATUSES),
-                        Run.kind == "chat",
-                        Run.compact.is_(False),
-                        Run.cancel_requested_at.is_(None),
-                        *(
-                            [
-                                exists().where(
-                                    AgentProfile.org_id == Run.org_id,
-                                    AgentProfile.id == Run.agent_profile_id,
-                                    AgentProfile.busy_mode == "steer",
-                                ),
-                                # A coding agent CLI cannot read a note in the middle of a run,
-                                # and a session in the direct mode sends each message to the
-                                # CLI (Section 15.4): there the message waits.
-                                Run.runtime.not_in(CODING_AGENTS),
-                                ~exists().where(
-                                    Session.org_id == Run.org_id,
-                                    Session.id == Run.session_id,
-                                    Session.coding_agent.is_not(None),
-                                ),
-                            ]
-                            if busy_mode
-                            else []
-                        ),
-                    )
-                    .order_by(Run.created_at.desc(), Run.id.desc())
-                    .limit(1)
-                    .with_for_update(of=Run, read=True)
-                )
-            ).one_or_none()
-            if row is None:
-                return None
-            _check_rate(row)
-            if row.pending >= MAX_PENDING_STEERS and busy_mode:
-                return None
-            if row.pending >= MAX_PENDING_STEERS:
-                raise QueueError(
-                    f"the run has {MAX_PENDING_STEERS} notes that it did not read yet."
-                    " Wait, or use /stop."
-                )
+        return text
+
+    async def _steer_in(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID,
+        session_id: uuid.UUID,
+        text: str,
+        user_id: uuid.UUID | None,
+        busy_mode: bool,
+    ) -> uuid.UUID | None:
+        """The note of ``steer`` in a transaction that holds the rate lock already."""
+        # The share lock keeps the run active until the note is in: ``_end`` must wait,
+        # so it sees the note and sends it on.
+        row = (
             await connection.execute(
-                insert(RunSteer).values(
-                    org_id=org_id,
-                    session_id=session_id,
-                    run_id=row.id,
-                    user_id=user_id,
-                    text=redact(text),
+                select(
+                    Run.id,
+                    select(func.count())
+                    .where(RunSteer.run_id == Run.id, RunSteer.status == "pending")
+                    .scalar_subquery()
+                    .label("pending"),
+                    *_rate_columns(org_id, user_id),
                 )
+                .where(
+                    Run.org_id == org_id,
+                    Run.session_id == session_id,
+                    Run.status.in_(("running",) if busy_mode else ACTIVE_STATUSES),
+                    Run.kind == "chat",
+                    Run.compact.is_(False),
+                    Run.cancel_requested_at.is_(None),
+                    *(
+                        [
+                            exists().where(
+                                AgentProfile.org_id == Run.org_id,
+                                AgentProfile.id == Run.agent_profile_id,
+                                AgentProfile.busy_mode == "steer",
+                            ),
+                            # A coding agent CLI cannot read a note in the middle of a run,
+                            # and a session in the direct mode sends each message to the
+                            # CLI (Section 15.4): there the message waits.
+                            Run.runtime.not_in(CODING_AGENTS),
+                            ~exists().where(
+                                Session.org_id == Run.org_id,
+                                Session.id == Run.session_id,
+                                Session.coding_agent.is_not(None),
+                            ),
+                        ]
+                        if busy_mode
+                        else []
+                    ),
+                )
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(1)
+                .with_for_update(of=Run, read=True)
             )
-            steered: uuid.UUID = row.id
-            return steered
+        ).one_or_none()
+        if row is None:
+            return None
+        _check_rate(row)
+        if row.pending >= MAX_PENDING_STEERS and busy_mode:
+            return None
+        if row.pending >= MAX_PENDING_STEERS:
+            raise QueueError(
+                f"the run has {MAX_PENDING_STEERS} notes that it did not read yet."
+                " Wait, or use /stop."
+            )
+        await connection.execute(
+            insert(RunSteer).values(
+                org_id=org_id,
+                session_id=session_id,
+                run_id=row.id,
+                user_id=user_id,
+                text=redact(text),
+            )
+        )
+        steered: uuid.UUID = row.id
+        return steered
 
     async def take_steers(self, *, org_id: uuid.UUID, run_id: uuid.UUID) -> str:
         """Marks the pending notes of a running run as delivered and returns their text, oldest
@@ -1315,6 +1531,19 @@ class RunQueue:
         ``reject``. The API calls it for one run after ``GateService.decide_approval``. The
         worker calls it for all runs from time to time.
         """
+        async with self._engine.begin() as connection:
+            return await self.release_decided_in(connection, org_id=org_id, run_id=run_id)
+
+    async def release_decided_in(
+        self,
+        connection: AsyncConnection,
+        *,
+        org_id: uuid.UUID | None = None,
+        run_id: uuid.UUID | None = None,
+    ) -> list[uuid.UUID]:
+        """``release_decided`` in the transaction of the caller. The statement sees an
+        approval that the same transaction decided. ``GateService.decide`` uses it, so the
+        decision and the release are one transaction (Section 4.4)."""
         decision = case((Approval.status == "approved", "approve"), else_="reject")
         reason = func.coalesce(
             Approval.decision_reason,
@@ -1332,31 +1561,45 @@ class RunQueue:
             conditions.append(Run.org_id == org_id)
         if run_id is not None:
             conditions.append(Run.id == run_id)
-        async with self._engine.begin() as connection:
-            rows = await connection.execute(
-                update(Run)
-                .where(*conditions)
-                .values(status="queued", resume_decision=decision, resume_reason=reason)
-                .returning(Run.id)
-            )
-            return list(rows.scalars())
+        rows = await connection.execute(
+            update(Run)
+            .where(*conditions)
+            .values(status="queued", resume_decision=decision, resume_reason=reason)
+            .returning(Run.id)
+        )
+        return list(rows.scalars())
 
     # -- workers ----------------------------------------------------------------------------
 
-    async def claim(self, owner: str) -> ClaimedRun | None:
+    async def claim(self, owner: str, *, peek: bool = True) -> ClaimedRun | None:
         """Claims the next run for ``owner``, or returns None if no run is ready.
 
         A run of an org that has ``max_running_runs`` running runs waits (``QueueLimits``). An
         advisory lock per org puts the claims of one org in a sequence, so two workers cannot
         both take the last place.
+
+        An idle worker asks every second. With ``peek``, one read without a transaction finds
+        out that no run is ready: one round trip and not four (Section 4.4). A worker that a
+        notification woke passes ``peek=False``, because a run is almost sure to be there.
         """
-        full = await self._full_orgs()
+        region = home_regions().home
+        if peek:
+            async with autocommit(self._engine) as connection:
+                ready = await connection.execute(self._candidate(set(), region, lock=False))
+                if ready.first() is None:
+                    return None
+        # The orgs at their limit are read only when the oldest ready run belongs to one: it
+        # saves a round trip of each claim.
+        full: set[uuid.UUID] = set()
+        refresh = False
         for _ in range(CLAIM_TRIES):
+            if refresh:
+                # After the transaction of the last try, so a small pool never holds two.
+                full |= await self._full_orgs()
+                refresh = False
             try:
                 async with self._engine.begin() as connection:
-                    row = (
-                        await connection.execute(self._candidate(full, home_regions().home))
-                    ).one_or_none()
+                    row = (await connection.execute(self._candidate(full, region))).one_or_none()
                     if row is None:
                         return None
                     if row.kind == "review" and not await self._review_on(connection, row.id):
@@ -1370,6 +1613,7 @@ class RunQueue:
                     await connection.execute(_lock("sama.queue.running", row.org_id))
                     if await self._at_limit(connection, row.org_id):
                         full.add(row.org_id)
+                        refresh = True
                         continue
                     return await self._claimed(connection, row.id, owner)
             except IntegrityError:
@@ -1380,7 +1624,7 @@ class RunQueue:
         return None
 
     @staticmethod
-    def _candidate(full: set[uuid.UUID], region: str) -> Any:
+    def _candidate(full: set[uuid.UUID], region: str, *, lock: bool = True) -> Any:
         """The oldest ready run (``_ready``): its org is in ``region`` (the home region, Section
         17.3), and its org is not in ``full``. A run of an org in another region stays queued:
         the deployment of that region runs it. Chat runs go before review runs.
@@ -1389,7 +1633,8 @@ class RunQueue:
         The session lock puts the claims of one session in a sequence, so the count of open runs
         stays true until the claim commits. ``complete`` takes the same lock before it stores a
         reply, so the transcript that a run reads at its claim (M7.1) has every reply that
-        committed before, and none of a later reply."""
+        committed before, and none of a later reply. ``lock=False`` is the same read without the
+        locks: it only tells whether a run is ready."""
         conditions = [
             Run.status == "queued",
             exists().where(Org.id == Run.org_id, Org.region == region),
@@ -1397,7 +1642,7 @@ class RunQueue:
         ]
         if full:
             conditions.append(Run.org_id.not_in(full))
-        return (
+        query = (
             select(Run.id, Run.org_id, Run.kind)
             .join(Session, and_(Session.org_id == Run.org_id, Session.id == Run.session_id))
             .join(
@@ -1407,8 +1652,10 @@ class RunQueue:
             .where(*conditions)
             .order_by(case((Run.kind == "chat", 0), else_=1), Run.created_at, Run.id)
             .limit(1)
-            .with_for_update(of=(Run, Session), skip_locked=True, key_share=True)
         )
+        if not lock:
+            return query
+        return query.with_for_update(of=(Run, Session), skip_locked=True, key_share=True)
 
     async def _full_orgs(self) -> set[uuid.UUID]:
         """The orgs that have ``max_running_runs`` running runs. Only orgs with a running run

@@ -22,12 +22,12 @@ import dataclasses
 import json
 import logging
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, cast
 
-from sqlalchemy import and_, case, func, insert, or_, select, update
+from sqlalchemy import Insert, and_, case, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import ColumnElement
@@ -37,6 +37,7 @@ from sama.db.models import (
     AgentProfile,
     Approval,
     AuditEntry,
+    Membership,
     ReviewProposal,
     Run,
     Session,
@@ -77,7 +78,7 @@ from sama.gate.decide import (
 )
 from sama.review.policy import REVIEW_TOOLSETS
 from sama.scheduler.spec import job_of_run
-from sama.tenancy.access import load_grants
+from sama.tenancy.access import Grants
 from sama.tenancy.authority import budget_problem, load_authority, load_run_spend, run_user
 from sama.tenancy.run_token import RunTokenClaims
 from sama.vault.redact import default_redactor, redact
@@ -111,6 +112,11 @@ class ApprovalScopeError(ApprovalError):
     """The scope does not fit the approval, for example ``session`` for a proposal."""
 
 
+Release = Callable[[AsyncConnection], Awaitable[list[uuid.UUID]]]
+"""A step that runs in the transaction of a decision, after the decision is stored. It queues the
+run of the approval again (Section 4.4)."""
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalDecision:
     """The result of a human decision."""
@@ -119,6 +125,10 @@ class ApprovalDecision:
     scope: ApprovalScope
     """The scope that the gate applied. ``once`` for a denial, for a tool that always asks,
     and for a proposal that was approved with ``always``."""
+    proposal: bool = False
+    """The approval is for a review proposal (Section 9.4)."""
+    released: tuple[uuid.UUID, ...] = ()
+    """The runs that the ``release`` step queued again in the same transaction."""
 
 
 def allowed_scopes(tool_name: str, *, proposal: bool) -> tuple[ApprovalScope, ...]:
@@ -884,9 +894,17 @@ class GateService:
         always_allow: bool = False,
         scope: ApprovalScope | None = None,
         reason: str | None = None,
+        release: Release | None = None,
     ) -> ApprovalDecision:
         """Records a human decision and returns the new status and the applied scope. Raises
-        ``ApprovalError``.
+        ``ApprovalError``, and ``ApprovalExpiredError`` when the approval timed out (it counts
+        as ``deny``).
+
+        ``release`` runs in the same transaction after the decision, also for an expired
+        approval, which resumes the run as a reject. The decision and the release cannot part:
+        when the release fails, the approval stays ``pending``. The transaction has one read
+        for the approval, the memberships of the user, and the review proposal, and the audit
+        entry is a CTE of the update (Section 4.4).
 
         Only a user who can read the session decides. In a shared session, only the user who
         started the run, a workspace admin, or an approver of the profile decides.
@@ -902,8 +920,11 @@ class GateService:
         scope = scope or ("always" if always_allow else "once")
         reason = redact(reason) if reason else reason
         status = "expired"
+        released: list[uuid.UUID] = []
         async with self._engine.begin() as connection:
-            row = (
+            # One statement reads the approval, the memberships of the user, and the review
+            # proposal of the approval. The row lock is on the approval only.
+            rows = (
                 await connection.execute(
                     select(
                         Approval.id,
@@ -919,7 +940,12 @@ class GateService:
                         Run.runtime,
                         Run.coding_agent,
                         AgentProfile.policy,
+                        ReviewProposal.id.label("proposal_id"),
+                        ReviewProposal.scope.label("proposal_scope"),
+                        Membership.workspace_id.label("grant_workspace_id"),
+                        Membership.role.label("grant_role"),
                     )
+                    .select_from(Approval)
                     .join(
                         Session,
                         and_(Session.org_id == Approval.org_id, Session.id == Approval.session_id),
@@ -932,6 +958,17 @@ class GateService:
                             AgentProfile.id == Run.agent_profile_id,
                         ),
                     )
+                    .outerjoin(
+                        ReviewProposal,
+                        and_(
+                            ReviewProposal.org_id == Approval.org_id,
+                            ReviewProposal.approval_id == Approval.id,
+                        ),
+                    )
+                    .outerjoin(
+                        Membership,
+                        and_(Membership.org_id == Approval.org_id, Membership.user_id == user_id),
+                    )
                     .where(
                         Approval.org_id == org_id,
                         Approval.run_id == run_id,
@@ -939,18 +976,20 @@ class GateService:
                     )
                     .with_for_update(of=Approval)
                 )
-            ).one_or_none()
-            if row is None:
+            ).all()
+            if not rows:
                 raise ApprovalError("the approval does not exist")
-            grants = await load_grants(connection, org_id, user_id)
-            proposed = (
-                await connection.execute(
-                    select(ReviewProposal.scope).where(
-                        ReviewProposal.org_id == org_id, ReviewProposal.approval_id == row.id
-                    )
-                )
-            ).scalar_one_or_none()
-            if proposed is None:
+            row = rows[0]
+            grants = Grants(
+                user_id,
+                tuple(
+                    (item.grant_workspace_id, item.grant_role)
+                    for item in rows
+                    if item.grant_role is not None
+                ),
+            )
+            proposed = row.proposal_scope if row.proposal_id is not None else None
+            if row.proposal_id is None:
                 if not grants.sees_session(row.workspace_id, row.audience, row.owner_user_id):
                     raise ApprovalError("this user cannot decide the approval")
                 # In a shared session, each member sees the session, but only the requester
@@ -998,6 +1037,7 @@ class GateService:
                 await self._expire_one(connection, row.id, run, call_id)
             else:
                 status = "approved" if approve else "rejected"
+                # The audit entry is a CTE of the update: one statement, one round trip.
                 await connection.execute(
                     update(Approval)
                     .where(Approval.id == row.id)
@@ -1007,19 +1047,20 @@ class GateService:
                         decided_at=now,
                         decision_reason=reason,
                     )
-                )
-                await self._audit(
-                    connection,
-                    run,
-                    f"approval.{status}",
-                    call_id,
-                    {
-                        "tool": row.tool_name,
-                        "reason": reason,
-                        "scope": scope,
-                        "always_allow": scope == "always",
-                    },
-                    user_id=user_id,
+                    .add_cte(
+                        self._audit_insert(
+                            run,
+                            f"approval.{status}",
+                            call_id,
+                            {
+                                "tool": row.tool_name,
+                                "reason": reason,
+                                "scope": scope,
+                                "always_allow": scope == "always",
+                            },
+                            user_id=user_id,
+                        ).cte("audit")
+                    )
                 )
                 if scope == "always":
                     await self._always_allow(
@@ -1029,9 +1070,11 @@ class GateService:
                     await self._session_allow(
                         connection, run, user_id, canonical_name(row.tool_name), call_id, row.id
                     )
+            if release is not None:
+                released = await release(connection)
         if status == "expired":
             raise ApprovalExpiredError("the approval timed out, so it counts as deny")
-        return ApprovalDecision(status, scope)
+        return ApprovalDecision(status, scope, row.proposal_id is not None, tuple(released))
 
     async def _session_allow(
         self,
@@ -1158,18 +1201,27 @@ class GateService:
         *,
         user_id: uuid.UUID | None = None,
     ) -> None:
-        await connection.execute(
-            insert(AuditEntry).values(
-                org_id=run.org_id,
-                workspace_id=run.workspace_id,
-                actor_kind="user" if user_id is not None else "system",
-                actor_user_id=user_id,
-                action=action,
-                target_type="tool_call" if call_id is not None else None,
-                target_id=call_id,
-                run_id=run.run_id,
-                details=default_redactor().json({"session_id": str(run.session_id), **details}),
-            )
+        await connection.execute(self._audit_insert(run, action, call_id, details, user_id=user_id))
+
+    @staticmethod
+    def _audit_insert(
+        run: _Ref,
+        action: str,
+        call_id: str | None,
+        details: dict[str, Any],
+        *,
+        user_id: uuid.UUID | None = None,
+    ) -> Insert:
+        return insert(AuditEntry).values(
+            org_id=run.org_id,
+            workspace_id=run.workspace_id,
+            actor_kind="user" if user_id is not None else "system",
+            actor_user_id=user_id,
+            action=action,
+            target_type="tool_call" if call_id is not None else None,
+            target_id=call_id,
+            run_id=run.run_id,
+            details=default_redactor().json({"session_id": str(run.session_id), **details}),
         )
 
 

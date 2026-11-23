@@ -24,13 +24,14 @@ import logging
 import os
 import signal
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.routing import Mount, Route
 
 from sama.api import ApiSettings, JwtVerifier, SamaApi
@@ -68,6 +69,8 @@ from sama.datacontrols.purge import MemoryDeleter, PurgeWorker, SandboxBackend
 from sama.datacontrols.service import DataControls, ServiceCleanup
 from sama.datacontrols.sweep import RetentionSweep
 from sama.db.engine import create_engine
+from sama.db.monitor import PoolMonitor, RequestMonitor
+from sama.db.pool import named, prewarm
 from sama.delegation import DelegationService
 from sama.gate.service import Escalation, GateService
 from sama.gate.wire import GATE_PATH
@@ -205,7 +208,9 @@ def build(
     default_redactor().add(*settings.secret_values())
     # The run queue and the API serve only the orgs of the home region (Section 17.3).
     set_home_regions(settings.regions)
-    engine = engine or create_engine(settings.database_url.get_secret_value())
+    engine = engine or create_engine(
+        settings.database_url.get_secret_value(), pool=settings.db_pool
+    )
     vault = Vault(engine, settings.vault_key) if settings.vault_key is not None else None
     keys = OrgKeys(
         vault,
@@ -671,6 +676,8 @@ def build(
             web_origins=settings.web_origins,
             signup=settings.signup,
             extension_ids=settings.extension_ids,
+            # The polls of the event streams use at most half of the pool (Section 4.4).
+            stream_db_slots=max(1, settings.db_pool.size // 2),
         ),
         chrome=chrome,
         integrations=integrations,
@@ -755,7 +762,10 @@ def build(
                 stack.push_async_callback(mem0.aclose)
             if memory_sync is not None:
                 stack.push_async_callback(memory_sync.wait)
+            # The first requests do not wait for a connect (Section 4.4).
+            await prewarm(engine, settings.db_pool.prewarm)
             loops = _monitor(settings, engine, stack, sandboxes=e2b, memories=mem0)
+            loops.append(PoolMonitor(engine))
             loops.append(RetentionSweep(engine))
             loops.append(SigninPoller(connections))
             loops.append(TaskDispatcher(engine, queue))
@@ -774,8 +784,13 @@ def build(
             await billing.start()
             loops.append(billing)
             plane.tasks = [
-                asyncio.create_task(worker.serve(stop, concurrency=settings.worker_concurrency)),
-                *(asyncio.create_task(loop.serve(stop)) for loop in loops),
+                asyncio.create_task(
+                    _named("worker", worker.serve(stop, concurrency=settings.worker_concurrency))
+                ),
+                *(
+                    asyncio.create_task(_named(type(loop).__name__.lower(), loop.serve(stop)))
+                    for loop in loops
+                ),
             ]
             for task in plane.tasks:
                 task.add_done_callback(lambda t: _ended(t, stop, exit_on_failure))
@@ -804,6 +819,8 @@ def build(
     app = Starlette(
         routes=[*routes, Mount("", app=api_app)],
         lifespan=lifespan,
+        # It names each request for the pool log and counts its database round trips.
+        middleware=[Middleware(RequestMonitor)],
     )
     plane = ControlPlane(
         app=app,
@@ -850,6 +867,12 @@ async def _close_sandboxes(sandboxed: SandboxedRuntime) -> None:
             await sandboxed.close_sandboxes()
     except TimeoutError:
         log.warning("the session sandboxes were not all paused before the stop")
+
+
+async def _named(name: str, work: Awaitable[None]) -> None:
+    """Runs a background loop with a name for the pool log lines (Section 4.4)."""
+    with named(name):
+        await work
 
 
 def _ended(task: asyncio.Task[None], stop: asyncio.Event, exit_on_failure: bool) -> None:
