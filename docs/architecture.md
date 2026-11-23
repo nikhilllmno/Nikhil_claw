@@ -9596,7 +9596,11 @@ A source link or an offer ("Do you want me to try the Wyndham site next?") is no
 `off_platform`. The output folder gets `results.jsonl` (the answers, the tools, the
 deflections that matched, the cost) and `summary.md`. `--rescore results.jsonl` classifies
 stored answers again after a change to the rules, and `--resume` skips the cases that
-`results.jsonl` already has. The classifier skips an offer of the agent ("I can also try
+`results.jsonl` already has. `--learn` runs a "learn this" probe instead: three messages that
+ask the agent to remember a way to check prices (the first is the production message of
+2026-11-23). The runner approves `memory` and `skill_manage` there, and labels each case
+`saved` (a sama store), `file_only` (only a native `Write` or `Edit` in the sandbox), or
+`not_saved`. Each result also lists the skills that the agent loaded with `skill_view`. The classifier skips an offer of the agent ("I can also try
 Goibibo") and a link label; it flags "open this link and check the dates".
 
 Staging and production share one E2B account with a limit of 20 running sandboxes, and a
