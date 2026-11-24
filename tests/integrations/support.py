@@ -72,8 +72,8 @@ class FakeTelegram:
                     401, json={"ok": False, "error_code": 401, "description": "Unauthorized"}
                 )
             return httpx.Response(200, json={"ok": True, "result": me})
-        if method in ("sendPhoto", "sendVoice"):
-            field = "photo" if method == "sendPhoto" else "voice"
+        if method in ("sendPhoto", "sendVoice", "sendDocument"):
+            field = {"sendPhoto": "photo", "sendVoice": "voice"}.get(method, "document")
             self.media.append((method, int(body["chat_id"]), body[field]))
             return httpx.Response(200, json={"ok": True, "result": {"message_id": next(self._ids)}})
         if method == "sendMessage":

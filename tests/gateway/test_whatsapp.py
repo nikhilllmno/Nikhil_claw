@@ -20,7 +20,7 @@ from sama.orchestrator.queue import RunQueue
 from sama.runtime.contract import RunCompleted, TextDelta
 from sama.runtime.fake import FakeScript
 from tests.gateway.channel_support import MIA, NUMBER, FakeWhatsApp, add_channel, code_for
-from tests.gateway.media_support import OGG, add_media, latest_run
+from tests.gateway.media_support import CSV, OGG, add_media, latest_run
 from tests.media.support import PNG
 from tests.orchestrator.conftest import (  # noqa: F401
     Tenant,
@@ -331,6 +331,40 @@ async def test_generated_media_goes_out_through_the_link(
     assert await harness.worker.run_once()
     await gateway.drain()
     assert provider.media[0][2] == f"https://sama.test/media/{media_id}"
+
+
+async def test_a_pdf_goes_as_a_file_and_a_csv_gets_a_note(
+    gateway: WhatsAppGateway,
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    provider: FakeWhatsApp,
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(FakeScript(events=(RunCompleted(output="both files"),)))
+    await gateway.handle(inbound("make a pdf and a csv"))
+    run = await latest_run(engine, tenant.org)
+    pdf = await add_media(
+        engine, run, "file", b"%PDF-1.7", name="a.pdf", mime_type="application/pdf"
+    )
+    await add_media(engine, run, "file", CSV, name="top5.csv")
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert [m[2] for m in provider.media] == [f"https://sama.test/media/{pdf}"]
+    assert any("top5.csv is ready, but WhatsApp cannot send" in t for t in provider.texts())
+
+
+def test_a_large_image_file_gets_the_note_too() -> None:
+    from sama.gateway.whatsapp_providers import MESSAGE_TYPES, carries
+    from sama.media.generate import StoredMedia
+
+    types = frozenset(MESSAGE_TYPES)
+    small = StoredMedia(uuid.uuid4(), "file", "image/png", "", b"x" * 1024, "a.png")
+    large = StoredMedia(uuid.uuid4(), "file", "image/png", "", b"x" * (6 * 1024 * 1024), "b.png")
+    pdf = StoredMedia(uuid.uuid4(), "file", "application/pdf", "", b"x" * (6 * 1024 * 1024))
+    assert carries(types, small)
+    assert not carries(types, large)
+    assert carries(types, pdf)
 
 
 async def test_a_repeated_message_is_dropped(

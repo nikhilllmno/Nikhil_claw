@@ -224,9 +224,37 @@ ATTACHMENT_MIME_TYPES: Final = ("image/png", "image/jpeg", "image/gif", "image/w
 """The image types that a channel can attach to a message (docs/architecture.md, Section 11.7)."""
 MAX_ATTACHMENT_BYTES: Final = 10 * 1024 * 1024
 """The size limit of one attachment, for the database and for the gateways."""
-GENERATED_MEDIA_KINDS: Final = ("image", "audio")
-GENERATED_MEDIA_MIME_TYPES: Final = ("image/png", "audio/ogg")
-"""PNG images of ``image_generate`` and Ogg Opus voice notes of ``text_to_speech``."""
+GENERATED_MEDIA_KINDS: Final = ("image", "audio", "file")
+GENERATED_FILE_MIME_TYPES: Final = (
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+    "text/tab-separated-values",
+    "text/calendar",
+    "text/html",
+    "application/json",
+    "application/xml",
+    "application/pdf",
+    "application/zip",
+    "application/gzip",
+    "application/x-tar",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/octet-stream",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/svg+xml",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
+    "video/mp4",
+)
+"""The types of ``generated_media``: the files that ``file_send`` gives to the user (Section
+11.10), with ``image/png`` of ``image_generate`` and ``audio/ogg`` of ``text_to_speech``. A file of
+another type goes as ``application/octet-stream``."""
 MAX_GENERATED_MEDIA_BYTES: Final = 10 * 1024 * 1024
 API_KEY_SCOPES: Final = ("chat", "mcp")
 """What an org API key can call (Section 10.7): ``chat`` is the OpenAI-compatible endpoint
@@ -1735,7 +1763,8 @@ class Attachment(Base):
 
 class GeneratedMedia(Base):
     """An image or a voice note that ``image_generate`` or ``text_to_speech`` made in a run
-    (docs/architecture.md, Section 11.8; roadmap M4.9). The bytes stay in the database. The
+    (docs/architecture.md, Section 11.8; roadmap M4.9), or a file of the session sandbox that
+    ``file_send`` gave to the user (Section 11.10). The bytes stay in the database. The
     gateway of the run sends the file to the chat when the run ends and sets ``delivered_at``.
     A member can read the metadata of the sessions that the member can see, never ``data``."""
 
@@ -1747,7 +1776,7 @@ class GeneratedMedia(Base):
             ondelete="CASCADE",
         ),
         CheckConstraint(_one_of("kind", GENERATED_MEDIA_KINDS), name="kind"),
-        CheckConstraint(_one_of("mime_type", GENERATED_MEDIA_MIME_TYPES), name="mime_type"),
+        CheckConstraint(_one_of("mime_type", GENERATED_FILE_MIME_TYPES), name="mime_type"),
         CheckConstraint(
             f"size_bytes BETWEEN 1 AND {MAX_GENERATED_MEDIA_BYTES}"
             " AND size_bytes = octet_length(data)",
@@ -1766,6 +1795,9 @@ class GeneratedMedia(Base):
     sha256: Mapped[str] = mapped_column(Text, nullable=False)
     caption: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     """A short text for the chat: the prompt of the image, or the start of the spoken text."""
+    name: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    """The download name of a file of ``file_send`` (``report.csv``). Empty for an image or a
+    voice note of the media tools."""
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()

@@ -845,6 +845,58 @@ describe("images in a message", () => {
     expect(await image.blob.text()).toBe("png-bytes");
   });
 
+  it("lists the media of a session with the limit", async () => {
+    const items = [
+      {
+        id: "m1",
+        run_id: "r1",
+        kind: "file",
+        mime_type: "text/csv",
+        name: "report.csv",
+        size_bytes: 12,
+        caption: "",
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(items), { status: 200 }));
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    expect(await client.listMedia("s1", 20)).toEqual(items);
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/sessions/s1/media?limit=20");
+    expect(authOf(init)).toBe("Bearer old");
+    await client.listMedia("s1", 100, 200);
+    const [paged] = fetcher.mock.calls[1] as unknown as [string, RequestInit];
+    expect(paged).toBe("https://api.test/sessions/s1/media?limit=100&offset=200");
+  });
+
+  it("downloads one media file with the Bearer token and the name of the header", async () => {
+    const fetcher = vi.fn(
+      async () =>
+        new Response("a,b", {
+          status: 200,
+          headers: { "Content-Disposition": 'attachment; filename="report.csv"' },
+        }),
+    );
+    const client = new ApiClient("https://api.test", tokens(), fetcher);
+    const file = await client.getMedia("s1", "m1", "file");
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/sessions/s1/media/m1");
+    expect(authOf(init)).toBe("Bearer old");
+    expect(file.name).toBe("report.csv");
+    expect(await file.blob.text()).toBe("a,b");
+  });
+
+  it("uses the fallback name and throws an ApiError when the media download fails", async () => {
+    const ok = vi.fn(async () => new Response("x", { status: 200 }));
+    expect((await new ApiClient("https://api.test", tokens(), ok).getMedia("s1", "m1", "image.png")).name).toBe(
+      "image.png",
+    );
+    const missing = vi.fn(async () => new Response(JSON.stringify({ detail: "no" }), { status: 404 }));
+    await expect(new ApiClient("https://api.test", tokens(), missing).getMedia("s1", "m1", "x")).rejects.toMatchObject({
+      status: 404,
+    });
+  });
+
   it("checks the files before the upload", () => {
     expect(imageProblem([file("a.png", "image/png")])).toBeNull();
     expect(imageProblem(Array.from({ length: 5 }, () => file("a.png", "image/png")))).toMatch(/first 4/);

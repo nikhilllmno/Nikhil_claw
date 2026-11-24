@@ -416,6 +416,19 @@ export interface MessageImage {
   size_bytes: number;
 }
 
+/** A file that a run made: an image, a voice note, or a file from `file_send`. */
+export interface MediaItem {
+  id: string;
+  run_id: string;
+  kind: "image" | "audio" | "file";
+  mime_type: string;
+  /** The download name. Old image and audio rows have an empty name. */
+  name: string;
+  size_bytes: number;
+  caption: string;
+  created_at: string;
+}
+
 /** The rules of the API for the images of one message (`sama.media.images`, M8.2). */
 export const MAX_IMAGES_PER_MESSAGE = 4;
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -2269,6 +2282,15 @@ export class ApiClient {
    */
   getAttachment = (sessionId: string, attachmentId: string) =>
     this.download(`/sessions/${sessionId}/attachments/${attachmentId}`, "image");
+  /** The files that the runs of a session made, newest first. `offset` skips the newest files. */
+  listMedia = (sessionId: string, limit = 50, offset = 0) =>
+    this.json<MediaItem[]>(`/sessions/${sessionId}/media${query({ limit, offset: offset || null })}`);
+  /**
+   * The bytes of one file of a run. An `img` or `a` element cannot send the Bearer token, so the
+   * web app fetches the file here and uses a blob. `fallback` is the name if the API sends none.
+   */
+  getMedia = (sessionId: string, mediaId: string, fallback: string) =>
+    this.download(`/sessions/${sessionId}/media/${mediaId}`, fallback);
   listSteers = (id: string) => this.json<SteerNote[]>(`/sessions/${id}/steers`);
   listOpenRuns = (id: string) => this.json<OpenRun[]>(`/sessions/${id}/open-runs`);
   /** The tool calls and sub-agent progress of the newest runs, for runs that ended earlier. */

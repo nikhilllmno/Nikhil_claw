@@ -26,7 +26,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Final, Literal, get_args
 
 import httpx
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import MAX_GENERATED_MEDIA_BYTES, GeneratedMedia
@@ -96,6 +96,8 @@ class MediaInfo:
     size_bytes: int
     caption: str
     created_at: datetime
+    name: str = ""
+    """The download name of a file (kind ``file``). Empty for an image or a voice note."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,16 @@ class StoredMedia:
     mime_type: str
     caption: str
     data: bytes = field(repr=False)
+    name: str = ""
+    """The download name of a file (kind ``file``). Empty for an image or a voice note."""
+
+    @property
+    def filename(self) -> str:
+        """The name of the file in a chat: the stored name, else ``image.png`` or
+        ``voice.ogg``."""
+        if self.name:
+            return self.name
+        return "image.png" if self.kind == "image" else "voice.ogg"
 
 
 _STORED_COLUMNS: Final = (
@@ -113,11 +125,12 @@ _STORED_COLUMNS: Final = (
     GeneratedMedia.mime_type,
     GeneratedMedia.caption,
     GeneratedMedia.data,
+    GeneratedMedia.name,
 )
 
 
 def _stored(row: Any) -> StoredMedia:
-    return StoredMedia(row.id, row.kind, row.mime_type, row.caption, bytes(row.data))
+    return StoredMedia(row.id, row.kind, row.mime_type, row.caption, bytes(row.data), row.name)
 
 
 class GeneratedMediaStore:
@@ -135,20 +148,41 @@ class GeneratedMediaStore:
         mime_type: str,
         data: bytes,
         caption: str,
-    ) -> uuid.UUID:
+        name: str = "",
+        run_limit: int | None = None,
+    ) -> uuid.UUID | None:
+        """Stores a file of the run. With ``run_limit``, it stores the file only when the run
+        has fewer files of any kind, and returns ``None`` otherwise. A transaction lock on the
+        run makes the count and the insert one step, so parallel calls cannot pass the
+        limit."""
         media_id = uuid.uuid4()
+        org_id, run_id = uuid.UUID(claims.org_id), uuid.UUID(claims.run_id)
         async with self._engine.begin() as connection:
+            if run_limit is not None:
+                await connection.execute(
+                    select(func.pg_advisory_xact_lock(func.hashtextextended(str(run_id), 0)))
+                )
+                count = (
+                    await connection.execute(
+                        select(func.count()).where(
+                            GeneratedMedia.org_id == org_id, GeneratedMedia.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+                if count >= run_limit:
+                    return None
             await connection.execute(
                 insert(GeneratedMedia).values(
                     id=media_id,
-                    org_id=uuid.UUID(claims.org_id),
+                    org_id=org_id,
                     session_id=uuid.UUID(claims.session_id),
-                    run_id=uuid.UUID(claims.run_id),
+                    run_id=run_id,
                     kind=kind,
                     mime_type=mime_type,
                     size_bytes=len(data),
                     sha256=hashlib.sha256(data).hexdigest(),
                     caption=caption[:MAX_CAPTION_CHARS],
+                    name=name,
                     data=data,
                 )
             )
@@ -173,9 +207,9 @@ class GeneratedMediaStore:
         return [_stored(row) for row in rows]
 
     async def list(
-        self, org_id: uuid.UUID, session_id: uuid.UUID, limit: int
+        self, org_id: uuid.UUID, session_id: uuid.UUID, limit: int, offset: int = 0
     ) -> Sequence[MediaInfo]:
-        """The files of a session without their bytes, newest first."""
+        """The files of a session without their bytes, newest first, from ``offset``."""
         query = (
             select(
                 GeneratedMedia.id,
@@ -185,10 +219,12 @@ class GeneratedMediaStore:
                 GeneratedMedia.size_bytes,
                 GeneratedMedia.caption,
                 GeneratedMedia.created_at,
+                GeneratedMedia.name,
             )
             .where(GeneratedMedia.org_id == org_id, GeneratedMedia.session_id == session_id)
             .order_by(GeneratedMedia.created_at.desc(), GeneratedMedia.id)
             .limit(limit)
+            .offset(offset)
         )
         async with self._engine.connect() as connection:
             rows = (await connection.execute(query)).all()

@@ -134,7 +134,7 @@ class _Outbox(RunOutbox):
 
     async def send_media(self, media: StoredMedia, *, reply_to: Any = None) -> None:
         extension = {"image/png": "png", "audio/ogg": "ogg"}.get(media.mime_type, "bin")
-        name = f"{media.kind}-{media.id.hex[:8]}.{extension}"
+        name = media.name or f"{media.kind}-{media.id.hex[:8]}.{extension}"
         text = media.caption or f"sama made this {media.kind}."
         await self._send(text, (Attachment(name, media.mime_type, media.data),))
 

@@ -188,6 +188,7 @@ from sama.gateway.whatsapp_providers import WhatsAppCredentials
 from sama.github.routes import setup_router
 from sama.github.service import MAX_PATH_CHARS, MAX_PROTECTED_PATHS, GitHubService, GitHubSetupError
 from sama.integrations.service import IntegrationError, Integrations
+from sama.media.files import media_headers
 from sama.media.generate import GeneratedMediaStore
 from sama.media.images import NewAttachment, clean_name, with_markers
 from sama.media.store import AttachmentStore
@@ -979,8 +980,8 @@ class PinOut(BaseModel):
 
 
 class MediaOut(BaseModel):
-    """An image or a voice note that a run made (Section 11.8). ``GET .../media/{id}`` gives
-    the bytes."""
+    """An image or a voice note that a run made (Section 11.8), or a file of ``file_send``
+    (kind ``file``, Section 11.10). ``GET .../media/{id}`` gives the bytes."""
 
     id: uuid.UUID
     run_id: uuid.UUID
@@ -989,6 +990,8 @@ class MediaOut(BaseModel):
     size_bytes: int
     caption: str
     created_at: datetime
+    name: str = ""
+    """The download name of a file. Empty for an image or a voice note."""
 
 
 class CompactionOut(BaseModel):
@@ -1665,10 +1668,15 @@ class SamaApi:
             connect = "'self'"
             if settings.supabase_url:
                 connect += f" {settings.supabase_url.rstrip('/')}"
-            response.headers["Content-Security-Policy"] = (
+            policy = (
                 f"default-src 'self'; connect-src {connect}; img-src 'self' data:; "
                 "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
             )
+            # A route can ask for a sandbox, for example a file of ``file_send``
+            # (Section 11.10). The sandbox stays in front of the policy of the API.
+            if response.headers.get("Content-Security-Policy") == "sandbox":
+                policy = f"sandbox; {policy}"
+            response.headers["Content-Security-Policy"] = policy
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["Referrer-Policy"] = "no-referrer"
             return response
@@ -1878,9 +1886,10 @@ class SamaApi:
             principal: Me,
             session_id: uuid.UUID,
             limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
         ) -> list[MediaOut]:
             access = await self._access(principal, session_id)
-            files = await self._media.list(access.org_id, session_id, limit)
+            files = await self._media.list(access.org_id, session_id, limit, offset)
             return [MediaOut(**asdict(media)) for media in files]
 
         @app.get("/sessions/{session_id}/media/{media_id}")
@@ -1889,14 +1898,10 @@ class SamaApi:
             media = await self._media.load(access.org_id, session_id, media_id)
             if media is None:
                 raise _not_found("the file does not exist")
-            name = "image.png" if media.kind == "image" else "voice.ogg"
             return Response(
                 content=media.data,
                 media_type=media.mime_type,
-                headers={
-                    "Content-Disposition": f'inline; filename="{name}"',
-                    "Cache-Control": "private, max-age=3600",
-                },
+                headers=media_headers(media.kind, media.filename),
             )
 
         @app.get("/sessions/{session_id}/attachments/{attachment_id}")

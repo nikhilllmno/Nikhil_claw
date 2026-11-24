@@ -23,8 +23,10 @@ from sama.gateway.whatsapp_providers import (
     TwilioProvider,
     WhatsAppCredentials,
     WhatsAppError,
+    WhatsAppProvider,
     build_provider,
     e164,
+    message_type,
 )
 from sama.media.generate import StoredMedia
 
@@ -143,7 +145,22 @@ async def test_meta_sends_text_buttons_and_media() -> None:
     buttons = bodies[1]["interactive"]["action"]["buttons"]
     assert [b["reply"]["id"] for b in buttons] == ["yes AB12CD", "no AB12CD"]
     assert bodies[2]["image"] == {"link": "https://sama.test/m"}
+    document = StoredMedia(uuid.uuid4(), "file", "text/csv", "", b"a,b", "top5.csv")
+    await provider.send_media("+15557654321", document, "https://sama.test/d")
+    last = json.loads(recorder.requests[-1].content)
+    assert last["type"] == "document"
+    assert last["document"] == {"link": "https://sama.test/d", "filename": "top5.csv"}
+    chart = StoredMedia(uuid.uuid4(), "file", "image/png", "", b"png", "chart.png")
+    await provider.send_media("+15557654321", chart, "https://sama.test/c")
+    assert json.loads(recorder.requests[-1].content)["image"] == {"link": "https://sama.test/c"}
     await provider.aclose()
+
+
+def test_each_provider_carries_only_the_types_that_whatsapp_accepts() -> None:
+    assert "text/csv" not in WhatsAppProvider.file_types
+    assert "application/pdf" in TwilioProvider.file_types
+    assert "text/plain" not in TwilioProvider.file_types
+    assert message_type(StoredMedia(uuid.uuid4(), "audio", "audio/ogg", "", b"o")) == "audio"
 
 
 async def test_meta_downloads_media_only_from_its_hosts() -> None:

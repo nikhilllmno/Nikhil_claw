@@ -43,7 +43,9 @@ TOOLSETS: Final[Mapping[str, frozenset[str]]] = {
     "memory": frozenset({"memory", "memory_recall"}),
     "skills": frozenset({"skills_list", "skill_view", "skill_manage", "skill_import"}),
     "sessions": frozenset({"session_search", "session_read"}),
-    "media": frozenset({"vision_analyze", "image_generate", "text_to_speech", "video_analyze"}),
+    "media": frozenset(
+        {"vision_analyze", "image_generate", "text_to_speech", "video_analyze", "file_send"}
+    ),
     "moa": frozenset({"moa"}),
     "tool_search": frozenset({"tool_search", "tool_describe", "tool_call"}),
     "subagents": SUBAGENT_TOOLS,
@@ -123,6 +125,7 @@ DEFAULT_ALLOW: Final = frozenset(
         "image_generate",
         "text_to_speech",
         "video_analyze",
+        "file_send",
         "moa",
         "tool_search",
         "tool_describe",

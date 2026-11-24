@@ -158,10 +158,58 @@ class _Http:
         return bytes(data), None
 
 
+_OFFICE: Final = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+)
+MESSAGE_TYPES: Final[Mapping[str, str]] = {
+    "image/png": "image",
+    "image/jpeg": "image",
+    "audio/mpeg": "audio",
+    "audio/ogg": "audio",
+    "video/mp4": "video",
+    "application/pdf": "document",
+    "text/plain": "document",
+    **dict.fromkeys(_OFFICE, "document"),
+}
+"""The WhatsApp message type of each file type that WhatsApp carries (Section 11.10). WhatsApp
+refuses other types, for example CSV, Markdown, and zip."""
+
+
+MAX_MEDIA_BYTES: Final[Mapping[str, int]] = {
+    "image": 5 * 1024 * 1024,
+    "audio": 16 * 1024 * 1024,
+    "video": 16 * 1024 * 1024,
+    "document": 16 * 1024 * 1024,
+}
+"""The largest file of each message type that the WhatsApp providers take (Meta: 5 MB for an
+image, 16 MB for audio and video; Twilio: 16 MB for a message). A file of ``file_send`` is at
+most 10 MB, so only an image can be too large."""
+
+
+def carries(provider_types: frozenset[str], media: StoredMedia) -> bool:
+    """True if a provider with ``provider_types`` can send this file of ``file_send``: a type
+    that WhatsApp takes, at a size that WhatsApp takes."""
+    if media.mime_type not in provider_types:
+        return False
+    return len(media.data) <= MAX_MEDIA_BYTES[message_type(media)]
+
+
+def message_type(media: StoredMedia) -> str:
+    """``image``, ``audio``, ``video``, or ``document`` for a file of a run."""
+    if media.kind in ("image", "audio"):
+        return media.kind
+    return MESSAGE_TYPES.get(media.mime_type, "document")
+
+
 class WhatsAppProvider(abc.ABC):
     name: Provider
     max_text: int = 4096
     buttons: bool = True
+    file_types: frozenset[str] = frozenset(MESSAGE_TYPES)
+    """The types of a ``file_send`` file that the provider can send. ``WhatsAppChat`` sends a
+    note instead of a file of another type."""
     """False when an approval card asks for a reply code and has no buttons."""
 
     @abc.abstractmethod
@@ -186,7 +234,8 @@ class WhatsAppProvider(abc.ABC):
 
     @abc.abstractmethod
     async def send_media(self, to: str, media: StoredMedia, url: str) -> str:
-        """Sends an image or a voice note that the provider reads from ``url``."""
+        """Sends an image, a voice note, or a file (a document) that the provider reads from
+        ``url``."""
 
     @abc.abstractmethod
     async def download(self, media: MediaRef, *, max_bytes: int) -> bytes:
@@ -343,8 +392,11 @@ class MetaProvider(WhatsAppProvider):
         )
 
     async def send_media(self, to: str, media: StoredMedia, url: str) -> str:
-        kind = "image" if media.kind == "image" else "audio"
-        return await self._send(to, {"type": kind, kind: {"link": url}})
+        kind = message_type(media)
+        body: dict[str, str] = {"link": url}
+        if kind == "document":
+            body["filename"] = media.filename
+        return await self._send(to, {"type": kind, kind: body})
 
     async def download(self, media: MediaRef, *, max_bytes: int) -> bytes:
         if media.ref.startswith("https://"):
@@ -367,6 +419,9 @@ class TwilioProvider(WhatsAppProvider):
     name = "twilio"
     max_text = 1600
     buttons = False
+    file_types = frozenset(
+        {"image/png", "image/jpeg", "audio/mpeg", "audio/ogg", "video/mp4", "application/pdf"}
+    )
 
     def __init__(self, *, number: str, client: TwilioClient, auth_token: SecretStr) -> None:
         self.number = number
@@ -595,7 +650,12 @@ class GupshupProvider(WhatsAppProvider):
     async def send_media(self, to: str, media: StoredMedia, url: str) -> str:
         if media.kind == "image":
             return await self._send(to, {"type": "image", "originalUrl": url, "previewUrl": url})
-        return await self._send(to, {"type": "audio", "url": url})
+        kind = message_type(media)
+        if kind == "image":
+            return await self._send(to, {"type": "image", "originalUrl": url, "previewUrl": url})
+        if kind == "document":
+            return await self._send(to, {"type": "file", "url": url, "filename": media.filename})
+        return await self._send(to, {"type": kind, "url": url})
 
     async def download(self, media: MediaRef, *, max_bytes: int) -> bytes:
         getter = _Http(self.http, ("gupshup.io", "whatsapp.net", "fbsbx.com"))
