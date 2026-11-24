@@ -5277,9 +5277,11 @@ list. It sends the file only to the chat of the session, so it needs no approval
   bytes of its format; else the tool tells the model to make the file again.
 - `name` is the download name. Sama keeps only letters, digits, `.`, `_`, and `-` (at most 80
   characters) and keeps the extension of the path when `name` has none.
-- A run has at most 10 files of any kind (images and voice notes count too), the number
-  that a gateway sends for a run. A lock on the run makes the count and the insert one step.
-  The tool result tells the model to name the file in the answer
+- `file_send` refuses a file when the run already has 10 files of any kind (images and voice
+  notes count too), the number that a gateway sends for a run. A lock on the run makes the
+  count and the insert one step. `image_generate` and `text_to_speech` do not check this limit
+  yet, so a run that mixes them with 10 files can store more than a gateway sends; the web app
+  and the API still give every file. The tool result tells the model to name the file in the answer
   and never to give a sandbox path or a link as the way to get it.
 
 The system text (`sama.instructions.SYSTEM_PROMPT`) has the same rule for both runtimes:
@@ -5309,7 +5311,8 @@ read `name` with the other metadata, never `data`.
   media link (which also has `attachment`, `nosniff`, and the `sandbox` CSP for a file), an
   image, audio, or video message for those types, and a document for a PDF, plain text, or an
   Office file (Meta, Gupshup). Twilio sends only images, audio, video, and PDF. WhatsApp refuses
-  other types (for example CSV, Markdown, and zip), so the gateway sends a short note instead:
+  other types (for example CSV, Markdown, and zip) and images over 5 MB, so the gateway sends a
+  short note instead:
   the file is ready in the web app, or the agent can make a PDF.
 
 **Eval.** `python -m sama.evals.file_delivery` sends 6 requests for a file (a CSV, a Markdown

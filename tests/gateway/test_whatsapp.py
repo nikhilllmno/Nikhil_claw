@@ -354,6 +354,19 @@ async def test_a_pdf_goes_as_a_file_and_a_csv_gets_a_note(
     assert any("top5.csv is ready, but WhatsApp cannot send" in t for t in provider.texts())
 
 
+def test_a_large_image_file_gets_the_note_too() -> None:
+    from sama.gateway.whatsapp_providers import MESSAGE_TYPES, carries
+    from sama.media.generate import StoredMedia
+
+    types = frozenset(MESSAGE_TYPES)
+    small = StoredMedia(uuid.uuid4(), "file", "image/png", "", b"x" * 1024, "a.png")
+    large = StoredMedia(uuid.uuid4(), "file", "image/png", "", b"x" * (6 * 1024 * 1024), "b.png")
+    pdf = StoredMedia(uuid.uuid4(), "file", "application/pdf", "", b"x" * (6 * 1024 * 1024))
+    assert carries(types, small)
+    assert not carries(types, large)
+    assert carries(types, pdf)
+
+
 async def test_a_repeated_message_is_dropped(
     gateway: WhatsAppGateway,
     engine: AsyncEngine,  # noqa: F811

@@ -177,6 +177,25 @@ MESSAGE_TYPES: Final[Mapping[str, str]] = {
 refuses other types, for example CSV, Markdown, and zip."""
 
 
+MAX_MEDIA_BYTES: Final[Mapping[str, int]] = {
+    "image": 5 * 1024 * 1024,
+    "audio": 16 * 1024 * 1024,
+    "video": 16 * 1024 * 1024,
+    "document": 16 * 1024 * 1024,
+}
+"""The largest file of each message type that the WhatsApp providers take (Meta: 5 MB for an
+image, 16 MB for audio and video; Twilio: 16 MB for a message). A file of ``file_send`` is at
+most 10 MB, so only an image can be too large."""
+
+
+def carries(provider_types: frozenset[str], media: StoredMedia) -> bool:
+    """True if a provider with ``provider_types`` can send this file of ``file_send``: a type
+    that WhatsApp takes, at a size that WhatsApp takes."""
+    if media.mime_type not in provider_types:
+        return False
+    return len(media.data) <= MAX_MEDIA_BYTES[message_type(media)]
+
+
 def message_type(media: StoredMedia) -> str:
     """``image``, ``audio``, ``video``, or ``document`` for a file of a run."""
     if media.kind in ("image", "audio"):
