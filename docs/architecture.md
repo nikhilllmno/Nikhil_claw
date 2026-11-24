@@ -9569,6 +9569,42 @@ message. A new alert comes only 30 minutes or more after the last alert.
 - When Slack does not take the message, the monitor tries again at the next check.
 - The webhook URL is a secret. It is never logged.
 
+### 18.5 The learn eval (M8.6)
+
+`python -m sama.evals.learn` checks that a rule which the user teaches ("learn this: ...")
+goes to a sama store and works in a new chat. Like every eval in `sama.evals`, it is not a
+unit test: it calls a sama API with a user token and spends model money. It has 6 probes:
+
+- 4 learn probes. The teach session gets the rule. Then a NEW session of the same user gets a
+  request that needs the rule. The first probe is the production message of 2026-11-23 (hotel
+  prices: ask for the dates, the people, and the pets first). The other probes have fixed
+  markers that only an answer that follows the rule has (a sign-off, `FALCON STATUS:`,
+  `DAILY BRIEF`).
+- 2 blocked probes ("remind me in 10 minutes", "search the web"). They check that the agent
+  does not call a built-in tool of the Claude CLI that sama does not run (`CronCreate`,
+  `WebSearch`, and the others of `BLOCKED_CLI_TOOLS`).
+
+The runner approves each approval with scope `session` and answers each question once. It
+reads the tool calls of each run from the trace. Each probe gets one label:
+
+| Label | Rule |
+|---|---|
+| `error` | A run failed or timed out, or an API call failed. |
+| `claude_memory` | A `Write`, `Edit`, or shell write to a Claude Code memory file (`~/.claude/projects/<cwd>/memory`, `MEMORY.md`). The file stays in one sandbox, so a new session does not see it. |
+| `blocked_tool` | A call to a built-in CLI tool of `BLOCKED_CLI_TOOLS`. |
+| `not_saved` | A learn probe without a `memory` or `skill_manage` call that worked in the teach session. |
+| `not_applied` | The text of the new session (answers and questions) misses a marker. |
+| `pass` | None of the above. |
+
+The probes save real memories and skills, so give each run a fresh user with its own
+workspace. `--arm` and `--run` label the results, `summary.md` has the counts per arm and
+runtime and the passes per probe, and `--rescore results.jsonl` scores stored results again.
+`--delete-jobs` deletes the jobs that the run made (the reminder probe makes one).
+`--e2b-max-running` waits while more E2B sandboxes run and kills the sandboxes of each probe
+(staging and production share one E2B account). For a change that is not deployed, run it
+against a local control plane with its own database. The Docker sandbox provider
+(`DockerProvider(network="host")`) needs no E2B sandbox and no public tunnel.
+
 ---
 
 ## 19. Technology stack and repository layout
