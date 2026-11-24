@@ -96,6 +96,8 @@ class MediaInfo:
     size_bytes: int
     caption: str
     created_at: datetime
+    name: str = ""
+    """The download name of a file (kind ``file``). Empty for an image or a voice note."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,16 @@ class StoredMedia:
     mime_type: str
     caption: str
     data: bytes = field(repr=False)
+    name: str = ""
+    """The download name of a file (kind ``file``). Empty for an image or a voice note."""
+
+    @property
+    def filename(self) -> str:
+        """The name of the file in a chat: the stored name, else ``image.png`` or
+        ``voice.ogg``."""
+        if self.name:
+            return self.name
+        return "image.png" if self.kind == "image" else "voice.ogg"
 
 
 _STORED_COLUMNS: Final = (
@@ -113,11 +125,12 @@ _STORED_COLUMNS: Final = (
     GeneratedMedia.mime_type,
     GeneratedMedia.caption,
     GeneratedMedia.data,
+    GeneratedMedia.name,
 )
 
 
 def _stored(row: Any) -> StoredMedia:
-    return StoredMedia(row.id, row.kind, row.mime_type, row.caption, bytes(row.data))
+    return StoredMedia(row.id, row.kind, row.mime_type, row.caption, bytes(row.data), row.name)
 
 
 class GeneratedMediaStore:
@@ -135,6 +148,7 @@ class GeneratedMediaStore:
         mime_type: str,
         data: bytes,
         caption: str,
+        name: str = "",
     ) -> uuid.UUID:
         media_id = uuid.uuid4()
         async with self._engine.begin() as connection:
@@ -149,6 +163,7 @@ class GeneratedMediaStore:
                     size_bytes=len(data),
                     sha256=hashlib.sha256(data).hexdigest(),
                     caption=caption[:MAX_CAPTION_CHARS],
+                    name=name,
                     data=data,
                 )
             )
@@ -185,6 +200,7 @@ class GeneratedMediaStore:
                 GeneratedMedia.size_bytes,
                 GeneratedMedia.caption,
                 GeneratedMedia.created_at,
+                GeneratedMedia.name,
             )
             .where(GeneratedMedia.org_id == org_id, GeneratedMedia.session_id == session_id)
             .order_by(GeneratedMedia.created_at.desc(), GeneratedMedia.id)

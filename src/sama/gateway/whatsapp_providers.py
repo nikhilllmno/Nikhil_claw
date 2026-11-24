@@ -186,7 +186,8 @@ class WhatsAppProvider(abc.ABC):
 
     @abc.abstractmethod
     async def send_media(self, to: str, media: StoredMedia, url: str) -> str:
-        """Sends an image or a voice note that the provider reads from ``url``."""
+        """Sends an image, a voice note, or a file (a document) that the provider reads from
+        ``url``."""
 
     @abc.abstractmethod
     async def download(self, media: MediaRef, *, max_bytes: int) -> bytes:
@@ -343,6 +344,9 @@ class MetaProvider(WhatsAppProvider):
         )
 
     async def send_media(self, to: str, media: StoredMedia, url: str) -> str:
+        if media.kind == "file":
+            document = {"link": url, "filename": media.filename}
+            return await self._send(to, {"type": "document", "document": document})
         kind = "image" if media.kind == "image" else "audio"
         return await self._send(to, {"type": kind, kind: {"link": url}})
 
@@ -595,6 +599,8 @@ class GupshupProvider(WhatsAppProvider):
     async def send_media(self, to: str, media: StoredMedia, url: str) -> str:
         if media.kind == "image":
             return await self._send(to, {"type": "image", "originalUrl": url, "previewUrl": url})
+        if media.kind == "file":
+            return await self._send(to, {"type": "file", "url": url, "filename": media.filename})
         return await self._send(to, {"type": "audio", "url": url})
 
     async def download(self, media: MediaRef, *, max_bytes: int) -> bytes:

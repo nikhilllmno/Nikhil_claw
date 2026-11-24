@@ -274,15 +274,16 @@ class _Outbox:
         )
 
     async def send_media(self, media: StoredMedia, *, reply_to: Any = None) -> None:
-        """Shares an image or a voice note in the conversation (Section 11.8)."""
-        image = media.kind == "image"
+        """Shares an image, a voice note (Section 11.8), or a file of ``file_send`` (Section
+        11.10) in the conversation."""
+        title = {"image": "Image", "audio": "Voice note"}.get(media.kind, media.filename)
         place = self._place
         await self._call(
             lambda: self._client.upload_file(
                 place.channel,
                 media.data,
-                filename="image.png" if image else "voice.ogg",
-                title="Image" if image else "Voice note",
+                filename=media.filename,
+                title=title,
                 thread_ts=place.thread_ts,
             )
         )

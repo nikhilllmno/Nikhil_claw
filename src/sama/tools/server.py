@@ -59,6 +59,10 @@ from sama.gate.wire import (
     GateAnswer,
     GateRequest,
 )
+from sama.media.files import MAX_CAPTION_CHARS as MAX_FILE_CAPTION_CHARS
+from sama.media.files import MAX_NAME_CHARS as MAX_FILE_NAME_CHARS
+from sama.media.files import MAX_PATH_CHARS as MAX_FILE_PATH_CHARS
+from sama.media.files import FileSender
 from sama.media.generate import (
     DEFAULT_IMAGE_SIZE,
     DEFAULT_VOICE,
@@ -246,6 +250,7 @@ CONNECTION_TEST: Final = "connection_test"
 CONNECTION_ADD_MCP: Final = "connection_add_mcp"
 EXECUTE_CODE: Final = "execute_code"
 IMAGE_GENERATE: Final = "image_generate"
+FILE_SEND: Final = "file_send"
 TEXT_TO_SPEECH: Final = "text_to_speech"
 VIDEO_ANALYZE: Final = "video_analyze"
 X_SEARCH: Final = "x_search"
@@ -419,6 +424,8 @@ class ToolServer:
     - ``images`` and ``speech``: make an image (``image_generate``) or a voice note
       (``text_to_speech``) that the gateway sends with the reply (Section 11.8). Without one,
       its tool is hidden.
+    - ``files``: gives a file of the session sandbox to the user (``file_send``, Section
+      11.10). Without it, the tool is hidden.
     - ``video``: answers questions about a video (``video_analyze``, Section 10.2.2). Without
       it, the tool is hidden.
     - ``x``: searches recent posts on X (``x_search``). Without it, the tool is hidden.
@@ -500,6 +507,7 @@ class ToolServer:
         coding: CodingTools | None = None,
         custom_tools: CustomToolService | None = None,
         video: VideoService | None = None,
+        files: FileSender | None = None,
         x: XSearch | None = None,
         moa: MixtureService | None = None,
         recall: MemoryRecall | None = None,
@@ -510,6 +518,7 @@ class ToolServer:
         self.custom_tools = custom_tools
         self.coding = coding
         self.video = video
+        self.files = files
         self.x = x
         self.moa = moa
         self.recall = recall
@@ -1021,6 +1030,37 @@ class ToolServer:
 
                 arguments = {"text": text, "voice": voice}
                 return await self._call(ctx, TEXT_TO_SPEECH, arguments, body)
+
+        if self.files is not None:
+            files = self.files
+
+            @server.tool(
+                name=FILE_SEND,
+                description=(
+                    "Give a file from your sandbox to the user as a download: a CSV, a report, "
+                    "a PDF, a chart, a zip, an Office file, and so on. Use it every time the "
+                    "user asks for a file, or when the result of the task is a file. Write the "
+                    "file first (in the work folder or /tmp), then call file_send with its "
+                    "path. The user cannot open a sandbox path or a relative link, so never "
+                    "give one as the way to get a file. To send a file again, call file_send "
+                    "again. path is relative to the work folder, or absolute. name is an "
+                    "optional download name. caption is an optional short note. At most 10 MB; "
+                    "put many files in one zip."
+                ),
+                annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
+                structured_output=False,
+            )
+            async def file_send(
+                ctx: Context,
+                path: Annotated[str, Field(min_length=1, max_length=MAX_FILE_PATH_CHARS)],
+                name: Annotated[str | None, Field(max_length=MAX_FILE_NAME_CHARS)] = None,
+                caption: Annotated[str, Field(max_length=MAX_FILE_CAPTION_CHARS)] = "",
+            ) -> str:
+                async def body(claims: RunTokenClaims) -> str:
+                    return (await files.send(claims, path, name, caption)).text
+
+                arguments = {"path": path, "name": name, "caption": caption}
+                return await self._call(ctx, FILE_SEND, arguments, body)
 
         if self.video is not None:
             video = self.video

@@ -264,18 +264,22 @@ class WhatsAppHub(GatewayCache[_Number]):
         async with self._engine.connect() as connection:
             file = (
                 await connection.execute(
-                    select(GeneratedMedia.mime_type, GeneratedMedia.data).where(
-                        GeneratedMedia.org_id == row.org_id, GeneratedMedia.id == media_id
-                    )
+                    select(
+                        GeneratedMedia.mime_type,
+                        GeneratedMedia.data,
+                        GeneratedMedia.kind,
+                        GeneratedMedia.name,
+                    ).where(GeneratedMedia.org_id == row.org_id, GeneratedMedia.id == media_id)
                 )
             ).one_or_none()
         if file is None:
             raise HTTPException(status_code=404, detail="not found")
-        return Response(
-            content=bytes(file.data),
-            media_type=file.mime_type,
-            headers={"Cache-Control": "no-store"},
-        )
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if file.kind == "file":
+            # A file of ``file_send`` is a download that no browser runs (Section 11.10).
+            headers["Content-Disposition"] = f'attachment; filename="{file.name or "file"}"'
+            headers["Content-Security-Policy"] = "sandbox"
+        return Response(content=bytes(file.data), media_type=file.mime_type, headers=headers)
 
 
 def _select() -> Any:

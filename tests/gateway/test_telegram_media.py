@@ -11,7 +11,7 @@ from sama.gateway.telegram import TelegramGateway
 from sama.media.generate import GeneratedMediaStore
 from sama.runtime.contract import RunCompleted
 from sama.runtime.fake import FakeScript
-from tests.gateway.media_support import OGG, PNG, add_media, latest_run
+from tests.gateway.media_support import CSV, OGG, PNG, add_media, latest_run
 from tests.gateway.test_telegram import (  # noqa: F401
     DM,
     gateway,
@@ -74,3 +74,21 @@ async def test_telegram_keeps_a_file_pending_when_the_send_fails(
     await gateway.drain()
     assert telegram.texts(DM)[-1] == "done"
     assert len(await GeneratedMediaStore(engine).pending(tenant.org, run.id)) == 1
+
+
+async def test_telegram_sends_a_file_of_file_send_as_a_document(
+    gateway: TelegramGateway,  # noqa: F811
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    telegram: FakeTelegram,  # noqa: F811
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(FakeScript(events=(RunCompleted(output="top5.csv is ready"),)))
+    await gateway.handle_update(message("make a csv and give me the file"))
+    run = await latest_run(engine, tenant.org)
+    await add_media(engine, run, "file", CSV, name="top5.csv")
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    assert telegram.media == [("sendDocument", DM, CSV)]
+    assert await GeneratedMediaStore(engine).pending(tenant.org, run.id) == []

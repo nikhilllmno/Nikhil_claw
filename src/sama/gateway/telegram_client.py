@@ -134,6 +134,25 @@ class TelegramClient:
         )
         return int(result["message_id"])
 
+    async def send_document(
+        self,
+        chat_id: int,
+        data: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        reply_to: int | None = None,
+    ) -> int:
+        """Sends a file of ``file_send`` as a document (Section 11.10). Returns the message
+        id."""
+        result = await self.call(
+            "sendDocument",
+            files={"document": (filename, data, mime_type)},
+            chat_id=chat_id,
+            reply_parameters=_reply(reply_to),
+        )
+        return int(result["message_id"])
+
     async def send_voice(self, chat_id: int, data: bytes, *, reply_to: int | None = None) -> int:
         """Sends an Ogg Opus voice note (``text_to_speech``). Returns the message id."""
         result = await self.call(

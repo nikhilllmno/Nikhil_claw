@@ -143,6 +143,11 @@ async def test_meta_sends_text_buttons_and_media() -> None:
     buttons = bodies[1]["interactive"]["action"]["buttons"]
     assert [b["reply"]["id"] for b in buttons] == ["yes AB12CD", "no AB12CD"]
     assert bodies[2]["image"] == {"link": "https://sama.test/m"}
+    document = StoredMedia(uuid.uuid4(), "file", "text/csv", "", b"a,b", "top5.csv")
+    await provider.send_media("+15557654321", document, "https://sama.test/d")
+    last = json.loads(recorder.requests[-1].content)
+    assert last["type"] == "document"
+    assert last["document"] == {"link": "https://sama.test/d", "filename": "top5.csv"}
     await provider.aclose()
 
 

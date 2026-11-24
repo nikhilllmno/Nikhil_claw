@@ -14,6 +14,7 @@ import {
   type CodingAgentName,
   type ClarifyRequest,
   type ExportFormat,
+  type MediaItem,
   type PlanOut,
   OPEN_RUN_STATUSES,
   type OpenRun,
@@ -76,6 +77,8 @@ import { PlanCard } from "./PlanPanel";
 import { useMedia } from "./useMedia";
 import { LiveRun, TodoList, ToolTrail } from "./ToolGroup";
 import { ConnectCard } from "./ConnectCard";
+import { FileCards } from "./FileCard";
+import { mediaByRun } from "@/lib/media";
 import { cardsOfCalls } from "@/lib/connectCard";
 import { ErrorState, LoadingState } from "./ui";
 import styles from "./Chat.module.css";
@@ -156,6 +159,16 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setMessagesError(null);
     } catch (e) {
       setMessagesError(errorText(e, "Could not load the messages."));
+    }
+  }, [api, sessionId]);
+  // The files of the runs (images, voice notes, and files of `file_send`). A failed list shows
+  // no cards: the files that are shown stay, and the next run end loads the list again.
+  const [media, setMedia] = useState<MediaItem[]>([]);
+  const loadMedia = useCallback(async () => {
+    try {
+      setMedia(await api.listMedia(sessionId, 100));
+    } catch {
+      // The chat works without the cards.
     }
   }, [api, sessionId]);
   const loadApprovals = useCallback(async () => {
@@ -316,6 +329,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       for (const effect of new Set(effects)) {
         if (effect === "reload_messages") {
           void loadMessages();
+          void loadMedia();
           void loadNotes();
           void loadPlan();
           reloadSessions();
@@ -323,7 +337,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
         else void loadQuestions();
       }
     },
-    [loadMessages, loadNotes, loadPlan, loadApprovals, loadQuestions, reloadSessions],
+    [loadMessages, loadMedia, loadNotes, loadPlan, loadApprovals, loadQuestions, reloadSessions],
   );
 
   // Load the session, then follow its event stream.
@@ -339,6 +353,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       }
       if (controller.signal.aborted) return;
       setDetail(loaded);
+      setMedia([]);
       setWorkspaceId(loaded.workspace_id);
       const runs = Object.fromEntries(
         loaded.runs
@@ -350,6 +365,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       );
       setLiveState({ ...initialLive, runs });
       void loadMessages();
+      void loadMedia();
       void loadActivity();
       void loadNotes();
       void loadPlan();
@@ -846,6 +862,12 @@ export function Chat({ sessionId }: { sessionId: string }) {
       );
     };
     const open = new Set(openRunIds({ runs: live.runs }));
+    // The files of a run go under its last answer. A run without an answer shows them at the end.
+    const files = mediaByRun(media);
+    const lastAnswer = new Map<string, string>();
+    for (const m of messages ?? []) {
+      if (m.role === "assistant" && m.run_id) lastAnswer.set(m.run_id, m.id);
+    }
     for (const m of messages ?? []) {
       notesBefore(m.created_at);
       if (m.role === "assistant" && m.run_id && !shown.has(m.run_id)) {
@@ -854,6 +876,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
         if (group) items.push(group);
       }
       items.push(<MessageView key={m.id} message={m} sessionId={sessionId} />);
+      if (m.role === "assistant" && m.run_id && lastAnswer.get(m.run_id) === m.id) {
+        const own = files.get(m.run_id);
+        if (own) items.push(<FileCards key={`files-${m.run_id}`} sessionId={sessionId} items={own} />);
+        files.delete(m.run_id);
+      }
     }
     notesBefore(null);
     // Runs that ended without a reply (stopped or failed) keep their trail. Open runs show live.
@@ -862,8 +889,11 @@ export function Chat({ sessionId }: { sessionId: string }) {
       const group = progress(runId);
       if (group) items.push(group);
     }
+    for (const [runId, own] of files) {
+      if (!open.has(runId)) items.push(<FileCards key={`files-${runId}`} sessionId={sessionId} items={own} />);
+    }
     return items;
-  }, [messages, notes, live.tools, live.subagents, live.runs, sessionId]);
+  }, [messages, media, notes, live.tools, live.subagents, live.runs, sessionId]);
 
   // The open runs, oldest request first, numbered as `/stop NUMBER` counts them (M7.1).
   const runRows = useMemo(() => {

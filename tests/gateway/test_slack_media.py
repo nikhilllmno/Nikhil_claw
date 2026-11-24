@@ -11,7 +11,7 @@ from sama.gateway.slack import SlackGateway
 from sama.media.generate import GeneratedMediaStore
 from sama.runtime.contract import RunCompleted
 from sama.runtime.fake import FakeScript
-from tests.gateway.media_support import PNG, add_media, latest_run
+from tests.gateway.media_support import CSV, PNG, add_media, latest_run
 from tests.gateway.test_slack import DM, dm, gateway, pair, slack  # noqa: F401
 from tests.integrations.support import FakeSlack
 from tests.orchestrator.conftest import (  # noqa: F401
@@ -64,3 +64,23 @@ async def test_slack_refuses_an_upload_url_of_another_host(
     assert slack.uploads == []
     assert slack.method_calls("files.completeUploadExternal") == []
     assert len(await GeneratedMediaStore(engine).pending(tenant.org, run.id)) == 1
+
+
+async def test_slack_uploads_a_file_of_file_send_with_its_name(
+    gateway: SlackGateway,  # noqa: F811
+    engine: AsyncEngine,  # noqa: F811
+    tenant: Tenant,  # noqa: F811
+    slack: FakeSlack,  # noqa: F811
+) -> None:
+    await pair(gateway, engine, tenant)
+    harness = Harness(engine)
+    harness.runtime.add_script(FakeScript(events=(RunCompleted(output="here"),)))
+    await gateway.handle_event(dm("make a csv"))
+    run = await latest_run(engine, tenant.org)
+    await add_media(engine, run, "file", CSV, name="top5.csv")
+    assert await harness.worker.run_once()
+    await gateway.drain()
+    [ticket] = slack.method_calls("files.getUploadURLExternal")
+    assert ticket == {"filename": "top5.csv", "length": str(len(CSV))}
+    [complete] = slack.method_calls("files.completeUploadExternal")
+    assert json.loads(complete["files"]) == [{"id": "F0FILE1", "title": "top5.csv"}]

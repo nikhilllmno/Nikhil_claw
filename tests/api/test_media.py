@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.api.conftest import bearer
-from tests.gateway.media_support import OGG, PNG, add_media, latest_run
+from tests.gateway.media_support import CSV, OGG, PNG, add_media, latest_run
 from tests.orchestrator.conftest import Tenant
 from tests.orchestrator.test_worker import Harness
 
@@ -82,3 +82,29 @@ async def test_a_file_of_another_session_or_user_is_not_found(
         response = await client.get(f"/sessions/{tenant.ids['s1']}/{path}", headers=stranger)
         assert response.status_code == 404, path
     assert (await client.get(f"/sessions/{tenant.ids['s1']}/media")).status_code == 401
+
+
+async def test_a_file_of_file_send_is_a_named_download_that_no_browser_runs(
+    client: httpx.AsyncClient, engine: AsyncEngine, tenant: Tenant
+) -> None:
+    harness = Harness(engine)
+    await harness.send(tenant, "s1", "make a csv and give me the file")
+    assert await harness.worker.run_once()
+    run = await latest_run(engine, tenant.org)
+    csv = await add_media(engine, run, "file", CSV, name="top5.csv")
+    page = await add_media(
+        engine, run, "file", b"<script>x</script>", name="r.html", mime_type="text/html"
+    )
+    url = f"/sessions/{tenant.ids['s1']}/media"
+    listed = {item["id"]: item for item in (await client.get(url, headers=mia(tenant))).json()}
+    assert (listed[str(csv)]["kind"], listed[str(csv)]["name"]) == ("file", "top5.csv")
+    assert listed[str(csv)]["run_id"] == str(run.id)
+    response = await client.get(f"{url}/{csv}", headers=mia(tenant))
+    assert response.status_code == 200
+    assert response.content == CSV
+    assert response.headers["content-type"].startswith("text/csv")
+    assert response.headers["content-disposition"] == 'attachment; filename="top5.csv"'
+    html = await client.get(f"{url}/{page}", headers=mia(tenant))
+    assert html.headers["content-security-policy"].startswith("sandbox; default-src 'self'")
+    assert html.headers["x-content-type-options"] == "nosniff"
+    assert html.headers["content-disposition"].startswith("attachment")

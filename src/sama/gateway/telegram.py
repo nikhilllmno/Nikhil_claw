@@ -276,7 +276,19 @@ class _Outbox:
         await self._call(lambda: self._client.edit_message(self._chat_id, message_id, text))
 
     async def send_media(self, media: StoredMedia, *, reply_to: Any = None) -> None:
-        """An image goes as a photo and a voice note as a voice message (Section 11.8)."""
+        """An image goes as a photo and a voice note as a voice message (Section 11.8). A file
+        of ``file_send`` goes as a document (Section 11.10)."""
+        if media.kind == "file":
+            await self._call(
+                lambda: self._client.send_document(
+                    self._chat_id,
+                    media.data,
+                    filename=media.filename,
+                    mime_type=media.mime_type,
+                    reply_to=reply_to,
+                )
+            )
+            return
         send = self._client.send_photo if media.kind == "image" else self._client.send_voice
         await self._call(lambda: send(self._chat_id, media.data, reply_to=reply_to))
 
