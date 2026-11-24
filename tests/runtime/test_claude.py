@@ -58,6 +58,7 @@ from sama.runtime import (
     validate_event_stream,
 )
 from sama.runtime.claude import (
+    AUTO_MEMORY_ENV,
     DROP_DEFERRED_ENV,
     MCP_TOOL_TIMEOUT_ENV,
     TOOL_SEARCH_ENV,
@@ -388,13 +389,53 @@ async def test_maps_the_request_to_options() -> None:
     assert options.disallowed_tools == []
     assert options.cwd == "/workspace"
     # Tool search off: the CLI loads the sama MCP tools at the start (no ``ToolSearch`` call).
+    # Auto memory off: facts go to the sama ``memory`` tool, not to files in the sandbox.
     assert options.env == {
         TOOL_SEARCH_ENV: "false",
         MCP_TOOL_TIMEOUT_ENV: "3600000",
+        AUTO_MEMORY_ENV: "1",
         "ANTHROPIC_BASE_URL": "https://proxy.test",
     }
     assert factory.clients[0].prompts == ["hello"]
     assert factory.clients[0].disconnected
+
+
+async def test_the_cli_offers_only_the_built_in_tools_that_sama_has() -> None:
+    """Seen on staging (2026-11-23): without a tool list, the model called ``CronCreate`` for
+    "remind me in 15 minutes", and the gate denied it; for "remember this" it wrote the fact to
+    the auto memory files of the CLI, and a new session did not know it; and each ``WebFetch``
+    failed the domain check of the CLI."""
+    factory = Factory([result()])
+    await collect(ClaudeRuntime(client_factory=factory).run(request()))
+    options = factory.clients[0].options
+    assert options.tools == [
+        "Agent",
+        "AskUserQuestion",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "MultiEdit",
+        "NotebookEdit",
+        "Read",
+        "Task",
+        "TodoWrite",
+        "ToolSearch",
+        "WebFetch",
+        "Write",
+    ]
+    for feature in ("CronCreate", "WebSearch", "Monitor", "Skill"):
+        assert feature not in options.tools
+    assert options.settings is not None
+    assert json.loads(options.settings) == {"skipWebFetchPreflight": True}
+    assert options.env[AUTO_MEMORY_ENV] == "1"
+
+
+async def test_the_settings_can_turn_auto_memory_on() -> None:
+    factory = Factory([result()])
+    settings = ClaudeSettings(env={AUTO_MEMORY_ENV: "0"})
+    await collect(ClaudeRuntime(settings=settings, client_factory=factory).run(request()))
+    assert factory.clients[0].options.env[AUTO_MEMORY_ENV] == "0"
 
 
 async def test_the_settings_can_turn_tool_search_on() -> None:

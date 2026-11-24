@@ -1065,6 +1065,24 @@ The adapter is `src/sama/runtime/claude.py`. These rules come from live tests wi
   tools with the switch off, so the gate allows `ToolSearch` in every run (a tool loader,
   Section 16.1). When a run has many connector tools, sama `tool_search`
   (Section 10.3) does this job.
+- **Built-in tools of the CLI.** The adapter gives `tools` (the CLI flag `--tools`): only the
+  built-in tools that a sama toolset has (`Bash`, `Read`, `Write`, `Edit`, `MultiEdit`,
+  `NotebookEdit`, `Glob`, `Grep`, `WebFetch`, `TodoWrite`, `Task`, `Agent`,
+  `AskUserQuestion`) and the loader `ToolSearch`. The list does not limit MCP tools, and the CLI
+  ignores a name that it does not know. Without the list, the CLI also offers its own features
+  (`CronCreate`, `WebSearch`, `Monitor`, and more). The gate denies them, so the model lost a
+  turn and told the user that a feature was not available. Sama has its own tools for them
+  (`cronjob_manage`, `web_search`). The gate still checks the toolsets of the run.
+- **Auto memory off.** The adapter sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. With auto memory
+  on, the CLI tells the model to save facts about the user in files under
+  `~/.claude/projects/<cwd>/memory`. Those files stay in one sandbox: a new session did not
+  know the fact, and the sama `memory` tool (Section 8) did not get it. `ClaudeSettings.env`
+  can override the switch.
+- **WebFetch.** The adapter gives the CLI the settings `{"skipWebFetchPreflight": true}`, as
+  the coding agents do (Section 15.4). Before each `WebFetch`, the CLI asks claude.ai if the
+  domain is safe. The sandbox cannot reach that check, so every `WebFetch` failed with "Unable
+  to verify if domain ... is safe to fetch". `WebFetch` still gets `ask` by default
+  (Section 16.1).
 - **Tool gate.** The `PreToolUse` hook calls the `ToolGate` with the tool use id (Section
   16.1). `allow` and `deny` go to the CLI.
   `ask` becomes `defer`. A sub-agent cannot pause the run, so the hook tells the gate that a
@@ -9550,6 +9568,42 @@ message. A new alert comes only 30 minutes or more after the last alert.
   new leader does not know the state of the old leader, so it can post the same alert again.
 - When Slack does not take the message, the monitor tries again at the next check.
 - The webhook URL is a secret. It is never logged.
+
+### 18.5 The learn eval (M8.6)
+
+`python -m sama.evals.learn` checks that a rule which the user teaches ("learn this: ...")
+goes to a sama store and works in a new chat. Like every eval in `sama.evals`, it is not a
+unit test: it calls a sama API with a user token and spends model money. It has 6 probes:
+
+- 4 learn probes. The teach session gets the rule. Then a NEW session of the same user gets a
+  request that needs the rule. The first probe is the production message of 2026-11-23 (hotel
+  prices: ask for the dates, the people, and the pets first). The other probes have fixed
+  markers that only an answer that follows the rule has (a sign-off, `FALCON STATUS:`,
+  `DAILY BRIEF`).
+- 2 blocked probes ("remind me in 10 minutes", "search the web"). They check that the agent
+  does not call a built-in tool of the Claude CLI that sama does not run (`CronCreate`,
+  `WebSearch`, and the others of `BLOCKED_CLI_TOOLS`).
+
+The runner approves each approval with scope `session` and answers each question once. It
+reads the tool calls of each run from the trace. Each probe gets one label:
+
+| Label | Rule |
+|---|---|
+| `error` | A run failed or timed out, or an API call failed. |
+| `claude_memory` | A `Write`, `Edit`, or shell write to a Claude Code memory file (`~/.claude/projects/<cwd>/memory`, `MEMORY.md`). The file stays in one sandbox, so a new session does not see it. |
+| `blocked_tool` | A call to a built-in CLI tool of `BLOCKED_CLI_TOOLS`. |
+| `not_saved` | A learn probe without a `memory` or `skill_manage` call that worked in the teach session. |
+| `not_applied` | The text of the new session (answers and questions) misses a marker. |
+| `pass` | None of the above. |
+
+The probes save real memories and skills, so give each run a fresh user with its own
+workspace. `--arm` and `--run` label the results, `summary.md` has the counts per arm and
+runtime and the passes per probe, and `--rescore results.jsonl` scores stored results again.
+`--delete-jobs` deletes the jobs that the run made (the reminder probe makes one).
+`--e2b-max-running` waits while more E2B sandboxes run and kills the sandboxes of each probe
+(staging and production share one E2B account). For a change that is not deployed, run it
+against a local control plane with its own database. The Docker sandbox provider
+(`DockerProvider(network="host")`) needs no E2B sandbox and no public tunnel.
 
 ---
 

@@ -14,6 +14,7 @@ from claude_agent_sdk.types import TaskNotificationMessage, TaskStartedMessage
 
 from sama.runtime import RunRequest, SubagentDefinition, SubagentEvent
 from sama.runtime.claude import (
+    AUTO_MEMORY_ENV,
     BACKGROUND_TASKS_ENV,
     MCP_TOOL_TIMEOUT_ENV,
     TOOL_SEARCH_ENV,
@@ -91,6 +92,7 @@ async def test_subagents_turn_off_background_tasks_and_keep_the_other_env() -> N
     assert env == {
         TOOL_SEARCH_ENV: "false",
         MCP_TOOL_TIMEOUT_ENV: "3600000",
+        AUTO_MEMORY_ENV: "1",
         BACKGROUND_TASKS_ENV: "1",
     }
 
