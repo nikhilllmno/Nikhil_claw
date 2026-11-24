@@ -2282,9 +2282,9 @@ export class ApiClient {
    */
   getAttachment = (sessionId: string, attachmentId: string) =>
     this.download(`/sessions/${sessionId}/attachments/${attachmentId}`, "image");
-  /** The files that the runs of a session made, newest first. */
-  listMedia = (sessionId: string, limit = 50) =>
-    this.json<MediaItem[]>(`/sessions/${sessionId}/media${query({ limit })}`);
+  /** The files that the runs of a session made, newest first. `offset` skips the newest files. */
+  listMedia = (sessionId: string, limit = 50, offset = 0) =>
+    this.json<MediaItem[]>(`/sessions/${sessionId}/media${query({ limit, offset: offset || null })}`);
   /**
    * The bytes of one file of a run. An `img` or `a` element cannot send the Bearer token, so the
    * web app fetches the file here and uses a blob. `fallback` is the name if the API sends none.

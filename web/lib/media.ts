@@ -41,3 +41,30 @@ export function mediaByRun(items: readonly MediaItem[]): Map<string, MediaItem[]
   }
   return byRun;
 }
+
+/** The files of one page of the list, and the most pages that one load reads. */
+export const MEDIA_PAGE = 100;
+export const MEDIA_MAX_PAGES = 10;
+
+/**
+ * All files of a session, newest first. It reads pages until one has fewer files than the page
+ * size, or until the page limit. A failed page rejects, so the caller keeps its old list.
+ */
+export async function listAllMedia(
+  page: (limit: number, offset: number) => Promise<MediaItem[]>,
+): Promise<MediaItem[]> {
+  const all: MediaItem[] = [];
+  for (let index = 0; index < MEDIA_MAX_PAGES; index += 1) {
+    const items = await page(MEDIA_PAGE, index * MEDIA_PAGE);
+    all.push(...items);
+    if (items.length < MEDIA_PAGE) break;
+  }
+  return all;
+}
+
+const PREVIEW_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/** True if the page can show the file as a picture. SVG stays out. */
+export function hasPreview(item: MediaItem): boolean {
+  return item.kind === "image" || PREVIEW_TYPES.includes(item.mime_type.toLowerCase());
+}

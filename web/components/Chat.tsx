@@ -78,7 +78,7 @@ import { useMedia } from "./useMedia";
 import { LiveRun, TodoList, ToolTrail } from "./ToolGroup";
 import { ConnectCard } from "./ConnectCard";
 import { FileCards } from "./FileCard";
-import { mediaByRun } from "@/lib/media";
+import { listAllMedia, mediaByRun } from "@/lib/media";
 import { cardsOfCalls } from "@/lib/connectCard";
 import { ErrorState, LoadingState } from "./ui";
 import styles from "./Chat.module.css";
@@ -161,14 +161,22 @@ export function Chat({ sessionId }: { sessionId: string }) {
       setMessagesError(errorText(e, "Could not load the messages."));
     }
   }, [api, sessionId]);
-  // The files of the runs (images, voice notes, and files of `file_send`). A failed list shows
-  // no cards: the files that are shown stay, and the next run end loads the list again.
+  // The files of the runs (images, voice notes, and files of `file_send`), read in pages. A failed
+  // load keeps the cards that are shown and shows a notice with a Retry button. Only the newest
+  // load counts, so an old answer never replaces a newer list.
   const [media, setMedia] = useState<MediaItem[]>([]);
+  const [mediaFailed, setMediaFailed] = useState(false);
+  const mediaLoad = useRef(0);
   const loadMedia = useCallback(async () => {
+    mediaLoad.current += 1;
+    const mine = mediaLoad.current;
     try {
-      setMedia(await api.listMedia(sessionId, 100));
+      const items = await listAllMedia((limit, offset) => api.listMedia(sessionId, limit, offset));
+      if (mine !== mediaLoad.current) return;
+      setMedia(items);
+      setMediaFailed(false);
     } catch {
-      // The chat works without the cards.
+      if (mine === mediaLoad.current) setMediaFailed(true);
     }
   }, [api, sessionId]);
   const loadApprovals = useCallback(async () => {
@@ -354,6 +362,7 @@ export function Chat({ sessionId }: { sessionId: string }) {
       if (controller.signal.aborted) return;
       setDetail(loaded);
       setMedia([]);
+      setMediaFailed(false);
       setWorkspaceId(loaded.workspace_id);
       const runs = Object.fromEntries(
         loaded.runs
@@ -1070,6 +1079,14 @@ export function Chat({ sessionId }: { sessionId: string }) {
             </div>
           ) : null}
           {timeline}
+          {mediaFailed ? (
+            <p className={styles.note} role="status">
+              Could not load the files of this chat.{" "}
+              <button type="button" className="btn btn-small" onClick={() => void loadMedia()}>
+                Retry
+              </button>
+            </p>
+          ) : null}
           {pending !== null ? (
             <>
               <article className={styles.user} aria-label="You, sending">

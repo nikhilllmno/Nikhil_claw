@@ -59,13 +59,13 @@ from sama.gate.wire import (
     GateAnswer,
     GateRequest,
 )
-from sama.media.files import MAX_CAPTION_CHARS as MAX_FILE_CAPTION_CHARS
 from sama.media.files import MAX_NAME_CHARS as MAX_FILE_NAME_CHARS
 from sama.media.files import MAX_PATH_CHARS as MAX_FILE_PATH_CHARS
 from sama.media.files import FileSender
 from sama.media.generate import (
     DEFAULT_IMAGE_SIZE,
     DEFAULT_VOICE,
+    MAX_CAPTION_CHARS,
     MAX_PROMPT_CHARS,
     MAX_SPEECH_CHARS,
     ImageService,
@@ -1054,7 +1054,7 @@ class ToolServer:
                 ctx: Context,
                 path: Annotated[str, Field(min_length=1, max_length=MAX_FILE_PATH_CHARS)],
                 name: Annotated[str | None, Field(max_length=MAX_FILE_NAME_CHARS)] = None,
-                caption: Annotated[str, Field(max_length=MAX_FILE_CAPTION_CHARS)] = "",
+                caption: Annotated[str, Field(max_length=MAX_CAPTION_CHARS)] = "",
             ) -> str:
                 async def body(claims: RunTokenClaims) -> str:
                     return (await files.send(claims, path, name, caption)).text

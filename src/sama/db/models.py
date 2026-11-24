@@ -252,11 +252,9 @@ GENERATED_FILE_MIME_TYPES: Final = (
     "audio/ogg",
     "video/mp4",
 )
-"""The types of a file that ``file_send`` gives to the user (Section 11.10). A file of another
-type goes as ``application/octet-stream``."""
-GENERATED_MEDIA_MIME_TYPES: Final = GENERATED_FILE_MIME_TYPES
-"""PNG images of ``image_generate``, Ogg Opus voice notes of ``text_to_speech``, and the files
-of ``file_send``. Both PNG and Ogg are in ``GENERATED_FILE_MIME_TYPES``."""
+"""The types of ``generated_media``: the files that ``file_send`` gives to the user (Section
+11.10), with ``image/png`` of ``image_generate`` and ``audio/ogg`` of ``text_to_speech``. A file of
+another type goes as ``application/octet-stream``."""
 MAX_GENERATED_MEDIA_BYTES: Final = 10 * 1024 * 1024
 API_KEY_SCOPES: Final = ("chat", "mcp")
 """What an org API key can call (Section 10.7): ``chat`` is the OpenAI-compatible endpoint
@@ -1778,7 +1776,7 @@ class GeneratedMedia(Base):
             ondelete="CASCADE",
         ),
         CheckConstraint(_one_of("kind", GENERATED_MEDIA_KINDS), name="kind"),
-        CheckConstraint(_one_of("mime_type", GENERATED_MEDIA_MIME_TYPES), name="mime_type"),
+        CheckConstraint(_one_of("mime_type", GENERATED_FILE_MIME_TYPES), name="mime_type"),
         CheckConstraint(
             f"size_bytes BETWEEN 1 AND {MAX_GENERATED_MEDIA_BYTES}"
             " AND size_bytes = octet_length(data)",

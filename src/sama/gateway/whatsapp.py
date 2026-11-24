@@ -130,6 +130,10 @@ class _Outbox(RunOutbox):
         if self._media_link is None:
             return
         await self._check()
+        if media.kind == "file" and media.mime_type not in self._provider.file_types:
+            # WhatsApp refuses this type (Section 11.10): say so instead of a failed send.
+            await self._provider.send_text(self._to, unsupported_file_text(media.filename))
+            return
         await self._provider.send_media(self._to, media, self._media_link(media))
 
     async def send_card(self, row: Any) -> None:
@@ -140,6 +144,14 @@ class _Outbox(RunOutbox):
             )
         else:
             await self.send_message(card_text(row, with_codes=True))
+
+
+def unsupported_file_text(name: str) -> str:
+    """The note for a file that WhatsApp cannot carry, for example a CSV or a zip."""
+    return (
+        f"{name} is ready, but WhatsApp cannot send this type of file. Open this chat in the"
+        " sama web app to download it, or ask me for a PDF version."
+    )
 
 
 class WhatsAppGateway(DirectGateway[WhatsAppChat]):

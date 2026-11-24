@@ -330,8 +330,7 @@ class Api:
 
     async def fetch(self, url: str) -> tuple[int, str, bytes]:
         """GETs a link, with the user token only for the API itself. Follows redirects."""
-        same = urlsplit(url).hostname == urlsplit(self.base).hostname
-        headers = {"Authorization": f"Bearer {self.token()}"} if same else {}
+        headers = {"Authorization": f"Bearer {self.token()}"} if same_origin(url, self.base) else {}
         try:
             async with self._client.stream(
                 "GET", url, headers=headers, follow_redirects=True
@@ -344,6 +343,22 @@ class Api:
                 return response.status_code, response.headers.get("content-type", ""), body
         except httpx.HTTPError as error:
             return 0, type(error).__name__, b""
+
+
+def same_origin(url: str, base: str) -> bool:
+    """True if ``url`` has the scheme, host, and port of ``base``. Only then does the eval send
+    the user token: a link of the model to ``http://`` or another port gets no token."""
+    a, b = urlsplit(url), urlsplit(base)
+    ports = {"http": 80, "https": 443}
+    try:
+        port_a, port_b = a.port or ports.get(a.scheme), b.port or ports.get(b.scheme)
+    except ValueError:
+        return False
+    return (a.scheme, (a.hostname or "").lower(), port_a) == (
+        b.scheme,
+        (b.hostname or "").lower(),
+        port_b,
+    )
 
 
 async def _settle(
@@ -398,7 +413,7 @@ async def _turn(
     await asyncio.sleep(2)
     ok = await _settle(api, session_id, case, result, time.monotonic() + timeout_s, answered)
     answers = await _answers(api, session_id)
-    if ok and answers and asks(answers[-1]):
+    if ok and answers and asks(answers[-1][0]):
         result.followups += 1
         await api.call("POST", f"/sessions/{session_id}/messages", {"text": case.followup})
         await asyncio.sleep(2)
@@ -436,8 +451,11 @@ async def run_case(
             ok, turn_runs = await _turn(
                 api, session_id, case, case.again, result, timeout_s, answered
             )
-        result.answers = await _answers(api, session_id)
-        result.answer = result.answers[-1] if result.answers else ""
+        answers = await _answers(api, session_id)
+        result.answers = [text for text, _ in answers]
+        # The checked turn is the last one: an answer of an earlier turn does not count.
+        turn = [text for text, run_id in answers if run_id in turn_runs]
+        result.answer = turn[-1] if turn else ""
         runs = await api.call("GET", f"/sessions/{session_id}/runs")
         failed = not ok or any(run["status"] != "completed" for run in runs)
         for run in sorted(runs, key=lambda run: run["created_at"]):
@@ -452,7 +470,7 @@ async def run_case(
         result.fetched = [asdict(f) for f in fetched]
         result.paths = sandbox_paths(result.answer) + relative_file_links(result.answer)
         result.outcome = classify(
-            result.answer, fetched, failed=failed, answered=bool(result.answers)
+            result.answer, fetched, failed=failed, answered=bool(result.answer)
         )
     except (httpx.HTTPError, KeyError, ValueError) as error:
         result.error = f"{type(error).__name__}: {error}"
@@ -492,10 +510,15 @@ def _fetched(source: str, kind: str, status: int, content_type: str, body: bytes
     )
 
 
-async def _answers(api: Api, session_id: str) -> list[str]:
+async def _answers(api: Api, session_id: str) -> list[tuple[str, str | None]]:
+    """The assistant answers of the session, in order, with the id of their run."""
     messages = await api.call("GET", f"/sessions/{session_id}/messages")
     items = messages["items"] if isinstance(messages, dict) else messages
-    return [str(m.get("text") or "") for m in items if m.get("role") == "assistant"]
+    return [
+        (str(m.get("text") or ""), None if m.get("run_id") is None else str(m["run_id"]))
+        for m in items
+        if m.get("role") == "assistant"
+    ]
 
 
 def summary(results: Iterable[Result]) -> str:
@@ -627,7 +650,7 @@ def load(path: Path) -> list[Result]:
             result.answer,
             fetched,
             failed=result.error is not None,
-            answered=bool(result.answers),
+            answered=bool(result.answer),
         )
         results[(result.case, result.runtime)] = result
     return list(results.values())

@@ -864,6 +864,9 @@ describe("images in a message", () => {
     const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://api.test/sessions/s1/media?limit=20");
     expect(authOf(init)).toBe("Bearer old");
+    await client.listMedia("s1", 100, 200);
+    const [paged] = fetcher.mock.calls[1] as unknown as [string, RequestInit];
+    expect(paged).toBe("https://api.test/sessions/s1/media?limit=100&offset=200");
   });
 
   it("downloads one media file with the Bearer token and the name of the header", async () => {

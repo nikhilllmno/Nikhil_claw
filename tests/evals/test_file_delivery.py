@@ -1,7 +1,10 @@
 """The file-delivery eval (docs/architecture.md, Section 11.10; roadmap M8.6)."""
 
+# ruff: noqa: S108 - the /tmp paths are paths of the fake sandbox, not of this host.
+
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 from pathlib import Path
@@ -10,7 +13,6 @@ from typing import Any
 import httpx
 import pytest
 
-from sama.evals import file_delivery
 from sama.evals.file_delivery import (
     CASES,
     Api,
@@ -21,13 +23,16 @@ from sama.evals.file_delivery import (
     load,
     relative_file_links,
     run_case,
+    same_origin,
     sandbox_paths,
     summary,
 )
 
 # Answers of the baseline on main, 2026-11-24 (shortened).
 CLAUDE_PATH = "I made the file at `/home/user/work/top5_countries_by_population.csv`:\n\n```csv"
-OPENAI_SANDBOX_LINK = "Your checklist is ready: [Download the PDF](sandbox:/home/user/work/goa.pdf)."
+OPENAI_SANDBOX_LINK = (
+    "Your checklist is ready: [Download the PDF](sandbox:/home/user/work/goa.pdf)."
+)
 OPENAI_LINE_LINK = "Created [`naming.md`](naming.md:1) with a summary of the naming rules."
 OPENAI_RELATIVE = "[Download the PNG chart](mumbai_monthly_rainfall.png)"
 GOOD = "I made **top5.csv** with the 5 most populous countries (UN 2024 estimates)."
@@ -133,7 +138,8 @@ class FakeSama:
     """A sama API with one session: each message makes one completed run, and the run of the
     second message stores a CSV file."""
 
-    def __init__(self) -> None:
+    def __init__(self, first: str = CLAUDE_PATH, second: str | None = GOOD) -> None:
+        self.first, self.second = first, second
         self.runs: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self.media: list[dict[str, Any]] = []
@@ -155,10 +161,10 @@ class FakeSama:
             text = json.loads(request.content)["text"]
             self.messages.append({"role": "user", "text": text})
             if len(self.runs) == 1:
-                self.messages.append({"role": "assistant", "text": CLAUDE_PATH})
-            else:
+                self.messages.append({"role": "assistant", "text": self.first, "run_id": run_id})
+            elif self.second is not None:
                 self.media.append({"id": "m1", "run_id": run_id})
-                self.messages.append({"role": "assistant", "text": GOOD})
+                self.messages.append({"role": "assistant", "text": self.second, "run_id": run_id})
             return httpx.Response(202, json={})
         if path == "/sessions/s1/runs":
             return httpx.Response(200, json=self.runs)
@@ -170,6 +176,8 @@ class FakeSama:
             return httpx.Response(200, json={"tool_calls": [{"tool_name": "file_send"}]})
         if path == "/sessions/s1/media":
             return httpx.Response(200, json=self.media)
+        if path == "/files/old.csv":
+            return httpx.Response(200, content=CSV, headers={"content-type": "text/csv"})
         if path == "/sessions/s1/media/m1":
             assert request.headers["authorization"] == "Bearer t"
             return httpx.Response(200, content=CSV, headers={"content-type": "text/csv"})
@@ -179,12 +187,14 @@ class FakeSama:
 async def test_a_resend_case_checks_only_the_second_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(file_delivery.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
     token = tmp_path / "token"
     token.write_text("t")
     api = Api("https://sama.test", token)
     fake = FakeSama()
-    api._client = httpx.AsyncClient(base_url="https://sama.test", transport=httpx.MockTransport(fake))
+    api._client = httpx.AsyncClient(
+        base_url="https://sama.test", transport=httpx.MockTransport(fake)
+    )
     case = next(case for case in CASES if case.id == "resend-csv")
     result = await run_case(api, case, "claude", workspace_id="w", profile_id="p", timeout_s=5)
     await api.aclose()
@@ -197,3 +207,36 @@ async def test_a_resend_case_checks_only_the_second_turn(
 
 async def _no_sleep(_: float) -> None:
     return None
+
+
+async def test_a_link_of_the_first_turn_does_not_count_for_the_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    token = tmp_path / "token"
+    token.write_text("t")
+    api = Api("https://sama.test", token)
+    fake = FakeSama(first="Here: https://sama.test/files/old.csv", second=None)
+    api._client = httpx.AsyncClient(
+        base_url="https://sama.test", transport=httpx.MockTransport(fake)
+    )
+    case = next(case for case in CASES if case.id == "resend-csv")
+    result = await run_case(api, case, "claude", workspace_id="w", profile_id="p", timeout_s=5)
+    await api.aclose()
+    assert result.answer == ""
+    assert result.fetched == []
+    assert result.outcome == "error"
+
+
+@pytest.mark.parametrize(
+    ("url", "same"),
+    [
+        ("https://sama.test/sessions/s1/media/m1", True),
+        ("https://sama.test:443/x.csv", True),
+        ("http://sama.test/x.csv", False),
+        ("https://sama.test:8443/x.csv", False),
+        ("https://evil.test/x.csv", False),
+    ],
+)
+def test_the_token_goes_only_to_the_origin_of_the_api(url: str, same: bool) -> None:
+    assert same_origin(url, "https://sama.test") is same

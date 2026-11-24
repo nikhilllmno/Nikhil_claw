@@ -26,7 +26,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Final, Literal, get_args
 
 import httpx
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sama.db.models import MAX_GENERATED_MEDIA_BYTES, GeneratedMedia
@@ -149,15 +149,34 @@ class GeneratedMediaStore:
         data: bytes,
         caption: str,
         name: str = "",
-    ) -> uuid.UUID:
+        run_limit: int | None = None,
+    ) -> uuid.UUID | None:
+        """Stores a file of the run. With ``run_limit``, it stores the file only when the run
+        has fewer files of any kind, and returns ``None`` otherwise. A transaction lock on the
+        run makes the count and the insert one step, so parallel calls cannot pass the
+        limit."""
         media_id = uuid.uuid4()
+        org_id, run_id = uuid.UUID(claims.org_id), uuid.UUID(claims.run_id)
         async with self._engine.begin() as connection:
+            if run_limit is not None:
+                await connection.execute(
+                    select(func.pg_advisory_xact_lock(func.hashtextextended(str(run_id), 0)))
+                )
+                count = (
+                    await connection.execute(
+                        select(func.count()).where(
+                            GeneratedMedia.org_id == org_id, GeneratedMedia.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+                if count >= run_limit:
+                    return None
             await connection.execute(
                 insert(GeneratedMedia).values(
                     id=media_id,
-                    org_id=uuid.UUID(claims.org_id),
+                    org_id=org_id,
                     session_id=uuid.UUID(claims.session_id),
-                    run_id=uuid.UUID(claims.run_id),
+                    run_id=run_id,
                     kind=kind,
                     mime_type=mime_type,
                     size_bytes=len(data),
@@ -188,9 +207,9 @@ class GeneratedMediaStore:
         return [_stored(row) for row in rows]
 
     async def list(
-        self, org_id: uuid.UUID, session_id: uuid.UUID, limit: int
+        self, org_id: uuid.UUID, session_id: uuid.UUID, limit: int, offset: int = 0
     ) -> Sequence[MediaInfo]:
-        """The files of a session without their bytes, newest first."""
+        """The files of a session without their bytes, newest first, from ``offset``."""
         query = (
             select(
                 GeneratedMedia.id,
@@ -205,6 +224,7 @@ class GeneratedMediaStore:
             .where(GeneratedMedia.org_id == org_id, GeneratedMedia.session_id == session_id)
             .order_by(GeneratedMedia.created_at.desc(), GeneratedMedia.id)
             .limit(limit)
+            .offset(offset)
         )
         async with self._engine.connect() as connection:
             rows = (await connection.execute(query)).all()

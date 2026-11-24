@@ -15,23 +15,25 @@ Rules:
 - The type comes from the file extension (``FILE_TYPES``). A file whose type has a known start
   (PDF, PNG, JPEG, GIF, WebP, zip and the Office formats) must start with it. A file with an
   unknown extension goes as ``application/octet-stream``.
-- A run gives at most ``MAX_FILES_PER_RUN`` files.
+- A run has at most ``MAX_FILES_PER_RUN`` files of any kind (the gateway limit). The count
+  and the insert are one locked step.
 """
 
 from __future__ import annotations
 
 import logging
 import posixpath
-import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncEngine
-
-from sama.db.models import GENERATED_FILE_MIME_TYPES, MAX_GENERATED_MEDIA_BYTES, GeneratedMedia
-from sama.media.generate import GeneratedMediaStore, MediaResult, MediaStatus, StoredMedia
+from sama.db.models import MAX_GENERATED_MEDIA_BYTES
+from sama.media.generate import (
+    MAX_SENT_PER_RUN,
+    PNG_MAGIC,
+    GeneratedMediaStore,
+    MediaResult,
+    MediaStatus,
+)
 from sama.media.images import clean_name
 from sama.media.meter import MediaError
 from sama.sandbox.base import Sandbox, SandboxError, SandboxFileTooLargeError
@@ -44,12 +46,12 @@ if TYPE_CHECKING:
 log = logging.getLogger("sama.media")
 
 KIND: Final = "file"
-MAX_FILES_PER_RUN: Final = 10
+MAX_FILES_PER_RUN: Final = MAX_SENT_PER_RUN
+"""A run has at most this many files of any kind, the number that a gateway sends."""
 MAX_PATH_CHARS: Final = 1_000
 MAX_NAME_CHARS: Final = 120
 """The longest ``name`` argument."""
 MAX_STORED_NAME_CHARS: Final = 80
-MAX_CAPTION_CHARS: Final = 200
 SCRATCH_DIR: Final = "/tmp"  # noqa: S108 - a folder of the sandbox, not of this host
 """The scratch folder of the sandbox. Code often writes charts and exports there."""
 OCTET_STREAM: Final = "application/octet-stream"
@@ -95,7 +97,7 @@ MAGIC: Final[Mapping[str, tuple[bytes, ...]]] = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _ZIP,
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": _ZIP,
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": _ZIP,
-    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/png": (PNG_MAGIC,),
     "image/jpeg": (b"\xff\xd8\xff",),
     "image/gif": (b"GIF87a", b"GIF89a"),
     "image/webp": (b"RIFF",),
@@ -110,13 +112,6 @@ NO_SANDBOX: Final = "This session has no sandbox, so there is no file to send."
 OUTSIDE: Final = (
     "The path must be a file in the work folder ({workdir}) or in /tmp. Write the file there first."
 )
-
-
-@dataclass(frozen=True, slots=True)
-class SentFile:
-    name: str
-    mime_type: str
-    size_bytes: int
 
 
 def file_type(name: str) -> str:
@@ -159,17 +154,17 @@ def download_name(name: str | None, path: str) -> str:
     return stem + suffix
 
 
-def media_headers(media: StoredMedia) -> dict[str, str]:
-    """The headers of ``GET /v1/sessions/{id}/media/{media_id}``. A file of ``file_send`` is a
-    download that the browser does not run: ``attachment``, ``nosniff``, and a sandbox CSP, so
-    an HTML or SVG file cannot run script on the API origin. An image or a voice note of the
-    media tools stays ``inline``."""
+def media_headers(kind: str, filename: str) -> dict[str, str]:
+    """The headers of a download of ``generated_media`` (the API and the WhatsApp media link).
+    A file of ``file_send`` is a download that the browser does not run: ``attachment``,
+    ``nosniff``, and a sandbox CSP, so an HTML or SVG file cannot run script on the API origin.
+    An image or a voice note of the media tools stays ``inline``."""
     headers = {"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"}
-    if media.kind == KIND:
-        headers["Content-Disposition"] = f'attachment; filename="{media.filename}"'
+    if kind == KIND:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
         headers["Content-Security-Policy"] = "sandbox"
     else:
-        headers["Content-Disposition"] = f'inline; filename="{media.filename}"'
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
     return headers
 
 
@@ -184,16 +179,9 @@ def size_text(size: int) -> str:
 class FileSender:
     """Copies a file of the session sandbox into ``generated_media`` for the user."""
 
-    def __init__(
-        self,
-        engine: AsyncEngine,
-        session_sandbox: SessionSandbox,
-        *,
-        store: GeneratedMediaStore | None = None,
-    ) -> None:
-        self._engine = engine
+    def __init__(self, session_sandbox: SessionSandbox, *, store: GeneratedMediaStore) -> None:
         self._session_sandbox = session_sandbox
-        self._store = store or GeneratedMediaStore(engine)
+        self._store = store
 
     async def send(
         self, claims: RunTokenClaims, path: str, name: str | None = None, caption: str = ""
@@ -207,10 +195,6 @@ class FileSender:
         real = await self._real_path(sandbox, full)
         if not allowed(real, sandbox.workdir):
             raise MediaError(OUTSIDE.format(workdir=sandbox.workdir))
-        if await self._count(claims) >= MAX_FILES_PER_RUN:
-            raise MediaError(
-                f"This run already sent {MAX_FILES_PER_RUN} files. Put more files in one zip."
-            )
         try:
             data = await sandbox.read_file(real, max_bytes=MAX_GENERATED_MEDIA_BYTES)
         except FileNotFoundError:
@@ -229,24 +213,27 @@ class FileSender:
         mime = file_type(filename)
         if mime == OCTET_STREAM:
             mime = file_type(real)
-        if mime not in GENERATED_FILE_MIME_TYPES:  # a guard for a later change of the maps
-            mime = OCTET_STREAM
         starts = MAGIC.get(mime)
         if starts and not data.startswith(starts):
             raise MediaError(
                 f"{filename} is not a valid {mime} file: its bytes do not start like one."
                 " Make the file again with a tool that writes this format."
             )
-        await self._store.save(
+        saved = await self._store.save(
             claims,
             kind=KIND,
             mime_type=mime,
             data=data,
-            caption=caption[:MAX_CAPTION_CHARS],
+            caption=caption,
             name=filename,
+            run_limit=MAX_SENT_PER_RUN,
         )
-        sent = SentFile(filename, mime, len(data))
-        return MediaResult(MediaStatus.OK, sent_text(sent))
+        if saved is None:
+            raise MediaError(
+                f"This run already has {MAX_SENT_PER_RUN} files for the user. Put more files"
+                " in one zip."
+            )
+        return MediaResult(MediaStatus.OK, sent_text(filename, mime, len(data)))
 
     async def _real_path(self, sandbox: Sandbox, path: str) -> str:
         """The target of ``path`` with every symbolic link followed, from the sandbox. Raises
@@ -262,22 +249,13 @@ class FileSender:
             raise MediaError(f"There is no file at {path}. Write the file first.")
         return posixpath.normpath(result.stdout.strip())
 
-    async def _count(self, claims: RunTokenClaims) -> int:
-        query = select(func.count()).where(
-            GeneratedMedia.org_id == uuid.UUID(claims.org_id),
-            GeneratedMedia.run_id == uuid.UUID(claims.run_id),
-            GeneratedMedia.kind == KIND,
-        )
-        async with self._engine.connect() as connection:
-            return int((await connection.execute(query)).scalar_one())
 
-
-def sent_text(sent: SentFile) -> str:
+def sent_text(name: str, mime_type: str, size: int) -> str:
     """The tool result: the file went to the user, and how to talk about it."""
     return (
-        f"Sent {sent.name} ({sent.mime_type}, {size_text(sent.size_bytes)}) to the user. It"
+        f"Sent {name} ({mime_type}, {size_text(size)}) to the user. It"
         " shows as a download with your reply (in a chat app, as a file). In your answer, name"
-        f" the file ({sent.name}) and say what is in it. Do not give a sandbox path or a link"
+        f" the file ({name}) and say what is in it. Do not give a sandbox path or a link"
         " as the way to get it: the user cannot open those. To send it again later, call"
         " file_send again."
     )

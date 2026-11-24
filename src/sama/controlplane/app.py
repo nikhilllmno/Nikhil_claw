@@ -519,7 +519,7 @@ def build(
         coding=coding,
         custom_tools=custom_tools,
         # Files of the sandbox for the user (Section 11.10, M8.6). It needs a sandbox, no key.
-        files=FileSender(engine, sandboxed.session_sandbox, store=media) if sandboxed else None,
+        files=FileSender(sandboxed.session_sandbox, store=media) if sandboxed else None,
         # The Hermes tool parity tools of Section 10.2.2 (M7.5). Each is hidden without its key.
         video=(
             VideoService(

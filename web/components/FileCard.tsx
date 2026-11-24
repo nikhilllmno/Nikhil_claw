@@ -7,7 +7,7 @@
 import { useEffect, useState } from "react";
 import { errorText, type MediaItem } from "@/lib/api";
 import { saveFile } from "@/lib/history";
-import { mediaLabel, mediaName } from "@/lib/media";
+import { hasPreview, mediaLabel, mediaName } from "@/lib/media";
 import { useApi } from "./AuthProvider";
 import styles from "./FileCard.module.css";
 
@@ -27,7 +27,7 @@ export function FileCards({ sessionId, items }: { sessionId: string; items: read
 function FileCard({ sessionId, item }: { sessionId: string; item: MediaItem }) {
   const api = useApi();
   const name = mediaName(item);
-  const isImage = item.kind === "image";
+  const isImage = hasPreview(item);
   const [blob, setBlob] = useState<Blob | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

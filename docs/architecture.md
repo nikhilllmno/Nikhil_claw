@@ -5267,7 +5267,9 @@ list. It sends the file only to the chat of the session, so it needs no approval
 
 - `path` is relative to the work folder, or absolute in the work folder or in `/tmp`. Sama
   follows symbolic links in the sandbox (`realpath`) and refuses a target outside these
-  folders, so a link cannot send `~/.claude` or another file of the runner.
+  folders, so a plain link to `~/.claude` or another file of the runner is refused. This is a
+  best-effort check: the path can change between `realpath` and the read. The sandbox belongs
+  to the session, and its own tools can already read these files.
 - A file has 1 byte to 10 MB. A folder is refused with the advice to zip it.
 - The type comes from the extension of the download name (`.csv` is `text/csv`, `.pdf` is
   `application/pdf`, and so on). A file with an unknown extension is
@@ -5275,7 +5277,9 @@ list. It sends the file only to the chat of the session, so it needs no approval
   bytes of its format; else the tool tells the model to make the file again.
 - `name` is the download name. Sama keeps only letters, digits, `.`, `_`, and `-` (at most 80
   characters) and keeps the extension of the path when `name` has none.
-- A run sends at most 10 files. The tool result tells the model to name the file in the answer
+- A run has at most 10 files of any kind (images and voice notes count too), the number
+  that a gateway sends for a run. A lock on the run makes the count and the insert one step.
+  The tool result tells the model to name the file in the answer
   and never to give a sandbox path or a link as the way to get it.
 
 The system text (`sama.instructions.SYSTEM_PROMPT`) has the same rule for both runtimes:
@@ -5291,17 +5295,22 @@ read `name` with the other metadata, never `data`.
 **Delivery.**
 
 - Web app: under the last answer of the run, a card for each file of the run, with the name,
-  the type and size, and a Download button. An image also has a small preview. The web app
-  loads the list when the chat opens and when a run ends.
-- HTTP API: `GET /v1/sessions/{id}/media` lists the files with `name`.
+  the type and size, and a Download button. A PNG, JPEG, GIF, or WebP image also has a small
+  preview. The web app loads the list when the chat opens and when a run ends. When the list
+  does not load, the chat shows a short notice with a Retry button.
+- HTTP API: `GET /v1/sessions/{id}/media` lists the files with `name` (`limit` 1 to 100,
+  `offset` 0 to 10,000; the web app reads pages of 100).
   `GET /v1/sessions/{id}/media/{media_id}` gives a file of `file_send` with
   `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, and a CSP that starts
   with `sandbox`, so an HTML or SVG file cannot run script on the API origin. An image or a
   voice note stays `inline`.
 - Telegram: a document (`sendDocument`) with the name. Slack: an upload with the name as the
-  file name and the title. Email: an attachment with the name. WhatsApp: a document (Meta,
-  Gupshup) or a media message (Twilio) from the signed media link, which also has
-  `attachment`, `nosniff`, and the `sandbox` CSP for a file.
+  file name and the title. Email: an attachment with the name. WhatsApp: from the signed
+  media link (which also has `attachment`, `nosniff`, and the `sandbox` CSP for a file), an
+  image, audio, or video message for those types, and a document for a PDF, plain text, or an
+  Office file (Meta, Gupshup). Twilio sends only images, audio, video, and PDF. WhatsApp refuses
+  other types (for example CSV, Markdown, and zip), so the gateway sends a short note instead:
+  the file is ready in the web app, or the agent can make a PDF.
 
 **Eval.** `python -m sama.evals.file_delivery` sends 6 requests for a file (a CSV, a Markdown
 report, a PDF, a PNG chart, a zip, and "send me that file again" in a second turn) to both

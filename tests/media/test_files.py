@@ -1,6 +1,8 @@
 """``file_send``: a file of the session sandbox goes to the user (docs/architecture.md, Section
 11.10; roadmap M8.6), with a fake sandbox and the real database."""
 
+# ruff: noqa: S108 - the /tmp paths are paths of the fake sandbox, not of this host.
+
 from __future__ import annotations
 
 import posixpath
@@ -11,7 +13,9 @@ from dataclasses import dataclass, field
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sama.db.models import GENERATED_FILE_MIME_TYPES
 from sama.media.files import (
+    FILE_TYPES,
     MAX_FILES_PER_RUN,
     FileSender,
     download_name,
@@ -93,7 +97,7 @@ async def rig(engine: AsyncEngine, tenant: Tenant) -> Rig:
     run_id = await RunQueue(engine).enqueue(
         org_id=tenant.org, session_id=tenant.ids["s3"], text="make a csv"
     )
-    sender = FileSender(engine, session_sandbox, store=store)  # type: ignore[arg-type]
+    sender = FileSender(session_sandbox, store=store)  # type: ignore[arg-type]
     return Rig(sender, sandbox, store, tenant, run_id, sandboxes)
 
 
@@ -147,7 +151,7 @@ async def test_missing_empty_folder_and_large_files_get_a_clear_error(rig: Rig) 
         await rig.sender.send(rig.claims(), "empty.txt")
     rig.sandbox.files[f"{WORKDIR}/big.zip"] = ZIP
     rig.sandbox.too_large = True
-    with pytest.raises(MediaError, match="larger than 10.0 MB"):
+    with pytest.raises(MediaError, match=r"larger than 10\.0 MB"):
         await rig.sender.send(rig.claims(), "big.zip")
     assert await rig.store.pending(rig.tenant.org, rig.run_id) == []
 
@@ -164,7 +168,7 @@ async def test_no_sandbox_and_the_limit_per_run(rig: Rig) -> None:
     rig.sandbox.files[f"{WORKDIR}/a.txt"] = b"a"
     for _ in range(MAX_FILES_PER_RUN):
         await rig.sender.send(rig.claims(), "a.txt")
-    with pytest.raises(MediaError, match="already sent 10 files"):
+    with pytest.raises(MediaError, match="already has 10 files"):
         await rig.sender.send(rig.claims(), "a.txt")
     rig.sandboxes[0] = None
     with pytest.raises(MediaError, match="no sandbox"):
@@ -202,12 +206,18 @@ def test_resolve_normalises_inside_the_allowed_folders() -> None:
         resolve("/tmp/../etc/passwd", WORKDIR)
 
 
+def test_each_type_of_an_extension_is_allowed_in_the_database() -> None:
+    assert set(FILE_TYPES.values()) <= set(GENERATED_FILE_MIME_TYPES)
+
+
 def test_a_file_is_a_download_that_no_browser_runs() -> None:
     page = StoredMedia(uuid.uuid4(), "file", "text/html", "", b"<script>", "page.html")
-    headers = media_headers(page)
+    headers = media_headers(page.kind, page.filename)
     assert headers["Content-Disposition"] == 'attachment; filename="page.html"'
     assert headers["Content-Security-Policy"] == "sandbox"
     assert headers["X-Content-Type-Options"] == "nosniff"
     image = StoredMedia(uuid.uuid4(), "image", "image/png", "", PNG)
-    assert media_headers(image)["Content-Disposition"] == 'inline; filename="image.png"'
-    assert "Content-Security-Policy" not in media_headers(image)
+    assert media_headers(image.kind, image.filename)["Content-Disposition"] == (
+        'inline; filename="image.png"'
+    )
+    assert "Content-Security-Policy" not in media_headers(image.kind, image.filename)

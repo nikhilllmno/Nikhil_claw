@@ -47,6 +47,7 @@ from sama.gateway.whatsapp_providers import (
 from sama.integrations.hub import GatewayCache, TranscriberFactory
 from sama.integrations.request_body import read_body
 from sama.integrations.service import WhatsAppFactory, secret_hash
+from sama.media.files import media_headers
 from sama.orchestrator.queue import RunQueue
 from sama.review.apply import ReviewApplier
 from sama.skills.service import SkillLibrary
@@ -274,11 +275,8 @@ class WhatsAppHub(GatewayCache[_Number]):
             ).one_or_none()
         if file is None:
             raise HTTPException(status_code=404, detail="not found")
-        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
-        if file.kind == "file":
-            # A file of ``file_send`` is a download that no browser runs (Section 11.10).
-            headers["Content-Disposition"] = f'attachment; filename="{file.name or "file"}"'
-            headers["Content-Security-Policy"] = "sandbox"
+        # A file of ``file_send`` is a download that no browser runs (Section 11.10).
+        headers = {**media_headers(file.kind, file.name or "file"), "Cache-Control": "no-store"}
         return Response(content=bytes(file.data), media_type=file.mime_type, headers=headers)
 
 

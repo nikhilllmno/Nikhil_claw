@@ -1886,9 +1886,10 @@ class SamaApi:
             principal: Me,
             session_id: uuid.UUID,
             limit: Annotated[int, Query(ge=1, le=100)] = 50,
+            offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
         ) -> list[MediaOut]:
             access = await self._access(principal, session_id)
-            files = await self._media.list(access.org_id, session_id, limit)
+            files = await self._media.list(access.org_id, session_id, limit, offset)
             return [MediaOut(**asdict(media)) for media in files]
 
         @app.get("/sessions/{session_id}/media/{media_id}")
@@ -1898,7 +1899,9 @@ class SamaApi:
             if media is None:
                 raise _not_found("the file does not exist")
             return Response(
-                content=media.data, media_type=media.mime_type, headers=media_headers(media)
+                content=media.data,
+                media_type=media.mime_type,
+                headers=media_headers(media.kind, media.filename),
             )
 
         @app.get("/sessions/{session_id}/attachments/{attachment_id}")
