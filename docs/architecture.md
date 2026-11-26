@@ -9718,6 +9718,23 @@ The provider and search keys are the defaults. An org key in the vault comes fir
   template build needs the repository secret `E2B_API_KEY`. The nightly job still builds `sama-runner` from `main` for the E2B tests and
   for local use (Section 16.2).
 - A template stays in E2B after its deploy. Old templates are removed by hand.
+- **Release notification.** The last steps of the `staging` and `production` jobs send one
+  JSON `POST` per deploy to the URL in the secret `VORFLUX_RELEASE_WEBHOOK_URL` (a repository
+  or environment secret). The steps run also when the deploy fails or is cancelled
+  (`if: always()`). Without the secret, they do not run. `scripts/release-notify.sh` builds
+  the body with `jq`. It has a 10-second limit for each request, never prints the URL, and
+  always exits 0, and the steps have `continue-on-error`, so a notification never fails a
+  deploy. The body has identifiers and links only: `event` (`deploy`, or `rollback` when the
+  deployed commit is an ancestor of the previous one), `status` (`succeeded`, `failed`,
+  `cancelled`), `environment`, `service`, `repository`, `version` (a tag on the commit, else
+  `main-<sha>`), `ref`, `commit_sha`, `previous_commit_sha`, `compare_url`, `run_url`,
+  `run_id`, `run_attempt`, `actor`, and `deployed_at` (UTC, ISO 8601).
+- `previous_commit_sha` is the commit of the last successful deployment to the same GitHub
+  environment (Deployments API, so the jobs have `deployments: read`). GitHub records the tip
+  of `main` as the SHA of these deployments, not the deployed commit, so each job puts
+  `#main-<sha>` at the end of its environment URL, and the script reads the commit from
+  there. When the last successful deployment has no such URL (a deploy from before this
+  step), the script uses the commit of the previous tag, else `null`.
 - A paused session sandbox of an older template is replaced on its next run. The CLI
   transcripts move to the new sandbox, and other files do not (Section 16.2).
 

@@ -15,6 +15,11 @@ name: Deploy
 #
 # Each GitHub environment (staging, production) needs the secret FLY_API_TOKEN. The template
 # build needs the repository secret E2B_API_KEY.
+#
+# The last step of each deploy job sends one release notification (a JSON POST) to the URL in
+# the secret VORFLUX_RELEASE_WEBHOOK_URL (repository or environment secret), also when the
+# deploy fails or is cancelled. Without the secret, the steps do not run. A failed
+# notification never fails the deploy (scripts/release-notify.sh).
 
 on:
   workflow_run:
@@ -47,11 +52,18 @@ jobs:
     timeout-minutes: 30
     environment:
       name: staging
-      url: https://sama-staging.fly.dev
+      # The fragment names the deployed image. GitHub records the tip of main as the commit of
+      # the deployment, so the release notification reads the deployed commit from here.
+      url: https://sama-staging.fly.dev/#main-${{ github.event.workflow_run.head_sha }}
     concurrency:
       group: deploy-staging
       cancel-in-progress: false
+    # deployments: read finds the last successful deployment for the release notification.
+    permissions:
+      contents: read
+      deployments: read
     env:
+      RELEASE_WEBHOOK_SET: ${{ secrets.VORFLUX_RELEASE_WEBHOOK_URL != '' }}
       SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -118,6 +130,36 @@ jobs:
             curl -sSf --retry 10 --retry-all-errors --retry-delay 3 --max-time 10 \
               "https://sama-staging.fly.dev${path}" > /dev/null
           done
+      # The release notification (docs/architecture.md, Section 19.3). It runs also when the
+      # deploy fails or is cancelled, and it never fails the job. The script comes from the
+      # commit of this workflow, because an older deployed commit does not have it.
+      - name: Check out the release notification script
+        if: always() && env.RELEASE_WEBHOOK_SET == 'true'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .release-notify
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: scripts/release-notify.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Send the release notification
+        if: always() && env.RELEASE_WEBHOOK_SET == 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          RELEASE_WEBHOOK_URL: ${{ secrets.VORFLUX_RELEASE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_STATUS: ${{ job.status }}
+          DEPLOY_ENVIRONMENT: staging
+          DEPLOY_SERVICE: sama
+          DEPLOY_SHA: ${{ env.SHA }}
+          DEPLOY_REF: refs/heads/${{ github.event.workflow_run.head_branch }}
+          DEPLOY_IMAGE_LABEL: main-${{ env.SHA }}
+          RELEASE_NOTIFY_GIT_DIR: .release-notify
+        run: bash .release-notify/scripts/release-notify.sh || true
 
   production:
     name: Promote to production
@@ -126,11 +168,17 @@ jobs:
     timeout-minutes: 30
     environment:
       name: production
-      url: https://sama-production.fly.dev
+      # The fragment names the deployed image (see the staging job).
+      url: https://sama-production.fly.dev/#main-${{ inputs.sha }}
     concurrency:
       group: deploy-production
       cancel-in-progress: false
+    # deployments: read finds the last successful deployment for the release notification.
+    permissions:
+      contents: read
+      deployments: read
     env:
+      RELEASE_WEBHOOK_SET: ${{ secrets.VORFLUX_RELEASE_WEBHOOK_URL != '' }}
       SHA: ${{ inputs.sha }}
     steps:
       - name: Check the commit
@@ -194,3 +242,33 @@ jobs:
             curl -sSf --retry 10 --retry-all-errors --retry-delay 3 --max-time 10 \
               "https://sama-production.fly.dev${path}" > /dev/null
           done
+      # The release notification (docs/architecture.md, Section 19.3). It runs also when the
+      # deploy fails or is cancelled, and it never fails the job. The script comes from the
+      # commit of this workflow, because an older deployed commit does not have it.
+      - name: Check out the release notification script
+        if: always() && env.RELEASE_WEBHOOK_SET == 'true'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .release-notify
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: scripts/release-notify.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Send the release notification
+        if: always() && env.RELEASE_WEBHOOK_SET == 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          RELEASE_WEBHOOK_URL: ${{ secrets.VORFLUX_RELEASE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_STATUS: ${{ job.status }}
+          DEPLOY_ENVIRONMENT: production
+          DEPLOY_SERVICE: sama
+          DEPLOY_SHA: ${{ env.SHA }}
+          DEPLOY_REF: refs/heads/main
+          DEPLOY_IMAGE_LABEL: main-${{ env.SHA }}
+          RELEASE_NOTIFY_GIT_DIR: .release-notify
+        run: bash .release-notify/scripts/release-notify.sh || true
