@@ -46,7 +46,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 2. Set `NEXT_PUBLIC_SAMA_API_URL` for each environment.
 3. Add the deployed origin to the API's `SAMA_WEB_ORIGINS` and the `/login` URL to Supabase's redirect URLs.
 
-`next.config.ts` sets a Content-Security-Policy, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`. The policy allows `blob:` images, because the chat shows the images of sent messages from blobs that it loads with the access token.
+`next.config.ts` sets a Content-Security-Policy, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`. The policy allows `blob:` images, because the chat shows the images of sent messages from blobs that it loads with the access token. It allows frames from `https://www.browserbase.com` only, because the Live browser panel shows the Browserbase live view in a frame.
 
 ## Routes
 
@@ -55,7 +55,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/login` | Email and password, emailed sign-in link (PKCE), "Create an account" (Supabase sign-up with PKCE), and a developer access-token box. |
 | `/invite` | The page of an invite link (`/invite#<token>`). It keeps the token while you sign in, then joins the org. |
 | `/` | New task: the task text, an optional repo and branch, plan first, workspace, agent, and audience. It starts the session, attaches the repo, and sends the task. A user without an org sees the open invites and, when sign-up is open, the form for a new org. |
-| `/s/[sessionId]` | Chat with live streaming, one row per tool call, a working line, approvals (keys 1, 2, 3), questions, the plan card, Stop and Esc, and `/compact`. The message box has the `/` and `@` menus, the history (up arrow), and the harness menu (sama, Claude Code, Codex). The header has Code (the code panel next to the chat), Create PR (with a repo), Runs, and the Export menu (Markdown and JSON). |
+| `/s/[sessionId]` | Chat with live streaming, one row per tool call, a working line, approvals (keys 1, 2, 3), questions (a Claude Code style card for `AskUserQuestion`: options with descriptions, multi-select, "Other" with a free text, keys 1 to 4), the plan card, Stop and Esc, and `/compact`. The message box has the `/` and `@` menus, the history (up arrow), the harness menu (sama, Claude Code, Codex), and the browser menu "Browser: Cloud / My Chrome" for the session. The header has Code (the code panel next to the chat), Browser (the Live browser panel: the live view of the cloud browser, the step of the agent, Take control and Give back, and Stop), Create PR (with a repo), Runs, and the Export menu (Markdown and JSON). |
 | `/s/[sessionId]/runs` | The runs of the session with the token use and the cost. Each run opens its trace: steps, tool calls, and model calls. |
 | `/agents/[profileId]` | Agent settings. Read-only unless you are an admin of the org. |
 | `/tasks` | Task board of the current workspace: columns, new cards, status, assignee, and comments. |
@@ -64,7 +64,7 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 | `/memory` | Memory editor: agent notes, your profile, and workspace notes, with the revision history and revert. |
 | `/skills` | Skill editor: list, new skill, `SKILL.md`, files, versions, and archive. Built-in skills are read-only. |
 | `/members` | The members of an org and their roles. An owner or admin changes roles and workspaces, removes members, makes invite links, and revokes invites. |
-| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot and the Slack app), the browser card of each org (saved logins and the URL policy), linked chat accounts with link codes, the agents (an admin creates a new agent), and "Your data" (download or delete your data in an org). |
+| `/settings` | Account, the chat apps of each org (an admin connects or disconnects the Telegram bot and the Slack app), the browser card of each org (saved logins and the URL policy), the "Chrome extension" card (Connected or Not connected, "Download the extension", and the load-unpacked steps), linked chat accounts with link codes, the agents (an admin creates a new agent), and "Your data" (download or delete your data in an org). |
 | `/onboarding` | The setup guide after sign-up: connect a chat app, pick or create an agent, send a first message. |
 | `/admin` | The admin area (an org owner or admin): overview, `/admin/usage`, `/admin/audit`, `/admin/changes` (agent changes), `/admin/curator`, `/admin/keys` (org keys and region), and `/admin/data` (retention, org export, org delete). |
 | `/help`, `/help/[topic]` | Help pages for customers. They need no sign-in. |
@@ -73,7 +73,8 @@ CI runs `npm ci`, lint, type check, tests and build in `.github/workflows/ci.yml
 
 ```
 app/          routes, global CSS and design tokens (tokens.css)
-components/   UI: shell, sidebar, chat, composer, cards, agent settings, providers,
+components/   UI: shell, sidebar, chat, composer, cards, question card, Live browser
+              panel, Chrome extension card, agent settings, providers,
               memory editor, skill editor, session search, run traces, settings,
               welcome (no org yet), members, chat apps, org keys, onboarding, admin
               (usage, audit log, agent changes, curator reports, data controls), help,
@@ -85,7 +86,9 @@ lib/          framework-free logic with unit tests:
               skills (name and path checks), history (cost, tokens, trace steps, file
               download), connections, tasks, time, config, orgs (invite links,
               the kept invite token, role rules), admin (usage, audit, retention),
-              onboarding (setup progress), help (the help text)
+              onboarding (setup progress), help (the help text), liveBrowser
+              (the step line of the Live browser panel), questions (the answers of
+              an AskUserQuestion card)
 ```
 
 Tokens: all colours, spacing and type come from CSS custom properties in `app/tokens.css`. Light and dark follow `prefers-color-scheme`.

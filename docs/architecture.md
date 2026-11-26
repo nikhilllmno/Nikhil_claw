@@ -9655,6 +9655,7 @@ the start with a message that names the variable but not its value.
 | `MEM0_API_KEY` | No | The `mem0` memory provider (Section 8.2). An org key in the vault (`mem0_api_key`) comes first. |
 | `SAMA_MOA_MAX_COST_USD` | No | The cost cap of one `moa` call, above 0 and at most 5. Default: `0.50` (Section 10.2.2). |
 | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | No | The cloud browser (Section 14.1). With both, the browser tools have the `cloud` target, and it is the default target. Without them, the tools have only `my_chrome` (Section 14.2.2). The key is a setting of the process; it is not in the vault yet. |
+| `SAMA_BROWSERBASE_PROXIES`, `SAMA_BROWSERBASE_CAPTCHAS` | No | Residential proxies and CAPTCHA solving of the cloud browser (Section 14.1, "Live browser (M8.3)"). Both are on by default; `0` turns each one off. Proxies add a small cost for each page. |
 | `SAMA_BROWSER_TASK_MODEL` | No | The Anthropic model of the browser sub-agent (Section 14.1, M5.6). Default `claude-sonnet-5-5`. It must have a price in the price table, else the process does not start. |
 | `COMPOSIO_API_KEY` | No | The Composio connectors (Section 10.3). An org key in the vault (`composio_api_key`) comes first. Without both, a Composio connection cannot start. |
 | `SAMA_COMPOSIO_WEBHOOK_SECRET` | No | The signing secret of the Composio webhook subscription of the sama project (Section 12.2). An org secret in the vault (`composio_webhook_secret`) comes first. Without both, sama refuses Composio events. |
@@ -9668,6 +9669,7 @@ the start with a message that names the variable but not its value.
 | `SAMA_SIGNUP` | No | `open` lets a user with a confirmed email make an org. The default, `invite_only`, adds users only with an invite (Section 17.2). |
 | `SAMA_SIGNUP_BLOCKED_DOMAINS` | No | More email domains that cannot make an org, comma-separated (Section 17.2). |
 | `SAMA_EXTENSION_IDS` | No | The Chrome extension ids that may open the extension WebSocket (Section 14.2.1). Without it, every `chrome-extension://` origin may connect with a valid token. |
+| `SAMA_EXTENSION_ZIP` | No | The build of the Chrome extension that `GET /extension/download` serves (Section 14.2.4). Default: `/opt/sama/extension/sama-extension.zip`, which the image has when the deploy workflow built it. Without the file, the download answers `404`. |
 | `SAMA_REGION`, `SAMA_REGION_URLS` | No | The home region of the deployment (default `ap-south-1`) and the `region=url` pairs of the other regions (Section 17.3) |
 | `SAMA_STRIPE_SECRET_KEY`, `SAMA_STRIPE_WEBHOOK_SECRET` | No | Billing (Section 17.5). Without both, or when Stripe refuses the key at start, billing is off and the plans add no model quota. |
 | `SAMA_STRIPE_ALLOW_LIVE` | No | `true` accepts a live Stripe key. Without it, a live key turns billing off. |
@@ -9700,6 +9702,11 @@ The provider and search keys are the defaults. An org key in the vault comes fir
   deploys that commit to staging and labels the image `main-<sha>`. The `production` job runs
   only by hand (`workflow_dispatch` with the commit SHA). It checks that the commit is on
   `main` and deploys the staging image of that commit, so production runs the tested image.
+- The `staging` job also builds the Chrome extension with the placeholder API address
+  `https://sama-api.invalid` and copies `deploy/sama-extension.zip` into the image
+  (`/opt/sama/extension/`). The production job uses the same image, so it serves the same zip;
+  the download puts the address of each API in it (Section 14.2.4). A local image build without
+  the zip works, and its download answers `404`.
 - The GitHub environments `staging` and `production` hold the secret `FLY_API_TOKEN`. Only
   `main` can deploy to them.
 - Each deploy builds the E2B template `sama-runner-<content hash>` and sets

@@ -76,7 +76,14 @@ export const HELP_TOPICS: HelpTopic[] = [
         heading: "Approvals and questions",
         paragraphs: [
           "Before the agent does something risky, for example a change to a file or a message to another person, it shows an approval card. Click Approve, Always allow, or Deny.",
-          "When the agent needs more information, it shows a question card. Type or choose your answer.",
+          "When the agent needs more information, it shows a question card. Type or choose your answer. A card with options shows a description for each option and Other last: choose Other to type your own answer.",
+        ],
+      },
+      {
+        heading: "The browser of the agent",
+        paragraphs: [
+          "The Browser menu in the message box sets the browser of the session. Cloud is a browser in the cloud, good for research in the background. My Chrome is your own Chrome with your logins, and it needs the sama extension. Get the extension from the Chrome extension card on the Settings page.",
+          "When the agent uses the cloud browser, the Live browser panel opens next to the chat. It shows the page, the address, and the current step of the agent. Click Take control to click and type yourself; the agent waits. Click Give back to let the agent continue.",
         ],
       },
       {
