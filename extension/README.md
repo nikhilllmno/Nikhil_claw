@@ -15,6 +15,10 @@ design is in `docs/architecture.md` §14.2.1 (side panel) and §14.2.2 (browser 
   `chrome.debugger`. The page shows the agent cursor and a Stop button. The user allows each
   site once, approves each sensitive action, and can take over the tab at any time. Banks,
   payments, password managers, and Google account pages are blocked.
+- The browser of a chat (M8.3): in the web chat, the menu "Browser: Cloud / My Chrome" sets the
+  target of each session. With "My Chrome", the agent uses this extension. When the extension is
+  offline, the agent says so in one line and can continue on the cloud browser
+  (`docs/architecture.md` §14.2.4).
 
 ## Build
 
@@ -29,15 +33,32 @@ SAMA_API_URL=https://sama-staging.fly.dev npm run build   # writes dist/
 `SAMA_API_URL` is the API address. The default is staging. It must use `https`, except for
 `localhost` and `127.0.0.1`. The build adds the address to `host_permissions`.
 
+The deploy workflow (`.github/workflows/deploy.yml`, staging job) also builds the extension with
+the placeholder address `https://sama-api.invalid` and puts the zip in the image
+(`/opt/sama/extension/sama-extension.zip`, `SAMA_EXTENSION_ZIP`). `GET /extension/download`
+puts the public address of the API in place of the placeholder, so each API serves its own
+build (`docs/architecture.md` §14.2.4).
+
 ## Load it in Chrome
+
+Get the build in one of two ways:
+
+- From the web app: open Settings, find the card "Chrome extension", and click "Download the
+  extension". Unzip the file into a folder that you keep. The card also shows "Connected" or
+  "Not connected".
+- From a local build: use `extension/dist`.
+
+Then:
 
 1. Open `chrome://extensions`.
 2. Turn on "Developer mode".
-3. Click "Load unpacked" and select `extension/dist`.
+3. Click "Load unpacked" and select the folder of the build.
 4. Click the sama icon in the toolbar. The side panel opens.
 
 The API accepts every `chrome-extension://` origin unless `SAMA_EXTENSION_IDS` is set. Set it
-to the id of the store item in production.
+to the id of the store item when the Chrome Web Store item exists. Until then, keep it unset on
+staging and production: the id of an unpacked extension depends on its folder, so a list would
+refuse it.
 
 ## Layout
 
