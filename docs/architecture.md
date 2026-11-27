@@ -8548,7 +8548,7 @@ migrated schema.
 
 | Table | Key columns |
 |---|---|
-| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0035`, Section 17.4) |
+| `orgs` | `name`, `slug` (unique), `plan`, `region`, `limits`, `retention_days` (null for the plan default, 1 to 3,650; migration `0035`, Section 17.4), `is_internal` (migration `0053`, Section 18.4) |
 | `users` | `org_id`, `auth_user_id` (the Supabase Auth user), `email`, `display_name` |
 | `workspaces` | `org_id`, `name`, `slug` (unique per org) |
 | `memberships` | `org_id`, `user_id`, `workspace_id` (null for the org), `role` |
@@ -9452,7 +9452,7 @@ once" (key 1), "Allow for this session" (key 2, scope `session` of Section 16.1)
   rejects calls over the limit, and the run ends with `RunFailed(budget_exceeded)`
   (Section 16.6).
 - **Audit log**: append-only rows for tool calls with side effects, approvals, configuration
-  changes, logins, and admin actions.
+  changes, logins, admin actions, and completed runs (`run.completed`, Section 18.4).
 - **Health**: structured logs, metrics (queue depth, run latency, sandbox start time, error
   rate), and alerts to a Slack channel.
 
@@ -9550,6 +9550,114 @@ message. A new alert comes only 30 minutes or more after the last alert.
   new leader does not know the state of the old leader, so it can post the same alert again.
 - When Slack does not take the message, the monitor tries again at the next check.
 - The webhook URL is a secret. It is never logged.
+
+### 18.4 Product metrics: activation (M8)
+
+Sama has no product analytics SDK. The product metrics read the database of sama. The source
+of each step of the activation journey is a server-side record. The append-only `audit_log`
+is the durable source: a person or the retention sweep (Section 17.4) can delete a session, and
+the delete takes its runs, run events, approvals, and tool calls. The audit log stays.
+
+| Step | Durable record |
+|---|---|
+| Org created | `orgs.created_at`; audit `org.created` (sign-up only, `via` = `signup`) |
+| Channel or connection | audit `connection.connected`, `integration.created`; `channel_identities` |
+| First session | audit `session.created` (gateway sessions) |
+| First completed run | audit `run.completed` (this section) |
+| Approval handled | audit `approval.approved`, `approval.rejected`, `approval.expired` |
+| Paid | audit `billing.checkout_started`, `org.plan_changed`; `org_billing` |
+
+**`run.completed`.** `RunQueue.complete` writes this audit row in the transaction that ends the
+run as `completed`, so each completed run has one row. The columns: `actor_kind` (`user` when
+a user started the run, else `system`), `actor_user_id`, `workspace_id`, `run_id`,
+`target_type` = `run`, and `target_id`. The `details` have only flags and ids: `session_id`,
+`kind` (`chat` or `review`), `compact`, `side`, `runtime`, `human_origin`, and `unattended`.
+They never have the message, the reply, a name, an email, or a phone number. A failed or
+cancelled run has no row.
+
+**Backfill.** `python -m sama.admin backfill-run-completed [--batch <n>]`
+(`sama.observability.activation`) writes the row for each completed run that does not have
+one, with `via` = `backfill` and `created_at` = the end of the run. It covers the runs from
+before migration `0053` and the runs that an old worker completed during the deploy. Run it
+after the deploy, when no worker of the old version is left. Each batch (default 500 rows) is a
+short transaction of its own, so the backfill holds no long lock. A second run adds no copy.
+The migration does not backfill: a long backfill in the migration transaction would hold the
+lock of `ADD COLUMN` on `orgs`.
+
+**Internal orgs.** `orgs.is_internal` marks an org of the operator team or of test traffic.
+The metrics leave these orgs out. `bootstrap` (Section 19.4) makes an internal org, and
+migration `0053` marks each org without `created_by_auth_user_id` (the orgs of `bootstrap`). A
+sign-up org is not internal. An operator changes the flag with
+`python -m sama.admin internal set --org <id> --on|--off`. The change writes the audit row
+`org.internal_changed`.
+
+**7-day activation rate.**
+
+- Cohort: the orgs with `is_internal = false` that were created in the report period, and
+  whose first 7 days ended (`created_at <= now() - 7 days`).
+- Qualifying run: a `run.completed` row with `kind` = `chat`, `compact` = false, and
+  `unattended` = false. A person, or a client of the person with an org API key, asked for the
+  run. A job, a trigger, a workflow, a delegated run, and a background review do not count.
+  `human_origin` = true is a narrower cut (web app and chat channels only). It is reliable
+  only for runs from 2026-11-23.
+- Numerator: the cohort orgs with a qualifying run in `[created_at, created_at + 7 days)`.
+- Denominator: the cohort orgs.
+
+```sql
+WITH cohort AS (
+    SELECT id, created_at FROM orgs
+    WHERE NOT is_internal
+      AND created_at >= :period_start AND created_at < :period_end
+      AND created_at <= now() - interval '7 days'
+), qualifying AS (
+    SELECT a.org_id, a.created_at
+    FROM audit_log a JOIN cohort c ON c.id = a.org_id
+    WHERE a.action = 'run.completed'
+      AND a.details->>'kind' = 'chat'
+      AND NOT (a.details->>'compact')::boolean
+      AND NOT (a.details->>'unattended')::boolean
+      AND a.created_at >= c.created_at AND a.created_at < c.created_at + interval '7 days'
+)
+SELECT count(*) AS cohort_orgs,
+       count(*) FILTER (WHERE c.id IN (SELECT org_id FROM qualifying)) AS activated_orgs,
+       round(100.0 * count(*) FILTER (WHERE c.id IN (SELECT org_id FROM qualifying))
+             / nullif(count(*), 0), 1) AS activation_rate_pct
+FROM cohort c;
+```
+
+**7-day return use.** Numerator: the activated orgs with a qualifying run on a later UTC day
+than their first qualifying run, and less than 7 days after it. Denominator: the activated
+orgs whose first qualifying run is 7 days old or more.
+
+```sql
+WITH cohort AS (
+    SELECT id, created_at FROM orgs
+    WHERE NOT is_internal
+      AND created_at >= :period_start AND created_at < :period_end
+), qualifying AS (
+    SELECT a.org_id, a.created_at
+    FROM audit_log a JOIN cohort c ON c.id = a.org_id
+    WHERE a.action = 'run.completed'
+      AND a.details->>'kind' = 'chat'
+      AND NOT (a.details->>'compact')::boolean
+      AND NOT (a.details->>'unattended')::boolean
+      AND a.created_at >= c.created_at
+), firsts AS (
+    SELECT q.org_id, min(q.created_at) AS first_at
+    FROM qualifying q JOIN cohort c ON c.id = q.org_id
+    WHERE q.created_at < c.created_at + interval '7 days'
+    GROUP BY q.org_id
+    HAVING min(q.created_at) <= now() - interval '7 days'
+)
+SELECT count(*) AS activated_orgs,
+       count(*) FILTER (WHERE EXISTS (
+           SELECT 1 FROM qualifying q
+           WHERE q.org_id = f.org_id
+             AND (q.created_at AT TIME ZONE 'UTC')::date > (f.first_at AT TIME ZONE 'UTC')::date
+             AND q.created_at < f.first_at + interval '7 days'
+       )) AS returned_orgs
+FROM firsts f;
+```
 
 ---
 
@@ -9727,7 +9835,8 @@ The provider and search keys are the defaults. An org key in the vault comes fir
 org-level `owner` membership, the workspace `main`, and the agent profile `sama` (model
 `claude-sonnet-5-5`, toolsets `core`, `todo`, `web`, `clarify`, `github`, `skills`). The owner signs in on the web
 page one time first, so that the email finds the Supabase Auth user. A second run adds only
-what is missing. Run it on the app machine with `fly ssh console`.
+what is missing. Run it on the app machine with `fly ssh console`. The org of `bootstrap` is
+internal (`orgs.is_internal`, Section 18.4), so the product metrics leave it out.
 
 ### 19.5 GitHub App (M3.7)
 

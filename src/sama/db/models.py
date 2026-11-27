@@ -330,6 +330,10 @@ class Org(Base):
     retention_days: Mapped[int | None] = mapped_column(Integer)
     """Sama deletes a session after this many days without activity. Null means the default
     of the plan (Section 17.4)."""
+    is_internal: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    """True for an org of the operator team or for test traffic (migration ``0053``). The
+    product metrics leave these orgs out (Section 18.4). ``bootstrap`` sets it, and
+    ``python -m sama.admin internal set`` changes it."""
     created_at: Mapped[datetime] = _created_at()
 
 

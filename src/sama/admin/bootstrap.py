@@ -129,7 +129,8 @@ async def bootstrap(
         org_id = await find_or_add(
             "org",
             select(Org.id).where(Org.slug == org_slug),
-            insert(Org).values(name=org_name, slug=org_slug).returning(Org.id),
+            # The operator makes this org, so it is internal (Section 18.4).
+            insert(Org).values(name=org_name, slug=org_slug, is_internal=True).returning(Org.id),
         )
         user_id = await find_or_add(
             "user",
