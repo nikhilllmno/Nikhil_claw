@@ -75,7 +75,7 @@ export const HELP_TOPICS: HelpTopic[] = [
       {
         heading: "Approvals and questions",
         paragraphs: [
-          "Before the agent does something risky, for example a change to a file or a message to another person, it shows an approval card. Click Approve, Always allow, or Deny.",
+          "Before the agent does something risky, for example a message to another person, it shows an approval card. Click Approve, Always allow, or Deny. In a private chat, the agent runs commands and changes files in its own sandbox without a card. In a shared session and in a job, it still asks.",
           "When the agent needs more information, it shows a question card. Type or choose your answer. A card with options shows a description for each option and Other last: choose Other to type your own answer.",
         ],
       },
@@ -118,13 +118,14 @@ export const HELP_TOPICS: HelpTopic[] = [
         paragraphs: [
           "Open an agent from the sidebar. Every member can read the settings. Only an org owner or admin can change them.",
           "A change applies to new sessions. A session that is open keeps the settings that it started with. A tool that you remove stops at once.",
+          "A new agent starts with the reasoning effort High. It gives better answers to hard tasks, and it costs about twice the model default. An org owner or admin can lower it in the Harness section of the console.",
         ],
       },
       {
         heading: "Create an agent",
         steps: [
           "Open the setup guide, or the Agents part of the Settings page.",
-          "Give a name and a soul. The soul tells the agent who it is and how it works.",
+          "Give a name and a soul. The soul tells the agent who it is and how it works. Without a soul, the agent gets the default soul of sama.",
           "Choose the workspace that can use it, or the whole org.",
         ],
       },

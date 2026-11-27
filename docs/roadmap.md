@@ -21,7 +21,7 @@ An item is done when its acceptance criteria pass in CI or in a recorded demo.
 | M5 | Browser | Cloud browser tools and the Chrome extension with click, type, and cursor. |
 | M6 | Self-change and customers | `change_propose`, `sama_pr`, curator, checkpoints, customer sign-up and billing. |
 | M7 | Parity and power use | Parallel requests, coding agent connectors, custom tools and sub-agents, Hermes parity, settings console, end-to-end tests. |
-| M8 | Seamless use | Connect apps from the chat in one click, and continue the request after the sign-in. A web app that works like Claude Code and Codex. A browser that the user can see and use. |
+| M8 | Seamless use | Connect apps from the chat in one click, and continue the request after the sign-in. A web app that works like Claude Code and Codex. A browser that the user can see and use. An agent that works and talks like Claude Code. |
 
 ```mermaid
 flowchart LR
