@@ -2912,7 +2912,9 @@ model. So one call can do many tool calls and give back a short result.
   call limit are helper behavior and not a security boundary: they live in the program process,
   and the program also has the run token, so it can change them or send requests itself. The
   gate (toolsets, deny rules, and approval tickets) is the boundary, and every request passes
-  it. `execute_code` itself gets `ask` by default, like `Bash`.
+  it. `execute_code` itself has the same defaults as `Bash`: since M8.5 it gets `allow` in a
+  private chat, and `ask` in a shared session, in an unattended run, and in a sub-agent
+  (Section 16.1).
 - **Limits.** The code has at most 50,000 characters. The time limit is 60 seconds by default
   and 300 seconds at most. A file that the program writes has at most 50 MB. The tool reads at
   most 200 KB of standard output, and the output cap of the tool server applies (50 KB, then a
@@ -7932,8 +7934,10 @@ gives no deferred tool: the search fails closed (Section 6.3).
   M3.7) holds the tokens of the repos on the allowlist. `github.com` stays an allowed host,
   for public clones and package installs, so a token in injected text can still push to
   another repo. Registry uploads stay a risk
-  until the egress filter checks methods and paths. The gate `ask` on `Bash` is the control
-  until then.
+  until the egress filter checks methods and paths. Until then, the control is the gate `ask`
+  on `Bash`. Since M8.5 that default applies only in a shared session, in an unattended run,
+  and in a sub-agent: a private chat allows `Bash` by default (Section 16.1). An org or
+  profile rule `ask` for `Bash` brings the control back in private chats.
 
 **Code.**
 
@@ -8388,7 +8392,7 @@ later. Each tool is hidden when its service is missing.
 
 | Tool | Section | Needs | Gate default |
 |---|---|---|---|
-| `execute_code(code, timeout_s)` | 10.2.1 | The session sandbox | `ask` |
+| `execute_code(code, timeout_s)` | 10.2.1 | The session sandbox | `allow` in a private chat, `ask` in a shared session and an unattended run (since M8.5, Section 16.1) |
 | `image_generate(prompt, size)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `text_to_speech(text, voice)` | 11.8 | A database and the OpenAI key of the org | `allow` |
 | `skill_import(url, path, ref, name, scope)` | 9.6 | The skill store | `ask` |
@@ -9258,7 +9262,9 @@ without a change of the web app.
   change.
 
 **Harness.** The agent profile has a run budget (Section 4.3) and a new column
-`reasoning_effort` (`low`, `medium`, `high`, or null for the default of the model).
+`reasoning_effort` (`low`, `medium`, `high`, or null for the default of the model). Since
+M8.5 a new profile gets `high`, and migration `0052` sets `high` on the default profile of
+each org when the value is null (Section 6.1). An admin lowers it here.
 
 - `GET /orgs/{org_id}/agent-profiles/{profile_id}` gives `budget` (`max_turns`, `max_cost_usd`,
   `max_wall_time_s`, `max_tokens`) and `reasoning_effort`. `options` gives `reasoning_efforts`
@@ -9732,7 +9738,8 @@ The provider and search keys are the defaults. An org key in the vault comes fir
 
 `python -m sama.admin bootstrap --org-slug <slug> --email <email>` creates the first org, an
 org-level `owner` membership, the workspace `main`, and the agent profile `sama` (model
-`claude-sonnet-5-5`, toolsets `core`, `todo`, `web`, `clarify`, `github`, `skills`). The owner signs in on the web
+`claude-sonnet-5-5`, the toolsets of `DEFAULT_TOOLSETS` in `sama.admin.bootstrap`, the default
+SOUL, and the reasoning effort `high` since M8.5, Section 6.1). The owner signs in on the web
 page one time first, so that the email finds the Supabase Auth user. A second run adds only
 what is missing. Run it on the app machine with `fly ssh console`.
 
