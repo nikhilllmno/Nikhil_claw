@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -290,6 +290,99 @@ async def test_fail_with_cancelled_ends_as_cancelled(engine: AsyncEngine, tenant
     assert (await run_row(engine, first)).status == "cancelled"
     row = await run_row(engine, second)
     assert (row.status, row.failure_code, row.failure_message) == ("failed", "tool_error", "m")
+
+
+async def _run_audit(engine: AsyncEngine, org_id: uuid.UUID) -> list[Any]:
+    async with engine.connect() as connection:
+        return list(
+            (
+                await connection.execute(
+                    select(AuditEntry)
+                    .where(AuditEntry.org_id == org_id, AuditEntry.action == "run.completed")
+                    .order_by(AuditEntry.id)
+                )
+            ).all()
+        )
+
+
+async def test_complete_writes_the_audit_row_run_completed(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The durable record of the activation metric (Section 18.4). It has flags and ids only:
+    no input, no reply, no name, and no email."""
+    queue = RunQueue(engine)
+    human = await queue.enqueue(
+        org_id=tenant.org,
+        session_id=tenant.ids["s1"],
+        text="a secret prompt",
+        user_id=tenant.ids["mia"],
+        human=True,
+    )
+    run = await claim(queue)
+    assert await queue.complete(
+        run, OWNER, output="a private reply", runtime_state=None, usage=Usage()
+    )
+    automated = await queue.enqueue(
+        org_id=tenant.org, session_id=tenant.ids["s2"], text="job", unattended=True
+    )
+    run = await claim(queue)
+    assert await queue.complete(run, OWNER, output="done", runtime_state=None, usage=Usage())
+
+    rows = await _run_audit(engine, tenant.org)
+    assert [(r.run_id, r.target_type, r.target_id) for r in rows] == [
+        (human, "run", str(human)),
+        (automated, "run", str(automated)),
+    ]
+    first, second = rows
+    assert (first.actor_kind, first.actor_user_id, first.workspace_id) == (
+        "user",
+        tenant.ids["mia"],
+        tenant.ids["ws"],
+    )
+    assert first.details == {
+        "session_id": str(tenant.ids["s1"]),
+        "kind": "chat",
+        "compact": False,
+        "side": False,
+        "runtime": run.runtime,
+        "human_origin": True,
+        "unattended": False,
+    }
+    assert (second.actor_kind, second.actor_user_id) == ("system", None)
+    assert (second.details["human_origin"], second.details["unattended"]) == (False, True)
+    text_ = str([r.details for r in rows])
+    assert "secret prompt" not in text_
+    assert "private reply" not in text_
+
+
+async def test_no_run_completed_row_for_a_failed_or_lost_run(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    queue = RunQueue(engine)
+    await enqueue(queue, tenant, "s1")
+    run = await claim(queue)
+    assert await queue.fail(run, OWNER, code=FailureCode.MODEL_ERROR, message="m", usage=Usage())
+    await enqueue(queue, tenant, "s2")
+    run = await claim(queue)
+    assert not await queue.complete(run, "intruder", output="x", runtime_state=None, usage=Usage())
+    assert await _run_audit(engine, tenant.org) == []
+
+
+async def test_the_run_completed_row_stays_when_the_session_goes(
+    engine: AsyncEngine, tenant: Tenant
+) -> None:
+    """The reason for the row: a deleted session takes its runs, not the audit log."""
+    queue = RunQueue(engine)
+    run_id = await enqueue(queue, tenant, "s3")
+    run = await claim(queue)
+    assert await queue.complete(run, OWNER, output="x", runtime_state=None, usage=Usage())
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(Session).where(Session.org_id == tenant.org, Session.id == tenant.ids["s3"])
+        )
+    async with engine.connect() as connection:
+        assert await connection.scalar(select(Run.id).where(Run.id == run_id)) is None
+    assert [r.run_id for r in await _run_audit(engine, tenant.org)] == [run_id]
 
 
 async def test_only_the_lease_owner_ends_a_run(engine: AsyncEngine, tenant: Tenant) -> None:

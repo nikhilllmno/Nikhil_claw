@@ -600,6 +600,43 @@ async def _finish_tool_calls(
     )
 
 
+async def _audit_completed(connection: AsyncConnection, run: ClaimedRun) -> None:
+    """Writes the audit row ``run.completed`` (docs/architecture.md, Section 18.4).
+
+    The row is the durable record of a completed run for the product metrics: ``audit_log`` is
+    append-only, and it stays when a person or the retention sweep deletes the session (and
+    with it the run). The details have only flags and ids. They never have the input, the
+    reply, a name, or an email."""
+    flags = (
+        await connection.execute(
+            select(Run.human_origin, Run.unattended).where(
+                Run.org_id == run.org_id, Run.id == run.run_id
+            )
+        )
+    ).one()
+    await connection.execute(
+        insert(AuditEntry).values(
+            org_id=run.org_id,
+            workspace_id=run.workspace_id,
+            actor_kind="user" if run.user_id is not None else "system",
+            actor_user_id=run.user_id,
+            action="run.completed",
+            target_type="run",
+            target_id=str(run.run_id),
+            run_id=run.run_id,
+            details={
+                "session_id": str(run.session_id),
+                "kind": run.kind,
+                "compact": run.compact,
+                "side": run.side,
+                "runtime": run.runtime,
+                "human_origin": flags.human_origin,
+                "unattended": flags.unattended,
+            },
+        )
+    )
+
+
 def _encode_state(state: bytes | None) -> str | None:
     return None if state is None else base64.b64encode(state).decode("ascii")
 
@@ -2197,6 +2234,9 @@ class RunQueue:
                 usage=usage,
                 runtime_state=_encode_state(runtime_state),
             )
+            if ended:
+                # In the same transaction, so a completed run always has its audit row, once.
+                await _audit_completed(connection, run)
             # A review run writes no message: nobody reads its reply (Section 9.4). A compact
             # run answers nobody, and it is no user turn.
             if ended and steerable:

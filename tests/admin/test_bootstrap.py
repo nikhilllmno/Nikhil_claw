@@ -59,6 +59,9 @@ async def test_a_second_run_adds_nothing(engine: AsyncEngine, slug: str) -> None
         ).one()
         grants = await load_grants(connection, first.org_id, first.user_id)
     assert role == "owner"
+    async with engine.connect() as connection:
+        internal = await connection.scalar(select(Org.is_internal).where(Org.id == first.org_id))
+    assert internal is True  # Section 18.4: the product metrics leave out an operator org.
     assert soul == (DEFAULT_SOUL, "high")  # M8.5
     assert profile == (
         None,
