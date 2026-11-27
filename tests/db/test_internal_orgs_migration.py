@@ -7,16 +7,13 @@ internal. A sign-up org stays a customer org. The downgrade removes the column.
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
-from datetime import UTC, datetime
 
 import asyncpg
 import pytest
 from alembic import command
 
 from tests.db.conftest import alembic_config, migrated_database
-from tests.db.world import seed
 
 pytestmark = pytest.mark.filterwarnings("ignore::ResourceWarning")
 
@@ -70,50 +67,3 @@ def test_the_backfill_marks_only_the_bootstrap_orgs_as_internal() -> None:
         assert not _has_column(url)
         command.upgrade(config, "head")
         assert _has_column(url)
-
-
-def test_the_upgrade_backfills_run_completed_once_without_message_text() -> None:
-    with migrated_database() as url:
-        config = alembic_config(url)
-        command.downgrade(config, "0052")
-        world = asyncio.run(seed(url))
-        done = world.ids["run:a1-alice"]
-        asyncio.run(
-            _fetch(
-                url,
-                "UPDATE runs SET status = 'completed', triggered_by_user_id = $2,"
-                " finished_at = '2026-11-20T10:00:00Z' WHERE id = $1",
-                done,
-                world.ids["alice"],
-            )
-        )
-        command.upgrade(config, "head")
-        query = (
-            "SELECT run_id, actor_kind, actor_user_id, workspace_id, details, created_at"
-            " FROM audit_log WHERE action = 'run.completed'"
-        )
-        [row] = asyncio.run(_fetch(url, query))
-        assert (row["run_id"], row["actor_kind"], row["actor_user_id"]) == (
-            done,
-            "user",
-            world.ids["alice"],
-        )
-        assert row["workspace_id"] == world.ids["a1"]
-        assert row["created_at"] == datetime(2026, 11, 20, 10, tzinfo=UTC)
-        details = json.loads(row["details"])
-        assert details == {
-            "session_id": str(world.ids["a1-alice"]),
-            "kind": "chat",
-            "compact": False,
-            "side": False,
-            "runtime": "fake",
-            "human_origin": False,
-            "unattended": False,
-            "via": "migration 0053",
-        }
-        assert "secret" not in row["details"]
-
-        # The downgrade keeps the entry (append-only), and a second upgrade adds no copy.
-        command.downgrade(config, "0052")
-        command.upgrade(config, "head")
-        assert len(asyncio.run(_fetch(url, query))) == 1

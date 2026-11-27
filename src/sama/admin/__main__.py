@@ -13,6 +13,9 @@
 - ``python -m sama.admin internal show|set --org <id> [--on|--off]``: the flag
   ``orgs.is_internal`` (Section 18.4). The product metrics leave out an internal org (the
   operator team or test traffic). ``set`` writes the audit entry ``org.internal_changed``.
+- ``python -m sama.admin backfill-run-completed [--batch <n>]``: the audit row
+  ``run.completed`` for each completed run without it (Section 18.4). Run it after a deploy of
+  migration ``0053``, when no old worker is left. A second run adds no copy.
 - ``python -m sama.admin github-app manifest [--public-url <url>] [--org <github org>]
   [--out <file>]`` and ``github-app convert <code> [--out-dir <dir>] [--fly-app <app>]``: the
   manifest flow of the sama GitHub App (Section 15.1). They need no database.
@@ -40,6 +43,7 @@ from sama.admin import github_app
 from sama.admin.bootstrap import DEFAULT_MODEL, BootstrapError, Bootstrapped, Owner, bootstrap
 from sama.db.engine import create_engine
 from sama.github.client import GitHubError
+from sama.observability.activation import DEFAULT_BATCH, backfill_run_completed
 from sama.orgs.internal import UnknownOrgError, org_is_internal, set_org_internal
 from sama.subagents import SubagentError, parse_subagents, profile_subagents, set_profile_subagents
 from sama.tenancy.regions import RegionError, org_region, regions_from_env, set_org_region
@@ -132,6 +136,14 @@ async def _internal(args: argparse.Namespace) -> dict[str, Any]:
             before = await set_org_internal(engine, org_id, args.internal)
             return result | {"is_internal": args.internal, "before": before}
         return result | {"is_internal": await org_is_internal(engine, org_id)}
+    finally:
+        await engine.dispose()
+
+
+async def _backfill(args: argparse.Namespace) -> dict[str, Any]:
+    engine = create_engine(_database_url())
+    try:
+        return {"written": await backfill_run_completed(engine, batch=args.batch)}
     finally:
         await engine.dispose()
 
@@ -230,6 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     flag = internal.add_mutually_exclusive_group()
     flag.add_argument("--on", dest="internal", action="store_const", const=True)
     flag.add_argument("--off", dest="internal", action="store_const", const=False)
+    backfill = commands.add_parser(
+        "backfill-run-completed",
+        help="Write the audit row run.completed for each completed run without it.",
+    )
+    backfill.add_argument("--batch", type=int, default=DEFAULT_BATCH, help="Rows per transaction.")
     app = commands.add_parser(
         "github-app", help="Create the sama GitHub App with the manifest flow of GitHub."
     )
@@ -254,6 +271,11 @@ def main(argv: list[str] | None = None) -> int:
         except RegionError as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
+        return 0
+    if args.command == "backfill-run-completed":
+        if args.batch < 1:
+            parser.error("--batch must be 1 or more")
+        print(json.dumps(asyncio.run(_backfill(args))))
         return 0
     if args.command == "internal":
         if args.action == "set" and args.internal is None:

@@ -9572,9 +9572,17 @@ run as `completed`, so each completed run has one row. The columns: `actor_kind`
 a user started the run, else `system`), `actor_user_id`, `workspace_id`, `run_id`,
 `target_type` = `run`, and `target_id`. The `details` have only flags and ids: `session_id`,
 `kind` (`chat` or `review`), `compact`, `side`, `runtime`, `human_origin`, and `unattended`.
-They never have the message, the reply, a name, an email, or a phone number. Migration `0053`
-writes the row for each completed run from before, with `via` = `migration 0053` and
-`created_at` = the end of the run. A failed or cancelled run has no row.
+They never have the message, the reply, a name, an email, or a phone number. A failed or
+cancelled run has no row.
+
+**Backfill.** `python -m sama.admin backfill-run-completed [--batch <n>]`
+(`sama.observability.activation`) writes the row for each completed run that does not have
+one, with `via` = `backfill` and `created_at` = the end of the run. It covers the runs from
+before migration `0053` and the runs that an old worker completed during the deploy. Run it
+after the deploy, when no worker of the old version is left. Each batch (default 500 rows) is a
+short transaction of its own, so the backfill holds no long lock. A second run adds no copy.
+The migration does not backfill: a long backfill in the migration transaction would hold the
+lock of `ADD COLUMN` on `orgs`.
 
 **Internal orgs.** `orgs.is_internal` marks an org of the operator team or of test traffic.
 The metrics leave these orgs out. `bootstrap` (Section 19.4) makes an internal org, and
